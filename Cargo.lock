@@ -583,6 +583,12 @@ version = "0.1.0"
 [[package]]
 name = "gyeol-crypto"
 version = "0.1.0"
+dependencies = [
+ "gyeol-identity",
+ "hkdf",
+ "hmac",
+ "sha2",
+]
 
 [[package]]
 name = "gyeol-datapath"
