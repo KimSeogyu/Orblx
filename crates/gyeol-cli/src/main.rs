@@ -9,6 +9,7 @@ use gyeol_edge::crate_name as edge_crate;
 use gyeol_identity::crate_name as identity_crate;
 use gyeol_identity::TrustBundle;
 
+mod connector;
 mod direct;
 mod edge;
 mod relay;
@@ -23,6 +24,7 @@ enum Action {
     Edge(edge::EdgeCommand),
     Direct(direct::Command),
     Relay(relay::Command),
+    Connector(connector::Command),
 }
 
 #[derive(Debug)]
@@ -75,6 +77,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Ok(Action::Connector(command)) => {
+            if let Err(err) = connector::run(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
         Err(err) => {
             eprintln!("{err}");
             std::process::exit(1);
@@ -113,6 +121,9 @@ where
     }
     if args.first().map(String::as_str) == Some("relay-smoke") {
         return relay::parse_smoke(&args[1..]).map(Action::Relay);
+    }
+    if args.first().map(String::as_str) == Some("connector") {
+        return connector::parse(&args[1..]).map(Action::Connector);
     }
     for arg in &args {
         if arg == "--version" || arg == "-V" {
@@ -356,7 +367,8 @@ mod tests {
             | Action::HelpHelloQuic
             | Action::Edge(_)
             | Action::Direct(_)
-            | Action::Relay(_) => {
+            | Action::Relay(_)
+            | Action::Connector(_) => {
                 panic!("the parser did not select hello-quic");
             }
         }
@@ -395,7 +407,8 @@ mod tests {
             | Action::HelpHelloQuic
             | Action::Edge(_)
             | Action::Direct(_)
-            | Action::Relay(_) => {
+            | Action::Relay(_)
+            | Action::Connector(_) => {
                 panic!("the parser did not select hello-quic");
             }
         }

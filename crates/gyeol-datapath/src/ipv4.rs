@@ -82,14 +82,44 @@ pub(crate) fn tcp_udp_destination(packet: &[u8]) -> Option<TcpUdpDestination> {
     Some(TcpUdpDestination { addr, proto, port })
 }
 
+/// TCP FIN flag.
+pub(crate) const TCP_FLAG_FIN: u8 = 0x01;
+
+/// TCP PSH flag.
+pub(crate) const TCP_FLAG_PSH: u8 = 0x08;
+
+/// TCP ACK flag.
+pub(crate) const TCP_FLAG_ACK: u8 = 0x10;
+
+/// One IPv4 packet that carries a TCP segment.
+///
+/// The checksum fields are zero.
+/// The connector uses this packet as a DATA payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TcpSegment {
+    /// Source address.
+    pub src: Ipv4Addr,
+    /// Destination address.
+    pub dst: Ipv4Addr,
+    /// Source port.
+    pub src_port: u16,
+    /// Destination port.
+    pub dst_port: u16,
+    /// TCP flag byte.
+    pub flags: u8,
+    /// TCP payload.
+    pub payload: Vec<u8>,
+}
+
 /// Build one IPv4 packet with a 20-byte header and a 20-byte TCP header.
 ///
 /// The checksum fields are zero.
-#[cfg(test)]
-pub(crate) fn tcp_ipv4_packet(
+pub(crate) fn encode_tcp_segment(
     src: Ipv4Addr,
     dst: Ipv4Addr,
+    src_port: u16,
     dst_port: u16,
+    flags: u8,
     payload: &[u8],
 ) -> Result<Vec<u8>, HelloError> {
     let total = 40usize
@@ -106,15 +136,62 @@ pub(crate) fn tcp_ipv4_packet(
     packet[9] = 6;
     packet[12..16].copy_from_slice(&src.octets());
     packet[16..20].copy_from_slice(&dst.octets());
+    packet[20..22].copy_from_slice(&src_port.to_be_bytes());
     packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
     packet[32] = 5 << 4;
+    packet[33] = flags;
+    packet[34] = 0xff;
+    packet[35] = 0xff;
     packet[40..].copy_from_slice(payload);
     Ok(packet)
 }
 
+/// Read one TCP segment from an IPv4 packet.
+///
+/// The function returns `None` when the packet is not TCP.
+pub(crate) fn decode_tcp_segment(packet: &[u8]) -> Option<TcpSegment> {
+    if !is_ipv4_packet(packet) || packet[9] != 6 {
+        return None;
+    }
+    let ip_header_len = usize::from(packet[0] & 0x0f) * 4;
+    let tcp = packet.get(ip_header_len..)?;
+    if tcp.len() < 20 {
+        return None;
+    }
+    let data_offset = usize::from(tcp[12] >> 4) * 4;
+    if data_offset < 20 || tcp.len() < data_offset {
+        return None;
+    }
+    Some(TcpSegment {
+        src: Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]),
+        dst: Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
+        src_port: u16::from_be_bytes([tcp[0], tcp[1]]),
+        dst_port: u16::from_be_bytes([tcp[2], tcp[3]]),
+        flags: tcp[13],
+        payload: tcp[data_offset..].to_vec(),
+    })
+}
+
+/// Build one IPv4 packet with a 20-byte header and a 20-byte TCP header.
+///
+/// The checksum fields are zero.
+/// The source port is 0.
+#[cfg(test)]
+pub(crate) fn tcp_ipv4_packet(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    dst_port: u16,
+    payload: &[u8],
+) -> Result<Vec<u8>, HelloError> {
+    encode_tcp_segment(src, dst, 0, dst_port, 0, payload)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ipv4_packet, is_ipv4_packet, tcp_ipv4_packet, tcp_udp_destination};
+    use super::{
+        decode_tcp_segment, encode_tcp_segment, ipv4_packet, is_ipv4_packet, tcp_ipv4_packet,
+        tcp_udp_destination, TCP_FLAG_ACK, TCP_FLAG_PSH,
+    };
     use std::net::Ipv4Addr;
 
     #[test]
@@ -140,6 +217,26 @@ mod tests {
         assert_eq!(dest.port, 443);
         let ping = ipv4_packet(src, dst, b"ping").unwrap();
         assert!(tcp_udp_destination(&ping).is_none());
+    }
+
+    #[test]
+    fn tcp_segment_round_trip_keeps_the_ports_and_the_payload() {
+        let src = Ipv4Addr::new(10, 8, 0, 2);
+        let dst = Ipv4Addr::new(10, 8, 0, 10);
+        let flags = TCP_FLAG_PSH | TCP_FLAG_ACK;
+        let packet = encode_tcp_segment(src, dst, 40_000, 443, flags, b"hello").unwrap();
+        assert!(is_ipv4_packet(&packet));
+        let segment = decode_tcp_segment(&packet).unwrap();
+        assert_eq!(segment.src, src);
+        assert_eq!(segment.dst, dst);
+        assert_eq!(segment.src_port, 40_000);
+        assert_eq!(segment.dst_port, 443);
+        assert_eq!(segment.flags, flags);
+        assert_eq!(segment.payload, b"hello");
+        let dest = tcp_udp_destination(&packet).unwrap();
+        assert_eq!(dest.addr, dst);
+        assert_eq!(dest.port, 443);
+        assert_eq!(dest.proto, 6);
     }
 
     #[test]
