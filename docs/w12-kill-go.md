@@ -9,21 +9,40 @@ Status: defer.
 
 K4 is the SVID PEM load from disk.
 Read the K4 section in [connector-hub.md](connector-hub.md).
+Pass is not measured.
+Fire is not measured.
 
-Checks on this tree:
+Checks on `main` at `f4ce5c86d18108ffe71d70325a8f958230d60147`:
 
 - [connector-hub.md](connector-hub.md) says this week does not replace the PEM load from disk.
 - `crates/gyeol-cli/src/ticket_load.rs` reads `ticket-verifier.pem` from disk.
 - `crates/gyeol-datapath/src/connector/lab.rs` writes SVID PEM files and reads those files.
 - `crates/gyeol-identity/src/ca.rs` returns `certificate_pem` and `private_key_pem`.
+- `TrustBundle::from_pem` in `crates/gyeol-identity/src/cert.rs` reads PEM text in memory.
+- `decode_certificate_pem_file` is absent.
+- `TrustBundle::from_pem_file` is absent.
+- `IssuedSvid::from_pem` is absent.
+- `IssuedSvid::from_pem_files` is absent.
 - The City Breeze feed test in `crates/gyeol-sim/src/sim.rs` rejects the strings `BEGIN` and `PRIVATE` in the event JSON.
 - That feed test does not remove the disk PEM load.
-- The pull request list for this repository shows no merged change that removes the disk PEM load.
 
-Pass is not measured.
-Fire is not measured.
-IdentityAgents may clear the PEM residual in parallel.
-This packet does not record that result.
+Open pull request: https://github.com/KimSeogyu/Orblx/pull/22
+Head SHA: `bae897a312c10001858698bd50385c8979d17889`
+State on 2026-10-28: open.
+`mergedAt` is null.
+The head commit message is `Load SVID and trust-bundle PEM from disk paths.`
+
+That head contains these functions:
+
+- `decode_certificate_pem_file` in `crates/gyeol-identity/src/cert.rs`
+- `TrustBundle::from_pem_file` in `crates/gyeol-identity/src/cert.rs`
+- `IssuedSvid::from_pem` in `crates/gyeol-identity/src/ca.rs`
+- `IssuedSvid::from_pem_files` in `crates/gyeol-identity/src/ca.rs`
+
+The residual clearance is on that open pull request.
+It is not on `main`.
+After pull request 22 merges, the Eng Lead or the PO may reclassify K4.
+Until that merge, the status stays defer.
 
 ## K5
 
