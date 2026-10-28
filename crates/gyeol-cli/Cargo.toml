@@ -1,0 +1,18 @@
+[package]
+name = "gyeol-cli"
+description = "Week 1 gyeol command. The command prints a hello line or the version."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "gyeol"
+path = "src/main.rs"
+
+[dependencies]
+gyeol-coord = { path = "../gyeol-coord" }
+gyeol-crypto = { path = "../gyeol-crypto" }
+gyeol-datapath = { path = "../gyeol-datapath" }
+gyeol-edge = { path = "../gyeol-edge" }
+gyeol-identity = { path = "../gyeol-identity" }

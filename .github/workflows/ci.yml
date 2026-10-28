@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  rust:
+    name: format, clippy, and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the repository
+        uses: actions/checkout@v4
+
+      - name: Install the stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check the Rust format
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run the tests
+        run: cargo test --workspace
