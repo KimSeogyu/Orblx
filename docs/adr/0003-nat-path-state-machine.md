@@ -120,3 +120,19 @@ On Relay, the wire carries ciphertext and a routing header with session_id only.
 4. Must Stick and upgrade be live in the Week 12 demo?
 5. What is the numeric agent RPC p99 target in milliseconds?
 6. For Week 6 TCP, do N-Edge and D-Path choose QUIC-style fallback or TLS-wrapped frames?
+
+## Week 6 decision
+
+Question 6 is decided.
+The primary TCP/443 framing is QUIC-style.
+A TCP record is a 16-bit big-endian length and one Relay datagram.
+The datagram header is version, kind, and a 16-byte session id.
+The DATA payload is one QUIC packet.
+The Relay copies that payload.
+The Relay does not parse the QUIC packet.
+The Relay does not terminate QUIC.
+The alternate is a Noise frame or a TLS-wrapped frame in the same payload slot.
+Week 6 does not implement that alternate.
+Stick and upgrade stays deferred.
+The path does not retry Direct while Relay is up.
+The path does not migrate the QUIC connection in this build.

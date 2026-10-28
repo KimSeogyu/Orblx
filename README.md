@@ -90,9 +90,15 @@ Direct then proves hello-quic on the same UDP socket.
 `direct_is_up` is true after that proof.
 The Direct budget is 3 seconds.
 The QUIC policy port is UDP 443.
-The code does not implement Relay.
-The code does not implement Stick and upgrade.
-The code does not implement TCP port 443.
+When Direct is down, the peers attach to the gyeol Relay.
+The Relay routes by session id only.
+The payload stays end-to-end encrypted.
+UDP port 443 is the preferred Relay socket.
+When UDP is blocked, the path uses TCP port 443.
+TCP uses a QUIC-style length prefix.
+The prefix is a 16-bit length and one Relay datagram.
+The datagram payload is one QUIC packet.
+Stick and upgrade is deferred.
 
 Run the in-process same-NAT lab:
 
@@ -130,6 +136,44 @@ Answer Binding requests in the lab:
 ```bash
 cargo run -p gyeol-cli -- stun-serve --listen 127.0.0.1:3478
 ```
+
+## Relay
+
+Run the Relay on UDP port 443 and TCP port 443:
+
+```bash
+cargo run -p gyeol-cli -- relay --udp 0.0.0.0:443 --tcp 0.0.0.0:443
+```
+
+The Relay does not mint a session id.
+Give the same session id to both peers.
+The peers prove QUIC through the Relay.
+
+```bash
+cargo run -p gyeol-cli -- relay-peer \
+  --role server \
+  --bind 0.0.0.0:0 \
+  --stun 127.0.0.1:3478 \
+  --session SESSION_HEX \
+  --relay 127.0.0.1:443 \
+  --transport auto \
+  --cert server.pem --key server.key \
+  --bundle bundle.pem --ticket ticket.bin
+```
+
+`--transport auto` tries UDP and then TCP.
+`--transport tcp` uses TCP only.
+
+Run the in-process labs:
+
+```bash
+cargo run -p gyeol-cli -- relay-smoke udp
+cargo run -p gyeol-cli -- relay-smoke tcp
+```
+
+[`scripts/edge-smoke.sh`](scripts/edge-smoke.sh) runs the Direct labs and the Relay labs.
+The userspace Relay labs need no extra privileges.
+The netns Relay labs need root, iproute2, and iptables.
 
 ## Completion criteria for the 12-week work
 

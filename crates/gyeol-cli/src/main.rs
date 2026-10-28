@@ -13,6 +13,7 @@ use gyeol_identity::{ticket_hash, DenySet, TrustBundle};
 
 mod direct;
 mod edge;
+mod relay;
 
 #[derive(Debug)]
 enum Action {
@@ -22,6 +23,7 @@ enum Action {
     HelloQuic(HelloQuicCommand),
     Edge(edge::EdgeCommand),
     Direct(direct::Command),
+    Relay(relay::Command),
 }
 
 #[derive(Debug)]
@@ -68,6 +70,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Ok(Action::Relay(command)) => {
+            if let Err(err) = relay::run(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
         Err(err) => {
             eprintln!("{err}");
             std::process::exit(1);
@@ -97,6 +105,15 @@ where
     }
     if args.first().map(String::as_str) == Some("direct-peer") {
         return direct::parse_peer(&args[1..]).map(Action::Direct);
+    }
+    if args.first().map(String::as_str) == Some("relay") {
+        return relay::parse_serve(&args[1..]).map(Action::Relay);
+    }
+    if args.first().map(String::as_str) == Some("relay-peer") {
+        return relay::parse_peer(&args[1..]).map(Action::Relay);
+    }
+    if args.first().map(String::as_str) == Some("relay-smoke") {
+        return relay::parse_smoke(&args[1..]).map(Action::Relay);
     }
     for arg in &args {
         if arg == "--version" || arg == "-V" {
@@ -342,7 +359,8 @@ mod tests {
             | Action::Version
             | Action::HelpHelloQuic
             | Action::Edge(_)
-            | Action::Direct(_) => {
+            | Action::Direct(_)
+            | Action::Relay(_) => {
                 panic!("the parser did not select hello-quic");
             }
         }
@@ -380,7 +398,8 @@ mod tests {
             | Action::Version
             | Action::HelpHelloQuic
             | Action::Edge(_)
-            | Action::Direct(_) => {
+            | Action::Direct(_)
+            | Action::Relay(_) => {
                 panic!("the parser did not select hello-quic");
             }
         }

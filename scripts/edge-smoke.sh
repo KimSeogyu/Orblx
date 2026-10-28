@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# Run the Week 5 edge lab.
+# Run the Week 5 edge lab and the Week 6 Relay lab.
 # The userspace lab needs no extra privileges.
 # UDP port 443 needs permission to bind that port.
 # The netns lab needs root, iproute2, and iptables.
-# The lab sends hole-punch datagrams.
-# The lab proves direct QUIC.
-# The lab does not use Relay.
+# The Direct lab sends hole-punch datagrams.
+# The Direct lab proves direct QUIC.
+# The Relay lab uses the gyeol Relay when Direct is down.
+# The Relay lab uses TCP port 443 when UDP is blocked.
 
 set -euo pipefail
+
+export PATH="/usr/sbin:/sbin:${PATH:-/usr/bin}"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
@@ -365,11 +368,108 @@ run_netns() {
   trap - EXIT
 }
 
+run_relay_userspace() {
+  echo "=== userspace Relay UDP lab ==="
+  local udp tcp
+  udp=$(cargo run -q -p gyeol-cli -- relay-smoke udp)
+  check_relay_smoke "$udp" udp
+  echo "=== userspace Relay TCP lab ==="
+  tcp=$(cargo run -q -p gyeol-cli -- relay-smoke tcp)
+  check_relay_smoke "$tcp" tcp
+}
+
+check_relay_smoke() {
+  local text=$1
+  local kind=$2
+  printf '%s\n' "$text"
+  local file
+  file=$(mktemp)
+  printf '%s\n' "$text" >"$file"
+  if ! grep -q "^relay lab ${kind}$" "$file"; then
+    echo "The Relay lab kind is not ${kind}."
+    cat "$file"
+    rm -f "$file"
+    exit 1
+  fi
+  if ! grep -q '^echo ok true$' "$file"; then
+    echo "The Relay QUIC echo did not succeed."
+    cat "$file"
+    rm -f "$file"
+    exit 1
+  fi
+  if ! grep -q '^payload_opaque true$' "$file"; then
+    echo "The Relay observed the probe plaintext."
+    cat "$file"
+    rm -f "$file"
+    exit 1
+  fi
+  if ! grep -q '^plaintext_hits 0$' "$file"; then
+    echo "plaintext_hits is not 0."
+    cat "$file"
+    rm -f "$file"
+    exit 1
+  fi
+  if ! grep -q '^tcp framing quic-style$' "$file"; then
+    echo "The TCP framing is not quic-style."
+    cat "$file"
+    rm -f "$file"
+    exit 1
+  fi
+  if ! grep -q '^stick deferred$' "$file"; then
+    echo "Stick status is not deferred."
+    cat "$file"
+    rm -f "$file"
+    exit 1
+  fi
+  need_at_least "$file" "forwards " 1
+  if [[ "$kind" == "udp" ]]; then
+    if ! grep -q '^transport udp$' "$file"; then
+      echo "The transport is not udp."
+      cat "$file"
+      rm -f "$file"
+      exit 1
+    fi
+    if ! grep -q '^direct_failed true$' "$file"; then
+      echo "Direct did not fail before Relay."
+      cat "$file"
+      rm -f "$file"
+      exit 1
+    fi
+    need_at_least "$file" "server direct packets " 1
+  fi
+  if [[ "$kind" == "tcp" ]]; then
+    if ! grep -q '^transport tcp$' "$file"; then
+      echo "The transport is not tcp."
+      cat "$file"
+      rm -f "$file"
+      exit 1
+    fi
+    if ! grep -q '^framing quic-style$' "$file"; then
+      echo "The framing is not quic-style."
+      cat "$file"
+      rm -f "$file"
+      exit 1
+    fi
+    if ! grep -q '^udp_blocked true$' "$file"; then
+      echo "UDP was not blocked in the TCP lab."
+      cat "$file"
+      rm -f "$file"
+      exit 1
+    fi
+  fi
+  rm -f "$file"
+  echo "userspace Relay ${kind}: echo ok, payload opaque, forwards >= 1."
+}
+
 if [[ "$mode" == "all" || "$mode" == "--userspace-only" ]]; then
   run_userspace
 fi
 
-if [[ "$mode" == "--userspace-only" ]]; then
+if [[ "$mode" == "all" || "$mode" == "--relay-userspace" ]]; then
+  run_relay_userspace
+fi
+
+if [[ "$mode" == "--userspace-only" || "$mode" == "--relay-userspace" ]]; then
   exit 0
 fi
 
@@ -410,4 +510,71 @@ if [[ "$mode" == "--privileged" || "$mode" == "--netns-only" ]]; then
     exit 0
   fi
   run_netns
+fi
+
+run_relay_443() {
+  echo "=== Relay bind UDP and TCP port 443 ==="
+  local bin="$root/target/debug/gyeol"
+  if [[ ! -x "$bin" ]]; then
+    echo "The gyeol binary is missing. Build it before the Relay port 443 lab."
+    exit 1
+  fi
+  local udp tcp
+  udp=$("$bin" relay-smoke udp --bind 127.0.0.1:443)
+  local file
+  file=$(mktemp)
+  printf '%s\n' "$udp" >"$file"
+  if ! grep -q '^relay udp port 443$' "$file"; then
+    echo "The Relay UDP port is not 443."
+    cat "$file"
+    rm -f "$file"
+    exit 1
+  fi
+  if ! grep -q '^policy port 443$' "$file"; then
+    echo "The policy port is not 443."
+    rm -f "$file"
+    exit 1
+  fi
+  rm -f "$file"
+  check_relay_smoke "$udp" udp
+  tcp=$("$bin" relay-smoke tcp --bind 127.0.0.1:443)
+  file=$(mktemp)
+  printf '%s\n' "$tcp" >"$file"
+  if ! grep -q '^relay tcp port 443$' "$file"; then
+    echo "The Relay TCP port is not 443."
+    cat "$file"
+    rm -f "$file"
+    exit 1
+  fi
+  if ! grep -q '^transport tcp$' "$file"; then
+    echo "The TCP fallback did not stay on TCP."
+    cat "$file"
+    rm -f "$file"
+    exit 1
+  fi
+  rm -f "$file"
+  check_relay_smoke "$tcp" tcp
+  echo "Relay port 443: UDP path is up. TCP fallback is up."
+}
+
+if [[ "$mode" == "--privileged" || "$mode" == "--relay-443" ]]; then
+  run_relay_443
+fi
+
+if [[ "$mode" == "--relay-443" ]]; then
+  exit 0
+fi
+
+if [[ "$mode" == "--privileged" || "$mode" == "--relay-netns" ]]; then
+  if ! command -v ip >/dev/null 2>&1 || ! command -v iptables >/dev/null 2>&1; then
+    echo "=== Relay netns lab skipped ==="
+    echo "Install iproute2 and iptables to run the Relay NAT labs."
+    if [[ "$mode" == "--relay-netns" ]]; then
+      exit 1
+    fi
+    exit 0
+  fi
+  "$root/scripts/relay-netns.sh" same-udp
+  "$root/scripts/relay-netns.sh" dual-udp
+  "$root/scripts/relay-netns.sh" dual-tcp
 fi

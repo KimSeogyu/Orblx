@@ -1,4 +1,4 @@
-//! Own STUN and the Allocate to Direct path.
+//! Own STUN, the Allocate to Direct path, and the gyeol Relay path.
 //!
 //! The client sends a Binding request.
 //! The client reads a Binding success response.
@@ -8,8 +8,11 @@
 //! Direct sends hole-punch datagrams.
 //! Direct then proves QUIC on the same UDP socket.
 //! The Direct attempt uses the 3 second budget.
-//! This crate does not implement Relay.
-//! This crate does not implement Stick and upgrade.
+//! Relay routes by session id through the gyeol Relay.
+//! The Relay payload stays opaque.
+//! UDP port 443 is preferred.
+//! TCP port 443 uses a QUIC-style length prefix when UDP is blocked.
+//! Stick and upgrade is deferred.
 
 mod candidate;
 mod direct;
@@ -17,6 +20,7 @@ mod error;
 mod lab;
 mod path;
 mod punch;
+mod relay;
 mod same_nat;
 mod stun;
 
@@ -31,10 +35,14 @@ pub use direct::{
 pub use error::EdgeError;
 pub use lab::{run_edge_smoke, SmokeReport};
 pub use path::{
-    AllocatePhase, DirectPhase, PathId, PathMachine, PathState, DIRECT_ATTEMPT_BUDGET,
-    DIRECT_QUIC_PORT,
+    AllocatePhase, DirectPhase, PathId, PathMachine, PathState, RelayPhase, DIRECT_ATTEMPT_BUDGET,
+    DIRECT_QUIC_PORT, STICK_AND_UPGRADE,
 };
 pub use punch::PunchToken;
+pub use relay::{
+    relay_policy_port, run_relay_smoke, RelayLabReport, RelayLink, RelayProof, RelayRequest,
+    RelaySmokeMode, RELAY_PROOF_PAYLOAD,
+};
 pub use same_nat::{run_same_nat_bound, run_same_nat_direct, SameNatReport};
 pub use stun::{LabStunServer, StunClient};
 

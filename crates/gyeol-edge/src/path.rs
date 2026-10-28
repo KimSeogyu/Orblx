@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use gyeol_relay::{RelaySessionId, RelayTransport};
+
 use crate::{CandidateSink, EdgeError, EndpointCandidate, StunClient, UnsignedCandidateSet};
 
 /// The Direct attempt budget from ADR 0003.
@@ -14,7 +16,14 @@ pub const DIRECT_ATTEMPT_BUDGET: Duration = Duration::from_secs(3);
 /// The policy port is 443.
 /// A lab that cannot bind port 443 uses another server port.
 /// The netns lab binds this port.
+/// The Relay uses this port for UDP and for TCP.
 pub const DIRECT_QUIC_PORT: u16 = 443;
+
+/// Stick and upgrade is not active.
+///
+/// The machine does not retry Direct while Relay is up.
+/// The machine does not migrate the QUIC connection.
+pub const STICK_AND_UPGRADE: &str = "deferred";
 
 /// The Allocate phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,13 +127,43 @@ pub enum DirectPhase {
     },
 }
 
+/// The Relay phase.
+///
+/// `Attach` means the peer is selecting UDP or TCP.
+/// `Up` means the QUIC proof succeeded through the Relay.
+/// `Failed` means the Relay attempt stopped.
+/// Stick and upgrade is not a phase in this build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayPhase {
+    /// The peer is attaching to the Relay.
+    Attach {
+        /// The transport under test.
+        transport: RelayTransport,
+        /// The routing session id.
+        session_id: RelaySessionId,
+    },
+    /// The Relay path is up.
+    Up {
+        /// UDP or TCP.
+        transport: RelayTransport,
+        /// The routing session id.
+        session_id: RelaySessionId,
+        /// The opaque path id.
+        path_id: PathId,
+    },
+    /// The Relay attempt stopped before QUIC was up.
+    Failed {
+        /// The routing session id.
+        session_id: RelaySessionId,
+    },
+}
+
 /// The path states that this crate implements.
 ///
 /// Allocate gathers one reflexive address.
 /// Direct punches and then proves QUIC.
-/// This crate does not implement Relay.
-/// This crate does not implement Stick and upgrade.
-/// This crate does not implement TCP port 443.
+/// Relay attaches to the gyeol Relay and then proves QUIC.
+/// Stick and upgrade is deferred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathState {
     /// The Allocate state.
@@ -141,6 +180,13 @@ pub enum PathState {
         /// The candidate from Allocate.
         candidate: EndpointCandidate,
     },
+    /// The Relay state.
+    Relay {
+        /// The Relay phase.
+        phase: RelayPhase,
+        /// The candidate from Allocate.
+        candidate: EndpointCandidate,
+    },
 }
 
 impl std::fmt::Display for PathState {
@@ -148,6 +194,17 @@ impl std::fmt::Display for PathState {
         match self {
             Self::Allocate { phase, .. } => write!(formatter, "Allocate {phase}"),
             Self::Direct { phase, .. } => write!(formatter, "Direct {phase}"),
+            Self::Relay { phase, .. } => write!(formatter, "Relay {phase}"),
+        }
+    }
+}
+
+impl std::fmt::Display for RelayPhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Attach { transport, .. } => write!(formatter, "Attach {transport}"),
+            Self::Up { transport, .. } => write!(formatter, "Up {transport}"),
+            Self::Failed { .. } => formatter.write_str("Failed"),
         }
     }
 }
@@ -206,7 +263,9 @@ impl PathMachine {
     pub fn candidate(&self) -> Option<EndpointCandidate> {
         match self.state {
             PathState::Allocate { candidate, .. } => candidate,
-            PathState::Direct { candidate, .. } => Some(candidate),
+            PathState::Direct { candidate, .. } | PathState::Relay { candidate, .. } => {
+                Some(candidate)
+            }
         }
     }
 
@@ -216,13 +275,30 @@ impl PathMachine {
     #[must_use]
     pub fn direct_is_up(&self) -> bool {
         match self.state {
-            PathState::Allocate { .. } => false,
+            PathState::Allocate { .. } | PathState::Relay { .. } => false,
             PathState::Direct { phase, .. } => match phase {
                 DirectPhase::Stub { .. }
                 | DirectPhase::Punching { .. }
                 | DirectPhase::Failed { .. } => false,
                 DirectPhase::Up { .. } => true,
             },
+        }
+    }
+
+    /// Report whether the Relay path has a QUIC proof.
+    #[must_use]
+    pub fn relay_is_up(&self) -> bool {
+        match self.state {
+            PathState::Relay {
+                phase: RelayPhase::Up { .. },
+                ..
+            } => true,
+            PathState::Allocate { .. }
+            | PathState::Direct { .. }
+            | PathState::Relay {
+                phase: RelayPhase::Attach { .. } | RelayPhase::Failed { .. },
+                ..
+            } => false,
         }
     }
 
@@ -234,12 +310,52 @@ impl PathMachine {
                 phase: DirectPhase::Up { path_id, .. },
                 ..
             } => Some(path_id),
-            PathState::Allocate { .. } => None,
-            PathState::Direct {
+            PathState::Relay {
+                phase: RelayPhase::Up { path_id, .. },
+                ..
+            } => Some(path_id),
+            PathState::Allocate { .. }
+            | PathState::Direct {
                 phase:
                     DirectPhase::Stub { .. } | DirectPhase::Punching { .. } | DirectPhase::Failed { .. },
                 ..
+            }
+            | PathState::Relay {
+                phase: RelayPhase::Attach { .. } | RelayPhase::Failed { .. },
+                ..
             } => None,
+        }
+    }
+
+    /// Return the Relay transport when the Relay path is up.
+    #[must_use]
+    pub fn relay_transport(&self) -> Option<RelayTransport> {
+        match self.state {
+            PathState::Relay {
+                phase: RelayPhase::Up { transport, .. },
+                ..
+            } => Some(transport),
+            PathState::Allocate { .. }
+            | PathState::Direct { .. }
+            | PathState::Relay {
+                phase: RelayPhase::Attach { .. } | RelayPhase::Failed { .. },
+                ..
+            } => None,
+        }
+    }
+
+    /// Return the Relay session id when the machine is in Relay.
+    #[must_use]
+    pub fn relay_session(&self) -> Option<RelaySessionId> {
+        match self.state {
+            PathState::Relay {
+                phase:
+                    RelayPhase::Attach { session_id, .. }
+                    | RelayPhase::Up { session_id, .. }
+                    | RelayPhase::Failed { session_id },
+                ..
+            } => Some(session_id),
+            PathState::Allocate { .. } | PathState::Direct { .. } => None,
         }
     }
 
@@ -249,7 +365,25 @@ impl PathMachine {
                 phase: AllocatePhase::Ready,
                 candidate: Some(candidate),
             } => Ok(candidate),
-            PathState::Allocate { .. } | PathState::Direct { .. } => Err(EdgeError::WrongState),
+            PathState::Allocate { .. } | PathState::Direct { .. } | PathState::Relay { .. } => {
+                Err(EdgeError::WrongState)
+            }
+        }
+    }
+
+    pub(crate) fn candidate_for_relay(&self) -> Result<EndpointCandidate, EdgeError> {
+        match self.state {
+            PathState::Allocate {
+                phase: AllocatePhase::Ready,
+                candidate: Some(candidate),
+            } => Ok(candidate),
+            PathState::Direct {
+                phase: DirectPhase::Failed { .. },
+                candidate,
+            } => Ok(candidate),
+            PathState::Allocate { .. } | PathState::Direct { .. } | PathState::Relay { .. } => {
+                Err(EdgeError::WrongState)
+            }
         }
     }
 
@@ -275,7 +409,7 @@ impl PathMachine {
                 phase: AllocatePhase::Gather,
                 candidate: None,
             } => {}
-            PathState::Allocate { .. } | PathState::Direct { .. } => {
+            PathState::Allocate { .. } | PathState::Direct { .. } | PathState::Relay { .. } => {
                 return Err(EdgeError::WrongState);
             }
         }
@@ -302,7 +436,7 @@ impl PathMachine {
                 phase: AllocatePhase::Ready,
                 candidate: Some(candidate),
             } => candidate,
-            PathState::Allocate { .. } | PathState::Direct { .. } => {
+            PathState::Allocate { .. } | PathState::Direct { .. } | PathState::Relay { .. } => {
                 return Err(EdgeError::WrongState);
             }
         };

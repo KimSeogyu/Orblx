@@ -86,7 +86,7 @@ pub fn issue_direct_pair(now: SystemTime) -> Result<DirectMaterial, EdgeError> {
 }
 
 impl DirectIdentity {
-    fn to_hello(&self) -> Result<HelloConfig, EdgeError> {
+    pub(crate) fn to_hello(&self) -> Result<HelloConfig, EdgeError> {
         let trust = TrustBundle::from_pem(&self.trust_pem).map_err(identity_error)?;
         Ok(HelloConfig {
             certificate_pem: self.certificate_pem.clone(),
