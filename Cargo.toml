@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/gyeol-audit",
     "crates/gyeol-cli",
     "crates/gyeol-coord",
     "crates/gyeol-crypto",

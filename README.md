@@ -211,6 +211,36 @@ The document has the TUN commands for a browser.
 The TUN device needs CAP_NET_ADMIN on Linux.
 When the TUN device is not available, use `connector smoke`.
 
+## Session audit
+
+Week 10 adds a session audit hash chain.
+The crate is `crates/gyeol-audit`.
+The chain records session start, session end, and session deny.
+Each record stores the previous SHA-256 hash.
+The hash covers the previous hash and the event bytes.
+The Relay session id is `RelaySessionId`.
+The frame session id is the datapath frame `session_id`.
+The peer is a SPIFFE ID from `gyeol-identity`.
+The ticket hash is `gyeol_identity::ticket_hash`.
+
+Export one deny and one successful session:
+
+```bash
+cargo run -p gyeol-cli -- audit demo --out chain.jsonl
+```
+
+Check the file:
+
+```bash
+cargo run -p gyeol-cli -- audit verify --file chain.jsonl
+```
+
+The check reads the chain file.
+The check does not use the data path.
+A valid file prints `ok` and the three counters.
+Read the byte layout in [docs/session-audit.md](docs/session-audit.md).
+[`scripts/audit-smoke.sh`](scripts/audit-smoke.sh) runs the same check.
+
 ## Completion criteria for the 12-week work
 
 The 12-week work is complete when all of these statements are true:

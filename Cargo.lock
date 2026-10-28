@@ -641,9 +641,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "gyeol-audit"
+version = "0.1.0"
+dependencies = [
+ "gyeol-identity",
+ "gyeol-relay",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "gyeol-cli"
 version = "0.1.0"
 dependencies = [
+ "gyeol-audit",
  "gyeol-coord",
  "gyeol-crypto",
  "gyeol-datapath",
