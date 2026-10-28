@@ -27,7 +27,7 @@ The SVID is `spiffe://gyeol.local/user/ada`.
 
 1. Start the harness with `cargo run -p gyeol-sim`.
 2. Open `http://127.0.0.1:8787`.
-3. Click Easy or click City Breeze.
+3. Click Play City Breeze. Easy in the engineering view opens the same page.
 4. The browser requests `GET /oidc/authorize`.
 5. The sign-in page shows the issuer, the audience, and the subject.
 6. Click Sign in.

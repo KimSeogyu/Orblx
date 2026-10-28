@@ -1,6 +1,7 @@
 //! The `gyeol-sim` command.
 //!
-//! The command serves the local harness UI.
+//! The command serves the game.
+//! The game reads the harness feed.
 
 use std::net::SocketAddr;
 
@@ -53,14 +54,16 @@ fn help_text() -> String {
         "\
 gyeol-sim [--listen ADDR]
 
-The command serves the sim harness.
+The command serves the Orblx game.
 The default address is {addr}.
-Open the page in a browser.
+Open that URL in a browser.
+The default page is the game.
 Easy and City Breeze open the mock IdP.
 Sign in on that page.
 The callback issues the human SVID.
-Select Medium or Hard for the other levels.
-The page shows packet events and session events.
+The board shows the feed events.
+Select Medium or Hard on the board.
+Press UDP block to see Direct fail and the Relay recover.
 ",
         addr = default_listen(),
     )

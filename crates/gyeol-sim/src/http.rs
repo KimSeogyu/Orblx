@@ -1,8 +1,10 @@
 //! The local web UI.
 //!
 //! The server binds one TCP port.
-//! The server reads and writes harness state.
-//! `GET /events` sends feed JSON as server-sent events.
+//! The default page is the game.
+//! The game reads feed JSON.
+//! `GET /events` sends that JSON as server-sent events.
+//! The engineering panels stay hidden until the player opens them.
 //! The server does not open a Unix socket.
 
 use std::convert::Infallible;
@@ -104,10 +106,11 @@ pub async fn serve(listen: SocketAddr) -> Result<(), SimError> {
     let local = listener.local_addr().map_err(|err| SimError::Bind {
         detail: err.to_string(),
     })?;
-    println!("The gyeol sim harness is ready.");
+    println!("The Orblx game is ready.");
     println!("Open http://{local}");
-    println!("Easy and City Breeze open the mock IdP sign-in page.");
-    println!("Select Medium or Hard for the other levels.");
+    println!("The default page is the game.");
+    println!("City Breeze opens the mock IdP sign-in page.");
+    println!("Select Medium or Hard on the game board.");
     println!("The event stream is http://{local}/events");
     serve_listener(listener).await
 }
@@ -462,6 +465,11 @@ mod tests {
 
     #[test]
     fn the_page_shell_names_the_panels_and_smash_buttons() {
+        assert!(INDEX_HTML.contains("id=\"game\""));
+        assert!(INDEX_HTML.contains("id=\"eng\" hidden"));
+        assert!(INDEX_HTML.contains("Play City Breeze"));
+        assert!(INDEX_HTML.contains("Play Agent JIT"));
+        assert!(INDEX_HTML.contains("Play Radioactive NAT"));
         assert!(INDEX_HTML.contains("Peers"));
         assert!(INDEX_HTML.contains("Packets"));
         assert!(INDEX_HTML.contains("QUIC path"));
@@ -475,6 +483,9 @@ mod tests {
         assert!(!INDEX_HTML.contains("@keyframes"));
         assert!(!APP_CSS.contains("@keyframes"));
         assert!(!APP_JS.contains("requestAnimationFrame"));
+        assert!(APP_JS.contains("new EventSource(\"/events\")"));
+        assert!(APP_JS.contains("applyFeed"));
+        assert!(!APP_JS.contains("Mbps"));
         assert!(APP_JS.contains("/api/smash"));
         assert!(APP_JS.contains("/api/level"));
         assert!(APP_JS.contains("/api/difficulty"));
@@ -501,7 +512,9 @@ mod tests {
 
         let page = exchange(addr, "GET / HTTP/1.1", "").await;
         assert!(page.contains("HTTP/1.1 200"));
-        assert!(page.contains("gyeol sim"));
+        assert!(page.contains("id=\"game\""));
+        assert!(page.contains("City Breeze"));
+        assert!(page.contains("id=\"eng\" hidden"));
 
         let smash = exchange(addr, "POST /api/smash HTTP/1.1", "{\"id\":\"revoke\"}").await;
         assert!(smash.contains("HTTP/1.1 200"));

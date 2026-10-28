@@ -3,74 +3,132 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>gyeol sim</title>
+  <title>Orblx</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <header>
+  <header class="top">
     <p class="mark" id="mark">live</p>
-    <h1>gyeol sim</h1>
-    <p id="notice">The harness is loading.</p>
-    <p id="error" role="alert"></p>
+    <div>
+      <h1>Orblx</h1>
+      <p class="lede">Play the mesh. The board follows the live feed.</p>
+    </div>
+    <button type="button" id="eng-toggle" aria-pressed="false" aria-controls="eng">Engineering view</button>
   </header>
+  <p id="error" role="alert"></p>
   <noscript>
-    <p>The harness UI needs JavaScript.</p>
+    <p>The game needs JavaScript.</p>
   </noscript>
-  <div class="layout">
-    <aside>
-      <section aria-labelledby="levels-title">
-        <h2 id="levels-title">Levels</h2>
-        <div id="levels"></div>
-      </section>
-      <section aria-labelledby="difficulty-title">
-        <h2 id="difficulty-title">Difficulty</h2>
-        <div id="difficulties" class="row"></div>
-        <p id="hook"></p>
-        <p id="difficulty-note" class="note"></p>
-      </section>
-      <section aria-labelledby="smash-title">
-        <h2 id="smash-title">Smash</h2>
-        <div class="smash">
-          <button type="button" id="smash-revoke">Revoke</button>
-          <button type="button" id="smash-udp-block">UDP block</button>
-          <button type="button" id="smash-agent-spawn">Spawn agent</button>
-        </div>
-        <p class="hint">Easy and City Breeze open the mock IdP. Sign in on that page. Revoke drops the SVID. UDP block runs the NAT path. Spawn agent runs the agent path.</p>
-      </section>
-    </aside>
-    <main>
-      <section aria-labelledby="peers-title">
-        <h2 id="peers-title">Peers</h2>
-        <div id="peers" data-panel="peers"></div>
-      </section>
-      <section aria-labelledby="packets-title">
-        <h2 id="packets-title">Packets</h2>
-        <div id="packets" data-panel="packets"></div>
-      </section>
-      <section aria-labelledby="quic-title">
-        <h2 id="quic-title">QUIC path</h2>
-        <div id="quic" data-panel="quic"></div>
-      </section>
-      <div class="split">
-        <section aria-labelledby="svid-title">
-          <h2 id="svid-title">SVID</h2>
-          <div id="svid" data-panel="svid"></div>
+  <main id="game">
+    <section class="play" aria-labelledby="play-title">
+      <h2 id="play-title">Play</h2>
+      <div class="row">
+        <button type="button" class="choice" id="play-city" aria-pressed="false">Play City Breeze</button>
+        <button type="button" class="choice" id="play-agent" aria-pressed="false">Play Agent JIT</button>
+        <button type="button" class="choice" id="play-hard" aria-pressed="false">Play Radioactive NAT</button>
+      </div>
+      <p class="hint">City Breeze opens the mock IdP. Sign in as ada. Medium and Hard run on this board. The board moves only when a feed event arrives.</p>
+    </section>
+    <section class="board" aria-labelledby="board-title">
+      <div class="board-head">
+        <h2 id="board-title">Board</h2>
+        <p id="level-name">No level yet.</p>
+        <p id="path-state" data-mode="idle">No path yet.</p>
+      </div>
+      <div class="map" id="mesh-link" data-mode="idle">
+        <article class="node" id="node-spoke">
+          <h3 id="spoke-name">Human</h3>
+          <p id="svid-chip" data-state="none">SVID</p>
+          <p id="ticket-chip" data-state="none">Ticket</p>
+        </article>
+        <div id="packet" class="packet idle" hidden></div>
+        <article class="node" id="node-hub">
+          <h3>Hub</h3>
+          <p>QUIC path</p>
+        </article>
+        <article class="node app" id="app-a" data-acl="idle">
+          <h3>app-a.orblx.test</h3>
+          <p id="app-a-status">Waiting</p>
+        </article>
+        <article class="node app" id="app-b" data-acl="idle">
+          <h3>app-b.orblx.test</h3>
+          <p id="app-b-status">Waiting</p>
+        </article>
+        <article class="node" id="node-relay" data-lit="false">
+          <h3>Relay</h3>
+          <p id="relay-status">Idle</p>
+        </article>
+      </div>
+      <p id="beat" aria-live="polite">Choose a level.</p>
+      <p id="clear" hidden></p>
+    </section>
+    <section class="poke" aria-labelledby="poke-title">
+      <h2 id="poke-title">Poke</h2>
+      <div class="row">
+        <button type="button" id="smash-revoke">Revoke</button>
+        <button type="button" id="smash-udp-block">UDP block</button>
+        <button type="button" id="smash-agent-spawn">Spawn agent</button>
+      </div>
+      <p class="hint">Revoke drops the SVID on this board. UDP block shows Direct not ok, then the TCP Relay. Spawn agent runs the agent allow and deny path.</p>
+    </section>
+    <section aria-labelledby="tape-title">
+      <h2 id="tape-title">Feed</h2>
+      <ol id="tape"></ol>
+    </section>
+  </main>
+  <div id="eng" hidden>
+    <p id="notice"></p>
+    <div class="layout">
+      <aside>
+        <section aria-labelledby="levels-title">
+          <h2 id="levels-title">Levels</h2>
+          <div id="levels"></div>
         </section>
-        <section aria-labelledby="ticket-title">
-          <h2 id="ticket-title">Ticket</h2>
-          <div id="ticket" data-panel="ticket"></div>
+        <section aria-labelledby="difficulty-title">
+          <h2 id="difficulty-title">Difficulty</h2>
+          <div id="difficulties" class="row"></div>
+          <p id="hook"></p>
+          <p id="difficulty-note" class="note"></p>
+        </section>
+        <section aria-labelledby="smash-title">
+          <h2 id="smash-title">Smash</h2>
+          <p class="hint">The game poke buttons use the same actions. Easy and City Breeze open the mock IdP.</p>
+        </section>
+      </aside>
+      <div class="eng-main">
+        <section aria-labelledby="peers-title">
+          <h2 id="peers-title">Peers</h2>
+          <div id="peers" data-panel="peers"></div>
+        </section>
+        <section aria-labelledby="packets-title">
+          <h2 id="packets-title">Packets</h2>
+          <div id="packets" data-panel="packets"></div>
+        </section>
+        <section aria-labelledby="quic-title">
+          <h2 id="quic-title">QUIC path</h2>
+          <div id="quic" data-panel="quic"></div>
+        </section>
+        <div class="split">
+          <section aria-labelledby="svid-title">
+            <h2 id="svid-title">SVID</h2>
+            <div id="svid" data-panel="svid"></div>
+          </section>
+          <section aria-labelledby="ticket-title">
+            <h2 id="ticket-title">Ticket</h2>
+            <div id="ticket" data-panel="ticket"></div>
+          </section>
+        </div>
+        <section aria-labelledby="steps-title">
+          <h2 id="steps-title">Level steps</h2>
+          <div id="steps" data-panel="steps"></div>
+        </section>
+        <section aria-labelledby="events-title">
+          <h2 id="events-title">Event log</h2>
+          <p id="audit"></p>
+          <ol id="events" data-panel="events" aria-live="polite"></ol>
         </section>
       </div>
-      <section aria-labelledby="steps-title">
-        <h2 id="steps-title">Level steps</h2>
-        <div id="steps" data-panel="steps"></div>
-      </section>
-      <section aria-labelledby="events-title">
-        <h2 id="events-title">Event log</h2>
-        <p id="audit"></p>
-        <ol id="events" data-panel="events" aria-live="polite"></ol>
-      </section>
-    </main>
+    </div>
   </div>
   <script src="/app.js"></script>
 </body>

@@ -6,19 +6,22 @@
   <title>Mock IdP</title>
   <link rel="stylesheet" href="/style.css">
 </head>
-<body>
-  <header>
+<body class="login-body">
+  <header class="top">
     <p class="mark">mock idp</p>
-    <h1>Sign in</h1>
-    <p id="issuer">Issuer: __ISSUER__</p>
-    <p id="audience">Audience: __AUDIENCE__</p>
-    <p id="subject">Subject: __SUBJECT__</p>
+    <div>
+      <h1>Sign in</h1>
+      <p class="lede">City Breeze. This page is the OIDC beat.</p>
+    </div>
   </header>
   <main class="login">
     <section aria-labelledby="sign-in-title">
       <h2 id="sign-in-title">Mock IdP</h2>
+      <p id="issuer">Issuer: __ISSUER__</p>
+      <p id="audience">Audience: __AUDIENCE__</p>
+      <p id="subject">Subject: __SUBJECT__</p>
       <p>The client is __CLIENT_ID__. The scope is __SCOPE__.</p>
-      <p>Sign in sends this browser to the harness callback. The callback issues the human SVID. The harness then opens the two HTTPS applications.</p>
+      <p>Sign in sends this browser to the harness callback. The callback issues the human SVID. The harness then opens the two HTTPS applications. The game board shows those feed events.</p>
       <form method="post" action="/oidc/authorize">
         <input type="hidden" name="client_id" value="__CLIENT_ID__">
         <input type="hidden" name="response_type" value="__RESPONSE_TYPE__">
