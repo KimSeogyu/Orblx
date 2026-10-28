@@ -172,6 +172,15 @@ button.selected {
   margin-top: 0.45rem;
 }
 
+.login {
+  width: min(40rem, calc(100% - 2rem));
+  margin: 0 auto 2rem;
+}
+
+.login form {
+  margin-top: 0.8rem;
+}
+
 @media (max-width: 800px) {
   .layout,
   .split {

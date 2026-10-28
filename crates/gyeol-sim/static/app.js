@@ -94,6 +94,10 @@ function renderLevels(levels) {
     button.setAttribute("aria-pressed", level.selected ? "true" : "false");
     button.textContent = level.title;
     button.addEventListener("click", function () {
+      if (level.id === "city_breeze") {
+        startOidcLogin();
+        return;
+      }
       postJson("/api/level", level.id);
     });
     const goal = document.createElement("p");
@@ -117,6 +121,10 @@ function renderDifficulties(items) {
     button.setAttribute("aria-pressed", item.selected ? "true" : "false");
     button.textContent = item.label;
     button.addEventListener("click", function () {
+      if (item.id === "easy") {
+        startOidcLogin();
+        return;
+      }
       postJson("/api/difficulty", item.id);
     });
     root.append(button);
@@ -300,6 +308,33 @@ function renderEvents(events) {
   if (atBottom) {
     root.scrollTop = root.scrollHeight;
   }
+}
+
+function startOidcLogin() {
+  const state = randomHex(16);
+  const redirect = window.location.origin + "/oidc/callback";
+  const params = new URLSearchParams({
+    client_id: "gyeol-sim",
+    response_type: "code",
+    redirect_uri: redirect,
+    state: state,
+    scope: "openid",
+  });
+  window.location.assign("/oidc/authorize?" + params.toString());
+}
+
+function randomHex(size) {
+  const values = new Uint8Array(size);
+  if (window.crypto && window.crypto.getRandomValues) {
+    window.crypto.getRandomValues(values);
+  } else {
+    for (let index = 0; index < values.length; index += 1) {
+      values[index] = Math.floor(Math.random() * 256);
+    }
+  }
+  return Array.from(values, function (value) {
+    return value.toString(16).padStart(2, "0");
+  }).join("");
 }
 
 document.getElementById("smash-revoke").addEventListener("click", function () {

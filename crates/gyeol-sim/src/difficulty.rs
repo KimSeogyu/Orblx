@@ -43,7 +43,9 @@ impl Difficulty {
     #[must_use]
     pub const fn note(self) -> &'static str {
         match self {
-            Self::Easy => "Press Revoke to drop the human SVID.",
+            Self::Easy => {
+                "Easy opens the mock IdP sign-in page. Press Revoke to drop the human SVID."
+            }
             Self::Medium => "Spawn agent allows application A and denies application B.",
             Self::Hard => "UDP block moves the path to the TCP Relay.",
         }

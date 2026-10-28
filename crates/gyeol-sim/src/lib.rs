@@ -12,6 +12,7 @@ mod feed;
 mod harness;
 mod http;
 mod level;
+mod oidc_flow;
 mod session;
 mod sim;
 

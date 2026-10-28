@@ -362,6 +362,45 @@ Set `GYEOL_DEMO_ADDR` when port 8787 is busy.
 GYEOL_DEMO_ADDR=127.0.0.1:8790 ./scripts/demo.sh
 ```
 
+## Browser sign-in
+
+City Breeze uses the local mock IdP.
+The issuer is `https://oidc.gyeol.local`.
+The audience is `gyeol-issue`.
+The subject is `ada`.
+The client id is `gyeol-sim`.
+The IdP is the built-in `MockOidc` signer.
+The built-in signer is enough for this demo.
+
+Start the harness:
+
+```bash
+cargo run -p gyeol-sim
+```
+
+Open `http://127.0.0.1:8787`.
+
+Click Easy or click City Breeze.
+The browser opens the mock IdP sign-in page.
+The page shows the issuer, the audience, and the subject.
+Click Sign in.
+The browser sends the sign-in form.
+The harness redirects the browser to `/oidc/callback`.
+The callback checks the one-time code and the state value.
+The callback issues the human SVID through `IssueGate`.
+The harness verifies the human ticket.
+The harness opens `app-a.orblx.test` and `app-b.orblx.test`.
+Each application returns status 200.
+The browser returns to the harness page.
+The SVID state is `up`.
+The QUIC path state is `up`.
+
+`./scripts/demo.sh` follows this same sign-in path.
+The script uses `curl`.
+A pass prints `demo pass`.
+
+Read the route list in [docs/w14-oidc-ui.md](docs/w14-oidc-ui.md).
+
 ## Sim harness
 
 The sim harness crate is `gyeol-sim`.
@@ -397,7 +436,9 @@ cargo run -p gyeol-sim -- --listen 127.0.0.1:8790
 ### Easy — City Breeze
 
 Select Easy on the page.
-Easy runs City Breeze.
+Easy opens the mock IdP sign-in page.
+Sign in on that page.
+The callback runs City Breeze.
 The event kinds are, in order:
 
 1. `difficulty_selected`
