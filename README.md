@@ -268,6 +268,10 @@ The 12-week work is complete when all of these statements are true:
 - On a laptop, the local TUN round-trip rate is at least 100 Mbps.
 - The system can export a short hash chain for session events.
 
+The TUN measurement record is [docs/w12-tun-bench.md](docs/w12-tun-bench.md).
+The measured number is pending the Datapath result.
+The kill or go packet is [docs/w12-kill-go.md](docs/w12-kill-go.md).
+
 ## Build and test
 
 Install a stable Rust toolchain.
@@ -311,16 +315,26 @@ GitHub Actions runs this workflow on each push to the main branch.
 
 ## Demo
 
-[`scripts/demo.sh`](scripts/demo.sh) is the demo script.
-In week 1, the script writes a message.
-The message says that the demo is not ready.
-The script then stops with exit status 0.
-The 12-week work includes the full demo.
+[`scripts/demo.sh`](scripts/demo.sh) is the one-command demo.
+The script starts the sim harness.
+The script posts Easy, Revoke, Medium, Spawn agent, Hard, and UDP block.
+Each post runs the live level machine.
+The script reads the event kinds from the harness response.
+The script checks that the page has no animation.
+A pass prints `demo pass`.
+The script needs `cargo`, `curl`, and `python3`.
 
-Run the script:
+Run the demo:
 
 ```bash
 ./scripts/demo.sh
+```
+
+The default address is `http://127.0.0.1:8787`.
+Set `GYEOL_DEMO_ADDR` when port 8787 is busy.
+
+```bash
+GYEOL_DEMO_ADDR=127.0.0.1:8790 ./scripts/demo.sh
 ```
 
 ## Sim harness
@@ -328,10 +342,10 @@ Run the script:
 The sim harness crate is `gyeol-sim`.
 The harness runs three levels.
 The levels are City Breeze, Agent JIT, and Radioactive NAT.
-Select Easy, Medium, or Hard on the page.
 The page shows peers, packets, and session panels.
 The event log shows feed JSON from those runs.
 UDP block calls `gyeol_edge::run_nat_smash`.
+The page does not play an animation.
 Read the feed fields in [docs/w11-feed-v1.md](docs/w11-feed-v1.md).
 Read the run steps in [docs/demo-sim.md](docs/demo-sim.md).
 
@@ -342,6 +356,149 @@ cargo run -p gyeol-sim
 ```
 
 Open `http://127.0.0.1:8787`.
+
+The event log writes each harness line when the action starts.
+The log then writes the identity lines.
+The log then writes the edge NAT lines.
+The log then writes the datapath lines.
+The lists below use that order.
+
+Use a different local address when port 8787 is busy:
+
+```bash
+cargo run -p gyeol-sim -- --listen 127.0.0.1:8790
+```
+
+### Easy — City Breeze
+
+Select Easy on the page.
+Easy runs City Breeze.
+The event kinds are, in order:
+
+1. `difficulty_selected`
+2. `svid.issued`
+3. `ticket.verified`
+4. `quic_hello`
+5. `frame_tx`
+6. `frame_rx`
+7. `frame_tx`
+8. `connector_https` for `app-a.orblx.test` with status 200
+9. `frame_tx`
+10. `connector_https` for `app-b.orblx.test` with status 200
+11. `session_up`
+
+Each City Breeze step has status `pass`.
+The SVID state is `up`.
+The QUIC path state is `up`.
+
+Press Revoke.
+The event kinds are, in order:
+
+1. `smash_revoke`
+2. `svid.revoked`
+3. `session.dropped`
+4. `session_down`
+
+`session.dropped` includes `within_s`.
+`within_s` is at most 60.
+The SVID state is `revoked`.
+The QUIC path state is `down`.
+
+### Medium — Agent JIT
+
+Select Medium on the page.
+Medium runs Agent JIT.
+The event kinds are, in order:
+
+1. `difficulty_selected`
+2. `agent.spawned`
+3. `ticket.verified`
+4. `jit.allow` for `app-a.orblx.test`
+5. `jit.deny` for `app-b.orblx.test`
+6. `svid.expired`
+7. `frame_tx`
+8. `session_up`
+9. `session_down`
+10. `session_down`
+
+Each Agent JIT step has status `pass`.
+The SVID state is `expired`.
+The audit deny count is 2.
+
+Press Spawn agent.
+Spawn agent runs the same Agent JIT machine.
+The first event kind is `smash_agent_spawn`.
+The later kinds match items 2 to 10 in the Medium list.
+
+### Hard — Radioactive NAT
+
+Select Hard on the page.
+Hard runs Radioactive NAT.
+The event kinds are, in order:
+
+1. `difficulty_selected`
+2. `svid.issued`
+3. `svid.revoked`
+4. `session.dropped`
+5. `nat.inject` with mode `udp_block`
+6. `path.allocate` with overlay address `10.8.0.1`
+7. `path.direct` with `ok` false
+8. `nat.probe`
+9. `path.down`
+10. `path.switch`
+11. `relay.hop`
+12. `path.relay` with hop `tcp`
+13. `path.up` with path `relay`
+14. `path.down`
+15. `session_down`
+
+`path.direct` is before `path.switch`.
+Direct is down.
+The path then uses the TCP Relay.
+`session.dropped` includes `within_s`.
+`within_s` is at most 60.
+The SVID state is `revoked`.
+The symmetric NAT step stays `not_run` on this UDP block path.
+The other Hard steps have status `pass`.
+The feed does not name stick or upgrade.
+
+Press UDP block.
+UDP block runs the same NAT machine and does not revoke the SVID.
+The event kinds start with `smash_udp_block` and `svid.issued`.
+The later kinds match items 5 to 13 in the Hard list.
+The QUIC path state is `up`.
+The revoke step stays `not_run`.
+
+## Early-user checks
+
+Run the demo. A pass prints `demo pass`.
+
+```bash
+./scripts/demo.sh
+```
+
+Run the session audit check. A pass prints `The session audit chain check passed.`
+
+```bash
+./scripts/audit-smoke.sh
+```
+
+Run the userspace connector check. A pass prints `The userspace connector proof passed.`
+
+```bash
+./scripts/connector-smoke.sh
+```
+
+Read the kill or go packet in [docs/w12-kill-go.md](docs/w12-kill-go.md).
+
+## TUN bench
+
+The bench command is `./scripts/tun-bench.sh`.
+Datapath owns the script and the measured rate.
+The record is [docs/w12-tun-bench.md](docs/w12-tun-bench.md).
+The measured Mbps value is pending Datapath measurement.
+A host that is not Linux, or a host with no TUN device, exits clean and prints the K3 note.
+That exit is not a pass of the 100 Mbps gate.
 
 ## License
 

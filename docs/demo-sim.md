@@ -14,6 +14,21 @@ The harness does not play a success animation.
 A button runs a state machine.
 The machine writes one feed object per transition.
 
+## One command
+
+Run the demo:
+
+```bash
+./scripts/demo.sh
+```
+
+The script starts this harness.
+The script posts Easy, Revoke, Medium, Spawn agent, Hard, and UDP block.
+The script reads the event kinds from the harness.
+The script does not play an animation.
+A pass prints `demo pass`.
+The browser steps and the kind lists are in the README.
+
 ## Run
 
 Install a stable Rust toolchain.
