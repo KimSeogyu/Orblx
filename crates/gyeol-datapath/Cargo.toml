@@ -1,6 +1,6 @@
 [package]
 name = "gyeol-datapath"
-description = "Week 1 data path crate. This crate does not contain data path functions."
+description = "Week 1 data path crate. This crate encodes and decodes the app frame."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
