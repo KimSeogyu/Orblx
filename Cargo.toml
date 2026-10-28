@@ -9,11 +9,8 @@ members = [
     "crates/gyeol-identity",
 ]
 
-# The planned libraries for the data path are Quinn, rustls, and ring.
+# The data path uses Quinn, rustls, and ring.
 # You can use aws-lc-rs as the crypto backend for rustls.
-# Week 1 does not add these libraries.
-# Add these libraries when the handshake code exists.
-# Add these libraries when the session code exists.
 # Do not add WireGuard, wireguard-go, Tailscale, Headscale, or DERP crates.
 
 [workspace.package]

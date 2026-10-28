@@ -1,7 +1,16 @@
 [package]
 name = "gyeol-datapath"
-description = "Week 1 data path crate. This crate encodes and decodes the app frame."
+description = "Data path crate. This crate encodes frames and moves IPv4 packets over QUIC."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 version.workspace = true
+
+[dependencies]
+gyeol-identity = { path = "../gyeol-identity" }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rand = "0.8"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "logging"] }
+rustls-pemfile = "2"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tun = "0.8"
