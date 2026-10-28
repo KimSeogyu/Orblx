@@ -216,6 +216,41 @@ function renderAudit(audit) {
   root.textContent = "Audit start " + audit.start + ". Audit end " + audit.end + ". Audit deny " + audit.deny + ". " + chain;
 }
 
+function eventSummary(body) {
+  const parts = [];
+  if (body.mode) {
+    parts.push(body.mode);
+  }
+  if (body.overlay_ip) {
+    parts.push("overlay " + body.overlay_ip);
+  }
+  if (body.reflexive) {
+    parts.push("reflexive " + body.reflexive);
+  }
+  if (typeof body.ok === "boolean") {
+    parts.push(body.ok ? "ok" : "not ok");
+  }
+  if (body.hop) {
+    parts.push("hop " + body.hop);
+  }
+  if (body.path) {
+    parts.push("path " + body.path);
+  }
+  if (body.from && body.to) {
+    parts.push(body.from + " to " + body.to);
+  }
+  if (body.rtt_ms !== undefined) {
+    parts.push(String(body.rtt_ms) + " ms");
+  }
+  if (body.peer_uri) {
+    parts.push(body.peer_uri);
+  }
+  if (parts.length === 0) {
+    return "";
+  }
+  return parts.join(". ") + ".";
+}
+
 function eventLine(event) {
   let detail = event.detail;
   let kind = event.kind;
@@ -224,7 +259,7 @@ function eventLine(event) {
     if (body.kind) {
       kind = body.kind;
     }
-    detail = body.detail || event.detail;
+    detail = body.detail || eventSummary(body) || event.detail;
   } catch (error) {
     detail = event.detail;
   }

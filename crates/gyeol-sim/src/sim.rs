@@ -1,12 +1,11 @@
 //! Level state machines for the sim harness.
 //!
 //! Each smash runs a state machine.
-//! The machine calls identity, frame, path, relay, and audit APIs.
+//! The machine calls identity, frame, audit, and `gyeol_edge::run_nat_smash`.
 //! The machine emits one feed object per transition.
 //! The machine does not play a canned success animation.
 
-use std::net::{Ipv4Addr, SocketAddr};
-use std::thread;
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gyeol_audit::{AuditLog, DenyReason, SessionEvent, SessionIds};
@@ -14,13 +13,15 @@ use gyeol_datapath::{
     ipv4_packet, is_ipv4_packet, Frame, FrameType, APP_A_BODY, APP_A_HOST, APP_A_OVERLAY,
     APP_B_BODY, APP_B_HOST, APP_B_OVERLAY, APP_OVERLAY_PORT, SPOKE_OVERLAY,
 };
-use gyeol_edge::{LabStunServer, MemoryCandidateSink, PathMachine, StunClient, DIRECT_QUIC_PORT};
+use gyeol_edge::{
+    run_nat_smash, NatDifficulty, NatInjectMode, NatLevel, NatSmash, NatSmashReport, LAB_OVERLAY_IP,
+};
 use gyeol_identity::{
     sign_agent_jit_ticket, sign_ticket, verify_ticket, DenyApply, DenySet, Ipv4Destination,
     IssueGate, MiniCa, MockOidc, SpiffeId, TicketClaims, TicketFlags, TicketSigner, TicketVerifier,
     TrustBundle, MAX_SKEW, MOCK_OIDC_ISSUER,
 };
-use gyeol_relay::{decode_datagram, encode_datagram, encode_tcp_record, RelayKind, RelaySessionId};
+use gyeol_relay::{RelaySessionId, RelayTransport};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -544,201 +545,48 @@ impl Engine {
         ));
         self.push_peer(self.leaf_uri(), "Human SVID for the NAT path.".to_string());
 
-        let udp_blocked = true;
-        let symmetric = matches!(self.difficulty, Difficulty::Hard);
-        lines.push(self.edge_line(
-            "nat.inject",
-            false,
-            fields(&[
-                ("inject", Value::from("udp_block")),
-                ("ok", Value::from(false)),
-                ("detail", Value::from("UDP is blocked.")),
-            ]),
-        ));
-        self.steps[0] = StepStatus::Pass;
-        if symmetric {
-            lines.push(self.edge_line(
-                "nat.inject",
-                false,
-                fields(&[
-                    ("inject", Value::from("symmetric")),
-                    ("ok", Value::from(false)),
-                    ("detail", Value::from("The path uses symmetric NAT.")),
-                ]),
-            ));
+        let mut report = run_nat_smash(NatSmash {
+            difficulty: NatDifficulty::Hard,
+            level: NatLevel::RadioactiveNat,
+            mode: NatInjectMode::UdpBlock,
+        })
+        .map_err(|err| err.to_string())?;
+        let edge_lines = report.log.drain();
+        accept_udp_block(&report, &edge_lines)?;
+        let relay_hex = report
+            .relay_session_hex
+            .clone()
+            .ok_or("The Relay session id is missing.")?;
+        self.session_hex = relay_hex.clone();
+        self.audit_relay =
+            Some(RelaySessionId::parse_hex(&relay_hex).map_err(|err| err.to_string())?);
+        for (index, body) in edge_lines.iter().enumerate() {
+            let value: Value =
+                serde_json::from_str(body).map_err(|_| "The NAT line is not JSON.".to_string())?;
+            let kind = value.get("kind").and_then(Value::as_str).unwrap_or("event");
+            let seq = u64::try_from(index).unwrap_or(0).saturating_add(1);
+            self.note_packet(seq, kind.to_string());
+            lines.push(FeedLine {
+                source: EventSource::EdgeNat,
+                body: body.clone(),
+            });
         }
-        self.steps[1] = StepStatus::Pass;
-
-        let mut machine = PathMachine::start_allocate();
-        let candidate = gather_candidate(&mut machine)?;
-        let path_id = gyeol_edge::PathId::allocate().map_err(|err| err.to_string())?;
-        self.session_hex = path_id.to_hex();
-        lines.push(self.edge_line(
-            "path.allocate",
-            false,
-            fields(&[
-                ("ok", Value::from(true)),
-                (
-                    "detail",
-                    Value::from(format!(
-                        "The path machine is in {}. The reflexive address is {}.",
-                        machine.state(),
-                        candidate.reflexive
-                    )),
-                ),
-            ]),
-        ));
+        self.steps[0] = StepStatus::Pass;
         self.steps[2] = StepStatus::Pass;
+        self.steps[3] = StepStatus::Pass;
+        self.steps[4] = StepStatus::Pass;
+        self.push_peer("overlay".to_string(), format!("Overlay {LAB_OVERLAY_IP}."));
         self.push_peer(
             "allocate".to_string(),
-            format!("Path {}.", path_id.to_hex()),
+            format!("Path {}.", report.path_session_hex),
         );
-
-        let probe_ms = measure_ms(|| ())?;
-        lines.push(self.edge_line(
-            "nat.probe",
-            false,
-            fields(&[
-                ("rtt_ms", Value::from(probe_ms)),
-                ("ok", Value::from(false)),
-                (
-                    "detail",
-                    Value::from("The UDP probe did not leave. UDP is blocked."),
-                ),
-            ]),
-        ));
-
-        if machine.direct_is_up() {
-            return Err("Direct is up. The UDP block did not stop the path.".to_string());
-        }
-        let direct_ok = !udp_blocked && !symmetric;
-        if direct_ok {
-            return Err("Direct ran while UDP was blocked.".to_string());
-        }
-        lines.push(self.edge_line(
-            "path.direct",
-            false,
-            fields(&[
-                ("ok", Value::from(false)),
-                (
-                    "detail",
-                    Value::from(format!(
-                        "Direct failed. direct_is_up is false. The QUIC port is {DIRECT_QUIC_PORT}."
-                    )),
-                ),
-            ]),
-        ));
-        self.steps[3] = StepStatus::Pass;
-
-        let relay = RelaySessionId::generate().map_err(|err| err.to_string())?;
-        let relay_hex = relay.to_hex();
-        lines.push(self.edge_line(
-            "path.switch",
-            false,
-            fields(&[
-                ("from_path_id", Value::from(path_id.to_hex())),
-                ("to_path_id", Value::from(relay_hex.clone())),
-                (
-                    "detail",
-                    Value::from("The path switched from Direct to Relay."),
-                ),
-            ]),
-        ));
-        lines.push(self.data_line_with_session(
-            &relay_hex,
-            "path_switch",
-            false,
-            fields(&[
-                ("from_path_id", Value::from(path_id.to_hex())),
-                ("to_path_id", Value::from(relay_hex.clone())),
-                (
-                    "detail",
-                    Value::from("The data path followed the switch to Relay."),
-                ),
-            ]),
-        ));
-        self.session_hex = relay_hex.clone();
-        self.audit_relay = Some(relay);
-        lines.push(self.edge_line(
-            "path.relay",
-            false,
-            fields(&[
-                ("ok", Value::from(true)),
-                (
-                    "detail",
-                    Value::from("The path attached to the gyeol Relay on TCP port 443."),
-                ),
-            ]),
-        ));
-        self.steps[4] = StepStatus::Pass;
-
-        let ping = self.ping_packet()?;
-        let frame = self.roundtrip_frame(1, &ping)?;
-        let frame_bytes = frame.encode();
-        let started = Instant::now();
-        let datagram =
-            encode_datagram(RelayKind::Data, relay, &frame_bytes).map_err(|err| err.to_string())?;
-        let record = encode_tcp_record(&datagram).map_err(|err| err.to_string())?;
-        let decoded = decode_datagram(&datagram).map_err(|err| err.to_string())?;
-        if decoded.session_id != relay {
-            return Err("The Relay session id changed.".to_string());
-        }
-        let inner = Frame::decode(&decoded.payload)
-            .map_err(|_| "The Relay payload did not decode as a frame.".to_string())?;
-        if inner.payload != frame.payload {
-            return Err("The Relay payload changed the packet.".to_string());
-        }
-        let rtt_ms = elapsed_ms(started)?;
-        lines.push(self.frame_line("frame_tx", &frame, "The peer sent one frame toward Relay."));
-        lines.push(self.edge_line(
-            "relay.hop",
-            false,
-            fields(&[
-                ("rtt_ms", Value::from(rtt_ms)),
-                ("ok", Value::from(true)),
-                (
-                    "detail",
-                    Value::from(format!(
-                        "The TCP record is {} bytes. UDP stays blocked.",
-                        record.len()
-                    )),
-                ),
-            ]),
-        ));
-        lines.push(self.frame_line(
-            "frame_rx",
-            &inner,
-            "The peer received the frame from the Relay payload.",
-        ));
-        self.note_packet(frame.seq, "Relay hop.");
-        lines.push(self.edge_line(
-            "path.up",
-            false,
-            fields(&[
-                ("ok", Value::from(true)),
-                ("detail", Value::from("The Relay path is up.")),
-            ]),
-        ));
-        lines.push(self.data_line(
-            "quic_hello",
-            true,
-            fields(&[
-                ("peer_uri", Value::from(self.leaf_uri())),
-                ("detail", Value::from("QUIC is up through the Relay.")),
-            ]),
-        ));
-        lines.push(self.data_line(
-            "session_up",
-            true,
-            fields(&[
-                ("reason", Value::from("relay")),
-                ("detail", Value::from("The Relay session is up.")),
-            ]),
-        ));
-        self.audit_start(now)?;
-        self.quic_up = true;
-        self.path_label = format!("Relay {relay_hex} is up. Direct is down.");
         self.push_peer("relay".to_string(), format!("Session {relay_hex}."));
+        let peer = report.peer_uri.clone().unwrap_or_default();
+        self.path_label = format!(
+            "Relay {relay_hex} is up on TCP. Direct is down. Peer {peer}. Overlay {LAB_OVERLAY_IP}."
+        );
+        self.quic_up = report.relay_up;
+        self.audit_start(now)?;
         if revoke_after {
             lines.extend(self.drop_revoked()?);
             self.steps[5] = StepStatus::Pass;
@@ -1262,20 +1110,6 @@ impl Engine {
         self.emit(EventSource::Datapath, kind, with_ticket, extra)
     }
 
-    fn data_line_with_session(
-        &mut self,
-        session_hex: &str,
-        kind: &str,
-        with_ticket: bool,
-        extra: Map<String, Value>,
-    ) -> FeedLine {
-        let saved = self.session_hex.clone();
-        self.session_hex = session_hex.to_string();
-        let line = self.emit(EventSource::Datapath, kind, with_ticket, extra);
-        self.session_hex = saved;
-        line
-    }
-
     fn frame_line(&mut self, kind: &str, frame: &Frame, detail: &str) -> FeedLine {
         let code = match frame.frame_type {
             FrameType::Data => 1_u64,
@@ -1379,24 +1213,6 @@ fn tcp_ipv4(src: Ipv4Addr, dst: Ipv4Addr, port: u16, payload: &[u8]) -> Result<V
     Ok(packet)
 }
 
-fn gather_candidate(machine: &mut PathMachine) -> Result<gyeol_edge::EndpointCandidate, String> {
-    let server = LabStunServer::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .map_err(|err| err.to_string())?;
-    let server_addr = server.local_addr().map_err(|err| err.to_string())?;
-    let handle = thread::spawn(move || server.serve_one(Duration::from_secs(2)));
-    let client = StunClient::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .map_err(|err| err.to_string())?;
-    let mut sink = MemoryCandidateSink::default();
-    let candidate = machine
-        .gather_reflexive(&client, server_addr, Duration::from_secs(2), &mut sink)
-        .map_err(|err| err.to_string())?;
-    let joined = handle
-        .join()
-        .map_err(|_| "The STUN server thread stopped.".to_string())?;
-    joined.map_err(|err| err.to_string())?;
-    Ok(candidate)
-}
-
 fn expiry_time(not_after: u64) -> Result<SystemTime, String> {
     let secs = not_after
         .checked_add(MAX_SKEW.as_secs())
@@ -1421,18 +1237,85 @@ fn unix_ms(now: SystemTime) -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
-fn elapsed_ms(started: Instant) -> Result<u64, String> {
-    u64::try_from(started.elapsed().as_millis()).map_err(|_| "The timer overflowed.".to_string())
-}
-
 fn elapsed_seconds(started: Instant) -> u64 {
     started.elapsed().as_secs()
 }
 
-fn measure_ms(body: impl FnOnce()) -> Result<u64, String> {
-    let started = Instant::now();
-    body();
-    elapsed_ms(started)
+fn accept_udp_block(report: &NatSmashReport, lines: &[String]) -> Result<(), String> {
+    const KINDS: [&str; 9] = [
+        "nat.inject",
+        "path.allocate",
+        "path.direct",
+        "nat.probe",
+        "path.down",
+        "path.switch",
+        "relay.hop",
+        "path.relay",
+        "path.up",
+    ];
+    if !report.ran || report.direct_up || !report.relay_up {
+        return Err("The NAT smash did not finish on Relay.".to_string());
+    }
+    if report.transport != Some(RelayTransport::Tcp) {
+        return Err("UDP block did not use the TCP Relay.".to_string());
+    }
+    if lines.len() != KINDS.len() {
+        return Err(format!("The NAT feed has {} lines.", lines.len()));
+    }
+    let mut direct_at = None;
+    let mut switch_at = None;
+    for (index, line) in lines.iter().enumerate() {
+        if line.contains("stick") || line.contains("upgrade") {
+            return Err("The NAT feed names stick or upgrade.".to_string());
+        }
+        let value: Value =
+            serde_json::from_str(line).map_err(|_| "The NAT line is not JSON.".to_string())?;
+        let kind = value.get("kind").and_then(Value::as_str).unwrap_or("");
+        if kind != KINDS[index] {
+            return Err(format!("NAT event {index} is {kind}."));
+        }
+        if value.get("v").and_then(Value::as_u64) != Some(1) {
+            return Err("The NAT feed version is not 1.".to_string());
+        }
+        if value.get("source").and_then(Value::as_str) != Some("edge_nat") {
+            return Err("The NAT source is not edge_nat.".to_string());
+        }
+        match kind {
+            "path.direct" => direct_at = Some(index),
+            "path.switch" => switch_at = Some(index),
+            _ => {}
+        }
+    }
+    match (direct_at, switch_at) {
+        (Some(direct), Some(switch)) if direct < switch => {}
+        (Some(_), Some(_)) | (Some(_), None) | (None, Some(_)) | (None, None) => {
+            return Err("path.direct is not before path.switch.".to_string());
+        }
+    }
+    let direct: Value =
+        serde_json::from_str(&lines[2]).map_err(|_| "The Direct line is not JSON.".to_string())?;
+    if direct.get("ok").and_then(Value::as_bool) != Some(false) {
+        return Err("Direct did not fail.".to_string());
+    }
+    if direct.get("session_id").and_then(Value::as_str) != Some(report.path_session_hex.as_str()) {
+        return Err("The Direct session id is not the PathId.".to_string());
+    }
+    let allocate: Value = serde_json::from_str(&lines[1])
+        .map_err(|_| "The Allocate line is not JSON.".to_string())?;
+    if allocate.get("overlay_ip").and_then(Value::as_str) != Some(LAB_OVERLAY_IP) {
+        return Err("The overlay address is not 10.8.0.1.".to_string());
+    }
+    let relay: Value =
+        serde_json::from_str(&lines[7]).map_err(|_| "The Relay line is not JSON.".to_string())?;
+    if relay.get("hop").and_then(Value::as_str) != Some("tcp") {
+        return Err("The Relay hop is not TCP.".to_string());
+    }
+    let up: Value =
+        serde_json::from_str(&lines[8]).map_err(|_| "The path up line is not JSON.".to_string())?;
+    if up.get("path").and_then(Value::as_str) != Some("relay") {
+        return Err("The up path is not Relay.".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1520,20 +1403,43 @@ mod tests {
         let mut engine = Engine::new();
         let lines = engine.block_udp();
         let names = event_kinds(&lines);
-        let direct = names.iter().position(|kind| kind == "path.direct").unwrap();
-        let switch = names.iter().position(|kind| kind == "path.switch").unwrap();
-        assert!(direct < switch);
-        assert!(names.contains(&"nat.inject".to_string()));
-        assert!(names.contains(&"path.allocate".to_string()));
-        assert!(names.contains(&"path.relay".to_string()));
-        assert!(names.contains(&"path.up".to_string()));
+        let edge = [
+            "nat.inject",
+            "path.allocate",
+            "path.direct",
+            "nat.probe",
+            "path.down",
+            "path.switch",
+            "relay.hop",
+            "path.relay",
+            "path.up",
+        ];
+        let found: Vec<&str> = names
+            .iter()
+            .filter(|kind| edge.contains(&kind.as_str()))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(found, edge);
         let direct_body = lines
             .iter()
             .find(|line| line.body.contains("\"kind\":\"path.direct\""))
             .unwrap();
         let value: Value = serde_json::from_str(&direct_body.body).unwrap();
         assert_eq!(value["ok"], Value::Bool(false));
+        assert_eq!(value["source"], Value::String("edge_nat".to_string()));
         assert_eq!(value["session_id"].as_str().unwrap().len(), 32);
+        let relay_body = lines
+            .iter()
+            .find(|line| line.body.contains("\"kind\":\"path.relay\""))
+            .unwrap();
+        let relay: Value = serde_json::from_str(&relay_body.body).unwrap();
+        assert_eq!(relay["hop"], Value::String("tcp".to_string()));
+        let allocate_body = lines
+            .iter()
+            .find(|line| line.body.contains("\"kind\":\"path.allocate\""))
+            .unwrap();
+        assert!(allocate_body.body.contains("10.8.0.1"));
+        assert!(engine.session().quic.detail.contains("10.8.0.1"));
         assert_eq!(engine.session().quic.state, PanelState::Up);
     }
 

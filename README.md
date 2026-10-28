@@ -331,6 +331,7 @@ The levels are City Breeze, Agent JIT, and Radioactive NAT.
 Select Easy, Medium, or Hard on the page.
 The page shows peers, packets, and session panels.
 The event log shows feed JSON from those runs.
+UDP block calls `gyeol_edge::run_nat_smash`.
 Read the feed fields in [docs/w11-feed-v1.md](docs/w11-feed-v1.md).
 Read the run steps in [docs/demo-sim.md](docs/demo-sim.md).
 

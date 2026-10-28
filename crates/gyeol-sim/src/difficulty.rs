@@ -45,7 +45,7 @@ impl Difficulty {
         match self {
             Self::Easy => "Press Revoke to drop the human SVID.",
             Self::Medium => "Spawn agent allows application A and denies application B.",
-            Self::Hard => "UDP block and symmetric NAT move the path to Relay.",
+            Self::Hard => "UDP block moves the path to the TCP Relay.",
         }
     }
 

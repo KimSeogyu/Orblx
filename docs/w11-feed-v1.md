@@ -47,13 +47,28 @@ The identity kinds are `svid.issued`, `agent.spawned`, `ticket.verified`, `jit.a
 
 ## EdgeNAT kinds
 
-The EdgeNAT kinds are `nat.inject`, `path.allocate`, `path.direct`, `path.relay`, `path.switch`, `nat.probe`, `relay.hop`, `path.up`, and `path.down`.
-`nat.inject` uses `inject` `udp_block` or `symmetric`.
-`path.direct` includes `ok`.
-When UDP is blocked, `ok` is false.
-The `path.direct` object is before `path.switch`.
-`path.switch` includes `from_path_id` and `to_path_id`.
-`nat.probe` and `relay.hop` include `rtt_ms` and `ok`.
+Radioactive NAT UDP block calls `gyeol_edge::run_nat_smash`.
+The call uses `NatDifficulty::Hard`, `NatLevel::RadioactiveNat`, and `NatInjectMode::UdpBlock`.
+`NatEventLog::drain` returns the JSON lines.
+The harness does not build a second NAT state machine.
+Stick and upgrade stay deferred.
+
+The UDP block order is:
+
+1. `nat.inject`
+2. `path.allocate`
+3. `path.direct` with `ok` false
+4. `nat.probe`
+5. `path.down`
+6. `path.switch`
+7. `relay.hop`
+8. `path.relay` with `hop` `tcp`
+9. `path.up` with `path` `relay`
+
+`path.direct` with `ok` false is before `path.switch`.
+`path.allocate` uses overlay address `10.8.0.1`.
+`session_id` is the PathId hex before Relay attaches.
+`session_id` is the RelaySessionId hex after Relay attaches.
 
 ## Datapath kinds
 
