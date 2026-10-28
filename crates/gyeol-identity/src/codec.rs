@@ -1,3 +1,6 @@
+use std::fs;
+use std::path::Path;
+
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 
@@ -109,4 +112,52 @@ pub(crate) fn ed25519_raw_from_spki(spki: &[u8]) -> Result<[u8; 32], IdentityErr
     let mut key = [0u8; 32];
     key.copy_from_slice(&spki[ED25519_SPKI_PREFIX.len()..]);
     Ok(key)
+}
+
+/// Algorithm identifier and nested seed header inside an Ed25519 PKCS#8 key.
+const ED25519_PKCS8_ALG: &[u8] = &[
+    0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+];
+
+/// Public-key tag used when the PKCS#8 version is 1. 32 key bytes follow this tag.
+const ED25519_PKCS8_PUB_MARK: &[u8] = &[0x81, 0x21, 0x00];
+
+pub(crate) fn ed25519_seed_from_pkcs8(
+    pkcs8: &[u8],
+) -> Result<([u8; 32], Option<[u8; 32]>), IdentityError> {
+    if pkcs8.len() < 2 || pkcs8[0] != 0x30 {
+        return Err(IdentityError::Encoding);
+    }
+    let length = usize::from(pkcs8[1]);
+    let rest = &pkcs8[2..];
+    if length != rest.len() || rest.len() < 3 || rest[0] != 0x02 || rest[1] != 0x01 {
+        return Err(IdentityError::Encoding);
+    }
+    let version = rest[2];
+    let after_version = &rest[3..];
+    if !after_version.starts_with(ED25519_PKCS8_ALG) {
+        return Err(IdentityError::Encoding);
+    }
+    let after_alg = &after_version[ED25519_PKCS8_ALG.len()..];
+    let Some((seed_bytes, tail)) = after_alg.split_at_checked(32) else {
+        return Err(IdentityError::Encoding);
+    };
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(seed_bytes);
+    if version == 0 && tail.is_empty() {
+        return Ok((seed, None));
+    }
+    if version != 1
+        || tail.len() != ED25519_PKCS8_PUB_MARK.len() + 32
+        || !tail.starts_with(ED25519_PKCS8_PUB_MARK)
+    {
+        return Err(IdentityError::Encoding);
+    }
+    let mut public_key = [0u8; 32];
+    public_key.copy_from_slice(&tail[ED25519_PKCS8_PUB_MARK.len()..]);
+    Ok((seed, Some(public_key)))
+}
+
+pub(crate) fn read_pem_file(path: &Path) -> Result<String, IdentityError> {
+    fs::read_to_string(path).map_err(|_| IdentityError::File)
 }
