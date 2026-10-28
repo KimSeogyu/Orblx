@@ -1,7 +1,19 @@
 [package]
 name = "gyeol-identity"
-description = "Week 1 identity crate. This crate does not contain identity functions."
+description = "Mini CA, mock OIDC SVID issue, capability tickets, and deny list."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 version.workspace = true
+
+[dependencies]
+base64 = "0.22"
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+jsonwebtoken = "=9.3.1"
+rand = "0.8.5"
+rcgen = { version = "=0.14.7", default-features = false, features = ["crypto", "pem", "ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.8"
+time = { version = "0.3.36", default-features = false }
+x509-parser = "0.18.1"
