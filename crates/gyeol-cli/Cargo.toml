@@ -1,6 +1,6 @@
 [package]
 name = "gyeol-cli"
-description = "gyeol command for Orblx. The command prints a hello line, prints the version, runs hello-quic, brings up same-NAT direct QUIC, runs the gyeol Relay, or runs the connector hub-spoke path."
+description = "gyeol command for Orblx. The command prints a hello line, prints the version, runs hello-quic, brings up same-NAT direct QUIC, runs the gyeol Relay, runs the connector hub-spoke path, or exports a session audit chain."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
@@ -11,6 +11,7 @@ name = "gyeol"
 path = "src/main.rs"
 
 [dependencies]
+gyeol-audit = { path = "../gyeol-audit" }
 gyeol-coord = { path = "../gyeol-coord" }
 gyeol-crypto = { path = "../gyeol-crypto" }
 gyeol-datapath = { path = "../gyeol-datapath" }
