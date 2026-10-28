@@ -13,11 +13,14 @@
 //! UDP port 443 is preferred.
 //! TCP port 443 uses a QUIC-style length prefix when UDP is blocked.
 //! Stick and upgrade is deferred.
+//! The NAT feed records one JSON object per path event.
 
 mod candidate;
 mod direct;
 mod error;
 mod lab;
+mod nat_feed;
+mod nat_smash;
 mod path;
 mod punch;
 mod relay;
@@ -33,6 +36,13 @@ pub use direct::{
 };
 pub use error::EdgeError;
 pub use lab::{run_edge_smoke, SmokeReport};
+pub use nat_feed::{
+    nat_inject_armed, NatDifficulty, NatEventLog, NatInjectMode, NatLevel, PathKind, PhaseName,
+    KIND_NAT_INJECT, KIND_NAT_PROBE, KIND_PATH_ALLOCATE, KIND_PATH_DIRECT, KIND_PATH_DOWN,
+    KIND_PATH_RELAY, KIND_PATH_SWITCH, KIND_PATH_UP, KIND_RELAY_HOP, LAB_OVERLAY_IP,
+    NAT_EVENT_VERSION, NAT_FEED_SOURCE,
+};
+pub use nat_smash::{run_nat_smash, NatSmash, NatSmashReport};
 pub use path::{
     AllocatePhase, DirectPhase, PathId, PathMachine, PathState, RelayPhase, DIRECT_ATTEMPT_BUDGET,
     DIRECT_QUIC_PORT, STICK_AND_UPGRADE,
