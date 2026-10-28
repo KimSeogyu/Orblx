@@ -69,6 +69,14 @@ impl StunClient {
         self.socket.local_addr().map_err(io_error)
     }
 
+    /// Return the bound socket.
+    ///
+    /// The caller can punch and run QUIC on this socket.
+    #[must_use]
+    pub fn into_socket(self) -> UdpSocket {
+        self.socket
+    }
+
     /// Send one Binding request to `server`.
     ///
     /// The function waits up to `timeout`.
@@ -145,6 +153,21 @@ impl LabStunServer {
         let response = binding_success(transaction_id, from)?;
         self.socket.send_to(&response, from).map_err(io_error)?;
         Ok(from)
+    }
+
+    /// Answer `count` Binding requests.
+    ///
+    /// Each request uses the same `timeout`.
+    pub fn serve_many(
+        &self,
+        count: usize,
+        timeout: Duration,
+    ) -> Result<Vec<SocketAddr>, EdgeError> {
+        let mut observed = Vec::with_capacity(count);
+        for _ in 0..count {
+            observed.push(self.serve_one(timeout)?);
+        }
+        Ok(observed)
     }
 }
 

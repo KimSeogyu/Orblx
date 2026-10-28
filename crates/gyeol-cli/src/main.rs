@@ -11,6 +11,7 @@ use gyeol_edge::crate_name as edge_crate;
 use gyeol_identity::crate_name as identity_crate;
 use gyeol_identity::{ticket_hash, DenySet, TrustBundle};
 
+mod direct;
 mod edge;
 
 #[derive(Debug)]
@@ -20,6 +21,7 @@ enum Action {
     HelpHelloQuic,
     HelloQuic(HelloQuicCommand),
     Edge(edge::EdgeCommand),
+    Direct(direct::Command),
 }
 
 #[derive(Debug)]
@@ -60,6 +62,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Ok(Action::Direct(command)) => {
+            if let Err(err) = direct::run(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
         Err(err) => {
             eprintln!("{err}");
             std::process::exit(1);
@@ -83,6 +91,12 @@ where
     }
     if args.first().map(String::as_str) == Some("edge-smoke") {
         return edge::parse_edge_smoke(&args[1..]).map(Action::Edge);
+    }
+    if args.first().map(String::as_str) == Some("direct-issue") {
+        return direct::parse_issue(&args[1..]).map(Action::Direct);
+    }
+    if args.first().map(String::as_str) == Some("direct-peer") {
+        return direct::parse_peer(&args[1..]).map(Action::Direct);
     }
     for arg in &args {
         if arg == "--version" || arg == "-V" {
@@ -324,7 +338,11 @@ mod tests {
                 assert!(command.tun_address.is_none());
                 assert!(command.connect.is_none());
             }
-            Action::Hello | Action::Version | Action::HelpHelloQuic | Action::Edge(_) => {
+            Action::Hello
+            | Action::Version
+            | Action::HelpHelloQuic
+            | Action::Edge(_)
+            | Action::Direct(_) => {
                 panic!("the parser did not select hello-quic");
             }
         }
@@ -358,7 +376,11 @@ mod tests {
                     std::net::Ipv4Addr::new(10, 8, 0, 2)
                 );
             }
-            Action::Hello | Action::Version | Action::HelpHelloQuic | Action::Edge(_) => {
+            Action::Hello
+            | Action::Version
+            | Action::HelpHelloQuic
+            | Action::Edge(_)
+            | Action::Direct(_) => {
                 panic!("the parser did not select hello-quic");
             }
         }

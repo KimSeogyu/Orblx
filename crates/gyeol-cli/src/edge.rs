@@ -1,7 +1,9 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use gyeol_edge::{run_edge_smoke, EdgeError, LabStunServer, StunClient};
+use gyeol_edge::{
+    run_same_nat_bound, run_same_nat_direct, EdgeError, LabStunServer, StunClient, DIRECT_QUIC_PORT,
+};
 
 use super::{parse_socket, take_value};
 
@@ -16,7 +18,7 @@ pub(crate) enum EdgeCommand {
     StunServeHelp,
     StunServe(SocketAddr),
     EdgeSmokeHelp,
-    EdgeSmoke,
+    EdgeSmoke(Option<SocketAddr>),
 }
 
 #[derive(Debug)]
@@ -84,14 +86,23 @@ pub(crate) fn parse_edge_smoke(args: &[String]) -> Result<EdgeCommand, String> {
     if wants_help(args) {
         return Ok(EdgeCommand::EdgeSmokeHelp);
     }
-    if args.is_empty() {
-        return Ok(EdgeCommand::EdgeSmoke);
+    let mut bind = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        index += 1;
+        let value = take_value(args, &mut index)?;
+        match flag {
+            "--bind" => bind = Some(parse_socket(&value, DIRECT_QUIC_PORT)?),
+            other => {
+                return Err(format!(
+                    "The flag {other} is not valid.\n{}",
+                    edge_smoke_help()
+                ));
+            }
+        }
     }
-    Err(format!(
-        "The flag {} is not valid.\n{}",
-        args[0],
-        edge_smoke_help()
-    ))
+    Ok(EdgeCommand::EdgeSmoke(bind))
 }
 
 pub(crate) fn run(command: EdgeCommand) -> Result<(), String> {
@@ -110,10 +121,23 @@ pub(crate) fn run(command: EdgeCommand) -> Result<(), String> {
             println!("{}", edge_smoke_help());
             Ok(())
         }
-        EdgeCommand::EdgeSmoke => {
-            let report = run_edge_smoke().map_err(|err| err.to_string())?;
+        EdgeCommand::EdgeSmoke(bind) => {
+            let report = match bind {
+                Some(addr) => run_same_nat_bound(addr),
+                None => run_same_nat_direct(),
+            }
+            .map_err(|err| err.to_string())?;
             for line in report.lines() {
                 println!("{line}");
+            }
+            if !report.server_direct_is_up || !report.client_direct_is_up || !report.echo_ok {
+                return Err("The same-NAT Direct path is not up.".to_string());
+            }
+            if report.server_packets_sent == 0 || report.client_packets_sent == 0 {
+                return Err("The hole punch did not send a packet.".to_string());
+            }
+            if report.server_packets_received == 0 || report.client_packets_received == 0 {
+                return Err("The hole punch did not receive a packet.".to_string());
             }
             Ok(())
         }
@@ -184,12 +208,14 @@ The command is a lab server.
 
 fn edge_smoke_help() -> String {
     "\
-gyeol edge-smoke
-The command runs Allocate against a lab STUN server.
-The command uses a userspace UDP NAT.
-The command enters the Direct stub.
-The command does not send hole-punch packets.
-Week 5 completes the hole punch.
+gyeol edge-smoke [--bind ADDR]
+The command runs Allocate for two peers behind one lab NAT.
+The command sends hole-punch datagrams.
+The command proves QUIC on the punched UDP socket.
+The default server bind tries UDP port 443.
+When the bind is not permitted, the server uses an ephemeral port.
+The Direct budget is 3 seconds.
+The command does not use Relay.
 "
     .to_string()
 }
@@ -217,7 +243,7 @@ mod tests {
             | EdgeCommand::StunServeHelp
             | EdgeCommand::StunServe(_)
             | EdgeCommand::EdgeSmokeHelp
-            | EdgeCommand::EdgeSmoke => panic!("the parser did not select stun"),
+            | EdgeCommand::EdgeSmoke(_) => panic!("the parser did not select stun"),
         }
     }
 
@@ -233,21 +259,24 @@ mod tests {
             | EdgeCommand::Stun(_)
             | EdgeCommand::StunServeHelp
             | EdgeCommand::EdgeSmokeHelp
-            | EdgeCommand::EdgeSmoke => panic!("the parser did not select stun-serve"),
+            | EdgeCommand::EdgeSmoke(_) => panic!("the parser did not select stun-serve"),
         }
     }
 
     #[test]
-    fn edge_smoke_help_states_the_stub() {
+    fn edge_smoke_help_names_the_hole_punch() {
         let command = parse_edge_smoke(&["--help".to_string()]).unwrap();
         assert!(matches!(command, EdgeCommand::EdgeSmokeHelp));
+        let help = super::edge_smoke_help();
+        assert!(help.contains("hole-punch"));
+        assert!(help.contains("443"));
         let command = parse_edge_smoke(&[]).unwrap();
-        assert!(matches!(command, EdgeCommand::EdgeSmoke));
+        assert!(matches!(command, EdgeCommand::EdgeSmoke(None)));
     }
 
     #[test]
-    fn edge_smoke_command_reaches_the_direct_stub() {
-        super::run(EdgeCommand::EdgeSmoke).unwrap();
+    fn edge_smoke_command_brings_direct_up() {
+        super::run(EdgeCommand::EdgeSmoke(None)).unwrap();
     }
 
     #[test]

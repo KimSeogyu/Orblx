@@ -58,6 +58,20 @@ pub enum EdgeError {
     CandidateRejected,
     /// A lab thread stopped.
     LabThread,
+    /// The UDP socket does not match the Allocate candidate.
+    SocketMismatch,
+    /// The Direct attempt exceeded the budget.
+    DirectBudget,
+    /// The QUIC echo did not match the probe packet.
+    EchoMismatch,
+    /// The candidate text is not valid.
+    BadCandidate,
+    /// The punch token is not valid.
+    BadToken,
+    /// The identity material is not valid.
+    Identity(String),
+    /// The QUIC path failed.
+    Quic(String),
 }
 
 impl fmt::Display for EdgeError {
@@ -107,6 +121,19 @@ impl fmt::Display for EdgeError {
                 formatter.write_str("The candidate sink rejected the unsigned set.")
             }
             Self::LabThread => formatter.write_str("The lab thread stopped."),
+            Self::SocketMismatch => {
+                formatter.write_str("The UDP socket does not match the Allocate candidate.")
+            }
+            Self::DirectBudget => formatter.write_str("The Direct attempt exceeded the budget."),
+            Self::EchoMismatch => {
+                formatter.write_str("The QUIC echo did not match the probe packet.")
+            }
+            Self::BadCandidate => formatter.write_str("The candidate text is not valid."),
+            Self::BadToken => formatter.write_str("The punch token is not valid."),
+            Self::Identity(detail) => {
+                write!(formatter, "The identity material is not valid. {detail}")
+            }
+            Self::Quic(detail) => write!(formatter, "The QUIC path failed. {detail}"),
         }
     }
 }

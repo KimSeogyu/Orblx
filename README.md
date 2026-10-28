@@ -81,21 +81,20 @@ The tests use an in-memory packet path.
 
 ## Edge path
 
-Week 4 adds own STUN in `gyeol-edge`.
-The client sends a Binding request.
-The client reads a Binding success response.
-The client stores the server-reflexive address.
+`gyeol-edge` gathers one reflexive address with in-tree STUN.
 The path machine starts in Allocate.
-The path machine can enter the Direct stub.
-The Direct stub does not send hole-punch packets.
-Week 5 completes the hole punch.
+Allocate stores one unsigned candidate.
+ADR 0003 leaves the Coordinator candidate owner open.
+Direct sends hole-punch datagrams.
+Direct then proves hello-quic on the same UDP socket.
+`direct_is_up` is true after that proof.
+The Direct budget is 3 seconds.
+The QUIC policy port is UDP 443.
 The code does not implement Relay.
 The code does not implement Stick and upgrade.
 The code does not implement TCP port 443.
-ADR 0003 leaves the Coordinator candidate owner open.
-The candidate set stays unsigned.
 
-Run the in-process lab:
+Run the in-process same-NAT lab:
 
 ```bash
 cargo run -p gyeol-cli -- edge-smoke
@@ -103,9 +102,22 @@ cargo run -p gyeol-cli -- edge-smoke
 
 The lab uses a local STUN server.
 The lab uses a userspace UDP NAT.
-The reflexive address is the NAT socket.
-[`scripts/edge-smoke.sh`](scripts/edge-smoke.sh) runs the same smoke.
-The script can also run a netns source-NAT lab when `ip` and `iptables` are present.
+The two peers share the NAT address.
+The punch uses the host candidates.
+The command tries to bind the QUIC server on UDP port 443.
+When that bind is not permitted, the server uses an ephemeral port.
+
+Run the same lab on UDP port 443 when the process can bind that port:
+
+```bash
+cargo run -p gyeol-cli -- edge-smoke --bind 127.0.0.1:443
+```
+
+[`scripts/edge-smoke.sh`](scripts/edge-smoke.sh) runs the userspace lab.
+The script runs the UDP 443 lab when root is available.
+The script runs a netns source-NAT lab when `ip` and `iptables` are present.
+The netns lab puts two peers behind one MASQUERADE NAT.
+The QUIC server binds UDP port 443.
 
 Gather against a STUN server:
 
