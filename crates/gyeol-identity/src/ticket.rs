@@ -1,17 +1,17 @@
 use std::fmt;
 use std::net::Ipv4Addr;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
-use crate::clock::{in_window, unix_time};
+use crate::clock::{in_window, unix_time, whole_seconds, MAX_AGENT_TTL};
 use crate::codec::{ed25519_raw_from_spki, ed25519_spki, encode_hex, pem_blocks, pem_encode};
 use crate::deny::DenySet;
 use crate::error::IdentityError;
-use crate::spiffe::SpiffeId;
+use crate::spiffe::{SpiffeId, WorkloadKind};
 
 const TICKET_VERSION: u8 = 1;
 const NONCE_LEN: usize = 16;
@@ -168,6 +168,93 @@ pub struct VerifiedTicket {
     pub flags: TicketFlags,
     pub nonce: [u8; 16],
     pub hash: [u8; 16],
+}
+
+/// One IPv4 host, protocol, and destination port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv4Destination {
+    /// Destination address.
+    pub addr: Ipv4Addr,
+    /// IP protocol number.
+    pub proto: u8,
+    /// Destination port.
+    pub port: u16,
+}
+
+/// Sign one agent JIT ticket.
+///
+/// The subject must be an agent SPIFFE ID.
+/// The ticket life is at most 5 minutes.
+/// The ticket names one IPv4 host and one port.
+/// The ticket is separate from the agent SVID.
+pub fn sign_agent_jit_ticket(
+    signer: &TicketSigner,
+    issuer: &SpiffeId,
+    agent: &SpiffeId,
+    now: SystemTime,
+    ttl: Duration,
+    dest: Ipv4Destination,
+) -> Result<SignedTicket, IdentityError> {
+    if agent.kind() != WorkloadKind::Agent {
+        return Err(IdentityError::SpiffeId);
+    }
+    let ttl_secs = whole_seconds(ttl)?;
+    if ttl > MAX_AGENT_TTL {
+        return Err(IdentityError::Time);
+    }
+    if dest.port == 0 {
+        return Err(IdentityError::Ticket);
+    }
+    let now_unix = unix_time(now)?;
+    let expires = now_unix.checked_add(ttl_secs).ok_or(IdentityError::Time)?;
+    let claims = TicketClaims {
+        issuer: issuer.clone(),
+        subject: agent.clone(),
+        not_before: now_unix,
+        expires,
+        dst_cidr: format!("{}/32", dest.addr),
+        proto: dest.proto,
+        dst_port: dest.port,
+        flags: TicketFlags::new(true, false),
+    };
+    sign_ticket(signer, &claims)
+}
+
+/// Allow one destination for an agent JIT ticket.
+///
+/// The function denies a ticket that does not set `FLAG_AGENT_JIT`.
+/// The function denies every destination except the one named host, protocol, and port.
+pub fn allow_agent_jit(
+    flags: TicketFlags,
+    dst_cidr: &str,
+    proto: u8,
+    dst_port: u16,
+    dest: Ipv4Destination,
+) -> Result<(), IdentityError> {
+    if !flags.agent_jit() || dst_port == 0 || dest.port == 0 {
+        return Err(IdentityError::Denied);
+    }
+    let host = host_from_prefix_32(dst_cidr)?;
+    if dest.addr != host || dest.proto != proto || dest.port != dst_port {
+        return Err(IdentityError::Denied);
+    }
+    Ok(())
+}
+
+fn host_from_prefix_32(cidr: &str) -> Result<Ipv4Addr, IdentityError> {
+    let (addr, prefix) = cidr.split_once('/').ok_or(IdentityError::Denied)?;
+    if prefix != "32" {
+        return Err(IdentityError::Denied);
+    }
+    let labels: Vec<&str> = addr.split('.').collect();
+    if labels.len() != 4 {
+        return Err(IdentityError::Denied);
+    }
+    let mut octets = [0u8; 4];
+    for (index, label) in labels.iter().enumerate() {
+        octets[index] = ipv4_octet(label).map_err(|_| IdentityError::Denied)?;
+    }
+    Ok(Ipv4Addr::from(octets))
 }
 
 /// Return `SHA-256(ticket_bytes)[0..16]`.

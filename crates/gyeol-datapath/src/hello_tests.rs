@@ -3,11 +3,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gyeol_crypto::{mac_input, ticket_hash, ticket_mac, CryptoError, TicketKey, TicketRing};
 use gyeol_identity::{
-    decode_certificate_pem, sign_ticket, DenySet, IdentityError, MiniCa, SpiffeId, TicketClaims,
-    TicketFlags, TicketSigner, TrustBundle,
+    decode_certificate_pem, sign_agent_jit_ticket, sign_ticket, DenySet, IdentityError,
+    Ipv4Destination, IssueGate, MiniCa, MockOidc, SpiffeId, TicketClaims, TicketFlags,
+    TicketSigner, TrustBundle, MAX_AGENT_TTL, MOCK_OIDC_ISSUER,
 };
 use tokio::sync::mpsc;
 
+use crate::ipv4::tcp_ipv4_packet;
 use crate::quic::pump_packets;
 use crate::{
     ipv4_packet, tun_capability_note, HelloConfig, HelloEndpoint, HelloError, PeerGate,
@@ -674,6 +676,353 @@ async fn receiver_error(server: HelloConfig, client: HelloConfig) -> HelloError 
         Err(err) => err,
         Ok(_) => panic!("the receiver accepted the ticket"),
     }
+}
+
+fn app_packet(dst: [u8; 4], port: u16) -> Vec<u8> {
+    tcp_ipv4_packet(
+        Ipv4Addr::new(10, 8, 0, 1),
+        Ipv4Addr::new(dst[0], dst[1], dst[2], dst[3]),
+        port,
+        b"https",
+    )
+    .unwrap()
+}
+
+#[test]
+fn agent_accept_path_allows_one_destination_and_denies_the_other() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let oidc = MockOidc::generate(MOCK_OIDC_ISSUER).unwrap();
+    let ca = MiniCa::generate(now).unwrap();
+    let gate_issue = IssueGate::new(ca, &oidc).unwrap();
+    let parent_token = oidc
+        .issue_id_token("seogyu-dev", now, Duration::from_secs(10 * 60))
+        .unwrap();
+    let agent = gate_issue
+        .issue_agent_svid(
+            &parent_token,
+            "worker-1",
+            now,
+            MAX_AGENT_TTL,
+            &DenySet::empty(),
+        )
+        .unwrap();
+    assert_eq!(
+        agent.svid.not_after - agent.svid.not_before,
+        MAX_AGENT_TTL.as_secs()
+    );
+    assert!(agent.svid.not_after - agent.svid.not_before <= 300);
+    let human = gate_issue
+        .issue_human_svid(&parent_token, now, &DenySet::empty())
+        .unwrap();
+    assert_ne!(human.spiffe_id, agent.svid.spiffe_id);
+    assert_eq!(human.spiffe_id, agent.parent);
+
+    let signer = TicketSigner::generate();
+    let mac_key = [0x42; 32];
+    let ring = TicketRing::single(
+        TicketKey::new(
+            signer.verifier(),
+            mac_key,
+            now - Duration::from_secs(60),
+            now + Duration::from_secs(86_400),
+        )
+        .unwrap(),
+        gate_issue.ca_public_key(),
+    )
+    .unwrap();
+    let issuer = SpiffeId::coord("1").unwrap();
+    let app_a = Ipv4Destination {
+        addr: Ipv4Addr::new(10, 8, 0, 10),
+        proto: 6,
+        port: 443,
+    };
+    let jit = sign_agent_jit_ticket(
+        &signer,
+        &issuer,
+        &agent.svid.spiffe_id,
+        now,
+        Duration::from_secs(60),
+        app_a,
+    )
+    .unwrap();
+    let jit_mac = ticket_mac(&mac_key, mac_input(&jit.bytes)).unwrap();
+    let mut bad_mac = jit_mac;
+    bad_mac[0] ^= 0xff;
+    let packet_a = app_packet([10, 8, 0, 10], 443);
+    let packet_b = app_packet([10, 8, 0, 11], 443);
+
+    let mut agent_gate = PeerGate::new();
+    agent_gate
+        .bind_leaf(
+            gate_issue.trust_bundle(),
+            &agent.svid.certificate_der,
+            now,
+            &DenySet::empty(),
+        )
+        .unwrap();
+    let early = agent_gate
+        .encode_data(1, 0, ticket_hash(&jit.bytes), &packet_b)
+        .unwrap();
+    assert!(
+        matches!(
+            agent_gate
+                .payload_from_data(&early, now, &DenySet::empty())
+                .unwrap_err(),
+            HelloError::TicketMissing
+        ),
+        "DATA ran before the ticket check"
+    );
+    assert_eq!(
+        ticket_failure(
+            agent_gate
+                .admit_ticket(&ring, &jit.bytes, &bad_mac, now, &DenySet::empty())
+                .unwrap_err()
+        ),
+        CryptoError::TicketMac
+    );
+
+    let admitted = agent_gate
+        .admit_ticket(&ring, &jit.bytes, &jit_mac, now, &DenySet::empty())
+        .unwrap();
+    assert_eq!(admitted, ticket_hash(&jit.bytes));
+    let frame_a = agent_gate.encode_data(1, 0, admitted, &packet_a).unwrap();
+    assert_eq!(
+        agent_gate
+            .payload_from_data(&frame_a, now, &DenySet::empty())
+            .unwrap(),
+        packet_a.as_slice()
+    );
+    let frame_b = agent_gate.encode_data(1, 1, admitted, &packet_b).unwrap();
+    assert!(
+        matches!(
+            agent_gate
+                .payload_from_data(&frame_b, now, &DenySet::empty())
+                .unwrap_err(),
+            HelloError::DestinationDenied
+        ),
+        "application B was allowed"
+    );
+    let wrong_port = app_packet([10, 8, 0, 10], 8443);
+    let frame_port = agent_gate.encode_data(1, 2, admitted, &wrong_port).unwrap();
+    assert!(matches!(
+        agent_gate
+            .payload_from_data(&frame_port, now, &DenySet::empty())
+            .unwrap_err(),
+        HelloError::DestinationDenied
+    ));
+    let ping = sample_packet();
+    let frame_ping = agent_gate.encode_data(1, 3, admitted, &ping).unwrap();
+    assert!(matches!(
+        agent_gate
+            .payload_from_data(&frame_ping, now, &DenySet::empty())
+            .unwrap_err(),
+        HelloError::DestinationDenied
+    ));
+    let late = now + Duration::from_secs(200);
+    assert_eq!(
+        ticket_failure(
+            agent_gate
+                .payload_from_data(&frame_a, late, &DenySet::empty())
+                .unwrap_err()
+        ),
+        CryptoError::Identity(IdentityError::Expired)
+    );
+
+    let human_claims = TicketClaims {
+        issuer: issuer.clone(),
+        subject: human.spiffe_id.clone(),
+        not_before: unix(now),
+        expires: unix(now) + 600,
+        dst_cidr: "10.8.0.0/24".to_string(),
+        proto: 6,
+        dst_port: 443,
+        flags: TicketFlags::none(),
+    };
+    let human_ticket = sign_ticket(&signer, &human_claims).unwrap();
+    let human_mac = ticket_mac(&mac_key, mac_input(&human_ticket.bytes)).unwrap();
+    assert_eq!(
+        ticket_failure(
+            agent_gate
+                .admit_ticket(
+                    &ring,
+                    &human_ticket.bytes,
+                    &human_mac,
+                    now,
+                    &DenySet::empty()
+                )
+                .unwrap_err()
+        ),
+        CryptoError::TicketSubject
+    );
+
+    let broad_agent = sign_ticket(
+        &signer,
+        &TicketClaims {
+            issuer,
+            subject: agent.svid.spiffe_id.clone(),
+            not_before: unix(now),
+            expires: unix(now) + 60,
+            dst_cidr: "10.8.0.0/24".to_string(),
+            proto: 6,
+            dst_port: 443,
+            flags: TicketFlags::none(),
+        },
+    )
+    .unwrap();
+    let broad_mac = ticket_mac(&mac_key, mac_input(&broad_agent.bytes)).unwrap();
+    assert!(
+        matches!(
+            agent_gate
+                .admit_ticket(
+                    &ring,
+                    &broad_agent.bytes,
+                    &broad_mac,
+                    now,
+                    &DenySet::empty()
+                )
+                .unwrap_err(),
+            HelloError::DestinationDenied
+        ),
+        "a broad agent ticket was admitted"
+    );
+
+    let mut human_gate = PeerGate::new();
+    human_gate
+        .bind_leaf(
+            gate_issue.trust_bundle(),
+            &human.certificate_der,
+            now,
+            &DenySet::empty(),
+        )
+        .unwrap();
+    let human_hash = human_gate
+        .admit_ticket(
+            &ring,
+            &human_ticket.bytes,
+            &human_mac,
+            now,
+            &DenySet::empty(),
+        )
+        .unwrap();
+    for packet in [&packet_a, &packet_b] {
+        let frame = human_gate.encode_data(1, 0, human_hash, packet).unwrap();
+        assert_eq!(
+            human_gate
+                .payload_from_data(&frame, now, &DenySet::empty())
+                .unwrap(),
+            packet.as_slice()
+        );
+    }
+}
+
+#[tokio::test]
+async fn quic_agent_allows_app_a_and_denies_app_b() {
+    tokio::time::timeout(Duration::from_secs(20), agent_quic_acl())
+        .await
+        .expect("the agent ACL test timed out");
+}
+
+async fn agent_quic_acl() {
+    let now = SystemTime::now();
+    let oidc = MockOidc::generate(MOCK_OIDC_ISSUER).unwrap();
+    let ca = MiniCa::generate(now).unwrap();
+    let issuer_gate = IssueGate::new(ca, &oidc).unwrap();
+    let parent_token = oidc
+        .issue_id_token("seogyu-dev", now, Duration::from_secs(10 * 60))
+        .unwrap();
+    let agent = issuer_gate
+        .issue_agent_svid(
+            &parent_token,
+            "worker-1",
+            now,
+            MAX_AGENT_TTL,
+            &DenySet::empty(),
+        )
+        .unwrap();
+    let human = issuer_gate
+        .issue_human_svid(&parent_token, now, &DenySet::empty())
+        .unwrap();
+    let signer = TicketSigner::generate();
+    let mac_key = [0x42; 32];
+    let ring = TicketRing::single(
+        TicketKey::new(
+            signer.verifier(),
+            mac_key,
+            now - Duration::from_secs(60),
+            now + Duration::from_secs(86_400),
+        )
+        .unwrap(),
+        issuer_gate.ca_public_key(),
+    )
+    .unwrap();
+    let trust = issuer_gate.trust_bundle().clone();
+    let coord = SpiffeId::coord("1").unwrap();
+    let jit = sign_agent_jit_ticket(
+        &signer,
+        &coord,
+        &agent.svid.spiffe_id,
+        now,
+        Duration::from_secs(60),
+        Ipv4Destination {
+            addr: Ipv4Addr::new(10, 8, 0, 10),
+            proto: 6,
+            port: 443,
+        },
+    )
+    .unwrap();
+    let jit_mac = ticket_mac(&mac_key, mac_input(&jit.bytes)).unwrap();
+    let human_ticket = sign_ticket(
+        &signer,
+        &TicketClaims {
+            issuer: coord,
+            subject: human.spiffe_id,
+            not_before: unix(now),
+            expires: unix(now) + 600,
+            dst_cidr: "10.8.0.0/24".to_string(),
+            proto: 6,
+            dst_port: 443,
+            flags: TicketFlags::none(),
+        },
+    )
+    .unwrap();
+    let human_mac = ticket_mac(&mac_key, mac_input(&human_ticket.bytes)).unwrap();
+    let server = HelloConfig::from_issued(
+        &human.certificate_pem,
+        &human.private_key_pem,
+        trust.clone(),
+        human_ticket.bytes,
+        human_mac,
+        ring.clone(),
+    );
+    let client = HelloConfig::from_issued(
+        &agent.svid.certificate_pem,
+        &agent.svid.private_key_pem,
+        trust,
+        jit.bytes,
+        jit_mac,
+        ring,
+    );
+    let packet_a = app_packet([10, 8, 0, 10], 443);
+    let packet_b = app_packet([10, 8, 0, 11], 443);
+    let server = HelloEndpoint::bind_server(server, loopback(0)).unwrap();
+    let addr = server.local_addr().unwrap();
+    let packet_a_for_server = packet_a.clone();
+    let server_task = tokio::spawn(async move {
+        let mut session = server.accept_one().await.unwrap();
+        let first = session.recv_ipv4().await.unwrap();
+        let second = session.recv_ipv4().await.unwrap_err();
+        (first, second)
+    });
+    let client = HelloEndpoint::bind_client(client, loopback(0)).unwrap();
+    let mut session = client.connect_one(addr).await.unwrap();
+    session.send_ipv4(&packet_a).await.unwrap();
+    session.send_ipv4(&packet_b).await.unwrap();
+    let (first, second) = server_task.await.unwrap();
+    assert_eq!(first, packet_a_for_server);
+    assert!(
+        matches!(second, HelloError::DestinationDenied),
+        "application B was allowed: {second}"
+    );
 }
 
 async fn connector_error(server: HelloConfig, client: HelloConfig) -> HelloError {

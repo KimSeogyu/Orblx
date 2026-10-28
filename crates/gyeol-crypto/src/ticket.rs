@@ -1,7 +1,9 @@
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
-use gyeol_identity::{verify_ticket as verify_ed25519_ticket, DenySet, SpiffeId, TicketVerifier};
+use gyeol_identity::{
+    verify_ticket as verify_ed25519_ticket, DenySet, SpiffeId, TicketFlags, TicketVerifier,
+};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -148,6 +150,10 @@ pub struct TicketProof {
     subject: SpiffeId,
     hash: [u8; 16],
     expires: u64,
+    dst_cidr: String,
+    proto: u8,
+    dst_port: u16,
+    flags: TicketFlags,
 }
 
 impl TicketProof {
@@ -164,6 +170,26 @@ impl TicketProof {
     /// Return the ticket expiry as Unix seconds.
     pub fn expires(&self) -> u64 {
         self.expires
+    }
+
+    /// Return the destination CIDR from the identity ticket.
+    pub fn dst_cidr(&self) -> &str {
+        &self.dst_cidr
+    }
+
+    /// Return the IP protocol number from the identity ticket.
+    pub fn proto(&self) -> u8 {
+        self.proto
+    }
+
+    /// Return the destination port from the identity ticket.
+    pub fn dst_port(&self) -> u16 {
+        self.dst_port
+    }
+
+    /// Return the ticket flags.
+    pub fn flags(&self) -> TicketFlags {
+        self.flags
     }
 }
 
@@ -195,6 +221,10 @@ pub fn verify_ticket(
                     subject: verified.subject,
                     hash: verified.hash,
                     expires: verified.expires,
+                    dst_cidr: verified.dst_cidr,
+                    proto: verified.proto,
+                    dst_port: verified.dst_port,
+                    flags: verified.flags,
                 });
             }
             Err(gyeol_identity::IdentityError::Signature) => continue,
@@ -333,6 +363,10 @@ mod tests {
         assert_eq!(proof.hash(), &signed.hash);
         assert_eq!(*proof.hash(), ticket_hash(&signed.bytes));
         assert_eq!(proof.expires(), unix(now) + 600);
+        assert_eq!(proof.dst_cidr(), "10.8.0.10/32");
+        assert_eq!(proof.proto(), 6);
+        assert_eq!(proof.dst_port(), 443);
+        assert!(!proof.flags().agent_jit());
 
         let mut bad_mac = mac;
         bad_mac[0] ^= 0xff;

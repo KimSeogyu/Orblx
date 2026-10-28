@@ -2,8 +2,14 @@
 //!
 //! The trust domain is `gyeol.local`.
 //! A human SVID is `spiffe://gyeol.local/user/{oidc_sub}`.
+//! An agent SVID is `spiffe://gyeol.local/agent/{id}`.
+//! The agent SVID requires a parent human ID token.
+//! The agent SVID life is at most 5 minutes.
 //! The SVID key is Ed25519.
 //! The ticket key is a different Ed25519 key.
+//! An agent capability ticket is separate from the SVID.
+//! The agent ticket allows one destination.
+//! Every other agent destination is denied.
 
 mod ca;
 mod cert;
@@ -20,11 +26,12 @@ pub use cert::{decode_certificate_pem, extract_spiffe_id, TrustBundle};
 pub use clock::{MAX_AGENT_TTL, MAX_SKEW, MAX_USER_TTL};
 pub use deny::{DenyApply, DenySet};
 pub use error::IdentityError;
-pub use oidc::{IssueGate, MockOidc, MOCK_OIDC_ISSUER, OIDC_AUDIENCE};
+pub use oidc::{AgentSvid, IssueGate, MockOidc, MOCK_OIDC_ISSUER, OIDC_AUDIENCE};
 pub use spiffe::{SpiffeId, WorkloadKind, TRUST_DOMAIN};
 pub use ticket::{
-    sign_ticket, ticket_hash, verify_ticket, SignedTicket, TicketClaims, TicketFlags, TicketSigner,
-    TicketVerifier, VerifiedTicket, FLAG_AGENT_JIT, FLAG_ONE_SHOT,
+    allow_agent_jit, sign_agent_jit_ticket, sign_ticket, ticket_hash, verify_ticket,
+    Ipv4Destination, SignedTicket, TicketClaims, TicketFlags, TicketSigner, TicketVerifier,
+    VerifiedTicket, FLAG_AGENT_JIT, FLAG_ONE_SHOT,
 };
 
 /// This function returns the name of this crate.

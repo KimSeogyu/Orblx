@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ca::MiniCa;
 use crate::cert::TrustBundle;
-use crate::clock::{in_window, unix_time, whole_seconds, MAX_USER_TTL};
+use crate::clock::{in_window, unix_time, whole_seconds, MAX_AGENT_TTL, MAX_USER_TTL};
 use crate::deny::DenySet;
 use crate::error::IdentityError;
 use crate::spiffe::SpiffeId;
@@ -120,6 +120,11 @@ impl IssueGate {
         self.ca.trust_bundle_pem()
     }
 
+    /// Return the raw Ed25519 public key of the SVID CA.
+    pub fn ca_public_key(&self) -> &[u8; 32] {
+        self.ca.public_key()
+    }
+
     /// Verify the ID token and issue `spiffe://gyeol.local/user/{sub}`.
     pub fn issue_human_svid(
         &self,
@@ -138,6 +143,38 @@ impl IssueGate {
         self.ca.issue(&id, now, Duration::from_secs(ttl_secs), deny)
     }
 
+    /// Verify a parent human ID token and issue `spiffe://gyeol.local/agent/{name}`.
+    ///
+    /// The parent token must pass the same checks as a human SVID.
+    /// `ttl` must be at most 5 minutes.
+    /// `ttl` must not exceed the remaining life of the parent token.
+    /// The function returns the SVID in memory.
+    /// The function does not write a PEM file.
+    pub fn issue_agent_svid(
+        &self,
+        parent_id_token: &str,
+        agent_name: &str,
+        now: SystemTime,
+        ttl: Duration,
+        deny: &DenySet,
+    ) -> Result<AgentSvid, IdentityError> {
+        let claims = self.verify_token(parent_id_token, now)?;
+        let parent = SpiffeId::user(&claims.sub)?;
+        deny.reject_uri(&parent)?;
+        let now_unix = unix_time(now)?;
+        if claims.exp <= now_unix {
+            return Err(IdentityError::Expired);
+        }
+        let remaining = claims.exp - now_unix;
+        let ttl_secs = whole_seconds(ttl)?;
+        if ttl > MAX_AGENT_TTL || ttl_secs > remaining {
+            return Err(IdentityError::Time);
+        }
+        let agent = SpiffeId::agent(agent_name)?;
+        let svid = self.ca.issue(&agent, now, ttl, deny)?;
+        Ok(AgentSvid { parent, svid })
+    }
+
     fn verify_token(&self, id_token: &str, now: SystemTime) -> Result<OidcClaims, IdentityError> {
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.set_audience(&[OIDC_AUDIENCE]);
@@ -153,6 +190,17 @@ impl IssueGate {
         in_window(now_unix, data.claims.nbf, data.claims.exp)?;
         Ok(data.claims)
     }
+}
+
+/// An agent SVID and the parent human SPIFFE ID that attested it.
+#[derive(Debug)]
+pub struct AgentSvid {
+    /// The human SPIFFE ID from the parent ID token.
+    pub parent: SpiffeId,
+    /// The agent leaf.
+    ///
+    /// The life is at most 5 minutes.
+    pub svid: crate::ca::IssuedSvid,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
