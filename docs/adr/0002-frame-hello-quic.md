@@ -87,7 +87,7 @@ No GSO/GRO in W1–W3. No kernel module.
 
 ## hello-quic W1 checklist
 
-- [ ] `docs/ADR-0002-frame-hello-quic.md` merged (this doc)
+- [ ] `docs/adr/0002-frame-hello-quic.md` merged (this doc)
 - [ ] `gyeol-datapath`: `Frame::{encode,decode}` + golden tests
 - [ ] No `wireguard*` / `boringtun` / `defguard` deps in workspace
 - [ ] ShipPlatform CI green on stub
