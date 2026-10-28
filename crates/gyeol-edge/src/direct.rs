@@ -1,6 +1,8 @@
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use gyeol_relay::{RelaySessionId, RelayTransport};
+
 use gyeol_crypto::{mac_input, ticket_mac, TicketKey, TicketRing};
 use gyeol_datapath::{ipv4_packet, prove_hello_socket, HelloConfig, HelloError, HelloSocketRole};
 use gyeol_identity::{
@@ -10,7 +12,9 @@ use gyeol_identity::{
 
 use crate::error::io_error;
 use crate::punch::{exchange, punch_plan, PunchCounts, PunchToken};
-use crate::{DirectPhase, EdgeError, EndpointCandidate, PathId, PathMachine, PathState};
+use crate::{
+    DirectPhase, EdgeError, EndpointCandidate, PathId, PathMachine, PathState, RelayPhase,
+};
 
 const PROOF_PAYLOAD: &[u8] = b"direct";
 const TICKET_LIFETIME: Duration = Duration::from_secs(600);
@@ -239,6 +243,23 @@ pub struct DirectRequest {
     pub budget: Duration,
 }
 
+/// A Direct session that replaced a live Relay path.
+///
+/// The method is reconnect.
+/// `from_path_id` is the Relay path id from before the retry.
+/// `proof.path_id` is the new Direct path id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectUpgrade {
+    /// The Relay path id that was holding.
+    pub from_path_id: PathId,
+    /// The Relay routing session that was holding.
+    pub relay_session: RelaySessionId,
+    /// UDP or TCP. This is the Relay transport that was holding.
+    pub relay_transport: RelayTransport,
+    /// The new Direct QUIC proof.
+    pub proof: DirectProof,
+}
+
 /// Evidence from one successful Direct attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectProof {
@@ -347,6 +368,77 @@ impl PathMachine {
         })
     }
 
+    /// Retry Direct while the machine is holding Relay.
+    ///
+    /// The call does nothing to the state when `now` is before `direct_retry_at`.
+    /// A failed punch or a failed QUIC proof leaves the machine on Relay Up.
+    /// The Relay path id stays the same after a failure.
+    /// A successful proof moves the machine to Direct Up.
+    /// The new proof is a new hello-quic session on `request.socket`.
+    /// The function does not migrate the Relay Quinn session.
+    /// The function does not restart the process.
+    pub fn retry_direct(
+        &mut self,
+        now: Instant,
+        request: DirectRequest,
+    ) -> Result<DirectUpgrade, EdgeError> {
+        let (candidate, transport, session_id, from_path_id) = match self.state() {
+            PathState::Relay {
+                phase:
+                    RelayPhase::Up {
+                        transport,
+                        session_id,
+                        path_id,
+                    },
+                candidate,
+            } => (candidate, transport, session_id, path_id),
+            PathState::Allocate { .. } | PathState::Direct { .. } | PathState::Relay { .. } => {
+                return Err(EdgeError::WrongState);
+            }
+        };
+        let Some(due) = self.direct_retry_at() else {
+            return Err(EdgeError::WrongState);
+        };
+        if now < due {
+            return Err(EdgeError::StickHold);
+        }
+        let budget = request.budget;
+        match attempt_direct(candidate, request) {
+            Ok(attempt) => {
+                let path_id = PathId::allocate()?;
+                self.clear_direct_retry();
+                self.move_to(PathState::Direct {
+                    phase: DirectPhase::Up {
+                        budget,
+                        quic_port: attempt.quic_port,
+                        packets_sent: attempt.packets_sent,
+                        packets_received: attempt.packets_received,
+                        path_id,
+                    },
+                    candidate,
+                });
+                Ok(DirectUpgrade {
+                    from_path_id,
+                    relay_session: session_id,
+                    relay_transport: transport,
+                    proof: DirectProof {
+                        packets_sent: attempt.packets_sent,
+                        packets_received: attempt.packets_received,
+                        quic_port: attempt.quic_port,
+                        path_id,
+                        peer: attempt.peer,
+                        elapsed: attempt.elapsed,
+                        echoed: attempt.echoed,
+                    },
+                })
+            }
+            Err(error) => {
+                self.schedule_direct_retry(now);
+                Err(error)
+            }
+        }
+    }
+
     fn mark_failed(
         &mut self,
         candidate: EndpointCandidate,
@@ -364,6 +456,66 @@ impl PathMachine {
             candidate,
         });
     }
+}
+
+struct DirectAttempt {
+    packets_sent: u32,
+    packets_received: u32,
+    quic_port: u16,
+    peer: SocketAddr,
+    elapsed: Duration,
+    echoed: Vec<u8>,
+}
+
+fn attempt_direct(
+    local_candidate: EndpointCandidate,
+    request: DirectRequest,
+) -> Result<DirectAttempt, EdgeError> {
+    let (preferred, targets) = punch_plan(local_candidate, request.remote);
+    let bound = request.socket.local_addr().map_err(io_error)?;
+    let quic_port = match request.role {
+        DirectRole::Server => bound.port(),
+        DirectRole::Client => preferred.port(),
+    };
+    let started = Instant::now();
+    let deadline = started + request.budget;
+    let punched = match exchange(
+        &request.socket,
+        &targets,
+        preferred,
+        request.token,
+        deadline,
+    ) {
+        Ok(outcome) => outcome,
+        Err(failure) => return Err(failure.error),
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(EdgeError::DirectBudget);
+    }
+    let quic_port = match request.role {
+        DirectRole::Server => quic_port,
+        DirectRole::Client => punched.peer.port(),
+    };
+    let echoed = prove_quic(
+        request.role,
+        &request.identity,
+        request.socket,
+        punched.peer,
+        remaining,
+    )?;
+    let elapsed = started.elapsed();
+    if elapsed > request.budget {
+        return Err(EdgeError::DirectBudget);
+    }
+    Ok(DirectAttempt {
+        packets_sent: punched.counts.packets_sent,
+        packets_received: punched.counts.packets_received,
+        quic_port,
+        peer: punched.peer,
+        elapsed,
+        echoed,
+    })
 }
 
 fn prove_quic(

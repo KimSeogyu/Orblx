@@ -205,7 +205,7 @@ impl PathMachine {
     /// The function tries UDP first when the preference is Auto or UDP.
     /// When UDP fails and the preference is Auto, the function uses TCP.
     /// The function does not punch a direct path.
-    /// The function does not migrate an existing QUIC connection.
+    /// `retry_direct` is the later Direct attempt while Relay is up.
     pub fn begin_relay(&mut self, request: RelayRequest) -> Result<RelayLink, EdgeError> {
         let candidate = self.candidate_for_relay()?;
         let started = Instant::now();
@@ -308,6 +308,7 @@ impl PathMachine {
             },
             candidate,
         });
+        self.arm_direct_retry(Instant::now());
         Ok(RelayProof {
             transport,
             session_id,

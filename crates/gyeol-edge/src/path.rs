@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gyeol_relay::{RelaySessionId, RelayTransport};
 
@@ -19,11 +19,24 @@ pub const DIRECT_ATTEMPT_BUDGET: Duration = Duration::from_secs(3);
 /// The Relay uses this port for UDP and for TCP.
 pub const DIRECT_QUIC_PORT: u16 = 443;
 
-/// Stick and upgrade is not active.
+/// The upgrade method while the path is on Relay.
 ///
-/// The machine does not retry Direct while Relay is up.
-/// The machine does not migrate the QUIC connection.
-pub const STICK_AND_UPGRADE: &str = "deferred";
+/// The machine holds the Relay path.
+/// The machine retries Direct on `DIRECT_RETRY_INTERVAL`.
+/// A failed retry leaves the path on Relay.
+/// A successful retry opens a new QUIC session on the direct socket.
+/// The process does not restart.
+/// Quinn is not asked to migrate the Relay session.
+/// The Relay hello-quic proof closes after one exchange.
+/// The Relay Quinn socket talks to a local bridge, not to the peer.
+pub const STICK_AND_UPGRADE: &str = "reconnect";
+
+/// The wait between Direct retries while Relay is up.
+///
+/// The timer starts when Relay comes up.
+/// A retry before this time returns `EdgeError::StickHold`.
+/// A failed retry starts the wait again.
+pub const DIRECT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The Allocate phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,7 +145,9 @@ pub enum DirectPhase {
 /// `Attach` means the peer is selecting UDP or TCP.
 /// `Up` means the QUIC proof succeeded through the Relay.
 /// `Failed` means the Relay attempt stopped.
-/// Stick and upgrade is not a phase in this build.
+/// Stick is not a separate phase.
+/// While `Up` is current, a Direct retry may run.
+/// A failed retry stays in `Up`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayPhase {
     /// The peer is attaching to the Relay.
@@ -163,7 +178,8 @@ pub enum RelayPhase {
 /// Allocate gathers one reflexive address.
 /// Direct punches and then proves QUIC.
 /// Relay attaches to the gyeol Relay and then proves QUIC.
-/// Stick and upgrade is deferred.
+/// Stick holds Relay Up and retries Direct.
+/// A successful retry moves the machine to Direct Up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathState {
     /// The Allocate state.
@@ -238,6 +254,10 @@ impl std::fmt::Display for DirectPhase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathMachine {
     state: PathState,
+    /// The earliest time a Direct retry may start.
+    ///
+    /// `None` means the machine is not holding a Relay path.
+    direct_retry_not_before: Option<Instant>,
 }
 
 impl PathMachine {
@@ -249,6 +269,7 @@ impl PathMachine {
                 phase: AllocatePhase::Gather,
                 candidate: None,
             },
+            direct_retry_not_before: None,
         }
     }
 
@@ -342,6 +363,34 @@ impl PathMachine {
                 ..
             } => None,
         }
+    }
+
+    /// Report whether the machine is holding a Relay path.
+    ///
+    /// The path stays on Relay until a Direct retry succeeds.
+    #[must_use]
+    pub fn stick_holding(&self) -> bool {
+        self.relay_is_up() && self.direct_retry_not_before.is_some()
+    }
+
+    /// Return the next time a Direct retry may start.
+    ///
+    /// `None` means the machine is not holding a Relay path.
+    #[must_use]
+    pub fn direct_retry_at(&self) -> Option<Instant> {
+        self.direct_retry_not_before
+    }
+
+    pub(crate) fn arm_direct_retry(&mut self, now: Instant) {
+        self.direct_retry_not_before = Some(now + DIRECT_RETRY_INTERVAL);
+    }
+
+    pub(crate) fn schedule_direct_retry(&mut self, now: Instant) {
+        self.direct_retry_not_before = Some(now + DIRECT_RETRY_INTERVAL);
+    }
+
+    pub(crate) fn clear_direct_retry(&mut self) {
+        self.direct_retry_not_before = None;
     }
 
     /// Return the Relay session id when the machine is in Relay.

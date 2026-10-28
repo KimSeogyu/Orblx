@@ -13,7 +13,7 @@ fn relay_policy_port_is_443() {
     assert_eq!(relay_policy_port(), DIRECT_QUIC_PORT);
     assert_eq!(framing_name(RelayTransport::Tcp), "quic-style");
     assert_eq!(framing_name(RelayTransport::Udp), "udp-datagram");
-    assert_eq!(STICK_AND_UPGRADE, "deferred");
+    assert_eq!(STICK_AND_UPGRADE, "reconnect");
     assert_eq!(RelayPreference::Auto.to_string(), "auto");
 }
 
@@ -55,13 +55,13 @@ fn udp_relay_comes_up_after_direct_fails() {
     assert_eq!(report.plaintext_hits, 0);
     assert!(report.forwards >= 1);
     assert_eq!(report.policy_port, 443);
-    assert_eq!(report.stick, "deferred");
+    assert_eq!(report.stick, "reconnect");
     assert_ne!(report.path_id_server, report.path_id_client);
     let text = report.lines().join("\n");
     assert!(text.contains("relay lab udp"));
     assert!(text.contains("payload_opaque true"));
     assert!(text.contains("tcp framing quic-style"));
-    assert!(text.contains("stick deferred"));
+    assert!(text.contains("stick reconnect"));
 }
 
 #[test]
