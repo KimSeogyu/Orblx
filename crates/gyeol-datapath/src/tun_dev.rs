@@ -53,6 +53,16 @@ pub fn open_tun(config: &TunConfig) -> Result<TunBridge, HelloError> {
     }
 }
 
+/// Open one Linux TUN device with the same configuration as [`open_tun`].
+///
+/// The caller owns the device.
+/// The bench uses this function.
+/// The hello-quic path uses [`open_tun`].
+#[cfg(target_os = "linux")]
+pub(crate) fn open_linux_device(config: &TunConfig) -> Result<tun::Device, HelloError> {
+    linux::open_device(config)
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{tun_capability_note, Duration, HelloError, TunBridge, TunConfig};
@@ -73,7 +83,7 @@ mod linux {
         })
     }
 
-    fn open_device(config: &TunConfig) -> Result<tun::Device, HelloError> {
+    pub(super) fn open_device(config: &TunConfig) -> Result<tun::Device, HelloError> {
         let mut device_config = tun::Configuration::default();
         device_config
             .address(config.address)

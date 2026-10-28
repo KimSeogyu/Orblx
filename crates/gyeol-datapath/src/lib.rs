@@ -7,6 +7,7 @@ mod gate;
 mod ipv4;
 mod quic;
 mod run;
+mod tun_bench;
 mod tun_dev;
 
 pub use connector::{
@@ -24,6 +25,7 @@ pub use quic::{
     HelloSocketRole,
 };
 pub use run::{run_hello, HelloRequest, HelloRole};
+pub use tun_bench::{run_local_tun_bench, TunBenchOutcome, TunBenchReport};
 pub use tun_dev::{tun_capability_note, TunBridge, TunConfig, DEFAULT_UDP_PORT};
 
 #[cfg(test)]
