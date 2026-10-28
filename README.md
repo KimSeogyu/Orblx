@@ -42,10 +42,42 @@ The `gyeol` command prints a hello line.
 The `gyeol` command prints the version when you use `--version`.
 The `gyeol` command prints the version when you use `-V`.
 
-The planned libraries are Quinn, rustls, and ring.
+The data path uses Quinn, rustls, and ring.
 You can use aws-lc-rs as the crypto backend for rustls.
-Week 1 does not add these libraries.
 Read the comment in the workspace `Cargo.toml`.
+
+## hello-quic
+
+Week 3 adds the hello-quic path.
+The path reads an IPv4 packet.
+The path wraps the packet in one ADR-0002 DATA frame.
+The path writes the frame on one QUIC bidirectional stream.
+The path checks the peer leaf with `gyeol-identity`.
+The record in [docs/adr/0002-frame-hello-quic.md](docs/adr/0002-frame-hello-quic.md) stays Proposed.
+
+Run the server:
+
+```bash
+cargo run -p gyeol-cli -- hello-quic server \
+  --cert server.pem --key server-key.pem \
+  --bundle trust-bundle.pem --ticket ticket.bin \
+  --tun-address 10.8.0.1
+```
+
+Run the client:
+
+```bash
+cargo run -p gyeol-cli -- hello-quic client \
+  --cert client.pem --key client-key.pem \
+  --bundle trust-bundle.pem --ticket ticket.bin \
+  --connect 127.0.0.1:443 \
+  --tun-address 10.8.0.2
+```
+
+The default UDP port is 443.
+The TUN device needs CAP_NET_ADMIN on Linux.
+The tests do not open a TUN device.
+The tests use an in-memory packet path.
 
 ## Completion criteria for the 12-week work
 

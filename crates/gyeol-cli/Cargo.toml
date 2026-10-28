@@ -1,6 +1,6 @@
 [package]
 name = "gyeol-cli"
-description = "Week 1 gyeol command. The command prints a hello line or the version."
+description = "gyeol command. The command prints a hello line, prints the version, or runs hello-quic."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true

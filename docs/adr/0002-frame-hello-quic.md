@@ -70,6 +70,9 @@ W1–W3 path:
    - Process B (or loopback): read stream → parse frame → write TUN.
    - Escape: `ping` to overlay IP succeeds on Linux loopback / two namespaces.
 
+W3 code keeps this status at Proposed.
+W4 freezes the on-wire bytes.
+
 No GSO/GRO in W1–W3. No kernel module.
 
 ### 5. Explicit non-goals (this ADR)
