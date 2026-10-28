@@ -1,0 +1,10 @@
+[package]
+name = "gyeol-relay"
+description = "The gyeol Relay. It routes by session id and forwards opaque payloads."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+getrandom = "0.2.17"

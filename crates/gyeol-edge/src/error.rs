@@ -72,6 +72,10 @@ pub enum EdgeError {
     Identity(String),
     /// The QUIC path failed.
     Quic(String),
+    /// The Relay attempt exceeded the budget.
+    RelayBudget,
+    /// The Relay path failed.
+    Relay(String),
 }
 
 impl fmt::Display for EdgeError {
@@ -134,6 +138,8 @@ impl fmt::Display for EdgeError {
                 write!(formatter, "The identity material is not valid. {detail}")
             }
             Self::Quic(detail) => write!(formatter, "The QUIC path failed. {detail}"),
+            Self::RelayBudget => formatter.write_str("The Relay attempt exceeded the budget."),
+            Self::Relay(detail) => write!(formatter, "The Relay path failed. {detail}"),
         }
     }
 }
