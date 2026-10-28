@@ -12,3 +12,4 @@ gyeol-crypto = { path = "../gyeol-crypto" }
 gyeol-datapath = { path = "../gyeol-datapath" }
 gyeol-identity = { path = "../gyeol-identity" }
 gyeol-relay = { path = "../gyeol-relay" }
+serde_json = { version = "1", features = ["preserve_order"] }

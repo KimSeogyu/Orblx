@@ -76,6 +76,8 @@ pub enum EdgeError {
     RelayBudget,
     /// The Relay path failed.
     Relay(String),
+    /// The NAT feed rejected an input.
+    BadNatFeed(String),
 }
 
 impl fmt::Display for EdgeError {
@@ -140,6 +142,9 @@ impl fmt::Display for EdgeError {
             Self::Quic(detail) => write!(formatter, "The QUIC path failed. {detail}"),
             Self::RelayBudget => formatter.write_str("The Relay attempt exceeded the budget."),
             Self::Relay(detail) => write!(formatter, "The Relay path failed. {detail}"),
+            Self::BadNatFeed(detail) => {
+                write!(formatter, "The NAT feed input is not valid. {detail}")
+            }
         }
     }
 }
