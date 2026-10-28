@@ -6,6 +6,13 @@ license.workspace = true
 publish.workspace = true
 version.workspace = true
 
+[[bin]]
+name = "tun-bench"
+path = "src/bin/tun-bench.rs"
+
+# `tun-bench` measures one local TUN round trip.
+# Do not add WireGuard, Headscale, or DERP crates.
+
 [dependencies]
 gyeol-crypto = { path = "../gyeol-crypto" }
 gyeol-identity = { path = "../gyeol-identity" }

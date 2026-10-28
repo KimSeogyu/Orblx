@@ -269,7 +269,8 @@ The 12-week work is complete when all of these statements are true:
 - The system can export a short hash chain for session events.
 
 The TUN measurement record is [docs/w12-tun-bench.md](docs/w12-tun-bench.md).
-The measured number is pending the Datapath result.
+The measured rate is 8091.299206 Mbps.
+The result is pass.
 The kill or go packet is [docs/w12-kill-go.md](docs/w12-kill-go.md).
 
 ## Build and test
@@ -296,6 +297,16 @@ Run the tests:
 ```bash
 cargo test --workspace
 ```
+
+Measure the local TUN round trip:
+
+```bash
+scripts/tun-bench.sh
+```
+
+The script prints the measured rate.
+The script exits 0 when the host has no TUN device.
+Read the measured result in [docs/w12-tun-bench.md](docs/w12-tun-bench.md).
 
 Start the command:
 
@@ -496,7 +507,8 @@ Read the kill or go packet in [docs/w12-kill-go.md](docs/w12-kill-go.md).
 The bench command is `./scripts/tun-bench.sh`.
 Datapath owns the script and the measured rate.
 The record is [docs/w12-tun-bench.md](docs/w12-tun-bench.md).
-The measured Mbps value is pending Datapath measurement.
+The measured rate is 8091.299206 Mbps.
+The result is pass.
 A host that is not Linux, or a host with no TUN device, exits clean and prints the K3 note.
 That exit is not a pass of the 100 Mbps gate.
 
