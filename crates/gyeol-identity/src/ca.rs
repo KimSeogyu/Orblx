@@ -1,6 +1,8 @@
 use std::fmt;
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
+use ed25519_dalek::SigningKey;
 use rcgen::string::Ia5String;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -8,8 +10,12 @@ use rcgen::{
 };
 use time::OffsetDateTime;
 
-use crate::cert::{cert_validity, TrustBundle};
+use crate::cert::{
+    cert_validity, certificate_ed25519_public_key, decode_certificate_pem, extract_spiffe_id,
+    TrustBundle,
+};
 use crate::clock::{offset_from_unix, unix_time, whole_seconds, CA_LIFETIME_SECS, MAX_SKEW_SECS};
+use crate::codec::{ed25519_seed_from_pkcs8, pem_blocks, read_pem_file};
 use crate::deny::DenySet;
 use crate::error::IdentityError;
 use crate::spiffe::SpiffeId;
@@ -163,6 +169,51 @@ pub struct IssuedSvid {
     pub private_key_pem: String,
     pub not_before: u64,
     pub not_after: u64,
+}
+
+impl IssuedSvid {
+    /// Build a leaf SVID from certificate PEM and private key PEM.
+    ///
+    /// The certificate must contain one CERTIFICATE block.
+    /// The private key must contain one PRIVATE KEY block.
+    /// The private key must match the certificate public key.
+    pub fn from_pem(certificate_pem: &str, private_key_pem: &str) -> Result<Self, IdentityError> {
+        let certificate_der = decode_certificate_pem(certificate_pem)?;
+        let spiffe_id = extract_spiffe_id(&certificate_der)?;
+        let (not_before, not_after) = cert_validity(&certificate_der)?;
+        let key_blocks =
+            pem_blocks(private_key_pem, "PRIVATE KEY").map_err(|_| IdentityError::Certificate)?;
+        if key_blocks.len() != 1 {
+            return Err(IdentityError::Certificate);
+        }
+        let (seed, embedded) =
+            ed25519_seed_from_pkcs8(&key_blocks[0]).map_err(|_| IdentityError::Certificate)?;
+        let derived = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        if embedded.is_some_and(|key| key != derived) {
+            return Err(IdentityError::Certificate);
+        }
+        if derived != certificate_ed25519_public_key(&certificate_der)? {
+            return Err(IdentityError::Certificate);
+        }
+        Ok(Self {
+            spiffe_id,
+            certificate_pem: certificate_pem.to_string(),
+            certificate_der,
+            private_key_pem: private_key_pem.to_string(),
+            not_before,
+            not_after,
+        })
+    }
+
+    /// Read a leaf SVID from a certificate PEM file and a private key PEM file.
+    ///
+    /// Each file must be UTF-8 text.
+    /// The function calls `from_pem` on that text.
+    pub fn from_pem_files(certificate: &Path, private_key: &Path) -> Result<Self, IdentityError> {
+        let certificate_pem = read_pem_file(certificate)?;
+        let private_key_pem = read_pem_file(private_key)?;
+        Self::from_pem(&certificate_pem, &private_key_pem)
+    }
 }
 
 impl fmt::Debug for IssuedSvid {
