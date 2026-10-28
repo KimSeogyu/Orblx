@@ -101,7 +101,9 @@ cargo run -p gyeol-sim
 ```
 
 Open `http://127.0.0.1:8787`.
-Easy and City Breeze open the mock IdP sign-in page.
+The default page is the game.
+The game reads this feed.
+Play City Breeze opens the mock IdP sign-in page.
 Sign in on that page.
 The callback emits `svid.issued` and the City Breeze kinds.
 Select Medium or Hard for the other levels.

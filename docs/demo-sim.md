@@ -2,15 +2,18 @@
 
 The sim harness runs three levels.
 The crate name is `gyeol-sim`.
-The harness serves a web page.
-The page shows peers, packets, the QUIC path, the SVID, and the ticket.
+The harness serves the game.
+The default page is the game.
+The engineering view shows peers, packets, the QUIC path, the SVID, and the ticket.
 The event log shows feed JSON.
 The feed version is 1.
 Read the field list in [w11-feed-v1.md](w11-feed-v1.md).
+Read the play path in [w15-demo-ui.md](w15-demo-ui.md).
 
 The harness does not open a TUN device.
 The harness does not open a Unix socket.
-The harness does not play a success animation.
+The game board moves when a feed event arrives.
+The game does not play a canned success animation.
 A button runs a state machine.
 The machine writes one feed object per transition.
 
@@ -26,7 +29,8 @@ The script starts this harness.
 The script signs in at the mock IdP for City Breeze.
 The script then posts Revoke, Medium, Spawn agent, Hard, and UDP block.
 The script reads the event kinds from the harness.
-The script does not play an animation.
+The script checks that the default page is the game.
+The script rejects a canned keyframe animation.
 A pass prints `demo pass`.
 The browser steps and the kind lists are in the README.
 
@@ -41,6 +45,7 @@ cargo run -p gyeol-sim
 ```
 
 Open `http://127.0.0.1:8787`.
+The page is the game.
 
 Use a different local address when port 8787 is busy:
 
@@ -78,7 +83,10 @@ The path uses the TCP Relay.
 
 ## Page
 
-Easy and City Breeze open the mock IdP sign-in page.
+The default page is the game.
+Play City Breeze opens the mock IdP sign-in page.
+Read the clicks in [w15-demo-ui.md](w15-demo-ui.md).
+Easy and City Breeze in the engineering view open the same sign-in page.
 Sign in on that page before the level runs.
 The smash buttons are Revoke, UDP block, and Spawn agent.
 Revoke writes `svid.revoked` and then `session.dropped`.

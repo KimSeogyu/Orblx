@@ -4,7 +4,8 @@
 # The script follows that sign-in with curl.
 # The later actions match the browser smash buttons.
 # The script checks the event kinds from those actions.
-# The script does not play an animation.
+# The script checks that the default page is the game.
+# The script rejects a canned keyframe animation.
 
 set -euo pipefail
 
@@ -60,12 +61,23 @@ import sys
 import urllib.request
 
 base = sys.argv[1]
+files = {}
 for path in ("/", "/style.css", "/app.js"):
     with urllib.request.urlopen(base + path, timeout=10) as response:
-        text = response.read().decode("utf-8", "replace")
-    if "@keyframes" in text or "requestAnimationFrame" in text:
-        raise SystemExit(f"The file {path} contains an animation.")
-print("The harness page has no animation.")
+        files[path] = response.read().decode("utf-8", "replace")
+    if "@keyframes" in files[path] or "requestAnimationFrame" in files[path]:
+        raise SystemExit(f"The file {path} contains a canned animation.")
+page = files["/"]
+script = files["/app.js"]
+if 'id="game"' not in page:
+    raise SystemExit("The default page is not the game.")
+if 'id="eng" hidden' not in page:
+    raise SystemExit("The engineering view is not hidden.")
+if 'Play City Breeze' not in page or 'UDP block' not in page:
+    raise SystemExit("The game controls are missing.")
+if 'new EventSource("/events")' not in script or "applyFeed" not in script:
+    raise SystemExit("The game does not read the feed.")
+print("The default page is the game. The game reads the feed. The page has no canned keyframe animation.")
 PY
 
 seqfile="${work}/seq"

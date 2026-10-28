@@ -338,14 +338,66 @@ GitHub Actions runs the format check, Clippy, and the tests.
 GitHub Actions runs this workflow on each pull request.
 GitHub Actions runs this workflow on each push to the main branch.
 
+## Play
+
+The play page is the game.
+The game reads StackFeed JSON.
+`GET /events` sends that JSON.
+The board moves when a feed event arrives.
+The board does not play a canned story.
+
+One command:
+
+```bash
+cargo run -p gyeol-sim
+```
+
+Open `http://127.0.0.1:8787`.
+
+Use another local address when port 8787 is busy:
+
+```bash
+cargo run -p gyeol-sim -- --listen 127.0.0.1:8790
+```
+
+Open `http://127.0.0.1:8790`.
+
+City Breeze:
+
+1. Click Play City Breeze.
+2. The mock IdP page opens.
+3. Click Sign in.
+4. The board shows the SVID, the ticket, the QUIC hello, and the two applications.
+5. `app-a.orblx.test` and `app-b.orblx.test` show status 200.
+
+Agent JIT:
+
+1. Click Play Agent JIT.
+2. The board shows allow for application A.
+3. The board shows deny for application B.
+
+Radioactive NAT and the UDP poke:
+
+1. Click Play Radioactive NAT or click UDP block.
+2. The board shows Direct not ok.
+3. The board then shows the TCP Relay.
+4. UDP block leaves the Relay path up.
+
+The engineering panels stay hidden.
+Click Engineering view to open them.
+Read the click path in [docs/w15-demo-ui.md](docs/w15-demo-ui.md).
+
 ## Demo
 
-[`scripts/demo.sh`](scripts/demo.sh) is the one-command demo.
-The script starts the sim harness.
-The script posts Easy, Revoke, Medium, Spawn agent, Hard, and UDP block.
-Each post runs the live level machine.
+[`scripts/demo.sh`](scripts/demo.sh) checks the live harness.
+The script starts the game server.
+The script signs in at the mock IdP for City Breeze.
+The script posts Revoke, Medium, Spawn agent, Hard, and UDP block.
+Each action runs the live level machine.
 The script reads the event kinds from the harness response.
-The script checks that the page has no animation.
+The script checks that the default page is the game.
+The script checks that the game reads the feed.
+The script rejects a canned keyframe animation.
 A pass prints `demo pass`.
 The script needs `cargo`, `curl`, and `python3`.
 
@@ -365,6 +417,7 @@ GYEOL_DEMO_ADDR=127.0.0.1:8790 ./scripts/demo.sh
 ## Browser sign-in
 
 City Breeze uses the local mock IdP.
+The play path is [Play](#play).
 The issuer is `https://oidc.gyeol.local`.
 The audience is `gyeol-issue`.
 The subject is `ada`.
@@ -372,7 +425,7 @@ The client id is `gyeol-sim`.
 The IdP is the built-in `MockOidc` signer.
 The built-in signer is enough for this demo.
 
-Start the harness:
+Start the game:
 
 ```bash
 cargo run -p gyeol-sim
@@ -380,7 +433,7 @@ cargo run -p gyeol-sim
 
 Open `http://127.0.0.1:8787`.
 
-Click Easy or click City Breeze.
+Click Play City Breeze.
 The browser opens the mock IdP sign-in page.
 The page shows the issuer, the audience, and the subject.
 Click Sign in.
@@ -406,11 +459,14 @@ Read the route list in [docs/w14-oidc-ui.md](docs/w14-oidc-ui.md).
 The sim harness crate is `gyeol-sim`.
 The harness runs three levels.
 The levels are City Breeze, Agent JIT, and Radioactive NAT.
-The page shows peers, packets, and session panels.
+The default page is the game in [Play](#play).
+The engineering view shows peers, packets, and session panels.
 The event log shows feed JSON from those runs.
 UDP block calls `gyeol_edge::run_nat_smash`.
-The page does not play an animation.
+The board moves from feed events.
+The board does not play a canned animation.
 Read the feed fields in [docs/w11-feed-v1.md](docs/w11-feed-v1.md).
+Read the play path in [docs/w15-demo-ui.md](docs/w15-demo-ui.md).
 Read the run steps in [docs/demo-sim.md](docs/demo-sim.md).
 
 Run the harness:
@@ -435,8 +491,8 @@ cargo run -p gyeol-sim -- --listen 127.0.0.1:8790
 
 ### Easy — City Breeze
 
-Select Easy on the page.
-Easy opens the mock IdP sign-in page.
+Click Play City Breeze.
+City Breeze opens the mock IdP sign-in page.
 Sign in on that page.
 The callback runs City Breeze.
 The event kinds are, in order:
@@ -472,8 +528,8 @@ The QUIC path state is `down`.
 
 ### Medium — Agent JIT
 
-Select Medium on the page.
-Medium runs Agent JIT.
+Click Play Agent JIT.
+Agent JIT runs on the board.
 The event kinds are, in order:
 
 1. `difficulty_selected`
@@ -498,8 +554,8 @@ The later kinds match items 2 to 10 in the Medium list.
 
 ### Hard — Radioactive NAT
 
-Select Hard on the page.
-Hard runs Radioactive NAT.
+Click Play Radioactive NAT.
+Radioactive NAT runs on the board.
 The event kinds are, in order:
 
 1. `difficulty_selected`
