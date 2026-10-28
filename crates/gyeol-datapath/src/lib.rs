@@ -17,6 +17,8 @@ pub use run::{run_hello, HelloRequest, HelloRole};
 pub use tun_dev::{tun_capability_note, TunBridge, TunConfig, DEFAULT_UDP_PORT};
 
 #[cfg(test)]
+mod golden;
+#[cfg(test)]
 mod hello_tests;
 
 /// Header size in bytes before the payload.
