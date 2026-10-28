@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::ticket_load;
 use gyeol_edge::{
     relay_policy_port, run_relay_smoke, DirectIdentity, DirectRole, MemoryCandidateSink,
     PathMachine, RelayRequest, RelaySmokeMode, StunClient, STICK_AND_UPGRADE,
 };
-use gyeol_identity::ticket_hash;
 use gyeol_relay::{
     framing_name, RelayPreference, RelayServer, RelaySessionId, ServerConfig, RELAY_PORT,
 };
@@ -350,14 +350,7 @@ fn load_identity(options: &PeerOptions) -> Result<DirectIdentity, String> {
         .map_err(|err| format!("The file {} did not open. {err}", options.key.display()))?;
     let trust_pem = fs::read_to_string(&options.bundle)
         .map_err(|err| format!("The file {} did not open. {err}", options.bundle.display()))?;
-    let ticket_bytes = fs::read(&options.ticket)
-        .map_err(|err| format!("The file {} did not open. {err}", options.ticket.display()))?;
-    Ok(DirectIdentity {
-        certificate_pem,
-        private_key_pem,
-        trust_pem,
-        ticket_hash: ticket_hash(&ticket_bytes),
-    })
+    ticket_load::load_direct_identity(certificate_pem, private_key_pem, trust_pem, &options.ticket)
 }
 
 fn tmp_path(path: &Path) -> PathBuf {
@@ -455,6 +448,8 @@ The command attaches to the gyeol Relay.
 The preferred transport is UDP.
 When UDP fails, auto uses TCP.
 The command proves QUIC through the Relay.
+The --ticket file is one identity ticket.
+The command also reads FILE.mac and the ticket key files in that directory.
 The command does not punch a direct path.
 Stick and upgrade is deferred.
 "

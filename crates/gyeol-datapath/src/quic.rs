@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use gyeol_crypto::TicketRing;
 use gyeol_identity::{decode_certificate_pem, DenySet, SpiffeId, TrustBundle};
 use rand::RngCore;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -13,13 +14,20 @@ use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use tokio::sync::mpsc;
 
 use crate::framing::expect_seq;
-use crate::{encode_length_prefixed, is_ipv4_packet, Frame, HelloError, PeerGate};
+use crate::{encode_length_prefixed, is_ipv4_packet, Frame, FrameType, HelloError, PeerGate};
 
 const ALPN: &[u8] = b"gyeol-hello";
 const SERVER_NAME: &str = "gyeol.local";
 const PEER_REJECT_CODE: u32 = 1;
+const TICKET_REJECT_CODE: u32 = 2;
+const TICKET_MAC_LEN: usize = 32;
 
-/// Leaf material and the trust bundle for one hello-quic endpoint.
+/// Leaf material and the capability ticket for one hello-quic endpoint.
+///
+/// `ticket_bytes` are the identity version-1 ticket bytes this endpoint presents.
+/// `ticket_mac` is the HMAC tag from `gyeol_crypto::ticket_mac` over those bytes.
+/// `ticket_ring` verifies the peer ticket.
+#[derive(Clone)]
 pub struct HelloConfig {
     /// PEM certificate for this endpoint.
     pub certificate_pem: String,
@@ -27,26 +35,34 @@ pub struct HelloConfig {
     pub private_key_pem: String,
     /// Roots that can authenticate the peer leaf.
     pub trust: TrustBundle,
-    /// `ticket_hash` value for outbound DATA frames.
-    pub ticket_hash: [u8; 16],
-    /// Deny list for leaf authentication.
+    /// Identity version-1 ticket bytes for this endpoint.
+    pub ticket_bytes: Vec<u8>,
+    /// HMAC-SHA256 tag over `ticket_bytes`.
+    pub ticket_mac: [u8; 32],
+    /// Ticket keys for the peer ticket check.
+    pub ticket_ring: TicketRing,
+    /// Deny list for the leaf check and the ticket check.
     pub deny: DenySet,
 }
 
 impl HelloConfig {
-    /// Build a config from an issued SVID.
+    /// Build a config from an issued SVID and a presented capability ticket.
     #[must_use]
     pub fn from_issued(
         certificate_pem: &str,
         private_key_pem: &str,
         trust: TrustBundle,
-        ticket_hash: [u8; 16],
+        ticket_bytes: Vec<u8>,
+        ticket_mac: [u8; 32],
+        ticket_ring: TicketRing,
     ) -> Self {
         Self {
             certificate_pem: certificate_pem.to_string(),
             private_key_pem: private_key_pem.to_string(),
             trust,
-            ticket_hash,
+            ticket_bytes,
+            ticket_mac,
+            ticket_ring,
             deny: DenySet::empty(),
         }
     }
@@ -54,8 +70,10 @@ impl HelloConfig {
 
 struct Auth {
     trust: TrustBundle,
-    ticket_hash: [u8; 16],
     deny: DenySet,
+    ticket_bytes: Vec<u8>,
+    ticket_mac: [u8; 32],
+    ticket_ring: TicketRing,
 }
 
 /// A Quinn endpoint that speaks hello-quic.
@@ -248,6 +266,7 @@ async fn prove_hello_async(
     }
 }
 
+#[derive(Clone, Copy)]
 enum StreamRole {
     Server,
     Client,
@@ -337,14 +356,18 @@ pub struct HelloReceiver {
     recv: quinn::RecvStream,
     next_seq: u64,
     gate: PeerGate,
+    deny: DenySet,
 }
 
 impl HelloReceiver {
     /// Read one DATA frame.
+    ///
+    /// The function rejects the frame when the capability ticket check fails.
     pub async fn recv_data_frame(&mut self) -> Result<Frame, HelloError> {
         let frame = read_frame(&mut self.recv).await?;
         self.next_seq = expect_seq(self.next_seq, frame.seq)?;
-        self.gate.payload_from_data(&frame)?;
+        self.gate
+            .payload_from_data(&frame, SystemTime::now(), &self.deny)?;
         Ok(frame)
     }
 
@@ -412,24 +435,115 @@ async fn bind_session(
         return Err(err);
     }
     let peer = gate.peer().cloned().ok_or(HelloError::PeerNotBound)?;
-    let (send, recv) = open_stream(&connection, role).await?;
-    let bound = PeerGate::bound(peer.clone());
+    let (mut send, mut recv) = open_stream(&connection, role).await?;
+    if let Err(err) = exchange_ticket(&mut send, &mut recv, role, auth, &mut gate).await {
+        reject_ticket(&connection);
+        return Err(err);
+    }
+    let local_hash = gyeol_crypto::ticket_hash(&auth.ticket_bytes);
+    let sender_gate = PeerGate::bound(peer.clone());
     Ok(HelloSession {
         connection,
         sender: HelloSender {
             send,
             session_id: random_session_id(),
             next_seq: 0,
-            ticket_hash: auth.ticket_hash,
+            ticket_hash: local_hash,
             peer,
-            gate: bound.clone(),
+            gate: sender_gate,
         },
         receiver: HelloReceiver {
             recv,
             next_seq: 0,
-            gate: bound,
+            gate,
+            deny: auth.deny.clone(),
         },
     })
+}
+
+async fn exchange_ticket(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    role: StreamRole,
+    auth: &Auth,
+    gate: &mut PeerGate,
+) -> Result<(), HelloError> {
+    match role {
+        StreamRole::Client => {
+            write_presented(send, auth).await?;
+            read_presented(recv, auth, gate).await
+        }
+        StreamRole::Server => {
+            read_presented(recv, auth, gate).await?;
+            write_presented(send, auth).await
+        }
+    }
+}
+
+async fn write_presented(send: &mut quinn::SendStream, auth: &Auth) -> Result<(), HelloError> {
+    let frame = presented_frame(&auth.ticket_bytes, &auth.ticket_mac);
+    let bytes = encode_length_prefixed(&frame)?;
+    send.write_all(&bytes)
+        .await
+        .map_err(|err| HelloError::Quic(err.to_string()))?;
+    Ok(())
+}
+
+async fn read_presented(
+    recv: &mut quinn::RecvStream,
+    auth: &Auth,
+    gate: &mut PeerGate,
+) -> Result<(), HelloError> {
+    let frame = match read_frame(recv).await {
+        Ok(frame) => frame,
+        Err(HelloError::StreamClosed) => return Err(HelloError::TicketMissing),
+        Err(err) => return Err(err),
+    };
+    match frame.frame_type {
+        FrameType::Ticket => {}
+        FrameType::Data | FrameType::Ctrl => return Err(HelloError::TicketMissing),
+    }
+    let (ticket_bytes, mac) = split_presented(&frame.payload)?;
+    let admitted = gate.admit_ticket(
+        &auth.ticket_ring,
+        ticket_bytes,
+        &mac,
+        SystemTime::now(),
+        &auth.deny,
+    )?;
+    if frame.ticket_hash != admitted {
+        return Err(HelloError::TicketHash);
+    }
+    Ok(())
+}
+
+/// Build one TICKET frame.
+///
+/// The payload is the 32-byte HMAC tag and then the identity ticket bytes.
+/// `ticket_hash` covers only the identity ticket bytes.
+/// The function does not compute a MAC.
+fn presented_frame(ticket_bytes: &[u8], mac: &[u8; 32]) -> Frame {
+    let mut payload = Vec::with_capacity(TICKET_MAC_LEN + ticket_bytes.len());
+    payload.extend_from_slice(mac);
+    payload.extend_from_slice(ticket_bytes);
+    Frame {
+        frame_type: FrameType::Ticket,
+        flags: 0,
+        session_id: 0,
+        seq: 0,
+        ticket_hash: gyeol_crypto::ticket_hash(ticket_bytes),
+        payload,
+    }
+}
+
+fn split_presented(payload: &[u8]) -> Result<(&[u8], [u8; 32]), HelloError> {
+    if payload.len() <= TICKET_MAC_LEN {
+        return Err(HelloError::TicketMissing);
+    }
+    let (mac_bytes, ticket_bytes) = payload.split_at(TICKET_MAC_LEN);
+    let mut mac = [0u8; 32];
+    mac.copy_from_slice(mac_bytes);
+    Ok((ticket_bytes, mac))
 }
 
 async fn open_stream(
@@ -452,6 +566,13 @@ fn reject(connection: &quinn::Connection) {
     connection.close(
         quinn::VarInt::from_u32(PEER_REJECT_CODE),
         b"peer leaf rejected",
+    );
+}
+
+fn reject_ticket(connection: &quinn::Connection) {
+    connection.close(
+        quinn::VarInt::from_u32(TICKET_REJECT_CODE),
+        b"ticket rejected",
     );
 }
 
@@ -538,8 +659,10 @@ fn client_rustls(config: &HelloConfig) -> Result<(rustls::ClientConfig, Auth), H
 fn auth_from(config: &HelloConfig) -> Auth {
     Auth {
         trust: config.trust.clone(),
-        ticket_hash: config.ticket_hash,
         deny: config.deny.clone(),
+        ticket_bytes: config.ticket_bytes.clone(),
+        ticket_mac: config.ticket_mac,
+        ticket_ring: config.ticket_ring.clone(),
     }
 }
 
@@ -572,7 +695,8 @@ fn io_error(err: std::io::Error) -> HelloError {
 ///
 /// The verifier checks the handshake signature.
 /// The session then calls `PeerGate::bind_leaf`.
-/// DATA stays rejected until that check succeeds.
+/// The session then checks the capability ticket.
+/// DATA stays rejected until both checks succeed.
 struct PresentedLeafVerifier {
     provider: Arc<CryptoProvider>,
 }

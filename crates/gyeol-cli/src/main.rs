@@ -4,16 +4,15 @@ use std::path::PathBuf;
 use gyeol_coord::crate_name as coord_crate;
 use gyeol_crypto::crate_name as crypto_crate;
 use gyeol_datapath::crate_name as datapath_crate;
-use gyeol_datapath::{
-    tun_capability_note, HelloConfig, HelloRequest, HelloRole, TunConfig, DEFAULT_UDP_PORT,
-};
+use gyeol_datapath::{tun_capability_note, HelloRequest, HelloRole, TunConfig, DEFAULT_UDP_PORT};
 use gyeol_edge::crate_name as edge_crate;
 use gyeol_identity::crate_name as identity_crate;
-use gyeol_identity::{ticket_hash, DenySet, TrustBundle};
+use gyeol_identity::TrustBundle;
 
 mod direct;
 mod edge;
 mod relay;
+mod ticket_load;
 
 #[derive(Debug)]
 enum Action {
@@ -141,6 +140,10 @@ gyeol hello-quic server --cert FILE --key FILE --bundle FILE --ticket FILE [--li
 gyeol hello-quic client --cert FILE --key FILE --bundle FILE --ticket FILE --connect ADDR [--listen ADDR] [--tun-address ADDR] [--tun-netmask ADDR] [--tun-name NAME]
 
 The command sends IPv4 packets as DATA frames.
+The command checks the peer capability ticket before it accepts DATA.
+The --ticket file is the identity ticket bytes.
+The command also reads FILE.mac.
+The ticket directory holds ticket-verifier.pem, ticket-mac.key, ticket-not-before, ticket-not-after, and svid-ca.pub.
 The command uses one QUIC bidirectional stream.
 The command uses UDP.
 The default port is {port}.
@@ -260,15 +263,8 @@ fn run_hello_quic(command: HelloQuicCommand) -> Result<(), String> {
     let private_key_pem = read_text(&command.key)?;
     let bundle_pem = read_text(&command.bundle)?;
     let trust = TrustBundle::from_pem(&bundle_pem).map_err(|err| err.to_string())?;
-    let ticket_bytes = std::fs::read(&command.ticket)
-        .map_err(|err| format!("The file {} did not open. {err}", command.ticket.display()))?;
-    let config = HelloConfig {
-        certificate_pem,
-        private_key_pem,
-        trust,
-        ticket_hash: ticket_hash(&ticket_bytes),
-        deny: DenySet::empty(),
-    };
+    let config =
+        ticket_load::load_hello_config(certificate_pem, private_key_pem, trust, &command.ticket)?;
     let role = match command.mode {
         HelloMode::Server => HelloRole::Server {
             listen: command.listen,

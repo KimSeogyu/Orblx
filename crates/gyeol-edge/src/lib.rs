@@ -30,7 +30,6 @@ pub use candidate::{
 };
 pub use direct::{
     issue_direct_pair, DirectIdentity, DirectMaterial, DirectProof, DirectRequest, DirectRole,
-    LAB_TICKET_BYTES,
 };
 pub use error::EdgeError;
 pub use lab::{run_edge_smoke, SmokeReport};

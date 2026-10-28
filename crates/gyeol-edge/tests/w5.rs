@@ -98,10 +98,5 @@ fn direct_budget_sends_punch_packets_and_stays_down() {
 }
 
 fn empty_identity() -> DirectIdentity {
-    DirectIdentity {
-        certificate_pem: String::new(),
-        private_key_pem: String::new(),
-        trust_pem: String::new(),
-        ticket_hash: [0; 16],
-    }
+    DirectIdentity::blank()
 }

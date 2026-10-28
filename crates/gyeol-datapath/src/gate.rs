@@ -1,15 +1,36 @@
+use std::fmt;
 use std::time::SystemTime;
 
+use gyeol_crypto::{verify_ticket, TicketRing};
 use gyeol_identity::{extract_spiffe_id, DenySet, SpiffeId, TrustBundle};
 
 use crate::{is_ipv4_packet, Frame, FrameType, HelloError};
 
-/// The peer SPIFFE ID for one hello-quic session.
+/// The peer SPIFFE ID and the admitted capability ticket.
 ///
-/// DATA frames stay rejected until `bind_leaf` succeeds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// DATA stays rejected until `bind_leaf` and `admit_ticket` succeed.
+/// `payload_from_data` checks the ticket again before it accepts DATA.
+#[derive(Clone)]
 pub struct PeerGate {
     peer: Option<SpiffeId>,
+    admitted: Option<AdmittedTicket>,
+}
+
+#[derive(Clone)]
+struct AdmittedTicket {
+    bytes: Vec<u8>,
+    mac: [u8; 32],
+    ring: TicketRing,
+}
+
+impl fmt::Debug for PeerGate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PeerGate")
+            .field("peer", &self.peer)
+            .field("ticket", &self.admitted.as_ref().map(|_| "admitted"))
+            .finish()
+    }
 }
 
 impl Default for PeerGate {
@@ -22,13 +43,22 @@ impl PeerGate {
     /// Create a gate with no peer.
     #[must_use]
     pub fn new() -> Self {
-        Self { peer: None }
+        Self {
+            peer: None,
+            admitted: None,
+        }
     }
 
     /// Create a gate that already has a peer.
+    ///
+    /// The gate has no capability ticket.
+    /// DATA stays rejected until `admit_ticket` succeeds.
     #[must_use]
     pub fn bound(peer: SpiffeId) -> Self {
-        Self { peer: Some(peer) }
+        Self {
+            peer: Some(peer),
+            admitted: None,
+        }
     }
 
     /// Return the bound SPIFFE ID.
@@ -57,7 +87,43 @@ impl PeerGate {
             return Err(HelloError::PeerRejected);
         }
         self.peer = Some(authed);
+        self.admitted = None;
         self.peer.as_ref().ok_or(HelloError::PeerNotBound)
+    }
+
+    /// Check one presented capability ticket and store it.
+    ///
+    /// Call this function after `bind_leaf`.
+    /// The function calls `gyeol_crypto::verify_ticket`.
+    /// `ticket_bytes` are the identity version-1 ticket bytes.
+    /// `mac` is the HMAC tag over those bytes.
+    /// An empty ticket is missing.
+    /// A bad tag, a bad signature, an expired ticket, or a subject
+    /// that differs from the peer is rejected.
+    pub fn admit_ticket(
+        &mut self,
+        ring: &TicketRing,
+        ticket_bytes: &[u8],
+        mac: &[u8; 32],
+        now: SystemTime,
+        deny: &DenySet,
+    ) -> Result<[u8; 16], HelloError> {
+        let peer = self.require_bound()?.clone();
+        if ticket_bytes.is_empty() {
+            return Err(HelloError::TicketMissing);
+        }
+        let proof =
+            verify_ticket(ring, ticket_bytes, mac, &peer, now, deny).map_err(HelloError::Ticket)?;
+        let hash = *proof.hash();
+        if hash != gyeol_crypto::ticket_hash(ticket_bytes) {
+            return Err(HelloError::TicketHash);
+        }
+        self.admitted = Some(AdmittedTicket {
+            bytes: ticket_bytes.to_vec(),
+            mac: *mac,
+            ring: ring.clone(),
+        });
+        Ok(hash)
     }
 
     /// Return the peer or reject the DATA path.
@@ -88,11 +154,33 @@ impl PeerGate {
     }
 
     /// Return the IPv4 payload of one DATA frame.
-    pub fn payload_from_data<'a>(&self, frame: &'a Frame) -> Result<&'a [u8], HelloError> {
-        self.require_bound()?;
+    ///
+    /// The function calls `gyeol_crypto::verify_ticket` again.
+    /// The frame `ticket_hash` must equal `proof.hash`.
+    /// A missing ticket, a bad ticket, or a different hash is rejected.
+    pub fn payload_from_data<'a>(
+        &self,
+        frame: &'a Frame,
+        now: SystemTime,
+        deny: &DenySet,
+    ) -> Result<&'a [u8], HelloError> {
+        let peer = self.require_bound()?;
         match frame.frame_type {
             FrameType::Data => {}
             FrameType::Ctrl | FrameType::Ticket => return Err(HelloError::NotData),
+        }
+        let admitted = self.admitted.as_ref().ok_or(HelloError::TicketMissing)?;
+        let proof = verify_ticket(
+            &admitted.ring,
+            &admitted.bytes,
+            &admitted.mac,
+            peer,
+            now,
+            deny,
+        )
+        .map_err(HelloError::Ticket)?;
+        if frame.ticket_hash != *proof.hash() {
+            return Err(HelloError::TicketHash);
         }
         if !is_ipv4_packet(&frame.payload) {
             return Err(HelloError::NotIpv4);

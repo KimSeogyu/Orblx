@@ -1,20 +1,20 @@
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use gyeol_crypto::{mac_input, ticket_mac, TicketKey, TicketRing};
 use gyeol_datapath::{ipv4_packet, prove_hello_socket, HelloConfig, HelloError, HelloSocketRole};
-use gyeol_identity::{ticket_hash, DenySet, MiniCa, SpiffeId, TrustBundle};
+use gyeol_identity::{
+    sign_ticket, DenySet, MiniCa, SpiffeId, TicketClaims, TicketFlags, TicketSigner,
+    TicketVerifier, TrustBundle,
+};
 
 use crate::error::io_error;
 use crate::punch::{exchange, punch_plan, PunchCounts, PunchToken};
 use crate::{DirectPhase, EdgeError, EndpointCandidate, PathId, PathMachine, PathState};
 
-/// Ticket bytes for the lab hello-quic proof.
-///
-/// The hash of these bytes is the frame `ticket_hash`.
-/// The bytes are not a signed capability ticket.
-pub const LAB_TICKET_BYTES: &[u8] = b"gyeol-w5-direct";
-
 const PROOF_PAYLOAD: &[u8] = b"direct";
+const TICKET_LIFETIME: Duration = Duration::from_secs(600);
+const TICKET_KEY_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The QUIC role for one Direct attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +28,8 @@ pub enum DirectRole {
 /// Leaf material for the lab QUIC proof.
 ///
 /// C-Key owns the handshake and AEAD.
-/// This material follows the hello-quic leaf check.
+/// The ticket bytes are an identity version-1 capability ticket.
+/// The HMAC tag comes from `gyeol_crypto::ticket_mac`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DirectIdentity {
     /// PEM certificate for this peer.
@@ -37,22 +38,34 @@ pub struct DirectIdentity {
     pub private_key_pem: String,
     /// PEM trust bundle.
     pub trust_pem: String,
-    /// Frame ticket hash.
-    pub ticket_hash: [u8; 16],
+    /// Identity version-1 ticket bytes for this peer.
+    pub ticket_bytes: Vec<u8>,
+    /// HMAC-SHA256 tag over `ticket_bytes`.
+    pub ticket_mac: [u8; 32],
+    /// PEM public key for the ticket signer.
+    pub ticket_verifier_pem: String,
+    /// HMAC key for the ticket tag.
+    pub ticket_mac_key: [u8; 32],
+    /// Start of the ticket key window.
+    pub ticket_not_before: SystemTime,
+    /// End of the ticket key window.
+    pub ticket_not_after: SystemTime,
+    /// Raw Ed25519 public key of the SVID CA.
+    pub svid_ca_public: [u8; 32],
 }
 
 /// Issued leaves for one server and one client.
 pub struct DirectMaterial {
-    /// The QUIC server leaf.
+    /// The QUIC server leaf and ticket.
     pub server: DirectIdentity,
-    /// The QUIC client leaf.
+    /// The QUIC client leaf and ticket.
     pub client: DirectIdentity,
-    /// The bytes whose hash is `ticket_hash`.
-    pub ticket_bytes: Vec<u8>,
 }
 
 /// Issue one mini-CA pair for the Direct lab.
 ///
+/// Each peer gets one capability ticket.
+/// The ticket subject is that peer.
 /// The function does not contact an OIDC provider.
 pub fn issue_direct_pair(now: SystemTime) -> Result<DirectMaterial, EdgeError> {
     let ca = MiniCa::generate(now).map_err(identity_error)?;
@@ -66,36 +79,146 @@ pub fn issue_direct_pair(now: SystemTime) -> Result<DirectMaterial, EdgeError> {
     let client = ca
         .issue(&client_id, now, ttl, &deny)
         .map_err(identity_error)?;
-    let hash = ticket_hash(LAB_TICKET_BYTES);
+    let signer = TicketSigner::generate();
+    if signer.public_key() == *ca.public_key() {
+        return Err(EdgeError::Identity(
+            "The ticket key matches the SVID CA key.".to_string(),
+        ));
+    }
+    let mac_key = random_mac_key()?;
+    let not_before = now;
+    let not_after = now + TICKET_KEY_LIFETIME;
     let trust_pem = ca.certificate_pem().to_string();
+    let ca_public = *ca.public_key();
+    let key = TicketKeyMaterial {
+        signer: &signer,
+        mac_key: &mac_key,
+        not_before,
+        not_after,
+        svid_ca_public: ca_public,
+    };
+    let server_identity = identity_for(
+        server.certificate_pem,
+        server.private_key_pem,
+        trust_pem.clone(),
+        &key,
+        &server_id,
+        now,
+    )?;
+    let client_identity = identity_for(
+        client.certificate_pem,
+        client.private_key_pem,
+        trust_pem,
+        &key,
+        &client_id,
+        now,
+    )?;
     Ok(DirectMaterial {
-        server: DirectIdentity {
-            certificate_pem: server.certificate_pem,
-            private_key_pem: server.private_key_pem,
-            trust_pem: trust_pem.clone(),
-            ticket_hash: hash,
-        },
-        client: DirectIdentity {
-            certificate_pem: client.certificate_pem,
-            private_key_pem: client.private_key_pem,
-            trust_pem,
-            ticket_hash: hash,
-        },
-        ticket_bytes: LAB_TICKET_BYTES.to_vec(),
+        server: server_identity,
+        client: client_identity,
     })
 }
 
 impl DirectIdentity {
+    /// Build material that cannot pass the ticket check.
+    ///
+    /// The punch budget test uses this value.
+    /// QUIC does not start.
+    #[must_use]
+    pub fn blank() -> Self {
+        Self {
+            certificate_pem: String::new(),
+            private_key_pem: String::new(),
+            trust_pem: String::new(),
+            ticket_bytes: Vec::new(),
+            ticket_mac: [0; 32],
+            ticket_verifier_pem: String::new(),
+            ticket_mac_key: [0; 32],
+            ticket_not_before: UNIX_EPOCH,
+            ticket_not_after: UNIX_EPOCH,
+            svid_ca_public: [0xff; 32],
+        }
+    }
+
     pub(crate) fn to_hello(&self) -> Result<HelloConfig, EdgeError> {
         let trust = TrustBundle::from_pem(&self.trust_pem).map_err(identity_error)?;
+        let verifier =
+            TicketVerifier::from_public_pem(&self.ticket_verifier_pem).map_err(identity_error)?;
+        let key = TicketKey::new(
+            verifier,
+            self.ticket_mac_key,
+            self.ticket_not_before,
+            self.ticket_not_after,
+        )
+        .map_err(|err| EdgeError::Identity(err.to_string()))?;
+        let ring = TicketRing::single(key, &self.svid_ca_public)
+            .map_err(|err| EdgeError::Identity(err.to_string()))?;
         Ok(HelloConfig {
             certificate_pem: self.certificate_pem.clone(),
             private_key_pem: self.private_key_pem.clone(),
             trust,
-            ticket_hash: self.ticket_hash,
+            ticket_bytes: self.ticket_bytes.clone(),
+            ticket_mac: self.ticket_mac,
+            ticket_ring: ring,
             deny: DenySet::empty(),
         })
     }
+}
+
+struct TicketKeyMaterial<'a> {
+    signer: &'a TicketSigner,
+    mac_key: &'a [u8; 32],
+    not_before: SystemTime,
+    not_after: SystemTime,
+    svid_ca_public: [u8; 32],
+}
+
+fn identity_for(
+    certificate_pem: String,
+    private_key_pem: String,
+    trust_pem: String,
+    key: &TicketKeyMaterial<'_>,
+    subject: &SpiffeId,
+    now: SystemTime,
+) -> Result<DirectIdentity, EdgeError> {
+    let now_unix = unix_secs(now)?;
+    let claims = TicketClaims {
+        issuer: SpiffeId::coord("1").map_err(identity_error)?,
+        subject: subject.clone(),
+        not_before: now_unix,
+        expires: now_unix + TICKET_LIFETIME.as_secs(),
+        dst_cidr: "10.8.0.0/24".to_string(),
+        proto: 6,
+        dst_port: 443,
+        flags: TicketFlags::none(),
+    };
+    let signed = sign_ticket(key.signer, &claims).map_err(identity_error)?;
+    let mac = ticket_mac(key.mac_key, mac_input(&signed.bytes))
+        .map_err(|err| EdgeError::Identity(err.to_string()))?;
+    Ok(DirectIdentity {
+        certificate_pem,
+        private_key_pem,
+        trust_pem,
+        ticket_bytes: signed.bytes,
+        ticket_mac: mac,
+        ticket_verifier_pem: key.signer.public_key_pem(),
+        ticket_mac_key: *key.mac_key,
+        ticket_not_before: key.not_before,
+        ticket_not_after: key.not_after,
+        svid_ca_public: key.svid_ca_public,
+    })
+}
+
+fn unix_secs(now: SystemTime) -> Result<u64, EdgeError> {
+    now.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| EdgeError::Identity("The time value is not valid.".to_string()))
+}
+
+fn random_mac_key() -> Result<[u8; 32], EdgeError> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|err| EdgeError::Io(err.to_string()))?;
+    Ok(bytes)
 }
 
 /// Inputs for one Direct attempt.

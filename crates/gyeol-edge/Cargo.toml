@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 getrandom = "0.2.17"
+gyeol-crypto = { path = "../gyeol-crypto" }
 gyeol-datapath = { path = "../gyeol-datapath" }
 gyeol-identity = { path = "../gyeol-identity" }
 gyeol-relay = { path = "../gyeol-relay" }
