@@ -64,7 +64,8 @@ h2 {
 .hint,
 .goal,
 .note,
-#hook {
+#hook,
+#audit {
   color: var(--muted);
 }
 

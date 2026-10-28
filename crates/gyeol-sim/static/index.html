@@ -8,7 +8,7 @@
 </head>
 <body>
   <header>
-    <p class="mark">skeleton</p>
+    <p class="mark" id="mark">live</p>
     <h1>gyeol sim</h1>
     <p id="notice">The harness is loading.</p>
     <p id="error" role="alert"></p>
@@ -35,7 +35,7 @@
           <button type="button" id="smash-udp-block">UDP block</button>
           <button type="button" id="smash-agent-spawn">Spawn agent</button>
         </div>
-        <p class="hint">A smash button writes a stub event. A smash button does not run the stack.</p>
+        <p class="hint">Revoke drops the SVID. UDP block runs the NAT path. Spawn agent runs the agent path.</p>
       </section>
     </aside>
     <main>
@@ -67,6 +67,7 @@
       </section>
       <section aria-labelledby="events-title">
         <h2 id="events-title">Event log</h2>
+        <p id="audit"></p>
         <ol id="events" data-panel="events" aria-live="polite"></ol>
       </section>
     </main>

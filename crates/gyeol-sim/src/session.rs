@@ -1,19 +1,28 @@
-//! Placeholder session panels.
+//! Session panels for the live harness.
 //!
-//! The panels stay empty in this skeleton.
-//! The harness does not invent peers, packets, or identity state.
+//! The panels start empty.
+//! A level run writes peers, packets, and identity state.
 
 use serde::Serialize;
 
 /// The state of one session panel.
-///
-/// The skeleton has one variant.
-/// A later week can add a variant when a real feed writes a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PanelState {
     /// The harness has no live value.
     None,
+    /// The value is ready and not up.
+    Ready,
+    /// The path or the identity is up.
+    Up,
+    /// The path is down.
+    Down,
+    /// The check denied the peer.
+    Denied,
+    /// The SVID or the ticket expired.
+    Expired,
+    /// The deny list revoked the SVID.
+    Revoked,
 }
 
 /// One session panel.
@@ -22,7 +31,7 @@ pub struct Panel {
     /// The panel state.
     pub state: PanelState,
     /// The panel sentence.
-    pub detail: &'static str,
+    pub detail: String,
 }
 
 /// One peer row for a later week.
@@ -44,8 +53,6 @@ pub struct PacketRow {
 }
 
 /// The session shell.
-///
-/// Smash actions do not write this value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionView {
     /// Observed peers. The skeleton list is empty.
@@ -67,23 +74,23 @@ pub struct SessionView {
 impl SessionView {
     /// The placeholder shell.
     #[must_use]
-    pub const fn placeholder() -> Self {
+    pub fn placeholder() -> Self {
         Self {
             peers: Vec::new(),
-            peer_empty: "No peers. The harness does not open a session.",
+            peer_empty: "No peers. Select a level or press a smash button.",
             packets: Vec::new(),
-            packet_empty: "No packets. The harness does not capture packets.",
+            packet_empty: "No packets. Select a level or press a smash button.",
             quic: Panel {
                 state: PanelState::None,
-                detail: "The harness does not open a QUIC path.",
+                detail: "The QUIC path is not up.".to_string(),
             },
             svid: Panel {
                 state: PanelState::None,
-                detail: "The harness does not issue an SVID.",
+                detail: "No SVID.".to_string(),
             },
             ticket: Panel {
                 state: PanelState::None,
-                detail: "The harness does not issue a ticket.",
+                detail: "No ticket.".to_string(),
             },
         }
     }
@@ -101,8 +108,8 @@ mod tests {
         assert_eq!(view.quic.state, PanelState::None);
         assert_eq!(view.svid.state, PanelState::None);
         assert_eq!(view.ticket.state, PanelState::None);
-        assert!(view.quic.detail.contains("does not open a QUIC path"));
-        assert!(view.svid.detail.contains("does not issue an SVID"));
-        assert!(view.ticket.detail.contains("does not issue a ticket"));
+        assert!(view.quic.detail.contains("not up"));
+        assert!(view.svid.detail.contains("No SVID"));
+        assert!(view.ticket.detail.contains("No ticket"));
     }
 }

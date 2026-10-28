@@ -73,7 +73,9 @@ function render(state) {
     return;
   }
   lastPayload = payload;
+  document.getElementById("mark").textContent = state.skeleton ? "skeleton" : "live";
   document.getElementById("notice").textContent = state.notice;
+  renderAudit(state.audit);
   renderLevels(state.levels);
   renderDifficulties(state.difficulties);
   document.getElementById("hook").textContent = state.fault_detail;
@@ -175,20 +177,93 @@ function renderSteps(levels) {
   }
   if (!selected) {
     const paragraph = document.createElement("p");
-    paragraph.textContent = "Select a level. The level bodies are empty.";
+    paragraph.textContent = "Select Easy, Medium, or Hard.";
     root.append(paragraph);
     return;
   }
   const title = document.createElement("p");
-  title.textContent = selected.title + ". The level body is empty.";
+  const live = selected.body === "live" ? "The level is live." : "The level has not run.";
+  title.textContent = selected.title + ". " + live;
   const list = document.createElement("ol");
   for (const step of selected.steps) {
     const item = document.createElement("li");
-    const status = step.status === "not_run" ? "not run" : step.status;
-    item.textContent = step.text + " Status: " + status + ".";
+    item.textContent = step.text + " Status: " + statusLabel(step.status) + ".";
     list.append(item);
   }
   root.append(title, list);
+}
+
+function statusLabel(status) {
+  if (status === "not_run") {
+    return "not run";
+  }
+  if (status === "pass") {
+    return "pass";
+  }
+  if (status === "fail") {
+    return "fail";
+  }
+  return status;
+}
+
+function renderAudit(audit) {
+  const root = document.getElementById("audit");
+  if (!audit) {
+    root.textContent = "";
+    return;
+  }
+  const chain = audit.ok ? "The audit chain is valid." : "The audit chain check failed.";
+  root.textContent = "Audit start " + audit.start + ". Audit end " + audit.end + ". Audit deny " + audit.deny + ". " + chain;
+}
+
+function eventSummary(body) {
+  const parts = [];
+  if (body.mode) {
+    parts.push(body.mode);
+  }
+  if (body.overlay_ip) {
+    parts.push("overlay " + body.overlay_ip);
+  }
+  if (body.reflexive) {
+    parts.push("reflexive " + body.reflexive);
+  }
+  if (typeof body.ok === "boolean") {
+    parts.push(body.ok ? "ok" : "not ok");
+  }
+  if (body.hop) {
+    parts.push("hop " + body.hop);
+  }
+  if (body.path) {
+    parts.push("path " + body.path);
+  }
+  if (body.from && body.to) {
+    parts.push(body.from + " to " + body.to);
+  }
+  if (body.rtt_ms !== undefined) {
+    parts.push(String(body.rtt_ms) + " ms");
+  }
+  if (body.peer_uri) {
+    parts.push(body.peer_uri);
+  }
+  if (parts.length === 0) {
+    return "";
+  }
+  return parts.join(". ") + ".";
+}
+
+function eventLine(event) {
+  let detail = event.detail;
+  let kind = event.kind;
+  try {
+    const body = JSON.parse(event.detail);
+    if (body.kind) {
+      kind = body.kind;
+    }
+    detail = body.detail || eventSummary(body) || event.detail;
+  } catch (error) {
+    detail = event.detail;
+  }
+  return event.seq + " " + sourceLabel(event.source) + " " + kind + " " + detail;
 }
 
 function sourceLabel(source) {
@@ -219,7 +294,7 @@ function renderEvents(events) {
   }
   for (const event of events) {
     const item = document.createElement("li");
-    item.textContent = event.seq + " " + sourceLabel(event.source) + " " + event.kind + " " + event.detail;
+    item.textContent = eventLine(event);
     root.append(item);
   }
   if (atBottom) {
@@ -239,3 +314,10 @@ document.getElementById("smash-agent-spawn").addEventListener("click", function 
 
 loadState();
 setInterval(loadState, 1000);
+
+if (window.EventSource) {
+  const stream = new EventSource("/events");
+  stream.onmessage = function () {
+    loadState();
+  };
+}

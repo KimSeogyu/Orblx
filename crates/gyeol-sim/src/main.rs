@@ -55,8 +55,9 @@ gyeol-sim [--listen ADDR]
 
 The command serves the sim harness.
 The default address is {addr}.
-The harness is a skeleton.
-The harness does not run the stack.
+Open the page in a browser.
+Select Easy, Medium, or Hard.
+The page shows packet events and session events.
 ",
         addr = default_listen(),
     )
@@ -90,7 +91,7 @@ mod tests {
         let command = command_from_args(["--help".to_string()]).unwrap();
         assert_eq!(command, Command::Help);
         assert!(help_text().contains("8787"));
-        assert!(help_text().contains("does not run the stack"));
+        assert!(help_text().contains("Easy"));
     }
 
     #[test]

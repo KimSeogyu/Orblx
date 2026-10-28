@@ -2,18 +2,24 @@
 //!
 //! The server binds one TCP port.
 //! The server reads and writes harness state.
-//! The server does not open a QUIC socket.
+//! `GET /events` sends feed JSON as server-sent events.
+//! The server does not open a Unix socket.
 
+use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::{header, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use futures::stream::Stream;
 use serde::Deserialize;
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 
 use crate::difficulty::Difficulty;
 use crate::event::HarnessEvent;
@@ -93,7 +99,8 @@ pub async fn serve(listen: SocketAddr) -> Result<(), SimError> {
     })?;
     println!("The gyeol sim harness is ready.");
     println!("Open http://{local}");
-    println!("The harness is a skeleton. The harness does not run the stack.");
+    println!("Select Easy, Medium, or Hard.");
+    println!("The event stream is http://{local}/events");
     serve_listener(listener).await
 }
 
@@ -126,18 +133,23 @@ fn router() -> Router {
         .route("/api/level", post(post_level))
         .route("/api/difficulty", post(post_difficulty))
         .route("/api/smash", post(post_smash))
+        .route("/events", get(events))
+        .route("/v0/events", get(events))
         .with_state(AppState::new())
 }
 
 #[derive(Clone)]
 struct AppState {
     harness: Arc<Mutex<Harness>>,
+    events: broadcast::Sender<String>,
 }
 
 impl AppState {
     fn new() -> Self {
+        let (events, _) = broadcast::channel(256);
         Self {
             harness: Arc::new(Mutex::new(Harness::new())),
+            events,
         }
     }
 }
@@ -236,11 +248,32 @@ fn apply(state: &AppState, body: impl FnOnce(&mut Harness)) -> (Snapshot, Vec<St
         .unwrap_or_else(|poison| poison.into_inner());
     let start = harness.events().len();
     body(&mut harness);
-    let lines = harness.events()[start..]
-        .iter()
-        .map(HarnessEvent::log_line)
-        .collect();
+    let fresh = &harness.events()[start..];
+    for event in fresh {
+        let _ = state.events.send(event.detail.clone());
+    }
+    let lines = fresh.iter().map(HarnessEvent::log_line).collect();
     (harness.snapshot(), lines)
+}
+
+async fn events(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = state.events.subscribe();
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(line) => return Some((Ok(Event::default().data(line)), rx)),
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
 }
 
 fn write_log(lines: &[String]) {
@@ -308,7 +341,7 @@ mod tests {
         assert!(state.contains("Agent JIT"));
         assert!(state.contains("Radioactive NAT"));
         assert!(state.contains("\"armed\":false"));
-        assert!(state.contains("\"skeleton\":true"));
+        assert!(state.contains("\"skeleton\":false"));
 
         let page = exchange(addr, "GET / HTTP/1.1", "").await;
         assert!(page.contains("HTTP/1.1 200"));
@@ -316,8 +349,10 @@ mod tests {
 
         let smash = exchange(addr, "POST /api/smash HTTP/1.1", "{\"id\":\"revoke\"}").await;
         assert!(smash.contains("HTTP/1.1 200"));
-        assert!(smash.contains("did not revoke"));
-        assert!(smash.contains("\"state\":\"none\""));
+        assert!(smash.contains("svid.revoked"));
+        assert!(smash.contains("session.dropped"));
+        assert!(smash.contains("within_s"));
+        assert!(smash.contains("\"state\":\"revoked\""));
 
         let bad = exchange(addr, "POST /api/smash HTTP/1.1", "{\"id\":\"nope\"}").await;
         assert!(bad.contains("HTTP/1.1 400"));

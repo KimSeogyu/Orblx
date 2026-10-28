@@ -1,7 +1,9 @@
 //! Fault-injection difficulty hooks.
 //!
-//! The harness stores Easy, Medium, or Hard.
-//! The harness does not inject a fault.
+//! Easy runs City Breeze.
+//! Medium runs Agent JIT.
+//! Hard runs Radioactive NAT.
+//! The harness arms the hook when a level runs.
 
 use serde::Serialize;
 
@@ -41,9 +43,9 @@ impl Difficulty {
     #[must_use]
     pub const fn note(self) -> &'static str {
         match self {
-            Self::Easy => "Later weeks can attach a light fault set.",
-            Self::Medium => "Later weeks can attach a mixed fault set.",
-            Self::Hard => "Later weeks can attach a heavy fault set.",
+            Self::Easy => "Press Revoke to drop the human SVID.",
+            Self::Medium => "Spawn agent allows application A and denies application B.",
+            Self::Hard => "UDP block moves the path to the TCP Relay.",
         }
     }
 

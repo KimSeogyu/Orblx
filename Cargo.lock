@@ -747,6 +747,12 @@ name = "gyeol-sim"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures",
+ "gyeol-audit",
+ "gyeol-datapath",
+ "gyeol-edge",
+ "gyeol-identity",
+ "gyeol-relay",
  "serde",
  "serde_json",
  "tokio",
