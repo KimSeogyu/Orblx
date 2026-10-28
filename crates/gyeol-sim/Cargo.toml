@@ -1,6 +1,6 @@
 [package]
 name = "gyeol-sim"
-description = "Local sim harness skeleton. The harness does not run the gyeol-quic stack."
+description = "Local sim harness. The harness runs three level state machines and serves feed JSON."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
@@ -10,11 +10,18 @@ version.workspace = true
 name = "gyeol-sim"
 path = "src/main.rs"
 
-# This crate is a local harness skeleton.
+# This crate is the local sim harness.
 # Do not add WireGuard, Headscale, or DERP crates.
+# Do not add a Unix socket for the feed.
 
 [dependencies]
 axum = "0.7.9"
+gyeol-audit = { path = "../gyeol-audit" }
+gyeol-datapath = { path = "../gyeol-datapath" }
+gyeol-edge = { path = "../gyeol-edge" }
+gyeol-identity = { path = "../gyeol-identity" }
+gyeol-relay = { path = "../gyeol-relay" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+futures = "0.3.34"
 tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

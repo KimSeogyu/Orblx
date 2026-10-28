@@ -3,16 +3,18 @@
 //! The operator can select a level.
 //! The operator can select a difficulty.
 //! The operator can press a smash button.
-//! Those actions write stub events.
-//! Those actions do not run the stack.
+//! Those actions run the level machine.
+//! The machine updates the session panels.
 
 use serde::Serialize;
 
 use crate::difficulty::{Difficulty, DifficultyCard, FaultHook};
-use crate::event::{EventBus, EventKind, EventSource, HarnessEvent, StackFeed};
+use crate::envelope::FeedLine;
+use crate::event::{EventBus, EventKind, HarnessEvent, StackFeed};
 use crate::feed::{DatapathFeed, EdgeNatFeed, IdentityFeed};
 use crate::level::{LevelCard, LevelId};
 use crate::session::SessionView;
+use crate::sim::{AuditView, Engine};
 
 /// A smash button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +42,7 @@ impl Smash {
 /// A JSON snapshot for the web UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Snapshot {
-    /// True while this build is a skeleton.
+    /// True while this build does not run a level machine.
     pub skeleton: bool,
     /// The page notice.
     pub notice: &'static str,
@@ -56,13 +58,13 @@ pub struct Snapshot {
     pub session: SessionView,
     /// The event log.
     pub events: Vec<HarnessEvent>,
+    /// The session audit chain for this run.
+    pub audit: AuditView,
 }
 
 /// The sim harness.
 pub struct Harness {
-    level: Option<LevelId>,
-    difficulty: Difficulty,
-    session: SessionView,
+    engine: Engine,
     bus: EventBus,
     feeds: Vec<Box<dyn StackFeed + Send>>,
 }
@@ -74,25 +76,23 @@ impl Default for Harness {
 }
 
 impl Harness {
-    /// Create a harness with the three empty stack feeds.
+    /// Create a harness with the three stack feeds.
     #[must_use]
     pub fn new() -> Self {
         Self::with_feeds(vec![
-            Box::new(IdentityFeed),
-            Box::new(EdgeNatFeed),
-            Box::new(DatapathFeed),
+            Box::new(IdentityFeed::default()),
+            Box::new(EdgeNatFeed::default()),
+            Box::new(DatapathFeed::default()),
         ])
     }
 
     /// Create a harness with caller-supplied feeds.
     ///
-    /// A later week can pass a live Identity, EdgeNAT, or Datapath feed.
+    /// A live Identity, EdgeNAT, or Datapath feed can replace a sim feed.
     #[must_use]
     pub fn with_feeds(feeds: Vec<Box<dyn StackFeed + Send>>) -> Self {
         Self {
-            level: None,
-            difficulty: Difficulty::Easy,
-            session: SessionView::placeholder(),
+            engine: Engine::new(),
             bus: EventBus::new(),
             feeds,
         }
@@ -107,60 +107,46 @@ impl Harness {
     /// The session panels.
     #[must_use]
     pub fn session(&self) -> &SessionView {
-        &self.session
+        self.engine.session()
     }
 
-    /// Select a level.
-    ///
-    /// The level body stays empty.
+    /// Select a level and run its script.
     pub fn select_level(&mut self, id: LevelId) {
-        self.level = Some(id);
-        self.bus.push(
-            EventSource::Harness,
-            EventKind::LevelSelected,
-            format!(
-                "The operator selected {}. The level body is empty. The harness did not run the level.",
-                id.title()
-            ),
-        );
+        let lines = self.engine.select_level(id);
+        self.stage(lines);
     }
 
-    /// Store a difficulty hook.
-    ///
-    /// The hook stays disarmed.
+    /// Select a difficulty and run the matching level.
     pub fn select_difficulty(&mut self, difficulty: Difficulty) {
-        self.difficulty = difficulty;
-        let hook = difficulty.hook();
-        self.bus.push(
-            EventSource::Harness,
-            EventKind::DifficultySelected,
-            format!(
-                "The operator selected {}. {}",
-                difficulty.label(),
-                hook.detail()
-            ),
-        );
+        let lines = self.engine.select_difficulty(difficulty);
+        self.stage(lines);
     }
 
-    /// Record a smash stub event.
-    ///
-    /// The session panels do not change.
+    /// Run one smash action.
     pub fn smash(&mut self, action: Smash) {
-        let (kind, detail) = match action {
-            Smash::Revoke => (
-                EventKind::SmashRevoke,
-                "The operator pressed revoke. The harness did not revoke an SVID. The harness did not drop packets.",
-            ),
-            Smash::UdpBlock => (
-                EventKind::SmashUdpBlock,
-                "The operator pressed UDP block. The harness did not block UDP. The harness did not change the path.",
-            ),
-            Smash::AgentSpawn => (
-                EventKind::SmashAgentSpawn,
-                "The operator pressed agent spawn. The harness did not spawn an agent. The harness did not write an allow or a deny.",
-            ),
+        let lines = match action {
+            Smash::Revoke => self.engine.revoke(),
+            Smash::UdpBlock => self.engine.block_udp(),
+            Smash::AgentSpawn => self.engine.spawn_agent(),
         };
-        self.bus.push(EventSource::Harness, kind, detail);
+        self.stage(lines);
+    }
+
+    fn stage(&mut self, lines: Vec<FeedLine>) {
+        for line in lines {
+            let mut queued = false;
+            for feed in &mut self.feeds {
+                if feed.source() == line.source {
+                    feed.enqueue(line.body.clone());
+                    queued = true;
+                    break;
+                }
+            }
+            if !queued {
+                self.bus.push(line.source, bus_kind(&line.body), line.body);
+            }
+        }
+        self.poll_feeds();
     }
 
     /// Drain the stack feeds into the event bus.
@@ -172,7 +158,8 @@ impl Harness {
             let source = feed.source();
             let details = feed.drain();
             for detail in details {
-                self.bus.push(source, EventKind::Feed, detail);
+                let kind = bus_kind(&detail);
+                self.bus.push(source, kind, detail);
             }
         }
     }
@@ -182,23 +169,55 @@ impl Harness {
     pub fn snapshot(&self) -> Snapshot {
         let levels = LevelId::all()
             .into_iter()
-            .map(|id| id.card(self.level == Some(id)))
+            .map(|id| {
+                let selected = self.engine.selected() && self.engine.level() == id;
+                let statuses = if selected {
+                    self.engine.steps().to_vec()
+                } else {
+                    Vec::new()
+                };
+                id.card(selected, selected && self.engine.live(), &statuses)
+            })
             .collect();
         let difficulties = Difficulty::all()
             .into_iter()
-            .map(|difficulty| difficulty.card(difficulty == self.difficulty))
+            .map(|difficulty| difficulty.card(difficulty == self.engine.difficulty()))
             .collect();
-        let fault_hook = self.difficulty.hook();
+        let fault_hook = FaultHook {
+            difficulty: self.engine.difficulty(),
+            armed: self.engine.armed(),
+        };
         Snapshot {
-            skeleton: true,
-            notice: "This page is a skeleton. The buttons write stub events. The buttons do not run the gyeol-quic stack.",
+            skeleton: false,
+            notice: "The harness runs the level machines. Smash buttons write live feed events.",
             levels,
             difficulties,
             fault_detail: fault_hook.detail(),
             fault_hook,
-            session: self.session.clone(),
+            session: self.engine.session().clone(),
             events: self.bus.events().to_vec(),
+            audit: self.engine.audit_view(),
         }
+    }
+}
+
+fn bus_kind(body: &str) -> EventKind {
+    let kind = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("kind")
+                .and_then(|item| item.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    match kind.as_str() {
+        "level_selected" => EventKind::LevelSelected,
+        "difficulty_selected" => EventKind::DifficultySelected,
+        "smash_revoke" | "svid.revoked" | "session.dropped" => EventKind::SmashRevoke,
+        "smash_udp_block" | "nat.inject" => EventKind::SmashUdpBlock,
+        "smash_agent_spawn" | "agent.spawned" => EventKind::SmashAgentSpawn,
+        _ => EventKind::Feed,
     }
 }
 
@@ -223,51 +242,63 @@ mod tests {
     }
 
     #[test]
-    fn smash_writes_stub_events_and_keeps_the_session_empty() {
+    fn smash_updates_the_session_panels() {
         let mut harness = Harness::new();
-        let before = harness.session().clone();
-        harness.smash(Smash::Revoke);
-        harness.smash(Smash::UdpBlock);
         harness.smash(Smash::AgentSpawn);
-        assert_eq!(harness.session(), &before);
-        assert_eq!(harness.session().quic.state, PanelState::None);
-        assert_eq!(harness.session().svid.state, PanelState::None);
-        assert_eq!(harness.session().ticket.state, PanelState::None);
-        assert!(harness.session().peers.is_empty());
-        assert!(harness.session().packets.is_empty());
-        assert_eq!(harness.events().len(), 3);
-        assert!(harness.events()[0].detail.contains("did not revoke"));
-        assert!(harness.events()[1].detail.contains("did not block UDP"));
-        assert!(harness.events()[2].detail.contains("did not spawn"));
-        assert_eq!(harness.events()[0].kind, EventKind::SmashRevoke);
+        assert_ne!(harness.session().svid.state, PanelState::None);
+        assert!(!harness.session().peers.is_empty());
+        let body = harness
+            .events()
+            .iter()
+            .map(|event| event.detail.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("agent.spawned"));
+        assert!(body.contains("jit.allow"));
+        assert!(body.contains("jit.deny"));
+        assert!(body.contains("svid.expired"));
+        assert!(body.contains("\"v\":1"));
     }
 
     #[test]
-    fn level_selection_does_not_run_the_level() {
+    fn level_selection_runs_the_level() {
         let mut harness = Harness::new();
-        let before = harness.session().clone();
-        harness.select_level(LevelId::RadioactiveNat);
+        harness.select_level(LevelId::CityBreeze);
         let snapshot = harness.snapshot();
         let selected = snapshot.levels.iter().find(|level| level.selected).unwrap();
-        assert_eq!(selected.title, "Radioactive NAT");
-        assert_eq!(selected.body, LevelBody::Empty);
+        assert_eq!(selected.title, "City Breeze");
+        assert_eq!(selected.body, LevelBody::Live);
         assert!(selected
             .steps
             .iter()
-            .all(|step| step.status == StepStatus::NotRun));
-        assert!(harness.events()[0].detail.contains("did not run the level"));
-        assert_eq!(harness.session(), &before);
+            .all(|step| step.status == StepStatus::Pass));
+        assert!(harness.events()[0].detail.contains("City Breeze"));
+        assert!(!harness.session().packets.is_empty());
+        assert!(snapshot.audit.ok);
+        assert!(!snapshot.skeleton);
     }
 
     #[test]
-    fn difficulty_selection_does_not_arm_the_hook() {
+    fn difficulty_selection_arms_the_hook() {
         let mut harness = Harness::new();
         harness.select_difficulty(Difficulty::Hard);
         let snapshot = harness.snapshot();
-        assert!(!snapshot.fault_hook.armed);
+        assert!(snapshot.fault_hook.armed);
         assert_eq!(snapshot.fault_hook.difficulty, Difficulty::Hard);
-        assert!(snapshot.fault_detail.contains("not armed"));
+        assert!(snapshot.fault_detail.contains("armed"));
         assert!(harness.events()[0].detail.contains("Hard"));
+        let body = harness
+            .events()
+            .iter()
+            .map(|event| event.detail.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let direct = body.find("\"kind\":\"path.direct\"").unwrap();
+        let switch = body.find("\"kind\":\"path.switch\"").unwrap();
+        assert!(direct < switch);
+        assert!(body.contains("\"ok\":false"));
+        assert!(body.contains("session.dropped"));
+        assert!(body.contains("\"within_s\""));
     }
 
     #[test]
@@ -288,7 +319,7 @@ mod tests {
         harness.poll_feeds();
         assert!(harness.events().is_empty());
         let snapshot = harness.snapshot();
-        assert!(snapshot.skeleton);
+        assert!(!snapshot.skeleton);
         assert_eq!(snapshot.levels.len(), 3);
         assert_eq!(snapshot.difficulties.len(), 3);
         assert!(snapshot.events.is_empty());

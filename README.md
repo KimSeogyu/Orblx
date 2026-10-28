@@ -325,10 +325,14 @@ Run the script:
 
 ## Sim harness
 
-The sim harness is a local skeleton.
-The crate name is `gyeol-sim`.
-The level bodies are empty.
-The harness does not run the gyeol-quic stack.
+The sim harness crate is `gyeol-sim`.
+The harness runs three levels.
+The levels are City Breeze, Agent JIT, and Radioactive NAT.
+Select Easy, Medium, or Hard on the page.
+The page shows peers, packets, and session panels.
+The event log shows feed JSON from those runs.
+Read the feed fields in [docs/w11-feed-v1.md](docs/w11-feed-v1.md).
+Read the run steps in [docs/demo-sim.md](docs/demo-sim.md).
 
 Run the harness:
 
@@ -337,9 +341,6 @@ cargo run -p gyeol-sim
 ```
 
 Open `http://127.0.0.1:8787`.
-
-The three levels are City Breeze, Agent JIT, and Radioactive NAT.
-Read the run steps in [docs/demo-sim.md](docs/demo-sim.md).
 
 ## License
 

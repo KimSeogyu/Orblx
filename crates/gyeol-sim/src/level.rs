@@ -1,10 +1,11 @@
-//! Level stubs for the sim harness.
+//! Levels for the sim harness.
 //!
 //! Each level has a name and a script.
-//! Each level body is empty.
-//! The harness does not run a level.
+//! The harness runs the script.
 
 use serde::Serialize;
+
+use crate::difficulty::Difficulty;
 
 /// The three harness levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -36,9 +37,6 @@ impl LevelId {
     }
 
     /// The level script in short sentences.
-    ///
-    /// The script is a description.
-    /// The harness does not run the script.
     #[must_use]
     pub const fn goal(self) -> &'static str {
         match self {
@@ -55,8 +53,6 @@ impl LevelId {
     }
 
     /// The script steps.
-    ///
-    /// Every step stays `not run` in this skeleton.
     #[must_use]
     pub const fn steps(self) -> &'static [&'static str] {
         match self {
@@ -92,16 +88,26 @@ impl LevelId {
             other => Err(format!("The level {other} is not valid.")),
         }
     }
+
+    /// The difficulty that matches this level.
+    #[must_use]
+    pub const fn difficulty(self) -> Difficulty {
+        match self {
+            Self::CityBreeze => Difficulty::Easy,
+            Self::AgentJit => Difficulty::Medium,
+            Self::RadioactiveNat => Difficulty::Hard,
+        }
+    }
 }
 
 /// The level body.
-///
-/// The skeleton has one variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LevelBody {
-    /// The level has no runner.
+    /// The level has not run.
     Empty,
+    /// The level machine has run.
+    Live,
 }
 
 /// The status of one script step.
@@ -110,6 +116,10 @@ pub enum LevelBody {
 pub enum StepStatus {
     /// The harness did not run the step.
     NotRun,
+    /// The step passed.
+    Pass,
+    /// The step failed.
+    Fail,
 }
 
 /// One level card in a snapshot.
@@ -123,7 +133,7 @@ pub struct LevelCard {
     pub goal: &'static str,
     /// Script steps.
     pub steps: Vec<LevelStep>,
-    /// Body state. The skeleton value is empty.
+    /// Body state.
     pub body: LevelBody,
     /// True when the operator selected this level.
     pub selected: bool,
@@ -134,21 +144,25 @@ pub struct LevelCard {
 pub struct LevelStep {
     /// The step sentence.
     pub text: &'static str,
-    /// The step status. The skeleton value is `not run`.
+    /// The step status.
     pub status: StepStatus,
 }
 
 impl LevelId {
     /// Build the card for a snapshot.
+    ///
+    /// `statuses` aligns with `steps`.
+    /// A missing status stays `not run`.
     #[must_use]
-    pub fn card(self, selected: bool) -> LevelCard {
+    pub fn card(self, selected: bool, live: bool, statuses: &[StepStatus]) -> LevelCard {
         let steps = self
             .steps()
             .iter()
             .copied()
-            .map(|text| LevelStep {
+            .enumerate()
+            .map(|(index, text)| LevelStep {
                 text,
-                status: StepStatus::NotRun,
+                status: statuses.get(index).copied().unwrap_or(StepStatus::NotRun),
             })
             .collect();
         LevelCard {
@@ -156,7 +170,11 @@ impl LevelId {
             title: self.title(),
             goal: self.goal(),
             steps,
-            body: LevelBody::Empty,
+            body: if live {
+                LevelBody::Live
+            } else {
+                LevelBody::Empty
+            },
             selected,
         }
     }
@@ -199,7 +217,7 @@ mod tests {
     #[test]
     fn cards_are_empty() {
         for id in LevelId::all() {
-            let card = id.card(false);
+            let card = id.card(false, false, &[]);
             assert_eq!(card.body, LevelBody::Empty);
             assert!(!card.steps.is_empty());
             assert!(card

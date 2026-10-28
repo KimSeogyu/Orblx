@@ -1,17 +1,18 @@
 # Sim harness
 
-The sim harness is a local skeleton.
+The sim harness runs three levels.
 The crate name is `gyeol-sim`.
 The harness serves a web page.
-The harness does not run the gyeol-quic stack.
-The harness does not open a TUN device.
-The harness does not open a QUIC socket.
-The harness does not issue an SVID.
-The harness does not issue a ticket.
+The page shows peers, packets, the QUIC path, the SVID, and the ticket.
+The event log shows feed JSON.
+The feed version is 1.
+Read the field list in [w11-feed-v1.md](w11-feed-v1.md).
 
-The level bodies are empty.
-A button writes a stub event.
-A button does not pretend that the stack ran.
+The harness does not open a TUN device.
+The harness does not open a Unix socket.
+The harness does not play a success animation.
+A button runs a state machine.
+The machine writes one feed object per transition.
 
 ## Run
 
@@ -39,47 +40,43 @@ cargo run -p gyeol-sim -- --help
 
 ## Levels
 
-The harness has three levels.
+Select a level or select a difficulty.
+Easy runs City Breeze.
+Medium runs Agent JIT.
+Hard runs Radioactive NAT.
 
-- City Breeze. A human uses OIDC to get an SVID. The human sends an overlay ping. The human opens two HTTPS applications.
-- Agent JIT. The operator spawns an agent. Application A allows the agent. Application B denies the agent. The ticket TTL expiry is visible.
-- Radioactive NAT. The path can block UDP. The path can use symmetric NAT. The order is Allocate, then Direct, then Relay. An SVID revoke drops new packets within 60 seconds.
+- City Breeze. A human uses OIDC to get an SVID. The human sends an overlay ping. The human opens two HTTPS applications. Press Revoke to drop that SVID.
+- Agent JIT. Spawn agent creates the agent SVID. Application A allows the agent. Application B denies the agent. The ticket TTL expiry is visible.
+- Radioactive NAT. UDP block and symmetric NAT are injected. The order is Allocate, then Direct, then Relay. Direct fails before the switch. An SVID revoke drops new packets within 60 seconds.
 
-Each step has the status `not run`.
+A passed step has the status `pass`.
 
 ## Difficulty
 
 The difficulty values are Easy, Medium, and Hard.
-The harness stores the selected value.
-The fault hook is not armed.
-The harness does not inject a fault.
+The fault hook is armed when the level runs.
+Easy arms the revoke inject.
+Medium arms the agent allow and deny path.
+Hard arms UDP block and symmetric NAT.
 
 ## Page
 
-The page has a Peers panel.
-The page has a Packets panel.
-The page has a QUIC path panel.
-The page has an SVID panel.
-The page has a Ticket panel.
-The page has an event log.
-
 The smash buttons are Revoke, UDP block, and Spawn agent.
-Revoke does not revoke an SVID.
-UDP block does not block UDP.
-Spawn agent does not spawn an agent.
-The terminal prints each new stub event.
+Revoke writes `svid.revoked` and then `session.dropped`.
+`within_s` is the wall-clock seconds for that drop.
+UDP block writes `nat.inject` and the path events.
+Spawn agent writes `agent.spawned`, `jit.allow`, `jit.deny`, and `svid.expired`.
+The terminal prints each new event.
+`GET /events` sends the same JSON.
 
 ## Event bus
 
 The trait name is `StackFeed`.
-`IdentityFeed` is the Identity stub.
-`EdgeNatFeed` is the EdgeNAT stub.
-`DatapathFeed` is the Datapath stub.
-Each stub returns no events.
-A later week can implement `StackFeed` for a live stack feed.
-`Harness::with_feeds` accepts those feeds.
-A feed line does not fill the session panels.
-This skeleton does not write the session panels.
+`drain` returns JSON objects.
+`IdentityFeed` carries identity kinds.
+`EdgeNatFeed` carries EdgeNAT kinds.
+`DatapathFeed` carries datapath kinds.
+`Harness::with_feeds` accepts a replacement feed.
 
 ## Checks
 

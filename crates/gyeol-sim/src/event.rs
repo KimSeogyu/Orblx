@@ -1,8 +1,7 @@
 //! Event bus for the sim harness.
 //!
-//! Smash buttons write stub events.
-//! Identity, EdgeNAT, and Datapath can feed events later.
-//! A feed event does not change the session panels.
+//! Smash buttons run a level machine.
+//! The machine writes JSON version 1 through `StackFeed`.
 
 use serde::Serialize;
 
@@ -15,11 +14,11 @@ const EVENT_CAP: usize = 256;
 pub enum EventSource {
     /// The harness UI or a smash button.
     Harness,
-    /// The identity stack. The stub feed is empty.
+    /// The identity stack.
     Identity,
-    /// The edge NAT stack. The stub feed is empty.
+    /// The edge NAT stack.
     EdgeNat,
-    /// The data path stack. The stub feed is empty.
+    /// The data path stack.
     Datapath,
 }
 
@@ -98,16 +97,19 @@ impl HarnessEvent {
 
 /// A producer of harness events.
 ///
-/// Identity, EdgeNAT, and Datapath can implement this trait later.
-/// A stub feed returns no lines.
+/// `drain` returns one JSON object per string.
+/// The object is feed version 1.
 pub trait StackFeed {
     /// The event source for drained lines.
     fn source(&self) -> EventSource;
 
     /// Take the lines that are ready.
-    ///
-    /// The skeleton feeds return an empty list.
     fn drain(&mut self) -> Vec<String>;
+
+    /// Store one JSON line until `drain`.
+    fn enqueue(&mut self, line: String) {
+        let _ = line;
+    }
 }
 
 /// The in-memory event log.

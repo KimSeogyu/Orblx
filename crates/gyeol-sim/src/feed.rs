@@ -1,16 +1,16 @@
-//! Empty stack feeds.
+//! Stack feeds for the sim harness.
 //!
-//! The feeds exist so a later week can replace them.
-//! Each feed returns no events.
+//! Each feed stores JSON lines.
+//! `drain` returns those lines.
+//! A new feed has no lines.
 
 use crate::event::{EventSource, StackFeed};
 
-/// The identity feed stub.
-///
-/// The stub does not issue an SVID.
-/// The stub does not read the identity crate.
+/// The identity feed.
 #[derive(Debug, Default)]
-pub struct IdentityFeed;
+pub struct IdentityFeed {
+    pending: Vec<String>,
+}
 
 impl StackFeed for IdentityFeed {
     fn source(&self) -> EventSource {
@@ -18,17 +18,19 @@ impl StackFeed for IdentityFeed {
     }
 
     fn drain(&mut self) -> Vec<String> {
-        Vec::new()
+        std::mem::take(&mut self.pending)
+    }
+
+    fn enqueue(&mut self, line: String) {
+        self.pending.push(line);
     }
 }
 
-/// The edge NAT feed stub.
-///
-/// The stub does not allocate a path.
-/// The stub does not punch a hole.
-/// The stub does not open a relay socket.
+/// The edge NAT feed.
 #[derive(Debug, Default)]
-pub struct EdgeNatFeed;
+pub struct EdgeNatFeed {
+    pending: Vec<String>,
+}
 
 impl StackFeed for EdgeNatFeed {
     fn source(&self) -> EventSource {
@@ -36,16 +38,19 @@ impl StackFeed for EdgeNatFeed {
     }
 
     fn drain(&mut self) -> Vec<String> {
-        Vec::new()
+        std::mem::take(&mut self.pending)
+    }
+
+    fn enqueue(&mut self, line: String) {
+        self.pending.push(line);
     }
 }
 
-/// The data path feed stub.
-///
-/// The stub does not open a QUIC socket.
-/// The stub does not read a packet.
+/// The data path feed.
 #[derive(Debug, Default)]
-pub struct DatapathFeed;
+pub struct DatapathFeed {
+    pending: Vec<String>,
+}
 
 impl StackFeed for DatapathFeed {
     fn source(&self) -> EventSource {
@@ -53,7 +58,11 @@ impl StackFeed for DatapathFeed {
     }
 
     fn drain(&mut self) -> Vec<String> {
-        Vec::new()
+        std::mem::take(&mut self.pending)
+    }
+
+    fn enqueue(&mut self, line: String) {
+        self.pending.push(line);
     }
 }
 
@@ -65,13 +74,16 @@ mod tests {
     #[test]
     fn stub_feeds_are_empty() {
         let mut bus = EventBus::new();
-        bus.ingest(&mut IdentityFeed);
-        bus.ingest(&mut EdgeNatFeed);
-        bus.ingest(&mut DatapathFeed);
+        let mut identity = IdentityFeed::default();
+        let mut edge = EdgeNatFeed::default();
+        let mut data = DatapathFeed::default();
+        bus.ingest(&mut identity);
+        bus.ingest(&mut edge);
+        bus.ingest(&mut data);
         assert!(bus.events().is_empty());
-        assert_eq!(IdentityFeed.source(), EventSource::Identity);
-        assert_eq!(EdgeNatFeed.source(), EventSource::EdgeNat);
-        assert_eq!(DatapathFeed.source(), EventSource::Datapath);
+        assert_eq!(identity.source(), EventSource::Identity);
+        assert_eq!(edge.source(), EventSource::EdgeNat);
+        assert_eq!(data.source(), EventSource::Datapath);
         assert_eq!(EventSource::EdgeNat.label(), "EdgeNAT");
         assert_eq!(EventSource::Datapath.label(), "Datapath");
     }
