@@ -1,15 +1,23 @@
 use std::fmt;
 use std::time::SystemTime;
 
-use gyeol_crypto::{verify_ticket, TicketRing};
-use gyeol_identity::{extract_spiffe_id, DenySet, SpiffeId, TrustBundle};
+use gyeol_crypto::{verify_ticket, TicketProof, TicketRing};
+use gyeol_identity::{
+    allow_agent_jit, extract_spiffe_id, DenySet, Ipv4Destination, SpiffeId, TrustBundle,
+    WorkloadKind,
+};
 
+use crate::ipv4::tcp_udp_destination;
 use crate::{is_ipv4_packet, Frame, FrameType, HelloError};
 
 /// The peer SPIFFE ID and the admitted capability ticket.
 ///
 /// DATA stays rejected until `bind_leaf` and `admit_ticket` succeed.
 /// `payload_from_data` checks the ticket again before it accepts DATA.
+/// An agent peer must present a JIT ticket.
+/// That ticket allows one destination.
+/// Every other agent destination is denied.
+/// A human peer keeps the ticket check and does not use the agent allow.
 #[derive(Clone)]
 pub struct PeerGate {
     peer: Option<SpiffeId>,
@@ -100,6 +108,7 @@ impl PeerGate {
     /// An empty ticket is missing.
     /// A bad tag, a bad signature, an expired ticket, or a subject
     /// that differs from the peer is rejected.
+    /// An agent ticket that does not set the JIT flag is denied after the ticket check.
     pub fn admit_ticket(
         &mut self,
         ring: &TicketRing,
@@ -117,6 +126,9 @@ impl PeerGate {
         let hash = *proof.hash();
         if hash != gyeol_crypto::ticket_hash(ticket_bytes) {
             return Err(HelloError::TicketHash);
+        }
+        if peer.kind() == WorkloadKind::Agent && !proof.flags().agent_jit() {
+            return Err(HelloError::DestinationDenied);
         }
         self.admitted = Some(AdmittedTicket {
             bytes: ticket_bytes.to_vec(),
@@ -158,6 +170,8 @@ impl PeerGate {
     /// The function calls `gyeol_crypto::verify_ticket` again.
     /// The frame `ticket_hash` must equal `proof.hash`.
     /// A missing ticket, a bad ticket, or a different hash is rejected.
+    /// The destination check runs after the ticket check.
+    /// An agent packet to any other destination is rejected.
     pub fn payload_from_data<'a>(
         &self,
         frame: &'a Frame,
@@ -185,6 +199,28 @@ impl PeerGate {
         if !is_ipv4_packet(&frame.payload) {
             return Err(HelloError::NotIpv4);
         }
+        if peer.kind() == WorkloadKind::Agent {
+            admit_agent_destination(&proof, &frame.payload)?;
+        }
         Ok(&frame.payload)
     }
+}
+
+fn admit_agent_destination(proof: &TicketProof, packet: &[u8]) -> Result<(), HelloError> {
+    if !proof.flags().agent_jit() {
+        return Err(HelloError::DestinationDenied);
+    }
+    let parsed = tcp_udp_destination(packet).ok_or(HelloError::DestinationDenied)?;
+    allow_agent_jit(
+        proof.flags(),
+        proof.dst_cidr(),
+        proof.proto(),
+        proof.dst_port(),
+        Ipv4Destination {
+            addr: parsed.addr,
+            proto: parsed.proto,
+            port: parsed.port,
+        },
+    )
+    .map_err(|_| HelloError::DestinationDenied)
 }

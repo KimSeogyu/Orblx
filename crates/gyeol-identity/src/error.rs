@@ -9,6 +9,8 @@ pub enum IdentityError {
     Certificate,
     /// The deny document check failed.
     DenyDocument,
+    /// The destination is not allowed.
+    Denied,
     /// The byte encoding check failed.
     Encoding,
     /// The end time has passed.
@@ -37,6 +39,7 @@ impl fmt::Display for IdentityError {
             IdentityError::Audience => "The token audience is not gyeol-issue.",
             IdentityError::Certificate => "The certificate check failed.",
             IdentityError::DenyDocument => "The deny document check failed.",
+            IdentityError::Denied => "The destination is not allowed.",
             IdentityError::Encoding => "The byte encoding check failed.",
             IdentityError::Expired => "The end time has passed.",
             IdentityError::NotYetValid => "The start time is still in the future.",

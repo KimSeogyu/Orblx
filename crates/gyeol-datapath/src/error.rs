@@ -42,6 +42,8 @@ pub enum HelloError {
     TicketMissing,
     /// The frame `ticket_hash` differs from the verified ticket.
     TicketHash,
+    /// The agent destination is not the one JIT allow.
+    DestinationDenied,
 }
 
 impl fmt::Display for HelloError {
@@ -77,6 +79,9 @@ impl fmt::Display for HelloError {
             Self::TicketHash => {
                 formatter.write_str("The frame ticket hash differs from the verified ticket.")
             }
+            Self::DestinationDenied => {
+                formatter.write_str("The destination is not allowed. The path rejects DATA.")
+            }
         }
     }
 }
@@ -100,7 +105,8 @@ impl std::error::Error for HelloError {
             | Self::Tun(_)
             | Self::Quic(_)
             | Self::TicketMissing
-            | Self::TicketHash => None,
+            | Self::TicketHash
+            | Self::DestinationDenied => None,
         }
     }
 }
