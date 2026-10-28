@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mock IdP</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <p class="mark">mock idp</p>
+    <h1>Sign in</h1>
+    <p id="issuer">Issuer: __ISSUER__</p>
+    <p id="audience">Audience: __AUDIENCE__</p>
+    <p id="subject">Subject: __SUBJECT__</p>
+  </header>
+  <main class="login">
+    <section aria-labelledby="sign-in-title">
+      <h2 id="sign-in-title">Mock IdP</h2>
+      <p>The client is __CLIENT_ID__. The scope is __SCOPE__.</p>
+      <p>Sign in sends this browser to the harness callback. The callback issues the human SVID. The harness then opens the two HTTPS applications.</p>
+      <form method="post" action="/oidc/authorize">
+        <input type="hidden" name="client_id" value="__CLIENT_ID__">
+        <input type="hidden" name="response_type" value="__RESPONSE_TYPE__">
+        <input type="hidden" name="redirect_uri" value="__REDIRECT_URI__">
+        <input type="hidden" name="state" value="__STATE__">
+        <input type="hidden" name="scope" value="__SCOPE__">
+        <input type="hidden" name="subject" value="__SUBJECT__">
+        <button type="submit" id="sign-in">Sign in</button>
+      </form>
+    </section>
+  </main>
+</body>
+</html>

@@ -8,6 +8,8 @@
 
 use serde::Serialize;
 
+use gyeol_identity::MockOidc;
+
 use crate::difficulty::{Difficulty, DifficultyCard, FaultHook};
 use crate::envelope::FeedLine;
 use crate::event::{EventBus, EventKind, HarnessEvent, StackFeed};
@@ -119,6 +121,12 @@ impl Harness {
     /// Select a difficulty and run the matching level.
     pub fn select_difficulty(&mut self, difficulty: Difficulty) {
         let lines = self.engine.select_difficulty(difficulty);
+        self.stage(lines);
+    }
+
+    /// Finish City Breeze from the mock IdP callback.
+    pub fn complete_oidc_city(&mut self, oidc: &MockOidc, subject: &str) {
+        let lines = self.engine.complete_oidc_city(oidc, subject);
         self.stage(lines);
     }
 

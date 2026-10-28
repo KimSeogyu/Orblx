@@ -19,7 +19,7 @@ use gyeol_edge::{
 use gyeol_identity::{
     sign_agent_jit_ticket, sign_ticket, verify_ticket, DenyApply, DenySet, Ipv4Destination,
     IssueGate, MiniCa, MockOidc, SpiffeId, TicketClaims, TicketFlags, TicketSigner, TicketVerifier,
-    TrustBundle, MAX_SKEW, MOCK_OIDC_ISSUER,
+    TrustBundle, MAX_SKEW, MOCK_OIDC_ISSUER, OIDC_AUDIENCE,
 };
 use gyeol_relay::{RelaySessionId, RelayTransport};
 use serde::Serialize;
@@ -31,7 +31,7 @@ use crate::event::EventSource;
 use crate::level::{LevelId, StepStatus};
 use crate::session::{PacketRow, Panel, PanelState, PeerRow, SessionView};
 
-const HUMAN_NAME: &str = "ada";
+pub(crate) const HUMAN_NAME: &str = "ada";
 const AGENT_NAME: &str = "worker";
 const AGENT_TTL: Duration = Duration::from_secs(60);
 const HUMAN_TOKEN_TTL: Duration = Duration::from_secs(600);
@@ -220,6 +220,26 @@ impl Engine {
         lines
     }
 
+    /// Finish City Breeze after the mock IdP callback.
+    ///
+    /// The caller passes the IdP that signed the browser login.
+    /// The function issues the human SVID from that IdP.
+    /// The function then opens the two HTTPS applications.
+    pub fn complete_oidc_city(&mut self, oidc: &MockOidc, subject: &str) -> Vec<FeedLine> {
+        self.begin(LevelId::CityBreeze);
+        let mut lines = vec![self.harness_line(
+            "difficulty_selected",
+            &format!(
+                "The operator selected {}. {}",
+                Difficulty::Easy.label(),
+                Difficulty::Easy.note()
+            ),
+        )];
+        let produced = self.run_city_from_idp(oidc, subject);
+        lines.extend(self.finish(produced));
+        lines
+    }
+
     /// Spawn the agent and run allow, deny, and TTL expiry.
     pub fn spawn_agent(&mut self) -> Vec<FeedLine> {
         self.begin(LevelId::AgentJit);
@@ -320,29 +340,59 @@ impl Engine {
     }
 
     fn run_city(&mut self) -> Result<Vec<FeedLine>, String> {
-        self.steps = vec![StepStatus::NotRun; 4];
         let now = SystemTime::now();
         self.issue_human(now)?;
+        self.finish_city(now, false)
+    }
+
+    fn run_city_from_idp(
+        &mut self,
+        oidc: &MockOidc,
+        subject: &str,
+    ) -> Result<Vec<FeedLine>, String> {
+        if subject != HUMAN_NAME {
+            return Err("The mock IdP subject is not valid.".to_string());
+        }
+        let now = SystemTime::now();
+        let token = oidc
+            .issue_id_token(subject, now, HUMAN_TOKEN_TTL)
+            .map_err(|err| err.to_string())?;
+        self.issue_human_from_token(oidc, &token, now)?;
+        self.finish_city(now, true)
+    }
+
+    fn finish_city(
+        &mut self,
+        now: SystemTime,
+        from_callback: bool,
+    ) -> Result<Vec<FeedLine>, String> {
+        self.steps = vec![StepStatus::NotRun; 4];
         self.steps[0] = StepStatus::Pass;
         self.steps[1] = StepStatus::Pass;
-        let mut lines = Vec::new();
-        lines.push(self.identity_line(
-            "svid.issued",
-            true,
-            &format!(
+        let issued = if from_callback {
+            format!(
+                "The mock IdP callback issued a token for {HUMAN_NAME}. The audience is {OIDC_AUDIENCE}. The human SVID is {}.",
+                self.leaf_uri()
+            )
+        } else {
+            format!(
                 "OIDC issued a token for {HUMAN_NAME}. The human SVID is {}.",
                 self.leaf_uri()
-            ),
-        ));
+            )
+        };
+        let peer = if from_callback {
+            "Human SVID from the mock IdP callback."
+        } else {
+            "Human SVID from the OIDC token."
+        };
+        let mut lines = Vec::new();
+        lines.push(self.identity_line("svid.issued", true, &issued));
         lines.push(self.identity_line(
             "ticket.verified",
             true,
             &format!("The human ticket is valid. The ticket TTL is {HUMAN_TICKET_TTL} seconds."),
         ));
-        self.push_peer(
-            self.leaf_uri(),
-            "Human SVID from the OIDC token.".to_string(),
-        );
+        self.push_peer(self.leaf_uri(), peer.to_string());
         lines.push(self.data_line(
             "quic_hello",
             false,
@@ -779,10 +829,19 @@ impl Engine {
         let token = oidc
             .issue_id_token(HUMAN_NAME, now, HUMAN_TOKEN_TTL)
             .map_err(|err| err.to_string())?;
+        self.issue_human_from_token(&oidc, &token, now)
+    }
+
+    fn issue_human_from_token(
+        &mut self,
+        oidc: &MockOidc,
+        token: &str,
+        now: SystemTime,
+    ) -> Result<(), String> {
         let ca = MiniCa::generate(now).map_err(|err| err.to_string())?;
-        let gate = IssueGate::new(ca, &oidc).map_err(|err| err.to_string())?;
+        let gate = IssueGate::new(ca, oidc).map_err(|err| err.to_string())?;
         let issued = gate
-            .issue_human_svid(&token, now, &self.deny)
+            .issue_human_svid(token, now, &self.deny)
             .map_err(|err| err.to_string())?;
         let trust_pem = gate.trust_bundle_pem().to_string();
         let trust = TrustBundle::from_pem(&trust_pem).map_err(|err| err.to_string())?;
@@ -1325,6 +1384,7 @@ mod tests {
     use crate::level::LevelId;
     use crate::session::PanelState;
     use crate::sim::Engine;
+    use gyeol_identity::{MockOidc, MOCK_OIDC_ISSUER};
     use serde_json::Value;
 
     fn event_kinds(lines: &[crate::envelope::FeedLine]) -> Vec<String> {
@@ -1471,5 +1531,50 @@ mod tests {
         assert!(engine.audit_view().ok);
         assert!(engine.audit_view().deny >= 1);
         assert!(engine.audit_view().end >= 1);
+    }
+
+    #[test]
+    fn the_mock_idp_callback_runs_city_breeze() {
+        let oidc = MockOidc::generate(MOCK_OIDC_ISSUER).unwrap();
+        let mut engine = Engine::new();
+        let lines = engine.complete_oidc_city(&oidc, "ada");
+        let names = event_kinds(&lines);
+        assert_eq!(
+            names,
+            vec![
+                "difficulty_selected",
+                "svid.issued",
+                "ticket.verified",
+                "quic_hello",
+                "frame_tx",
+                "frame_rx",
+                "frame_tx",
+                "connector_https",
+                "frame_tx",
+                "connector_https",
+                "session_up",
+            ]
+        );
+        let blob = lines
+            .iter()
+            .map(|line| line.body.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(blob.contains("app-a.orblx.test"));
+        assert!(blob.contains("app-b.orblx.test"));
+        assert!(blob.contains("The mock IdP callback issued a token"));
+        assert!(blob.contains("\"status\":200"));
+        assert_eq!(engine.session().svid.state, PanelState::Up);
+        assert!(engine.session().svid.detail.contains("user/ada"));
+        assert_eq!(engine.session().quic.state, PanelState::Up);
+        assert_eq!(engine.level(), LevelId::CityBreeze);
+
+        let bad = engine.complete_oidc_city(&oidc, "bob");
+        let bad_blob = bad
+            .iter()
+            .map(|line| line.body.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(bad_blob.contains("level_failed"));
     }
 }

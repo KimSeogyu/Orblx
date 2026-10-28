@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Run City Breeze, Agent JIT, and Radioactive NAT on the live harness.
-# The script posts the same actions as the browser page.
+# City Breeze signs in through the mock IdP page.
+# The script follows that sign-in with curl.
+# The later actions match the browser smash buttons.
 # The script checks the event kinds from those actions.
 # The script does not play an animation.
 
@@ -69,16 +71,93 @@ PY
 seqfile="${work}/seq"
 printf '0\n' >"$seqfile"
 
-post() {
+oidc_easy() {
+  local state
+  state=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+  local page="${work}/login.html"
+  local login_code
+  login_code=$(curl --silent --show-error --output "$page" --write-out '%{http_code}' \
+    "${base}/oidc/authorize?client_id=gyeol-sim&response_type=code&redirect_uri=%2Foidc%2Fcallback&state=${state}&scope=openid")
+  if [[ "$login_code" != "200" ]]; then
+    echo "The mock IdP login page returned ${login_code}."
+    exit 1
+  fi
+  python3 - "$page" "$state" <<'PY'
+import sys
+page, state = sys.argv[1:3]
+text = open(page, encoding="utf-8").read()
+for needle in (
+    "Sign in",
+    "https://oidc.gyeol.local",
+    "gyeol-issue",
+    "Subject: ada",
+    f'value="{state}"',
+):
+    if needle not in text:
+        raise SystemExit("The mock IdP login page is missing " + needle + ".")
+if "@keyframes" in text:
+    raise SystemExit("The mock IdP login page contains an animation.")
+print("The mock IdP login page is ready.")
+PY
+  local headers="${work}/login.headers"
+  local posted="${work}/login.body"
+  local post_code
+  post_code=$(curl --silent --show-error --dump-header "$headers" --output "$posted" --write-out '%{http_code}' \
+    --data-urlencode "subject=ada" \
+    --data-urlencode "client_id=gyeol-sim" \
+    --data-urlencode "response_type=code" \
+    --data-urlencode "redirect_uri=/oidc/callback" \
+    --data-urlencode "state=${state}" \
+    --data-urlencode "scope=openid" \
+    "${base}/oidc/authorize")
+  if [[ "$post_code" != "303" ]]; then
+    echo "The mock IdP sign-in returned ${post_code}."
+    cat "$posted"
+    exit 1
+  fi
+  local location
+  location=$(python3 - "$headers" "$state" <<'PY'
+import sys
+path, state = sys.argv[1:3]
+location = ""
+for line in open(path, encoding="utf-8", errors="replace"):
+    if line.lower().startswith("location:"):
+        location = line.split(":", 1)[1].strip()
+if not location.startswith("/oidc/callback?"):
+    raise SystemExit("The mock IdP redirect is not the callback.")
+if "state=" + state not in location:
+    raise SystemExit("The mock IdP redirect state differs.")
+print(location)
+PY
+)
+  local callback_headers="${work}/callback.headers"
+  local callback_body="${work}/callback.body"
+  local callback_code
+  callback_code=$(curl --silent --show-error --dump-header "$callback_headers" --output "$callback_body" --write-out '%{http_code}' \
+    "${base}${location}")
+  if [[ "$callback_code" != "303" ]]; then
+    echo "The mock IdP callback returned ${callback_code}."
+    cat "$callback_body"
+    exit 1
+  fi
+  python3 - "$callback_headers" <<'PY'
+import sys
+location = ""
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    if line.lower().startswith("location:"):
+        location = line.split(":", 1)[1].strip()
+if location != "/":
+    raise SystemExit("The callback did not return to the harness page.")
+print("The mock IdP callback issued the City Breeze session.")
+PY
+  local body="${work}/easy.json"
+  curl --fail --silent --show-error "${base}/api/state" --output "$body"
+  check_snapshot easy "$body"
+}
+
+check_snapshot() {
   local name=$1
-  local path=$2
-  local id=$3
-  local body="${work}/${name}.json"
-  curl --fail --silent --show-error \
-    --header 'content-type: application/json' \
-    --data "{\"id\":\"${id}\"}" \
-    "${base}${path}" \
-    --output "$body"
+  local body=$2
   local prev
   prev=$(cat "$seqfile")
   python3 - "$body" "$name" "$prev" "$seqfile" <<'PY'
@@ -297,7 +376,20 @@ open(seqfile, "w", encoding="utf-8").write(str(last) + "\n")
 PY
 }
 
-post easy /api/difficulty easy
+post() {
+  local name=$1
+  local path=$2
+  local id=$3
+  local body="${work}/${name}.json"
+  curl --fail --silent --show-error \
+    --header 'content-type: application/json' \
+    --data "{\"id\":\"${id}\"}" \
+    "${base}${path}" \
+    --output "$body"
+  check_snapshot "$name" "$body"
+}
+
+oidc_easy
 post revoke /api/smash revoke
 post medium /api/difficulty medium
 post agent /api/smash agent_spawn

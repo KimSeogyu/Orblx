@@ -7,11 +7,11 @@
 
 use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, SystemTime};
 
-use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::extract::{Form, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -25,6 +25,7 @@ use crate::difficulty::Difficulty;
 use crate::event::HarnessEvent;
 use crate::harness::{Harness, Smash, Snapshot};
 use crate::level::LevelId;
+use crate::oidc_flow::{login_page, AuthorizeRequest, Idp};
 
 /// The default TCP port.
 pub const DEFAULT_PORT: u16 = 8787;
@@ -56,6 +57,11 @@ pub enum SimError {
         /// The server detail.
         detail: String,
     },
+    /// The mock IdP did not open.
+    Idp {
+        /// The IdP detail.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for SimError {
@@ -67,6 +73,7 @@ impl std::fmt::Display for SimError {
                 write!(f, "The harness did not start the runtime. {detail}")
             }
             Self::Serve { detail } => write!(f, "The harness server stopped. {detail}"),
+            Self::Idp { detail } => write!(f, "The mock IdP did not open. {detail}"),
         }
     }
 }
@@ -99,7 +106,8 @@ pub async fn serve(listen: SocketAddr) -> Result<(), SimError> {
     })?;
     println!("The gyeol sim harness is ready.");
     println!("Open http://{local}");
-    println!("Select Easy, Medium, or Hard.");
+    println!("Easy and City Breeze open the mock IdP sign-in page.");
+    println!("Select Medium or Hard for the other levels.");
     println!("The event stream is http://{local}/events");
     serve_listener(listener).await
 }
@@ -116,42 +124,54 @@ pub fn serve_blocking(listen: SocketAddr) -> Result<(), SimError> {
 }
 
 async fn serve_listener(listener: TcpListener) -> Result<(), SimError> {
-    axum::serve(listener, router())
+    axum::serve(listener, router()?)
         .await
         .map_err(|err| SimError::Serve {
             detail: err.to_string(),
         })
 }
 
-fn router() -> Router {
-    Router::new()
+fn router() -> Result<Router, SimError> {
+    Ok(Router::new()
         .route("/", get(index))
         .route("/app.js", get(script))
         .route("/style.css", get(style))
         .route("/favicon.ico", get(favicon))
+        .route("/oidc/authorize", get(get_authorize).post(post_authorize))
+        .route("/oidc/callback", get(get_callback))
         .route("/api/state", get(get_state))
         .route("/api/level", post(post_level))
         .route("/api/difficulty", post(post_difficulty))
         .route("/api/smash", post(post_smash))
         .route("/events", get(events))
         .route("/v0/events", get(events))
-        .with_state(AppState::new())
+        .with_state(AppState::open()?))
 }
 
 #[derive(Clone)]
 struct AppState {
     harness: Arc<Mutex<Harness>>,
     events: broadcast::Sender<String>,
+    idp: Arc<Mutex<Idp>>,
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn open() -> Result<Self, SimError> {
         let (events, _) = broadcast::channel(256);
-        Self {
+        let idp = Idp::open().map_err(|detail| SimError::Idp { detail })?;
+        Ok(Self {
             harness: Arc::new(Mutex::new(Harness::new())),
             events,
-        }
+            idp: Arc::new(Mutex::new(idp)),
+        })
     }
+}
+
+fn lock_idp(state: &AppState) -> MutexGuard<'_, Idp> {
+    state
+        .idp
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
 }
 
 struct ApiError {
@@ -179,6 +199,31 @@ struct IdRequest {
     id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AuthorizeQuery {
+    client_id: String,
+    response_type: String,
+    redirect_uri: String,
+    state: String,
+    scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthorizeForm {
+    client_id: String,
+    response_type: String,
+    redirect_uri: String,
+    state: String,
+    scope: String,
+    subject: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CallbackQuery {
+    code: String,
+    state: String,
+}
+
 fn asset(content_type: &'static str, body: &'static str) -> impl IntoResponse {
     (
         [
@@ -203,6 +248,114 @@ async fn style() -> impl IntoResponse {
 
 async fn favicon() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+async fn get_authorize(
+    headers: HeaderMap,
+    Query(query): Query<AuthorizeQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let request = authorize_from(
+        query.client_id,
+        query.response_type,
+        query.redirect_uri,
+        query.state,
+        query.scope,
+    );
+    request
+        .check(request_host(&headers))
+        .map_err(ApiError::bad)?;
+    Ok(html_page(login_page(&request)))
+}
+
+async fn post_authorize(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AuthorizeForm>,
+) -> Result<Response, ApiError> {
+    let request = authorize_from(
+        form.client_id,
+        form.response_type,
+        form.redirect_uri,
+        form.state,
+        form.scope,
+    );
+    let mut idp = lock_idp(&state);
+    let location = idp
+        .begin(
+            &request,
+            &form.subject,
+            SystemTime::now(),
+            request_host(&headers),
+        )
+        .map_err(ApiError::bad)?;
+    Ok(see_other(&location))
+}
+
+async fn get_callback(
+    State(state): State<AppState>,
+    Query(query): Query<CallbackQuery>,
+) -> Result<Response, ApiError> {
+    let lines = {
+        let mut idp = lock_idp(&state);
+        let subject = idp
+            .consume(&query.code, &query.state, SystemTime::now())
+            .map_err(ApiError::bad)?;
+        let (_snapshot, lines) = apply(&state, |harness| {
+            harness.complete_oidc_city(idp.oidc(), &subject);
+        });
+        lines
+    };
+    write_log(&lines);
+    Ok(see_other("/"))
+}
+
+fn authorize_from(
+    client_id: String,
+    response_type: String,
+    redirect_uri: String,
+    state: String,
+    scope: String,
+) -> AuthorizeRequest {
+    AuthorizeRequest {
+        client_id,
+        response_type,
+        redirect_uri,
+        state,
+        scope,
+    }
+}
+
+fn request_host(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+}
+
+fn html_page(body: String) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+}
+
+fn see_other(location: &str) -> Response {
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, location.to_string()),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+            (
+                header::CONTENT_TYPE,
+                "text/plain; charset=utf-8".to_string(),
+            ),
+        ],
+        "The browser follows the redirect.",
+    )
+        .into_response()
 }
 
 async fn get_state(State(state): State<AppState>) -> Json<Snapshot> {
@@ -325,6 +478,9 @@ mod tests {
         assert!(APP_JS.contains("/api/smash"));
         assert!(APP_JS.contains("/api/level"));
         assert!(APP_JS.contains("/api/difficulty"));
+        assert!(APP_JS.contains("/oidc/authorize"));
+        assert!(APP_JS.contains("/oidc/callback"));
+        assert!(INDEX_HTML.contains("mock IdP"));
     }
 
     #[tokio::test]
@@ -359,13 +515,95 @@ mod tests {
         assert!(bad.contains("not valid"));
     }
 
+    #[tokio::test]
+    async fn the_mock_idp_login_issues_a_city_breeze_svid() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            serve_listener(listener).await.unwrap();
+        });
+
+        let state_value = "00112233445566778899aabbccddeeff";
+        let login = exchange(
+            addr,
+            &format!(
+                "GET /oidc/authorize?client_id=gyeol-sim&response_type=code&redirect_uri=%2Foidc%2Fcallback&state={state_value}&scope=openid HTTP/1.1"
+            ),
+            "",
+        )
+        .await;
+        assert!(login.contains("HTTP/1.1 200"));
+        assert!(login.contains("Sign in"));
+        assert!(login.contains("https://oidc.gyeol.local"));
+        assert!(login.contains("gyeol-issue"));
+        assert!(login.contains("Subject: ada"));
+        assert!(!login.contains("@keyframes"));
+
+        let form = format!(
+            "subject=ada&client_id=gyeol-sim&response_type=code&redirect_uri=%2Foidc%2Fcallback&state={state_value}&scope=openid"
+        );
+        let posted = exchange_typed(
+            addr,
+            "POST /oidc/authorize HTTP/1.1",
+            "application/x-www-form-urlencoded",
+            &form,
+        )
+        .await;
+        assert!(posted.contains("HTTP/1.1 303"));
+        let location = header_value(&posted, "location").expect("location");
+        assert!(location.starts_with("/oidc/callback?code="));
+        assert!(location.contains(&format!("state={state_value}")));
+
+        let callback = exchange(addr, &format!("GET {location} HTTP/1.1"), "").await;
+        assert!(callback.contains("HTTP/1.1 303"));
+        assert_eq!(header_value(&callback, "location"), Some("/"));
+
+        let state = exchange(addr, "GET /api/state HTTP/1.1", "").await;
+        assert!(state.contains("HTTP/1.1 200"));
+        assert!(state.contains("svid.issued"));
+        assert!(state.contains("ticket.verified"));
+        assert!(state.contains("app-a.orblx.test"));
+        assert!(state.contains("app-b.orblx.test"));
+        assert!(state.contains("connector_https"));
+        assert!(state.contains("\"state\":\"up\""));
+        assert!(state.contains("The mock IdP callback issued a token"));
+
+        let reused = exchange(addr, &format!("GET {location} HTTP/1.1"), "").await;
+        assert!(reused.contains("HTTP/1.1 400"));
+        assert!(reused.contains("code"));
+
+        let evil = exchange_typed(
+            addr,
+            "POST /oidc/authorize HTTP/1.1",
+            "application/x-www-form-urlencoded",
+            "subject=ada&client_id=gyeol-sim&response_type=code&redirect_uri=https%3A%2F%2Fevil.example%2Foidc%2Fcallback&state=00112233445566778899aabbccddeeff&scope=openid",
+        )
+        .await;
+        assert!(evil.contains("HTTP/1.1 400"));
+        assert!(evil.contains("redirect"));
+    }
+
     async fn exchange(addr: std::net::SocketAddr, head: &str, body: &str) -> String {
+        let content_type = if body.is_empty() {
+            ""
+        } else {
+            "application/json"
+        };
+        exchange_typed(addr, head, content_type, body).await
+    }
+
+    async fn exchange_typed(
+        addr: std::net::SocketAddr,
+        head: &str,
+        content_type: &str,
+        body: &str,
+    ) -> String {
         let mut stream = connect_retry(addr).await;
         let request = if body.is_empty() {
             format!("{head}\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         } else {
             format!(
-                "{head}\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "{head}\r\nHost: localhost\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             )
         };
@@ -390,5 +628,15 @@ mod tests {
             }
         }
         panic!("The test did not connect. {last}");
+    }
+
+    fn header_value<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
+        let prefix = format!("{name}:");
+        for line in raw.lines() {
+            if line.len() >= prefix.len() && line[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+                return Some(line[prefix.len()..].trim());
+            }
+        }
+        None
     }
 }

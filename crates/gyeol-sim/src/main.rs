@@ -56,7 +56,10 @@ gyeol-sim [--listen ADDR]
 The command serves the sim harness.
 The default address is {addr}.
 Open the page in a browser.
-Select Easy, Medium, or Hard.
+Easy and City Breeze open the mock IdP.
+Sign in on that page.
+The callback issues the human SVID.
+Select Medium or Hard for the other levels.
 The page shows packet events and session events.
 ",
         addr = default_listen(),
@@ -92,6 +95,7 @@ mod tests {
         assert_eq!(command, Command::Help);
         assert!(help_text().contains("8787"));
         assert!(help_text().contains("Easy"));
+        assert!(help_text().contains("mock IdP"));
     }
 
     #[test]
