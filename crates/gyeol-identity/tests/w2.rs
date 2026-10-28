@@ -19,6 +19,13 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// First 16 bytes of SHA-256 over `fixtures/ticket-valid.bin`.
+///
+/// W4 freezes this value. Datapath checks the same bytes.
+const TICKET_VALID_HASH: [u8; 16] = [
+    0xf6, 0x09, 0x53, 0x41, 0x15, 0x57, 0xe1, 0xfd, 0x44, 0x3f, 0x38, 0x4a, 0x85, 0x92, 0xba, 0xd3,
+];
+
 fn gate_at(now: SystemTime) -> (MockOidc, IssueGate) {
     let oidc = MockOidc::generate(MOCK_OIDC_ISSUER).unwrap();
     let ca = MiniCa::generate(now).unwrap();
@@ -357,10 +364,8 @@ fn draft_fixtures_match_the_locked_profile() {
     assert!(meta.contains("f60953411557e1fd443f384a8592bad3"));
 
     let ticket = include_bytes!("../fixtures/ticket-valid.bin");
-    assert_eq!(
-        hex(&ticket_hash(ticket)),
-        "f60953411557e1fd443f384a8592bad3"
-    );
+    assert_eq!(ticket_hash(ticket), TICKET_VALID_HASH);
+    assert_eq!(hex(&TICKET_VALID_HASH), "f60953411557e1fd443f384a8592bad3");
     let verifier =
         TicketVerifier::from_public_pem(include_str!("../fixtures/ticket-pub.pem")).unwrap();
     let now = UNIX_EPOCH + Duration::from_secs(1_793_196_196);
@@ -395,4 +400,16 @@ fn draft_fixtures_match_the_locked_profile() {
     let from_ca =
         gyeol_identity::TrustBundle::from_pem(include_str!("../fixtures/ca.pem")).unwrap();
     assert!(from_ca.to_pem().contains("BEGIN CERTIFICATE"));
+}
+
+#[test]
+fn ticket_valid_hash_matches_the_frozen_datapath_fixture() {
+    let ticket = include_bytes!("../fixtures/ticket-valid.bin");
+    assert_eq!(ticket_hash(ticket), TICKET_VALID_HASH);
+    let listed = include_str!("../../gyeol-datapath/testdata/ticket-valid-hash.hex");
+    let listed: String = listed
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect();
+    assert_eq!(listed, hex(&TICKET_VALID_HASH));
 }
