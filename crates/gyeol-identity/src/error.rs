@@ -15,6 +15,8 @@ pub enum IdentityError {
     Encoding,
     /// The end time has passed.
     Expired,
+    /// The file read failed.
+    File,
     /// The start time is still in the future.
     NotYetValid,
     /// The certificate profile check failed.
@@ -42,6 +44,7 @@ impl fmt::Display for IdentityError {
             IdentityError::Denied => "The destination is not allowed.",
             IdentityError::Encoding => "The byte encoding check failed.",
             IdentityError::Expired => "The end time has passed.",
+            IdentityError::File => "The file read failed.",
             IdentityError::NotYetValid => "The start time is still in the future.",
             IdentityError::Profile => "The certificate profile check failed.",
             IdentityError::Revoked => "The deny list contains this identifier.",

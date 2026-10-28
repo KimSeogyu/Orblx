@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use x509_parser::asn1_rs::{BitString, FromDer};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::{
@@ -6,7 +8,7 @@ use x509_parser::extensions::{
 use x509_parser::x509::X509Version;
 
 use crate::clock::{in_window, unix_time};
-use crate::codec::pem_blocks;
+use crate::codec::{pem_blocks, read_pem_file};
 use crate::deny::DenySet;
 use crate::error::IdentityError;
 use crate::spiffe::SpiffeId;
@@ -23,6 +25,15 @@ pub fn decode_certificate_pem(pem: &str) -> Result<Vec<u8>, IdentityError> {
         return Err(IdentityError::Certificate);
     }
     blocks.into_iter().next().ok_or(IdentityError::Certificate)
+}
+
+/// Read one PEM certificate file and return the DER bytes.
+///
+/// The file must be UTF-8 text.
+/// The function calls `decode_certificate_pem` on that text.
+pub fn decode_certificate_pem_file(path: &Path) -> Result<Vec<u8>, IdentityError> {
+    let text = read_pem_file(path)?;
+    decode_certificate_pem(&text)
 }
 
 /// Read the single SPIFFE URI from a leaf certificate.
@@ -62,6 +73,15 @@ impl TrustBundle {
             roots.push(root);
         }
         Ok(Self { roots })
+    }
+
+    /// Load a trust bundle from a PEM file.
+    ///
+    /// The file must be UTF-8 text.
+    /// The function calls `from_pem` on that text.
+    pub fn from_pem_file(path: &Path) -> Result<Self, IdentityError> {
+        let text = read_pem_file(path)?;
+        Self::from_pem(&text)
     }
 
     /// Return the PEM concatenation of the root certificates.
@@ -115,6 +135,11 @@ fn load_root(der: &[u8]) -> Result<Root, IdentityError> {
         not_after,
         der: der.to_vec(),
     })
+}
+
+pub(crate) fn certificate_ed25519_public_key(der: &[u8]) -> Result<[u8; 32], IdentityError> {
+    let cert = parse_cert(der)?;
+    ed25519_public_key(&cert)
 }
 
 pub(crate) fn cert_validity(der: &[u8]) -> Result<(u64, u64), IdentityError> {

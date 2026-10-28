@@ -10,6 +10,11 @@
 //! An agent capability ticket is separate from the SVID.
 //! The agent ticket allows one destination.
 //! Every other agent destination is denied.
+//!
+//! `decode_certificate_pem_file` reads one certificate PEM file.
+//! `TrustBundle::from_pem_file` reads a trust bundle PEM file.
+//! `IssuedSvid::from_pem_files` reads a leaf certificate PEM file and a private key PEM file.
+//! Those functions read the file text and call the in-memory PEM decode path.
 
 mod ca;
 mod cert;
@@ -22,7 +27,9 @@ mod spiffe;
 mod ticket;
 
 pub use ca::{IssuedSvid, MiniCa};
-pub use cert::{decode_certificate_pem, extract_spiffe_id, TrustBundle};
+pub use cert::{
+    decode_certificate_pem, decode_certificate_pem_file, extract_spiffe_id, TrustBundle,
+};
 pub use clock::{MAX_AGENT_TTL, MAX_SKEW, MAX_USER_TTL};
 pub use deny::{DenyApply, DenySet};
 pub use error::IdentityError;
