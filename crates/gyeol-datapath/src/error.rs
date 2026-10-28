@@ -44,6 +44,8 @@ pub enum HelloError {
     TicketHash,
     /// The agent destination is not the one JIT allow.
     DestinationDenied,
+    /// The connector hub-spoke path failed.
+    Connector(String),
 }
 
 impl fmt::Display for HelloError {
@@ -82,6 +84,7 @@ impl fmt::Display for HelloError {
             Self::DestinationDenied => {
                 formatter.write_str("The destination is not allowed. The path rejects DATA.")
             }
+            Self::Connector(detail) => write!(formatter, "The connector failed. {detail}"),
         }
     }
 }
@@ -106,7 +109,8 @@ impl std::error::Error for HelloError {
             | Self::Quic(_)
             | Self::TicketMissing
             | Self::TicketHash
-            | Self::DestinationDenied => None,
+            | Self::DestinationDenied
+            | Self::Connector(_) => None,
         }
     }
 }

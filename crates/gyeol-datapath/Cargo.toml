@@ -1,6 +1,6 @@
 [package]
 name = "gyeol-datapath"
-description = "Data path crate. This crate encodes frames and moves IPv4 packets over QUIC."
+description = "Data path crate for Orblx. This crate encodes frames, moves IPv4 packets over QUIC, and forwards two HTTPS apps on the connector path."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
@@ -11,7 +11,10 @@ gyeol-crypto = { path = "../gyeol-crypto" }
 gyeol-identity = { path = "../gyeol-identity" }
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rand = "0.8"
+rcgen = { version = "=0.14.7", default-features = false, features = ["crypto", "pem", "ring"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "logging"] }
 rustls-pemfile = "2"
+time = { version = "0.3.36", default-features = false }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tokio-rustls = { version = "=0.26.2", default-features = false, features = ["ring", "tls12", "logging"] }
 tun = "0.8"

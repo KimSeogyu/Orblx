@@ -175,6 +175,42 @@ cargo run -p gyeol-cli -- relay-smoke tcp
 The userspace Relay labs need no extra privileges.
 The netns Relay labs need root, iproute2, and iptables.
 
+## Connector hub
+
+The product name is Orblx.
+The command name is gyeol.
+Week 9 adds the connector hub-spoke path.
+The path carries HTTPS for two apps.
+The apps are `app-a.orblx.test` and `app-b.orblx.test`.
+The overlay addresses are `10.8.0.10` and `10.8.0.11`.
+The path uses one QUIC bidirectional stream.
+The stream carries ADR-0002 DATA frames.
+Each DATA payload is one IPv4 TCP segment.
+The spoke reads the TLS server name.
+The hub forwards the TCP bytes to the matching app.
+The build does not link to WireGuard.
+The build does not link to Headscale.
+The build does not link to DERP.
+
+Run the userspace proof.
+The proof does not open a TUN device.
+
+```bash
+cargo run -p gyeol-cli -- connector smoke
+```
+
+The command prints status 200 for both apps.
+The command prints `mesh_to` and `mesh_from` counts above zero.
+The client dials the spoke ingress.
+The client does not dial the app listeners.
+
+Read the lab commands in [docs/connector-hub.md](docs/connector-hub.md).
+The document has the curl commands.
+The document has the two-process commands.
+The document has the TUN commands for a browser.
+The TUN device needs CAP_NET_ADMIN on Linux.
+When the TUN device is not available, use `connector smoke`.
+
 ## Completion criteria for the 12-week work
 
 The 12-week work is complete when all of these statements are true:

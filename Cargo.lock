@@ -674,9 +674,12 @@ dependencies = [
  "gyeol-identity",
  "quinn",
  "rand 0.8.8",
+ "rcgen",
  "rustls",
  "rustls-pemfile",
+ "time",
  "tokio",
+ "tokio-rustls",
  "tun",
 ]
 
@@ -1723,6 +1726,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "tokio-rustls"
+version = "0.26.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e727b36a1a0e8b74c376ac2211e40c2c8af09fb4013c60d910495810f008e9b"
+dependencies = [
+ "rustls",
+ "tokio",
 ]
 
 [[package]]

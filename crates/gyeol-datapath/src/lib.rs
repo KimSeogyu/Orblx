@@ -1,5 +1,6 @@
 use std::fmt;
 
+mod connector;
 mod error;
 mod framing;
 mod gate;
@@ -7,6 +8,12 @@ mod ipv4;
 mod quic;
 mod run;
 mod tun_dev;
+
+pub use connector::{
+    issue_connector_lab, prove_lab_directory, prove_two_https_apps, run_hub_dir, run_spoke_dir,
+    serve_apps_dir, serve_userspace, AppFetch, TwoAppProof, APP_A_BODY, APP_A_HOST, APP_A_OVERLAY,
+    APP_B_BODY, APP_B_HOST, APP_B_OVERLAY, APP_OVERLAY_PORT, SPOKE_OVERLAY,
+};
 
 pub use error::HelloError;
 pub use framing::{decode_length_prefixed, encode_length_prefixed, MAX_FRAME_LEN};
