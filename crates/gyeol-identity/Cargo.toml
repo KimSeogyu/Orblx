@@ -9,7 +9,7 @@ version.workspace = true
 [dependencies]
 base64 = "0.22"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
-jsonwebtoken = "=10.3.0"
+jsonwebtoken = { version = "=10.3.0", features = ["rust_crypto"] }
 rand = "0.8.5"
 rcgen = { version = "=0.14.7", default-features = false, features = ["crypto", "pem", "ring"] }
 serde = { version = "1", features = ["derive"] }
