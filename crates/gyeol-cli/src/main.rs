@@ -11,12 +11,15 @@ use gyeol_edge::crate_name as edge_crate;
 use gyeol_identity::crate_name as identity_crate;
 use gyeol_identity::{ticket_hash, DenySet, TrustBundle};
 
+mod edge;
+
 #[derive(Debug)]
 enum Action {
     Hello,
     Version,
     HelpHelloQuic,
     HelloQuic(HelloQuicCommand),
+    Edge(edge::EdgeCommand),
 }
 
 #[derive(Debug)]
@@ -51,6 +54,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Ok(Action::Edge(command)) => {
+            if let Err(err) = edge::run(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
         Err(err) => {
             eprintln!("{err}");
             std::process::exit(1);
@@ -65,6 +74,15 @@ where
     let args: Vec<String> = args.into_iter().collect();
     if args.first().map(String::as_str) == Some("hello-quic") {
         return parse_hello_quic(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("stun") {
+        return edge::parse_stun(&args[1..]).map(Action::Edge);
+    }
+    if args.first().map(String::as_str) == Some("stun-serve") {
+        return edge::parse_stun_serve(&args[1..]).map(Action::Edge);
+    }
+    if args.first().map(String::as_str) == Some("edge-smoke") {
+        return edge::parse_edge_smoke(&args[1..]).map(Action::Edge);
     }
     for arg in &args {
         if arg == "--version" || arg == "-V" {
@@ -180,7 +198,7 @@ fn parse_hello_quic(args: &[String]) -> Result<Action, String> {
     }))
 }
 
-fn take_value(args: &[String], index: &mut usize) -> Result<String, String> {
+pub(crate) fn take_value(args: &[String], index: &mut usize) -> Result<String, String> {
     let value = args
         .get(*index)
         .ok_or_else(|| "The flag needs a value.".to_string())?;
@@ -191,7 +209,7 @@ fn take_value(args: &[String], index: &mut usize) -> Result<String, String> {
     Ok(value.clone())
 }
 
-fn parse_socket(text: &str, default_port: u16) -> Result<SocketAddr, String> {
+pub(crate) fn parse_socket(text: &str, default_port: u16) -> Result<SocketAddr, String> {
     if let Ok(addr) = text.parse::<SocketAddr>() {
         return Ok(addr);
     }
@@ -306,7 +324,7 @@ mod tests {
                 assert!(command.tun_address.is_none());
                 assert!(command.connect.is_none());
             }
-            Action::Hello | Action::Version | Action::HelpHelloQuic => {
+            Action::Hello | Action::Version | Action::HelpHelloQuic | Action::Edge(_) => {
                 panic!("the parser did not select hello-quic");
             }
         }
@@ -340,7 +358,7 @@ mod tests {
                     std::net::Ipv4Addr::new(10, 8, 0, 2)
                 );
             }
-            Action::Hello | Action::Version | Action::HelpHelloQuic => {
+            Action::Hello | Action::Version | Action::HelpHelloQuic | Action::Edge(_) => {
                 panic!("the parser did not select hello-quic");
             }
         }
