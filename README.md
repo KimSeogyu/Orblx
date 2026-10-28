@@ -79,6 +79,46 @@ The TUN device needs CAP_NET_ADMIN on Linux.
 The tests do not open a TUN device.
 The tests use an in-memory packet path.
 
+## Edge path
+
+Week 4 adds own STUN in `gyeol-edge`.
+The client sends a Binding request.
+The client reads a Binding success response.
+The client stores the server-reflexive address.
+The path machine starts in Allocate.
+The path machine can enter the Direct stub.
+The Direct stub does not send hole-punch packets.
+Week 5 completes the hole punch.
+The code does not implement Relay.
+The code does not implement Stick and upgrade.
+The code does not implement TCP port 443.
+ADR 0003 leaves the Coordinator candidate owner open.
+The candidate set stays unsigned.
+
+Run the in-process lab:
+
+```bash
+cargo run -p gyeol-cli -- edge-smoke
+```
+
+The lab uses a local STUN server.
+The lab uses a userspace UDP NAT.
+The reflexive address is the NAT socket.
+[`scripts/edge-smoke.sh`](scripts/edge-smoke.sh) runs the same smoke.
+The script can also run a netns source-NAT lab when `ip` and `iptables` are present.
+
+Gather against a STUN server:
+
+```bash
+cargo run -p gyeol-cli -- stun --server 127.0.0.1:3478
+```
+
+Answer Binding requests in the lab:
+
+```bash
+cargo run -p gyeol-cli -- stun-serve --listen 127.0.0.1:3478
+```
+
 ## Completion criteria for the 12-week work
 
 The 12-week work is complete when all of these statements are true:
