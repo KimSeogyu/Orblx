@@ -133,6 +133,9 @@ The Relay does not parse the QUIC packet.
 The Relay does not terminate QUIC.
 The alternate is a Noise frame or a TLS-wrapped frame in the same payload slot.
 Week 6 does not implement that alternate.
-Stick and upgrade stays deferred.
+Week 6 leaves stick and upgrade deferred.
 The path does not retry Direct while Relay is up.
-The path does not migrate the QUIC connection in this build.
+The path does not migrate the QUIC connection in that build.
+Week 13 enables stick.
+The method is reconnect.
+See [docs/w13-stick-upgrade.md](../w13-stick-upgrade.md).

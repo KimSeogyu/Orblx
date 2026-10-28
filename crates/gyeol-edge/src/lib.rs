@@ -12,7 +12,9 @@
 //! The Relay payload stays opaque.
 //! UDP port 443 is preferred.
 //! TCP port 443 uses a QUIC-style length prefix when UDP is blocked.
-//! Stick and upgrade is deferred.
+//! Stick holds the Relay path and retries Direct.
+//! A successful retry reconnects hello-quic on the direct socket.
+//! The process does not restart.
 //! The NAT feed records one JSON object per path event.
 
 mod candidate;
@@ -25,6 +27,7 @@ mod path;
 mod punch;
 mod relay;
 mod same_nat;
+mod stick;
 mod stun;
 
 pub use candidate::{
@@ -33,6 +36,7 @@ pub use candidate::{
 };
 pub use direct::{
     issue_direct_pair, DirectIdentity, DirectMaterial, DirectProof, DirectRequest, DirectRole,
+    DirectUpgrade,
 };
 pub use error::EdgeError;
 pub use lab::{run_edge_smoke, SmokeReport};
@@ -45,7 +49,7 @@ pub use nat_feed::{
 pub use nat_smash::{run_nat_smash, NatSmash, NatSmashReport};
 pub use path::{
     AllocatePhase, DirectPhase, PathId, PathMachine, PathState, RelayPhase, DIRECT_ATTEMPT_BUDGET,
-    DIRECT_QUIC_PORT, STICK_AND_UPGRADE,
+    DIRECT_QUIC_PORT, DIRECT_RETRY_INTERVAL, STICK_AND_UPGRADE,
 };
 pub use punch::PunchToken;
 pub use relay::{
@@ -53,6 +57,7 @@ pub use relay::{
     RelaySmokeMode, RELAY_PROOF_PAYLOAD,
 };
 pub use same_nat::{run_same_nat_bound, run_same_nat_direct, SameNatReport};
+pub use stick::{run_stick_upgrade, StickNatKind, StickReport};
 pub use stun::{LabStunServer, StunClient};
 
 /// This function returns the name of this crate.

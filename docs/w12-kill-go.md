@@ -147,7 +147,9 @@ The Datapath agent id is `bc-551a2bb3`.
 
 This packet does not add a marketplace.
 This packet does not add recruiting.
-Stick and upgrade stay deferred.
+This packet does not add stick and upgrade.
+Week 13 adds that path.
+See [w13-stick-upgrade.md](w13-stick-upgrade.md).
 Full OIDC polish stays out.
 This packet does not add WireGuard.
 This packet does not add Headscale.

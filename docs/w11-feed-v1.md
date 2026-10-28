@@ -51,7 +51,8 @@ Radioactive NAT UDP block calls `gyeol_edge::run_nat_smash`.
 The call uses `NatDifficulty::Hard`, `NatLevel::RadioactiveNat`, and `NatInjectMode::UdpBlock`.
 `NatEventLog::drain` returns the JSON lines.
 The harness does not build a second NAT state machine.
-Stick and upgrade stay deferred.
+This feed does not record a stick retry.
+The stick lab is in [w13-stick-upgrade.md](w13-stick-upgrade.md).
 
 The UDP block order is:
 

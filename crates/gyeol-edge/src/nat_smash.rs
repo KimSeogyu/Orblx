@@ -3,7 +3,7 @@
 //! The runner records feed events from the path lab.
 //! UDP block follows the Week 6 TCP Relay lab after Direct fails.
 //! Symmetric NAT follows the Week 6 UDP Relay lab after Direct fails.
-//! Stick and upgrade stay deferred.
+//! This runner does not upgrade a Relay path to Direct.
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::thread::{self, JoinHandle};
@@ -97,7 +97,7 @@ pub struct NatSmashReport {
 /// UDP block discards Relay UDP and comes up on TCP.
 /// Symmetric NAT comes up on Relay UDP after Direct fails.
 /// The runner copies measured times into `rtt_ms`.
-/// Stick and upgrade stay deferred.
+/// The runner does not retry Direct after Relay is up.
 pub fn run_nat_smash(smash: NatSmash) -> Result<NatSmashReport, EdgeError> {
     let path_id = PathId::allocate()?;
     let path_session_hex = path_id.to_hex();
@@ -605,7 +605,7 @@ mod tests {
         assert!(!report.direct_up);
         assert!(report.relay_up);
         assert_eq!(report.transport, Some(transport));
-        assert_eq!(STICK_AND_UPGRADE, "deferred");
+        assert_eq!(STICK_AND_UPGRADE, "reconnect");
         let direct_rtt = report.direct_rtt_ms.expect("direct rtt");
         let hop_rtt = report.relay_attach_rtt_ms.expect("hop rtt");
         assert!(direct_rtt >= 150, "direct rtt {direct_rtt}");
