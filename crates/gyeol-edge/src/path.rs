@@ -5,15 +5,15 @@ use crate::{CandidateSink, EdgeError, EndpointCandidate, StunClient, UnsignedCan
 
 /// The Direct attempt budget from ADR 0003.
 ///
-/// Week 4 stores the budget.
-/// Week 4 does not start the timer.
-/// Week 5 uses the budget for the hole punch.
+/// The timer starts in `establish_direct`.
+/// The attempt fails when the budget elapses.
 pub const DIRECT_ATTEMPT_BUDGET: Duration = Duration::from_secs(3);
 
-/// The UDP port for a later direct QUIC session.
+/// The UDP port for a direct QUIC session.
 ///
-/// Week 4 stores the port.
-/// Week 4 does not open the QUIC session.
+/// The policy port is 443.
+/// A lab that cannot bind port 443 uses another server port.
+/// The netns lab binds this port.
 pub const DIRECT_QUIC_PORT: u16 = 443;
 
 /// The Allocate phase.
@@ -25,10 +25,56 @@ pub enum AllocatePhase {
     Ready,
 }
 
+/// Opaque path identifier allocated by N-Edge.
+///
+/// D-Path does not parse these bytes.
+/// D-Path owns send and recv on the active path_id.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PathId([u8; 16]);
+
+impl PathId {
+    /// Allocate 16 random bytes.
+    pub fn allocate() -> Result<Self, crate::EdgeError> {
+        let mut bytes = [0u8; 16];
+        getrandom::getrandom(&mut bytes).map_err(|err| crate::EdgeError::Io(err.to_string()))?;
+        Ok(Self(bytes))
+    }
+
+    /// Return the opaque bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    /// Return the bytes as lowercase hex.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        encode_hex(&self.0)
+    }
+}
+
+impl std::fmt::Debug for PathId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "PathId({})", self.to_hex())
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 /// The Direct phase.
 ///
-/// Week 4 has only the stub.
-/// Week 5 adds the hole punch.
+/// `Stub` records the budget and does not send a packet.
+/// `Punching` is the hole-punch attempt.
+/// `Up` means the hole punch and the QUIC proof succeeded.
+/// `Failed` means the attempt stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectPhase {
     /// The attempt is recorded.
@@ -39,15 +85,46 @@ pub enum DirectPhase {
         /// The later QUIC UDP port.
         quic_port: u16,
     },
+    /// The peers are sending hole-punch packets.
+    Punching {
+        /// The failure budget.
+        budget: Duration,
+        /// The QUIC server UDP port for this attempt.
+        quic_port: u16,
+    },
+    /// The hole punch and the QUIC proof succeeded.
+    Up {
+        /// The failure budget.
+        budget: Duration,
+        /// The QUIC server UDP port.
+        quic_port: u16,
+        /// Hole-punch datagrams this peer sent.
+        packets_sent: u32,
+        /// Hole-punch datagrams this peer received.
+        packets_received: u32,
+        /// The opaque path id.
+        path_id: PathId,
+    },
+    /// The Direct attempt stopped before QUIC was up.
+    Failed {
+        /// The failure budget.
+        budget: Duration,
+        /// The QUIC server UDP port for this attempt.
+        quic_port: u16,
+        /// Hole-punch datagrams this peer sent.
+        packets_sent: u32,
+        /// Hole-punch datagrams this peer received.
+        packets_received: u32,
+    },
 }
 
-/// The path states that Week 4 implements.
+/// The path states that this crate implements.
 ///
 /// Allocate gathers one reflexive address.
-/// Direct records a hole-punch stub.
-/// Week 4 does not implement Relay.
-/// Week 4 does not implement Stick and upgrade.
-/// Week 4 does not implement TCP port 443.
+/// Direct punches and then proves QUIC.
+/// This crate does not implement Relay.
+/// This crate does not implement Stick and upgrade.
+/// This crate does not implement TCP port 443.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathState {
     /// The Allocate state.
@@ -57,7 +134,7 @@ pub enum PathState {
         /// The candidate, when the phase is Ready.
         candidate: Option<EndpointCandidate>,
     },
-    /// The Direct stub.
+    /// The Direct state.
     Direct {
         /// The Direct phase.
         phase: DirectPhase,
@@ -88,6 +165,9 @@ impl std::fmt::Display for DirectPhase {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Stub { .. } => formatter.write_str("Stub"),
+            Self::Punching { .. } => formatter.write_str("Punch"),
+            Self::Up { .. } => formatter.write_str("Up"),
+            Self::Failed { .. } => formatter.write_str("Failed"),
         }
     }
 }
@@ -132,16 +212,49 @@ impl PathMachine {
 
     /// Report whether Direct has a QUIC path.
     ///
-    /// Week 4 does not complete the hole punch.
-    /// The function returns false.
+    /// The function returns true only after the hole punch and the QUIC proof.
     #[must_use]
     pub fn direct_is_up(&self) -> bool {
         match self.state {
             PathState::Allocate { .. } => false,
             PathState::Direct { phase, .. } => match phase {
-                DirectPhase::Stub { .. } => false,
+                DirectPhase::Stub { .. }
+                | DirectPhase::Punching { .. }
+                | DirectPhase::Failed { .. } => false,
+                DirectPhase::Up { .. } => true,
             },
         }
+    }
+
+    /// Return the opaque path id when Direct is up.
+    #[must_use]
+    pub fn path_id(&self) -> Option<PathId> {
+        match self.state {
+            PathState::Direct {
+                phase: DirectPhase::Up { path_id, .. },
+                ..
+            } => Some(path_id),
+            PathState::Allocate { .. } => None,
+            PathState::Direct {
+                phase:
+                    DirectPhase::Stub { .. } | DirectPhase::Punching { .. } | DirectPhase::Failed { .. },
+                ..
+            } => None,
+        }
+    }
+
+    pub(crate) fn ready_candidate(&self) -> Result<EndpointCandidate, EdgeError> {
+        match self.state {
+            PathState::Allocate {
+                phase: AllocatePhase::Ready,
+                candidate: Some(candidate),
+            } => Ok(candidate),
+            PathState::Allocate { .. } | PathState::Direct { .. } => Err(EdgeError::WrongState),
+        }
+    }
+
+    pub(crate) fn move_to(&mut self, state: PathState) {
+        self.state = state;
     }
 
     /// Gather one reflexive address and store an unsigned candidate.
@@ -182,7 +295,7 @@ impl PathMachine {
     ///
     /// The function does not send a packet.
     /// The function does not open a QUIC session.
-    /// Week 5 sends the hole-punch packets.
+    /// `establish_direct` sends the hole-punch packets.
     pub fn begin_direct_stub(&mut self) -> Result<(), EdgeError> {
         let candidate = match self.state {
             PathState::Allocate {

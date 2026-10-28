@@ -12,7 +12,10 @@ pub use error::HelloError;
 pub use framing::{decode_length_prefixed, encode_length_prefixed, MAX_FRAME_LEN};
 pub use gate::PeerGate;
 pub use ipv4::{ipv4_packet, is_ipv4_packet};
-pub use quic::{HelloConfig, HelloEndpoint, HelloReceiver, HelloSender, HelloSession};
+pub use quic::{
+    prove_hello_socket, HelloConfig, HelloEndpoint, HelloReceiver, HelloSender, HelloSession,
+    HelloSocketRole,
+};
 pub use run::{run_hello, HelloRequest, HelloRole};
 pub use tun_dev::{tun_capability_note, TunBridge, TunConfig, DEFAULT_UDP_PORT};
 

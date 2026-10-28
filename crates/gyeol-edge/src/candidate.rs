@@ -52,3 +52,67 @@ impl CandidateSink for MemoryCandidateSink {
         Ok(())
     }
 }
+
+/// Encode one unsigned candidate as text.
+///
+/// The text has no signature.
+/// ADR 0003 does not name the owner of the Coordinator blob.
+#[must_use]
+pub fn encode_candidate(candidate: EndpointCandidate) -> String {
+    format!(
+        "local {}\nreflexive {}\n",
+        candidate.local, candidate.reflexive
+    )
+}
+
+/// Decode one unsigned candidate from text.
+///
+/// The function does not verify a signature.
+pub fn decode_candidate(text: &str) -> Result<EndpointCandidate, EdgeError> {
+    let mut local = None;
+    let mut reflexive = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let key = parts.next().unwrap_or("");
+        let value = parts.next().unwrap_or("");
+        if parts.next().is_some() {
+            return Err(EdgeError::BadCandidate);
+        }
+        let addr: SocketAddr = value.parse().map_err(|_| EdgeError::BadCandidate)?;
+        match key {
+            "local" => local = Some(addr),
+            "reflexive" => reflexive = Some(addr),
+            _ => return Err(EdgeError::BadCandidate),
+        }
+    }
+    match (local, reflexive) {
+        (Some(local), Some(reflexive)) => Ok(EndpointCandidate { local, reflexive }),
+        _ => Err(EdgeError::BadCandidate),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use super::{decode_candidate, encode_candidate, EndpointCandidate};
+
+    #[test]
+    fn candidate_text_round_trip_has_no_signature() {
+        let candidate = EndpointCandidate {
+            local: SocketAddr::from((Ipv4Addr::new(10, 20, 0, 2), 443)),
+            reflexive: SocketAddr::from((Ipv4Addr::new(10, 30, 0, 2), 40000)),
+        };
+        let text = encode_candidate(candidate);
+        assert!(!text.contains("signature"));
+        assert_eq!(decode_candidate(&text).unwrap(), candidate);
+        assert_eq!(
+            decode_candidate("local 127.0.0.1:1\n"),
+            Err(crate::EdgeError::BadCandidate)
+        );
+    }
+}
