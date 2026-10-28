@@ -7,6 +7,7 @@ publish.workspace = true
 version.workspace = true
 
 [dependencies]
+gyeol-crypto = { path = "../gyeol-crypto" }
 gyeol-identity = { path = "../gyeol-identity" }
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rand = "0.8"

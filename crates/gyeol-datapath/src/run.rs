@@ -24,7 +24,7 @@ pub enum HelloRole {
 
 /// The inputs for one hello-quic process.
 pub struct HelloRequest {
-    /// Leaf, trust bundle, and ticket hash.
+    /// Leaf, trust bundle, and capability ticket.
     pub config: HelloConfig,
     /// Server or client.
     pub role: HelloRole,

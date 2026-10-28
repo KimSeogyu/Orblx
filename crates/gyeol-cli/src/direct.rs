@@ -4,13 +4,12 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use super::ticket_load;
+use super::{parse_socket, take_value};
 use gyeol_edge::{
     decode_candidate, encode_candidate, issue_direct_pair, DirectIdentity, DirectRequest,
     DirectRole, MemoryCandidateSink, PathMachine, PunchToken, StunClient, DIRECT_ATTEMPT_BUDGET,
 };
-use gyeol_identity::ticket_hash;
-
-use super::{parse_socket, take_value};
 
 const STUN_TIMEOUT: Duration = Duration::from_secs(5);
 const PEER_WAIT: Duration = Duration::from_secs(10);
@@ -161,7 +160,9 @@ fn run_issue(out: &Path) -> Result<(), String> {
         &out.join("client.key"),
         material.client.private_key_pem.as_bytes(),
     )?;
-    write_file(&out.join("ticket.bin"), &material.ticket_bytes)?;
+    ticket_load::write_shared(out, &material.server)?;
+    ticket_load::write_ticket(&out.join("server-ticket.bin"), &material.server)?;
+    ticket_load::write_ticket(&out.join("client-ticket.bin"), &material.client)?;
     println!("out {}", out.display());
     Ok(())
 }
@@ -213,14 +214,7 @@ fn load_identity(options: &PeerOptions) -> Result<DirectIdentity, String> {
         .map_err(|err| format!("The file {} did not open. {err}", options.key.display()))?;
     let trust_pem = fs::read_to_string(&options.bundle)
         .map_err(|err| format!("The file {} did not open. {err}", options.bundle.display()))?;
-    let ticket_bytes = fs::read(&options.ticket)
-        .map_err(|err| format!("The file {} did not open. {err}", options.ticket.display()))?;
-    Ok(DirectIdentity {
-        certificate_pem,
-        private_key_pem,
-        trust_pem,
-        ticket_hash: ticket_hash(&ticket_bytes),
-    })
+    ticket_load::load_direct_identity(certificate_pem, private_key_pem, trust_pem, &options.ticket)
 }
 
 fn publish_candidate(path: &Path, candidate: gyeol_edge::EndpointCandidate) -> Result<(), String> {
@@ -304,7 +298,10 @@ fn wants_help(args: &[String]) -> bool {
 fn issue_help() -> String {
     "\
 gyeol direct-issue --out DIR
-The command writes a lab CA, two leaves, and ticket bytes.
+The command writes a lab CA, two leaves, and two capability tickets.
+The ticket files are server-ticket.bin and client-ticket.bin.
+Each ticket file has a FILE.mac tag.
+The directory holds ticket-verifier.pem, ticket-mac.key, ticket-not-before, ticket-not-after, and svid-ca.pub.
 The leaves are for the Direct QUIC proof.
 The command does not contact an OIDC provider.
 "
@@ -319,6 +316,8 @@ The command writes the unsigned candidate.
 The command waits for the peer candidate file.
 The command sends hole-punch datagrams.
 The command proves QUIC on the same UDP socket.
+The --ticket file is one identity ticket.
+The command also reads FILE.mac and the ticket key files in that directory.
 The default timeout is 3 seconds.
 The timeout is the Direct budget.
 The command does not use Relay.

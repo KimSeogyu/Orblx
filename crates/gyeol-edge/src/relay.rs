@@ -687,12 +687,7 @@ fn prepare_peer(fail_direct: bool) -> Result<(PathMachine, u32), EdgeError> {
 }
 
 fn empty_identity() -> DirectIdentity {
-    DirectIdentity {
-        certificate_pem: String::new(),
-        private_key_pem: String::new(),
-        trust_pem: String::new(),
-        ticket_hash: [0; 16],
-    }
+    DirectIdentity::blank()
 }
 
 fn join_lab<T>(handle: JoinHandle<T>) -> Result<T, EdgeError> {

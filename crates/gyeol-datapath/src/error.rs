@@ -1,5 +1,6 @@
 use std::fmt;
 
+use gyeol_crypto::CryptoError;
 use gyeol_identity::IdentityError;
 
 use crate::FrameError;
@@ -35,6 +36,12 @@ pub enum HelloError {
     Tun(String),
     /// The QUIC connection failed.
     Quic(String),
+    /// The capability ticket check rejected the peer.
+    Ticket(CryptoError),
+    /// The peer did not present a capability ticket.
+    TicketMissing,
+    /// The frame `ticket_hash` differs from the verified ticket.
+    TicketHash,
 }
 
 impl fmt::Display for HelloError {
@@ -58,6 +65,18 @@ impl fmt::Display for HelloError {
             Self::Io(detail) => write!(formatter, "The I/O operation failed. {detail}"),
             Self::Tun(detail) => write!(formatter, "The TUN device did not open. {detail}"),
             Self::Quic(detail) => write!(formatter, "The QUIC connection failed. {detail}"),
+            Self::Ticket(err) => {
+                write!(
+                    formatter,
+                    "The capability ticket check rejected the peer. {err}"
+                )
+            }
+            Self::TicketMissing => {
+                formatter.write_str("The capability ticket is missing. The path rejects DATA.")
+            }
+            Self::TicketHash => {
+                formatter.write_str("The frame ticket hash differs from the verified ticket.")
+            }
         }
     }
 }
@@ -67,6 +86,7 @@ impl std::error::Error for HelloError {
         match self {
             Self::Identity(err) => Some(err),
             Self::Frame(err) => Some(err),
+            Self::Ticket(err) => Some(err),
             Self::PeerNotBound
             | Self::PeerRejected
             | Self::NotIpv4
@@ -78,7 +98,9 @@ impl std::error::Error for HelloError {
             | Self::Tls(_)
             | Self::Io(_)
             | Self::Tun(_)
-            | Self::Quic(_) => None,
+            | Self::Quic(_)
+            | Self::TicketMissing
+            | Self::TicketHash => None,
         }
     }
 }

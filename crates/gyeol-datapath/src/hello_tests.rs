@@ -1,7 +1,11 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use gyeol_identity::{decode_certificate_pem, ticket_hash, DenySet, MiniCa, SpiffeId, TrustBundle};
+use gyeol_crypto::{mac_input, ticket_hash, ticket_mac, CryptoError, TicketKey, TicketRing};
+use gyeol_identity::{
+    decode_certificate_pem, sign_ticket, DenySet, IdentityError, MiniCa, SpiffeId, TicketClaims,
+    TicketFlags, TicketSigner, TrustBundle,
+};
 use tokio::sync::mpsc;
 
 use crate::quic::pump_packets;
@@ -29,15 +33,82 @@ fn sample_packet() -> Vec<u8> {
     .unwrap()
 }
 
-fn fixture_hash() -> [u8; 16] {
-    ticket_hash(TICKET_VALID)
-}
-
 struct IssuedPair {
     server: HelloConfig,
     client: HelloConfig,
     server_id: SpiffeId,
     client_id: SpiffeId,
+    signer: TicketSigner,
+    mac_key: [u8; 32],
+}
+
+struct Presented {
+    bytes: Vec<u8>,
+    mac: [u8; 32],
+    nonce: [u8; 16],
+}
+
+fn unix(now: SystemTime) -> u64 {
+    now.duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+fn ticket_claims(now: SystemTime, subject: &SpiffeId, lifetime: u64) -> TicketClaims {
+    let start = unix(now);
+    TicketClaims {
+        issuer: SpiffeId::coord("1").unwrap(),
+        subject: subject.clone(),
+        not_before: start,
+        expires: start + lifetime,
+        dst_cidr: "10.8.0.0/24".to_string(),
+        proto: 6,
+        dst_port: 443,
+        flags: TicketFlags::none(),
+    }
+}
+
+fn present(
+    signer: &TicketSigner,
+    mac_key: &[u8; 32],
+    now: SystemTime,
+    subject: &SpiffeId,
+    lifetime: u64,
+) -> Presented {
+    let signed = sign_ticket(signer, &ticket_claims(now, subject, lifetime)).unwrap();
+    let mac = ticket_mac(mac_key, mac_input(&signed.bytes)).unwrap();
+    Presented {
+        bytes: signed.bytes,
+        mac,
+        nonce: signed.nonce,
+    }
+}
+
+fn ring_for(ca: &MiniCa, signer: &TicketSigner, mac_key: [u8; 32], now: SystemTime) -> TicketRing {
+    assert_ne!(signer.public_key(), *ca.public_key());
+    let key = TicketKey::new(
+        signer.verifier(),
+        mac_key,
+        now - Duration::from_secs(60),
+        now + Duration::from_secs(86_400),
+    )
+    .unwrap();
+    TicketRing::single(key, ca.public_key()).unwrap()
+}
+
+fn config_for(
+    certificate_pem: &str,
+    private_key_pem: &str,
+    trust: TrustBundle,
+    presented: &Presented,
+    ring: &TicketRing,
+) -> HelloConfig {
+    HelloConfig::from_issued(
+        certificate_pem,
+        private_key_pem,
+        trust,
+        presented.bytes.clone(),
+        presented.mac,
+        ring.clone(),
+    )
 }
 
 fn issue_pair(now: SystemTime) -> (MiniCa, IssuedPair) {
@@ -48,25 +119,40 @@ fn issue_pair(now: SystemTime) -> (MiniCa, IssuedPair) {
     let client_id = SpiffeId::user("w3-client").unwrap();
     let server = ca.issue(&server_id, now, ttl, &deny).unwrap();
     let client = ca.issue(&client_id, now, ttl, &deny).unwrap();
-    let hash = fixture_hash();
+    let signer = TicketSigner::generate();
+    let mac_key = [0x24; 32];
+    let ring = ring_for(&ca, &signer, mac_key, now);
+    let server_ticket = present(&signer, &mac_key, now, &server_id, 600);
+    let client_ticket = present(&signer, &mac_key, now, &client_id, 600);
     let trust = ca.trust_bundle().clone();
     let pair = IssuedPair {
-        server: HelloConfig::from_issued(
+        server: config_for(
             &server.certificate_pem,
             &server.private_key_pem,
             trust.clone(),
-            hash,
+            &server_ticket,
+            &ring,
         ),
-        client: HelloConfig::from_issued(
+        client: config_for(
             &client.certificate_pem,
             &client.private_key_pem,
             trust,
-            hash,
+            &client_ticket,
+            &ring,
         ),
         server_id,
         client_id,
+        signer,
+        mac_key,
     };
     (ca, pair)
+}
+
+fn ticket_failure(err: HelloError) -> CryptoError {
+    match err {
+        HelloError::Ticket(err) => err,
+        other => panic!("the ticket check did not fail: {other}"),
+    }
 }
 
 fn assert_identity_error(err: HelloError) {
@@ -111,7 +197,7 @@ fn fixture_leaf_binds_and_unbound_gate_rejects_data() {
     let leaf = decode_certificate_pem(USER_SVID_PEM).unwrap();
     let now = UNIX_EPOCH + Duration::from_secs(FIXTURE_UNIX);
     let packet = sample_packet();
-    let hash = fixture_hash();
+    let hash = ticket_hash(TICKET_VALID);
 
     let unbound = PeerGate::new();
     let err = unbound.encode_data(1, 0, hash, &packet).unwrap_err();
@@ -132,12 +218,17 @@ fn fixture_leaf_binds_and_unbound_gate_rejects_data() {
     let frame = gate.encode_data(7, 0, hash, &packet).unwrap();
     assert_eq!(frame.ticket_hash, hash);
     assert_eq!(frame.seq, 0);
-    assert_eq!(gate.payload_from_data(&frame).unwrap(), packet.as_slice());
+    assert!(matches!(
+        gate.payload_from_data(&frame, now, &DenySet::empty())
+            .unwrap_err(),
+        HelloError::TicketMissing
+    ));
 
     let mut control = frame.clone();
     control.frame_type = crate::FrameType::Ctrl;
     assert!(matches!(
-        gate.payload_from_data(&control).unwrap_err(),
+        gate.payload_from_data(&control, now, &DenySet::empty())
+            .unwrap_err(),
         HelloError::NotData
     ));
 
@@ -156,6 +247,8 @@ async fn quic_frame_round_trip_uses_the_fixture_ticket_hash() {
 async fn round_trip() -> Result<(), HelloError> {
     let now = SystemTime::now();
     let (_ca, pair) = issue_pair(now);
+    let client_hash = ticket_hash(&pair.client.ticket_bytes);
+    let server_hash = ticket_hash(&pair.server.ticket_bytes);
     let server = HelloEndpoint::bind_server(pair.server, loopback(0))?;
     let addr = server.local_addr()?;
     let packet = sample_packet();
@@ -167,14 +260,13 @@ async fn round_trip() -> Result<(), HelloError> {
     let reply_for_server = reply.clone();
     let server_id = pair.server_id.clone();
     let client_id = pair.client_id.clone();
-    let hash = fixture_hash();
     let packet_for_server = packet.clone();
 
     let server_task = tokio::spawn(async move {
         let mut session = server.accept_one().await.unwrap();
         assert_eq!(session.peer_id(), &client_id);
         let frame = session.recv_data_frame().await.unwrap();
-        assert_eq!(frame.ticket_hash, hash);
+        assert_eq!(frame.ticket_hash, client_hash);
         assert_eq!(frame.seq, 0);
         assert_eq!(frame.payload, packet_for_server);
         let client_session_from_frame = frame.session_id;
@@ -192,7 +284,7 @@ async fn round_trip() -> Result<(), HelloError> {
     session.send_ipv4(&packet).await?;
     let got = session.recv_data_frame().await?;
     assert_eq!(got.payload, reply);
-    assert_eq!(got.ticket_hash, hash);
+    assert_eq!(got.ticket_hash, server_hash);
     assert_eq!(got.seq, 0);
     session.send_ipv4(&packet).await?;
     let (server_session_id, client_session_from_frame) = server_task.await.unwrap();
@@ -254,7 +346,9 @@ async fn reject_bad_client() {
         &bad.certificate_pem,
         &bad.private_key_pem,
         ca.trust_bundle().clone(),
-        fixture_hash(),
+        pair.client.ticket_bytes.clone(),
+        pair.client.ticket_mac,
+        pair.client.ticket_ring.clone(),
     );
     let server = HelloEndpoint::bind_server(pair.server, loopback(0)).unwrap();
     let addr = server.local_addr().unwrap();
@@ -288,7 +382,9 @@ async fn reject_bad_server() {
         &bad.certificate_pem,
         &bad.private_key_pem,
         ca.trust_bundle().clone(),
-        fixture_hash(),
+        pair.server.ticket_bytes.clone(),
+        pair.server.ticket_mac,
+        pair.server.ticket_ring.clone(),
     );
     let server = HelloEndpoint::bind_server(bad_server, loopback(0)).unwrap();
     let addr = server.local_addr().unwrap();
@@ -302,4 +398,299 @@ async fn reject_bad_server() {
     };
     assert_identity_error(err);
     server_task.abort();
+}
+
+#[test]
+fn ticket_acl_drops_bad_tickets_and_allows_a_valid_ticket() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let ca = MiniCa::generate(now).unwrap();
+    let peer = SpiffeId::user("seogyu-dev").unwrap();
+    let issued = ca
+        .issue(&peer, now, Duration::from_secs(300), &DenySet::empty())
+        .unwrap();
+    let signer = TicketSigner::generate();
+    let mac_key = [0x42; 32];
+    let ring = ring_for(&ca, &signer, mac_key, now);
+    let good = present(&signer, &mac_key, now, &peer, 600);
+    let hash = ticket_hash(&good.bytes);
+
+    let mut gate = PeerGate::new();
+    let unbound = gate
+        .admit_ticket(&ring, &good.bytes, &good.mac, now, &DenySet::empty())
+        .unwrap_err();
+    assert!(matches!(unbound, HelloError::PeerNotBound));
+
+    gate.bind_leaf(
+        ca.trust_bundle(),
+        &issued.certificate_der,
+        now,
+        &DenySet::empty(),
+    )
+    .unwrap();
+    let packet = sample_packet();
+    let frame = gate.encode_data(1, 0, hash, &packet).unwrap();
+    assert!(matches!(
+        gate.payload_from_data(&frame, now, &DenySet::empty())
+            .unwrap_err(),
+        HelloError::TicketMissing
+    ));
+    assert!(matches!(
+        gate.admit_ticket(&ring, &[], &good.mac, now, &DenySet::empty())
+            .unwrap_err(),
+        HelloError::TicketMissing
+    ));
+
+    let mut wrong = good.bytes.clone();
+    let last = wrong.len() - 1;
+    wrong[last] ^= 0xff;
+    assert_eq!(
+        ticket_failure(
+            gate.admit_ticket(&ring, &wrong, &good.mac, now, &DenySet::empty())
+                .unwrap_err()
+        ),
+        CryptoError::Identity(IdentityError::Signature)
+    );
+
+    let mut bad_mac = good.mac;
+    bad_mac[0] ^= 0xff;
+    assert_eq!(
+        ticket_failure(
+            gate.admit_ticket(&ring, &good.bytes, &bad_mac, now, &DenySet::empty())
+                .unwrap_err()
+        ),
+        CryptoError::TicketMac
+    );
+
+    let other = SpiffeId::user("other-user").unwrap();
+    let other_ticket = present(&signer, &mac_key, now, &other, 600);
+    assert_eq!(
+        ticket_failure(
+            gate.admit_ticket(
+                &ring,
+                &other_ticket.bytes,
+                &other_ticket.mac,
+                now,
+                &DenySet::empty()
+            )
+            .unwrap_err()
+        ),
+        CryptoError::TicketSubject
+    );
+
+    let expired_claims = TicketClaims {
+        issuer: SpiffeId::coord("1").unwrap(),
+        subject: peer.clone(),
+        not_before: unix(now) - 10_000,
+        expires: unix(now) - 120,
+        dst_cidr: "10.8.0.0/24".to_string(),
+        proto: 6,
+        dst_port: 443,
+        flags: TicketFlags::none(),
+    };
+    let expired = sign_ticket(&signer, &expired_claims).unwrap();
+    let expired_mac = ticket_mac(&mac_key, mac_input(&expired.bytes)).unwrap();
+    assert_eq!(
+        ticket_failure(
+            gate.admit_ticket(&ring, &expired.bytes, &expired_mac, now, &DenySet::empty())
+                .unwrap_err()
+        ),
+        CryptoError::Identity(IdentityError::Expired)
+    );
+
+    let admitted = gate
+        .admit_ticket(&ring, &good.bytes, &good.mac, now, &DenySet::empty())
+        .unwrap();
+    assert_eq!(admitted, hash);
+    assert_eq!(
+        gate.payload_from_data(&frame, now, &DenySet::empty())
+            .unwrap(),
+        packet.as_slice()
+    );
+
+    let mut mismatched = frame.clone();
+    mismatched.ticket_hash[0] ^= 0xff;
+    assert!(matches!(
+        gate.payload_from_data(&mismatched, now, &DenySet::empty())
+            .unwrap_err(),
+        HelloError::TicketHash
+    ));
+
+    let late = now + Duration::from_secs(800);
+    assert_eq!(
+        ticket_failure(
+            gate.payload_from_data(&frame, late, &DenySet::empty())
+                .unwrap_err()
+        ),
+        CryptoError::Identity(IdentityError::Expired)
+    );
+    assert_eq!(
+        gate.payload_from_data(&frame, now, &DenySet::empty())
+            .unwrap(),
+        packet.as_slice()
+    );
+
+    let mut deny = DenySet::empty();
+    let document = format!(
+        r#"{{"version":1,"generated_at":1,"revoked_uris":[],"revoked_ticket_nonces":["{nonce}"]}}"#,
+        nonce = hex(&good.nonce)
+    );
+    deny.apply_json(document.as_bytes()).unwrap();
+    assert_eq!(
+        ticket_failure(gate.payload_from_data(&frame, now, &deny).unwrap_err()),
+        CryptoError::Identity(IdentityError::Revoked)
+    );
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[tokio::test]
+async fn quic_receiver_drops_a_bad_ticket_and_allows_a_valid_ticket() {
+    tokio::time::timeout(Duration::from_secs(30), ticket_accept_cases())
+        .await
+        .expect("the ticket accept test timed out");
+}
+
+async fn ticket_accept_cases() {
+    let now = SystemTime::now();
+    let (ca, pair) = issue_pair(now);
+    let client_leaf = pair.client.certificate_pem.clone();
+    let client_key = pair.client.private_key_pem.clone();
+    let server_leaf = pair.server.certificate_pem.clone();
+    let server_key = pair.server.private_key_pem.clone();
+    let trust = ca.trust_bundle().clone();
+    let ring = pair.client.ticket_ring.clone();
+
+    let missing = HelloConfig::from_issued(
+        &client_leaf,
+        &client_key,
+        trust.clone(),
+        Vec::new(),
+        pair.client.ticket_mac,
+        ring.clone(),
+    );
+    let server_err = receiver_error(pair.server.clone(), missing).await;
+    assert!(
+        matches!(server_err, HelloError::TicketMissing),
+        "a missing ticket was accepted: {server_err}"
+    );
+
+    let mut wrong_bytes = pair.client.ticket_bytes.clone();
+    let last = wrong_bytes.len() - 1;
+    wrong_bytes[last] ^= 0xff;
+    let wrong = HelloConfig::from_issued(
+        &client_leaf,
+        &client_key,
+        trust.clone(),
+        wrong_bytes,
+        pair.client.ticket_mac,
+        ring.clone(),
+    );
+    let server_err = receiver_error(pair.server.clone(), wrong).await;
+    assert_eq!(
+        ticket_failure(server_err),
+        CryptoError::Identity(IdentityError::Signature)
+    );
+
+    let mut bad_mac = pair.client.ticket_mac;
+    bad_mac[0] ^= 0xff;
+    let bad = HelloConfig::from_issued(
+        &client_leaf,
+        &client_key,
+        trust.clone(),
+        pair.client.ticket_bytes.clone(),
+        bad_mac,
+        ring.clone(),
+    );
+    let server_err = receiver_error(pair.server.clone(), bad).await;
+    assert_eq!(ticket_failure(server_err), CryptoError::TicketMac);
+
+    let expired = present(
+        &pair.signer,
+        &pair.mac_key,
+        now - Duration::from_secs(10_000),
+        &pair.client_id,
+        100,
+    );
+    let expired_config = HelloConfig::from_issued(
+        &client_leaf,
+        &client_key,
+        trust.clone(),
+        expired.bytes,
+        expired.mac,
+        ring.clone(),
+    );
+    let server_err = receiver_error(pair.server.clone(), expired_config).await;
+    assert_eq!(
+        ticket_failure(server_err),
+        CryptoError::Identity(IdentityError::Expired)
+    );
+
+    let other = SpiffeId::user("other-user").unwrap();
+    let other_ticket = present(&pair.signer, &pair.mac_key, now, &other, 600);
+    let other_config = HelloConfig::from_issued(
+        &client_leaf,
+        &client_key,
+        trust.clone(),
+        other_ticket.bytes,
+        other_ticket.mac,
+        ring.clone(),
+    );
+    let server_err = receiver_error(pair.server.clone(), other_config).await;
+    assert_eq!(ticket_failure(server_err), CryptoError::TicketSubject);
+
+    let expired_server = present(
+        &pair.signer,
+        &pair.mac_key,
+        now - Duration::from_secs(10_000),
+        &pair.server_id,
+        100,
+    );
+    let bad_server = HelloConfig::from_issued(
+        &server_leaf,
+        &server_key,
+        trust,
+        expired_server.bytes,
+        expired_server.mac,
+        ring,
+    );
+    let client_err = connector_error(bad_server, pair.client.clone()).await;
+    assert_eq!(
+        ticket_failure(client_err),
+        CryptoError::Identity(IdentityError::Expired)
+    );
+}
+
+async fn receiver_error(server: HelloConfig, client: HelloConfig) -> HelloError {
+    let server = HelloEndpoint::bind_server(server, loopback(0)).unwrap();
+    let addr = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move { server.accept_one().await });
+    let client = HelloEndpoint::bind_client(client, loopback(0)).unwrap();
+    let client_task = tokio::spawn(async move { client.connect_one(addr).await });
+    let server_result = server_task.await.unwrap();
+    client_task.abort();
+    match server_result {
+        Err(err) => err,
+        Ok(_) => panic!("the receiver accepted the ticket"),
+    }
+}
+
+async fn connector_error(server: HelloConfig, client: HelloConfig) -> HelloError {
+    let server = HelloEndpoint::bind_server(server, loopback(0)).unwrap();
+    let addr = server.local_addr().unwrap();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        let result = server.accept_one().await;
+        let _ = release_rx.await;
+        result
+    });
+    let client = HelloEndpoint::bind_client(client, loopback(0)).unwrap();
+    let client_result = client.connect_one(addr).await;
+    let _ = release_tx.send(());
+    let _ = server_task.await;
+    match client_result {
+        Err(err) => err,
+        Ok(_) => panic!("the connector accepted the ticket"),
+    }
 }
