@@ -415,8 +415,8 @@ check_relay_smoke() {
     rm -f "$file"
     exit 1
   fi
-  if ! grep -q '^stick deferred$' "$file"; then
-    echo "Stick status is not deferred."
+  if ! grep -q '^stick reconnect$' "$file"; then
+    echo "Stick status is not reconnect."
     cat "$file"
     rm -f "$file"
     exit 1

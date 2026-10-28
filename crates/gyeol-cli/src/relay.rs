@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 
 use super::ticket_load;
 use gyeol_edge::{
-    relay_policy_port, run_relay_smoke, DirectIdentity, DirectRole, MemoryCandidateSink,
-    PathMachine, RelayRequest, RelaySmokeMode, StunClient, STICK_AND_UPGRADE,
+    relay_policy_port, run_relay_smoke, run_stick_upgrade, DirectIdentity, DirectRole,
+    MemoryCandidateSink, PathMachine, RelayRequest, RelaySmokeMode, StickNatKind, StunClient,
+    STICK_AND_UPGRADE,
 };
 use gyeol_relay::{
     framing_name, RelayPreference, RelayServer, RelaySessionId, ServerConfig, RELAY_PORT,
@@ -27,6 +28,8 @@ pub(crate) enum Command {
     Serve(ServeOptions),
     Peer(Box<PeerOptions>),
     Smoke(SmokeOptions),
+    /// Run the stick labs.
+    Stick,
 }
 
 #[derive(Debug)]
@@ -218,7 +221,53 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
         Command::Serve(options) => run_serve(options),
         Command::Peer(options) => run_peer(*options),
         Command::Smoke(options) => run_smoke(options),
+        Command::Stick => run_stick(),
     }
+}
+
+pub(crate) fn parse_stick(args: &[String]) -> Result<Command, String> {
+    if wants_help(args) {
+        return Ok(Command::Help(stick_help()));
+    }
+    if !args.is_empty() {
+        return Err(stick_help());
+    }
+    Ok(Command::Stick)
+}
+
+fn run_stick() -> Result<(), String> {
+    for kind in [
+        StickNatKind::SameNat,
+        StickNatKind::Symmetric,
+        StickNatKind::UdpBlock,
+    ] {
+        let report = run_stick_upgrade(kind).map_err(|err| err.to_string())?;
+        for line in report.lines() {
+            println!("{line}");
+        }
+        if !report.lab_ok() {
+            return Err(format!(
+                "The stick lab {} did not meet the expected result.",
+                kind.slug()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn stick_help() -> String {
+    "\
+gyeol stick-upgrade
+The command starts on the Relay.
+The command holds that path.
+The command retries Direct.
+same-nat moves later traffic to Direct.
+symmetric stays on the UDP Relay.
+udp-block stays on the TCP Relay.
+The upgrade method is reconnect.
+The process does not restart.
+"
+    .to_string()
 }
 
 fn run_serve(options: ServeOptions) -> Result<(), String> {
@@ -451,7 +500,8 @@ The command proves QUIC through the Relay.
 The --ticket file is one identity ticket.
 The command also reads FILE.mac and the ticket key files in that directory.
 The command does not punch a direct path.
-Stick and upgrade is deferred.
+The command does not retry Direct.
+Run gyeol stick-upgrade for the stick lab.
 "
     .to_string()
 }
@@ -479,7 +529,7 @@ mod tests {
                 assert_eq!(options.udp.unwrap().port(), 443);
                 assert_eq!(options.tcp.unwrap().port(), 443);
             }
-            Command::Help(_) | Command::Peer(_) | Command::Smoke(_) => {
+            Command::Help(_) | Command::Peer(_) | Command::Smoke(_) | Command::Stick => {
                 panic!("the parser did not select relay");
             }
         }
@@ -499,7 +549,7 @@ mod tests {
                 assert!(matches!(options.mode, gyeol_edge::RelaySmokeMode::Tcp));
                 assert!(options.bind.is_none());
             }
-            Command::Help(_) | Command::Serve(_) | Command::Peer(_) => {
+            Command::Help(_) | Command::Serve(_) | Command::Peer(_) | Command::Stick => {
                 panic!("the parser did not select relay-smoke");
             }
         }

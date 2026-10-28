@@ -130,6 +130,9 @@ where
     if args.first().map(String::as_str) == Some("relay-smoke") {
         return relay::parse_smoke(&args[1..]).map(Action::Relay);
     }
+    if args.first().map(String::as_str) == Some("stick-upgrade") {
+        return relay::parse_stick(&args[1..]).map(Action::Relay);
+    }
     if args.first().map(String::as_str) == Some("connector") {
         return connector::parse(&args[1..]).map(Action::Connector);
     }

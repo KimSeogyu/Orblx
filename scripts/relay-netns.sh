@@ -93,7 +93,7 @@ check_peer() {
   expect_line "$file" "direct_is_up false"
   expect_line "$file" "echo ok true"
   expect_line "$file" "transport ${transport}"
-  expect_line "$file" "stick deferred"
+  expect_line "$file" "stick reconnect"
   expect_line "$file" "tcp framing quic-style"
   if [[ "$transport" == "tcp" ]]; then
     expect_line "$file" "framing quic-style"

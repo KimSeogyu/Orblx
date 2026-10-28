@@ -3,7 +3,7 @@
 //! Each recorded line is one JSON object.
 //! ShipPlatform can return `drain` from the sim feed.
 //! The smash runner drives `PathMachine` and calls these builders.
-//! Stick and upgrade stay deferred.
+//! This feed does not record a stick retry.
 //!
 //! ```
 //! use gyeol_edge::{

@@ -98,7 +98,7 @@ When UDP is blocked, the path uses TCP port 443.
 TCP uses a QUIC-style length prefix.
 The prefix is a 16-bit length and one Relay datagram.
 The datagram payload is one QUIC packet.
-Stick and upgrade is deferred.
+Stick and upgrade is in [Stick and upgrade](#stick-and-upgrade).
 
 Run the in-process same-NAT lab:
 
@@ -135,6 +135,20 @@ Answer Binding requests in the lab:
 
 ```bash
 cargo run -p gyeol-cli -- stun-serve --listen 127.0.0.1:3478
+```
+
+## Stick and upgrade
+
+While the path is on the Relay, the path stays on the Relay.
+The path retries Direct on a 1 second interval.
+A failed retry leaves the path on the Relay.
+A successful retry opens a new hello-quic session on the direct socket.
+The process does not restart.
+The method is reconnect.
+The details and the lab results are in [docs/w13-stick-upgrade.md](docs/w13-stick-upgrade.md).
+
+```bash
+cargo run -p gyeol-cli -- stick-upgrade
 ```
 
 ## Relay

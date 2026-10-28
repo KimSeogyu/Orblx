@@ -62,7 +62,7 @@ Hard runs Radioactive NAT.
 
 - City Breeze. A human uses OIDC to get an SVID. The human sends an overlay ping. The human opens two HTTPS applications. Press Revoke to drop that SVID.
 - Agent JIT. Spawn agent creates the agent SVID. Application A allows the agent. Application B denies the agent. The ticket TTL expiry is visible.
-- Radioactive NAT. UDP block calls `gyeol_edge::run_nat_smash`. Direct fails. The path then uses the TCP Relay. The overlay address is `10.8.0.1`. An SVID revoke drops new packets within 60 seconds. Stick and upgrade stay deferred.
+- Radioactive NAT. UDP block calls `gyeol_edge::run_nat_smash`. Direct fails. The path then uses the TCP Relay. The overlay address is `10.8.0.1`. An SVID revoke drops new packets within 60 seconds. This smash does not upgrade to Direct. Stick and upgrade is in [w13-stick-upgrade.md](w13-stick-upgrade.md).
 
 A passed step has the status `pass`.
 
