@@ -1,0 +1,20 @@
+[package]
+name = "gyeol-sim"
+description = "Local sim harness skeleton. The harness does not run the gyeol-quic stack."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "gyeol-sim"
+path = "src/main.rs"
+
+# This crate is a local harness skeleton.
+# Do not add WireGuard, Headscale, or DERP crates.
+
+[dependencies]
+axum = "0.7.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

@@ -213,6 +213,24 @@ Run the script:
 ./scripts/demo.sh
 ```
 
+## Sim harness
+
+The sim harness is a local skeleton.
+The crate name is `gyeol-sim`.
+The level bodies are empty.
+The harness does not run the gyeol-quic stack.
+
+Run the harness:
+
+```bash
+cargo run -p gyeol-sim
+```
+
+Open `http://127.0.0.1:8787`.
+
+The three levels are City Breeze, Agent JIT, and Radioactive NAT.
+Read the run steps in [docs/demo-sim.md](docs/demo-sim.md).
+
 ## License
 
 The license is the Apache License, Version 2.0.

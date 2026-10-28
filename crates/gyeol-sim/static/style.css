@@ -1,0 +1,179 @@
+:root {
+  color-scheme: dark;
+  --bg: #14161c;
+  --panel: #1d212b;
+  --text: #ece7dc;
+  --muted: #b7b1a6;
+  --line: #343a48;
+  --accent: #e0b15a;
+  --focus: #f2d48a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  line-height: 1.45;
+}
+
+header,
+.layout {
+  width: min(72rem, calc(100% - 2rem));
+  margin: 0 auto;
+}
+
+header {
+  padding-top: 1.25rem;
+}
+
+h1,
+h2,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  margin-bottom: 0.35rem;
+  font-size: 1.8rem;
+}
+
+h2 {
+  margin-bottom: 0.6rem;
+  font-size: 1rem;
+  letter-spacing: 0.02em;
+}
+
+.mark {
+  display: inline-block;
+  margin-bottom: 0.4rem;
+  padding: 0.1rem 0.45rem;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+#notice,
+.hint,
+.goal,
+.note,
+#hook {
+  color: var(--muted);
+}
+
+#error {
+  min-height: 1.2rem;
+  color: #f0a090;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 22rem 1fr;
+  gap: 1rem;
+  padding-bottom: 2rem;
+}
+
+aside,
+main {
+  display: grid;
+  gap: 1rem;
+  align-content: start;
+}
+
+section {
+  padding: 0.9rem 1rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+button {
+  font: inherit;
+  color: var(--text);
+  background: #262b36;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.55rem 0.75rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: var(--accent);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+button.selected {
+  border-color: var(--accent);
+  background: #322c22;
+}
+
+.level {
+  display: grid;
+  gap: 0.35rem;
+  margin-bottom: 0.8rem;
+}
+
+.level:last-child {
+  margin-bottom: 0;
+}
+
+.goal,
+.hint,
+.note {
+  margin-bottom: 0;
+  font-size: 0.92rem;
+}
+
+.row,
+.smash,
+.split {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.smash {
+  display: grid;
+}
+
+.split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+.state {
+  font-weight: 650;
+}
+
+#events {
+  margin: 0;
+  padding-left: 1.2rem;
+  max-height: 18rem;
+  overflow: auto;
+  font-family: ui-monospace, monospace;
+  font-size: 0.92rem;
+}
+
+#events li + li {
+  margin-top: 0.45rem;
+}
+
+@media (max-width: 800px) {
+  .layout,
+  .split {
+    grid-template-columns: 1fr;
+  }
+}

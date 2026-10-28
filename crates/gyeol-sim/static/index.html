@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gyeol sim</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <p class="mark">skeleton</p>
+    <h1>gyeol sim</h1>
+    <p id="notice">The harness is loading.</p>
+    <p id="error" role="alert"></p>
+  </header>
+  <noscript>
+    <p>The harness UI needs JavaScript.</p>
+  </noscript>
+  <div class="layout">
+    <aside>
+      <section aria-labelledby="levels-title">
+        <h2 id="levels-title">Levels</h2>
+        <div id="levels"></div>
+      </section>
+      <section aria-labelledby="difficulty-title">
+        <h2 id="difficulty-title">Difficulty</h2>
+        <div id="difficulties" class="row"></div>
+        <p id="hook"></p>
+        <p id="difficulty-note" class="note"></p>
+      </section>
+      <section aria-labelledby="smash-title">
+        <h2 id="smash-title">Smash</h2>
+        <div class="smash">
+          <button type="button" id="smash-revoke">Revoke</button>
+          <button type="button" id="smash-udp-block">UDP block</button>
+          <button type="button" id="smash-agent-spawn">Spawn agent</button>
+        </div>
+        <p class="hint">A smash button writes a stub event. A smash button does not run the stack.</p>
+      </section>
+    </aside>
+    <main>
+      <section aria-labelledby="peers-title">
+        <h2 id="peers-title">Peers</h2>
+        <div id="peers" data-panel="peers"></div>
+      </section>
+      <section aria-labelledby="packets-title">
+        <h2 id="packets-title">Packets</h2>
+        <div id="packets" data-panel="packets"></div>
+      </section>
+      <section aria-labelledby="quic-title">
+        <h2 id="quic-title">QUIC path</h2>
+        <div id="quic" data-panel="quic"></div>
+      </section>
+      <div class="split">
+        <section aria-labelledby="svid-title">
+          <h2 id="svid-title">SVID</h2>
+          <div id="svid" data-panel="svid"></div>
+        </section>
+        <section aria-labelledby="ticket-title">
+          <h2 id="ticket-title">Ticket</h2>
+          <div id="ticket" data-panel="ticket"></div>
+        </section>
+      </div>
+      <section aria-labelledby="steps-title">
+        <h2 id="steps-title">Level steps</h2>
+        <div id="steps" data-panel="steps"></div>
+      </section>
+      <section aria-labelledby="events-title">
+        <h2 id="events-title">Event log</h2>
+        <ol id="events" data-panel="events" aria-live="polite"></ol>
+      </section>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -7,6 +7,7 @@ members = [
     "crates/gyeol-datapath",
     "crates/gyeol-edge",
     "crates/gyeol-identity",
+    "crates/gyeol-sim",
 ]
 
 # The data path uses Quinn, rustls, and ring.
