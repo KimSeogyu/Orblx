@@ -79,6 +79,58 @@ The TUN device needs CAP_NET_ADMIN on Linux.
 The tests do not open a TUN device.
 The tests use an in-memory packet path.
 
+## Edge path
+
+`gyeol-edge` gathers one reflexive address with in-tree STUN.
+The path machine starts in Allocate.
+Allocate stores one unsigned candidate.
+ADR 0003 leaves the Coordinator candidate owner open.
+Direct sends hole-punch datagrams.
+Direct then proves hello-quic on the same UDP socket.
+`direct_is_up` is true after that proof.
+The Direct budget is 3 seconds.
+The QUIC policy port is UDP 443.
+The code does not implement Relay.
+The code does not implement Stick and upgrade.
+The code does not implement TCP port 443.
+
+Run the in-process same-NAT lab:
+
+```bash
+cargo run -p gyeol-cli -- edge-smoke
+```
+
+The lab uses a local STUN server.
+The lab uses a userspace UDP NAT.
+The two peers share the NAT address.
+The punch uses the host candidates.
+The command tries to bind the QUIC server on UDP port 443.
+When that bind is not permitted, the server uses an ephemeral port.
+
+Run the same lab on UDP port 443 when the process can bind that port:
+
+```bash
+cargo run -p gyeol-cli -- edge-smoke --bind 127.0.0.1:443
+```
+
+[`scripts/edge-smoke.sh`](scripts/edge-smoke.sh) runs the userspace lab.
+The script runs the UDP 443 lab when root is available.
+The script runs a netns source-NAT lab when `ip` and `iptables` are present.
+The netns lab puts two peers behind one MASQUERADE NAT.
+The QUIC server binds UDP port 443.
+
+Gather against a STUN server:
+
+```bash
+cargo run -p gyeol-cli -- stun --server 127.0.0.1:3478
+```
+
+Answer Binding requests in the lab:
+
+```bash
+cargo run -p gyeol-cli -- stun-serve --listen 127.0.0.1:3478
+```
+
 ## Completion criteria for the 12-week work
 
 The 12-week work is complete when all of these statements are true:

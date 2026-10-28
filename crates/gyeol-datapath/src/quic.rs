@@ -1,7 +1,7 @@
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use gyeol_identity::{decode_certificate_pem, DenySet, SpiffeId, TrustBundle};
 use rand::RngCore;
@@ -116,6 +116,55 @@ impl HelloEndpoint {
         bind_session(connection, &self.auth, StreamRole::Server).await
     }
 
+    /// Build an endpoint on a socket the caller already owns.
+    ///
+    /// Call this function inside a Tokio runtime.
+    /// The function sets the socket to nonblocking mode.
+    /// N-Edge uses this after a hole punch so QUIC keeps the same UDP socket.
+    pub fn from_std_socket(
+        config: HelloConfig,
+        socket: std::net::UdpSocket,
+        role: HelloSocketRole,
+    ) -> Result<Self, HelloError> {
+        let _ = socket.set_read_timeout(None);
+        socket.set_nonblocking(true).map_err(io_error)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| HelloError::Quic("The call is outside a Tokio runtime.".to_string()))?;
+        let (endpoint, auth) = match role {
+            HelloSocketRole::Server => {
+                let (rustls_config, auth) = server_rustls(&config)?;
+                let quic = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
+                    .map_err(|err| HelloError::Tls(err.to_string()))?;
+                let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic));
+                server.transport_config(transport_config());
+                let endpoint = quinn::Endpoint::new(
+                    quinn::EndpointConfig::default(),
+                    Some(server),
+                    socket,
+                    runtime,
+                )
+                .map_err(io_error)?;
+                (endpoint, auth)
+            }
+            HelloSocketRole::Client { .. } => {
+                let (rustls_config, auth) = client_rustls(&config)?;
+                let quic = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config)
+                    .map_err(|err| HelloError::Tls(err.to_string()))?;
+                let mut client = quinn::ClientConfig::new(Arc::new(quic));
+                client.transport_config(transport_config());
+                let mut endpoint =
+                    quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
+                        .map_err(io_error)?;
+                endpoint.set_default_client_config(client);
+                (endpoint, auth)
+            }
+        };
+        Ok(Self {
+            endpoint,
+            auth: Arc::new(auth),
+        })
+    }
+
     /// Connect to `peer` and open one bidirectional stream.
     pub async fn connect_one(&self, peer: SocketAddr) -> Result<HelloSession, HelloError> {
         let connecting = self
@@ -126,6 +175,76 @@ impl HelloEndpoint {
             .await
             .map_err(|err| HelloError::Quic(err.to_string()))?;
         bind_session(connection, &self.auth, StreamRole::Client).await
+    }
+
+    async fn wait_idle(&self) {
+        self.endpoint.wait_idle().await;
+    }
+}
+
+/// The role for one hello-quic proof on an existing UDP socket.
+pub enum HelloSocketRole {
+    /// Accept one peer on this socket.
+    Server,
+    /// Connect to `peer` from this socket.
+    Client {
+        /// The nominated peer socket.
+        peer: SocketAddr,
+    },
+}
+
+/// Open hello-quic on `socket`, exchange one IPv4 packet, and close.
+///
+/// The server echoes the packet.
+/// The client sends `packet` and returns the echo.
+/// The function creates a Tokio runtime.
+/// Do not call it from inside a runtime.
+/// The function returns an error when `timeout` elapses.
+pub fn prove_hello_socket(
+    config: HelloConfig,
+    socket: std::net::UdpSocket,
+    role: HelloSocketRole,
+    packet: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, HelloError> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| HelloError::Io(err.to_string()))?;
+    runtime.block_on(async {
+        match tokio::time::timeout(timeout, prove_hello_async(config, socket, role, packet)).await {
+            Ok(result) => result,
+            Err(_) => Err(HelloError::Quic("The QUIC proof timed out.".to_string())),
+        }
+    })
+}
+
+async fn prove_hello_async(
+    config: HelloConfig,
+    socket: std::net::UdpSocket,
+    role: HelloSocketRole,
+    packet: &[u8],
+) -> Result<Vec<u8>, HelloError> {
+    match role {
+        HelloSocketRole::Server => {
+            let endpoint = HelloEndpoint::from_std_socket(config, socket, HelloSocketRole::Server)?;
+            let mut session = endpoint.accept_one().await?;
+            let got = session.recv_ipv4().await?;
+            session.send_ipv4(&got).await?;
+            session.wait_closed().await;
+            endpoint.wait_idle().await;
+            Ok(got)
+        }
+        HelloSocketRole::Client { peer } => {
+            let endpoint =
+                HelloEndpoint::from_std_socket(config, socket, HelloSocketRole::Client { peer })?;
+            let mut session = endpoint.connect_one(peer).await?;
+            session.send_ipv4(packet).await?;
+            let got = session.recv_ipv4().await?;
+            drop(session);
+            endpoint.wait_idle().await;
+            Ok(got)
+        }
     }
 }
 

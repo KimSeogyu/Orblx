@@ -1,7 +1,12 @@
 [package]
 name = "gyeol-edge"
-description = "Week 1 edge crate. This crate does not contain edge functions."
+description = "Edge crate. This crate gathers a STUN reflexive address and brings up same-NAT direct QUIC."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 version.workspace = true
+
+[dependencies]
+getrandom = "0.2.17"
+gyeol-datapath = { path = "../gyeol-datapath" }
+gyeol-identity = { path = "../gyeol-identity" }
