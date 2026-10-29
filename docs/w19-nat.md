@@ -133,84 +133,212 @@ bash scripts/proof/nat.sh
 
 ## Output
 
-This run was on one REAL Linux host.
+This run was on one REAL Linux host at commit `e924524`.
 Docker ran the [C] containers.
 The command exited 0.
+The output below leaves out build lines, ping reply lines, and repeated status fields.
 
 ```text
 === REAL cargo test tampered candidate ===
 The candidate signature for node-a was rejected.
+The candidate signature for node-a was rejected.
 test signed::tests::tampered_candidate_signature_is_rejected ... ok
-
+REAL bridge-nf-call-iptables 0
+=== [C] start public network, routers, coordinator, and relay ===
+REAL bridge-nf-call-iptables 0
 === [C] router-1 cone ===
 router mode cone
-router wan eth0 172.29.19.11
--A PREROUTING -i eth0 -p udp -m udp --dport 443 -j DNAT --to-destination 10.19.1.10:443
--A POSTROUTING -o eth0 -j SNAT --to-source 172.29.19.11
-
+router wan eth1 172.29.19.11
+-A PREROUTING -i eth1 -p udp -m udp --dport 443 -j DNAT --to-destination 10.19.1.10:443
+-A POSTROUTING -o eth1 -j SNAT --to-source 172.29.19.11
+-A FORWARD -d 10.19.0.0/16 ! -o eth0 -j DROP
+-A FORWARD -s 10.19.0.0/16 ! -i eth0 -j DROP
+-A FORWARD -d 10.19.1.10/32 -i eth1 -o eth0 -p udp -m udp --dport 443 -j ACCEPT
+-A FORWARD -i eth0 -o eth1 -j ACCEPT
+-A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 === [C] router-2 symmetric ===
 router mode symmetric
 router wan eth0 172.29.19.12
 -A POSTROUTING -o eth0 -p udp -j MASQUERADE --random-fully
-
+-A POSTROUTING -o eth0 -p tcp -j MASQUERADE
+-A POSTROUTING -o eth0 -p icmp -j MASQUERADE
+-A FORWARD -d 10.19.0.0/16 ! -o eth1 -j DROP
+-A FORWARD -s 10.19.0.0/16 ! -i eth1 -j DROP
+-A FORWARD -i eth1 -o eth0 -j ACCEPT
+-A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+=== [C] router-3 cone ===
+router mode cone
+router wan eth1 172.29.19.13
+-A PREROUTING -i eth1 -p udp -m udp --dport 443 -j DNAT --to-destination 10.19.3.10:443
+-A POSTROUTING -o eth1 -j SNAT --to-source 172.29.19.13
+-A FORWARD -d 10.19.0.0/16 ! -o eth0 -j DROP
+-A FORWARD -s 10.19.0.0/16 ! -i eth0 -j DROP
+-A FORWARD -d 10.19.3.10/32 -i eth1 -o eth0 -p udp -m udp --dport 443 -j ACCEPT
+-A FORWARD -i eth0 -o eth1 -j ACCEPT
+-A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+=== [C] router-4 symmetric ===
+router mode symmetric
+router wan eth1 172.29.19.14
+-A POSTROUTING -o eth1 -p udp -j MASQUERADE --random-fully
+-A POSTROUTING -o eth1 -p tcp -j MASQUERADE
+-A POSTROUTING -o eth1 -p icmp -j MASQUERADE
+-A FORWARD -d 10.19.0.0/16 ! -o eth0 -j DROP
+-A FORWARD -s 10.19.0.0/16 ! -i eth0 -j DROP
+-A FORWARD -i eth0 -o eth1 -j ACCEPT
+-A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+=== [C] no hairpin and no LAN to LAN forward ===
+router-1 wan eth1 dnat_rules_off_wan 0
+router-2 wan eth0 dnat_rules_off_wan 0
+router-3 wan eth1 dnat_rules_off_wan 0
+router-4 wan eth1 dnat_rules_off_wan 0
+=== [C] symmetric NAT mapping probe ===
+node-y: mapping inner:40000 to 172.29.19.10:5001 seen_as 172.29.19.12:9261
+node-y: mapping inner:40000 to 172.29.19.20:5001 seen_as 172.29.19.12:8926
+router-2 inner_port 40000 external_ip 172.29.19.12 port_to_coord 9261 port_to_relay 8926
+router-2 symmetric true
+node-x: mapping inner:40000 to 172.29.19.10:5001 seen_as 172.29.19.11:40000
+node-x: mapping inner:40000 to 172.29.19.20:5001 seen_as 172.29.19.11:40000
+router-1 inner_port 40000 port_to_coord 40000 port_to_relay 40000
+router-1 endpoint_independent true
+node-w: mapping inner:40000 to 172.29.19.10:5001 seen_as 172.29.19.14:8656
+node-w: mapping inner:40000 to 172.29.19.20:5001 seen_as 172.29.19.14:57802
+router-4 inner_port 40000 port_to_coord 8656 port_to_relay 57802
+router-4 symmetric true
+=== [C] token node-x ===
+wrote one enroll token
+token_id 3ae187169ae6353c
+out /var/lib/orblx/tokens/node-x
+=== [C] token node-y ===
+wrote one enroll token
+token_id 71a99549307beaaa
+out /var/lib/orblx/tokens/node-y
+=== [C] token node-z ===
+wrote one enroll token
+token_id 817a513ec995f217
+out /var/lib/orblx/tokens/node-z
+=== [C] token node-w ===
+wrote one enroll token
+token_id 19b5655e445b95ba
+out /var/lib/orblx/tokens/node-w
 === [C] enroll node-x ===
 enrolled
-name node-x
-overlay_ip 100.64.0.1
 === [C] enroll node-y ===
 enrolled
-name node-y
-overlay_ip 100.64.0.2
 === [C] enroll node-z ===
 enrolled
-name node-z
-overlay_ip 100.64.0.3
-
+=== [C] enroll node-w ===
+enrolled
+=== [C] overlay addresses ===
+overlay node-x 100.64.0.1
+overlay node-y 100.64.0.2
+overlay node-z 100.64.0.3
+overlay node-w 100.64.0.4
+=== [C] no shared subnet between nodes ===
+node-x: 2: eth0    inet 10.19.1.10/24 brd 10.19.1.255 scope global eth0\       valid_lft forever preferred_lft forever
+node-x: default via 10.19.1.2 dev eth0 
+node-x: 10.19.1.0/24 dev eth0 proto kernel scope link src 10.19.1.10 
+node-y: 2: eth0    inet 10.19.2.10/24 brd 10.19.2.255 scope global eth0\       valid_lft forever preferred_lft forever
+node-y: default via 10.19.2.2 dev eth0 
+node-y: 10.19.2.0/24 dev eth0 proto kernel scope link src 10.19.2.10 
+node-z: 2: eth0    inet 10.19.3.10/24 brd 10.19.3.255 scope global eth0\       valid_lft forever preferred_lft forever
+node-z: default via 10.19.3.2 dev eth0 
+node-z: 10.19.3.0/24 dev eth0 proto kernel scope link src 10.19.3.10 
+node-w: 2: eth0    inet 10.19.4.10/24 brd 10.19.4.255 scope global eth0\       valid_lft forever preferred_lft forever
+node-w: default via 10.19.4.2 dev eth0 
+node-w: 10.19.4.0/24 dev eth0 proto kernel scope link src 10.19.4.10 
+lan_reach 10.19.2.10 no
+lan_reach 10.19.3.10 no
+lan_reach 10.19.4.10 no
+lan_reach 10.19.2.2 no
+lan_reach 10.19.3.2 no
+lan_shortcut false
 === [C] case 1 cone to cone ===
 peer node-z overlay_ip 100.64.0.3 path direct svid spiffe://orblx.local/node/node-z svid_expiry unknown
-3 packets transmitted, 3 received, 0% packet loss
+3 packets transmitted, 3 received, 0% packet loss, time 401ms
 case1 path direct
-
 === [C] case 2 cone to symmetric ===
 peer node-y overlay_ip 100.64.0.2 path direct svid spiffe://orblx.local/node/node-y svid_expiry unknown
-3 packets transmitted, 3 received, 0% packet loss
+3 packets transmitted, 3 received, 0% packet loss, time 401ms
 case2 path direct
-
+=== [C] case 2 direct path evidence ===
+node-x: The candidate for node-y is 172.29.19.12:77.
+node-x: The hole punch reached 172.29.19.12:486.
+node-x: The reflexive endpoint is 172.29.19.11:443.
+node-y: The candidate for node-x is 172.29.19.11:443.
+node-y: The hole punch reached 172.29.19.11:443.
+node-y: The reflexive endpoint is 172.29.19.12:77.
+case2 node-x punch_peer 172.29.19.12:486
+case2 node-y punch_peer 172.29.19.11:443
 === [C] case 3 block direct UDP ===
+=== [C] drop UDP between the cone routers ===
 peer node-z overlay_ip 100.64.0.3 path relay svid spiffe://orblx.local/node/node-z svid_expiry unknown
-ping_replies 37
-max_gap_ms 604
+=== [C] restore UDP between the cone routers ===
 peer node-z overlay_ip 100.64.0.3 path direct svid spiffe://orblx.local/node/node-z svid_expiry unknown
 case3 path relay
 case3 return direct
-
+=== [C] ping gap at each path switch ===
+ping_summary 50 packets transmitted, 47 received, 6% packet loss, time 9829ms
+ping_replies 47
+case3 switch1 from direct to relay detect_ms 1395 max_gap_ms 556
+case3 switch2 from relay to direct detect_ms 423 max_gap_ms 250
+case3 max_gap_ms_all 556
+=== [C] case 5 symmetric to symmetric ===
+peer node-w overlay_ip 100.64.0.4 path relay svid spiffe://orblx.local/node/node-w svid_expiry unknown
+peer node-w overlay_ip 100.64.0.4 path relay svid spiffe://orblx.local/node/node-w svid_expiry unknown
+peer node-y overlay_ip 100.64.0.2 path relay svid spiffe://orblx.local/node/node-y svid_expiry unknown
+3 packets transmitted, 3 received, 0% packet loss, time 401ms
+node-y: The candidate for node-w is 172.29.19.14:455.
+node-y: The direct attempt ended. The node can use the relay.
+node-y: The reflexive endpoint is 172.29.19.12:77.
+node-y: The relay transport is udp.
+node-w: The candidate for node-y is 172.29.19.12:77.
+node-w: The direct attempt ended. The node can use the relay.
+node-w: The reflexive endpoint is 172.29.19.14:455.
+node-w: The relay transport is udp.
+case5 path relay relay
 === [C] case 4 tampered candidate ===
 The candidate signature for node-a was rejected.
 The candidate signature was rejected.
 case4 rejected true
-
 case1 path direct
 case2 path direct
 case3 path relay
 case3 return direct
 case4 rejected true
+case5 path relay
+router-2 port_to_coord 9261 port_to_relay 8926
 proof_ok
 ```
+
+The router mapping probe shows that router-2 is symmetric.
+One inner port got port 9261 toward the coordinator and port 8926 toward the Relay.
+Router-4 also changed the port.
+Router-1 kept port 40000 for both destinations.
 
 Case 1 is cone to cone.
 The path is direct.
 
 Case 2 is cone to symmetric.
-The same-IP punch reached the symmetric peer.
 The path is direct.
-A failed punch on another network would show `relay` instead.
+The signed candidate for node Y is `172.29.19.12:77`, from the STUN flow.
+The punch reached node Y at `172.29.19.12:486`, a new port on the same IP.
+Node Y reached the WAN address of router-1, `172.29.19.11:443`.
+The section "Why cone to symmetric is direct" explains this result.
 
 Case 3 drops UDP between the two cone routers while `ping -i 0.2` runs.
-The path moves to relay.
-The longest gap between ping replies was 604 ms.
-That gap is under 1 second.
-After the drop rules are removed, the path returns to direct.
+The path moves to relay, then returns to direct after the drop rules are removed.
+The proof records the longest gap between ping replies at each switch.
+The direct to relay switch had a longest gap of 556 ms.
+The relay to direct switch had a longest gap of 250 ms.
+Each gap is under 1 second.
+The ping lost 3 of 50 packets during the direct to relay switch.
+The proof stops when a switch gap is longer than 1 second or the path does not return to direct.
 
 Case 4 rejects a tampered candidate.
 The unit test prints the same rejection line.
 The [C] check runs `orblx nat verify-candidate` with a bad signature.
+
+Case 5 is symmetric to symmetric.
+The direct attempt ended on both nodes, and both nodes use the Relay over UDP.
+The ping through the Relay passed.
+The proof stops when case 5 reports a direct path or a hole punch.
