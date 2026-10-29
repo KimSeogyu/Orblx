@@ -1,0 +1,71 @@
+# Config audit proof stack.
+# `docker compose up` starts only the coordinator.
+# The node services use the nodes profile.
+name: orblx-audit-proof
+
+services:
+  coord:
+    image: orblx-audit:w20
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /var/lib/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+    volumes:
+      - orblx-audit-store:/var/lib/orblx
+      - ${POLICY_FILE:?set POLICY_FILE}:/var/lib/orblx/policy.hujson:ro
+    networks:
+      - proof
+
+  owner:
+    image: orblx-audit:w20
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    volumes:
+      - orblx-audit-store:/coord-state:ro
+      - orblx-audit-owner:/var/lib/orblx
+    networks:
+      - proof
+
+  a:
+    image: orblx-audit:w20
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    volumes:
+      - orblx-audit-store:/coord-state:ro
+      - orblx-audit-a:/var/lib/orblx
+    networks:
+      - proof
+
+  b:
+    image: orblx-audit:w20
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    volumes:
+      - orblx-audit-store:/coord-state:ro
+      - orblx-audit-b:/var/lib/orblx
+    networks:
+      - proof
+
+volumes:
+  orblx-audit-store:
+  orblx-audit-owner:
+  orblx-audit-a:
+  orblx-audit-b:
+
+networks:
+  proof:

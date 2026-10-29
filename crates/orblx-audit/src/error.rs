@@ -23,6 +23,8 @@ pub enum AuditError {
     BadTicketHash,
     /// The reason does not match the event kind.
     BadReason,
+    /// An actor, target, or detail text is not valid.
+    BadText,
     /// The export encoder failed.
     Export,
 }
@@ -46,6 +48,7 @@ impl fmt::Display for AuditError {
             Self::BadKind => formatter.write_str("The event kind is not start, end, or deny."),
             Self::BadTicketHash => formatter.write_str("The ticket hash is not valid."),
             Self::BadReason => formatter.write_str("The deny reason is not valid."),
+            Self::BadText => formatter.write_str("The record text is not valid."),
             Self::Export => formatter.write_str("The chain export failed."),
         }
     }

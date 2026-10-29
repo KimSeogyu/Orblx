@@ -38,6 +38,7 @@ pub async fn spawn(
     coord: &Coordinator,
     listen: SocketAddr,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), CoordError> {
+    coord.enable_config_audit()?;
     let material = coord.tls_material()?;
     let endpoint = tlsutil::server_endpoint(&material, listen)?;
     let addr = endpoint.local_addr().map_err(CoordError::io)?;
@@ -206,7 +207,7 @@ async fn dispatch(
             })
         }
         "admin-nodes" | "admin-users" | "admin-approve" | "admin-revoke" | "admin-expire"
-        | "admin-routes" => dispatch_admin(coord, connection, &request, now),
+        | "admin-routes" | "admin-audit" => dispatch_admin(coord, connection, &request, now),
         _ => Err(CoordError::Protocol(
             "The request is not valid.".to_string(),
         )),
@@ -228,10 +229,11 @@ fn dispatch_admin(
     let value = match request.op.as_str() {
         "admin-nodes" => admin::nodes(coord)?,
         "admin-users" => admin::users(coord)?,
-        "admin-approve" => admin::approve(coord, &request.name)?,
-        "admin-revoke" => admin::revoke(coord, &request.name, now)?,
-        "admin-expire" => admin::expire(coord, &request.name)?,
+        "admin-approve" => admin::approve(coord, &request.name, caller.as_uri())?,
+        "admin-revoke" => admin::revoke(coord, &request.name, caller.as_uri(), now)?,
+        "admin-expire" => admin::expire(coord, &request.name, caller.as_uri())?,
         "admin-routes" => admin::routes(coord)?,
+        "admin-audit" => admin::audit(coord, parse_since(&request.name)?)?,
         _ => {
             return Err(CoordError::Protocol(
                 "The request is not valid.".to_string(),
@@ -246,6 +248,17 @@ fn dispatch_admin(
         detail: Some(detail),
         ..Response::default()
     })
+}
+
+/// The admin audit call puts the `since` Unix time in the name field.
+fn parse_since(text: &str) -> Result<Option<u64>, CoordError> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse::<u64>()
+        .map(Some)
+        .map_err(|_| CoordError::Protocol("The audit time is not valid.".to_string()))
 }
 
 fn leaf_response(result: crate::state::EnrollResult) -> Response {

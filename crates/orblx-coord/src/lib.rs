@@ -28,7 +28,7 @@ mod store;
 mod ticket;
 mod tlsutil;
 
-pub use admin::{approve, deny_json, deny_set, expire, nodes, revoke, routes, users};
+pub use admin::{approve, audit, deny_json, deny_set, expire, nodes, revoke, routes, users};
 pub use client::{
     admin_blocking, advertise_exit_blocking, advertise_routes_blocking, enroll_with_oidc_blocking,
     enroll_with_token_blocking, fetch_deny_blocking, fetch_netmap_blocking, netmap_json,
@@ -43,6 +43,7 @@ pub use netmap::{
 pub use server::serve_blocking;
 pub use state::{
     oidc_config, read_node_material, Coordinator, EnrollResult, NetmapView, OidcConfig,
+    CONFIG_AUDIT_FILE,
 };
 pub use store::CreatedToken;
 
@@ -492,7 +493,8 @@ mod tests {
             .peers
             .iter()
             .any(|peer| peer.name == "b"));
-        let version = super::admin::revoke(&coord, "b", now).unwrap();
+        let version =
+            super::admin::revoke(&coord, "b", "spiffe://orblx.local/node/owner", now).unwrap();
         assert_eq!(version["deny_version"], 1);
         let deny = super::admin::deny_set(&coord, now).unwrap();
         let id = orblx_identity::SpiffeId::node("b").unwrap();
@@ -501,5 +503,126 @@ mod tests {
         let text = nodes.to_string();
         assert!(text.contains("\"name\":\"b\""));
         assert!(text.contains("\"approved\":true"));
+    }
+
+    #[test]
+    fn every_control_plane_change_writes_one_config_record() {
+        use orblx_audit::{verify_config_file, ConfigAction, EMPTY_DIGEST};
+
+        let scratch = Scratch::new();
+        let owner = "spiffe://orblx.local/node/owner";
+        let first = format!(
+            r#"{{
+              "nodeApproval": true,
+              "owners": ["{owner}"],
+              "tags": {{"tag:exit": ["spiffe://orblx.local/node/b"]}},
+              "tagOwners": {{"tag:exit": ["{owner}"]}},
+              "autoApprovers": {{
+                "exitNode": ["tag:exit"],
+                "routes": {{"10.9.0.0/24": ["tag:exit"]}}
+              }}
+            }}"#
+        );
+        fs::write(scratch.0.join("policy.hujson"), &first).unwrap();
+        let now = SystemTime::now();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        for name in ["owner", "a", "b"] {
+            let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+            coord
+                .enroll_token(name, &token.secret, &[format!("{name}:443")], &[], now)
+                .unwrap();
+        }
+        super::admin::approve(&coord, "a", owner).unwrap();
+        super::admin::approve(&coord, "b", owner).unwrap();
+        coord
+            .advertise_routes("b", &["10.9.0.0/24".to_string()])
+            .unwrap();
+        coord
+            .advertise_routes("b", &["10.9.0.0/24".to_string()])
+            .unwrap();
+        coord.advertise_exit("b", true).unwrap();
+        coord.advertise_exit("b", true).unwrap();
+        super::admin::expire(&coord, "a", owner).unwrap();
+        super::admin::revoke(&coord, "a", owner, now).unwrap();
+        fs::write(scratch.0.join("policy.hujson"), "{ not hujson").unwrap();
+        let _ = coord.node_list().unwrap();
+        let _ = coord.node_list().unwrap();
+        let second = first.replace("10.9.0.0/24", "10.9.1.0/24");
+        fs::write(scratch.0.join("policy.hujson"), &second).unwrap();
+        let _ = coord.node_list().unwrap();
+
+        let path = scratch.0.join(super::CONFIG_AUDIT_FILE);
+        let checked = verify_config_file(&path).unwrap();
+        let actions: Vec<ConfigAction> = checked.records.iter().map(|r| r.event.action).collect();
+        assert_eq!(
+            actions,
+            vec![
+                ConfigAction::PolicyLoad,
+                ConfigAction::Enroll,
+                ConfigAction::Enroll,
+                ConfigAction::Enroll,
+                ConfigAction::Approve,
+                ConfigAction::Approve,
+                ConfigAction::Routes,
+                ConfigAction::ExitNode,
+                ConfigAction::Expire,
+                ConfigAction::Revoke,
+                ConfigAction::PolicyReject,
+                ConfigAction::PolicyReplace,
+            ]
+        );
+        let records = &checked.records;
+        let load = &records[0].event;
+        assert_eq!(load.actor, "spiffe://orblx.local/coord/coord");
+        assert_eq!(load.before, EMPTY_DIGEST);
+        assert_eq!(load.after, orblx_audit::sha256_digest(first.as_bytes()));
+        assert!(records[1].event.actor.starts_with("token:"));
+        assert_eq!(records[1].event.target, "owner");
+        assert_eq!(records[1].event.before, EMPTY_DIGEST);
+        assert!(records[2].event.detail.ends_with("pending"));
+        for index in [4, 5, 8, 9] {
+            assert_eq!(records[index].event.actor, owner);
+            assert_ne!(records[index].event.before, records[index].event.after);
+        }
+        assert_eq!(records[4].event.target, "a");
+        assert_eq!(records[6].event.actor, "spiffe://orblx.local/node/b");
+        assert!(records[6].event.detail.contains("10.9.0.0/24"));
+        assert_eq!(records[7].event.detail, "offer on");
+        assert!(records[9].event.detail.contains("deny_version 1"));
+        let reject = &records[10].event;
+        assert_eq!(reject.before, load.after);
+        assert_eq!(reject.after, orblx_audit::sha256_digest(b"{ not hujson"));
+        assert!(!reject.detail.is_empty());
+        let replace = &records[11].event;
+        assert_eq!(replace.before, load.after);
+        assert_eq!(replace.after, orblx_audit::sha256_digest(second.as_bytes()));
+
+        let report = super::admin::audit(&coord, None).unwrap();
+        assert_eq!(report["verify"]["ok"], true);
+        assert_eq!(report["verify"]["records"], 12);
+        assert_eq!(report["lines"].as_array().unwrap().len(), 12);
+        let later = super::admin::audit(&coord, Some(u64::MAX)).unwrap();
+        assert!(later["lines"].as_array().unwrap().is_empty());
+
+        drop(coord);
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        let reopened = verify_config_file(&path).unwrap();
+        let restart = &reopened.records.last().unwrap().event;
+        assert_eq!(restart.action, ConfigAction::PolicyLoad);
+        assert_eq!(restart.before, replace.after);
+        assert_eq!(restart.after, replace.after);
+
+        let text = fs::read_to_string(&path).unwrap();
+        let at = text.find("\"approve\"").unwrap() + 1;
+        let mut bytes = text.into_bytes();
+        bytes[at] = b'A';
+        fs::write(&path, bytes).unwrap();
+        let report = super::admin::audit(&coord, None).unwrap();
+        assert_eq!(report["verify"]["ok"], false);
+        drop(coord);
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        assert!(coord.enable_config_audit().is_err());
     }
 }

@@ -23,6 +23,8 @@ pub(crate) enum Command {
 pub(crate) struct Call {
     op: String,
     target: String,
+    json: bool,
+    verify_only: bool,
     state: PathBuf,
     coord: SocketAddr,
     coord_name: String,
@@ -40,6 +42,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         "revoke" => "admin-revoke",
         "expire" => "admin-expire",
         "routes" => "admin-routes",
+        "audit" => "admin-audit",
         other => return Err(format!("The mode {other} is not valid.\n{}", help())),
     };
     let mut target = String::new();
@@ -47,6 +50,8 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
     let mut coord = None;
     let mut coord_name = None;
     let mut bundle = None;
+    let mut json = false;
+    let mut verify_only = false;
     let mut index = 1;
     if matches!(op, "admin-approve" | "admin-revoke" | "admin-expire") {
         let name = args
@@ -61,8 +66,19 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
     while index < args.len() {
         let flag = args[index].as_str();
         index += 1;
+        if op == "admin-audit" && flag == "--json" {
+            json = true;
+            continue;
+        }
+        if op == "admin-audit" && flag == "--verify" {
+            verify_only = true;
+            continue;
+        }
         let value = take_value(args, &mut index)?;
         match flag {
+            "--since" if op == "admin-audit" => {
+                target = parse_since(&value, now_unix()?)?.to_string();
+            }
             "--state" => state = Some(PathBuf::from(value)),
             "--coord" => coord = Some(parse_socket(&value, 443)?),
             "--coord-name" => coord_name = Some(value),
@@ -76,6 +92,8 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
     Ok(Command::Call(Call {
         op: op.to_string(),
         target,
+        json,
+        verify_only,
         state,
         coord,
         coord_name: coord_name.unwrap_or_else(|| "coord".to_string()),
@@ -103,6 +121,9 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             .map_err(|err| err.to_string())?;
             let value: Value = serde_json::from_str(&detail)
                 .map_err(|_| "The coordinator response is not valid.".to_string())?;
+            if call.op == "admin-audit" {
+                return print_audit(&value, call.json, call.verify_only);
+            }
             print_admin(&call.op, &value)
         }
     }
@@ -186,6 +207,118 @@ fn print_admin(op: &str, value: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Print the config chain records and the chain check.
+///
+/// The command fails when the coordinator chain check fails.
+fn print_audit(value: &Value, json: bool, verify_only: bool) -> Result<(), String> {
+    let bad = || "The coordinator response is not valid.".to_string();
+    let lines = value
+        .get("lines")
+        .and_then(Value::as_array)
+        .ok_or_else(bad)?;
+    let verify = value.get("verify").ok_or_else(bad)?;
+    if !verify_only {
+        for line in lines {
+            let raw = line.as_str().ok_or_else(bad)?;
+            if json {
+                println!("{raw}");
+                continue;
+            }
+            match serde_json::from_str::<Value>(raw) {
+                Ok(record) => println!("{}", audit_line(&record)),
+                Err(_) => println!("record invalid line"),
+            }
+        }
+    }
+    let ok = verify.get("ok").and_then(Value::as_bool) == Some(true);
+    let summary = if ok {
+        let records = verify.get("records").and_then(Value::as_u64).unwrap_or(0);
+        let tip = verify.get("tip").and_then(Value::as_str).unwrap_or("");
+        format!("verify ok records {records} tip {tip}")
+    } else {
+        let error = verify
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("The chain check failed.");
+        format!("verify failed: {error}")
+    };
+    if json && !verify_only {
+        eprintln!("{summary}");
+    } else {
+        println!("{summary}");
+    }
+    if ok {
+        Ok(())
+    } else {
+        Err("The config audit chain check failed.".to_string())
+    }
+}
+
+fn audit_line(record: &Value) -> String {
+    let field = |name: &str| {
+        record
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string()
+    };
+    let short = |name: &str| field(name).chars().take(16).collect::<String>();
+    let index = record
+        .get("index")
+        .and_then(Value::as_u64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let mut line = format!(
+        "record {index} {} {} {} actor {} before {} after {}",
+        field("at_utc"),
+        field("action"),
+        field("target"),
+        field("actor"),
+        short("before"),
+        short("after"),
+    );
+    let detail = field("detail");
+    if !detail.is_empty() && detail != "?" {
+        line.push_str(" detail ");
+        line.push_str(&detail);
+    }
+    line
+}
+
+/// Parse `--since` as Unix seconds.
+///
+/// The value is Unix seconds, `YYYY-MM-DDTHH:MM:SSZ`, or an age such as `90s`, `30m`, `2h`, or `7d`.
+fn parse_since(text: &str, now: u64) -> Result<u64, String> {
+    let bad = || format!("The --since value {text} is not valid.");
+    if let Some(at) = orblx_audit::parse_utc_text(text) {
+        return Ok(at);
+    }
+    if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return text.parse::<u64>().map_err(|_| bad());
+    }
+    let (number, unit) = text.split_at(text.len().saturating_sub(1));
+    let scale = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return Err(bad()),
+    };
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let count: u64 = number.parse().map_err(|_| bad())?;
+    let age = count.checked_mul(scale).ok_or_else(bad)?;
+    Ok(now.saturating_sub(age))
+}
+
+fn now_unix() -> Result<u64, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| "The system time is not valid.".to_string())
+}
+
 fn text_field(value: &Value, name: &str) -> Result<String, String> {
     value
         .get(name)
@@ -202,12 +335,18 @@ orblx admin approve NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundl
 orblx admin revoke NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin expire NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin routes --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin audit --coord ADDR [--since TIME] [--json] [--verify] [--state DIR] [--coord-name NAME] [--bundle FILE]
 
 The command uses the node SVID in the state directory.
 The coordinator accepts the call when that SVID is an owner.
 approve puts the node into netmaps and grants.
 revoke adds the node to the deny set.
 expire removes the node from netmaps until approve.
+audit prints the control-plane audit chain and the chain check.
+TIME is Unix seconds, YYYY-MM-DDTHH:MM:SSZ, or an age such as 30m, 2h, or 7d.
+--json prints one JSON record on each line.
+--verify prints only the chain check.
+audit fails when the chain check fails.
 The command does not print private keys or enroll tokens.
 "
     .to_string()
@@ -236,6 +375,39 @@ mod tests {
             }
             Command::Help => panic!("the parser did not select approve"),
         }
+    }
+
+    #[test]
+    fn audit_parses_since_json_and_verify() {
+        let command = parse(&[
+            "audit".to_string(),
+            "--coord".to_string(),
+            "127.0.0.1:443".to_string(),
+            "--since".to_string(),
+            "2026-10-29T23:59:59Z".to_string(),
+            "--json".to_string(),
+            "--verify".to_string(),
+        ])
+        .unwrap();
+        match command {
+            Command::Call(call) => {
+                assert_eq!(call.op, "admin-audit");
+                assert_eq!(call.target, "1793318399");
+                assert!(call.json);
+                assert!(call.verify_only);
+            }
+            Command::Help => panic!("the parser did not select audit"),
+        }
+    }
+
+    #[test]
+    fn since_accepts_unix_utc_and_age() {
+        assert_eq!(super::parse_since("100", 1000).unwrap(), 100);
+        assert_eq!(super::parse_since("2m", 1000).unwrap(), 880);
+        assert_eq!(super::parse_since("1d", 1000).unwrap(), 0);
+        assert_eq!(super::parse_since("1970-01-01T00:01:40Z", 0).unwrap(), 100);
+        assert!(super::parse_since("2w", 1000).is_err());
+        assert!(super::parse_since("", 1000).is_err());
     }
 
     #[test]
