@@ -27,7 +27,7 @@ use orblx_datapath::{
 };
 use orblx_identity::{
     sign_ticket, DenySet, MiniCa, Policy, SpiffeId, TicketClaims, TicketFlags, TicketSigner,
-    MAX_USER_TTL,
+    MAX_AGENT_TTL, MAX_USER_TTL,
 };
 
 use super::{parse_socket, take_value};
@@ -81,6 +81,22 @@ pub(crate) struct IssueOptions {
     out: PathBuf,
     nodes: Vec<(String, Ipv4Addr)>,
     policy: Option<PathBuf>,
+    users: Vec<String>,
+    agents: Vec<IssuedAgent>,
+}
+
+struct IssuedAgent {
+    name: String,
+    parent: String,
+    host: Ipv4Addr,
+    user: String,
+}
+
+struct PendingAgent {
+    name: String,
+    parent: Option<String>,
+    host: Option<Ipv4Addr>,
+    user: Option<String>,
 }
 
 impl std::fmt::Debug for Command {
@@ -116,6 +132,8 @@ impl std::fmt::Debug for Command {
                 .field("out", &options.out)
                 .field("nodes", &options.nodes.len())
                 .field("policy", &options.policy)
+                .field("users", &options.users.len())
+                .field("agents", &options.agents.len())
                 .finish(),
         }
     }
@@ -263,6 +281,9 @@ pub(crate) fn parse_issue(args: &[String]) -> Result<Command, String> {
     let mut out = None;
     let mut nodes = Vec::new();
     let mut policy = None;
+    let mut users = Vec::new();
+    let mut agents = Vec::new();
+    let mut pending: Option<PendingAgent> = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -272,14 +293,88 @@ pub(crate) fn parse_issue(args: &[String]) -> Result<Command, String> {
             "--out" => out = Some(PathBuf::from(value)),
             "--node" => nodes.push(parse_node(&value)?),
             "--policy" => policy = Some(PathBuf::from(value)),
+            "--user" => users.push(value),
+            "--agent" => {
+                if let Some(agent) = pending.take() {
+                    agents.push(finish_agent(agent)?);
+                }
+                pending = Some(PendingAgent {
+                    name: value,
+                    parent: None,
+                    host: None,
+                    user: None,
+                });
+            }
+            "--agent-parent" => {
+                let agent = pending.as_mut().ok_or_else(|| {
+                    format!("The flag --agent-parent needs --agent.\n{}", help_text())
+                })?;
+                agent.parent = Some(value);
+            }
+            "--agent-host" => {
+                let agent = pending.as_mut().ok_or_else(|| {
+                    format!("The flag --agent-host needs --agent.\n{}", help_text())
+                })?;
+                agent.host = Some(parse_ipv4(&value)?);
+            }
+            "--agent-user" => {
+                let agent = pending.as_mut().ok_or_else(|| {
+                    format!("The flag --agent-user needs --agent.\n{}", help_text())
+                })?;
+                agent.user = Some(value);
+            }
             other => return Err(format!("The flag {other} is not valid.\n{}", help_text())),
         }
+    }
+    if let Some(agent) = pending {
+        agents.push(finish_agent(agent)?);
     }
     let out = out.ok_or_else(|| format!("The command needs --out.\n{}", help_text()))?;
     if nodes.is_empty() {
         return Err(format!("The command needs --node.\n{}", help_text()));
     }
-    Ok(Command::Issue(IssueOptions { out, nodes, policy }))
+    Ok(Command::Issue(IssueOptions {
+        out,
+        nodes,
+        policy,
+        users,
+        agents,
+    }))
+}
+
+fn finish_agent(agent: PendingAgent) -> Result<IssuedAgent, String> {
+    let parent = agent.parent.ok_or_else(|| {
+        format!(
+            "The agent {} needs --agent-parent.\n{}",
+            agent.name,
+            help_text()
+        )
+    })?;
+    let host = agent.host.ok_or_else(|| {
+        format!(
+            "The agent {} needs --agent-host.\n{}",
+            agent.name,
+            help_text()
+        )
+    })?;
+    let user = agent.user.ok_or_else(|| {
+        format!(
+            "The agent {} needs --agent-user.\n{}",
+            agent.name,
+            help_text()
+        )
+    })?;
+    Ok(IssuedAgent {
+        name: agent.name,
+        parent,
+        host,
+        user,
+    })
+}
+
+fn parse_ipv4(text: &str) -> Result<Ipv4Addr, String> {
+    text.parse()
+        .map_err(|_| format!("The overlay address {text} is not valid."))
 }
 
 pub(crate) fn run(command: Command) -> Result<(), String> {
@@ -302,6 +397,7 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
     let netmap = Netmap::from_path(&netmap_path).map_err(|err| err.to_string())?;
     let config = load_config(&options.state_dir)?;
     let visibility = load_visibility(&options.state_dir, &netmap.self_node.name)?;
+    let ssh_state = options.state_dir.clone();
     spawn_deny_refresh(&options);
     let underlay = underlay_for(&netmap, options.coord, options.relay);
     let renew = load_renewer(&options.state_dir, options.coord, options.coord_name)?;
@@ -321,6 +417,11 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
         relay: options.relay,
         netmap_path,
         visibility,
+        on_ready: Some(Box::new(move |overlay| {
+            if let Err(err) = orblx_ssh::spawn_overlay_server(&ssh_state, overlay) {
+                eprintln!("The SSH server did not start. {err}");
+            }
+        })),
         metrics: options.metrics,
     })
     .map_err(|err| err.to_string())
@@ -700,7 +801,126 @@ fn run_issue(options: IssueOptions) -> Result<(), String> {
     if let Some(policy) = &options.policy {
         write_signed_grants(&options.out, &options.nodes, policy)?;
     }
+    issue_users(&options, &ca)?;
+    issue_agents(&options, &ca, &signer, now, now_unix)?;
     Ok(())
+}
+
+fn issue_users(options: &IssueOptions, ca: &MiniCa) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    let now = SystemTime::now();
+    for name in &options.users {
+        SpiffeId::user(name).map_err(|_| format!("The user name {name} is not valid."))?;
+        if !seen.insert(name.clone()) {
+            return Err(format!("The user name {name} is repeated."));
+        }
+        let dir = options.out.join("users").join(name);
+        fs::create_dir_all(&dir)
+            .map_err(|err| format!("The directory {} was not created. {err}", dir.display()))?;
+        set_dir_mode(&dir)?;
+        let id = SpiffeId::user(name).map_err(|err| err.to_string())?;
+        let issued = ca
+            .issue(&id, now, MAX_USER_TTL, &DenySet::empty())
+            .map_err(|err| err.to_string())?;
+        write_mode(
+            &dir.join(CERT_FILE),
+            issued.certificate_pem.as_bytes(),
+            FILE_PUBLIC,
+        )?;
+        write_mode(
+            &dir.join(KEY_FILE),
+            issued.private_key_pem.as_bytes(),
+            FILE_SECRET,
+        )?;
+        write_mode(
+            &dir.join(BUNDLE_FILE),
+            ca.certificate_pem().as_bytes(),
+            FILE_PUBLIC,
+        )?;
+        println!(
+            "The command wrote the user {name} material in {}.",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+fn issue_agents(
+    options: &IssueOptions,
+    ca: &MiniCa,
+    signer: &TicketSigner,
+    now: SystemTime,
+    now_unix: u64,
+) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for agent in &options.agents {
+        SpiffeId::agent(&agent.name)
+            .map_err(|_| format!("The agent name {} is not valid.", agent.name))?;
+        if !seen.insert(agent.name.clone()) {
+            return Err(format!("The agent name {} is repeated.", agent.name));
+        }
+        if !options.users.iter().any(|user| user == &agent.parent) {
+            return Err(format!(
+                "The agent {} parent {} is not a user in this issue.",
+                agent.name, agent.parent
+            ));
+        }
+        if !login_name_ok(&agent.user) {
+            return Err(format!("The login name {} is not valid.", agent.user));
+        }
+        let dir = options.out.join("agents").join(&agent.name);
+        fs::create_dir_all(&dir)
+            .map_err(|err| format!("The directory {} was not created. {err}", dir.display()))?;
+        set_dir_mode(&dir)?;
+        let id = SpiffeId::agent(&agent.name).map_err(|err| err.to_string())?;
+        let issued = ca
+            .issue(&id, now, MAX_AGENT_TTL, &DenySet::empty())
+            .map_err(|err| err.to_string())?;
+        let claims = TicketClaims {
+            issuer: SpiffeId::coord("ssh").map_err(|err| err.to_string())?,
+            subject: id,
+            not_before: now_unix,
+            expires: now_unix.saturating_add(MAX_AGENT_TTL.as_secs()),
+            dst_cidr: format!("{}/32", agent.host),
+            proto: 6,
+            dst_port: 22,
+            flags: TicketFlags::new(true, true),
+        };
+        let signed = sign_ticket(signer, &claims).map_err(|err| err.to_string())?;
+        write_mode(
+            &dir.join(CERT_FILE),
+            issued.certificate_pem.as_bytes(),
+            FILE_PUBLIC,
+        )?;
+        write_mode(
+            &dir.join(KEY_FILE),
+            issued.private_key_pem.as_bytes(),
+            FILE_SECRET,
+        )?;
+        write_mode(
+            &dir.join(BUNDLE_FILE),
+            ca.certificate_pem().as_bytes(),
+            FILE_PUBLIC,
+        )?;
+        write_mode(&dir.join(TICKET_FILE), &signed.bytes, FILE_SECRET)?;
+        println!(
+            "The command wrote the agent {} ticket for host {} user {} in {}.",
+            agent.name,
+            agent.host,
+            agent.user,
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+fn login_name_ok(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=32).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_' || *byte == b'-'
+        })
 }
 
 fn load_visibility(dir: &Path, self_name: &str) -> Result<Arc<dyn PeerVisibility>, String> {
@@ -910,7 +1130,7 @@ orblx up [--netmap FILE] [--state-dir DIR] [--listen ADDR] [--accept-routes] [--
 orblx set --exit-node NAME [--exit-node-allow-lan-access] [--state-dir DIR]
 orblx down [--state-dir DIR]
 orblx status [--state-dir DIR]
-orblx node-issue --out DIR --node NAME=OVERLAY_IP [--node NAME=OVERLAY_IP ...] [--policy FILE]
+orblx node-issue --out DIR --node NAME=OVERLAY_IP [--node NAME=OVERLAY_IP ...] [--policy FILE] [--user NAME] [--agent NAME --agent-parent USER --agent-host ADDR --agent-user USER]
 
 The node keeps one QUIC session for each peer.
 The router sends each outbound TUN packet to the peer that owns the destination.
@@ -924,6 +1144,12 @@ A new grants.signed.json file replaces the DNS reach list.
 A missing grant file allows every peer.
 The --policy file writes those signed grants during node-issue.
 The node does not read the policy file.
+--user writes a user SVID under users/NAME.
+--agent writes an agent SVID and one ticket under agents/NAME.
+The ticket sets FLAG_AGENT_JIT and FLAG_ONE_SHOT.
+The ticket names one host, TCP, and port 22.
+The login name comes from --agent-user.
+The command does not print the private key or the ticket.
 On Linux the node sets the per-link domain ~orblx on the TUN device.
 On macOS the node writes /etc/resolver/orblx.
 orblx down removes that resolver configuration.
@@ -1003,7 +1229,10 @@ fn unix_secs(now: SystemTime) -> Result<u64, String> {
 mod tests {
     use std::fs;
     use std::net::{Ipv4Addr, SocketAddr};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+
+    use orblx_identity::{verify_ticket, DenySet, TicketVerifier};
 
     use super::{parse_issue, parse_set, parse_up, run, Command, DEFAULT_STATE_DIR};
 
@@ -1141,6 +1370,53 @@ mod tests {
         let config = super::load_config(&dir.join("a")).unwrap();
         assert!(config.certificate_pem.contains("CERTIFICATE"));
         assert!(!config.private_key_pem.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn node_issue_writes_a_user_svid_and_one_agent_ticket() {
+        let dir = std::env::temp_dir().join(format!("orblx-w19-issue-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        run(parse_issue(&[
+            "--out".to_string(),
+            dir.to_string_lossy().to_string(),
+            "--node".to_string(),
+            "b=100.64.0.2".to_string(),
+            "--user".to_string(),
+            "alice".to_string(),
+            "--agent".to_string(),
+            "helper".to_string(),
+            "--agent-parent".to_string(),
+            "alice".to_string(),
+            "--agent-host".to_string(),
+            "100.64.0.2".to_string(),
+            "--agent-user".to_string(),
+            "alice".to_string(),
+        ])
+        .unwrap())
+        .unwrap();
+        assert!(dir.join("users").join("alice").join("cert.pem").exists());
+        assert!(!dir.join("users").join("alice").join("ticket.bin").exists());
+        let ticket_path = dir.join("agents").join("helper").join("ticket.bin");
+        let mode = fs::metadata(&ticket_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let verifier = TicketVerifier::from_public_pem(
+            &fs::read_to_string(dir.join("b").join("ticket-verifier.pem")).unwrap(),
+        )
+        .unwrap();
+        let ticket = fs::read(&ticket_path).unwrap();
+        let verified = verify_ticket(
+            &verifier,
+            &ticket,
+            std::time::SystemTime::now(),
+            &DenySet::empty(),
+        )
+        .unwrap();
+        assert!(verified.flags.agent_jit());
+        assert!(verified.flags.one_shot());
+        assert_eq!(verified.dst_cidr, "100.64.0.2/32");
+        assert_eq!(verified.proto, 6);
+        assert_eq!(verified.dst_port, 22);
         let _ = fs::remove_dir_all(&dir);
     }
 

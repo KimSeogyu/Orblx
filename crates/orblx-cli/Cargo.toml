@@ -1,6 +1,6 @@
 [package]
 name = "orblx-cli"
-description = "orblx command for Orblx. The command prints a hello line, prints the version, runs the node daemon, runs hello-quic, brings up same-NAT direct QUIC, runs the orblx Relay, runs the connector hub-spoke path, exports a session audit chain, or runs the coordinator."
+description = "orblx command for Orblx. The command prints a hello line, prints the version, runs the node daemon, runs hello-quic, brings up same-NAT direct QUIC, runs the orblx Relay, runs the connector hub-spoke path, exports a session audit chain, opens an SVID SSH session, or runs the coordinator."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
@@ -18,5 +18,7 @@ orblx-datapath = { path = "../orblx-datapath" }
 orblx-edge = { path = "../orblx-edge" }
 orblx-identity = { path = "../orblx-identity" }
 orblx-relay = { path = "../orblx-relay" }
+orblx-ssh = { path = "../orblx-ssh" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1.54.1", features = ["rt", "macros", "net", "io-util", "sync", "time"] }
