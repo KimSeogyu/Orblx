@@ -116,6 +116,9 @@ pub(crate) fn plan_overlay(
     })
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) use device::install_destination_route;
+
 /// Assign the address and add the route.
 pub(crate) fn apply_overlay<R: RouteInstaller>(
     installer: &mut R,
@@ -251,8 +254,9 @@ mod device {
     use tokio::sync::mpsc::{self, error::TryRecvError};
 
     use super::{
-        apply_overlay, bsd_ioctl_readwrite, requested_control_unit, utun_index, CtlInfo,
-        ShellInstaller, SockaddrCtl, IPV4_UTUN_HEADER,
+        apply_overlay, bsd_ioctl_readwrite, prefix_len, requested_control_unit, utun_index,
+        validate_utun_name, CtlInfo, OverlayRoute, RouteInstaller, ShellInstaller, SockaddrCtl,
+        IPV4_UTUN_HEADER,
     };
     use crate::tun_dev::{TunBridge, TunConfig};
     use crate::HelloError;
@@ -275,7 +279,30 @@ mod device {
         Ok(TunBridge {
             from_tun: from_tun_rx,
             to_tun: to_tun_tx,
+            name,
         })
+    }
+
+    /// Add one peer prefix route on an open utun device.
+    ///
+    /// `open` already assigns the overlay address and the address route.
+    pub(crate) fn install_destination_route(
+        interface: &str,
+        network: std::net::Ipv4Addr,
+        netmask: std::net::Ipv4Addr,
+    ) -> Result<(), HelloError> {
+        validate_utun_name(interface).map_err(HelloError::Tun)?;
+        let prefix_len = prefix_len(netmask).map_err(HelloError::Tun)?;
+        let route = OverlayRoute {
+            interface: interface.to_string(),
+            network,
+            netmask,
+            prefix_len,
+        };
+        let mut installer = ShellInstaller {
+            runner: SystemCommand,
+        };
+        installer.add_route(&route).map_err(HelloError::Tun)
     }
 
     struct SystemCommand;

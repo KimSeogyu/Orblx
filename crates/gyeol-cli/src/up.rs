@@ -97,10 +97,11 @@ pub(crate) fn parse_up(args: &[String]) -> Result<Command, String> {
             other => return Err(format!("The flag {other} is not valid.\n{}", help_text())),
         }
     }
-    let netmap = netmap.ok_or_else(|| format!("The command needs --netmap.\n{}", help_text()))?;
+    let state_dir = state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR));
+    let netmap = netmap.unwrap_or_else(|| state_dir.join("netmap.json"));
     Ok(Command::Up(UpOptions {
         netmap,
-        state_dir: state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
+        state_dir,
         listen: listen
             .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_UDP_PORT))),
     }))
@@ -338,7 +339,7 @@ fn wants_help(args: &[String]) -> bool {
 fn help_text() -> String {
     format!(
         "\
-gyeol up --netmap FILE [--state-dir DIR] [--listen ADDR]
+gyeol up [--netmap FILE] [--state-dir DIR] [--listen ADDR]
 gyeol down [--state-dir DIR]
 gyeol status [--state-dir DIR]
 gyeol node-issue --out DIR --node NAME=OVERLAY_IP [--node NAME=OVERLAY_IP ...]
@@ -346,6 +347,7 @@ gyeol node-issue --out DIR --node NAME=OVERLAY_IP [--node NAME=OVERLAY_IP ...]
 The node keeps one QUIC session for each peer.
 The router sends each outbound TUN packet to the peer that owns the destination.
 The default state directory is {DEFAULT_STATE_DIR}.
+The default netmap file is {DEFAULT_STATE_DIR}/netmap.json.
 The node stores the overlay IP in that directory.
 A restart reads the stored overlay IP.
 The --listen address is the UDP socket.
@@ -415,6 +417,22 @@ mod tests {
                     SocketAddr::from((Ipv4Addr::UNSPECIFIED, 443))
                 );
                 assert_eq!(options.netmap, PathBuf::from("netmap.json"));
+            }
+            Command::Help(_) | Command::Down(_) | Command::Status(_) | Command::Issue(_) => {
+                panic!("the parser did not select up");
+            }
+        }
+    }
+
+    #[test]
+    fn up_defaults_the_netmap_file() {
+        let command = parse_up(&[]).unwrap();
+        match command {
+            Command::Up(options) => {
+                assert_eq!(
+                    options.netmap,
+                    PathBuf::from(DEFAULT_STATE_DIR).join("netmap.json")
+                );
             }
             Command::Help(_) | Command::Down(_) | Command::Status(_) | Command::Issue(_) => {
                 panic!("the parser did not select up");

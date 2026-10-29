@@ -4,6 +4,8 @@ The product name is Orblx.
 This document records the macOS utun path.
 This pull request does not add the node daemon.
 W18-1 adds `gyeol up`.
+`gyeol up` opens this utun device.
+When `--netmap` is absent, the netmap file is `/var/lib/gyeol/netmap.json`.
 This path does not use WireGuard.
 This path does not use Headscale.
 This path does not use DERP.
@@ -95,7 +97,7 @@ sudo install -m 755 target/release/gyeol /usr/local/bin/gyeol
 sudo mkdir -p /var/lib/gyeol
 ```
 
-Copy the W18-1 netmap file into `/var/lib/gyeol` before you start the node.
+Copy the W18-1 netmap file to `/var/lib/gyeol/netmap.json` before you start the node.
 Start the node with the W18-1 service or with:
 
 ```bash
@@ -130,7 +132,7 @@ sudo install -m 755 target/release/gyeol /usr/local/bin/gyeol
 sudo mkdir -p /var/lib/gyeol /var/log
 ```
 
-Copy the W18-1 netmap file into `/var/lib/gyeol`.
+Copy the W18-1 netmap file to `/var/lib/gyeol/netmap.json`.
 Install the launchd unit:
 
 ```bash

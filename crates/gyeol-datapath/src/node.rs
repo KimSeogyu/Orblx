@@ -1,13 +1,16 @@
-//! The long-running Linux node.
+//! The long-running node.
 //!
 //! The process keeps one QUIC session for each peer.
 //! The router sends each outbound TUN packet to the peer that owns the destination.
 //! The state directory keeps the overlay IP across a restart.
+//! Linux uses the `gyeol0` TUN device.
+//! macOS uses a kernel-chosen utun device.
 
 use std::collections::HashMap;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -18,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+#[cfg(target_os = "macos")]
+use crate::netmap::{ipv4_mask, parse_cidr};
 use crate::netmap::{parse_ipv4, Netmap, NetmapPeer};
 use crate::quic::HelloEndpoint;
 use crate::router::{route_packet, RouterTable};
@@ -35,6 +40,7 @@ pub const NODE_STATUS_FILE: &str = "status.txt";
 
 const PATH_DIRECT: &str = "direct";
 const PATH_DOWN: &str = "down";
+#[cfg(target_os = "linux")]
 const TUN_NAME: &str = "gyeol0";
 
 static LINK_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -203,7 +209,7 @@ pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
     let router = RouterTable::from_netmap(&request.netmap)
         .map_err(|err| HelloError::Node(err.to_string()))?;
     let bridge = open_tun(&TunConfig {
-        name: Some(TUN_NAME.to_string()),
+        name: tun_device_name(),
         address: parse_ipv4(&record.overlay_ip).map_err(|err| HelloError::Node(err.to_string()))?,
         netmask: Ipv4Addr::new(255, 255, 255, 255),
     })?;
@@ -679,8 +685,43 @@ fn read_pid(dir: &Path) -> Option<u32> {
     text.trim().parse().ok()
 }
 
+#[cfg(target_os = "linux")]
 fn process_is_running(pid: u32) -> bool {
     pid != 0 && Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(target_os = "macos")]
+fn process_is_running(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: the pid is positive. Signal 0 does not deliver a signal. It checks that the process exists.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_is_running(pid: u32) -> bool {
+    let _ = pid;
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn tun_device_name() -> Option<String> {
+    Some(TUN_NAME.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn tun_device_name() -> Option<String> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn tun_device_name() -> Option<String> {
+    None
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), HelloError> {
@@ -689,6 +730,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), HelloError> {
     fs::rename(&tmp, path).map_err(|err| HelloError::Node(err.to_string()))
 }
 
+#[cfg(target_os = "linux")]
 fn prepare_link(name: &str, cidrs: &[String]) -> Result<(), HelloError> {
     run_ip(&["link", "set", "dev", name, "arp", "off"])?;
     run_ip(&["link", "set", "dev", name, "up"])?;
@@ -702,6 +744,29 @@ fn prepare_link(name: &str, cidrs: &[String]) -> Result<(), HelloError> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn prepare_link(name: &str, cidrs: &[String]) -> Result<(), HelloError> {
+    for cidr in cidrs {
+        let (network, prefix_len) =
+            parse_cidr(cidr).map_err(|err| HelloError::Node(err.to_string()))?;
+        crate::tun_macos::install_destination_route(
+            name,
+            Ipv4Addr::from(ipv4_mask(prefix_len) & u32::from(network)),
+            Ipv4Addr::from(ipv4_mask(prefix_len)),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn prepare_link(name: &str, cidrs: &[String]) -> Result<(), HelloError> {
+    let _ = (name, cidrs);
+    Err(HelloError::Node(
+        "The node opens a TUN device on Linux or macOS.".to_string(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn run_ip(args: &[&str]) -> Result<(), HelloError> {
     let output = Command::new("ip")
         .args(args)

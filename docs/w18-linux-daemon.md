@@ -235,11 +235,12 @@ The proof script leaves those sysctls unchanged.
 Use one real Mac, one real Linux host, and the three containers on that Linux host.
 The containers are extra Linux nodes.
 The Linux host also runs one native node.
-This build opens the TUN device on Linux.
-On macOS, `gyeol up` stops with the error that the host is not Linux.
-The Mac commands below are the commands for the later macOS TUN path.
-Until that path exists, the Linux host and the three containers are the nodes this build can prove.
-Run the checks that stay on the Linux host first.
+Linux opens the TUN device `gyeol0`.
+macOS opens a utun device.
+The kernel chooses the utun name.
+`gyeol up` prints that name.
+The Mac command is the same `gyeol up`.
+The utun details are in `docs/w18-macos.md`.
 
 Set `LINUX_LAN` to the Linux host address on the LAN.
 Set `MAC_LAN` to the Mac address on the LAN.
@@ -339,11 +340,17 @@ The unit runs `/usr/local/bin/gyeol up --netmap /etc/gyeol/netmap.json --state-d
 The unit stops the node with `gyeol down`.
 The manual command is the same `gyeol up` line.
 
-On the Mac, after the macOS TUN path exists:
+On the Mac, run the same command as root.
+The state directory default is `/var/lib/gyeol`.
+When `--netmap` is absent, the file is `/var/lib/gyeol/netmap.json`.
+`scripts/dev.gyeol.plist` runs `gyeol up` with that default.
 
 ```
-gyeol up --netmap netmap-mac.json --state-dir "$HOME/gyeol-state" --listen 0.0.0.0:443
+sudo gyeol up --netmap netmap-mac.json --state-dir /var/lib/gyeol --listen 0.0.0.0:443
+ifconfig | grep 100.64.0.5
 ```
+
+The `ifconfig` line shows `100.64.0.5` on a `utun` interface.
 
 Check the Linux host:
 
