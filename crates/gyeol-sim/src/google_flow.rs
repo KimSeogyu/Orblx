@@ -545,6 +545,7 @@ mod tests {
         assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A8787%2Foidc%2Fcallback"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("scope=openid"));
+        assert!(url.contains("prompt=select_account"));
         assert!(url.contains("state="));
         assert!(url.contains("nonce="));
         assert!(!url.contains("oidc.gyeol.local"));

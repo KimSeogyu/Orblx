@@ -136,6 +136,7 @@ fn the_registered_client_builds_an_authorize_url() {
     assert!(url.starts_with(GOOGLE_AUTHORIZE_ENDPOINT));
     assert!(url.contains("response_type=code"));
     assert!(url.contains("scope=openid"));
+    assert!(url.contains("prompt=select_account"));
     assert!(url.contains(REGISTERED_CLIENT_ID));
     assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A8787%2Foidc%2Fcallback"));
     assert!(url.contains(&format!("state={STATE}")));

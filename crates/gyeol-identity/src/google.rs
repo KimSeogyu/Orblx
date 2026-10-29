@@ -154,6 +154,7 @@ impl GoogleClient {
     ///
     /// `redirect_uri` must be one of the two registered callback URIs.
     /// `state` and `nonce` are 16 to 128 lowercase hex characters.
+    /// The URL sets `prompt=select_account` so Google shows the account chooser.
     pub fn authorize_url(
         &self,
         redirect_uri: &str,
@@ -170,6 +171,7 @@ impl GoogleClient {
         append_pair(&mut url, "scope", "openid", false);
         append_pair(&mut url, "state", state, false);
         append_pair(&mut url, "nonce", nonce, false);
+        append_pair(&mut url, "prompt", "select_account", false);
         Ok(url)
     }
 
