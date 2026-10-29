@@ -17,6 +17,8 @@ path = "src/bin/tun-bench.rs"
 orblx-audit = { path = "../orblx-audit" }
 orblx-crypto = { path = "../orblx-crypto" }
 orblx-identity = { path = "../orblx-identity" }
+orblx-relay = { path = "../orblx-relay" }
+sha2 = "0.10.8"
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rand = "0.8"
 rcgen = { version = "=0.14.7", default-features = false, features = ["crypto", "pem", "ring"] }

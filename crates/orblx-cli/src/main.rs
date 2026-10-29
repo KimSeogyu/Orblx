@@ -174,6 +174,9 @@ where
     if args.first().map(String::as_str) == Some("up") {
         return up::parse_up(&args[1..]).map(Action::Node);
     }
+    if args.first().map(String::as_str) == Some("set") {
+        return up::parse_set(&args[1..]).map(Action::Node);
+    }
     if args.first().map(String::as_str) == Some("down") {
         return up::parse_down(&args[1..]).map(Action::Node);
     }

@@ -56,6 +56,12 @@ pub struct NetmapPeer {
     pub endpoints: Vec<String>,
     /// Extra destination CIDRs that this peer owns.
     pub routes: Vec<String>,
+    /// The coordinator published this peer as an approved exit node.
+    ///
+    /// The policy `autoApprovers.exitNode` class sets this flag.
+    /// A false value stays out of the JSON text.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exit_node: bool,
     /// The DNS owner label.
     ///
     /// Empty means the peer has no `<node>.<owner>.orblx` name.
@@ -259,6 +265,10 @@ pub(crate) fn parse_cidr(text: &str) -> Result<(Ipv4Addr, u8), NetmapError> {
         });
     }
     Ok((ip, prefix_len))
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub(crate) fn ipv4_mask(prefix_len: u8) -> u32 {

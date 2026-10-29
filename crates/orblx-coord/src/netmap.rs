@@ -251,6 +251,7 @@ mod tests {
                 svid: "spiffe://orblx.local/node/laptop".to_string(),
                 endpoints: vec!["10.0.0.2:443".to_string()],
                 routes: vec!["192.168.1.0/24".to_string()],
+                exit_node: false,
                 owner: String::new(),
             }],
         }

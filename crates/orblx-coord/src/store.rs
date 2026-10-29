@@ -33,6 +33,8 @@ struct NodeRecord {
     owner: String,
     endpoints: Vec<String>,
     routes: Vec<String>,
+    #[serde(default)]
+    exit_node: bool,
     enrolled_unix: u64,
 }
 
@@ -74,6 +76,7 @@ pub struct StoredNode {
     pub svid: String,
     pub endpoints: Vec<String>,
     pub routes: Vec<String>,
+    pub exit_node: bool,
 }
 
 impl NodeStore {
@@ -115,6 +118,7 @@ impl NodeStore {
                 svid: node.svid.clone(),
                 endpoints: node.endpoints.clone(),
                 routes: node.routes.clone(),
+                exit_node: node.exit_node,
             })
             .collect()
     }
@@ -234,6 +238,7 @@ impl NodeStore {
             owner: plan.owner,
             endpoints: plan.endpoints.clone(),
             routes: plan.routes.clone(),
+            exit_node: false,
             enrolled_unix: now_unix,
         };
         let stored = StoredNode {
@@ -242,6 +247,7 @@ impl NodeStore {
             svid: node.svid.clone(),
             endpoints: node.endpoints.clone(),
             routes: node.routes.clone(),
+            exit_node: node.exit_node,
         };
         self.disk.nodes.push(node);
         self.disk.next_index = plan.next_index;
@@ -261,6 +267,20 @@ impl NodeStore {
             .find(|node| node.name == name)
             .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
         node.routes = canonical_routes;
+        self.persist()
+    }
+
+    /// Store whether this node offers to be an exit node.
+    ///
+    /// The signed netmap sets the flag only after policy approval.
+    pub fn set_exit_node(&mut self, name: &str, enabled: bool) -> Result<(), CoordError> {
+        let node = self
+            .disk
+            .nodes
+            .iter_mut()
+            .find(|node| node.name == name)
+            .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        node.exit_node = enabled;
         self.persist()
     }
 

@@ -197,6 +197,7 @@ pub struct Policy {
     grants: Vec<CompiledGrant>,
     tests: Vec<StoredTest>,
     routes: Vec<RouteRule>,
+    exit_nodes: Vec<SpiffeId>,
 }
 
 impl std::fmt::Debug for Policy {
@@ -206,6 +207,7 @@ impl std::fmt::Debug for Policy {
             .field("grants", &self.grants.len())
             .field("tests", &self.tests.len())
             .field("routes", &self.routes.len())
+            .field("exit_nodes", &self.exit_nodes.len())
             .finish()
     }
 }
@@ -220,6 +222,7 @@ impl Policy {
             grants: Vec::new(),
             tests: Vec::new(),
             routes: Vec::new(),
+            exit_nodes: Vec::new(),
         }
     }
 
@@ -300,6 +303,8 @@ impl Policy {
     /// `autoApprovers` approves the listed prefix and a longer prefix inside it.
     /// `routeApprovals` approves one exact CIDR.
     /// `0.0.0.0/0` is an exit route. This function returns false for that prefix.
+    ///
+    /// Exit nodes use [`Policy::approves_exit_node`].
     #[must_use]
     pub fn approves_route(&self, node: &SpiffeId, cidr: &str) -> bool {
         let Ok((prefix, prefix_len)) = parse_route_cidr(cidr) else {
@@ -311,6 +316,14 @@ impl Policy {
         self.routes
             .iter()
             .any(|rule| rule.src == *node && route_matches(rule, prefix, prefix_len))
+    }
+
+    /// Return true when `autoApprovers.exitNode` lists this node.
+    ///
+    /// An empty class approves no node.
+    #[must_use]
+    pub fn approves_exit_node(&self, node: &SpiffeId) -> bool {
+        self.exit_nodes.iter().any(|id| id == node)
     }
 
     /// Return the inline assertions.
@@ -402,6 +415,8 @@ struct PolicyFile {
 struct AutoApproversFile {
     #[serde(default)]
     routes: BTreeMap<String, Vec<String>>,
+    #[serde(default, rename = "exitNode")]
+    exit_node: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -518,11 +533,32 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
         tests.push(compile_test(&catalog, test)?);
     }
     let routes = compile_routes(&catalog, file)?;
+    let exit_nodes = compile_exit_nodes(&catalog, &file.auto_approvers.exit_node)?;
     Ok(Policy {
         grants,
         tests,
         routes,
+        exit_nodes,
     })
+}
+
+fn compile_exit_nodes(
+    catalog: &Catalog,
+    selectors: &[String],
+) -> Result<Vec<SpiffeId>, PolicyError> {
+    let mut exit_nodes = Vec::new();
+    for selector in selectors {
+        for src in expand(catalog, selector)? {
+            if exit_nodes.len() >= MAX_GRANTS {
+                return Err(PolicyError::new("The policy has too many grants."));
+            }
+            if !exit_nodes.contains(&src) {
+                exit_nodes.push(src);
+            }
+        }
+    }
+    exit_nodes.sort_by(|left, right| left.as_uri().cmp(right.as_uri()));
+    Ok(exit_nodes)
 }
 
 fn compile_routes(catalog: &Catalog, file: &PolicyFile) -> Result<Vec<RouteRule>, PolicyError> {
@@ -1176,5 +1212,28 @@ mod tests {
         }"#;
         let err = Policy::from_hujson(text.as_bytes()).unwrap_err();
         assert!(err.to_string().contains("exit route"));
+    }
+
+    #[test]
+    fn exit_node_approval_follows_the_exit_node_class() {
+        let text = r#"{
+          "tags": {
+            "tag:exit": ["spiffe://orblx.local/node/exit"]
+          },
+          "tagOwners": {
+            "tag:exit": ["spiffe://orblx.local/node/client"]
+          },
+          "autoApprovers": {
+            "exitNode": ["tag:exit"]
+          }
+        }"#;
+        let policy = Policy::from_hujson(text.as_bytes()).unwrap();
+        let exit = super::SpiffeId::parse("spiffe://orblx.local/node/exit").unwrap();
+        let client = super::SpiffeId::parse("spiffe://orblx.local/node/client").unwrap();
+        assert!(policy.approves_exit_node(&exit));
+        assert!(!policy.approves_exit_node(&client));
+        assert!(!policy.approves_route(&exit, "0.0.0.0/0"));
+        let empty = Policy::empty();
+        assert!(!empty.approves_exit_node(&exit));
     }
 }

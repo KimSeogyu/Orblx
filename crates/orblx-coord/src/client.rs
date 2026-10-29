@@ -29,6 +29,7 @@ pub async fn enroll_with_token(
         nonce: None,
         endpoints: endpoints.to_vec(),
         routes: routes.to_vec(),
+        exit_node: false,
     };
     round_trip(coord, coord_name, bundle_pem, None, request, None, true).await
 }
@@ -76,6 +77,7 @@ pub async fn enroll_with_oidc(input: OidcEnroll<'_>) -> Result<EnrollResult, Coo
         nonce: Some(input.nonce.to_string()),
         endpoints: input.endpoints.to_vec(),
         routes: input.routes.to_vec(),
+        exit_node: false,
     };
     round_trip(
         input.coord,
@@ -130,6 +132,7 @@ pub async fn advertise_routes(
         nonce: None,
         endpoints: Vec::new(),
         routes: routes.to_vec(),
+        exit_node: false,
     };
     let result = round_trip(
         coord,
@@ -163,6 +166,7 @@ pub async fn fetch_netmap(
         nonce: None,
         endpoints: Vec::new(),
         routes: Vec::new(),
+        exit_node: false,
     };
     let result = round_trip(
         coord,
@@ -187,6 +191,7 @@ fn view_from_result(result: EnrollResult) -> NetmapView {
         netmap_public: result.netmap_public,
         approved_routes: result.approved_routes,
         advertised_routes: result.advertised_routes,
+        exit_approved: result.exit_approved,
     }
 }
 
@@ -210,6 +215,7 @@ pub async fn renew_svid(
         nonce: None,
         endpoints: Vec::new(),
         routes: Vec::new(),
+        exit_node: false,
     };
     let result = round_trip(
         coord,
@@ -241,6 +247,56 @@ pub fn renew_svid_blocking(
 /// Fetch a fresh netmap with the stored node SVID.
 ///
 /// Call this function outside a Tokio runtime.
+/// Register this node as an exit node and store the fresh netmap.
+///
+/// Call this function outside a Tokio runtime.
+pub fn advertise_exit_blocking(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+    enabled: bool,
+) -> Result<NetmapView, CoordError> {
+    block_on(advertise_exit(
+        coord, coord_name, bundle_pem, state_dir, enabled,
+    ))
+}
+
+/// Register this node as an exit node and store the fresh netmap.
+pub async fn advertise_exit(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+    enabled: bool,
+) -> Result<NetmapView, CoordError> {
+    let material = read_node_material(state_dir)?;
+    let pinned = material.netmap_public;
+    let request = Request {
+        op: "exit".to_string(),
+        name: material.name.clone(),
+        token: None,
+        id_token: None,
+        nonce: None,
+        endpoints: Vec::new(),
+        routes: Vec::new(),
+        exit_node: enabled,
+    };
+    let result = round_trip(
+        coord,
+        coord_name,
+        bundle_pem,
+        Some(material),
+        request,
+        Some(pinned),
+        false,
+    )
+    .await?;
+    let view = view_from_result(result);
+    view.write_state(state_dir)?;
+    Ok(view)
+}
+
 pub fn fetch_netmap_blocking(
     coord: SocketAddr,
     coord_name: &str,
@@ -357,6 +413,7 @@ fn enroll_from_response(
         endpoints,
         approved_routes: response.approved_routes.unwrap_or_default(),
         advertised_routes: response.advertised_routes.unwrap_or_default(),
+        exit_approved: response.exit_approved.unwrap_or(false),
     })
 }
 

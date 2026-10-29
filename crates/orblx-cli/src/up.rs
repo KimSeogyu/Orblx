@@ -47,6 +47,13 @@ pub(crate) enum Command {
     Down(StateOptions),
     Status(StateOptions),
     Issue(IssueOptions),
+    Set(SetOptions),
+}
+
+pub(crate) struct SetOptions {
+    pub(crate) state_dir: PathBuf,
+    pub(crate) exit_node: String,
+    pub(crate) allow_lan: bool,
 }
 
 pub(crate) struct UpOptions {
@@ -56,6 +63,10 @@ pub(crate) struct UpOptions {
     pub(crate) listen: SocketAddr,
     pub(crate) accept_routes: bool,
     pub(crate) advertise_routes: Vec<String>,
+    pub(crate) advertise_exit: bool,
+    pub(crate) exit_node: Option<String>,
+    pub(crate) allow_lan: bool,
+    pub(crate) relay: Option<SocketAddr>,
     pub(crate) coord: Option<SocketAddr>,
     pub(crate) coord_name: Option<String>,
     pub(crate) bundle: Option<PathBuf>,
@@ -82,7 +93,17 @@ impl std::fmt::Debug for Command {
                 .field("listen", &options.listen)
                 .field("accept_routes", &options.accept_routes)
                 .field("advertise_routes", &options.advertise_routes.len())
+                .field("advertise_exit", &options.advertise_exit)
+                .field("exit_node", &options.exit_node)
+                .field("allow_lan", &options.allow_lan)
+                .field("relay", &options.relay)
                 .field("coord", &options.coord)
+                .finish(),
+            Self::Set(options) => formatter
+                .debug_struct("Set")
+                .field("state_dir", &options.state_dir)
+                .field("exit_node", &options.exit_node)
+                .field("allow_lan", &options.allow_lan)
                 .finish(),
             Self::Down(options) | Self::Status(options) => formatter
                 .debug_struct("State")
@@ -107,6 +128,10 @@ pub(crate) fn parse_up(args: &[String]) -> Result<Command, String> {
     let mut listen = None;
     let mut accept_routes = false;
     let mut advertise_routes = Vec::new();
+    let mut advertise_exit = false;
+    let mut exit_node = None;
+    let mut allow_lan = false;
+    let mut relay = None;
     let mut coord = None;
     let mut coord_name = None;
     let mut bundle = None;
@@ -118,12 +143,22 @@ pub(crate) fn parse_up(args: &[String]) -> Result<Command, String> {
             accept_routes = true;
             continue;
         }
+        if flag == "--advertise-exit-node" {
+            advertise_exit = true;
+            continue;
+        }
+        if flag == "--exit-node-allow-lan-access" {
+            allow_lan = true;
+            continue;
+        }
         let value = take_value(args, &mut index)?;
         match flag {
             "--netmap" => netmap = Some(PathBuf::from(value)),
             "--state-dir" => state_dir = Some(PathBuf::from(value)),
             "--listen" => listen = Some(parse_socket(&value, DEFAULT_UDP_PORT)?),
             "--advertise-routes" => advertise_routes.push(value),
+            "--exit-node" => exit_node = Some(value),
+            "--relay" => relay = Some(parse_socket(&value, 443)?),
             "--coord" => coord = Some(parse_socket(&value, 443)?),
             "--coord-name" => coord_name = Some(value),
             "--bundle" => bundle = Some(PathBuf::from(value)),
@@ -133,11 +168,16 @@ pub(crate) fn parse_up(args: &[String]) -> Result<Command, String> {
     let state_dir = state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR));
     let netmap_set = netmap.is_some();
     let netmap = netmap.unwrap_or_else(|| state_dir.join("netmap.json"));
-    if !advertise_routes.is_empty() && coord.is_some() && bundle.is_none() {
+    let needs_bundle = coord.is_some()
+        && bundle.is_none()
+        && (advertise_exit || !advertise_routes.is_empty() || accept_routes || exit_node.is_some());
+    if needs_bundle {
         return Err(format!("The command needs --bundle.\n{}", help_text()));
     }
-    if accept_routes && coord.is_some() && bundle.is_none() && advertise_routes.is_empty() {
-        return Err(format!("The command needs --bundle.\n{}", help_text()));
+    if let Some(name) = exit_node.as_deref() {
+        if name.is_empty() {
+            return Err(format!("The exit node name is empty.\n{}", help_text()));
+        }
     }
     Ok(Command::Up(UpOptions {
         netmap,
@@ -147,9 +187,47 @@ pub(crate) fn parse_up(args: &[String]) -> Result<Command, String> {
             .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_UDP_PORT))),
         accept_routes,
         advertise_routes,
+        advertise_exit,
+        exit_node,
+        allow_lan,
+        relay,
         coord,
         coord_name,
         bundle,
+    }))
+}
+
+pub(crate) fn parse_set(args: &[String]) -> Result<Command, String> {
+    if wants_help(args) {
+        return Ok(Command::Help(help_text()));
+    }
+    let mut state_dir = None;
+    let mut exit_node = None;
+    let mut allow_lan = false;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        index += 1;
+        if flag == "--exit-node-allow-lan-access" {
+            allow_lan = true;
+            continue;
+        }
+        let value = take_value(args, &mut index)?;
+        match flag {
+            "--state-dir" => state_dir = Some(PathBuf::from(value)),
+            "--exit-node" => exit_node = Some(value),
+            other => return Err(format!("The flag {other} is not valid.\n{}", help_text())),
+        }
+    }
+    let exit_node =
+        exit_node.ok_or_else(|| format!("The command needs --exit-node.\n{}", help_text()))?;
+    if exit_node.is_empty() {
+        return Err(format!("The exit node name is empty.\n{}", help_text()));
+    }
+    Ok(Command::Set(SetOptions {
+        state_dir: state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
+        exit_node,
+        allow_lan,
     }))
 }
 
@@ -203,15 +281,22 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
         Command::Down(options) => run_down(options),
         Command::Status(options) => run_status(options),
         Command::Issue(options) => run_issue(options),
+        Command::Set(options) => run_set(options),
     }
 }
 
-fn run_up(options: UpOptions) -> Result<(), String> {
-    let (netmap_path, forward_routes) = publish_routes(&options)?;
+fn run_up(mut options: UpOptions) -> Result<(), String> {
+    apply_saved_exit(&mut options)?;
+    let (netmap_path, forward_routes, forward_exit) = publish_routes(&options)?;
     let netmap = Netmap::from_path(&netmap_path).map_err(|err| err.to_string())?;
     let config = load_config(&options.state_dir)?;
-    let renew = load_renewer(&options.state_dir, options.coord, options.coord_name)?;
+    let renew = load_renewer(
+        &options.state_dir,
+        options.coord,
+        options.coord_name.clone(),
+    )?;
     let visibility = load_visibility(&options.state_dir, &netmap.self_node.name)?;
+    let underlay = underlay_for(&netmap, options.coord, options.relay);
     run_node(NodeRequest {
         config,
         netmap,
@@ -221,10 +306,36 @@ fn run_up(options: UpOptions) -> Result<(), String> {
         stop: None,
         accept_routes: options.accept_routes,
         forward_routes,
+        forward_exit,
+        exit_node: options.exit_node,
+        allow_lan: options.allow_lan,
+        underlay,
+        relay: options.relay,
         netmap_path,
         visibility,
     })
     .map_err(|err| err.to_string())
+}
+
+fn push_ipv4(extra: &mut Vec<Ipv4Addr>, addr: Option<SocketAddr>) {
+    if let Some(SocketAddr::V4(addr)) = addr {
+        extra.push(*addr.ip());
+    }
+}
+
+fn underlay_for(
+    netmap: &Netmap,
+    coord: Option<SocketAddr>,
+    relay: Option<SocketAddr>,
+) -> Vec<Ipv4Addr> {
+    let mut extra = Vec::new();
+    push_ipv4(&mut extra, coord);
+    push_ipv4(&mut extra, relay);
+    let mut endpoints = Vec::new();
+    for peer in &netmap.peers {
+        endpoints.extend(peer.endpoints.iter().cloned());
+    }
+    orblx_datapath::underlay_addresses(&endpoints, &extra)
 }
 
 fn load_renewer(
@@ -291,12 +402,18 @@ fn resolve_coord(text: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("The coordinator address {text} is not valid."))
 }
 
-fn publish_routes(options: &UpOptions) -> Result<(PathBuf, Vec<String>), String> {
-    if options.advertise_routes.is_empty() && !(options.accept_routes && options.coord.is_some()) {
-        return Ok((options.netmap.clone(), options.advertise_routes.clone()));
+fn publish_routes(options: &UpOptions) -> Result<(PathBuf, Vec<String>, bool), String> {
+    let wants_fetch = options.coord.is_some()
+        && (options.accept_routes || options.exit_node.is_some() || options.advertise_exit);
+    if options.advertise_routes.is_empty() && !options.advertise_exit && !wants_fetch {
+        return Ok((options.netmap.clone(), Vec::new(), false));
     }
     let Some(coord) = options.coord else {
-        return Ok((options.netmap.clone(), options.advertise_routes.clone()));
+        return Ok((
+            options.netmap.clone(),
+            options.advertise_routes.clone(),
+            options.advertise_exit,
+        ));
     };
     let bundle = options
         .bundle
@@ -305,37 +422,123 @@ fn publish_routes(options: &UpOptions) -> Result<(PathBuf, Vec<String>), String>
     let bundle_pem = fs::read_to_string(bundle)
         .map_err(|err| format!("The file {} did not open. {err}", bundle.display()))?;
     let coord_name = options.coord_name.as_deref().unwrap_or("coord");
-    if options.advertise_routes.is_empty() {
+    if options.advertise_routes.is_empty() && !options.advertise_exit {
         orblx_coord::fetch_netmap_blocking(coord, coord_name, &bundle_pem, &options.state_dir)
             .map_err(|err| err.to_string())?;
         println!("The node uses the coordinator netmap.");
-        return Ok((options.state_dir.join("netmap.json"), Vec::new()));
+        return Ok((options.state_dir.join("netmap.json"), Vec::new(), false));
     }
-    let view = advertise_routes_blocking(
-        coord,
-        coord_name,
-        &bundle_pem,
-        &options.state_dir,
-        &options.advertise_routes,
-    )
-    .map_err(|err| err.to_string())?;
-    for route in &view.approved_routes {
-        println!("approved route {route}");
+    let mut forward_routes = Vec::new();
+    let mut forward_exit = false;
+    if !options.advertise_routes.is_empty() {
+        let view = advertise_routes_blocking(
+            coord,
+            coord_name,
+            &bundle_pem,
+            &options.state_dir,
+            &options.advertise_routes,
+        )
+        .map_err(|err| err.to_string())?;
+        for route in &view.approved_routes {
+            println!("approved route {route}");
+        }
+        for route in &view.advertised_routes {
+            if !view.approved_routes.iter().any(|item| item == route) {
+                println!("held route {route}");
+            }
+        }
+        if options.netmap_set {
+            fs::copy(options.state_dir.join("netmap.json"), &options.netmap)
+                .map_err(|err| format!("The netmap file was not written. {err}"))?;
+        }
+        forward_routes = view.approved_routes;
     }
-    for route in &view.advertised_routes {
-        if !view.approved_routes.iter().any(|item| item == route) {
-            println!("held route {route}");
+    if options.advertise_exit {
+        let view = orblx_coord::advertise_exit_blocking(
+            coord,
+            coord_name,
+            &bundle_pem,
+            &options.state_dir,
+            true,
+        )
+        .map_err(|err| err.to_string())?;
+        if view.exit_approved {
+            println!("approved exit node");
+            forward_exit = true;
+        } else {
+            println!("held exit node");
+        }
+        if options.netmap_set {
+            fs::copy(options.state_dir.join("netmap.json"), &options.netmap)
+                .map_err(|err| format!("The netmap file was not written. {err}"))?;
         }
     }
+    println!("The node uses the coordinator netmap.");
     let path = if options.netmap_set {
-        fs::copy(options.state_dir.join("netmap.json"), &options.netmap)
-            .map_err(|err| format!("The netmap file was not written. {err}"))?;
         options.netmap.clone()
     } else {
         options.state_dir.join("netmap.json")
     };
-    println!("The node uses the coordinator netmap.");
-    Ok((path, view.approved_routes))
+    Ok((path, forward_routes, forward_exit))
+}
+
+fn apply_saved_exit(options: &mut UpOptions) -> Result<(), String> {
+    if options.exit_node.is_some() {
+        return Ok(());
+    }
+    let path = options.state_dir.join("exit-node.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let text = read_text(&path)?;
+    let prefs: ExitPrefs =
+        serde_json::from_str(&text).map_err(|_| "The exit node file is not valid.".to_string())?;
+    if prefs.exit_node.is_empty() {
+        return Ok(());
+    }
+    options.exit_node = Some(prefs.exit_node);
+    options.allow_lan = options.allow_lan || prefs.allow_lan;
+    println!(
+        "The node uses exit node {}.",
+        options.exit_node.as_deref().unwrap_or("")
+    );
+    Ok(())
+}
+
+fn run_set(options: SetOptions) -> Result<(), String> {
+    fs::create_dir_all(&options.state_dir).map_err(|err| {
+        format!(
+            "The directory {} was not created. {err}",
+            options.state_dir.display()
+        )
+    })?;
+    let prefs = ExitPrefs {
+        exit_node: options.exit_node.clone(),
+        allow_lan: options.allow_lan,
+    };
+    let text = serde_json::to_string(&prefs)
+        .map_err(|_| "The exit node file was not written.".to_string())?;
+    write_mode(
+        &options.state_dir.join("exit-node.json"),
+        text.as_bytes(),
+        FILE_PUBLIC,
+    )?;
+    if options.allow_lan {
+        println!(
+            "The next start uses exit node {} and keeps LAN access.",
+            options.exit_node
+        );
+    } else {
+        println!("The next start uses exit node {}.", options.exit_node);
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ExitPrefs {
+    exit_node: String,
+    #[serde(default)]
+    allow_lan: bool,
 }
 
 fn run_down(options: StateOptions) -> Result<(), String> {
@@ -661,7 +864,8 @@ fn wants_help(args: &[String]) -> bool {
 fn help_text() -> String {
     format!(
         "\
-orblx up [--netmap FILE] [--state-dir DIR] [--listen ADDR] [--accept-routes] [--advertise-routes CIDR] [--coord ADDR] [--bundle FILE] [--coord-name NAME]
+orblx up [--netmap FILE] [--state-dir DIR] [--listen ADDR] [--accept-routes] [--advertise-routes CIDR] [--advertise-exit-node] [--exit-node NAME] [--exit-node-allow-lan-access] [--relay ADDR] [--coord ADDR] [--bundle FILE] [--coord-name NAME]
+orblx set --exit-node NAME [--exit-node-allow-lan-access] [--state-dir DIR]
 orblx down [--state-dir DIR]
 orblx status [--state-dir DIR]
 orblx node-issue --out DIR --node NAME=OVERLAY_IP [--node NAME=OVERLAY_IP ...] [--policy FILE]
@@ -700,7 +904,16 @@ The command does not print the private key or a token.
 The coordinator publishes a route after the policy approves it.
 A route that the policy does not approve stays off the signed netmap.
 --accept-routes installs approved subnet routes on the TUN device.
-The node does not install 0.0.0.0/0.
+--exit-node NAME routes 0.0.0.0/0 through that approved exit node.
+An exit node that the policy does not approve is not used.
+--exit-node-allow-lan-access keeps connected LAN prefixes on the local interface.
+--advertise-exit-node offers this node as an exit node.
+The policy autoApprovers exitNode class approves that offer.
+The node masquerades overlay traffic that leaves the node.
+The node keeps coordinator, Relay, and peer underlay addresses outside the tunnel.
+While an exit node is in use, non-overlay DNS queries go through that exit node.
+--relay ADDR is the orblx Relay. UDP is the first path. TCP port 443 is the fallback.
+orblx set stores the exit node for the next orblx up.
 The router forwards an approved local subnet with kernel masquerade.
 "
     )
@@ -750,7 +963,7 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
 
-    use super::{parse_issue, parse_up, run, Command, DEFAULT_STATE_DIR};
+    use super::{parse_issue, parse_set, parse_up, run, Command, DEFAULT_STATE_DIR};
 
     #[test]
     fn up_defaults_the_state_directory_and_the_port() {
@@ -766,7 +979,11 @@ mod tests {
                 assert!(!options.accept_routes);
                 assert!(options.advertise_routes.is_empty());
             }
-            Command::Help(_) | Command::Down(_) | Command::Status(_) | Command::Issue(_) => {
+            Command::Help(_)
+            | Command::Down(_)
+            | Command::Status(_)
+            | Command::Issue(_)
+            | Command::Set(_) => {
                 panic!("the parser did not select up");
             }
         }
@@ -783,7 +1000,11 @@ mod tests {
                 );
                 assert!(!options.netmap_set);
             }
-            Command::Help(_) | Command::Down(_) | Command::Status(_) | Command::Issue(_) => {
+            Command::Help(_)
+            | Command::Down(_)
+            | Command::Status(_)
+            | Command::Issue(_)
+            | Command::Set(_) => {
                 panic!("the parser did not select up");
             }
         }
@@ -805,8 +1026,60 @@ mod tests {
                 assert_eq!(options.advertise_routes.len(), 2);
                 assert!(options.coord.is_none());
             }
-            Command::Help(_) | Command::Down(_) | Command::Status(_) | Command::Issue(_) => {
+            Command::Help(_)
+            | Command::Down(_)
+            | Command::Status(_)
+            | Command::Issue(_)
+            | Command::Set(_) => {
                 panic!("the parser did not select up");
+            }
+        }
+    }
+
+    #[test]
+    fn up_and_set_accept_the_exit_node_flags() {
+        let command = parse_up(&[
+            "--advertise-exit-node".to_string(),
+            "--exit-node".to_string(),
+            "exit".to_string(),
+            "--exit-node-allow-lan-access".to_string(),
+            "--relay".to_string(),
+            "172.30.19.5:443".to_string(),
+        ])
+        .unwrap();
+        match command {
+            Command::Up(options) => {
+                assert!(options.advertise_exit);
+                assert_eq!(options.exit_node.as_deref(), Some("exit"));
+                assert!(options.allow_lan);
+                assert_eq!(options.relay.unwrap().port(), 443);
+            }
+            Command::Help(_)
+            | Command::Down(_)
+            | Command::Status(_)
+            | Command::Issue(_)
+            | Command::Set(_) => {
+                panic!("the parser did not select up");
+            }
+        }
+        let set = parse_set(&[
+            "--exit-node".to_string(),
+            "exit".to_string(),
+            "--state-dir".to_string(),
+            "/tmp/orblx-exit".to_string(),
+        ])
+        .unwrap();
+        match set {
+            Command::Set(options) => {
+                assert_eq!(options.exit_node, "exit");
+                assert!(!options.allow_lan);
+            }
+            Command::Help(_)
+            | Command::Up(_)
+            | Command::Down(_)
+            | Command::Status(_)
+            | Command::Issue(_) => {
+                panic!("the parser did not select set");
             }
         }
     }
@@ -872,6 +1145,7 @@ mod tests {
             svid: "spiffe://orblx.local/node/b".to_string(),
             endpoints: vec!["172.28.18.12:443".to_string()],
             routes: Vec::new(),
+            exit_node: false,
             owner: "lab".to_string(),
         };
         let mut peer_c = peer_b.clone();
@@ -919,6 +1193,7 @@ mod tests {
             svid: format!("spiffe://orblx.local/node/{name}"),
             endpoints: Vec::new(),
             routes: Vec::new(),
+            exit_node: false,
             owner: "lab".to_string(),
         }
     }

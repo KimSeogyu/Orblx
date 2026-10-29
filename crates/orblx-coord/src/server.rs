@@ -108,6 +108,7 @@ async fn handle_connection(
                 grants: None,
                 approved_routes: None,
                 advertised_routes: None,
+                exit_approved: None,
             }
         }
     };
@@ -176,6 +177,15 @@ async fn dispatch(
             let view = coord.advertise_routes(&request.name, &request.routes)?;
             Ok(netmap_response(&view))
         }
+        "exit" => {
+            let peer = peer_node(connection, &coord.tls_material()?.trust_pem)?;
+            let peer = peer.ok_or(CoordError::Peer)?;
+            if peer != request.name {
+                return Err(CoordError::Peer);
+            }
+            let view = coord.advertise_exit(&request.name, request.exit_node)?;
+            Ok(netmap_response(&view))
+        }
         "netmap" => {
             let peer = peer_node(connection, &coord.tls_material()?.trust_pem)?;
             let peer = peer.ok_or(CoordError::Peer)?;
@@ -205,6 +215,7 @@ fn leaf_response(result: crate::state::EnrollResult) -> Response {
         grants: Some(result.signed_grants),
         approved_routes: Some(result.approved_routes),
         advertised_routes: Some(result.advertised_routes),
+        exit_approved: Some(result.exit_approved),
     }
 }
 
@@ -221,6 +232,7 @@ fn netmap_response(view: &crate::state::NetmapView) -> Response {
         grants: Some(view.signed_grants.clone()),
         approved_routes: Some(view.approved_routes.clone()),
         advertised_routes: Some(view.advertised_routes.clone()),
+        exit_approved: Some(view.exit_approved),
     }
 }
 

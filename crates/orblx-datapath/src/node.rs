@@ -22,8 +22,8 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::dns::{
-    refresh_resolver, serve_dns, DnsTable, LinkResolverGuard, PeerVisibility, ResolvConfForwarder,
-    DNS_PORT,
+    refresh_resolver, serve_dns, DnsTable, ExitNodeForwarder, LinkResolverGuard, PeerVisibility,
+    QueryForwarder, ResolvConfForwarder, DNS_PORT,
 };
 #[cfg(target_os = "macos")]
 use crate::netmap::{ipv4_mask, parse_cidr};
@@ -131,6 +131,16 @@ pub struct NodeRequest {
     pub accept_routes: bool,
     /// Local CIDRs this node forwards onto a connected LAN.
     pub forward_routes: Vec<String>,
+    /// Masquerade overlay traffic that leaves this node.
+    pub forward_exit: bool,
+    /// The selected exit node. `None` means this node does not use one.
+    pub exit_node: Option<String>,
+    /// Keep connected LAN prefixes outside the tunnel.
+    pub allow_lan: bool,
+    /// Coordinator, Relay, and peer underlay addresses.
+    pub underlay: Vec<Ipv4Addr>,
+    /// The orblx Relay socket. `None` means direct UDP only.
+    pub relay: Option<SocketAddr>,
     /// The netmap file. The node reads it again when the file changes.
     pub netmap_path: PathBuf,
     /// [`crate::GrantPeers`] hides peers the signed grants do not let this node reach.
@@ -212,6 +222,7 @@ struct Mesh {
     peers: Arc<Mutex<Vec<PeerView>>>,
     to_tun: mpsc::Sender<Vec<u8>>,
     state_dir: Arc<PathBuf>,
+    relay: Option<SocketAddr>,
     shutdown: watch::Receiver<bool>,
     rekey_tx: watch::Sender<u64>,
     rekey_rx: watch::Receiver<u64>,
@@ -277,12 +288,20 @@ pub fn running_pid(state_dir: &Path) -> Option<u32> {
 
 /// Run the node until the process receives SIGINT or SIGTERM.
 pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
-    let prepared = prepare_node(request)?;
+    let mut prepared = prepare_node(request)?;
     let install = prepared
         .router
         .install_cidrs(prepared.request.accept_routes);
     for cidr in &install {
         println!("The node installs route {cidr}.");
+    }
+    if let Some(name) = prepared.request.exit_node.clone() {
+        if prepared.router.is_exit(&name) {
+            println!("The node installs route 0.0.0.0/0 through the exit node {name}.");
+        } else {
+            println!("The exit node {name} is not approved. The node does not use it.");
+            prepared.request.exit_node = None;
+        }
     }
     let bridge = open_tun(&TunConfig {
         name: tun_device_name(),
@@ -294,6 +313,18 @@ pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
     if !prepared.request.forward_routes.is_empty() {
         crate::subnet::enable_kernel_forward(&prepared.request.forward_routes)?;
     }
+    if prepared.request.forward_exit {
+        crate::subnet::enable_exit_masquerade()?;
+    }
+    let exit_routes = if prepared.request.exit_node.is_some() {
+        Some(crate::exit_route::install_exit_routes(
+            &bridge.name,
+            prepared.request.allow_lan,
+            &prepared.request.underlay,
+        )?)
+    } else {
+        None
+    };
     println!("The overlay IP is {}.", prepared.record.overlay_ip);
     println!(
         "The state directory is {}.",
@@ -306,12 +337,14 @@ pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
         .enable_all()
         .build()
         .map_err(|err| HelloError::Io(err.to_string()))?;
-    runtime.block_on(run_mesh(
+    let result = runtime.block_on(run_mesh(
         prepared,
         bridge.from_tun,
         bridge.to_tun,
         Some(bridge.name),
-    ))
+    ));
+    drop(exit_routes);
+    result
 }
 
 /// Run the node with in-memory packets.
@@ -408,8 +441,18 @@ async fn run_mesh_inner(
     let tun_router = Arc::clone(&router);
     let tun_links = Arc::clone(&links);
     let accept_routes = request.accept_routes;
+    let exit_node = request.exit_node.clone();
+    let relay = request.relay;
     tasks.push(tokio::spawn(async move {
-        read_tun(from_tun, tun_router, tun_links, tun_shutdown, accept_routes).await;
+        read_tun(
+            from_tun,
+            tun_router,
+            tun_links,
+            tun_shutdown,
+            accept_routes,
+            exit_node,
+        )
+        .await;
     }));
 
     let netmap = Arc::new(request.netmap);
@@ -423,6 +466,7 @@ async fn run_mesh_inner(
         peers: Arc::clone(&peers),
         to_tun: to_tun.clone(),
         state_dir: Arc::clone(&state_dir),
+        relay,
         shutdown: shutdown_rx,
         rekey_tx,
         rekey_rx,
@@ -432,16 +476,20 @@ async fn run_mesh_inner(
         accept_loop(accept_mesh).await;
     }));
 
-    for peer in netmap
-        .peers
-        .iter()
-        .filter(|peer| we_dial(&node.name, &peer.name))
-    {
-        let dial_mesh = mesh.clone();
-        let peer = peer.clone();
-        tasks.push(tokio::spawn(async move {
-            dial_peer(dial_mesh, peer).await;
-        }));
+    for peer in netmap.peers.iter() {
+        if we_dial(&node.name, &peer.name) {
+            let dial_mesh = mesh.clone();
+            let peer = peer.clone();
+            tasks.push(tokio::spawn(async move {
+                dial_peer(dial_mesh, peer).await;
+            }));
+        } else if mesh.relay.is_some() {
+            let accept_mesh = mesh.clone();
+            let peer = peer.clone();
+            tasks.push(tokio::spawn(async move {
+                accept_relay(accept_mesh, peer).await;
+            }));
+        }
     }
 
     if let Some(renewer) = request.renew {
@@ -471,6 +519,7 @@ async fn run_mesh_inner(
     let resolver = if let Some(interface) = interface {
         let overlay =
             parse_ipv4(&node.overlay_ip).map_err(|err| HelloError::Node(err.to_string()))?;
+        let exit_dns = exit_dns_target(&netmap, request.exit_node.as_deref());
         let (guard, dns_tasks) = spawn_overlay_dns(
             DnsSpawn {
                 interface,
@@ -480,6 +529,7 @@ async fn run_mesh_inner(
                 node_overlay: node.overlay_ip.clone(),
                 visibility,
                 shutdown: dns_shutdown,
+                exit_dns,
             },
             &netmap,
         )
@@ -616,6 +666,7 @@ async fn read_tun(
     links: Arc<Mutex<HashMap<String, LiveLink>>>,
     mut shutdown: watch::Receiver<bool>,
     accept_routes: bool,
+    exit_node: Option<String>,
 ) {
     loop {
         tokio::select! {
@@ -628,7 +679,7 @@ async fn read_tun(
                 let Some(packet) = packet else {
                     return;
                 };
-                let Some(peer) = route_packet(&router, &packet, accept_routes) else {
+                let Some(peer) = route_packet(&router, &packet, accept_routes, exit_node.as_deref()) else {
                     continue;
                 };
                 let peer = peer.to_string();
@@ -672,7 +723,7 @@ async fn accept_loop(mut mesh: Mesh) {
                         let link = mesh.clone();
                         let (remote_tx, _remote_rx) = watch::channel(0u64);
                         tokio::spawn(async move {
-                            run_link(link, session, peer_name, remote_tx).await;
+                            run_link(link, session, peer_name, remote_tx, None).await;
                         });
                     }
                     Err(HelloError::EndpointClosed) => return,
@@ -692,10 +743,16 @@ async fn dial_peer(mut mesh: Mesh, peer: NetmapPeer) {
         if stopped(&mesh) {
             return;
         }
-        let Some(session) = dial_ready(&mut mesh, &peer).await else {
+        let Some((session, relay_face)) = dial_ready(&mut mesh, &peer).await else {
             return;
         };
-        let mut task = spawn_link(&mesh, session, peer.name.clone(), remote_tx.clone());
+        let mut task = spawn_link(
+            &mesh,
+            session,
+            peer.name.clone(),
+            remote_tx.clone(),
+            relay_face,
+        );
         loop {
             tokio::select! {
                 _ = &mut task => break,
@@ -721,10 +778,11 @@ fn spawn_link(
     session: HelloSession,
     name: String,
     remote_tx: watch::Sender<u64>,
+    relay_face: Option<crate::relay_path::RelayFace>,
 ) -> JoinHandle<()> {
     let mesh = mesh.clone();
     tokio::spawn(async move {
-        run_link(mesh, session, name, remote_tx).await;
+        run_link(mesh, session, name, remote_tx, relay_face).await;
     })
 }
 
@@ -734,10 +792,16 @@ async fn reconnect(
     remote_tx: &watch::Sender<u64>,
     task: &mut JoinHandle<()>,
 ) {
-    let Some(session) = dial_once(mesh, peer).await else {
+    let Some((session, relay_face)) = dial_once(mesh, peer).await else {
         return;
     };
-    let next = spawn_link(mesh, session, peer.name.clone(), remote_tx.clone());
+    let next = spawn_link(
+        mesh,
+        session,
+        peer.name.clone(),
+        remote_tx.clone(),
+        relay_face,
+    );
     let mut old = std::mem::replace(task, next);
     if tokio::time::timeout(Duration::from_secs(2), &mut old)
         .await
@@ -747,7 +811,10 @@ async fn reconnect(
     }
 }
 
-async fn dial_ready(mesh: &mut Mesh, peer: &NetmapPeer) -> Option<HelloSession> {
+async fn dial_ready(
+    mesh: &mut Mesh,
+    peer: &NetmapPeer,
+) -> Option<(HelloSession, Option<crate::relay_path::RelayFace>)> {
     loop {
         if stopped(mesh) {
             return None;
@@ -766,7 +833,10 @@ async fn dial_ready(mesh: &mut Mesh, peer: &NetmapPeer) -> Option<HelloSession> 
     }
 }
 
-async fn dial_once(mesh: &mut Mesh, peer: &NetmapPeer) -> Option<HelloSession> {
+async fn dial_once(
+    mesh: &mut Mesh,
+    peer: &NetmapPeer,
+) -> Option<(HelloSession, Option<crate::relay_path::RelayFace>)> {
     for endpoint_text in &peer.endpoints {
         if stopped(mesh) {
             return None;
@@ -782,33 +852,135 @@ async fn dial_once(mesh: &mut Mesh, peer: &NetmapPeer) -> Option<HelloSession> {
             }
         };
         let connect = mesh.endpoint.connect_one(addr);
-        tokio::select! {
+        let result = tokio::select! {
             changed = mesh.shutdown.changed() => {
                 if changed.is_err() || *mesh.shutdown.borrow() {
                     return None;
                 }
+                continue;
             }
-            result = connect => {
+            result = tokio::time::timeout(Duration::from_secs(3), connect) => result,
+        };
+        match result {
+            Ok(Ok(session)) => {
+                if session.peer_id().as_uri() != peer.svid {
+                    eprintln!(
+                        "The peer {} presented {}.",
+                        peer.name,
+                        session.peer_id().as_uri()
+                    );
+                    continue;
+                }
+                return Some((session, None));
+            }
+            Ok(Err(err)) => {
+                eprintln!("The dial to {} at {addr} failed. {err}", peer.name);
+            }
+            Err(_) => {
+                eprintln!(
+                    "The dial to {} at {addr} failed. The attempt timed out.",
+                    peer.name
+                );
+            }
+        }
+    }
+    if let Some(relay) = mesh.relay {
+        return dial_relay(mesh, peer, relay)
+            .await
+            .map(|(session, face)| (session, Some(face)));
+    }
+    None
+}
+
+async fn dial_relay(
+    mesh: &Mesh,
+    peer: &NetmapPeer,
+    relay: SocketAddr,
+) -> Option<(HelloSession, crate::relay_path::RelayFace)> {
+    let config = lock(&mesh.identity).clone();
+    let session_id = crate::relay_path::relay_session_id(&mesh.node.name, &peer.name);
+    let opened = tokio::task::spawn_blocking(move || {
+        crate::relay_path::open_relay(config, relay, session_id, false)
+    })
+    .await
+    .ok()?;
+    let face = match opened {
+        Ok(face) => face,
+        Err(err) => {
+            eprintln!("The Relay path to {} failed. {err}", peer.name);
+            return None;
+        }
+    };
+    match face.endpoint.connect_one(face.face_addr).await {
+        Ok(session) => {
+            if session.peer_id().as_uri() != peer.svid {
+                eprintln!(
+                    "The peer {} presented {}.",
+                    peer.name,
+                    session.peer_id().as_uri()
+                );
+                return None;
+            }
+            Some((session, face))
+        }
+        Err(err) => {
+            eprintln!("The Relay path to {} failed. {err}", peer.name);
+            None
+        }
+    }
+}
+
+async fn accept_relay(mut mesh: Mesh, peer: NetmapPeer) {
+    let Some(relay) = mesh.relay else {
+        return;
+    };
+    let (remote_tx, _remote_rx) = watch::channel(0u64);
+    loop {
+        if stopped(&mesh) {
+            return;
+        }
+        let config = lock(&mesh.identity).clone();
+        let session_id = crate::relay_path::relay_session_id(&mesh.node.name, &peer.name);
+        let opened = tokio::task::spawn_blocking(move || {
+            crate::relay_path::open_relay(config, relay, session_id, true)
+        })
+        .await;
+        let face = match opened {
+            Ok(Ok(face)) => face,
+            Ok(Err(err)) => {
+                eprintln!("The Relay path to {} failed. {err}", peer.name);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            Err(_) => return,
+        };
+        let accepted = face.endpoint.accept_one();
+        tokio::select! {
+            changed = mesh.shutdown.changed() => {
+                if changed.is_err() || *mesh.shutdown.borrow() {
+                    return;
+                }
+            }
+            result = accepted => {
                 match result {
+                    Ok(session) if session.peer_id().as_uri() == peer.svid => {
+                        run_link(mesh.clone(), session, peer.name.clone(), remote_tx.clone(), Some(face)).await;
+                    }
                     Ok(session) => {
-                        if session.peer_id().as_uri() != peer.svid {
-                            eprintln!(
-                                "The peer {} presented {}.",
-                                peer.name,
-                                session.peer_id().as_uri()
-                            );
-                            continue;
-                        }
-                        return Some(session);
+                        eprintln!(
+                            "The peer {} presented {}.",
+                            peer.name,
+                            session.peer_id().as_uri()
+                        );
                     }
                     Err(err) => {
-                        eprintln!("The dial to {} at {addr} failed. {err}", peer.name);
+                        eprintln!("The Relay path to {} failed. {err}", peer.name);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
             }
         }
     }
-    None
 }
 
 fn stopped(mesh: &Mesh) -> bool {
@@ -828,7 +1000,15 @@ async fn run_link(
     session: HelloSession,
     name: String,
     remote_rekey: watch::Sender<u64>,
+    relay_face: Option<crate::relay_path::RelayFace>,
 ) {
+    if let Some(face) = &relay_face {
+        let kind = match face.transport {
+            orblx_relay::RelayTransport::Tcp => "TCP",
+            orblx_relay::RelayTransport::Udp => "UDP",
+        };
+        println!("The path to {name} uses the {kind} Relay.");
+    }
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let (ask_tx, ask_rx) = watch::channel(0u64);
     let (tx, rx) = mpsc::channel(32);
@@ -1330,6 +1510,12 @@ fn run_ip(args: &[&str]) -> Result<(), HelloError> {
     )))
 }
 
+#[derive(Clone)]
+struct ExitDns {
+    address: Ipv4Addr,
+    name: String,
+}
+
 struct DnsSpawn {
     interface: String,
     overlay: Ipv4Addr,
@@ -1338,6 +1524,20 @@ struct DnsSpawn {
     node_overlay: String,
     visibility: Arc<dyn PeerVisibility>,
     shutdown: watch::Receiver<bool>,
+    exit_dns: Option<ExitDns>,
+}
+
+fn exit_dns_target(netmap: &Netmap, exit_node: Option<&str>) -> Option<ExitDns> {
+    let name = exit_node?;
+    let peer = netmap
+        .peers
+        .iter()
+        .find(|peer| peer.name == name && peer.exit_node)?;
+    let address = parse_ipv4(&peer.overlay_ip).ok()?;
+    Some(ExitDns {
+        address,
+        name: name.to_string(),
+    })
 }
 
 async fn spawn_overlay_dns(
@@ -1355,24 +1555,32 @@ async fn spawn_overlay_dns(
         }
     };
     println!("The DNS responder listens on {bind_at}.");
+    let capture_all = dns.exit_dns.is_some();
     refresh_resolver(
         &dns.interface,
         dns.overlay,
         &table,
         dns.visibility.as_ref(),
         &guard.armed_flag(),
+        capture_all,
     );
     let (table_tx, table_rx) = watch::channel(table);
     let mut tasks = Vec::new();
     let serve_visibility = Arc::clone(&dns.visibility);
     let serve_shutdown = dns.shutdown.clone();
     let overlay = dns.overlay;
+    let forwarder: Arc<dyn QueryForwarder> = if let Some(exit) = dns.exit_dns.clone() {
+        Arc::new(ExitNodeForwarder::new(exit.address, exit.name, overlay))
+    } else {
+        Arc::new(ResolvConfForwarder::new(overlay))
+    };
     tasks.push(tokio::spawn(async move {
         serve_dns(
             socket,
             table_rx,
             serve_visibility,
-            Arc::new(ResolvConfForwarder::new(overlay)),
+            forwarder,
+            overlay,
             serve_shutdown,
         )
         .await;
@@ -1389,6 +1597,7 @@ async fn spawn_overlay_dns(
             armed,
             tables: table_tx,
             shutdown: dns.shutdown,
+            capture_all,
         })
         .await;
     }));
@@ -1405,6 +1614,7 @@ struct DnsWatch {
     armed: Arc<AtomicBool>,
     tables: watch::Sender<DnsTable>,
     shutdown: watch::Receiver<bool>,
+    capture_all: bool,
 }
 
 async fn watch_netmap_dns(mut watch_state: DnsWatch) {
@@ -1429,6 +1639,7 @@ async fn watch_netmap_dns(mut watch_state: DnsWatch) {
                         &table,
                         watch_state.visibility.as_ref(),
                         &watch_state.armed,
+                        watch_state.capture_all,
                     );
                     println!("The DNS answers follow the new grants.");
                 }
@@ -1452,6 +1663,7 @@ fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut 
                     &table,
                     watch_state.visibility.as_ref(),
                     &watch_state.armed,
+                    watch_state.capture_all,
                 );
                 let _ = watch_state.tables.send(table);
                 println!("The DNS answers follow the new netmap.");

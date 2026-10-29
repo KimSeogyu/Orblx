@@ -19,6 +19,8 @@ pub struct Request {
     pub endpoints: Vec<String>,
     #[serde(default)]
     pub routes: Vec<String>,
+    #[serde(default)]
+    pub exit_node: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -44,6 +46,8 @@ pub struct Response {
     pub approved_routes: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advertised_routes: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_approved: Option<bool>,
 }
 
 impl std::fmt::Debug for Response {
