@@ -246,6 +246,27 @@ impl IssueGate {
         Ok(AgentSvid { parent, svid })
     }
 
+    /// Return the human owner subject for one node enrollment.
+    ///
+    /// A mock gate checks a mock ID token.
+    /// A Google gate checks a Google ID token.
+    /// `nonce` is required for a Google gate.
+    /// The function does not issue an SVID.
+    pub fn owner_subject(
+        &self,
+        id_token: &str,
+        nonce: Option<&str>,
+        now: SystemTime,
+    ) -> Result<String, IdentityError> {
+        match &self.idp {
+            IdpKey::Mock { .. } => Ok(self.verify_token(id_token, now)?.sub),
+            IdpKey::Google { client_id, jwks } => {
+                let nonce = nonce.ok_or(IdentityError::Token)?;
+                Ok(jwks.verify(id_token, client_id, nonce, now)?.subject)
+            }
+        }
+    }
+
     fn mint_human(
         &self,
         subject: &str,

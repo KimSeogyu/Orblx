@@ -689,6 +689,23 @@ dependencies = [
 [[package]]
 name = "gyeol-coord"
 version = "0.1.0"
+dependencies = [
+ "base64",
+ "ed25519-dalek",
+ "gyeol-datapath",
+ "gyeol-edge",
+ "gyeol-identity",
+ "quinn",
+ "rand 0.8.8",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots 0.26.11",
+]
 
 [[package]]
 name = "gyeol-crypto"

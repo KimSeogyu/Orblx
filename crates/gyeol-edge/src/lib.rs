@@ -4,6 +4,7 @@
 //! The client reads a Binding success response.
 //! Allocate stores the reflexive address.
 //! The candidate set is unsigned.
+//! `endpoint_sign_payload` is the byte string the coordinator signs.
 //! ADR 0003 does not name the owner of the Coordinator blob.
 //! Direct sends hole-punch datagrams.
 //! Direct then proves QUIC on the same UDP socket.
@@ -31,8 +32,8 @@ mod stick;
 mod stun;
 
 pub use candidate::{
-    decode_candidate, encode_candidate, CandidateSink, EndpointCandidate, MemoryCandidateSink,
-    UnsignedCandidateSet,
+    decode_candidate, encode_candidate, endpoint_sign_payload, CandidateSink, EndpointCandidate,
+    MemoryCandidateSink, UnsignedCandidateSet,
 };
 pub use direct::{
     issue_direct_pair, DirectIdentity, DirectMaterial, DirectProof, DirectRequest, DirectRole,

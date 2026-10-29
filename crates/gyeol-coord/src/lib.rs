@@ -1,15 +1,237 @@
+//! Node enrollment, stable overlay addresses, and signed netmaps.
+//!
+//! A node enrolls one time.
+//! The node receives `spiffe://gyeol.local/node/{name}`.
+//! The node receives one address from `100.64.0.0/10`.
+//! The coordinator signs each netmap and each endpoint with Ed25519.
+//! The listener uses QUIC on UDP 443 with the SVID `spiffe://gyeol.local/coord/{name}`.
+//! Enrollment uses server authentication because the node SVID does not exist yet.
+//! A later netmap fetch uses the node SVID as the client certificate.
+
+mod client;
+mod error;
+mod files;
+mod http_util;
+mod ippool;
+mod netmap;
+mod proto;
+mod server;
+mod state;
+mod store;
+mod tlsutil;
+
+pub use client::{
+    enroll_with_oidc_blocking, enroll_with_token_blocking, fetch_netmap_blocking, netmap_json,
+    OidcEnroll,
+};
+pub use error::CoordError;
+pub use http_util::{fetch_google_jwks_blocking, post_google_token_blocking};
+pub use netmap::{verify_signed_endpoint, verify_signed_netmap, SignedEndpoint, SignedNetmap};
+pub use server::serve_blocking;
+pub use state::{
+    oidc_config, read_node_material, Coordinator, EnrollResult, NetmapView, OidcConfig,
+};
+pub use store::CreatedToken;
+
 /// This function returns the name of this crate.
-/// This crate does not contain coordination functions.
 pub fn crate_name() -> &'static str {
     "gyeol-coord"
 }
 
 #[cfg(test)]
 mod tests {
-    use super::crate_name;
+    use std::fs;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
+
+    use gyeol_identity::{IssueGate, MiniCa, MockOidc, OidcMode, MOCK_OIDC_ISSUER, OIDC_MODE_ENV};
+
+    use super::{crate_name, verify_signed_netmap, Coordinator, OidcConfig};
 
     #[test]
     fn crate_name_is_stable() {
         assert_eq!(crate_name(), "gyeol-coord");
+    }
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let mut raw = [0u8; 8];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut raw);
+            let path = std::env::temp_dir().join(format!("gyeol-coord-{}", hex(&raw)));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut text = String::new();
+        for byte in bytes {
+            text.push(HEX[usize::from(byte >> 4)] as char);
+            text.push(HEX[usize::from(byte & 0x0f)] as char);
+        }
+        text
+    }
+
+    #[test]
+    fn token_reuse_is_rejected_and_ips_survive_reopen() {
+        let scratch = Scratch::new();
+        let now = SystemTime::now();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+        let first = coord
+            .enroll_token(
+                "server-a",
+                &token.secret,
+                &["server-a:443".to_string()],
+                &["192.168.1.0/24".to_string()],
+                now,
+            )
+            .unwrap();
+        assert_eq!(first.overlay_ip, "100.64.0.1");
+        assert_eq!(first.svid, "spiffe://gyeol.local/node/server-a");
+        let reused = coord.enroll_token("server-c", &token.secret, &[], &[], now);
+        assert!(matches!(reused.unwrap_err(), super::CoordError::TokenUsed));
+        let expired = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+        let later = now.checked_add(Duration::from_secs(60)).unwrap();
+        let stale = coord.enroll_token("server-d", &expired.secret, &[], &[], later);
+        assert!(matches!(
+            stale.unwrap_err(),
+            super::CoordError::TokenExpired
+        ));
+        let store_text = fs::read_to_string(scratch.0.join("nodes.json")).unwrap();
+        assert!(!store_text.contains("PRIVATE KEY"));
+        assert!(!store_text.contains("ge1."));
+        drop(coord);
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let view = coord.netmap_for("server-a").unwrap();
+        assert_eq!(view.signed_netmap.netmap.self_node.overlay_ip, "100.64.0.1");
+        verify_signed_netmap(&view.signed_netmap, &view.netmap_public).unwrap();
+        let second = coord
+            .create_token_at(Duration::from_secs(120), later)
+            .unwrap();
+        let other = coord
+            .enroll_token(
+                "server-b",
+                &second.secret,
+                &["server-b:443".to_string()],
+                &[],
+                later,
+            )
+            .unwrap();
+        assert_eq!(other.overlay_ip, "100.64.0.2");
+    }
+
+    #[test]
+    fn mock_oidc_mode_enrolls_a_node() {
+        assert_eq!(OIDC_MODE_ENV, "ORBLX_OIDC_MODE");
+        assert_eq!(OidcMode::parse(Some("mock")).unwrap(), OidcMode::Mock);
+        let scratch = Scratch::new();
+        let now = SystemTime::now();
+        let oidc = MockOidc::generate(MOCK_OIDC_ISSUER).unwrap();
+        let gate = IssueGate::new(MiniCa::generate(now).unwrap(), &oidc).unwrap();
+        let coord =
+            Coordinator::open(&scratch.0, "coord", OidcConfig::Mock(Box::new(gate))).unwrap();
+        let id_token = oidc
+            .issue_id_token("alice", now, Duration::from_secs(600))
+            .unwrap();
+        let result = coord
+            .enroll_oidc(
+                "laptop",
+                &id_token,
+                None,
+                &["laptop:443".to_string()],
+                &[],
+                now,
+            )
+            .unwrap();
+        assert_eq!(result.svid, "spiffe://gyeol.local/node/laptop");
+        assert_eq!(result.overlay_ip, "100.64.0.1");
+        assert!(result
+            .endpoints
+            .iter()
+            .any(|item| item.endpoint == "laptop:443"));
+        let again = coord.enroll_oidc("laptop", &id_token, None, &[], &[], now);
+        assert!(matches!(again.unwrap_err(), super::CoordError::Exists));
+    }
+
+    #[tokio::test]
+    async fn two_nodes_keep_ips_after_restart() {
+        let scratch = Scratch::new();
+        let node_a = Scratch::new();
+        let node_b = Scratch::new();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let token_a = coord.create_token(Duration::from_secs(600)).unwrap();
+        let token_b = coord.create_token(Duration::from_secs(600)).unwrap();
+        let (addr, handle) =
+            super::server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .unwrap();
+        let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+        let first = super::client::enroll_with_token(
+            addr,
+            "coord",
+            &bundle,
+            "server-a",
+            &token_a.secret,
+            &["server-a:443".to_string()],
+            &[],
+        )
+        .await
+        .unwrap();
+        first.write_state(&node_a.0).unwrap();
+        let second = super::client::enroll_with_token(
+            addr,
+            "coord",
+            &bundle,
+            "server-b",
+            &token_b.secret,
+            &["server-b:443".to_string()],
+            &[],
+        )
+        .await
+        .unwrap();
+        second.write_state(&node_b.0).unwrap();
+        assert_eq!(first.overlay_ip, "100.64.0.1");
+        assert_eq!(second.overlay_ip, "100.64.0.2");
+        handle.abort();
+        drop(coord);
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let (addr, handle) =
+            super::server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .unwrap();
+        let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+        let view = super::client::fetch_netmap(addr, "coord", &bundle, &node_a.0)
+            .await
+            .unwrap();
+        assert_eq!(view.signed_netmap.netmap.self_node.overlay_ip, "100.64.0.1");
+        assert_eq!(view.signed_netmap.netmap.peers[0].name, "server-b");
+        assert_eq!(view.signed_netmap.netmap.peers[0].overlay_ip, "100.64.0.2");
+        let node_text = fs::read_to_string(node_a.0.join("netmap.json")).unwrap();
+        let parsed = gyeol_datapath::Netmap::from_slice(node_text.as_bytes()).unwrap();
+        assert_eq!(parsed, view.signed_netmap.netmap);
+        assert!(!node_text.contains("\"sig\""));
+        let reused = super::client::enroll_with_token(
+            addr,
+            "coord",
+            &bundle,
+            "server-c",
+            &token_a.secret,
+            &[],
+            &[],
+        )
+        .await;
+        assert!(reused.unwrap_err().to_string().contains("already used"));
+        handle.abort();
     }
 }

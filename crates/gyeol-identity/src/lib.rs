@@ -13,6 +13,8 @@
 //! An agent capability ticket is separate from the SVID.
 //! The agent ticket allows one destination.
 //! Every other agent destination is denied.
+//! Node enrollment calls `IssueGate::owner_subject`.
+//! That call does not issue the node SVID.
 //!
 //! `decode_certificate_pem_file` reads one certificate PEM file.
 //! `TrustBundle::from_pem_file` reads a trust bundle PEM file.
@@ -39,7 +41,7 @@ pub use clock::{MAX_AGENT_TTL, MAX_SKEW, MAX_USER_TTL};
 pub use deny::{DenyApply, DenySet};
 pub use error::IdentityError;
 pub use google::{
-    GoogleClient, GoogleIdClaims, GoogleJwks, GoogleTokenRequest, OidcMode,
+    google_client_id_ok, GoogleClient, GoogleIdClaims, GoogleJwks, GoogleTokenRequest, OidcMode,
     GOOGLE_AUTHORIZE_ENDPOINT, GOOGLE_CLIENT_ID_ENV, GOOGLE_CLIENT_SECRET_ENV, GOOGLE_ISSUER,
     GOOGLE_JWKS_URL, GOOGLE_REDIRECT_LOCALHOST, GOOGLE_REDIRECT_LOOPBACK, GOOGLE_TOKEN_ENDPOINT,
     OIDC_MODE_ENV,

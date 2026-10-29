@@ -65,6 +65,22 @@ pub fn encode_candidate(candidate: EndpointCandidate) -> String {
     )
 }
 
+/// The bytes the coordinator signs for one endpoint.
+///
+/// The text is `gyeol-endpoint-v1`, the node name, and `host:port`.
+/// A newline in either value is rejected.
+/// This function does not sign the bytes.
+pub fn endpoint_sign_payload(node_name: &str, endpoint: &str) -> Result<String, EdgeError> {
+    if node_name.is_empty()
+        || endpoint.is_empty()
+        || node_name.contains(['\n', '\r'])
+        || endpoint.contains(['\n', '\r'])
+    {
+        return Err(EdgeError::BadCandidate);
+    }
+    Ok(format!("gyeol-endpoint-v1\n{node_name}\n{endpoint}\n"))
+}
+
 /// Decode one unsigned candidate from text.
 ///
 /// The function does not verify a signature.
@@ -99,7 +115,7 @@ pub fn decode_candidate(text: &str) -> Result<EndpointCandidate, EdgeError> {
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
-    use super::{decode_candidate, encode_candidate, EndpointCandidate};
+    use super::{decode_candidate, encode_candidate, endpoint_sign_payload, EndpointCandidate};
 
     #[test]
     fn candidate_text_round_trip_has_no_signature() {
@@ -112,6 +128,16 @@ mod tests {
         assert_eq!(decode_candidate(&text).unwrap(), candidate);
         assert_eq!(
             decode_candidate("local 127.0.0.1:1\n"),
+            Err(crate::EdgeError::BadCandidate)
+        );
+    }
+
+    #[test]
+    fn endpoint_sign_payload_rejects_a_newline() {
+        let text = endpoint_sign_payload("server", "10.0.0.2:443").unwrap();
+        assert_eq!(text, "gyeol-endpoint-v1\nserver\n10.0.0.2:443\n");
+        assert_eq!(
+            endpoint_sign_payload("bad\nname", "10.0.0.2:443"),
             Err(crate::EdgeError::BadCandidate)
         );
     }
