@@ -171,7 +171,11 @@ fn default_udp_port_is_443() {
 
 #[test]
 fn tun_note_names_the_capability() {
-    assert!(tun_capability_note().contains("CAP_NET_ADMIN"));
+    let note = tun_capability_note();
+    #[cfg(target_os = "macos")]
+    assert!(note.contains("root"));
+    #[cfg(not(target_os = "macos"))]
+    assert!(note.contains("CAP_NET_ADMIN"));
 }
 
 #[test]

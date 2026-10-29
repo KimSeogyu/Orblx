@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>dev.gyeol</string>
+	<key>Comment</key>
+	<string>Orblx node. W18-1 provides the gyeol up command. The process needs root so it can open utun.</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/gyeol</string>
+		<string>up</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/var/lib/gyeol</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>UserName</key>
+	<string>root</string>
+	<key>GroupName</key>
+	<string>wheel</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>/var/log/gyeol.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/gyeol.err</string>
+</dict>
+</plist>

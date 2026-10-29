@@ -1,4 +1,5 @@
 use std::net::Ipv4Addr;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -8,10 +9,17 @@ use crate::HelloError;
 /// The default UDP port for hello-quic.
 pub const DEFAULT_UDP_PORT: u16 = 443;
 
-/// The operator note for the TUN capability.
+/// The operator note for the TUN privilege.
 #[must_use]
 pub fn tun_capability_note() -> &'static str {
-    "The TUN device needs CAP_NET_ADMIN on Linux. The command opens the device when you set --tun-address."
+    #[cfg(target_os = "macos")]
+    {
+        "The utun device needs root on macOS. The command opens the device when you set --tun-address."
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "The TUN device needs CAP_NET_ADMIN on Linux. The command opens the device when you set --tun-address."
+    }
 }
 
 /// The address of one userspace TUN device.
@@ -33,21 +41,26 @@ pub struct TunBridge {
     pub to_tun: mpsc::Sender<Vec<u8>>,
 }
 
-/// Open a Linux TUN device and start the packet thread.
+/// Open a TUN device and start the packet thread.
 ///
-/// The process needs CAP_NET_ADMIN.
-/// The device does not add a packet-information header.
+/// On Linux the process needs CAP_NET_ADMIN.
+/// On macOS the process needs root. The device is a utun interface.
 /// The bytes are the IPv4 packet.
+/// The macOS utun header stays inside `tun_macos`.
 pub fn open_tun(config: &TunConfig) -> Result<TunBridge, HelloError> {
     #[cfg(target_os = "linux")]
     {
         linux::open(config)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        crate::tun_macos::open(config)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = config;
         Err(HelloError::Tun(format!(
-            "{}. This host is not Linux.",
+            "{}. This host is not Linux or macOS.",
             tun_capability_note()
         )))
     }

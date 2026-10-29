@@ -9,6 +9,7 @@ mod quic;
 mod run;
 mod tun_bench;
 mod tun_dev;
+mod tun_macos;
 
 pub use connector::{
     issue_connector_lab, prove_lab_directory, prove_two_https_apps, run_hub_dir, run_spoke_dir,

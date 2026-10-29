@@ -6,6 +6,8 @@
 //! The bench writes the packet back to the TUN device.
 //! The bench does not use WireGuard, Headscale, or DERP.
 
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
@@ -173,7 +175,7 @@ pub fn run_local_tun_bench() -> Result<TunBenchOutcome, String> {
     #[cfg(not(target_os = "linux"))]
     {
         Ok(TunBenchOutcome::Skipped(
-            "K3: This host is not Linux. The TUN device in this tree is a Linux TUN device."
+            "K3: This host is not Linux. The local TUN bench measures a Linux TUN device."
                 .to_string(),
         ))
     }
