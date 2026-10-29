@@ -6,21 +6,21 @@
 set -u
 
 if [ -x /usr/lib/systemd/systemd-resolved ]; then
+  # A container restart keeps /run. A stale socket makes resolvectl fail.
+  rm -rf /run/dbus /run/systemd/resolve
   mkdir -p /run/systemd /run/dbus || true
-  rm -rf /run/systemd/resolve
-  if [ ! -S /run/dbus/system_bus_socket ]; then
-    dbus-daemon --system --fork || true
-  fi
-  if [ ! -S /run/systemd/resolve/io.systemd.Resolve ]; then
-    /usr/lib/systemd/systemd-resolved >/tmp/systemd-resolved.log 2>&1 &
-  fi
+  dbus-daemon --system --fork || true
+  /usr/lib/systemd/systemd-resolved >/tmp/systemd-resolved.log 2>&1 &
   i=0
-  while [ "$i" -lt 30 ]; do
+  while [ "$i" -lt 50 ]; do
     if resolvectl status >/dev/null 2>&1; then
       break
     fi
+    if [ ! -S /run/dbus/system_bus_socket ]; then
+      dbus-daemon --system --fork || true
+    fi
     i=$((i + 1))
-    sleep 0.1
+    sleep 0.2
   done
 fi
 

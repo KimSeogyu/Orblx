@@ -132,6 +132,7 @@ pub struct EnrollResult {
     pub endpoints: Vec<SignedEndpoint>,
     pub approved_routes: Vec<String>,
     pub advertised_routes: Vec<String>,
+    pub exit_approved: bool,
     pub ticket: Option<IssuedTicket>,
 }
 
@@ -159,6 +160,8 @@ pub struct NetmapView {
     pub approved_routes: Vec<String>,
     /// Every CIDR this node advertised, including held routes.
     pub advertised_routes: Vec<String>,
+    /// True when this node is an approved exit node.
+    pub exit_approved: bool,
 }
 
 /// Files a node keeps after enrollment.
@@ -359,6 +362,22 @@ impl Coordinator {
             if !view.approved_routes.iter().any(|item| item == route) {
                 println!("held route {route}");
             }
+        }
+        Ok(view)
+    }
+
+    /// Store the exit-node offer and return a fresh signed netmap.
+    ///
+    /// The signed netmap sets `exit_node` only when [`Policy::approves_exit_node`] allows it.
+    pub fn advertise_exit(&self, name: &str, enabled: bool) -> Result<NetmapView, CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        inner.store.set_exit_node(name, enabled)?;
+        let view = sign_view(&inner, name)?;
+        if view.exit_approved {
+            println!("approved exit node {name}");
+        } else if enabled {
+            println!("held exit node {name}");
         }
         Ok(view)
     }
@@ -577,6 +596,7 @@ fn finish_enroll(
         endpoints: view.endpoints,
         approved_routes: view.approved_routes,
         advertised_routes: view.advertised_routes,
+        exit_approved: view.exit_approved,
         ticket: Some(ticket),
     })
 }
@@ -623,6 +643,7 @@ fn issue_leaf(inner: &mut Inner, name: &str, now: SystemTime) -> Result<EnrollRe
         endpoints: view.endpoints,
         approved_routes: view.approved_routes,
         advertised_routes: view.advertised_routes,
+        exit_approved: view.exit_approved,
         ticket: Some(ticket),
     })
 }
@@ -655,6 +676,7 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
                 svid: node.svid.clone(),
                 endpoints: node.endpoints.clone(),
                 routes: published_routes(&inner.policy, &node.svid, &node.routes),
+                exit_node: published_exit(&inner.policy, &node.svid, node.exit_node),
                 owner: String::new(),
             });
         }
@@ -679,6 +701,7 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
         verify_signed_endpoint(endpoint, &netmap_public)?;
     }
     let approved_routes = published_routes(&inner.policy, &self_node.svid, &self_node.routes);
+    let exit_approved = published_exit(&inner.policy, &self_node.svid, self_node.exit_node);
     Ok(NetmapView {
         signed_netmap,
         signed_grants,
@@ -686,7 +709,18 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
         netmap_public,
         approved_routes,
         advertised_routes: self_node.routes.clone(),
+        exit_approved,
     })
+}
+
+fn published_exit(policy: &Policy, svid: &str, offered: bool) -> bool {
+    if !offered {
+        return false;
+    }
+    let Ok(id) = SpiffeId::parse(svid) else {
+        return false;
+    };
+    policy.approves_exit_node(&id)
 }
 
 fn filtered_grants(

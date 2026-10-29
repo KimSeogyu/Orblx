@@ -326,7 +326,13 @@ fn node_request(
         stop: Some(stop),
         accept_routes: false,
         forward_routes: Vec::new(),
+        forward_exit: false,
+        exit_node: None,
+        allow_lan: false,
+        underlay: Vec::new(),
+        relay: None,
         visibility: Arc::new(AllowPeers),
+        on_ready: None,
         metrics: None,
     }
 }

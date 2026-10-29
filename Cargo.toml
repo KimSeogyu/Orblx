@@ -10,6 +10,7 @@ members = [
     "crates/orblx-identity",
     "crates/orblx-relay",
     "crates/orblx-sim",
+    "crates/orblx-ssh",
 ]
 
 # The data path uses Quinn, rustls, and ring.
