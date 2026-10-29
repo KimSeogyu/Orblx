@@ -1,6 +1,6 @@
 use std::io::Cursor;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use orblx_crypto::TicketRing;
@@ -14,7 +14,9 @@ use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use tokio::sync::mpsc;
 
 use crate::framing::expect_seq;
-use crate::{encode_length_prefixed, is_ipv4_packet, Frame, FrameType, HelloError, PeerGate};
+use crate::{
+    encode_length_prefixed, is_ipv4_packet, Frame, FrameType, HelloError, PeerGate, FLAG_REKEY_REQ,
+};
 
 const ALPN: &[u8] = b"orblx-hello";
 const SERVER_NAME: &str = "orblx.local";
@@ -80,6 +82,11 @@ struct Auth {
 pub struct HelloEndpoint {
     endpoint: quinn::Endpoint,
     auth: Arc<Auth>,
+    /// The leaf used for the next outbound handshake.
+    ///
+    /// Quinn stores this value on the endpoint object.
+    /// A shared endpoint cannot replace it through `&self`.
+    client_config: Mutex<Option<quinn::ClientConfig>>,
 }
 
 impl HelloEndpoint {
@@ -93,10 +100,7 @@ impl HelloEndpoint {
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic));
         server.transport_config(transport_config());
         let endpoint = quinn::Endpoint::server(server, listen).map_err(io_error)?;
-        Ok(Self {
-            endpoint,
-            auth: Arc::new(auth),
-        })
+        Ok(Self::assemble(endpoint, auth, None))
     }
 
     /// Bind a client socket.
@@ -109,11 +113,8 @@ impl HelloEndpoint {
         let mut client = quinn::ClientConfig::new(Arc::new(quic));
         client.transport_config(transport_config());
         let mut endpoint = quinn::Endpoint::client(bind).map_err(io_error)?;
-        endpoint.set_default_client_config(client);
-        Ok(Self {
-            endpoint,
-            auth: Arc::new(auth),
-        })
+        endpoint.set_default_client_config(client.clone());
+        Ok(Self::assemble(endpoint, auth, Some(client)))
     }
 
     /// Bind one UDP socket that accepts peers and dials peers.
@@ -132,11 +133,42 @@ impl HelloEndpoint {
             .map_err(|err| HelloError::Tls(err.to_string()))?;
         let mut client = quinn::ClientConfig::new(Arc::new(quic_client));
         client.transport_config(transport_config());
-        endpoint.set_default_client_config(client);
-        Ok(Self {
+        endpoint.set_default_client_config(client.clone());
+        Ok(Self::assemble(endpoint, auth, Some(client)))
+    }
+
+    /// Install a new leaf for later handshakes.
+    ///
+    /// Open sessions keep the previous leaf until the node reconnects.
+    pub fn install_identity(&self, config: &HelloConfig) -> Result<(), HelloError> {
+        let (server_config, _) = server_rustls(config)?;
+        let (client_config, _) = client_rustls(config)?;
+        let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(server_config)
+            .map_err(|err| HelloError::Tls(err.to_string()))?;
+        let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+        server.transport_config(transport_config());
+        self.endpoint.set_server_config(Some(server));
+        let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client_config)
+            .map_err(|err| HelloError::Tls(err.to_string()))?;
+        let mut client = quinn::ClientConfig::new(Arc::new(quic_client));
+        client.transport_config(transport_config());
+        *self
+            .client_config
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(client);
+        Ok(())
+    }
+
+    fn assemble(
+        endpoint: quinn::Endpoint,
+        auth: Auth,
+        client: Option<quinn::ClientConfig>,
+    ) -> Self {
+        Self {
             endpoint,
             auth: Arc::new(auth),
-        })
+            client_config: Mutex::new(client),
+        }
     }
 
     /// Return the local UDP address.
@@ -180,7 +212,7 @@ impl HelloEndpoint {
         socket.set_nonblocking(true).map_err(io_error)?;
         let runtime = quinn::default_runtime()
             .ok_or_else(|| HelloError::Quic("The call is outside a Tokio runtime.".to_string()))?;
-        let (endpoint, auth) = match role {
+        let (endpoint, auth, client) = match role {
             HelloSocketRole::Server => {
                 let (rustls_config, auth) = server_rustls(&config)?;
                 let quic = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
@@ -194,7 +226,7 @@ impl HelloEndpoint {
                     runtime,
                 )
                 .map_err(io_error)?;
-                (endpoint, auth)
+                (endpoint, auth, None)
             }
             HelloSocketRole::Client { .. } => {
                 let (rustls_config, auth) = client_rustls(&config)?;
@@ -205,21 +237,24 @@ impl HelloEndpoint {
                 let mut endpoint =
                     quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
                         .map_err(io_error)?;
-                endpoint.set_default_client_config(client);
-                (endpoint, auth)
+                endpoint.set_default_client_config(client.clone());
+                (endpoint, auth, Some(client))
             }
         };
-        Ok(Self {
-            endpoint,
-            auth: Arc::new(auth),
-        })
+        Ok(Self::assemble(endpoint, auth, client))
     }
 
     /// Connect to `peer` and open one bidirectional stream.
     pub async fn connect_one(&self, peer: SocketAddr) -> Result<HelloSession, HelloError> {
+        let config = self
+            .client_config
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+            .ok_or_else(|| HelloError::Quic("The endpoint has no client identity.".to_string()))?;
         let connecting = self
             .endpoint
-            .connect(peer, SERVER_NAME)
+            .connect_with(config, peer, SERVER_NAME)
             .map_err(|err| HelloError::Quic(err.to_string()))?;
         let connection = connecting
             .await
@@ -388,6 +423,37 @@ impl HelloSender {
         self.next_seq = self.next_seq.checked_add(1).ok_or(HelloError::BadSeq)?;
         Ok(())
     }
+
+    /// Send one CTRL frame.
+    ///
+    /// `flags` may include [`FLAG_REKEY_REQ`].
+    pub(crate) async fn send_ctrl(&mut self, flags: u8) -> Result<(), HelloError> {
+        let frame = Frame {
+            frame_type: FrameType::Ctrl,
+            flags,
+            session_id: self.session_id,
+            seq: self.next_seq,
+            ticket_hash: self.ticket_hash,
+            payload: Vec::new(),
+        };
+        let bytes = encode_length_prefixed(&frame)?;
+        self.send
+            .write_all(&bytes)
+            .await
+            .map_err(|err| HelloError::Quic(err.to_string()))?;
+        self.next_seq = self.next_seq.checked_add(1).ok_or(HelloError::BadSeq)?;
+        Ok(())
+    }
+}
+
+/// One frame from an open session.
+pub(crate) enum SessionEvent {
+    /// An IPv4 packet.
+    Packet(Vec<u8>),
+    /// A CTRL frame with no rekey flag.
+    Keepalive,
+    /// A CTRL frame that requests a new handshake.
+    Rekey,
 }
 
 /// The receive half of a hello-quic session.
@@ -414,6 +480,31 @@ impl HelloReceiver {
     pub async fn recv_ipv4(&mut self) -> Result<Vec<u8>, HelloError> {
         let frame = self.recv_data_frame().await?;
         Ok(frame.payload)
+    }
+
+    /// Read one DATA or CTRL frame.
+    pub(crate) async fn recv_event(&mut self) -> Result<SessionEvent, HelloError> {
+        let frame = read_frame(&mut self.recv).await?;
+        self.next_seq = expect_seq(self.next_seq, frame.seq)?;
+        match frame.frame_type {
+            FrameType::Data => {
+                let payload = self
+                    .gate
+                    .payload_from_data(&frame, SystemTime::now(), &self.deny)?
+                    .to_vec();
+                Ok(SessionEvent::Packet(payload))
+            }
+            FrameType::Ctrl => {
+                self.gate
+                    .accept_ctrl(&frame, SystemTime::now(), &self.deny)?;
+                if frame.flags & FLAG_REKEY_REQ != 0 {
+                    Ok(SessionEvent::Rekey)
+                } else {
+                    Ok(SessionEvent::Keepalive)
+                }
+            }
+            FrameType::Ticket => Err(HelloError::NotData),
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use orblx_datapath::{Netmap, NetmapPeer, NetmapSelf};
 use orblx_identity::{
@@ -97,6 +97,8 @@ struct Inner {
     coord_svid: IssuedSvid,
     netmap_key: NetmapKey,
     oidc: OidcState,
+    /// Life of a node leaf. The maximum is [`MAX_USER_TTL`].
+    svid_ttl: Duration,
     policy_path: PathBuf,
     policy: Policy,
     policy_hash: Option<[u8; 32]>,
@@ -217,6 +219,7 @@ impl Coordinator {
                 coord_svid,
                 netmap_key,
                 oidc,
+                svid_ttl: MAX_USER_TTL,
                 policy_path: dir.join(POLICY_FILE),
                 policy: Policy::empty(),
                 policy_hash: None,
@@ -245,6 +248,34 @@ impl Coordinator {
         }
         refresh_policy(&mut inner);
         Ok(())
+    }
+
+    /// Set the life of the next node leaf.
+    ///
+    /// The value is a whole number of seconds from 1 through the user maximum.
+    pub fn set_node_svid_ttl(&self, ttl: Duration) -> Result<(), CoordError> {
+        if ttl.is_zero() || ttl.subsec_nanos() != 0 || ttl > MAX_USER_TTL {
+            return Err(CoordError::Time);
+        }
+        let mut inner = self.lock()?;
+        inner.svid_ttl = ttl;
+        Ok(())
+    }
+
+    /// Issue a new leaf for an enrolled node.
+    ///
+    /// The overlay address does not change.
+    /// The caller must not log `private_key_pem`.
+    pub fn renew_node(&self, name: &str, now: SystemTime) -> Result<EnrollResult, CoordError> {
+        let _ = SpiffeId::node(name)?;
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        if !inner.store.nodes().iter().any(|node| node.name == name) {
+            return Err(CoordError::Protocol(
+                "The node is not enrolled.".to_string(),
+            ));
+        }
+        issue_leaf(&mut inner, name, now)
     }
 
     pub fn create_token(&self, ttl: std::time::Duration) -> Result<CreatedToken, CoordError> {
@@ -459,7 +490,9 @@ fn finish_enroll(
     now: SystemTime,
 ) -> Result<EnrollResult, CoordError> {
     let id = SpiffeId::node(&plan.name)?;
-    let issued = inner.ca.issue(&id, now, MAX_USER_TTL, &DenySet::empty())?;
+    let issued = inner
+        .ca
+        .issue(&id, now, inner.svid_ttl, &DenySet::empty())?;
     let stored = inner
         .store
         .commit(plan, issued.spiffe_id.as_uri().to_string(), now)?;
@@ -468,6 +501,29 @@ fn finish_enroll(
         name: stored.name,
         overlay_ip: stored.overlay_ip,
         svid: stored.svid,
+        certificate_pem: issued.certificate_pem,
+        private_key_pem: issued.private_key_pem,
+        trust_bundle_pem: inner.ca.trust_bundle_pem().to_string(),
+        netmap_public: view.netmap_public,
+        signed_netmap: view.signed_netmap,
+        signed_grants: view.signed_grants,
+        endpoints: view.endpoints,
+        approved_routes: view.approved_routes,
+        advertised_routes: view.advertised_routes,
+    })
+}
+
+fn issue_leaf(inner: &mut Inner, name: &str, now: SystemTime) -> Result<EnrollResult, CoordError> {
+    let id = SpiffeId::node(name)?;
+    let issued = inner
+        .ca
+        .issue(&id, now, inner.svid_ttl, &DenySet::empty())?;
+    let view = sign_view(inner, name)?;
+    let self_node = view.signed_netmap.netmap.self_node.clone();
+    Ok(EnrollResult {
+        name: self_node.name,
+        overlay_ip: self_node.overlay_ip,
+        svid: issued.spiffe_id.as_uri().to_string(),
         certificate_pem: issued.certificate_pem,
         private_key_pem: issued.private_key_pem,
         trust_bundle_pem: inner.ca.trust_bundle_pem().to_string(),

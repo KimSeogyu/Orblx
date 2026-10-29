@@ -34,8 +34,9 @@ pub use gate::PeerGate;
 pub use ipv4::{ipv4_destination, ipv4_packet, is_ipv4_packet};
 pub use netmap::{Netmap, NetmapError, NetmapPeer, NetmapSelf};
 pub use node::{
-    format_node_status, read_status_text, run_node, running_pid, NodeRequest, NodeStatus,
-    StatusPeer, NODE_PID_FILE, NODE_RECORD_FILE, NODE_STATUS_FILE,
+    format_node_status, read_status_text, run_memory_node, run_node, running_pid, MemoryDevice,
+    NodeRequest, NodeStatus, RenewedLeaf, StatusPeer, SvidRenewer, NODE_PID_FILE, NODE_RECORD_FILE,
+    NODE_STATUS_FILE,
 };
 pub use quic::{
     prove_hello_socket, HelloConfig, HelloEndpoint, HelloReceiver, HelloSender, HelloSession,

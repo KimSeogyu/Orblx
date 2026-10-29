@@ -52,6 +52,13 @@ const COMMAND_WAIT: Duration = Duration::from_secs(5);
 pub trait PeerVisibility: Send + Sync {
     /// Return true when the node may answer names for this peer.
     fn is_visible(&self, peer: &NetmapPeer) -> bool;
+
+    /// A value that changes when the reach list changes.
+    ///
+    /// The node reads this value and refreshes the resolver search list.
+    fn revision(&self) -> u64 {
+        0
+    }
 }
 
 /// The visibility hook for a node that has no signed grants.

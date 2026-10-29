@@ -1028,6 +1028,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
+ "orblx-crypto",
  "orblx-datapath",
  "orblx-edge",
  "orblx-identity",

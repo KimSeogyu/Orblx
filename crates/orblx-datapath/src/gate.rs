@@ -233,6 +233,34 @@ impl PeerGate {
         }
         Ok(&frame.payload)
     }
+
+    /// Check one CTRL frame against the admitted ticket.
+    pub fn accept_ctrl(
+        &self,
+        frame: &Frame,
+        now: SystemTime,
+        deny: &DenySet,
+    ) -> Result<(), HelloError> {
+        let peer = self.require_bound()?;
+        match frame.frame_type {
+            FrameType::Ctrl => {}
+            FrameType::Data | FrameType::Ticket => return Err(HelloError::NotData),
+        }
+        let admitted = self.admitted.as_ref().ok_or(HelloError::TicketMissing)?;
+        let proof = verify_ticket(
+            &admitted.ring,
+            &admitted.bytes,
+            &admitted.mac,
+            peer,
+            now,
+            deny,
+        )
+        .map_err(HelloError::Ticket)?;
+        if frame.ticket_hash != *proof.hash() {
+            return Err(HelloError::TicketHash);
+        }
+        Ok(())
+    }
 }
 
 fn admit_agent_destination(proof: &TicketProof, packet: &[u8]) -> Result<(), HelloError> {

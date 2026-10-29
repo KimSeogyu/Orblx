@@ -111,16 +111,10 @@ async fn handle_connection(
             }
         }
     };
-    let enrolled = response.ok && response.certificate_pem.is_some();
     proto::write_json(&mut send, &response).await?;
     let _ = send.finish();
     drop(send);
     drop(recv);
-    if enrolled {
-        if let Some(netmap) = &response.netmap {
-            println!("enrolled {}", netmap.netmap.self_node.name);
-        }
-    }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), connection.closed()).await;
     Ok(())
 }
@@ -160,7 +154,18 @@ async fn dispatch(
                     ))
                 }
             };
-            Ok(enroll_response(result))
+            println!("enrolled {}", result.name);
+            Ok(leaf_response(result))
+        }
+        "renew" => {
+            let peer = peer_node(connection, &coord.tls_material()?.trust_pem)?;
+            let peer = peer.ok_or(CoordError::Peer)?;
+            if peer != request.name {
+                return Err(CoordError::Peer);
+            }
+            let result = coord.renew_node(&request.name, now)?;
+            println!("renewed {}", result.name);
+            Ok(leaf_response(result))
         }
         "advertise" => {
             let peer = peer_node(connection, &coord.tls_material()?.trust_pem)?;
@@ -187,7 +192,7 @@ async fn dispatch(
     }
 }
 
-fn enroll_response(result: crate::state::EnrollResult) -> Response {
+fn leaf_response(result: crate::state::EnrollResult) -> Response {
     Response {
         ok: true,
         error: None,
@@ -195,11 +200,11 @@ fn enroll_response(result: crate::state::EnrollResult) -> Response {
         private_key_pem: Some(result.private_key_pem),
         trust_bundle_pem: Some(result.trust_bundle_pem),
         netmap_pub_hex: Some(encode_hex(&result.netmap_public)),
-        approved_routes: Some(result.approved_routes),
-        advertised_routes: Some(result.advertised_routes),
         netmap: Some(result.signed_netmap),
         endpoints: Some(result.endpoints),
         grants: Some(result.signed_grants),
+        approved_routes: Some(result.approved_routes),
+        advertised_routes: Some(result.advertised_routes),
     }
 }
 

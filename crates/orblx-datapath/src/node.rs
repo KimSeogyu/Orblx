@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use orblx_identity::{decode_certificate_pem, extract_spiffe_id, leaf_not_after, SpiffeId};
+use orblx_identity::{decode_certificate_pem, extract_spiffe_id, leaf_validity, SpiffeId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -28,10 +28,10 @@ use crate::dns::{
 #[cfg(target_os = "macos")]
 use crate::netmap::{ipv4_mask, parse_cidr};
 use crate::netmap::{parse_ipv4, Netmap, NetmapPeer};
-use crate::quic::HelloEndpoint;
+use crate::quic::{HelloEndpoint, SessionEvent};
 use crate::router::{route_packet, RouterTable};
 use crate::tun_dev::{open_tun, TunConfig};
-use crate::{HelloConfig, HelloError, HelloSession};
+use crate::{HelloConfig, HelloError, HelloSender, HelloSession, FLAG_REKEY_REQ};
 
 /// The node record file in the state directory.
 pub const NODE_RECORD_FILE: &str = "node.json";
@@ -43,9 +43,73 @@ pub const NODE_PID_FILE: &str = "orblxd.pid";
 pub const NODE_STATUS_FILE: &str = "status.txt";
 
 const PATH_DIRECT: &str = "direct";
+const PATH_STALE: &str = "stale";
 const PATH_DOWN: &str = "down";
+/// A session with no received frame for this long is `stale`.
+const STALE_AFTER: Duration = Duration::from_secs(2);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
 static LINK_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// A new leaf from the coordinator.
+///
+/// Debug output elides the private key.
+pub struct RenewedLeaf {
+    /// PEM certificate for this node.
+    pub certificate_pem: String,
+    /// PEM private key for this node.
+    pub private_key_pem: String,
+}
+
+impl std::fmt::Debug for RenewedLeaf {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RenewedLeaf")
+            .field("private_key_pem", &"[elided]")
+            .finish()
+    }
+}
+
+/// Calls the coordinator renew API.
+///
+/// The function must not log keys or tokens.
+#[derive(Clone)]
+pub struct SvidRenewer {
+    renew: Arc<dyn Fn() -> Result<RenewedLeaf, String> + Send + Sync>,
+}
+
+impl std::fmt::Debug for SvidRenewer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SvidRenewer")
+    }
+}
+
+impl SvidRenewer {
+    /// Store the renew function.
+    pub fn new<F>(renew: F) -> Self
+    where
+        F: Fn() -> Result<RenewedLeaf, String> + Send + Sync + 'static,
+    {
+        Self {
+            renew: Arc::new(renew),
+        }
+    }
+
+    fn renew(&self) -> Result<RenewedLeaf, String> {
+        (self.renew)()
+    }
+}
+
+/// In-memory packets for tests.
+///
+/// `from_tun` carries packets that the node sends to peers.
+/// `to_tun` carries packets that peers send to the node.
+pub struct MemoryDevice {
+    /// Packets from the local host.
+    pub from_tun: mpsc::Receiver<Vec<u8>>,
+    /// Packets for the local host.
+    pub to_tun: mpsc::Sender<Vec<u8>>,
+}
 
 /// Inputs for one node process.
 pub struct NodeRequest {
@@ -57,6 +121,12 @@ pub struct NodeRequest {
     pub listen: SocketAddr,
     /// The state directory. The default is `/var/lib/orblx`.
     pub state_dir: PathBuf,
+    /// Renews the node SVID. `None` keeps the file certificate.
+    pub renew: Option<SvidRenewer>,
+    /// Stops the node when the watch value is true.
+    ///
+    /// `None` waits for SIGINT or SIGTERM.
+    pub stop: Option<watch::Receiver<bool>>,
     /// Install approved subnet routes from the netmap into the TUN device.
     pub accept_routes: bool,
     /// Local CIDRs this node forwards onto a connected LAN.
@@ -75,7 +145,7 @@ pub struct StatusPeer {
     pub name: String,
     /// The peer overlay address.
     pub overlay_ip: String,
-    /// `direct` or `down`.
+    /// `direct`, `stale`, or `down`.
     pub path: String,
     /// The peer SPIFFE ID.
     pub svid: String,
@@ -110,26 +180,32 @@ struct NodeView {
     name: String,
     overlay_ip: String,
     svid: String,
-    svid_expiry: u64,
+    not_before: AtomicU64,
+    not_after: AtomicU64,
 }
 
+#[derive(Clone)]
 struct PeerView {
     name: String,
     overlay_ip: String,
     svid: String,
-    path: String,
+    session: bool,
+    last_rx: Option<Instant>,
     svid_expiry: Option<u64>,
+    reported: String,
 }
 
 struct LiveLink {
     tx: mpsc::Sender<Vec<u8>>,
     cancel: watch::Sender<bool>,
     generation: u64,
+    ask_rekey: watch::Sender<u64>,
 }
 
 #[derive(Clone)]
 struct Mesh {
     endpoint: Arc<HelloEndpoint>,
+    identity: Arc<Mutex<HelloConfig>>,
     netmap: Arc<Netmap>,
     node: Arc<NodeView>,
     links: Arc<Mutex<HashMap<String, LiveLink>>>,
@@ -137,6 +213,8 @@ struct Mesh {
     to_tun: mpsc::Sender<Vec<u8>>,
     state_dir: Arc<PathBuf>,
     shutdown: watch::Receiver<bool>,
+    rekey_tx: watch::Sender<u64>,
+    rekey_rx: watch::Receiver<u64>,
 }
 
 /// Format `orblx status` text.
@@ -199,6 +277,68 @@ pub fn running_pid(state_dir: &Path) -> Option<u32> {
 
 /// Run the node until the process receives SIGINT or SIGTERM.
 pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
+    let prepared = prepare_node(request)?;
+    let install = prepared
+        .router
+        .install_cidrs(prepared.request.accept_routes);
+    for cidr in &install {
+        println!("The node installs route {cidr}.");
+    }
+    let bridge = open_tun(&TunConfig {
+        name: tun_device_name(),
+        address: parse_ipv4(&prepared.record.overlay_ip)
+            .map_err(|err| HelloError::Node(err.to_string()))?,
+        netmask: Ipv4Addr::new(255, 255, 255, 255),
+    })?;
+    prepare_link(&bridge.name, &install)?;
+    if !prepared.request.forward_routes.is_empty() {
+        crate::subnet::enable_kernel_forward(&prepared.request.forward_routes)?;
+    }
+    println!("The overlay IP is {}.", prepared.record.overlay_ip);
+    println!(
+        "The state directory is {}.",
+        prepared.request.state_dir.display()
+    );
+    println!("The TUN device is {}.", bridge.name);
+    announce_renew(&prepared.request);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| HelloError::Io(err.to_string()))?;
+    runtime.block_on(run_mesh(
+        prepared,
+        bridge.from_tun,
+        bridge.to_tun,
+        Some(bridge.name),
+    ))
+}
+
+/// Run the node with in-memory packets.
+///
+/// Call this function inside a Tokio runtime.
+/// The function does not open a TUN device.
+pub async fn run_memory_node(request: NodeRequest, device: MemoryDevice) -> Result<(), HelloError> {
+    let prepared = prepare_node(request)?;
+    println!("The overlay IP is {}.", prepared.record.overlay_ip);
+    println!(
+        "The state directory is {}.",
+        prepared.request.state_dir.display()
+    );
+    println!("The TUN device is memory.");
+    announce_renew(&prepared.request);
+    run_mesh(prepared, device.from_tun, device.to_tun, None).await
+}
+
+struct PreparedNode {
+    request: NodeRequest,
+    view: NodeView,
+    record: NodeRecord,
+    router: RouterTable,
+    _pid_guard: PidGuard,
+}
+
+fn prepare_node(request: NodeRequest) -> Result<PreparedNode, HelloError> {
     request
         .netmap
         .check()
@@ -216,39 +356,38 @@ pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
             "The node is already running. The pid is {pid}."
         )));
     }
-    let _pid_guard = PidGuard::create(&request.state_dir)?;
+    let pid_guard = PidGuard::create(&request.state_dir)?;
     let router = RouterTable::from_netmap(&request.netmap)
         .map_err(|err| HelloError::Node(err.to_string()))?;
-    let install = router.install_cidrs(request.accept_routes);
-    for cidr in &install {
-        println!("The node installs route {cidr}.");
-    }
-    let bridge = open_tun(&TunConfig {
-        name: tun_device_name(),
-        address: parse_ipv4(&record.overlay_ip).map_err(|err| HelloError::Node(err.to_string()))?,
-        netmask: Ipv4Addr::new(255, 255, 255, 255),
-    })?;
-    prepare_link(&bridge.name, &install)?;
-    if !request.forward_routes.is_empty() {
-        crate::subnet::enable_kernel_forward(&request.forward_routes)?;
-    }
-    println!("The overlay IP is {}.", record.overlay_ip);
-    println!("The state directory is {}.", request.state_dir.display());
-    println!("The TUN device is {}.", bridge.name);
-
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| HelloError::Io(err.to_string()))?;
-    runtime.block_on(run_mesh(request, view, router, bridge))
+    Ok(PreparedNode {
+        request,
+        view,
+        record,
+        router,
+        _pid_guard: pid_guard,
+    })
 }
 
-async fn run_mesh(
+fn announce_renew(request: &NodeRequest) {
+    if request.renew.is_some() {
+        println!("The node renews the SVID at two thirds of the certificate life.");
+    } else {
+        println!(
+            "The node does not renew the SVID. The state directory has no coordinator address."
+        );
+    }
+}
+
+async fn run_mesh_inner(
     request: NodeRequest,
     view: NodeView,
     router: RouterTable,
-    bridge: crate::TunBridge,
+    from_tun: mpsc::Receiver<Vec<u8>>,
+    to_tun: mpsc::Sender<Vec<u8>>,
+    interface: Option<String>,
+    _pid_guard: PidGuard,
 ) -> Result<(), HelloError> {
+    let identity = Arc::new(Mutex::new(request.config.clone()));
     let netmap_path = request.netmap_path.clone();
     let visibility = Arc::clone(&request.visibility);
     let endpoint = Arc::new(HelloEndpoint::bind_node(request.config, request.listen)?);
@@ -259,15 +398,15 @@ async fn run_mesh(
     let peers = Arc::new(Mutex::new(initial_peers(&request.netmap)));
     let links = Arc::new(Mutex::new(HashMap::<String, LiveLink>::new()));
     let router = Arc::new(router);
-    publish(&state_dir, &node, &lock(&peers), "up");
+    publish(&state_dir, &node, &peers, "up");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (rekey_tx, rekey_rx) = watch::channel(0u64);
     let mut tasks = Vec::<JoinHandle<()>>::new();
 
     let tun_shutdown = shutdown_rx.clone();
     let tun_router = Arc::clone(&router);
     let tun_links = Arc::clone(&links);
-    let from_tun = bridge.from_tun;
     let accept_routes = request.accept_routes;
     tasks.push(tokio::spawn(async move {
         read_tun(from_tun, tun_router, tun_links, tun_shutdown, accept_routes).await;
@@ -277,13 +416,16 @@ async fn run_mesh(
     let dns_shutdown = shutdown_rx.clone();
     let mesh = Mesh {
         endpoint: Arc::clone(&endpoint),
+        identity,
         netmap: Arc::clone(&netmap),
         node: Arc::clone(&node),
         links: Arc::clone(&links),
         peers: Arc::clone(&peers),
-        to_tun: bridge.to_tun.clone(),
+        to_tun: to_tun.clone(),
         state_dir: Arc::clone(&state_dir),
         shutdown: shutdown_rx,
+        rekey_tx,
+        rekey_rx,
     };
     let accept_mesh = mesh.clone();
     tasks.push(tokio::spawn(async move {
@@ -302,23 +444,53 @@ async fn run_mesh(
         }));
     }
 
-    let overlay = parse_ipv4(&node.overlay_ip).map_err(|err| HelloError::Node(err.to_string()))?;
-    let (resolver, dns_tasks) = spawn_overlay_dns(
-        DnsSpawn {
-            interface: bridge.name.clone(),
-            overlay,
-            netmap_path,
-            node_name: node.name.clone(),
-            node_overlay: node.overlay_ip.clone(),
-            visibility,
-            shutdown: dns_shutdown,
-        },
-        &netmap,
-    )
-    .await;
-    tasks.extend(dns_tasks);
+    if let Some(renewer) = request.renew {
+        let renew_mesh = mesh.clone();
+        tasks.push(tokio::spawn(async move {
+            renew_loop(renew_mesh, renewer).await;
+        }));
+    }
 
-    wait_for_stop().await;
+    let mut status_mesh = mesh.clone();
+    tasks.push(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                changed = status_mesh.shutdown.changed() => {
+                    if changed.is_err() || *status_mesh.shutdown.borrow() {
+                        return;
+                    }
+                }
+                _ = tick.tick() => {
+                    publish(&status_mesh.state_dir, &status_mesh.node, &status_mesh.peers, "up");
+                }
+            }
+        }
+    }));
+
+    let resolver = if let Some(interface) = interface {
+        let overlay =
+            parse_ipv4(&node.overlay_ip).map_err(|err| HelloError::Node(err.to_string()))?;
+        let (guard, dns_tasks) = spawn_overlay_dns(
+            DnsSpawn {
+                interface,
+                overlay,
+                netmap_path,
+                node_name: node.name.clone(),
+                node_overlay: node.overlay_ip.clone(),
+                visibility,
+                shutdown: dns_shutdown,
+            },
+            &netmap,
+        )
+        .await;
+        tasks.extend(dns_tasks);
+        Some(guard)
+    } else {
+        None
+    };
+
+    wait_for_stop(request.stop).await;
     let _ = shutdown_tx.send(true);
     drop(resolver);
     endpoint.close();
@@ -329,10 +501,29 @@ async fn run_mesh(
     for task in tasks {
         let _ = task.await;
     }
-    publish(&state_dir, &node, &lock(&peers), "down");
+    publish(&state_dir, &node, &peers, "down");
     println!("The node is down.");
-    drop(bridge.to_tun);
+    drop(to_tun);
     Ok(())
+}
+
+async fn run_mesh(
+    prepared: PreparedNode,
+    from_tun: mpsc::Receiver<Vec<u8>>,
+    to_tun: mpsc::Sender<Vec<u8>>,
+    interface: Option<String>,
+) -> Result<(), HelloError> {
+    let PreparedNode {
+        request,
+        view,
+        router,
+        _pid_guard,
+        ..
+    } = prepared;
+    run_mesh_inner(
+        request, view, router, from_tun, to_tun, interface, _pid_guard,
+    )
+    .await
 }
 
 fn local_view(request: &NodeRequest) -> Result<NodeView, HelloError> {
@@ -354,11 +545,13 @@ fn local_view(request: &NodeRequest) -> Result<NodeView, HelloError> {
     }
     let overlay = parse_ipv4(&request.netmap.self_node.overlay_ip)
         .map_err(|err| HelloError::Node(err.to_string()))?;
+    let (not_before, not_after) = leaf_validity(&der).map_err(HelloError::Identity)?;
     Ok(NodeView {
         name: request.netmap.self_node.name.clone(),
         overlay_ip: overlay.to_string(),
         svid: svid.as_uri().to_string(),
-        svid_expiry: leaf_not_after(&der).map_err(HelloError::Identity)?,
+        not_before: AtomicU64::new(not_before),
+        not_after: AtomicU64::new(not_after),
     })
 }
 
@@ -369,8 +562,10 @@ fn initial_peers(map: &Netmap) -> Vec<PeerView> {
             name: peer.name.clone(),
             overlay_ip: peer.overlay_ip.clone(),
             svid: peer.svid.clone(),
-            path: PATH_DOWN.to_string(),
+            session: false,
+            last_rx: None,
             svid_expiry: None,
+            reported: PATH_DOWN.to_string(),
         })
         .collect()
 }
@@ -379,23 +574,39 @@ fn we_dial(self_name: &str, peer_name: &str) -> bool {
     self_name < peer_name
 }
 
-async fn wait_for_stop() {
-    let mut terminate =
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(signal) => signal,
-            Err(err) => {
-                eprintln!("The node did not install the stop handler. {err}");
-                std::future::pending::<()>().await;
-                return;
-            }
-        };
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => {
-            if let Err(err) = result {
-                eprintln!("The node did not wait for SIGINT. {err}");
+async fn wait_for_stop(external: Option<watch::Receiver<bool>>) {
+    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+    match terminate {
+        Ok(mut terminate) => {
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => {
+                    if let Err(err) = result {
+                        eprintln!("The node did not wait for SIGINT. {err}");
+                    }
+                }
+                _ = terminate.recv() => {}
+                _ = external_stop(external) => {}
             }
         }
-        _ = terminate.recv() => {}
+        Err(err) => {
+            eprintln!("The node did not install the stop handler. {err}");
+            external_stop(external).await;
+        }
+    }
+}
+
+async fn external_stop(external: Option<watch::Receiver<bool>>) {
+    let Some(mut external) = external else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if *external.borrow() {
+            return;
+        }
+        if external.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -459,17 +670,9 @@ async fn accept_loop(mut mesh: Mesh) {
                             continue;
                         }
                         let link = mesh.clone();
+                        let (remote_tx, _remote_rx) = watch::channel(0u64);
                         tokio::spawn(async move {
-                            run_link(
-                                session,
-                                peer_name,
-                                link.links,
-                                link.peers,
-                                link.to_tun,
-                                link.state_dir,
-                                link.node,
-                            )
-                            .await;
+                            run_link(link, session, peer_name, remote_tx).await;
                         });
                     }
                     Err(HelloError::EndpointClosed) => return,
@@ -484,69 +687,132 @@ async fn accept_loop(mut mesh: Mesh) {
 }
 
 async fn dial_peer(mut mesh: Mesh, peer: NetmapPeer) {
+    let (remote_tx, mut remote_rx) = watch::channel(0u64);
     loop {
-        if *mesh.shutdown.borrow() {
+        if stopped(&mesh) {
             return;
         }
-        for endpoint_text in &peer.endpoints {
-            if *mesh.shutdown.borrow() {
-                return;
-            }
-            let addr = match resolve_endpoint(endpoint_text).await {
-                Ok(addr) => addr,
-                Err(()) => {
-                    eprintln!(
-                        "The endpoint {endpoint_text} for {} is not valid.",
-                        peer.name
-                    );
-                    continue;
-                }
-            };
-            let connect = mesh.endpoint.connect_one(addr);
+        let Some(session) = dial_ready(&mut mesh, &peer).await else {
+            return;
+        };
+        let mut task = spawn_link(&mesh, session, peer.name.clone(), remote_tx.clone());
+        loop {
             tokio::select! {
-                changed = mesh.shutdown.changed() => {
-                    if changed.is_err() || *mesh.shutdown.borrow() {
+                _ = &mut task => break,
+                changed = mesh.rekey_rx.changed() => {
+                    if changed.is_err() || stopped(&mesh) {
                         return;
                     }
+                    reconnect(&mut mesh, &peer, &remote_tx, &mut task).await;
                 }
-                result = connect => {
-                    match result {
-                        Ok(session) => {
-                            if session.peer_id().as_uri() != peer.svid {
-                                eprintln!(
-                                    "The peer {} presented {}.",
-                                    peer.name,
-                                    session.peer_id().as_uri()
-                                );
-                                continue;
-                            }
-                            run_link(
-                                session,
-                                peer.name.clone(),
-                                Arc::clone(&mesh.links),
-                                Arc::clone(&mesh.peers),
-                                mesh.to_tun.clone(),
-                                Arc::clone(&mesh.state_dir),
-                                Arc::clone(&mesh.node),
-                            )
-                            .await;
-                        }
-                        Err(err) => {
-                            eprintln!("The dial to {} at {addr} failed. {err}", peer.name);
-                        }
+                changed = remote_rx.changed() => {
+                    if changed.is_err() || stopped(&mesh) {
+                        return;
                     }
+                    reconnect(&mut mesh, &peer, &remote_tx, &mut task).await;
                 }
             }
+        }
+    }
+}
+
+fn spawn_link(
+    mesh: &Mesh,
+    session: HelloSession,
+    name: String,
+    remote_tx: watch::Sender<u64>,
+) -> JoinHandle<()> {
+    let mesh = mesh.clone();
+    tokio::spawn(async move {
+        run_link(mesh, session, name, remote_tx).await;
+    })
+}
+
+async fn reconnect(
+    mesh: &mut Mesh,
+    peer: &NetmapPeer,
+    remote_tx: &watch::Sender<u64>,
+    task: &mut JoinHandle<()>,
+) {
+    let Some(session) = dial_once(mesh, peer).await else {
+        return;
+    };
+    let next = spawn_link(mesh, session, peer.name.clone(), remote_tx.clone());
+    let mut old = std::mem::replace(task, next);
+    if tokio::time::timeout(Duration::from_secs(2), &mut old)
+        .await
+        .is_err()
+    {
+        old.abort();
+    }
+}
+
+async fn dial_ready(mesh: &mut Mesh, peer: &NetmapPeer) -> Option<HelloSession> {
+    loop {
+        if stopped(mesh) {
+            return None;
+        }
+        if let Some(session) = dial_once(mesh, peer).await {
+            return Some(session);
         }
         tokio::select! {
             changed = mesh.shutdown.changed() => {
                 if changed.is_err() || *mesh.shutdown.borrow() {
-                    return;
+                    return None;
                 }
             }
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
     }
+}
+
+async fn dial_once(mesh: &mut Mesh, peer: &NetmapPeer) -> Option<HelloSession> {
+    for endpoint_text in &peer.endpoints {
+        if stopped(mesh) {
+            return None;
+        }
+        let addr = match resolve_endpoint(endpoint_text).await {
+            Ok(addr) => addr,
+            Err(()) => {
+                eprintln!(
+                    "The endpoint {endpoint_text} for {} is not valid.",
+                    peer.name
+                );
+                continue;
+            }
+        };
+        let connect = mesh.endpoint.connect_one(addr);
+        tokio::select! {
+            changed = mesh.shutdown.changed() => {
+                if changed.is_err() || *mesh.shutdown.borrow() {
+                    return None;
+                }
+            }
+            result = connect => {
+                match result {
+                    Ok(session) => {
+                        if session.peer_id().as_uri() != peer.svid {
+                            eprintln!(
+                                "The peer {} presented {}.",
+                                peer.name,
+                                session.peer_id().as_uri()
+                            );
+                            continue;
+                        }
+                        return Some(session);
+                    }
+                    Err(err) => {
+                        eprintln!("The dial to {} at {addr} failed. {err}", peer.name);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn stopped(mesh: &Mesh) -> bool {
+    *mesh.shutdown.borrow()
 }
 
 async fn resolve_endpoint(text: &str) -> Result<SocketAddr, ()> {
@@ -558,38 +824,52 @@ async fn resolve_endpoint(text: &str) -> Result<SocketAddr, ()> {
 }
 
 async fn run_link(
+    mesh: Mesh,
     session: HelloSession,
     name: String,
-    links: Arc<Mutex<HashMap<String, LiveLink>>>,
-    peers: Arc<Mutex<Vec<PeerView>>>,
-    to_tun: mpsc::Sender<Vec<u8>>,
-    state_dir: Arc<PathBuf>,
-    node: Arc<NodeView>,
+    remote_rekey: watch::Sender<u64>,
 ) {
     let (cancel_tx, cancel_rx) = watch::channel(false);
+    let (ask_tx, ask_rx) = watch::channel(0u64);
     let (tx, rx) = mpsc::channel(32);
     let generation = LINK_GENERATION.fetch_add(1, Ordering::Relaxed);
     let expiry = session.peer_not_after();
     {
-        let mut map = lock(&links);
+        let mut map = lock(&mesh.links);
         if let Some(old) = map.insert(
             name.clone(),
             LiveLink {
                 tx,
                 cancel: cancel_tx,
                 generation,
+                ask_rekey: ask_tx,
             },
         ) {
             let _ = old.cancel.send(true);
         }
     }
-    set_peer(&peers, &name, PATH_DIRECT, Some(expiry));
-    publish(&state_dir, &node, &lock(&peers), "up");
-    println!("The path to {name} is direct.");
+    set_session(&mesh.peers, &name, true, Some(expiry));
+    publish(&mesh.state_dir, &mesh.node, &mesh.peers, "up");
     let (sender, receiver) = session.split();
-    drive_session(sender, receiver, rx, cancel_rx, to_tun).await;
+    let peers = Arc::clone(&mesh.peers);
+    let state_dir = Arc::clone(&mesh.state_dir);
+    let node = Arc::clone(&mesh.node);
+    let peer_name = name.clone();
+    drive_session(
+        SessionIo {
+            sender,
+            receiver,
+            packets: rx,
+            cancel: cancel_rx,
+            to_tun: mesh.to_tun.clone(),
+            ask_rekey: ask_rx,
+            remote_rekey,
+        },
+        move || note_rx(&peers, &state_dir, &node, &peer_name),
+    )
+    .await;
     let removed = {
-        let mut map = lock(&links);
+        let mut map = lock(&mesh.links);
         if map.get(&name).map(|link| link.generation) == Some(generation) {
             map.remove(&name);
             true
@@ -598,23 +878,49 @@ async fn run_link(
         }
     };
     if removed {
-        set_peer(&peers, &name, PATH_DOWN, None);
-        publish(&state_dir, &node, &lock(&peers), "up");
-        println!("The path to {name} is down.");
+        set_session(&mesh.peers, &name, false, None);
+        publish(&mesh.state_dir, &mesh.node, &mesh.peers, "up");
     }
 }
 
-async fn drive_session(
-    mut sender: crate::HelloSender,
-    mut receiver: crate::HelloReceiver,
-    mut packets: mpsc::Receiver<Vec<u8>>,
-    mut cancel: watch::Receiver<bool>,
+struct SessionIo {
+    sender: HelloSender,
+    receiver: crate::HelloReceiver,
+    packets: mpsc::Receiver<Vec<u8>>,
+    cancel: watch::Receiver<bool>,
     to_tun: mpsc::Sender<Vec<u8>>,
-) {
+    ask_rekey: watch::Receiver<u64>,
+    remote_rekey: watch::Sender<u64>,
+}
+
+async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
+    let SessionIo {
+        mut sender,
+        mut receiver,
+        mut packets,
+        mut cancel,
+        to_tun,
+        mut ask_rekey,
+        remote_rekey,
+    } = io;
+    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     loop {
         tokio::select! {
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
+                    return;
+                }
+            }
+            changed = ask_rekey.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                if sender.send_ctrl(FLAG_REKEY_REQ).await.is_err() {
+                    return;
+                }
+            }
+            _ = keepalive.tick() => {
+                if sender.send_ctrl(0).await.is_err() {
                     return;
                 }
             }
@@ -626,12 +932,19 @@ async fn drive_session(
                     return;
                 }
             }
-            incoming = receiver.recv_ipv4() => {
+            incoming = receiver.recv_event() => {
                 match incoming {
-                    Ok(packet) => {
+                    Ok(SessionEvent::Packet(packet)) => {
+                        on_rx();
                         if to_tun.send(packet).await.is_err() {
                             return;
                         }
+                    }
+                    Ok(SessionEvent::Keepalive) => on_rx(),
+                    Ok(SessionEvent::Rekey) => {
+                        on_rx();
+                        let next = remote_rekey.borrow().saturating_add(1);
+                        let _ = remote_rekey.send(next);
                     }
                     Err(_) => return,
                 }
@@ -640,27 +953,77 @@ async fn drive_session(
     }
 }
 
-fn set_peer(peers: &Mutex<Vec<PeerView>>, name: &str, path: &str, expiry: Option<u64>) {
+fn set_session(peers: &Mutex<Vec<PeerView>>, name: &str, session: bool, expiry: Option<u64>) {
     let mut peers = lock(peers);
     if let Some(peer) = peers.iter_mut().find(|peer| peer.name == name) {
-        peer.path = path.to_string();
-        peer.svid_expiry = expiry;
+        peer.session = session;
+        if session {
+            peer.svid_expiry = expiry;
+        } else {
+            peer.last_rx = None;
+            peer.svid_expiry = None;
+        }
     }
 }
 
-fn publish(dir: &Path, node: &NodeView, peers: &[PeerView], state: &str) {
+fn note_rx(peers: &Mutex<Vec<PeerView>>, dir: &Path, node: &NodeView, name: &str) {
+    let changed = {
+        let mut peers = lock(peers);
+        let Some(peer) = peers.iter_mut().find(|peer| peer.name == name) else {
+            return;
+        };
+        let before = current_path(peer, Instant::now());
+        peer.last_rx = Some(Instant::now());
+        let after = current_path(peer, Instant::now());
+        before != after
+    };
+    if changed {
+        publish(dir, node, peers, "up");
+    }
+}
+
+fn current_path(peer: &PeerView, now: Instant) -> &'static str {
+    path_kind(
+        peer.session,
+        peer.last_rx.map(|then| now.saturating_duration_since(then)),
+    )
+}
+
+fn path_kind(session: bool, age: Option<Duration>) -> &'static str {
+    if !session {
+        return PATH_DOWN;
+    }
+    match age {
+        Some(age) if age <= STALE_AFTER => PATH_DIRECT,
+        Some(_) | None => PATH_STALE,
+    }
+}
+
+fn publish(dir: &Path, node: &NodeView, peers: &Mutex<Vec<PeerView>>, state: &str) {
+    let now = Instant::now();
+    let peers = {
+        let mut peers = lock(peers);
+        for peer in peers.iter_mut() {
+            let path = current_path(peer, now);
+            if peer.reported != path {
+                println!("The path to {} is {path}.", peer.name);
+                peer.reported = path.to_string();
+            }
+        }
+        peers.clone()
+    };
     let status = NodeStatus {
         state: state.to_string(),
         name: node.name.clone(),
         overlay_ip: node.overlay_ip.clone(),
         svid: node.svid.clone(),
-        svid_expiry: node.svid_expiry,
+        svid_expiry: node.not_after.load(Ordering::Relaxed),
         peers: peers
             .iter()
             .map(|peer| StatusPeer {
                 name: peer.name.clone(),
                 overlay_ip: peer.overlay_ip.clone(),
-                path: peer.path.clone(),
+                path: current_path(peer, now).to_string(),
                 svid: peer.svid.clone(),
                 svid_expiry: peer.svid_expiry,
             })
@@ -670,6 +1033,151 @@ fn publish(dir: &Path, node: &NodeView, peers: &[PeerView], state: &str) {
     if let Err(err) = write_atomic(&dir.join(NODE_STATUS_FILE), text.as_bytes()) {
         eprintln!("The node did not write the status file. {err}");
     }
+}
+
+async fn renew_loop(mut mesh: Mesh, renewer: SvidRenewer) {
+    loop {
+        if stopped(&mesh) {
+            return;
+        }
+        let not_before = mesh.node.not_before.load(Ordering::Relaxed);
+        let not_after = mesh.node.not_after.load(Ordering::Relaxed);
+        let due = renew_unix(not_before, not_after);
+        let wait = due.saturating_sub(unix_now());
+        tokio::select! {
+            changed = mesh.shutdown.changed() => {
+                if changed.is_err() || *mesh.shutdown.borrow() {
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
+        }
+        if stopped(&mesh) {
+            return;
+        }
+        let mut attempt = 0u32;
+        loop {
+            if stopped(&mesh) {
+                return;
+            }
+            let renewer = renewer.clone();
+            let fetched = tokio::task::spawn_blocking(move || renewer.renew()).await;
+            let leaf = match fetched {
+                Ok(Ok(leaf)) => leaf,
+                Ok(Err(err)) => {
+                    eprintln!(
+                        "The SVID renewal failed. The node will retry. {}",
+                        safe_text(&err)
+                    );
+                    if !sleep_retry(&mut mesh, retry_delay(attempt)).await {
+                        return;
+                    }
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("The SVID renewal failed. The node will retry.");
+                    if !sleep_retry(&mut mesh, retry_delay(attempt)).await {
+                        return;
+                    }
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+            };
+            match apply_leaf(&mesh, &leaf) {
+                Ok(expiry) => {
+                    signal_rekey(&mesh);
+                    publish(&mesh.state_dir, &mesh.node, &mesh.peers, "up");
+                    println!("The node renewed the SVID. The new expiry is {expiry}.");
+                    break;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "The SVID renewal failed. The node will retry. {}",
+                        safe_text(&err.to_string())
+                    );
+                    if !sleep_retry(&mut mesh, retry_delay(attempt)).await {
+                        return;
+                    }
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+        }
+    }
+}
+
+fn apply_leaf(mesh: &Mesh, leaf: &RenewedLeaf) -> Result<u64, HelloError> {
+    let der = decode_certificate_pem(&leaf.certificate_pem).map_err(HelloError::Identity)?;
+    let id = extract_spiffe_id(&der).map_err(HelloError::Identity)?;
+    if id.as_uri() != mesh.node.svid {
+        return Err(HelloError::Node(
+            "The renewed SVID name does not match this node.".to_string(),
+        ));
+    }
+    let (not_before, not_after) = leaf_validity(&der).map_err(HelloError::Identity)?;
+    let previous = lock(&mesh.identity).clone();
+    let next = {
+        let mut config = lock(&mesh.identity);
+        config.certificate_pem = leaf.certificate_pem.clone();
+        config.private_key_pem = leaf.private_key_pem.clone();
+        config.clone()
+    };
+    if let Err(err) = mesh.endpoint.install_identity(&next) {
+        *lock(&mesh.identity) = previous;
+        return Err(err);
+    }
+    mesh.node.not_before.store(not_before, Ordering::Relaxed);
+    mesh.node.not_after.store(not_after, Ordering::Relaxed);
+    Ok(not_after)
+}
+
+fn signal_rekey(mesh: &Mesh) {
+    {
+        let links = lock(&mesh.links);
+        for link in links.values() {
+            let next = link.ask_rekey.borrow().saturating_add(1);
+            let _ = link.ask_rekey.send(next);
+        }
+    }
+    let next = mesh.rekey_rx.borrow().saturating_add(1);
+    let _ = mesh.rekey_tx.send(next);
+}
+
+async fn sleep_retry(mesh: &mut Mesh, delay: Duration) -> bool {
+    tokio::select! {
+        changed = mesh.shutdown.changed() => {
+            changed.is_ok() && !*mesh.shutdown.borrow()
+        }
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
+
+fn retry_delay(attempt: u32) -> Duration {
+    let secs = 1u64.checked_shl(attempt).unwrap_or(30).min(30);
+    Duration::from_secs(secs)
+}
+
+fn renew_unix(not_before: u64, not_after: u64) -> u64 {
+    let life = not_after.saturating_sub(not_before);
+    not_before.saturating_add(life.saturating_mul(2) / 3)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn safe_text(text: &str) -> String {
+    if text.contains("PRIVATE")
+        || text.contains("BEGIN ")
+        || text.contains("ge1.")
+        || text.contains('\n')
+    {
+        return "The coordinator request failed.".to_string();
+    }
+    text.to_string()
 }
 
 fn load_or_create_state(dir: &Path, netmap: &Netmap) -> Result<NodeRecord, HelloError> {
@@ -902,6 +1410,7 @@ struct DnsWatch {
 async fn watch_netmap_dns(mut watch_state: DnsWatch) {
     let mut last = fs::read(&watch_state.path).unwrap_or_default();
     let mut last_error = String::new();
+    let mut grant_revision = watch_state.visibility.revision();
     loop {
         tokio::select! {
             changed = watch_state.shutdown.changed() => {
@@ -910,6 +1419,19 @@ async fn watch_netmap_dns(mut watch_state: DnsWatch) {
                 }
             }
             _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                let next = watch_state.visibility.revision();
+                if next != grant_revision {
+                    grant_revision = next;
+                    let table = watch_state.tables.borrow().clone();
+                    refresh_resolver(
+                        &watch_state.interface,
+                        watch_state.overlay,
+                        &table,
+                        watch_state.visibility.as_ref(),
+                        &watch_state.armed,
+                    );
+                    println!("The DNS answers follow the new grants.");
+                }
                 reload_dns_file(&watch_state, &mut last, &mut last_error);
             }
         }
@@ -998,6 +1520,7 @@ impl Drop for PidGuard {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use super::{format_node_status, load_or_create_state, NodeStatus, StatusPeer};
     use crate::netmap::Netmap;
@@ -1070,5 +1593,53 @@ mod tests {
             "peer c overlay_ip 100.64.0.3 path down svid spiffe://orblx.local/node/c svid_expiry unknown\n"
         ));
         assert!(text.find("peer b").unwrap() < text.find("peer c").unwrap());
+    }
+
+    #[test]
+    fn renewal_starts_at_two_thirds_of_the_life() {
+        assert_eq!(super::renew_unix(1_000, 1_060), 1_040);
+        assert_eq!(super::renew_unix(0, 3), 2);
+        assert_eq!(super::renew_unix(50, 50), 50);
+    }
+
+    #[test]
+    fn status_path_is_not_direct_without_a_recent_packet() {
+        assert_eq!(super::path_kind(false, None), "down");
+        assert_eq!(super::path_kind(true, None), "stale");
+        assert_eq!(
+            super::path_kind(true, Some(Duration::from_secs(1))),
+            "direct"
+        );
+        assert_eq!(
+            super::path_kind(true, Some(Duration::from_secs(2))),
+            "direct"
+        );
+        assert_eq!(
+            super::path_kind(true, Some(Duration::from_millis(2_001))),
+            "stale"
+        );
+        let text = format_node_status(&NodeStatus {
+            state: "up".to_string(),
+            name: "a".to_string(),
+            overlay_ip: "100.64.0.1".to_string(),
+            svid: "spiffe://orblx.local/node/a".to_string(),
+            svid_expiry: 100,
+            peers: vec![StatusPeer {
+                name: "b".to_string(),
+                overlay_ip: "100.64.0.2".to_string(),
+                path: "stale".to_string(),
+                svid: "spiffe://orblx.local/node/b".to_string(),
+                svid_expiry: Some(200),
+            }],
+        });
+        assert!(text.contains("path stale "));
+        assert!(!text.contains("path direct "));
+    }
+
+    #[test]
+    fn renewal_errors_do_not_keep_key_text() {
+        let text = super::safe_text("-----BEGIN PRIVATE KEY-----\nabc");
+        assert_eq!(text, "The coordinator request failed.");
+        assert!(!text.contains("PRIVATE"));
     }
 }

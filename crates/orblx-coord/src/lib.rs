@@ -9,14 +9,18 @@
 //! The listener uses QUIC on UDP 443 with the SVID `spiffe://orblx.local/coord/{name}`.
 //! Enrollment uses server authentication because the node SVID does not exist yet.
 //! A later netmap fetch uses the node SVID as the client certificate.
+//! A later renew call uses the node SVID and returns a new leaf.
 
 mod client;
 mod error;
+
 mod files;
 mod http_util;
 mod ippool;
 mod netmap;
 mod proto;
+#[cfg(test)]
+mod renew_test;
 mod server;
 mod state;
 mod store;
@@ -24,7 +28,7 @@ mod tlsutil;
 
 pub use client::{
     advertise_routes_blocking, enroll_with_oidc_blocking, enroll_with_token_blocking,
-    fetch_netmap_blocking, netmap_json, OidcEnroll,
+    fetch_netmap_blocking, netmap_json, renew_svid_blocking, OidcEnroll,
 };
 pub use error::CoordError;
 pub use http_util::{fetch_google_jwks_blocking, post_google_token_blocking};

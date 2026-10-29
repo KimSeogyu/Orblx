@@ -5,7 +5,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use orblx_identity::{OidcMode, GOOGLE_CLIENT_ID_ENV};
+use orblx_identity::{OidcMode, GOOGLE_CLIENT_ID_ENV, MAX_USER_TTL};
 
 use super::{parse_socket, take_value};
 use orblx_coord::{
@@ -90,6 +90,12 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             }
             let oidc = oidc_config(mode, client_id).map_err(|err| err.to_string())?;
             let coord = Coordinator::open(&state, &name, oidc).map_err(|err| err.to_string())?;
+            if let Some(ttl) = node_svid_ttl_from_env()? {
+                coord
+                    .set_node_svid_ttl(ttl)
+                    .map_err(|err| err.to_string())?;
+                println!("node svid ttl {}", ttl.as_secs());
+            }
             if let Some(policy) = policy {
                 coord
                     .set_policy_file(&policy)
@@ -139,6 +145,7 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             )
             .map_err(|err| err.to_string())?;
             result.write_state(&state).map_err(|err| err.to_string())?;
+            remember_coord(&state, coord, &coord_name)?;
             print_enrolled(&result);
             Ok(())
         }
@@ -188,6 +195,42 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn node_svid_ttl_from_env() -> Result<Option<Duration>, String> {
+    let Ok(text) = std::env::var("ORBLX_SVID_TTL") else {
+        return Ok(None);
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let secs: u64 = text
+        .parse()
+        .map_err(|_| "ORBLX_SVID_TTL is not a number of seconds.".to_string())?;
+    if secs == 0 || secs > MAX_USER_TTL.as_secs() {
+        return Err(format!(
+            "ORBLX_SVID_TTL must be from 1 to {} seconds.",
+            MAX_USER_TTL.as_secs()
+        ));
+    }
+    Ok(Some(Duration::from_secs(secs)))
+}
+
+fn remember_coord(state: &std::path::Path, coord: SocketAddr, name: &str) -> Result<(), String> {
+    fs::write(state.join("coord-addr"), format!("{coord}\n")).map_err(|err| {
+        format!(
+            "The file {} was not written. {err}",
+            state.join("coord-addr").display()
+        )
+    })?;
+    fs::write(state.join("coord-name"), format!("{name}\n")).map_err(|err| {
+        format!(
+            "The file {} was not written. {err}",
+            state.join("coord-name").display()
+        )
+    })?;
+    Ok(())
 }
 
 fn stored_coord_name(state: &std::path::Path) -> Result<String, String> {
@@ -407,6 +450,9 @@ The coordinator SVID is spiffe://orblx.local/coord/{name}.
 An enroll token is one use.
 The command writes the token only to --out.
 The command does not print the token.
+ORBLX_SVID_TTL sets the node leaf life in seconds.
+The default life is 900 seconds.
+The enroll command stores the coordinator address in the state directory.
 The default policy file is DIR/policy.hujson.
 A failed policy test keeps the last good policy.
 The coordinator logs one error line for that failure.
