@@ -1,6 +1,8 @@
 "use strict";
 
-const STEP_MS = 480;
+const RUN_MS = 35000;
+const STEP_MIN = 800;
+const STEP_MAX = 4000;
 const LEVEL_TITLE = {
   city_breeze: "City Breeze",
   agent_jit: "Agent JIT",
@@ -11,19 +13,73 @@ const PLAY_BUTTON = {
   agent_jit: "play-agent",
   radioactive_nat: "play-hard",
 };
+const BLURB_FOR = {
+  easy: "blurb-easy",
+  medium: "blurb-medium",
+  hard: "blurb-hard",
+};
+const NEXT_DIFFICULTY = {
+  city_breeze: "medium",
+  agent_jit: "hard",
+};
 const RESET_KINDS = {
   difficulty_selected: true,
   level_selected: true,
   smash_udp_block: true,
   smash_agent_spawn: true,
 };
+const BREAK_KINDS = {
+  difficulty_selected: true,
+  level_selected: true,
+  smash_udp_block: true,
+  smash_agent_spawn: true,
+  smash_revoke: true,
+};
+const FIELD_KEYS = [
+  "kind",
+  "seq",
+  "ts_ms",
+  "source",
+  "level",
+  "difficulty",
+  "session_id",
+  "path",
+  "ok",
+  "hop",
+  "mode",
+  "host",
+  "status",
+  "reason",
+  "peer_uri",
+  "within_s",
+  "rtt_ms",
+  "ticket_hash",
+  "overlay_ip",
+  "from",
+  "to",
+  "frame_type",
+  "flags",
+  "ipv4_len",
+  "bytes",
+  "detail",
+];
+const NODE_IDS = ["node-spoke", "node-hub", "app-a", "app-b", "node-relay"];
 
 let lastPayload = "";
 let seenSeq = 0;
 let inflight = false;
 let busy = false;
+let booted = false;
+let pacePending = false;
+let stepMs = STEP_MIN;
+let runTotal = 0;
+let runDone = 0;
+let inspectTarget = "";
+let runResult = null;
 const seenFeed = new Set();
 const queue = [];
+const bootBuffer = [];
+const lastByNode = {};
 
 function showError(message) {
   document.getElementById("error").textContent = message;
@@ -66,6 +122,7 @@ async function loadState() {
     }
     clearError();
     render(state);
+    finishBoot();
   } catch (error) {
     showError(error.message || "The harness request failed.");
   }
@@ -104,6 +161,7 @@ function render(state) {
     renderAudit(state.audit);
     renderLevels(state.levels);
     renderDifficulties(state.difficulties);
+    renderCurve(state.difficulties, state.fault_detail);
     document.getElementById("hook").textContent = state.fault_detail;
     renderSession(state.session);
     renderSteps(state.levels);
@@ -128,10 +186,34 @@ function markSelected(state) {
     const on = id === selected;
     button.className = on ? "choice selected" : "choice";
     button.setAttribute("aria-pressed", on ? "true" : "false");
+    button.parentElement.dataset.selected = on ? "true" : "false";
   }
   if (selected && LEVEL_TITLE[selected]) {
     document.getElementById("level-name").textContent = LEVEL_TITLE[selected];
+    document.getElementById("game").dataset.level = selected;
   }
+}
+
+function renderCurve(items, faultDetail) {
+  const root = document.getElementById("curve");
+  root.replaceChildren();
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    const step = document.createElement("li");
+    step.className = item.selected ? "step selected" : "step";
+    step.dataset.difficulty = item.id;
+    step.style.setProperty("--rank", String(index + 1));
+    step.textContent = item.label;
+    if (item.selected) {
+      step.setAttribute("aria-current", "step");
+    }
+    root.append(step);
+    const blurb = document.getElementById(BLURB_FOR[item.id]);
+    if (blurb && item.note) {
+      blurb.textContent = item.note;
+    }
+  }
+  document.getElementById("fault-line").textContent = faultDetail;
 }
 
 function ingestState(state) {
@@ -140,22 +222,83 @@ function ingestState(state) {
   }
 }
 
-function ingest(raw) {
+function parseFeed(raw) {
   if (typeof raw !== "string" || seenFeed.has(raw)) {
-    return;
+    return null;
   }
   let body;
   try {
     body = JSON.parse(raw);
   } catch (error) {
-    return;
+    return null;
   }
   if (!body || body.v !== 1 || typeof body.kind !== "string") {
-    return;
+    return null;
   }
   seenFeed.add(raw);
+  return body;
+}
+
+function ingest(raw) {
+  const body = parseFeed(raw);
+  if (!body) {
+    return;
+  }
+  if (!booted) {
+    bootBuffer.push(body);
+    return;
+  }
+  enqueue(body);
+}
+
+function finishBoot() {
+  if (booted) {
+    return;
+  }
+  booted = true;
+  const fresh = bootBuffer.splice(0, bootBuffer.length);
+  let start = 0;
+  for (let index = 0; index < fresh.length; index += 1) {
+    if (RESET_KINDS[fresh[index].kind]) {
+      start = index;
+    }
+  }
+  for (let index = 0; index < start; index += 1) {
+    applyFeed(fresh[index]);
+  }
+  for (let index = start; index < fresh.length; index += 1) {
+    enqueue(fresh[index]);
+  }
+}
+
+function enqueue(body) {
+  if (BREAK_KINDS[body.kind]) {
+    queue.splice(0, queue.length);
+    runDone = 0;
+    runResult = null;
+    document.getElementById("endcard").hidden = true;
+  }
   queue.push(body);
-  pump();
+  schedulePace();
+}
+
+function schedulePace() {
+  if (pacePending) {
+    return;
+  }
+  pacePending = true;
+  window.setTimeout(function () {
+    pacePending = false;
+    if (queue.length > 0) {
+      const raw = Math.round(RUN_MS / queue.length);
+      stepMs = Math.max(STEP_MIN, Math.min(STEP_MAX, raw));
+      runTotal = runDone + queue.length;
+      updateBar();
+    }
+    if (!busy) {
+      pump();
+    }
+  }, 0);
 }
 
 function pump() {
@@ -164,14 +307,37 @@ function pump() {
   }
   const next = queue.shift();
   if (!next) {
+    showEnd();
     return;
   }
   busy = true;
   applyFeed(next);
+  runDone += 1;
+  if (runTotal < runDone) {
+    runTotal = runDone;
+  }
+  updateBar();
   window.setTimeout(function () {
     busy = false;
     pump();
-  }, STEP_MS);
+  }, stepMs);
+}
+
+function updateBar() {
+  const bar = document.getElementById("runbar");
+  const label = document.getElementById("run-count");
+  if (runTotal <= 0) {
+    bar.max = 1;
+    bar.value = 0;
+    bar.textContent = "Feed 0 of 0";
+    label.textContent = "";
+    return;
+  }
+  bar.max = runTotal;
+  bar.value = runDone;
+  const text = "Feed " + String(runDone) + " of " + String(runTotal);
+  bar.textContent = text;
+  label.textContent = text;
 }
 
 function applyFeed(body) {
@@ -183,13 +349,17 @@ function applyFeed(body) {
   game.dataset.kind = body.kind;
   if (LEVEL_TITLE[body.level]) {
     document.getElementById("level-name").textContent = LEVEL_TITLE[body.level];
+    game.dataset.level = body.level;
   }
   document.getElementById("beat").textContent = beatText(body);
   pushTape(body);
   applyIdentity(body);
   applyPath(body);
   applyApps(body);
-  applyPacket(body);
+  paintNodes(body);
+  placeMarker(laneFor(body), labelFor(body));
+  remember(body);
+  noteResult(body);
 }
 
 function beatText(body) {
@@ -267,12 +437,21 @@ function resetBoard() {
   document.getElementById("relay-status").textContent = "Idle";
   setApp("app-a", "idle", "Waiting");
   setApp("app-b", "idle", "Waiting");
+  for (let index = 0; index < NODE_IDS.length; index += 1) {
+    setNode(NODE_IDS[index], "idle");
+  }
   const packet = document.getElementById("packet");
   packet.className = "packet idle";
   packet.hidden = true;
+  const floatLabel = document.getElementById("float-label");
+  floatLabel.className = "float-label";
+  floatLabel.hidden = true;
+  floatLabel.textContent = "";
   const clear = document.getElementById("clear");
   clear.hidden = true;
   clear.textContent = "";
+  runResult = null;
+  document.getElementById("endcard").hidden = true;
 }
 
 function setChip(id, state, text) {
@@ -281,12 +460,24 @@ function setChip(id, state, text) {
   chip.textContent = text;
 }
 
+function setNode(id, state) {
+  const node = document.getElementById(id);
+  node.dataset.state = state;
+  document.getElementById(id + "-state").textContent = state;
+  if (id === "node-relay") {
+    node.dataset.lit = state === "up" ? "true" : "false";
+  }
+}
+
 function setPath(mode, label) {
   document.getElementById("mesh-link").dataset.mode = mode;
   const path = document.getElementById("path-state");
   path.dataset.mode = mode;
   path.textContent = label;
-  document.getElementById("node-relay").dataset.lit = mode === "relay" ? "true" : "false";
+  const relay = document.getElementById("node-relay");
+  if (mode === "relay" && relay.dataset.state !== "down" && relay.dataset.state !== "revoked") {
+    setNode("node-relay", "up");
+  }
 }
 
 function setApp(id, acl, text) {
@@ -402,30 +593,360 @@ function applyApps(body) {
   }
 }
 
-function applyPacket(body) {
-  let lane = "";
-  const text = typeof body.detail === "string" ? body.detail : "";
-  if (body.kind === "frame_rx" || text.indexOf("came back") !== -1) {
-    lane = "spoke";
-  } else if (text.indexOf("app-b.orblx.test") !== -1) {
-    lane = "b";
-  } else if (text.indexOf("app-a.orblx.test") !== -1) {
-    lane = "a";
-  } else if (body.kind === "frame_tx" && text.indexOf("ping") !== -1) {
-    lane = "hub";
-  } else if (body.kind === "frame_tx") {
-    lane = "hub";
-  } else if (body.kind === "path.relay" || body.kind === "relay.hop" || (body.kind === "path.up" && body.path === "relay")) {
-    lane = "relay";
-  } else if (body.kind === "path.direct" && body.ok === false) {
-    lane = "hub";
+function paintNodes(body) {
+  const kind = body.kind;
+  if (kind === "svid.issued" || kind === "agent.spawned" || kind === "ticket.verified") {
+    const spoke = document.getElementById("node-spoke");
+    if (spoke.dataset.state === "idle") {
+      setNode("node-spoke", "up");
+    }
   }
+  if (kind === "svid.issued" || kind === "agent.spawned") {
+    setNode("node-spoke", "up");
+  }
+  if (kind === "svid.expired") {
+    setNode("node-spoke", "down");
+  }
+  if (kind === "svid.revoked") {
+    setNode("node-spoke", "revoked");
+  }
+  if (kind === "session.dropped") {
+    const spoke = document.getElementById("node-spoke");
+    if (spoke.dataset.state !== "revoked") {
+      setNode("node-spoke", "down");
+    }
+    setNode("node-hub", "down");
+  }
+  if (kind === "quic_hello" || kind === "session_up") {
+    setNode("node-hub", "up");
+  }
+  if (kind === "path.direct") {
+    setNode("node-hub", body.ok === true ? "up" : "degraded");
+  }
+  if (kind === "nat.inject" || kind === "nat.probe" || kind === "path.switch") {
+    setNode("node-hub", "degraded");
+  }
+  if (kind === "path.down") {
+    setNode("node-hub", "down");
+    if (body.reason === "revoked") {
+      setNode("node-relay", "down");
+    }
+  }
+  if (kind === "path.up") {
+    setNode("node-hub", "up");
+    if (body.path === "relay") {
+      setNode("node-relay", "up");
+    }
+  }
+  if (kind === "path.relay" || kind === "relay.hop") {
+    setNode("node-relay", body.ok === false ? "degraded" : "up");
+  }
+  if (kind === "session_down") {
+    if (body.reason === "destination") {
+      setNode("app-b", "down");
+    } else if (body.reason === "expired") {
+      setNode("node-spoke", "down");
+      setNode("node-hub", "down");
+    } else if (body.reason === "revoked") {
+      setNode("node-spoke", "revoked");
+      setNode("node-hub", "down");
+      setNode("node-relay", "down");
+    } else {
+      setNode("node-hub", "down");
+    }
+  }
+  const host = namedHost(body);
+  if (kind === "connector_https" && host.length > 0) {
+    const bad = typeof body.status === "number" && body.status >= 400;
+    setNode(host, bad ? "down" : "up");
+  }
+  if (kind === "jit.allow" && host.length > 0) {
+    setNode(host, "up");
+  }
+  if (kind === "jit.deny" && host.length > 0) {
+    setNode(host, "down");
+  }
+}
+
+function laneFor(body) {
+  const text = typeof body.detail === "string" ? body.detail : "";
+  const host = namedHost(body);
+  if (host === "app-b" || (body.kind === "session_down" && body.reason === "destination")) {
+    return "b";
+  }
+  if (host === "app-a") {
+    return "a";
+  }
+  if (body.kind === "frame_rx" || text.indexOf("came back") !== -1) {
+    return "spoke";
+  }
+  if (
+    body.kind === "path.relay" ||
+    body.kind === "relay.hop" ||
+    (body.kind === "path.up" && body.path === "relay") ||
+    body.kind === "path.allocate"
+  ) {
+    return "relay";
+  }
+  if (
+    body.kind === "svid.issued" ||
+    body.kind === "svid.revoked" ||
+    body.kind === "svid.expired" ||
+    body.kind === "agent.spawned" ||
+    body.kind === "ticket.verified" ||
+    body.kind === "session.dropped"
+  ) {
+    return "spoke";
+  }
+  if (
+    body.kind === "quic_hello" ||
+    body.kind === "frame_tx" ||
+    body.kind === "path.direct" ||
+    body.kind === "path.switch" ||
+    body.kind === "path.down" ||
+    body.kind === "path.up" ||
+    body.kind === "nat.inject" ||
+    body.kind === "nat.probe" ||
+    body.kind === "session_up" ||
+    body.kind === "session_down"
+  ) {
+    return "hub";
+  }
+  return "";
+}
+
+function labelFor(body) {
+  const kind = body.kind;
+  if (kind === "ticket.verified") {
+    return "ticket";
+  }
+  if (kind.indexOf("svid.") === 0 || kind === "agent.spawned") {
+    return "SVID";
+  }
+  if (kind === "path.direct") {
+    return "Direct";
+  }
+  if (kind === "path.relay" || kind === "relay.hop" || (kind === "path.up" && body.path === "relay")) {
+    return "Relay";
+  }
+  if (kind === "jit.allow") {
+    return "Allow";
+  }
+  if (kind === "jit.deny") {
+    return "Deny";
+  }
+  if (kind === "nat.inject" && body.mode) {
+    return String(body.mode);
+  }
+  if (kind === "connector_https") {
+    const status = body.status !== undefined ? " " + String(body.status) : "";
+    return (body.host || kind) + status;
+  }
+  if (kind === "path.switch" && body.from && body.to) {
+    return String(body.from) + " to " + String(body.to);
+  }
+  if (kind === "path.allocate" && body.overlay_ip) {
+    return String(body.overlay_ip);
+  }
+  if (kind === "session_up" || kind === "session_down" || kind === "session.dropped") {
+    return body.reason ? kind + " " + String(body.reason) : kind;
+  }
+  if (kind === "quic_hello" || kind === "frame_tx" || kind === "frame_rx" || kind === "path.down" || kind === "nat.probe") {
+    return kind;
+  }
+  return "";
+}
+
+function placeMarker(lane, label) {
+  const packet = document.getElementById("packet");
+  const floatLabel = document.getElementById("float-label");
   if (lane.length === 0) {
     return;
   }
-  const packet = document.getElementById("packet");
   packet.hidden = false;
   packet.className = "packet at-" + lane;
+  if (label.length === 0) {
+    floatLabel.hidden = true;
+    floatLabel.textContent = "";
+    return;
+  }
+  floatLabel.hidden = false;
+  floatLabel.className = "float-label at-" + lane;
+  floatLabel.textContent = label;
+}
+
+function targetsFor(body) {
+  const targets = [];
+  const kind = body.kind;
+  if (
+    kind.indexOf("svid.") === 0 ||
+    kind === "agent.spawned" ||
+    kind === "ticket.verified" ||
+    kind === "session.dropped"
+  ) {
+    targets.push("node-spoke");
+  }
+  if (
+    kind === "quic_hello" ||
+    kind === "path.direct" ||
+    kind === "path.switch" ||
+    kind === "path.down" ||
+    kind === "path.up" ||
+    kind === "path.allocate" ||
+    kind === "nat.inject" ||
+    kind === "nat.probe" ||
+    kind === "session_up" ||
+    kind === "session_down" ||
+    kind === "frame_tx" ||
+    kind === "frame_rx"
+  ) {
+    targets.push("node-hub");
+  }
+  if (
+    kind === "path.relay" ||
+    kind === "relay.hop" ||
+    (kind === "path.up" && body.path === "relay") ||
+    (kind === "path.down" && body.reason === "revoked")
+  ) {
+    targets.push("node-relay");
+  }
+  const host = namedHost(body);
+  if (host.length > 0) {
+    targets.push(host);
+  }
+  if (kind === "session_down" && body.reason === "destination") {
+    targets.push("app-b");
+  }
+  return targets;
+}
+
+function remember(body) {
+  const targets = targetsFor(body);
+  targets.push("inspect-path");
+  for (let index = 0; index < targets.length; index += 1) {
+    lastByNode[targets[index]] = body;
+  }
+  if (inspectTarget.length > 0 && targets.indexOf(inspectTarget) !== -1) {
+    renderInspector();
+  }
+}
+
+function renderInspector() {
+  const target = document.getElementById("inspect-target");
+  const fields = document.getElementById("inspect-fields");
+  fields.replaceChildren();
+  if (inspectTarget.length === 0) {
+    target.textContent = "Click a node or the path.";
+    return;
+  }
+  let name = "Path";
+  let state = document.getElementById("path-state").dataset.mode || "idle";
+  if (inspectTarget !== "inspect-path") {
+    const node = document.getElementById(inspectTarget);
+    const heading = node.querySelector(".node-title");
+    name = heading ? heading.textContent : inspectTarget;
+    state = node.dataset.state || "idle";
+  }
+  target.textContent = name + " " + state;
+  const body = lastByNode[inspectTarget];
+  if (!body) {
+    return;
+  }
+  for (let index = 0; index < FIELD_KEYS.length; index += 1) {
+    const key = FIELD_KEYS[index];
+    if (body[key] === undefined) {
+      continue;
+    }
+    const term = document.createElement("dt");
+    term.textContent = key;
+    const value = document.createElement("dd");
+    value.textContent = String(body[key]);
+    fields.append(term, value);
+  }
+}
+
+function selectInspect(id) {
+  inspectTarget = id;
+  const buttons = document.querySelectorAll(".node, #inspect-path");
+  for (let index = 0; index < buttons.length; index += 1) {
+    const button = buttons[index];
+    button.setAttribute("aria-pressed", button.id === id ? "true" : "false");
+  }
+  renderInspector();
+}
+
+function classify(body) {
+  if (body.kind === "session_down" && body.reason === "destination") {
+    return "";
+  }
+  if (body.kind === "session_up" || body.kind === "path.up" || body.kind === "svid.expired") {
+    return "win";
+  }
+  if (body.kind === "session_down" && body.reason === "expired") {
+    return "win";
+  }
+  if (body.kind === "svid.revoked" || body.kind === "session.dropped") {
+    return "loss";
+  }
+  if (body.kind === "session_down" && body.reason === "revoked") {
+    return "loss";
+  }
+  if (body.kind === "path.down" && body.reason === "revoked") {
+    return "loss";
+  }
+  if (body.kind === "path.direct" && body.ok === false) {
+    return "loss";
+  }
+  return "";
+}
+
+function quip(body) {
+  if (body.kind === "session_up") {
+    return "The session is up. Watching was enough.";
+  }
+  if (body.kind === "svid.expired" || (body.kind === "session_down" && body.reason === "expired")) {
+    return "The ticket got old on purpose.";
+  }
+  if (body.kind === "path.up") {
+    return "The direct path failed. The Relay path is up.";
+  }
+  if (body.kind === "svid.revoked" || body.kind === "session.dropped" || body.reason === "revoked") {
+    return "Revoke won. The mesh can try the next level.";
+  }
+  if (body.kind === "path.direct" && body.ok === false) {
+    return "Direct is not ok. Wait for the next feed line.";
+  }
+  return "";
+}
+
+function noteResult(body) {
+  const tone = classify(body);
+  if (tone.length === 0) {
+    return;
+  }
+  runResult = { tone: tone, body: body };
+}
+
+function showEnd() {
+  if (!runResult) {
+    return;
+  }
+  const card = document.getElementById("endcard");
+  document.getElementById("end-tone").textContent = runResult.tone === "win" ? "Soft win" : "Soft loss";
+  const line = quip(runResult.body);
+  const detail = beatText(runResult.body);
+  document.getElementById("end-copy").textContent = line.length > 0 ? line + " " + detail : detail;
+  card.hidden = false;
+}
+
+function nextLevel() {
+  const level = document.getElementById("game").dataset.level;
+  const difficulty = NEXT_DIFFICULTY[level];
+  if (difficulty) {
+    postJson("/api/difficulty", difficulty);
+    return;
+  }
+  startOidcLogin();
 }
 
 function renderLevels(levels) {
@@ -668,6 +1189,7 @@ document.getElementById("smash-udp-block").addEventListener("click", function ()
 document.getElementById("smash-agent-spawn").addEventListener("click", function () {
   postJson("/api/smash", "agent_spawn");
 });
+document.getElementById("next-level").addEventListener("click", nextLevel);
 document.getElementById("eng-toggle").addEventListener("click", function () {
   const eng = document.getElementById("eng");
   const open = eng.hasAttribute("hidden");
@@ -677,6 +1199,15 @@ document.getElementById("eng-toggle").addEventListener("click", function () {
     eng.setAttribute("hidden", "");
   }
   this.setAttribute("aria-pressed", open ? "true" : "false");
+});
+for (let index = 0; index < NODE_IDS.length; index += 1) {
+  const id = NODE_IDS[index];
+  document.getElementById(id).addEventListener("click", function () {
+    selectInspect(id);
+  });
+}
+document.getElementById("inspect-path").addEventListener("click", function () {
+  selectInspect("inspect-path");
 });
 
 loadState();

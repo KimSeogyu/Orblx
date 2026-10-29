@@ -492,6 +492,17 @@ mod tests {
         assert!(APP_JS.contains("/oidc/authorize"));
         assert!(APP_JS.contains("/oidc/callback"));
         assert!(INDEX_HTML.contains("mock IdP"));
+        assert!(INDEX_HTML.contains("id=\"curve\""));
+        assert!(INDEX_HTML.contains("id=\"runbar\""));
+        assert!(INDEX_HTML.contains("id=\"inspector\""));
+        assert!(INDEX_HTML.contains("id=\"toolbox\""));
+        assert!(INDEX_HTML.contains("id=\"endcard\""));
+        assert!(INDEX_HTML.contains("Next Level"));
+        assert!(INDEX_HTML.contains("data-state=\"idle\""));
+        assert!(APP_JS.contains("RUN_MS = 35000"));
+        assert!(APP_JS.contains("Soft win"));
+        assert!(APP_JS.contains("Soft loss"));
+        assert!(!APP_JS.contains("@keyframes"));
     }
 
     #[tokio::test]
