@@ -9,6 +9,7 @@ use crate::netmap::{
 };
 use crate::proto::{self, Request, Response};
 use crate::state::{read_node_material, EnrollResult, NetmapView, NodeMaterial};
+use crate::ticket::{decode_ticket_wire, IssuedTicket};
 use crate::tlsutil::{self, ClientTls};
 
 /// Enroll with a one-use token.
@@ -241,6 +242,116 @@ pub fn renew_svid_blocking(
 /// Fetch a fresh netmap with the stored node SVID.
 ///
 /// Call this function outside a Tokio runtime.
+/// Call one admin operation with the node SVID in `state_dir`.
+///
+/// The coordinator accepts the call only when that SVID is an owner.
+/// The caller must not log the returned document when it can hold a secret.
+/// Admin documents do not hold secrets.
+pub fn admin_blocking(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+    op: &str,
+    name: &str,
+) -> Result<String, CoordError> {
+    block_on(admin_call(
+        coord, coord_name, bundle_pem, state_dir, op, name,
+    ))
+}
+
+/// Fetch the deny document with the node SVID in `state_dir`.
+pub fn fetch_deny_blocking(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+) -> Result<String, CoordError> {
+    block_on(fetch_deny(coord, coord_name, bundle_pem, state_dir))
+}
+
+async fn admin_call(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+    op: &str,
+    name: &str,
+) -> Result<String, CoordError> {
+    let material = read_node_material(state_dir)?;
+    let request = Request {
+        op: op.to_string(),
+        name: name.to_string(),
+        token: None,
+        id_token: None,
+        nonce: None,
+        endpoints: Vec::new(),
+        routes: Vec::new(),
+    };
+    authed_detail(coord, coord_name, bundle_pem, material, request).await
+}
+
+async fn fetch_deny(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+) -> Result<String, CoordError> {
+    let material = read_node_material(state_dir)?;
+    let request = Request {
+        op: "deny".to_string(),
+        name: material.name.clone(),
+        token: None,
+        id_token: None,
+        nonce: None,
+        endpoints: Vec::new(),
+        routes: Vec::new(),
+    };
+    authed_detail(coord, coord_name, bundle_pem, material, request).await
+}
+
+async fn authed_detail(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    material: NodeMaterial,
+    request: Request,
+) -> Result<String, CoordError> {
+    let expect_coord = SpiffeId::coord(coord_name)?;
+    let client_tls = ClientTls {
+        trust_pem: bundle_pem.to_string(),
+        expect_coord,
+        certificate_pem: Some(material.certificate_pem),
+        private_key_pem: Some(material.private_key_pem),
+    };
+    let endpoint =
+        tlsutil::client_endpoint(&client_tls, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
+    let connecting = endpoint
+        .connect(coord, tlsutil::SERVER_NAME)
+        .map_err(|err| CoordError::Tls(format!("connect: {err}")))?;
+    let connection = connecting
+        .await
+        .map_err(|err| CoordError::Tls(format!("handshake: {err}")))?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|err| CoordError::Tls(format!("open: {err}")))?;
+    proto::write_json(&mut send, &request).await?;
+    let _ = send.finish();
+    let response: Response = proto::read_json(&mut recv).await?;
+    connection.close(quinn::VarInt::from_u32(0), b"done");
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.wait_idle()).await;
+    if !response.ok {
+        let text = response
+            .error
+            .unwrap_or_else(|| "The coordinator request failed.".to_string());
+        return Err(CoordError::Protocol(text));
+    }
+    response
+        .detail
+        .ok_or_else(|| CoordError::Protocol("The coordinator request failed.".to_string()))
+}
+
 pub fn fetch_netmap_blocking(
     coord: SocketAddr,
     coord_name: &str,
@@ -298,6 +409,15 @@ fn enroll_from_response(
             .unwrap_or_else(|| "The coordinator request failed.".to_string());
         return Err(CoordError::Protocol(text));
     }
+    let ticket = ticket_from_parts(
+        response.ticket_hex.clone(),
+        response.ticket_mac_hex.clone(),
+        response.ticket_verifier_pem.clone(),
+        response.ticket_mac_key_hex.clone(),
+        response.ticket_not_before,
+        response.ticket_not_after,
+        response.svid_ca_pub_hex.clone(),
+    )?;
     let signed = response
         .netmap
         .ok_or_else(|| CoordError::Protocol("The netmap is not valid.".to_string()))?;
@@ -357,7 +477,41 @@ fn enroll_from_response(
         endpoints,
         approved_routes: response.approved_routes.unwrap_or_default(),
         advertised_routes: response.advertised_routes.unwrap_or_default(),
+        ticket,
     })
+}
+
+fn ticket_from_parts(
+    ticket_hex: Option<String>,
+    mac: Option<String>,
+    verifier: Option<String>,
+    mac_key: Option<String>,
+    not_before: Option<u64>,
+    not_after: Option<u64>,
+    ca: Option<String>,
+) -> Result<Option<IssuedTicket>, CoordError> {
+    let Some(ticket_hex) = ticket_hex else {
+        return Ok(None);
+    };
+    let mac = mac.ok_or_else(|| CoordError::Protocol("The ticket is not valid.".to_string()))?;
+    let verifier =
+        verifier.ok_or_else(|| CoordError::Protocol("The ticket is not valid.".to_string()))?;
+    let mac_key =
+        mac_key.ok_or_else(|| CoordError::Protocol("The ticket is not valid.".to_string()))?;
+    let not_before =
+        not_before.ok_or_else(|| CoordError::Protocol("The ticket is not valid.".to_string()))?;
+    let not_after =
+        not_after.ok_or_else(|| CoordError::Protocol("The ticket is not valid.".to_string()))?;
+    let ca = ca.ok_or_else(|| CoordError::Protocol("The ticket is not valid.".to_string()))?;
+    Ok(Some(decode_ticket_wire(
+        &ticket_hex,
+        &mac,
+        &verifier,
+        &mac_key,
+        not_before,
+        not_after,
+        &ca,
+    )?))
 }
 
 pub fn netmap_json(signed: &SignedNetmap) -> Result<String, CoordError> {

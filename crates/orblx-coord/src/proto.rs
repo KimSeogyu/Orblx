@@ -21,7 +21,7 @@ pub struct Request {
     pub routes: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct Response {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -44,6 +44,22 @@ pub struct Response {
     pub approved_routes: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advertised_routes: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_mac_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_verifier_pem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_mac_key_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_not_before: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_not_after: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svid_ca_pub_hex: Option<String>,
 }
 
 impl std::fmt::Debug for Response {

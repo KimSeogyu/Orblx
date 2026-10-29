@@ -42,10 +42,10 @@ pub use direct::{
 pub use error::EdgeError;
 pub use lab::{run_edge_smoke, SmokeReport};
 pub use nat_feed::{
-    nat_inject_armed, NatDifficulty, NatEventLog, NatInjectMode, NatLevel, PathKind, PhaseName,
-    KIND_NAT_INJECT, KIND_NAT_PROBE, KIND_PATH_ALLOCATE, KIND_PATH_DIRECT, KIND_PATH_DOWN,
-    KIND_PATH_RELAY, KIND_PATH_SWITCH, KIND_PATH_UP, KIND_RELAY_HOP, LAB_OVERLAY_IP,
-    NAT_EVENT_VERSION, NAT_FEED_SOURCE,
+    nat_inject_armed, NatDifficulty, NatEventLog, NatInjectMode, NatKind, NatLevel, PathKind,
+    PhaseName, KIND_NAT_INJECT, KIND_NAT_PROBE, KIND_PATH_ALLOCATE, KIND_PATH_DIRECT,
+    KIND_PATH_DOWN, KIND_PATH_RELAY, KIND_PATH_SWITCH, KIND_PATH_UP, KIND_RELAY_HOP,
+    LAB_OVERLAY_IP, NAT_EVENT_VERSION, NAT_FEED_SOURCE,
 };
 pub use nat_smash::{run_nat_smash, NatSmash, NatSmashReport};
 pub use path::{

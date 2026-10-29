@@ -176,6 +176,15 @@ impl RelayServer {
         *lock_mutex(&self.shared.stats)
     }
 
+    /// Return a reader for the counters.
+    ///
+    /// The metrics listener calls the reader.
+    #[must_use]
+    pub fn stats_reader(&self) -> Arc<dyn Fn() -> RelayStats + Send + Sync> {
+        let shared = Arc::clone(&self.shared);
+        Arc::new(move || *lock_mutex(&shared.stats))
+    }
+
     /// Stop the listen loops and wait for them.
     pub fn shutdown(&mut self) {
         self.shared.stop.store(true, Ordering::Relaxed);
