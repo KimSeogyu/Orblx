@@ -327,6 +327,7 @@ fn node_request(
         accept_routes: false,
         forward_routes: Vec::new(),
         visibility: Arc::new(AllowPeers),
+        on_ready: None,
     }
 }
 

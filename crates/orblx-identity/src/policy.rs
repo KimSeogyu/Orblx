@@ -1,11 +1,14 @@
-//! HuJSON policy for groups, tags, receiver grants, and subnet route approval.
+//! HuJSON policy for groups, tags, receiver grants, subnet route approval, and SSH.
 //!
 //! The file is JSON with `//` comments, `/* */` comments, and trailing commas.
 //! A rule names a source, a destination, and a port.
 //! The default is deny.
 //! An agent source needs one host, one protocol, and one port.
 //! A human source may use a group, a tag, and a port range.
+//! `ssh` names a source, a destination, the login users, and a check period.
+//! An agent SSH source needs one destination and one user.
 //! `tests` lists allow and deny assertions.
+//! `sshTests` lists SSH allow and deny assertions.
 //! A failed assertion rejects the file.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -191,12 +194,59 @@ struct RouteRule {
     exact: bool,
 }
 
+/// One SSH allow or deny assertion from a loaded policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshAssertion {
+    /// Source SPIFFE ID.
+    pub src: String,
+    /// Destination SPIFFE ID.
+    pub dst: String,
+    /// Login name.
+    pub user: String,
+    /// True when the policy allows the session.
+    pub allow: bool,
+    /// Check period in seconds.
+    ///
+    /// A deny assertion uses 0.
+    pub check_period: u64,
+}
+
+impl SshAssertion {
+    /// Return one short result line.
+    #[must_use]
+    pub fn line(&self) -> String {
+        let verb = if self.allow { "allow" } else { "deny" };
+        format!(
+            "{verb} ssh {} {} {} {}",
+            self.src, self.user, self.dst, self.check_period
+        )
+    }
+}
+
 /// A loaded policy whose inline tests passed.
 #[derive(Clone)]
 pub struct Policy {
     grants: Vec<CompiledGrant>,
     tests: Vec<StoredTest>,
     routes: Vec<RouteRule>,
+    ssh: Vec<SshGrant>,
+    ssh_tests: Vec<StoredSshTest>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SshGrant {
+    src: SpiffeId,
+    dst: SpiffeId,
+    user: String,
+    check_period: u64,
+}
+
+#[derive(Clone)]
+struct StoredSshTest {
+    src: SpiffeId,
+    dst: SpiffeId,
+    user: String,
+    allow: bool,
 }
 
 impl std::fmt::Debug for Policy {
@@ -206,6 +256,7 @@ impl std::fmt::Debug for Policy {
             .field("grants", &self.grants.len())
             .field("tests", &self.tests.len())
             .field("routes", &self.routes.len())
+            .field("ssh", &self.ssh.len())
             .finish()
     }
 }
@@ -220,6 +271,8 @@ impl Policy {
             grants: Vec::new(),
             tests: Vec::new(),
             routes: Vec::new(),
+            ssh: Vec::new(),
+            ssh_tests: Vec::new(),
         }
     }
 
@@ -341,6 +394,44 @@ impl Policy {
         }
         lines
     }
+
+    /// Return the SSH check period in seconds when the session is allowed.
+    ///
+    /// The default is deny.
+    /// Two matching rules use the shorter period.
+    #[must_use]
+    pub fn ssh_check_period(&self, src: &SpiffeId, dst: &SpiffeId, user: &str) -> Option<u64> {
+        self.ssh
+            .iter()
+            .filter(|grant| grant.src == *src && grant.dst == *dst && grant.user == user)
+            .map(|grant| grant.check_period)
+            .min()
+    }
+
+    /// Return the inline SSH assertions.
+    ///
+    /// The assertions passed when [`Policy::from_hujson`] returned this value.
+    #[must_use]
+    pub fn ssh_assertions(&self) -> Vec<SshAssertion> {
+        self.ssh_tests
+            .iter()
+            .map(|test| {
+                let check_period = if test.allow {
+                    self.ssh_check_period(&test.src, &test.dst, &test.user)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                SshAssertion {
+                    src: test.src.as_uri().to_string(),
+                    dst: test.dst.as_uri().to_string(),
+                    user: test.user.clone(),
+                    allow: test.allow,
+                    check_period,
+                }
+            })
+            .collect()
+    }
 }
 
 impl Policy {
@@ -357,8 +448,29 @@ impl Policy {
                 }
             }
         }
+        for test in &self.ssh_tests {
+            let allowed = self
+                .ssh_check_period(&test.src, &test.dst, &test.user)
+                .is_some();
+            if allowed != test.allow {
+                return Err(ssh_test_failure(
+                    &test.src, &test.dst, &test.user, test.allow,
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+fn ssh_test_failure(src: &SpiffeId, dst: &SpiffeId, user: &str, expect_allow: bool) -> PolicyError {
+    let outcome = if expect_allow { "denied" } else { "allowed" };
+    let expect = if expect_allow { "allow" } else { "deny" };
+    PolicyError::new(format!(
+        "The SSH policy test failed. The source {} to {} as user {} is {outcome}. The test expects an {expect}.",
+        src.as_uri(),
+        dst.as_uri(),
+        safe_label(user)
+    ))
 }
 
 fn test_failure(
@@ -395,6 +507,29 @@ struct PolicyFile {
     route_approvals: Vec<RouteApprovalFile>,
     #[serde(default)]
     tests: Vec<TestFile>,
+    #[serde(default)]
+    ssh: Vec<SshRuleFile>,
+    #[serde(default, rename = "sshTests")]
+    ssh_tests: Vec<SshTestFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SshRuleFile {
+    src: Vec<String>,
+    dst: Vec<String>,
+    users: Vec<String>,
+    #[serde(rename = "checkPeriod")]
+    check_period: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SshTestFile {
+    src: String,
+    dst: String,
+    user: String,
+    action: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -518,11 +653,161 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
         tests.push(compile_test(&catalog, test)?);
     }
     let routes = compile_routes(&catalog, file)?;
+    let ssh = compile_ssh(&catalog, &file.ssh)?;
+    let mut ssh_tests = Vec::new();
+    for test in &file.ssh_tests {
+        ssh_tests.push(compile_ssh_test(&catalog, test)?);
+    }
     Ok(Policy {
         grants,
         tests,
         routes,
+        ssh,
+        ssh_tests,
     })
+}
+
+fn compile_ssh(catalog: &Catalog, rules: &[SshRuleFile]) -> Result<Vec<SshGrant>, PolicyError> {
+    let mut grants = Vec::new();
+    for rule in rules {
+        if rule.src.is_empty() || rule.dst.is_empty() || rule.users.is_empty() {
+            return Err(PolicyError::new(
+                "The SSH rule needs a source, a destination, a user, and a check period.",
+            ));
+        }
+        let period = parse_check_period(&rule.check_period)?;
+        let mut users = Vec::new();
+        for user in &rule.users {
+            let name = parse_ssh_user(user)?;
+            if users.iter().any(|item: &String| item == &name) {
+                return Err(PolicyError::new("The SSH rule repeats a user."));
+            }
+            users.push(name);
+        }
+        for src_text in &rule.src {
+            let sources = expand(catalog, src_text)?;
+            for dst_text in &rule.dst {
+                let dests = expand(catalog, dst_text)?;
+                for src in &sources {
+                    let agent_broad = src.kind() == WorkloadKind::Agent
+                        && (sources.len() != 1
+                            || dests.len() != 1
+                            || users.len() != 1
+                            || rule.src.len() != 1
+                            || rule.dst.len() != 1
+                            || rule.users.len() != 1);
+                    if agent_broad {
+                        return Err(PolicyError::new(format!(
+                            "The agent {} needs one host and one user.",
+                            src.as_uri()
+                        )));
+                    }
+                    for dst in &dests {
+                        for user in &users {
+                            if grants.len() >= MAX_GRANTS {
+                                return Err(PolicyError::new("The policy has too many grants."));
+                            }
+                            grants.push(SshGrant {
+                                src: src.clone(),
+                                dst: dst.clone(),
+                                user: user.clone(),
+                                check_period: period,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    grants.sort_by(|left, right| {
+        (
+            left.src.as_uri(),
+            left.dst.as_uri(),
+            left.user.as_str(),
+            left.check_period,
+        )
+            .cmp(&(
+                right.src.as_uri(),
+                right.dst.as_uri(),
+                right.user.as_str(),
+                right.check_period,
+            ))
+    });
+    grants.dedup();
+    Ok(grants)
+}
+
+fn compile_ssh_test(catalog: &Catalog, test: &SshTestFile) -> Result<StoredSshTest, PolicyError> {
+    let allow = match test.action.as_str() {
+        "accept" => true,
+        "deny" => false,
+        _ => {
+            return Err(PolicyError::new(
+                "The SSH policy test action is accept or deny.",
+            ))
+        }
+    };
+    let user = parse_ssh_user(&test.user)?;
+    let sources = expand(catalog, &test.src)?;
+    let dests = expand(catalog, &test.dst)?;
+    let src = one_ssh_id(&sources, "source")?;
+    let dst = one_ssh_id(&dests, "destination")?;
+    Ok(StoredSshTest {
+        src,
+        dst,
+        user,
+        allow,
+    })
+}
+
+fn one_ssh_id(ids: &[SpiffeId], role: &str) -> Result<SpiffeId, PolicyError> {
+    if ids.len() != 1 {
+        return Err(PolicyError::new(format!(
+            "The SSH policy test {role} names one SPIFFE ID."
+        )));
+    }
+    Ok(ids[0].clone())
+}
+
+fn parse_ssh_user(text: &str) -> Result<String, PolicyError> {
+    let bytes = text.as_bytes();
+    let ok = !bytes.is_empty()
+        && bytes.len() <= 32
+        && bytes[0].is_ascii_lowercase()
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-' || *byte == b'_'
+        });
+    if !ok {
+        return Err(PolicyError::new(format!(
+            "The SSH user {} is not valid.",
+            safe_label(text)
+        )));
+    }
+    Ok(text.to_string())
+}
+
+fn parse_check_period(text: &str) -> Result<u64, PolicyError> {
+    let (number, unit) = text
+        .strip_suffix('s')
+        .map(|number| (number, 1u64))
+        .or_else(|| text.strip_suffix('m').map(|number| (number, 60u64)))
+        .ok_or_else(|| PolicyError::new("The SSH check period is not valid."))?;
+    if number.is_empty()
+        || (number.len() > 1 && number.starts_with('0'))
+        || !number.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(PolicyError::new("The SSH check period is not valid."));
+    }
+    let value: u64 = number
+        .parse()
+        .map_err(|_| PolicyError::new("The SSH check period is not valid."))?;
+    let seconds = value
+        .checked_mul(unit)
+        .ok_or_else(|| PolicyError::new("The SSH check period is not valid."))?;
+    if seconds == 0 || seconds > 24 * 60 * 60 {
+        return Err(PolicyError::new("The SSH check period is not valid."));
+    }
+    Ok(seconds)
 }
 
 fn compile_routes(catalog: &Catalog, file: &PolicyFile) -> Result<Vec<RouteRule>, PolicyError> {
@@ -1176,5 +1461,136 @@ mod tests {
         }"#;
         let err = Policy::from_hujson(text.as_bytes()).unwrap_err();
         assert!(err.to_string().contains("exit route"));
+    }
+
+    #[test]
+    fn ssh_rules_allow_one_user_and_reject_the_rest() {
+        let text = r#"{
+          // Alice may open SSH on the box.
+          "groups": {
+            "group:people": ["spiffe://orblx.local/user/alice"],
+          },
+          "tags": {
+            "tag:box": ["spiffe://orblx.local/node/box"],
+          },
+          "tagOwners": {
+            "tag:box": ["group:people"],
+          },
+          "ssh": [
+            {
+              "src": ["group:people"],
+              "dst": ["tag:box"],
+              "users": ["alice", "root"],
+              "checkPeriod": "30s",
+            },
+            {
+              "src": ["spiffe://orblx.local/agent/helper"],
+              "dst": ["spiffe://orblx.local/node/box"],
+              "users": ["alice"],
+              "checkPeriod": "1m",
+            },
+          ],
+          "sshTests": [
+            {
+              "src": "spiffe://orblx.local/user/alice",
+              "dst": "spiffe://orblx.local/node/box",
+              "user": "alice",
+              "action": "accept",
+            },
+            {
+              "src": "spiffe://orblx.local/user/mallory",
+              "dst": "spiffe://orblx.local/node/box",
+              "user": "mallory",
+              "action": "deny",
+            },
+            {
+              "src": "spiffe://orblx.local/user/alice",
+              "dst": "spiffe://orblx.local/node/mac",
+              "user": "alice",
+              "action": "deny",
+            },
+            {
+              "src": "spiffe://orblx.local/agent/helper",
+              "dst": "spiffe://orblx.local/node/box",
+              "user": "alice",
+              "action": "accept",
+            },
+            {
+              "src": "spiffe://orblx.local/agent/helper",
+              "dst": "spiffe://orblx.local/node/box",
+              "user": "root",
+              "action": "deny",
+            },
+          ],
+        }"#;
+        let policy = Policy::from_hujson(text.as_bytes()).unwrap();
+        let alice = super::SpiffeId::user("alice").unwrap();
+        let mallory = super::SpiffeId::user("mallory").unwrap();
+        let agent = super::SpiffeId::agent("helper").unwrap();
+        let box_id = super::SpiffeId::node("box").unwrap();
+        let mac = super::SpiffeId::node("mac").unwrap();
+        assert_eq!(policy.ssh_check_period(&alice, &box_id, "alice"), Some(30));
+        assert_eq!(policy.ssh_check_period(&alice, &box_id, "root"), Some(30));
+        assert_eq!(policy.ssh_check_period(&mallory, &box_id, "mallory"), None);
+        assert_eq!(policy.ssh_check_period(&alice, &mac, "alice"), None);
+        assert_eq!(policy.ssh_check_period(&agent, &box_id, "alice"), Some(60));
+        assert_eq!(policy.ssh_check_period(&agent, &box_id, "root"), None);
+        let lines: Vec<String> = policy
+            .ssh_assertions()
+            .iter()
+            .map(|item| item.line())
+            .collect();
+        assert!(lines.iter().any(|line| line.starts_with("allow ssh ")));
+        assert!(lines.iter().any(|line| line.starts_with("deny ssh ")));
+    }
+
+    #[test]
+    fn a_failing_ssh_assertion_rejects_the_file() {
+        let text = r#"{
+          "ssh": [{
+            "src": ["spiffe://orblx.local/user/alice"],
+            "dst": ["spiffe://orblx.local/node/box"],
+            "users": ["alice"],
+            "checkPeriod": "30s"
+          }],
+          "sshTests": [{
+            "src": "spiffe://orblx.local/user/alice",
+            "dst": "spiffe://orblx.local/node/box",
+            "user": "root",
+            "action": "accept"
+          }]
+        }"#;
+        let err = Policy::from_hujson(text.as_bytes()).unwrap_err();
+        let sentence = err.to_string();
+        assert!(sentence.contains("The SSH policy test failed."));
+        assert!(sentence.contains("root"));
+    }
+
+    #[test]
+    fn a_broad_agent_ssh_rule_is_rejected() {
+        let text = r#"{
+          "ssh": [{
+            "src": ["spiffe://orblx.local/agent/helper"],
+            "dst": ["spiffe://orblx.local/node/box"],
+            "users": ["alice", "root"],
+            "checkPeriod": "30s"
+          }]
+        }"#;
+        let err = Policy::from_hujson(text.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("one host and one user"));
+    }
+
+    #[test]
+    fn an_ssh_check_period_must_name_seconds_or_minutes() {
+        let text = r#"{
+          "ssh": [{
+            "src": ["spiffe://orblx.local/user/alice"],
+            "dst": ["spiffe://orblx.local/node/box"],
+            "users": ["alice"],
+            "checkPeriod": "30"
+          }]
+        }"#;
+        let err = Policy::from_hujson(text.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("check period"));
     }
 }

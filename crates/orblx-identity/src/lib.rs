@@ -13,7 +13,7 @@
 //! An agent capability ticket is separate from the SVID.
 //! The agent ticket allows one destination.
 //! Every other agent destination is denied.
-//! `Policy::from_hujson` loads groups, tags, accept rules, route approval, and inline tests.
+//! `Policy::from_hujson` loads groups, tags, accept rules, route approval, SSH rules, and inline tests.
 //! A failed test rejects the file.
 //! `autoApprovers` and `routeApprovals` approve subnet CIDRs.
 //! `0.0.0.0/0` stays an exit route.
@@ -52,7 +52,27 @@ pub use google::{
     OIDC_MODE_ENV,
 };
 pub use oidc::{AgentSvid, IssueGate, MockOidc, MOCK_OIDC_ISSUER, OIDC_AUDIENCE};
-pub use policy::{Policy, PolicyAssertion, PolicyError, ReceiverGrant, ReceiverGrants};
+pub use policy::{
+    Policy, PolicyAssertion, PolicyError, ReceiverGrant, ReceiverGrants, SshAssertion,
+};
+
+/// Return the Ed25519 seed from a PKCS#8 private key PEM.
+///
+/// The caller must not write the seed to a log.
+pub fn ed25519_seed_from_private_pem(pem: &str) -> Result<[u8; 32], IdentityError> {
+    let blocks = codec::pem_blocks(pem, "PRIVATE KEY")?;
+    if blocks.len() != 1 {
+        return Err(IdentityError::Certificate);
+    }
+    let (seed, _) = codec::ed25519_seed_from_pkcs8(&blocks[0])?;
+    Ok(seed)
+}
+
+/// Return the Ed25519 public key from a certificate PEM.
+pub fn ed25519_public_key_from_certificate_pem(pem: &str) -> Result<[u8; 32], IdentityError> {
+    let der = decode_certificate_pem(pem)?;
+    cert::certificate_ed25519_public_key(&der)
+}
 pub use spiffe::{SpiffeId, WorkloadKind, TRUST_DOMAIN};
 pub use ticket::{
     allow_agent_jit, sign_agent_jit_ticket, sign_ticket, ticket_hash, verify_ticket,

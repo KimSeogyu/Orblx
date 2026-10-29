@@ -57,6 +57,9 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             for assertion in policy.assertions() {
                 println!("{}", assertion.line());
             }
+            for assertion in policy.ssh_assertions() {
+                println!("{}", assertion.line());
+            }
             println!("policy ok");
             Ok(())
         }
@@ -188,6 +191,8 @@ A tag names SPIFFE IDs and has one owner.
 An accept rule names a source, a destination, and a port.
 The default is deny.
 An agent source needs one host, one protocol, and one port.
+An ssh rule names a source, a destination, the login users, and a check period.
+An agent ssh source needs one host and one user.
 The tests in the file must pass.
 A failed test rejects the file.
 The enforce command checks the signed grants on the receiver.
