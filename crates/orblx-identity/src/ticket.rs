@@ -117,6 +117,22 @@ impl TicketSigner {
             key: self.signing.verifying_key(),
         }
     }
+
+    /// Build a signer from a stored 32-byte seed.
+    #[must_use]
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        Self {
+            signing: SigningKey::from_bytes(seed),
+        }
+    }
+
+    /// Return the 32-byte seed.
+    ///
+    /// The caller must not log the seed.
+    #[must_use]
+    pub fn seed(&self) -> [u8; 32] {
+        self.signing.to_bytes()
+    }
 }
 
 /// The public half of a ticket key.

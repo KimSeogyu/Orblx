@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use orblx_identity::{decode_certificate_pem, extract_spiffe_id, leaf_validity, SpiffeId};
+use orblx_identity::{decode_certificate_pem, extract_spiffe_id, leaf_validity, DenySet, SpiffeId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -136,6 +136,11 @@ pub struct NodeRequest {
     /// [`crate::GrantPeers`] hides peers the signed grants do not let this node reach.
     /// [`crate::AllowPeers`] allows every peer when the node has no grant file.
     pub visibility: Arc<dyn PeerVisibility>,
+    /// Loopback Prometheus address.
+    ///
+    /// `None` does not open the metrics port.
+    /// The default command uses `127.0.0.1:9464`.
+    pub metrics: Option<SocketAddr>,
 }
 
 /// One peer line in `orblx status`.
@@ -202,14 +207,21 @@ struct LiveLink {
     ask_rekey: watch::Sender<u64>,
 }
 
+struct NodeCounters {
+    tx: AtomicU64,
+    rx: AtomicU64,
+}
+
 #[derive(Clone)]
 struct Mesh {
     endpoint: Arc<HelloEndpoint>,
     identity: Arc<Mutex<HelloConfig>>,
     netmap: Arc<Netmap>,
+    netmap_path: PathBuf,
     node: Arc<NodeView>,
     links: Arc<Mutex<HashMap<String, LiveLink>>>,
     peers: Arc<Mutex<Vec<PeerView>>>,
+    counters: Arc<NodeCounters>,
     to_tun: mpsc::Sender<Vec<u8>>,
     state_dir: Arc<PathBuf>,
     shutdown: watch::Receiver<bool>,
@@ -403,13 +415,26 @@ async fn run_mesh_inner(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (rekey_tx, rekey_rx) = watch::channel(0u64);
     let mut tasks = Vec::<JoinHandle<()>>::new();
+    let counters = Arc::new(NodeCounters {
+        tx: AtomicU64::new(0),
+        rx: AtomicU64::new(0),
+    });
 
     let tun_shutdown = shutdown_rx.clone();
     let tun_router = Arc::clone(&router);
     let tun_links = Arc::clone(&links);
+    let tun_counters = Arc::clone(&counters);
     let accept_routes = request.accept_routes;
     tasks.push(tokio::spawn(async move {
-        read_tun(from_tun, tun_router, tun_links, tun_shutdown, accept_routes).await;
+        read_tun(
+            from_tun,
+            tun_router,
+            tun_links,
+            tun_shutdown,
+            accept_routes,
+            tun_counters,
+        )
+        .await;
     }));
 
     let netmap = Arc::new(request.netmap);
@@ -418,15 +443,65 @@ async fn run_mesh_inner(
         endpoint: Arc::clone(&endpoint),
         identity,
         netmap: Arc::clone(&netmap),
+        netmap_path: netmap_path.clone(),
         node: Arc::clone(&node),
         links: Arc::clone(&links),
         peers: Arc::clone(&peers),
+        counters: Arc::clone(&counters),
         to_tun: to_tun.clone(),
         state_dir: Arc::clone(&state_dir),
         shutdown: shutdown_rx,
         rekey_tx,
         rekey_rx,
     };
+    if let Some(addr) = request.metrics {
+        let metrics_peers = Arc::clone(&peers);
+        let metrics_counters = Arc::clone(&counters);
+        match orblx_audit::spawn_metrics_server(addr, move || {
+            let sessions = lock(&metrics_peers)
+                .iter()
+                .filter(|peer| peer.session)
+                .count();
+            let sessions = u64::try_from(sessions).unwrap_or(u64::MAX);
+            format!(
+                "{}{}{}",
+                orblx_audit::sample_line(
+                    "orblx_node_packets_tx",
+                    "counter",
+                    metrics_counters.tx.load(Ordering::Relaxed)
+                ),
+                orblx_audit::sample_line(
+                    "orblx_node_packets_rx",
+                    "counter",
+                    metrics_counters.rx.load(Ordering::Relaxed)
+                ),
+                orblx_audit::sample_line("orblx_node_sessions", "gauge", sessions),
+            )
+        }) {
+            Ok(bound) => println!("metrics {bound}"),
+            Err(err) => eprintln!("{err}"),
+        }
+    }
+    let deny_endpoint = Arc::clone(&endpoint);
+    let deny_dir = Arc::clone(&state_dir);
+    let mut deny_shutdown = mesh.shutdown.clone();
+    tasks.push(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            tokio::select! {
+                changed = deny_shutdown.changed() => {
+                    if changed.is_err() || *deny_shutdown.borrow() {
+                        return;
+                    }
+                }
+                _ = tick.tick() => {
+                    if let Some(deny) = read_deny_file(&deny_dir) {
+                        deny_endpoint.replace_deny(deny);
+                    }
+                }
+            }
+        }
+    }));
     let accept_mesh = mesh.clone();
     tasks.push(tokio::spawn(async move {
         accept_loop(accept_mesh).await;
@@ -616,6 +691,7 @@ async fn read_tun(
     links: Arc<Mutex<HashMap<String, LiveLink>>>,
     mut shutdown: watch::Receiver<bool>,
     accept_routes: bool,
+    counters: Arc<NodeCounters>,
 ) {
     loop {
         tokio::select! {
@@ -637,10 +713,28 @@ async fn read_tun(
                     map.get(&peer).map(|link| link.tx.clone())
                 };
                 if let Some(tx) = tx {
-                    let _ = tx.send(packet).await;
+                    if tx.send(packet).await.is_ok() {
+                        counters.tx.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
+    }
+}
+
+fn fresh_netmap(mesh: &Mesh) -> Netmap {
+    match Netmap::from_path(&mesh.netmap_path) {
+        Ok(netmap) => netmap,
+        Err(_) => (*mesh.netmap).clone(),
+    }
+}
+
+fn read_deny_file(dir: &Path) -> Option<DenySet> {
+    let bytes = fs::read(dir.join("deny.json")).ok()?;
+    let mut deny = DenySet::empty();
+    match deny.apply_json(&bytes) {
+        Ok(_) => Some(deny),
+        Err(_) => None,
     }
 }
 
@@ -655,7 +749,8 @@ async fn accept_loop(mut mesh: Mesh) {
             accepted = mesh.endpoint.accept_one() => {
                 match accepted {
                     Ok(session) => {
-                        let peer_name = mesh.netmap.peers.iter().find(|peer| peer.svid == session.peer_id().as_uri()).map(|peer| peer.name.clone());
+                        let netmap = fresh_netmap(&mesh);
+                        let peer_name = netmap.peers.iter().find(|peer| peer.svid == session.peer_id().as_uri()).map(|peer| peer.name.clone());
                         let Some(peer_name) = peer_name else {
                             eprintln!(
                                 "The node drops a session from {}.",
@@ -864,6 +959,7 @@ async fn run_link(
             to_tun: mesh.to_tun.clone(),
             ask_rekey: ask_rx,
             remote_rekey,
+            counters: Arc::clone(&mesh.counters),
         },
         move || note_rx(&peers, &state_dir, &node, &peer_name),
     )
@@ -891,6 +987,7 @@ struct SessionIo {
     to_tun: mpsc::Sender<Vec<u8>>,
     ask_rekey: watch::Receiver<u64>,
     remote_rekey: watch::Sender<u64>,
+    counters: Arc<NodeCounters>,
 }
 
 async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
@@ -902,6 +999,7 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
         to_tun,
         mut ask_rekey,
         remote_rekey,
+        counters,
     } = io;
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     loop {
@@ -931,11 +1029,13 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                 if sender.send_ipv4(&packet).await.is_err() {
                     return;
                 }
+                counters.tx.fetch_add(1, Ordering::Relaxed);
             }
             incoming = receiver.recv_event() => {
                 match incoming {
                     Ok(SessionEvent::Packet(packet)) => {
                         on_rx();
+                        counters.rx.fetch_add(1, Ordering::Relaxed);
                         if to_tun.send(packet).await.is_err() {
                             return;
                         }

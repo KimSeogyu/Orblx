@@ -13,6 +13,7 @@ mod chain;
 mod demo;
 mod error;
 mod event;
+mod expose;
 mod hexutil;
 mod metrics;
 
@@ -27,6 +28,7 @@ pub use demo::{
 };
 pub use error::AuditError;
 pub use event::{DenyReason, EventKind, SessionEvent, SessionIds};
+pub use expose::{default_metrics_addr, sample_line, spawn_metrics_server, DEFAULT_METRICS_PORT};
 pub use metrics::SessionMetrics;
 
 /// This function returns the name of this crate.

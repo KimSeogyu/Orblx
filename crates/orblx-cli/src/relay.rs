@@ -38,6 +38,7 @@ pub(crate) struct ServeOptions {
     tcp: Option<SocketAddr>,
     audit_absent: Option<Vec<u8>>,
     audit_path: Option<PathBuf>,
+    metrics: Option<SocketAddr>,
 }
 
 #[derive(Debug)]
@@ -74,6 +75,7 @@ pub(crate) fn parse_serve(args: &[String]) -> Result<Command, String> {
     let mut tcp = None;
     let mut audit_absent = None;
     let mut audit_path = None;
+    let mut metrics = Some(orblx_audit::default_metrics_addr());
     let mut saw_udp = false;
     let mut saw_tcp = false;
     let mut index = 0;
@@ -92,6 +94,13 @@ pub(crate) fn parse_serve(args: &[String]) -> Result<Command, String> {
             }
             "--audit-absent" => audit_absent = Some(parse_hex_bytes(&value)?),
             "--audit-file" => audit_path = Some(PathBuf::from(value)),
+            "--metrics" => {
+                metrics = if value == "off" {
+                    None
+                } else {
+                    Some(parse_socket(&value, orblx_audit::DEFAULT_METRICS_PORT)?)
+                };
+            }
             other => {
                 return Err(format!("The flag {other} is not valid.\n{}", serve_help()));
             }
@@ -107,6 +116,7 @@ pub(crate) fn parse_serve(args: &[String]) -> Result<Command, String> {
         tcp,
         audit_absent,
         audit_path,
+        metrics,
     }))
 }
 
@@ -289,6 +299,26 @@ fn run_serve(options: ServeOptions) -> Result<(), String> {
     }
     println!("policy port {}", relay_policy_port());
     println!("tcp framing quic-style");
+    if let Some(addr) = options.metrics {
+        let read_stats = server.stats_reader();
+        match orblx_audit::spawn_metrics_server(addr, move || {
+            let stats = read_stats();
+            format!(
+                "{}{}{}{}",
+                orblx_audit::sample_line("orblx_relay_attaches", "counter", stats.attaches),
+                orblx_audit::sample_line("orblx_relay_forwards", "counter", stats.forwards),
+                orblx_audit::sample_line(
+                    "orblx_relay_forward_bytes",
+                    "counter",
+                    stats.forward_bytes
+                ),
+                orblx_audit::sample_line("orblx_relay_drops", "counter", stats.drops),
+            )
+        }) {
+            Ok(bound) => println!("metrics {bound}"),
+            Err(err) => eprintln!("{err}"),
+        }
+    }
     loop {
         thread::sleep(Duration::from_secs(60));
     }

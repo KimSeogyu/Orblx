@@ -72,10 +72,16 @@ impl HelloConfig {
 
 struct Auth {
     trust: TrustBundle,
-    deny: DenySet,
+    deny: SharedDeny,
     ticket_bytes: Vec<u8>,
     ticket_mac: [u8; 32],
     ticket_ring: TicketRing,
+}
+
+type SharedDeny = Arc<Mutex<DenySet>>;
+
+fn deny_now(deny: &SharedDeny) -> DenySet {
+    deny.lock().unwrap_or_else(|err| err.into_inner()).clone()
 }
 
 /// A Quinn endpoint that speaks hello-quic.
@@ -174,6 +180,12 @@ impl HelloEndpoint {
     /// Return the local UDP address.
     pub fn local_addr(&self) -> Result<SocketAddr, HelloError> {
         self.endpoint.local_addr().map_err(io_error)
+    }
+
+    /// Replace the deny set used by new sessions and open sessions.
+    pub fn replace_deny(&self, deny: DenySet) {
+        let mut slot = self.auth.deny.lock().unwrap_or_else(|err| err.into_inner());
+        *slot = deny;
     }
 
     /// Close the UDP socket.
@@ -461,7 +473,7 @@ pub struct HelloReceiver {
     recv: quinn::RecvStream,
     next_seq: u64,
     gate: PeerGate,
-    deny: DenySet,
+    deny: SharedDeny,
 }
 
 impl HelloReceiver {
@@ -471,8 +483,9 @@ impl HelloReceiver {
     pub async fn recv_data_frame(&mut self) -> Result<Frame, HelloError> {
         let frame = read_frame(&mut self.recv).await?;
         self.next_seq = expect_seq(self.next_seq, frame.seq)?;
+        let deny = deny_now(&self.deny);
         self.gate
-            .payload_from_data(&frame, SystemTime::now(), &self.deny)?;
+            .payload_from_data(&frame, SystemTime::now(), &deny)?;
         Ok(frame)
     }
 
@@ -488,15 +501,16 @@ impl HelloReceiver {
         self.next_seq = expect_seq(self.next_seq, frame.seq)?;
         match frame.frame_type {
             FrameType::Data => {
+                let deny = deny_now(&self.deny);
                 let payload = self
                     .gate
-                    .payload_from_data(&frame, SystemTime::now(), &self.deny)?
+                    .payload_from_data(&frame, SystemTime::now(), &deny)?
                     .to_vec();
                 Ok(SessionEvent::Packet(payload))
             }
             FrameType::Ctrl => {
-                self.gate
-                    .accept_ctrl(&frame, SystemTime::now(), &self.deny)?;
+                let deny = deny_now(&self.deny);
+                self.gate.accept_ctrl(&frame, SystemTime::now(), &deny)?;
                 if frame.flags & FLAG_REKEY_REQ != 0 {
                     Ok(SessionEvent::Rekey)
                 } else {
@@ -560,7 +574,8 @@ async fn bind_session(
         }
     };
     let mut gate = PeerGate::new();
-    if let Err(err) = gate.bind_leaf(&auth.trust, &leaf, SystemTime::now(), &auth.deny) {
+    let deny = deny_now(&auth.deny);
+    if let Err(err) = gate.bind_leaf(&auth.trust, &leaf, SystemTime::now(), &deny) {
         reject(&connection);
         return Err(err);
     }
@@ -587,7 +602,7 @@ async fn bind_session(
             recv,
             next_seq: 0,
             gate,
-            deny: auth.deny.clone(),
+            deny: Arc::clone(&auth.deny),
         },
         peer_not_after,
     })
@@ -636,12 +651,13 @@ async fn read_presented(
         FrameType::Data | FrameType::Ctrl => return Err(HelloError::TicketMissing),
     }
     let (ticket_bytes, mac) = split_presented(&frame.payload)?;
+    let deny = deny_now(&auth.deny);
     let admitted = gate.admit_ticket(
         &auth.ticket_ring,
         ticket_bytes,
         &mac,
         SystemTime::now(),
-        &auth.deny,
+        &deny,
     )?;
     if frame.ticket_hash != admitted {
         return Err(HelloError::TicketHash);
@@ -791,11 +807,40 @@ fn client_rustls(config: &HelloConfig) -> Result<(rustls::ClientConfig, Auth), H
 fn auth_from(config: &HelloConfig) -> Auth {
     Auth {
         trust: config.trust.clone(),
-        deny: config.deny.clone(),
+        deny: Arc::new(Mutex::new(config.deny.clone())),
         ticket_bytes: config.ticket_bytes.clone(),
         ticket_mac: config.ticket_mac,
         ticket_ring: config.ticket_ring.clone(),
     }
+}
+
+/// Open one hello-quic session and return the elapsed time.
+///
+/// The function binds an ephemeral UDP socket.
+/// The function does not open a TUN device.
+pub fn measure_hello_rtt(
+    config: HelloConfig,
+    peer: SocketAddr,
+    timeout: Duration,
+) -> Result<Duration, HelloError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| HelloError::Io(err.to_string()))?;
+    runtime.block_on(async {
+        let endpoint = HelloEndpoint::bind_client(
+            config,
+            SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)),
+        )?;
+        let started = tokio::time::Instant::now();
+        let session = tokio::time::timeout(timeout, endpoint.connect_one(peer))
+            .await
+            .map_err(|_| HelloError::Quic("The ping timed out.".to_string()))??;
+        let elapsed = started.elapsed();
+        drop(session);
+        endpoint.close();
+        Ok(elapsed)
+    })
 }
 
 fn identity_parts(
