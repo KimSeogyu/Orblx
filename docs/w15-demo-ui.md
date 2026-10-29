@@ -1,5 +1,7 @@
 # Playable demo
 
+The default page is the character scene in [w16-char-fx.md](w16-char-fx.md).
+This page records the level machine under that scene.
 The default page is a game.
 The game is City Breeze, Agent JIT, and Radioactive NAT.
 The board reads StackFeed JSON version 1.

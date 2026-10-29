@@ -11,7 +11,6 @@
     <p class="mark" id="mark">live</p>
     <div>
       <h1>Orblx</h1>
-      <p class="lede">Play the mesh. The board follows the live feed.</p>
     </div>
     <button type="button" id="eng-toggle" aria-pressed="false" aria-controls="eng">Engineering view</button>
   </header>
@@ -19,38 +18,34 @@
   <noscript>
     <p>The game needs JavaScript.</p>
   </noscript>
-  <main id="game" data-level="none">
+  <main id="game" data-level="none" data-result="">
     <section class="cartridges" aria-labelledby="play-title">
-      <h2 id="play-title">Levels</h2>
+      <h2 id="play-title" class="quiet quiet-eng">Levels</h2>
       <div class="row">
         <article class="cartridge" data-level="city_breeze">
           <button type="button" class="choice" id="play-city" aria-pressed="false">Play City Breeze</button>
-          <p class="blurb" id="blurb-easy">Easy opens the mock IdP sign-in page. Press Revoke to drop the human SVID.</p>
+          <p class="blurb quiet quiet-eng" id="blurb-easy">Easy opens the mock IdP sign-in page. Press Revoke to drop the human SVID.</p>
         </article>
         <article class="cartridge" data-level="agent_jit">
           <button type="button" class="choice" id="play-agent" aria-pressed="false">Play Agent JIT</button>
-          <p class="blurb" id="blurb-medium">Spawn agent allows application A and denies application B.</p>
+          <p class="blurb quiet quiet-eng" id="blurb-medium">Spawn agent allows application A and denies application B.</p>
         </article>
         <article class="cartridge" data-level="radioactive_nat">
           <button type="button" class="choice" id="play-hard" aria-pressed="false">Play Radioactive NAT</button>
-          <p class="blurb" id="blurb-hard">UDP block moves the path to the TCP Relay.</p>
+          <p class="blurb quiet quiet-eng" id="blurb-hard">UDP block moves the path to the TCP Relay.</p>
         </article>
       </div>
       <div class="curve-wrap">
-        <h2 id="curve-title">Difficulty</h2>
+        <h2 id="curve-title" class="quiet quiet-eng">Difficulty</h2>
         <ol id="curve"></ol>
-        <p id="fault-line"></p>
+        <p id="fault-line" class="quiet quiet-eng"></p>
       </div>
     </section>
     <section class="board" aria-labelledby="board-title">
       <div class="board-head">
-        <h2 id="board-title">Board</h2>
-        <p id="level-name">No level yet.</p>
-        <p id="path-state" data-mode="idle">No path yet.</p>
-      </div>
-      <div class="run-row">
-        <progress id="runbar" max="1" value="0">Feed 0 of 0</progress>
-        <p id="run-count"></p>
+        <h2 id="board-title" class="quiet quiet-eng">Board</h2>
+        <p id="level-name"></p>
+        <p id="path-state" class="quiet quiet-eng" data-mode="idle">No path yet.</p>
       </div>
       <div class="stage">
         <svg class="art art-city" viewBox="0 0 360 72" aria-hidden="true">
@@ -76,58 +71,141 @@
           <path d="M250 36 L236 28 M250 36 L236 44"></path>
           <rect x="270" y="18" width="64" height="36"></rect>
         </svg>
-        <div class="map" id="mesh-link" data-mode="idle">
-          <button type="button" class="node" id="node-spoke" data-state="idle" aria-pressed="false">
+        <div class="map" id="mesh-link" data-mode="idle" data-link="idle">
+          <svg class="bonds" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+            <line id="bond-direct" x1="18" y1="22" x2="50" y2="50"></line>
+            <line id="bond-app-a" x1="50" y1="50" x2="82" y2="20"></line>
+            <line id="bond-app-b" x1="50" y1="50" x2="82" y2="78"></line>
+            <line id="bond-relay" x1="18" y1="80" x2="50" y2="50"></line>
+            <line id="bond-live" x1="18" y1="22" x2="50" y2="50"></line>
+          </svg>
+          <div id="fx"></div>
+          <button type="button" class="node cast" id="node-spoke" data-state="idle" data-cast="human" aria-pressed="false">
+            <svg class="sprite" viewBox="0 0 80 110" aria-hidden="true">
+              <g class="body">
+                <circle class="head" cx="40" cy="22" r="10"></circle>
+                <path class="torso" d="M40 32 V62"></path>
+                <path class="arm-l" d="M40 42 L24 58"></path>
+                <path class="arm-r" d="M40 42 L56 58"></path>
+                <path class="leg-l" d="M40 62 L30 92"></path>
+                <path class="leg-r" d="M40 62 L50 92"></path>
+                <path class="mark-x" d="M22 18 L58 86 M58 18 L22 86"></path>
+              </g>
+            </svg>
             <span class="node-title" id="spoke-name">Human</span>
-            <span class="node-state" id="node-spoke-state">idle</span>
+            <span class="node-state quiet" id="node-spoke-state">idle</span>
             <span id="svid-chip" data-state="none">SVID</span>
             <span id="ticket-chip" data-state="none">Ticket</span>
+          </button>
+          <button type="button" class="node cast" id="actor-agent" data-state="idle" data-cast="agent" aria-pressed="false">
+            <svg class="sprite" viewBox="0 0 80 110" aria-hidden="true">
+              <g class="body">
+                <path class="antenna" d="M40 4 L33 14 H47 Z"></path>
+                <circle class="head" cx="40" cy="24" r="10"></circle>
+                <path class="torso" d="M40 34 V64"></path>
+                <path class="arm-l" d="M40 44 L22 60"></path>
+                <path class="arm-r" d="M40 44 L58 60"></path>
+                <path class="leg-l" d="M40 64 L30 94"></path>
+                <path class="leg-r" d="M40 64 L50 94"></path>
+                <path class="mark-x" d="M22 18 L58 86 M58 18 L22 86"></path>
+              </g>
+            </svg>
+            <span class="node-title">Agent</span>
+            <span class="node-state quiet" id="actor-agent-state">idle</span>
           </button>
           <button type="button" id="inspect-path" class="path-hit" aria-pressed="false">Path</button>
           <div id="packet" class="packet idle" hidden></div>
           <p id="float-label" class="float-label" hidden></p>
-          <button type="button" class="node" id="node-hub" data-state="idle" aria-pressed="false">
-            <span class="node-title">Hub</span>
-            <span class="node-state" id="node-hub-state">idle</span>
-            <span class="node-note">QUIC path</span>
+          <button type="button" class="node cast" id="node-hub" data-state="idle" data-cast="direct" aria-pressed="false">
+            <svg class="sprite" viewBox="0 0 80 110" aria-hidden="true">
+              <g class="body">
+                <circle class="head" cx="40" cy="20" r="8"></circle>
+                <path class="torso" d="M40 28 V58"></path>
+                <path class="arm-l" d="M40 40 H14"></path>
+                <path class="arm-r" d="M40 40 H66"></path>
+                <path class="leg-l" d="M40 58 L32 90"></path>
+                <path class="leg-r" d="M40 58 L48 90"></path>
+                <path class="mark-x" d="M22 18 L58 86 M58 18 L22 86"></path>
+              </g>
+            </svg>
+            <span class="node-title">Direct</span>
+            <span class="node-state quiet" id="node-hub-state">idle</span>
+            <span class="node-note quiet">QUIC path</span>
           </button>
-          <button type="button" class="node app" id="app-a" data-state="idle" data-acl="idle" aria-pressed="false">
+          <button type="button" class="node cast app" id="app-a" data-state="idle" data-acl="idle" data-cast="app-a" aria-pressed="false">
+            <svg class="sprite app-sprite" viewBox="0 0 80 110" aria-hidden="true">
+              <g class="body">
+                <rect class="shell" x="16" y="18" width="48" height="72" rx="4"></rect>
+                <circle cx="32" cy="38" r="3"></circle>
+                <circle cx="48" cy="38" r="3"></circle>
+                <path class="mouth" d="M30 50 H50"></path>
+                <g class="door"><rect x="34" y="62" width="12" height="28"></rect></g>
+                <path class="bar" d="M22 46 H58 M22 74 H58"></path>
+                <path class="mark-x" d="M20 22 L60 86 M60 22 L20 86"></path>
+              </g>
+            </svg>
             <span class="node-title">app-a.orblx.test</span>
-            <span class="node-state" id="app-a-state">idle</span>
-            <span class="node-note" id="app-a-status">Waiting</span>
+            <span class="node-state quiet" id="app-a-state">idle</span>
+            <span class="node-note quiet" id="app-a-status">Waiting</span>
           </button>
-          <button type="button" class="node app" id="app-b" data-state="idle" data-acl="idle" aria-pressed="false">
+          <button type="button" class="node cast app" id="app-b" data-state="idle" data-acl="idle" data-cast="app-b" aria-pressed="false">
+            <svg class="sprite app-sprite" viewBox="0 0 80 110" aria-hidden="true">
+              <g class="body">
+                <rect class="shell" x="16" y="18" width="48" height="72" rx="4"></rect>
+                <circle cx="32" cy="38" r="3"></circle>
+                <circle cx="48" cy="38" r="3"></circle>
+                <path class="mouth" d="M30 50 H50"></path>
+                <g class="door"><rect x="34" y="62" width="12" height="28"></rect></g>
+                <path class="bar" d="M22 46 H58 M22 74 H58"></path>
+                <path class="mark-x" d="M20 22 L60 86 M60 22 L20 86"></path>
+              </g>
+            </svg>
             <span class="node-title">app-b.orblx.test</span>
-            <span class="node-state" id="app-b-state">idle</span>
-            <span class="node-note" id="app-b-status">Waiting</span>
+            <span class="node-state quiet" id="app-b-state">idle</span>
+            <span class="node-note quiet" id="app-b-status">Waiting</span>
           </button>
-          <button type="button" class="node" id="node-relay" data-state="idle" data-lit="false" aria-pressed="false">
+          <button type="button" class="node cast" id="node-relay" data-state="idle" data-lit="false" data-cast="relay" aria-pressed="false">
+            <svg class="sprite" viewBox="0 0 80 110" aria-hidden="true">
+              <g class="body">
+                <circle class="head" cx="40" cy="20" r="8"></circle>
+                <path class="torso" d="M40 28 V58"></path>
+                <path class="arm-l" d="M40 40 L18 40 L18 62"></path>
+                <path class="arm-r" d="M40 40 L62 40 L62 62"></path>
+                <path class="leg-l" d="M40 58 L28 90"></path>
+                <path class="leg-r" d="M40 58 L52 90"></path>
+                <path class="mark-x" d="M22 18 L58 86 M58 18 L22 86"></path>
+              </g>
+            </svg>
             <span class="node-title">Relay</span>
-            <span class="node-state" id="node-relay-state">idle</span>
-            <span class="node-note" id="relay-status">Idle</span>
+            <span class="node-state quiet" id="node-relay-state">idle</span>
+            <span class="node-note quiet" id="relay-status">Idle</span>
           </button>
         </div>
+        <div class="run-row">
+          <progress id="runbar" max="1" value="0">Feed 0 of 0</progress>
+          <p id="run-count" class="quiet quiet-eng"></p>
+        </div>
+        <div id="endcard" hidden>
+          <p id="end-tone" class="quiet quiet-eng"></p>
+          <p id="end-copy" class="quiet quiet-eng"></p>
+          <button type="button" id="next-level">Next Level</button>
+        </div>
       </div>
-      <ul class="legend">
+      <ul class="legend quiet quiet-eng">
         <li data-state="up">up</li>
         <li data-state="degraded">degraded</li>
         <li data-state="down">down</li>
         <li data-state="revoked">revoked</li>
       </ul>
-      <p id="beat" aria-live="polite">Pick a level.</p>
-      <p id="clear" hidden></p>
-      <div id="endcard" hidden>
-        <p id="end-tone"></p>
-        <p id="end-copy"></p>
-        <button type="button" id="next-level">Next Level</button>
-      </div>
+      <p id="beat" class="quiet quiet-eng" aria-live="polite">Pick a level.</p>
+      <p id="clear" class="quiet quiet-eng" hidden></p>
     </section>
-    <section id="inspector" aria-live="polite" aria-labelledby="inspector-title">
+    <section id="inspector" class="quiet quiet-eng" aria-live="polite" aria-labelledby="inspector-title">
       <h2 id="inspector-title">Inspector</h2>
       <p id="inspect-target">Click a node or the path.</p>
       <dl id="inspect-fields"></dl>
     </section>
-    <section aria-labelledby="tape-title">
+    <section class="quiet quiet-eng" aria-labelledby="tape-title">
       <h2 id="tape-title">Feed</h2>
       <ol id="tape"></ol>
     </section>
