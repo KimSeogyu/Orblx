@@ -168,6 +168,14 @@ async fn dispatch(
             let view = coord.advertise_routes(&request.name, &request.routes)?;
             Ok(netmap_response(&view))
         }
+        "candidates" => {
+            let peer = peer_node(coord, connection)?;
+            if peer != request.name {
+                return Err(CoordError::Peer);
+            }
+            let view = coord.set_candidates(&request.name, &request.endpoints)?;
+            Ok(netmap_response(&view))
+        }
         "exit" => {
             let peer = peer_node(coord, connection)?;
             if peer != request.name {

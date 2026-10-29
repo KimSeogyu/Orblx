@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::io_error;
 use crate::session::encode_hex;
@@ -16,6 +16,12 @@ use crate::{
 };
 
 const READ_SLICE: Duration = Duration::from_millis(50);
+
+/// A peer that sends nothing for this long loses the session slot.
+///
+/// A restarted node can attach again.
+/// A live peer sends a probe before this time.
+const PEER_IDLE: Duration = Duration::from_secs(1);
 
 /// Bind addresses and the lab audit needle.
 pub struct ServerConfig {
@@ -89,6 +95,7 @@ struct Session {
 struct Slot {
     id: u64,
     dest: Dest,
+    last_seen: Instant,
 }
 
 #[derive(Clone)]
@@ -244,6 +251,7 @@ fn handle_udp(
         }
         RelayKind::Data => {
             let id = udp_peer_id(shared, datagram.session_id, from)?;
+            touch_slot(shared, datagram.session_id, id);
             forward(shared, datagram.session_id, id, &datagram.payload);
             Ok(())
         }
@@ -320,6 +328,7 @@ fn tcp_conn(mut stream: TcpStream, shared: Arc<Shared>) {
                         bump_drop(&shared);
                         continue;
                     }
+                    touch_slot(&shared, session_id, id);
                     forward(&shared, session_id, id, &datagram.payload);
                 }
                 RelayKind::Detach => {
@@ -378,12 +387,14 @@ fn register_udp(
     let session = sessions
         .entry(session_id)
         .or_insert_with(|| Session { slots: Vec::new() });
-    if let Some(slot) = session.slots.iter().find(|slot| match slot.dest {
+    if let Some(slot) = session.slots.iter_mut().find(|slot| match slot.dest {
         Dest::Udp(existing) => existing == addr,
         Dest::Tcp(_) => false,
     }) {
+        slot.last_seen = Instant::now();
         return Ok(slot.id);
     }
+    reap_idle(session);
     if session.slots.len() >= 2 {
         return Err(RelayError::SessionFull);
     }
@@ -391,6 +402,7 @@ fn register_udp(
     session.slots.push(Slot {
         id,
         dest: Dest::Udp(addr),
+        last_seen: Instant::now(),
     });
     lock_mutex(&shared.stats).attaches += 1;
     Ok(id)
@@ -405,6 +417,7 @@ fn register_tcp(
     let session = sessions
         .entry(session_id)
         .or_insert_with(|| Session { slots: Vec::new() });
+    reap_idle(session);
     if session.slots.len() >= 2 {
         return Err(RelayError::SessionFull);
     }
@@ -412,6 +425,7 @@ fn register_tcp(
     session.slots.push(Slot {
         id,
         dest: Dest::Tcp(tx),
+        last_seen: Instant::now(),
     });
     lock_mutex(&shared.stats).attaches += 1;
     Ok(id)
@@ -432,6 +446,23 @@ fn udp_peer_id(
             Dest::Udp(_) | Dest::Tcp(_) => None,
         })
         .ok_or(RelayError::NotAttached)
+}
+
+fn reap_idle(session: &mut Session) {
+    let now = Instant::now();
+    session
+        .slots
+        .retain(|slot| now.saturating_duration_since(slot.last_seen) < PEER_IDLE);
+}
+
+fn touch_slot(shared: &Shared, session_id: RelaySessionId, id: u64) {
+    let mut sessions = lock_mutex(&shared.sessions);
+    let Some(session) = sessions.get_mut(&session_id) else {
+        return;
+    };
+    if let Some(slot) = session.slots.iter_mut().find(|slot| slot.id == id) {
+        slot.last_seen = Instant::now();
+    }
 }
 
 fn remove_peer(shared: &Shared, session_id: RelaySessionId, id: u64) {

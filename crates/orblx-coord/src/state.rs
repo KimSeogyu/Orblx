@@ -366,6 +366,22 @@ impl Coordinator {
         Ok(view)
     }
 
+    /// Store reflexive endpoints and return a fresh signed view.
+    ///
+    /// Each endpoint is signed with the netmap Ed25519 key.
+    pub fn set_candidates(
+        &self,
+        name: &str,
+        endpoints: &[String],
+    ) -> Result<NetmapView, CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        inner.store.set_endpoints(name, endpoints)?;
+        let view = sign_view(&inner, name)?;
+        println!("candidates {name}");
+        Ok(view)
+    }
+
     /// Store the exit-node offer and return a fresh signed netmap.
     ///
     /// The signed netmap sets `exit_node` only when [`Policy::approves_exit_node`] allows it.

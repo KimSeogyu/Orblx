@@ -66,6 +66,8 @@ pub enum EdgeError {
     EchoMismatch,
     /// The candidate text is not valid.
     BadCandidate,
+    /// The coordinator signature on a candidate is not valid.
+    Signature,
     /// The punch token is not valid.
     BadToken,
     /// The identity material is not valid.
@@ -137,6 +139,7 @@ impl fmt::Display for EdgeError {
                 formatter.write_str("The QUIC echo did not match the probe packet.")
             }
             Self::BadCandidate => formatter.write_str("The candidate text is not valid."),
+            Self::Signature => formatter.write_str("The candidate signature was rejected."),
             Self::BadToken => formatter.write_str("The punch token is not valid."),
             Self::Identity(detail) => {
                 write!(formatter, "The identity material is not valid. {detail}")

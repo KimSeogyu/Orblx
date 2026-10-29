@@ -244,6 +244,56 @@ pub fn renew_svid_blocking(
     block_on(renew_svid(coord, coord_name, bundle_pem, state_dir))
 }
 
+/// Publish reflexive endpoints and store the fresh signed view.
+///
+/// Call this function outside a Tokio runtime.
+pub fn publish_candidates_blocking(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+    endpoints: &[String],
+) -> Result<NetmapView, CoordError> {
+    block_on(publish_candidates(
+        coord, coord_name, bundle_pem, state_dir, endpoints,
+    ))
+}
+
+/// Publish reflexive endpoints and store the fresh signed view.
+pub async fn publish_candidates(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+    endpoints: &[String],
+) -> Result<NetmapView, CoordError> {
+    let material = read_node_material(state_dir)?;
+    let pinned = material.netmap_public;
+    let request = Request {
+        op: "candidates".to_string(),
+        name: material.name.clone(),
+        token: None,
+        id_token: None,
+        nonce: None,
+        endpoints: endpoints.to_vec(),
+        routes: Vec::new(),
+        exit_node: false,
+    };
+    let result = round_trip(
+        coord,
+        coord_name,
+        bundle_pem,
+        Some(material),
+        request,
+        Some(pinned),
+        false,
+    )
+    .await?;
+    let view = view_from_result(result);
+    view.write_state(state_dir)?;
+    Ok(view)
+}
+
 /// Register this node as an exit node and store the fresh netmap.
 ///
 /// Call this function outside a Tokio runtime.

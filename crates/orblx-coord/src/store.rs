@@ -334,6 +334,29 @@ impl NodeStore {
         self.persist()
     }
 
+    /// Replace the endpoint list for an enrolled node.
+    ///
+    /// The caller passes the reflexive address gathered by STUN.
+    pub fn set_endpoints(&mut self, name: &str, endpoints: &[String]) -> Result<(), CoordError> {
+        if endpoints.is_empty() || endpoints.len() > 8 {
+            return Err(CoordError::Endpoint);
+        }
+        for endpoint in endpoints {
+            crate::ippool::parse_endpoint(endpoint)?;
+        }
+        let node = self
+            .disk
+            .nodes
+            .iter_mut()
+            .find(|node| node.name == name)
+            .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        if node.endpoints == endpoints {
+            return Ok(());
+        }
+        node.endpoints = endpoints.to_vec();
+        self.persist()
+    }
+
     fn plan(
         &self,
         name: &str,
