@@ -10,13 +10,15 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orblx_coord::advertise_routes_blocking;
 use orblx_crypto::{mac_input, ticket_mac};
 use orblx_datapath::{
-    read_status_text, run_node, running_pid, HelloConfig, Netmap, NodeRequest, DEFAULT_UDP_PORT,
+    read_status_text, remove_link_resolver, run_node, running_pid, AllowPeers, HelloConfig, Netmap,
+    NodeRequest, DEFAULT_UDP_PORT, LINUX_TUN_NAME,
 };
 use orblx_identity::{
     sign_ticket, DenySet, MiniCa, SpiffeId, TicketClaims, TicketFlags, TicketSigner, MAX_USER_TTL,
@@ -197,6 +199,7 @@ fn run_up(options: UpOptions) -> Result<(), String> {
     let (netmap_path, forward_routes) = publish_routes(&options)?;
     let netmap = Netmap::from_path(&netmap_path).map_err(|err| err.to_string())?;
     let config = load_config(&options.state_dir)?;
+    // W18-5 replaces AllowPeers with the policy check.
     run_node(NodeRequest {
         config,
         netmap,
@@ -204,6 +207,8 @@ fn run_up(options: UpOptions) -> Result<(), String> {
         state_dir: options.state_dir,
         accept_routes: options.accept_routes,
         forward_routes,
+        netmap_path,
+        visibility: Arc::new(AllowPeers),
     })
     .map_err(|err| err.to_string())
 }
@@ -262,6 +267,7 @@ fn publish_routes(options: &UpOptions) -> Result<(PathBuf, Vec<String>), String>
 fn run_down(options: StateOptions) -> Result<(), String> {
     let Some(pid) = running_pid(&options.state_dir) else {
         println!("The node is down.");
+        let _ = remove_link_resolver(LINUX_TUN_NAME);
         return Ok(());
     };
     let status = std::process::Command::new("kill")
@@ -274,6 +280,7 @@ fn run_down(options: StateOptions) -> Result<(), String> {
     for _ in 0..50 {
         if running_pid(&options.state_dir).is_none() {
             println!("The node is down.");
+            let _ = remove_link_resolver(LINUX_TUN_NAME);
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
@@ -435,6 +442,12 @@ orblx node-issue --out DIR --node NAME=OVERLAY_IP [--node NAME=OVERLAY_IP ...]
 
 The node keeps one QUIC session for each peer.
 The router sends each outbound TUN packet to the peer that owns the destination.
+The node answers DNS on the overlay address at port 53.
+A netmap name is <node>.<owner>.orblx and the short name <node>.
+The node forwards every other name.
+On Linux the node sets the per-link domain ~orblx on the TUN device.
+On macOS the node writes /etc/resolver/orblx.
+orblx down removes that resolver configuration.
 The default state directory is {DEFAULT_STATE_DIR}.
 The default netmap file is {DEFAULT_STATE_DIR}/netmap.json.
 The node stores the overlay IP in that directory.

@@ -41,6 +41,7 @@ build_image() {
   image_dir="$(mktemp -d)"
   cp "$bin" "$image_dir/orblx"
   cp "$ROOT/scripts/proof/Dockerfile" "$image_dir/Dockerfile"
+  cp "$ROOT/scripts/proof/entrypoint.sh" "$image_dir/entrypoint.sh"
   docker build -t orblx-coord:w18 "$image_dir"
   rm -rf "$image_dir"
 }

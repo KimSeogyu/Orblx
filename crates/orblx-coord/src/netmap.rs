@@ -189,6 +189,9 @@ fn netmap_error(err: NetmapError) -> CoordError {
         | NetmapError::Duplicate { .. } => {
             CoordError::Protocol("The netmap is not valid.".to_string())
         }
+        NetmapError::Owner { .. } => {
+            CoordError::Protocol("The owner is not a DNS name.".to_string())
+        }
     }
 }
 
@@ -240,6 +243,7 @@ mod tests {
             self_node: NetmapSelf {
                 name: "server".to_string(),
                 overlay_ip: "100.64.0.1".to_string(),
+                owner: String::new(),
             },
             peers: vec![NetmapPeer {
                 name: "laptop".to_string(),
@@ -247,6 +251,7 @@ mod tests {
                 svid: "spiffe://orblx.local/node/laptop".to_string(),
                 endpoints: vec!["10.0.0.2:443".to_string()],
                 routes: vec!["192.168.1.0/24".to_string()],
+                owner: String::new(),
             }],
         }
     }
