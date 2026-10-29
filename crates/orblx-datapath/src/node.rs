@@ -55,6 +55,10 @@ pub struct NodeRequest {
     pub listen: SocketAddr,
     /// The state directory. The default is `/var/lib/orblx`.
     pub state_dir: PathBuf,
+    /// Install approved subnet routes from the netmap into the TUN device.
+    pub accept_routes: bool,
+    /// Local CIDRs this node forwards onto a connected LAN.
+    pub forward_routes: Vec<String>,
 }
 
 /// One peer line in `orblx status`.
@@ -208,12 +212,19 @@ pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
     let _pid_guard = PidGuard::create(&request.state_dir)?;
     let router = RouterTable::from_netmap(&request.netmap)
         .map_err(|err| HelloError::Node(err.to_string()))?;
+    let install = router.install_cidrs(request.accept_routes);
+    for cidr in &install {
+        println!("The node installs route {cidr}.");
+    }
     let bridge = open_tun(&TunConfig {
         name: tun_device_name(),
         address: parse_ipv4(&record.overlay_ip).map_err(|err| HelloError::Node(err.to_string()))?,
         netmask: Ipv4Addr::new(255, 255, 255, 255),
     })?;
-    prepare_link(&bridge.name, &router.destinations())?;
+    prepare_link(&bridge.name, &install)?;
+    if !request.forward_routes.is_empty() {
+        crate::subnet::enable_kernel_forward(&request.forward_routes)?;
+    }
     println!("The overlay IP is {}.", record.overlay_ip);
     println!("The state directory is {}.", request.state_dir.display());
     println!("The TUN device is {}.", bridge.name);
@@ -248,8 +259,9 @@ async fn run_mesh(
     let tun_router = Arc::clone(&router);
     let tun_links = Arc::clone(&links);
     let from_tun = bridge.from_tun;
+    let accept_routes = request.accept_routes;
     tasks.push(tokio::spawn(async move {
-        read_tun(from_tun, tun_router, tun_links, tun_shutdown).await;
+        read_tun(from_tun, tun_router, tun_links, tun_shutdown, accept_routes).await;
     }));
 
     let netmap = Arc::new(request.netmap);
@@ -365,6 +377,7 @@ async fn read_tun(
     router: Arc<RouterTable>,
     links: Arc<Mutex<HashMap<String, LiveLink>>>,
     mut shutdown: watch::Receiver<bool>,
+    accept_routes: bool,
 ) {
     loop {
         tokio::select! {
@@ -377,7 +390,7 @@ async fn read_tun(
                 let Some(packet) = packet else {
                     return;
                 };
-                let Some(peer) = route_packet(&router, &packet) else {
+                let Some(peer) = route_packet(&router, &packet, accept_routes) else {
                     continue;
                 };
                 let peer = peer.to_string();

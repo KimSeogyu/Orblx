@@ -23,8 +23,8 @@ mod store;
 mod tlsutil;
 
 pub use client::{
-    enroll_with_oidc_blocking, enroll_with_token_blocking, fetch_netmap_blocking, netmap_json,
-    OidcEnroll,
+    advertise_routes_blocking, enroll_with_oidc_blocking, enroll_with_token_blocking,
+    fetch_netmap_blocking, netmap_json, OidcEnroll,
 };
 pub use error::CoordError;
 pub use http_util::{fetch_google_jwks_blocking, post_google_token_blocking};
@@ -289,5 +289,75 @@ mod tests {
         let kept = reopened.netmap_for("box").unwrap();
         assert_eq!(kept.signed_grants.grants.grants[0].port_start, 22);
         assert!(scratch.0.join("policy.loaded.hujson").exists());
+    }
+
+    #[test]
+    fn an_unapproved_route_stays_out_of_the_signed_netmap() {
+        let scratch = Scratch::new();
+        let policy = r#"{
+          "tags": {
+            "tag:router": ["spiffe://orblx.local/node/router"]
+          },
+          "tagOwners": {
+            "tag:router": ["spiffe://orblx.local/node/client"]
+          },
+          "autoApprovers": {
+            "routes": {
+              "10.88.0.0/24": ["tag:router"]
+            }
+          }
+        }"#;
+        fs::write(scratch.0.join("policy.hujson"), policy).unwrap();
+        let now = SystemTime::now();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let router_token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+        let client_token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+        coord
+            .enroll_token(
+                "router",
+                &router_token.secret,
+                &["router:443".to_string()],
+                &["10.88.0.0/24".to_string(), "10.99.0.0/24".to_string()],
+                now,
+            )
+            .unwrap();
+        coord
+            .enroll_token(
+                "client",
+                &client_token.secret,
+                &["client:443".to_string()],
+                &[],
+                now,
+            )
+            .unwrap();
+        let client = coord.netmap_for("client").unwrap();
+        let routes = &client.signed_netmap.netmap.peers[0].routes;
+        assert_eq!(routes, &vec!["10.88.0.0/24".to_string()]);
+        let router = coord
+            .advertise_routes(
+                "router",
+                &[
+                    "10.88.0.0/24".to_string(),
+                    "10.99.0.0/24".to_string(),
+                    "10.77.0.0/24".to_string(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(router.approved_routes, vec!["10.88.0.0/24".to_string()]);
+        assert!(router
+            .advertised_routes
+            .iter()
+            .any(|route| route == "10.99.0.0/24"));
+        assert!(router
+            .advertised_routes
+            .iter()
+            .any(|route| route == "10.77.0.0/24"));
+        let again = coord.netmap_for("client").unwrap();
+        assert_eq!(
+            again.signed_netmap.netmap.peers[0].routes,
+            vec!["10.88.0.0/24".to_string()]
+        );
+        let exit = coord.advertise_routes("router", &["0.0.0.0/0".to_string()]);
+        assert!(exit.unwrap_err().to_string().contains("exit route"));
     }
 }

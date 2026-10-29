@@ -1,0 +1,34 @@
+{
+  // The router may publish 10.88.0.0/24.
+  // 10.99.0.0/24 has no approver. The coordinator holds that route.
+  "groups": {
+    "group:humans": ["spiffe://orblx.local/node/client"],
+  },
+  "tags": {
+    "tag:router": ["spiffe://orblx.local/node/router"],
+  },
+  "tagOwners": {
+    "tag:router": ["group:humans"],
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["group:humans"],
+      "proto": "tcp",
+      "dst": ["tag:router:80"],
+    },
+  ],
+  "autoApprovers": {
+    "routes": {
+      "10.88.0.0/24": ["tag:router"],
+    },
+  },
+  "tests": [
+    {
+      "src": "spiffe://orblx.local/node/client",
+      "proto": "tcp",
+      "accept": ["tag:router:80"],
+      "deny": ["spiffe://orblx.local/node/router:22"],
+    },
+  ],
+}

@@ -249,6 +249,21 @@ impl NodeStore {
         Ok(stored)
     }
 
+    /// Replace the advertised routes for an enrolled node.
+    ///
+    /// The caller publishes a route only after policy approval.
+    pub fn set_routes(&mut self, name: &str, routes: &[String]) -> Result<(), CoordError> {
+        let canonical_routes = subnet_routes(routes)?;
+        let node = self
+            .disk
+            .nodes
+            .iter_mut()
+            .find(|node| node.name == name)
+            .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        node.routes = canonical_routes;
+        self.persist()
+    }
+
     fn plan(
         &self,
         name: &str,
@@ -263,10 +278,7 @@ impl NodeStore {
         for endpoint in endpoints {
             parse_endpoint(endpoint)?;
         }
-        let mut canonical_routes = Vec::with_capacity(routes.len());
-        for route in routes {
-            canonical_routes.push(canonical_route(route)?);
-        }
+        let canonical_routes = subnet_routes(routes)?;
         let ip = overlay_ip(self.disk.next_index)?;
         let next_index = self
             .disk
@@ -301,6 +313,23 @@ pub struct EnrollPlan {
     owner: String,
     token_id: String,
     next_index: u32,
+}
+
+fn subnet_routes(routes: &[String]) -> Result<Vec<String>, CoordError> {
+    let mut canonical_routes = Vec::with_capacity(routes.len());
+    for route in routes {
+        let canonical = canonical_route(route)?;
+        if canonical == "0.0.0.0/0" {
+            return Err(CoordError::Protocol(
+                "The route 0.0.0.0/0 is an exit route.".to_string(),
+            ));
+        }
+        if !canonical_routes.contains(&canonical) {
+            canonical_routes.push(canonical);
+        }
+    }
+    canonical_routes.sort();
+    Ok(canonical_routes)
 }
 
 fn token_hash(secret: &str) -> String {
