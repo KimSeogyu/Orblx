@@ -17,9 +17,9 @@ use gyeol_edge::{
     run_nat_smash, NatDifficulty, NatInjectMode, NatLevel, NatSmash, NatSmashReport, LAB_OVERLAY_IP,
 };
 use gyeol_identity::{
-    sign_agent_jit_ticket, sign_ticket, verify_ticket, DenyApply, DenySet, Ipv4Destination,
-    IssueGate, MiniCa, MockOidc, SpiffeId, TicketClaims, TicketFlags, TicketSigner, TicketVerifier,
-    TrustBundle, MAX_SKEW, MOCK_OIDC_ISSUER, OIDC_AUDIENCE,
+    sign_agent_jit_ticket, sign_ticket, verify_ticket, DenyApply, DenySet, GoogleJwks,
+    Ipv4Destination, IssueGate, MiniCa, MockOidc, SpiffeId, TicketClaims, TicketFlags,
+    TicketSigner, TicketVerifier, TrustBundle, MAX_SKEW, MOCK_OIDC_ISSUER, OIDC_AUDIENCE,
 };
 use gyeol_relay::{RelaySessionId, RelayTransport};
 use serde::Serialize;
@@ -32,6 +32,12 @@ use crate::level::{LevelId, StepStatus};
 use crate::session::{PacketRow, Panel, PanelState, PeerRow, SessionView};
 
 pub(crate) const HUMAN_NAME: &str = "ada";
+
+enum CitySource {
+    Process,
+    Mock,
+    Google,
+}
 const AGENT_NAME: &str = "worker";
 const AGENT_TTL: Duration = Duration::from_secs(60);
 const HUMAN_TOKEN_TTL: Duration = Duration::from_secs(600);
@@ -240,6 +246,31 @@ impl Engine {
         lines
     }
 
+    /// Finish City Breeze after the Google callback.
+    ///
+    /// `IssueGate::from_google` checks the ID token.
+    /// `issue_google_human_svid` checks the same nonce.
+    pub fn complete_google_city(
+        &mut self,
+        client_id: &str,
+        jwks_json: &str,
+        id_token: &str,
+        nonce: &str,
+    ) -> Vec<FeedLine> {
+        self.begin(LevelId::CityBreeze);
+        let mut lines = vec![self.harness_line(
+            "difficulty_selected",
+            &format!(
+                "The operator selected {}. {}",
+                Difficulty::Easy.label(),
+                Difficulty::Easy.note()
+            ),
+        )];
+        let produced = self.run_city_from_google(client_id, jwks_json, id_token, nonce);
+        lines.extend(self.finish(produced));
+        lines
+    }
+
     /// Spawn the agent and run allow, deny, and TTL expiry.
     pub fn spawn_agent(&mut self) -> Vec<FeedLine> {
         self.begin(LevelId::AgentJit);
@@ -342,7 +373,7 @@ impl Engine {
     fn run_city(&mut self) -> Result<Vec<FeedLine>, String> {
         let now = SystemTime::now();
         self.issue_human(now)?;
-        self.finish_city(now, false)
+        self.finish_city(now, CitySource::Process)
     }
 
     fn run_city_from_idp(
@@ -358,32 +389,47 @@ impl Engine {
             .issue_id_token(subject, now, HUMAN_TOKEN_TTL)
             .map_err(|err| err.to_string())?;
         self.issue_human_from_token(oidc, &token, now)?;
-        self.finish_city(now, true)
+        self.finish_city(now, CitySource::Mock)
+    }
+
+    fn run_city_from_google(
+        &mut self,
+        client_id: &str,
+        jwks_json: &str,
+        id_token: &str,
+        nonce: &str,
+    ) -> Result<Vec<FeedLine>, String> {
+        let now = SystemTime::now();
+        self.issue_human_from_google(client_id, jwks_json, id_token, nonce, now)?;
+        self.finish_city(now, CitySource::Google)
     }
 
     fn finish_city(
         &mut self,
         now: SystemTime,
-        from_callback: bool,
+        source: CitySource,
     ) -> Result<Vec<FeedLine>, String> {
         self.steps = vec![StepStatus::NotRun; 4];
         self.steps[0] = StepStatus::Pass;
         self.steps[1] = StepStatus::Pass;
-        let issued = if from_callback {
-            format!(
+        let issued = match source {
+            CitySource::Mock => format!(
                 "The mock IdP callback issued a token for {HUMAN_NAME}. The audience is {OIDC_AUDIENCE}. The human SVID is {}.",
                 self.leaf_uri()
-            )
-        } else {
-            format!(
+            ),
+            CitySource::Process => format!(
                 "OIDC issued a token for {HUMAN_NAME}. The human SVID is {}.",
                 self.leaf_uri()
-            )
+            ),
+            CitySource::Google => format!(
+                "Google issued the human ID token. The human SVID is {}.",
+                self.leaf_uri()
+            ),
         };
-        let peer = if from_callback {
-            "Human SVID from the mock IdP callback."
-        } else {
-            "Human SVID from the OIDC token."
+        let peer = match source {
+            CitySource::Mock => "Human SVID from the mock IdP callback.",
+            CitySource::Process => "Human SVID from the OIDC token.",
+            CitySource::Google => "Human SVID from the Google ID token.",
         };
         let mut lines = Vec::new();
         lines.push(self.identity_line("svid.issued", true, &issued));
@@ -844,6 +890,33 @@ impl Engine {
             .issue_human_svid(token, now, &self.deny)
             .map_err(|err| err.to_string())?;
         let trust_pem = gate.trust_bundle_pem().to_string();
+        self.store_human(issued, trust_pem, now)
+    }
+
+    fn issue_human_from_google(
+        &mut self,
+        client_id: &str,
+        jwks_json: &str,
+        token: &str,
+        nonce: &str,
+        now: SystemTime,
+    ) -> Result<(), String> {
+        let jwks = GoogleJwks::from_json(jwks_json).map_err(|err| err.to_string())?;
+        let ca = MiniCa::generate(now).map_err(|err| err.to_string())?;
+        let gate = IssueGate::from_google(ca, client_id, jwks).map_err(|err| err.to_string())?;
+        let issued = gate
+            .issue_google_human_svid(token, nonce, now, &self.deny)
+            .map_err(|err| err.to_string())?;
+        let trust_pem = gate.trust_bundle_pem().to_string();
+        self.store_human(issued, trust_pem, now)
+    }
+
+    fn store_human(
+        &mut self,
+        issued: gyeol_identity::IssuedSvid,
+        trust_pem: String,
+        now: SystemTime,
+    ) -> Result<(), String> {
         let trust = TrustBundle::from_pem(&trust_pem).map_err(|err| err.to_string())?;
         let authed = trust
             .authenticate_leaf(&issued.certificate_der, now, &self.deny)

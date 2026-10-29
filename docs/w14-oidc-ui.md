@@ -1,7 +1,10 @@
 # Mock IdP sign-in
 
-The harness serves a local OIDC sign-in page.
-City Breeze uses that page.
+The default City Breeze path is Google OIDC.
+Read that path in [w17-google-oidc.md](w17-google-oidc.md).
+This page describes `ORBLX_OIDC_MODE=mock`.
+The harness serves a local OIDC sign-in page on that mode.
+City Breeze uses that page when the mode is mock.
 The page is the browser path for a human SVID.
 The signer is the built-in `MockOidc` in `gyeol-identity`.
 `IssueGate` turns the ID token into the human SVID.

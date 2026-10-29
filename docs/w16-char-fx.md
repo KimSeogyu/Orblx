@@ -3,7 +3,7 @@
 The default page is a character scene.
 The scene reads StackFeed JSON version 1.
 `GET /events` sends that JSON.
-The scene also reads `GET /api/state` after the mock IdP callback.
+The scene also reads `GET /api/state` after the Google callback.
 A feed event moves a character, a path, or both.
 The scene does not invent a feed event.
 The scene does not play a canned keyframe story.
@@ -85,8 +85,8 @@ The gap stays between 0.8 seconds and 4 seconds.
 City Breeze:
 
 1. Click Play City Breeze.
-2. The mock IdP page opens.
-3. Click Sign in.
+2. The browser opens Google sign-in.
+3. Complete the Google consent.
 4. The human shows the SVID and the ticket.
 5. Direct meets application A and application B.
 6. Each application returns status 200.
@@ -123,7 +123,7 @@ The degraded, down, and revoked characters drop on a soft loss.
 Next Level starts the next difficulty.
 City Breeze goes to Agent JIT.
 Agent JIT goes to Radioactive NAT.
-Radioactive NAT opens the mock IdP for City Breeze.
+Radioactive NAT opens Google sign-in for City Breeze.
 The sentence for that result stays in Engineering view.
 
 ## Inspector
@@ -160,7 +160,7 @@ The script rejects a canned keyframe animation.
 
 ## Notes for accept
 
-The player drives City Breeze through the mock IdP.
+The player drives City Breeze through Google sign-in.
 The player drives Agent JIT and Radioactive NAT from the same URL.
 UDP block shows the Direct fault and the Relay recovery on that board.
 The picture uses feed fields only.

@@ -160,13 +160,17 @@ impl Idp {
     }
 }
 
-fn fresh_code() -> Result<String, String> {
-    let mut bytes = [0u8; 32];
+pub(crate) fn random_hex(nbytes: usize) -> Result<String, String> {
+    let mut bytes = vec![0u8; nbytes];
     let mut file = std::fs::File::open("/dev/urandom")
-        .map_err(|_| "The mock IdP did not open the random source.".to_string())?;
+        .map_err(|_| "The sign-in path did not open the random source.".to_string())?;
     file.read_exact(&mut bytes)
-        .map_err(|_| "The mock IdP did not read the random source.".to_string())?;
+        .map_err(|_| "The sign-in path did not read the random source.".to_string())?;
     Ok(hex_encode(&bytes))
+}
+
+fn fresh_code() -> Result<String, String> {
+    random_hex(32)
 }
 
 /// Render the sign-in page for one authorize request.

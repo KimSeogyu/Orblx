@@ -25,9 +25,10 @@ use tokio::sync::broadcast;
 
 use crate::difficulty::Difficulty;
 use crate::event::HarnessEvent;
+use crate::google_flow::{GoogleReady, PendingExchange, SignIn};
 use crate::harness::{Harness, Smash, Snapshot};
 use crate::level::LevelId;
-use crate::oidc_flow::{login_page, AuthorizeRequest, Idp};
+use crate::oidc_flow::{login_page, random_hex, AuthorizeRequest, CALLBACK_PATH, CLIENT_ID};
 
 /// The default TCP port.
 pub const DEFAULT_PORT: u16 = 8787;
@@ -75,7 +76,7 @@ impl std::fmt::Display for SimError {
                 write!(f, "The harness did not start the runtime. {detail}")
             }
             Self::Serve { detail } => write!(f, "The harness server stopped. {detail}"),
-            Self::Idp { detail } => write!(f, "The mock IdP did not open. {detail}"),
+            Self::Idp { detail } => write!(f, "The sign-in path did not open. {detail}"),
         }
     }
 }
@@ -109,7 +110,8 @@ pub async fn serve(listen: SocketAddr) -> Result<(), SimError> {
     println!("The Orblx game is ready.");
     println!("Open http://{local}");
     println!("The default page is the game.");
-    println!("City Breeze opens the mock IdP sign-in page.");
+    println!("City Breeze opens Google sign-in.");
+    println!("The redirect URI is http://127.0.0.1:8787/oidc/callback.");
     println!("Select Medium or Hard on the game board.");
     println!("The event stream is http://{local}/events");
     serve_listener(listener).await
@@ -127,14 +129,19 @@ pub fn serve_blocking(listen: SocketAddr) -> Result<(), SimError> {
 }
 
 async fn serve_listener(listener: TcpListener) -> Result<(), SimError> {
-    axum::serve(listener, router()?)
+    let sign_in = SignIn::open().map_err(|detail| SimError::Idp { detail })?;
+    serve_with(listener, sign_in).await
+}
+
+async fn serve_with(listener: TcpListener, sign_in: SignIn) -> Result<(), SimError> {
+    axum::serve(listener, router(sign_in)?)
         .await
         .map_err(|err| SimError::Serve {
             detail: err.to_string(),
         })
 }
 
-fn router() -> Result<Router, SimError> {
+fn router(sign_in: SignIn) -> Result<Router, SimError> {
     Ok(Router::new()
         .route("/", get(index))
         .route("/app.js", get(script))
@@ -148,31 +155,30 @@ fn router() -> Result<Router, SimError> {
         .route("/api/smash", post(post_smash))
         .route("/events", get(events))
         .route("/v0/events", get(events))
-        .with_state(AppState::open()?))
+        .with_state(AppState::open(sign_in)))
 }
 
 #[derive(Clone)]
 struct AppState {
     harness: Arc<Mutex<Harness>>,
     events: broadcast::Sender<String>,
-    idp: Arc<Mutex<Idp>>,
+    sign_in: Arc<Mutex<SignIn>>,
 }
 
 impl AppState {
-    fn open() -> Result<Self, SimError> {
+    fn open(sign_in: SignIn) -> Self {
         let (events, _) = broadcast::channel(256);
-        let idp = Idp::open().map_err(|detail| SimError::Idp { detail })?;
-        Ok(Self {
+        Self {
             harness: Arc::new(Mutex::new(Harness::new())),
             events,
-            idp: Arc::new(Mutex::new(idp)),
-        })
+            sign_in: Arc::new(Mutex::new(sign_in)),
+        }
     }
 }
 
-fn lock_idp(state: &AppState) -> MutexGuard<'_, Idp> {
+fn lock_sign_in(state: &AppState) -> MutexGuard<'_, SignIn> {
     state
-        .idp
+        .sign_in
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
 }
@@ -202,12 +208,17 @@ struct IdRequest {
     id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct AuthorizeQuery {
+    #[serde(default)]
     client_id: String,
+    #[serde(default)]
     response_type: String,
+    #[serde(default)]
     redirect_uri: String,
+    #[serde(default)]
     state: String,
+    #[serde(default)]
     scope: String,
 }
 
@@ -221,10 +232,14 @@ struct AuthorizeForm {
     subject: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct CallbackQuery {
+    #[serde(default)]
     code: String,
+    #[serde(default)]
     state: String,
+    #[serde(default)]
+    error: String,
 }
 
 fn asset(content_type: &'static str, body: &'static str) -> impl IntoResponse {
@@ -254,20 +269,49 @@ async fn favicon() -> StatusCode {
 }
 
 async fn get_authorize(
+    State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthorizeQuery>,
-) -> Result<impl IntoResponse, ApiError> {
-    let request = authorize_from(
+) -> Result<Response, ApiError> {
+    let mut sign_in = lock_sign_in(&state);
+    match &mut *sign_in {
+        SignIn::Google(session) => {
+            let host = request_host(&headers).unwrap_or("127.0.0.1:8787");
+            let location = session
+                .begin(host, SystemTime::now())
+                .map_err(ApiError::bad)?;
+            Ok(see_other(&location))
+        }
+        SignIn::Unconfigured => Err(ApiError::bad(
+            "Set ORBLX_GOOGLE_CLIENT_ID and ORBLX_GOOGLE_CLIENT_SECRET.",
+        )),
+        SignIn::Mock(_) => {
+            let request = mock_authorize_request(query).map_err(ApiError::bad)?;
+            request
+                .check(request_host(&headers))
+                .map_err(ApiError::bad)?;
+            Ok(html_page(login_page(&request)).into_response())
+        }
+    }
+}
+
+fn mock_authorize_request(query: AuthorizeQuery) -> Result<AuthorizeRequest, String> {
+    if query.client_id.is_empty() {
+        return Ok(AuthorizeRequest {
+            client_id: CLIENT_ID.to_string(),
+            response_type: "code".to_string(),
+            redirect_uri: CALLBACK_PATH.to_string(),
+            state: random_hex(16)?,
+            scope: "openid".to_string(),
+        });
+    }
+    Ok(authorize_from(
         query.client_id,
         query.response_type,
         query.redirect_uri,
         query.state,
         query.scope,
-    );
-    request
-        .check(request_host(&headers))
-        .map_err(ApiError::bad)?;
-    Ok(html_page(login_page(&request)))
+    ))
 }
 
 async fn post_authorize(
@@ -275,41 +319,85 @@ async fn post_authorize(
     headers: HeaderMap,
     Form(form): Form<AuthorizeForm>,
 ) -> Result<Response, ApiError> {
-    let request = authorize_from(
-        form.client_id,
-        form.response_type,
-        form.redirect_uri,
-        form.state,
-        form.scope,
-    );
-    let mut idp = lock_idp(&state);
-    let location = idp
-        .begin(
-            &request,
-            &form.subject,
-            SystemTime::now(),
-            request_host(&headers),
-        )
-        .map_err(ApiError::bad)?;
-    Ok(see_other(&location))
+    let mut sign_in = lock_sign_in(&state);
+    match &mut *sign_in {
+        SignIn::Mock(idp) => {
+            let request = authorize_from(
+                form.client_id,
+                form.response_type,
+                form.redirect_uri,
+                form.state,
+                form.scope,
+            );
+            let location = idp
+                .begin(
+                    &request,
+                    &form.subject,
+                    SystemTime::now(),
+                    request_host(&headers),
+                )
+                .map_err(ApiError::bad)?;
+            Ok(see_other(&location))
+        }
+        SignIn::Google(_) | SignIn::Unconfigured => {
+            Err(ApiError::bad("Google sign-in does not use the local form."))
+        }
+    }
+}
+
+enum CallbackWork {
+    Ready(Vec<String>),
+    Google(PendingExchange),
 }
 
 async fn get_callback(
     State(state): State<AppState>,
     Query(query): Query<CallbackQuery>,
 ) -> Result<Response, ApiError> {
-    let lines = {
-        let mut idp = lock_idp(&state);
-        let subject = idp
-            .consume(&query.code, &query.state, SystemTime::now())
-            .map_err(ApiError::bad)?;
-        let (_snapshot, lines) = apply(&state, |harness| {
-            harness.complete_oidc_city(idp.oidc(), &subject);
-        });
-        lines
+    let work = {
+        let mut sign_in = lock_sign_in(&state);
+        match &mut *sign_in {
+            SignIn::Unconfigured => {
+                return Err(ApiError::bad(
+                    "Set ORBLX_GOOGLE_CLIENT_ID and ORBLX_GOOGLE_CLIENT_SECRET.",
+                ));
+            }
+            SignIn::Google(session) => {
+                if !query.error.is_empty() {
+                    return Err(ApiError::bad("Google did not complete sign-in."));
+                }
+                let exchange = session
+                    .take(&query.code, &query.state, SystemTime::now())
+                    .map_err(ApiError::bad)?;
+                CallbackWork::Google(exchange)
+            }
+            SignIn::Mock(idp) => {
+                let subject = idp
+                    .consume(&query.code, &query.state, SystemTime::now())
+                    .map_err(ApiError::bad)?;
+                let (_snapshot, lines) = apply(&state, |harness| {
+                    harness.complete_oidc_city(idp.oidc(), &subject);
+                });
+                CallbackWork::Ready(lines)
+            }
+        }
+    };
+    let lines = match work {
+        CallbackWork::Ready(lines) => lines,
+        CallbackWork::Google(exchange) => {
+            let ready = exchange.run().await.map_err(ApiError::bad)?;
+            let (_snapshot, lines) = apply_google(&state, ready);
+            lines
+        }
     };
     write_log(&lines);
     Ok(see_other("/"))
+}
+
+fn apply_google(state: &AppState, ready: GoogleReady) -> (Snapshot, Vec<String>) {
+    apply(state, |harness| {
+        harness.complete_google_city(&ready.client_id, &ready.jwks, &ready.id_token, &ready.nonce);
+    })
 }
 
 fn authorize_from(
@@ -446,8 +534,21 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
-    use super::{default_listen, parse_listen, serve_listener, DEFAULT_PORT};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use gyeol_identity::GoogleClient;
+    use rand::thread_rng;
+    use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+    use rsa::traits::PublicKeyParts;
+    use rsa::RsaPrivateKey;
+
+    use super::{default_listen, parse_listen, serve_listener, serve_with, SignIn, DEFAULT_PORT};
+    use crate::google_flow::GoogleSession;
     use crate::http::{APP_CSS, APP_JS, INDEX_HTML};
+
+    const PLAY_CLIENT_ID: &str =
+        "949089074205-hpspmac5i7uld6q5p3f019tvmojhoipi.apps.googleusercontent.com";
+    const PLAY_SUBJECT: &str = "104821234567890123456";
 
     #[test]
     fn the_default_port_is_8787() {
@@ -489,9 +590,12 @@ mod tests {
         assert!(APP_JS.contains("/api/smash"));
         assert!(APP_JS.contains("/api/level"));
         assert!(APP_JS.contains("/api/difficulty"));
-        assert!(APP_JS.contains("/oidc/authorize"));
-        assert!(APP_JS.contains("/oidc/callback"));
-        assert!(INDEX_HTML.contains("mock IdP"));
+        assert!(APP_JS.contains("window.location.assign(\"/oidc/authorize\")"));
+        assert!(!INDEX_HTML.to_ascii_lowercase().contains("mock idp"));
+        assert!(!INDEX_HTML.contains("ada"));
+        assert!(!APP_JS.contains("ada"));
+        assert!(!APP_JS.contains("gyeol-sim"));
+        assert!(INDEX_HTML.contains("Google sign-in"));
         assert!(INDEX_HTML.contains("id=\"curve\""));
         assert!(INDEX_HTML.contains("id=\"runbar\""));
         assert!(INDEX_HTML.contains("id=\"inspector\""));
@@ -544,7 +648,8 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            serve_listener(listener).await.unwrap();
+            let sign_in = SignIn::mock().unwrap();
+            serve_with(listener, sign_in).await.unwrap();
         });
 
         let state_value = "00112233445566778899aabbccddeeff";
@@ -568,6 +673,7 @@ mod tests {
         );
         let posted = exchange_typed(
             addr,
+            "localhost",
             "POST /oidc/authorize HTTP/1.1",
             "application/x-www-form-urlencoded",
             &form,
@@ -598,6 +704,7 @@ mod tests {
 
         let evil = exchange_typed(
             addr,
+            "localhost",
             "POST /oidc/authorize HTTP/1.1",
             "application/x-www-form-urlencoded",
             "subject=ada&client_id=gyeol-sim&response_type=code&redirect_uri=https%3A%2F%2Fevil.example%2Foidc%2Fcallback&state=00112233445566778899aabbccddeeff&scope=openid",
@@ -607,27 +714,139 @@ mod tests {
         assert!(evil.contains("redirect"));
     }
 
+    #[tokio::test]
+    async fn google_authorize_redirects_to_accounts() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = GoogleClient::new(PLAY_CLIENT_ID, "test-secret-value").unwrap();
+        let session = GoogleSession::from_client(client).unwrap();
+        tokio::spawn(async move {
+            serve_with(listener, SignIn::google(session)).await.unwrap();
+        });
+        let response =
+            exchange_host(addr, "127.0.0.1:8787", "GET /oidc/authorize HTTP/1.1", "").await;
+        assert!(response.contains("HTTP/1.1 303"));
+        let location = header_value(&response, "location").unwrap();
+        assert!(location.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
+        assert!(location.contains(PLAY_CLIENT_ID));
+        assert!(location.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A8787%2Foidc%2Fcallback"));
+        assert!(!location.contains("test-secret-value"));
+        assert!(!response.to_ascii_lowercase().contains("mock idp"));
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_google_path_does_not_open_the_mock_page() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            serve_with(listener, SignIn::Unconfigured).await.unwrap();
+        });
+        let response = exchange(addr, "GET /oidc/authorize HTTP/1.1", "").await;
+        assert!(response.contains("HTTP/1.1 400"));
+        assert!(response.contains("ORBLX_GOOGLE_CLIENT_ID"));
+        assert!(response.contains("ORBLX_GOOGLE_CLIENT_SECRET"));
+        assert!(!response.to_ascii_lowercase().contains("mock idp"));
+        assert!(!response.contains("Subject: ada"));
+    }
+
+    #[tokio::test]
+    async fn the_google_callback_issues_a_city_breeze_svid() {
+        let (jwks, pem) = test_rsa();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let session = GoogleSession::scripted(
+            PLAY_CLIENT_ID,
+            "test-secret-value",
+            &jwks,
+            &pem,
+            PLAY_SUBJECT,
+        )
+        .unwrap();
+        tokio::spawn(async move {
+            serve_with(listener, SignIn::google(session)).await.unwrap();
+        });
+        let started =
+            exchange_host(addr, "127.0.0.1:8787", "GET /oidc/authorize HTTP/1.1", "").await;
+        let location = header_value(&started, "location").unwrap();
+        let state = query_value(location, "state");
+        let callback = exchange(
+            addr,
+            &format!("GET /oidc/callback?code=abcd&state={state} HTTP/1.1"),
+            "",
+        )
+        .await;
+        assert!(callback.contains("HTTP/1.1 303"));
+        assert_eq!(header_value(&callback, "location"), Some("/"));
+        let state_body = exchange(addr, "GET /api/state HTTP/1.1", "").await;
+        assert!(state_body.contains("Google issued the human ID token"));
+        assert!(state_body.contains(&format!("user/{PLAY_SUBJECT}")));
+        assert!(state_body.contains("\"state\":\"up\""));
+        assert!(state_body.contains("app-a.orblx.test"));
+        assert!(state_body.contains("app-b.orblx.test"));
+        assert!(!state_body.contains("mock IdP"));
+        assert!(!state_body.contains("user/ada"));
+        let reused = exchange(
+            addr,
+            &format!("GET /oidc/callback?code=abcd&state={state} HTTP/1.1"),
+            "",
+        )
+        .await;
+        assert!(reused.contains("HTTP/1.1 400"));
+    }
+
+    fn test_rsa() -> (String, String) {
+        let mut rng = thread_rng();
+        let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let pem = key.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
+        let n = URL_SAFE_NO_PAD.encode(key.n().to_bytes_be());
+        let e = URL_SAFE_NO_PAD.encode(key.e().to_bytes_be());
+        let jwks = format!(
+            r#"{{"keys":[{{"kty":"RSA","alg":"RS256","use":"sig","kid":"orblx-test","n":"{n}","e":"{e}"}}]}}"#
+        );
+        (jwks, pem)
+    }
+
+    fn query_value(url: &str, key: &str) -> String {
+        let query = url.split_once('?').unwrap().1;
+        for pair in query.split('&') {
+            if let Some(value) = pair.strip_prefix(&format!("{key}=")) {
+                return value.to_string();
+            }
+        }
+        panic!("missing {key}");
+    }
+
     async fn exchange(addr: std::net::SocketAddr, head: &str, body: &str) -> String {
+        exchange_host(addr, "localhost", head, body).await
+    }
+
+    async fn exchange_host(
+        addr: std::net::SocketAddr,
+        host: &str,
+        head: &str,
+        body: &str,
+    ) -> String {
         let content_type = if body.is_empty() {
             ""
         } else {
             "application/json"
         };
-        exchange_typed(addr, head, content_type, body).await
+        exchange_typed(addr, host, head, content_type, body).await
     }
 
     async fn exchange_typed(
         addr: std::net::SocketAddr,
+        host: &str,
         head: &str,
         content_type: &str,
         body: &str,
     ) -> String {
         let mut stream = connect_retry(addr).await;
         let request = if body.is_empty() {
-            format!("{head}\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            format!("{head}\r\nHost: {host}\r\nConnection: close\r\n\r\n")
         } else {
             format!(
-                "{head}\r\nHost: localhost\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "{head}\r\nHost: {host}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             )
         };

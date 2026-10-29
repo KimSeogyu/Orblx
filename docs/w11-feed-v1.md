@@ -103,11 +103,10 @@ cargo run -p gyeol-sim
 Open `http://127.0.0.1:8787`.
 The default page is the game.
 The game reads this feed.
-Play City Breeze opens the mock IdP sign-in page.
-Sign in on that page.
+Play City Breeze opens Google sign-in.
 The callback emits `svid.issued` and the City Breeze kinds.
 Select Medium or Hard for the other levels.
 Press Revoke, UDP block, or Spawn agent.
-Read the sign-in steps in [w14-oidc-ui.md](w14-oidc-ui.md).
+Read the sign-in steps in [w17-google-oidc.md](w17-google-oidc.md).
 The event log shows the JSON kinds.
 The terminal prints each new line.

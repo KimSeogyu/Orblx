@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run City Breeze, Agent JIT, and Radioactive NAT on the live harness.
-# City Breeze signs in through the mock IdP page.
-# The script follows that sign-in with curl.
+# City Breeze uses the Google authorize redirect.
+# ORBLX_OIDC_MODE=mock signs in through the local IdP page.
 # The later actions match the browser smash buttons.
 # The script checks the event kinds from those actions.
 # The script checks that the default page is the game.
@@ -57,6 +57,7 @@ fi
 echo "The harness is ready at ${base}."
 
 python3 - "$base" <<'PY'
+import re
 import sys
 import urllib.request
 
@@ -93,11 +94,71 @@ for needle in (
         raise SystemExit("The game page is missing " + needle + ".")
 if "RUN_MS = 35000" not in script or "Soft win" not in script:
     raise SystemExit("The timed run or the end card is missing.")
+for path in ("/", "/app.js"):
+    text = files[path]
+    lowered = text.lower()
+    if "mock idp" in lowered or "subject: ada" in lowered or "fake" in lowered:
+        raise SystemExit(path + " shows a mock or fake sign-in.")
+    if re.search(r"\bada\b", text, re.I):
+        raise SystemExit(path + " names the fixed subject.")
 print("The default page is the game. The game reads the feed. The page has no canned keyframe animation.")
 PY
 
 seqfile="${work}/seq"
 printf '0\n' >"$seqfile"
+
+google_authorize() {
+  local headers="${work}/authorize.headers"
+  local posted="${work}/authorize.body"
+  local code
+  code=$(curl --silent --show-error --dump-header "$headers" --output "$posted" --write-out '%{http_code}' \
+    "${base}/oidc/authorize")
+  python3 - "$headers" "$posted" "$code" "$addr" <<'PY'
+import os
+import sys
+from urllib.parse import quote
+
+headers, body_path, code, addr = sys.argv[1:5]
+body = open(body_path, encoding="utf-8", errors="replace").read()
+location = ""
+for line in open(headers, encoding="utf-8", errors="replace"):
+    if line.lower().startswith("location:"):
+        location = line.split(":", 1)[1].strip()
+secret = os.environ.get("ORBLX_GOOGLE_CLIENT_SECRET", "")
+client = os.environ.get("ORBLX_GOOGLE_CLIENT_ID", "")
+text = location + "\n" + body
+if secret and secret in text:
+    raise SystemExit("The authorize response contains the client secret.")
+lowered = text.lower()
+if "mock idp" in lowered or "subject: ada" in lowered:
+    raise SystemExit("The authorize response is the mock sign-in page.")
+if client and secret:
+    if code != "303":
+        print(body)
+        raise SystemExit("Google authorize returned " + code + ".")
+    if not location.startswith("https://accounts.google.com/o/oauth2/v2/auth?"):
+        raise SystemExit("Google authorize did not open accounts.google.com.")
+    redirect = quote("http://" + addr + "/oidc/callback", safe="")
+    for needle in (
+        "client_id=" + client,
+        "redirect_uri=" + redirect,
+        "response_type=code",
+        "scope=openid",
+        "state=",
+        "nonce=",
+    ):
+        if needle not in location:
+            raise SystemExit("The Google authorize URL is missing a required field.")
+    print("Google authorize redirects to accounts.google.com.")
+else:
+    if code != "400":
+        print(body)
+        raise SystemExit("Unconfigured Google authorize returned " + code + ".")
+    if "ORBLX_GOOGLE_CLIENT_ID" not in body or "ORBLX_GOOGLE_CLIENT_SECRET" not in body:
+        raise SystemExit("The unconfigured response does not name both variables.")
+    print("Google authorize asks for the client id and the client secret.")
+PY
+}
 
 oidc_easy() {
   local state
@@ -249,6 +310,14 @@ expected = {
         "session.dropped",
         "session_down",
     ],
+    "revoke_cold": [
+        "smash_revoke",
+        "svid.issued",
+        "svid.revoked",
+        "session.dropped",
+        "session_up",
+        "session_down",
+    ],
     "medium": [
         "difficulty_selected",
         "agent.spawned",
@@ -333,7 +402,7 @@ if name == "easy":
     need(https[1], "status", 200)
     print("easy pass")
 
-if name == "revoke":
+if name in ("revoke", "revoke_cold"):
     if level["id"] != "city_breeze":
         fail("Revoke left City Breeze.")
     dropped = next(body for body in new if body["kind"] == "session.dropped")
@@ -417,8 +486,13 @@ post() {
   check_snapshot "$name" "$body"
 }
 
-oidc_easy
-post revoke /api/smash revoke
+if [[ "${ORBLX_OIDC_MODE:-}" == "mock" ]]; then
+  oidc_easy
+  post revoke /api/smash revoke
+else
+  google_authorize
+  post revoke_cold /api/smash revoke
+fi
 post medium /api/difficulty medium
 post agent /api/smash agent_spawn
 post hard /api/difficulty hard

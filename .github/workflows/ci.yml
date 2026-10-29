@@ -27,3 +27,10 @@ jobs:
 
       - name: Run the tests
         run: cargo test --workspace
+
+      - name: Run the harness demo
+        env:
+          # Public Web client id. The secret is a stand-in. It is not a Google secret.
+          ORBLX_GOOGLE_CLIENT_ID: 949089074205-hpspmac5i7uld6q5p3f019tvmojhoipi.apps.googleusercontent.com
+          ORBLX_GOOGLE_CLIENT_SECRET: not-a-real-google-secret
+        run: ./scripts/demo.sh

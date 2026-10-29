@@ -1381,30 +1381,7 @@ function renderEvents(events) {
 }
 
 function startOidcLogin() {
-  const state = randomHex(16);
-  const redirect = window.location.origin + "/oidc/callback";
-  const params = new URLSearchParams({
-    client_id: "gyeol-sim",
-    response_type: "code",
-    redirect_uri: redirect,
-    state: state,
-    scope: "openid",
-  });
-  window.location.assign("/oidc/authorize?" + params.toString());
-}
-
-function randomHex(size) {
-  const values = new Uint8Array(size);
-  if (window.crypto && window.crypto.getRandomValues) {
-    window.crypto.getRandomValues(values);
-  } else {
-    for (let index = 0; index < values.length; index += 1) {
-      values[index] = Math.floor(Math.random() * 256);
-    }
-  }
-  return Array.from(values, function (value) {
-    return value.toString(16).padStart(2, "0");
-  }).join("");
+  window.location.assign("/oidc/authorize");
 }
 
 document.getElementById("play-city").addEventListener("click", function () {

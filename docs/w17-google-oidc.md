@@ -123,3 +123,81 @@ The harness calls this API on the Google path:
 
 The browser pages and `scripts/demo.sh` stay on the harness change.
 That change must keep the mock path behind `ORBLX_OIDC_MODE=mock`.
+
+## Harness surface
+
+The default page is the character scene.
+Play City Breeze sends the browser to `GET /oidc/authorize`.
+The page does not show a mock IdP panel.
+The page does not show a fixed subject.
+The page does not show a fake banner.
+`ORBLX_OIDC_MODE=mock` still serves the local sign-in page.
+That page stays off the default path.
+
+A missing client id or a missing client secret returns HTTP 400.
+The response names `ORBLX_GOOGLE_CLIENT_ID` and `ORBLX_GOOGLE_CLIENT_SECRET`.
+The response is not the mock sign-in page.
+
+The callback posts the token request.
+The harness does not log that body.
+The harness reads `id_token`.
+The harness fetches the JWKS document.
+The harness calls `GoogleJwks::from_json`.
+The harness calls `IssueGate::from_google`.
+The harness calls `issue_google_human_svid` with the authorize nonce.
+The feed line says that Google issued the human ID token.
+The SVID state is `up`.
+The QUIC path state is `up`.
+
+## Play
+
+Set the two environment variables.
+Leave `ORBLX_OIDC_MODE` unset.
+
+```bash
+export ORBLX_GOOGLE_CLIENT_ID=949089074205-hpspmac5i7uld6q5p3f019tvmojhoipi.apps.googleusercontent.com
+export ORBLX_GOOGLE_CLIENT_SECRET=
+cargo run -p gyeol-sim
+```
+
+Put the client secret in `ORBLX_GOOGLE_CLIENT_SECRET`.
+Do not commit that value.
+`.env.example` shows the public client id and an empty secret.
+
+Open `http://127.0.0.1:8787`.
+`http://localhost:8787` is the other registered origin.
+Another port is not a registered redirect.
+
+1. Click Play City Breeze.
+2. The browser opens the Google authorization page.
+3. Complete the Google consent.
+4. Google returns the browser to `/oidc/callback`.
+5. The character scene shows the human SVID up.
+6. The Direct path meets `app-a.orblx.test` and `app-b.orblx.test`.
+
+The play recording waits for the client secret.
+The engineering lead injects `ORBLX_GOOGLE_CLIENT_SECRET` into the agent.
+The recording then follows the click path above.
+Save that recording under `artifacts/orblx-w17-play/`.
+
+## Demo and CI
+
+`./scripts/demo.sh` checks the default page.
+The page and `app.js` must not contain a mock IdP panel or the fixed subject.
+With both Google variables set, `GET /oidc/authorize` returns 303.
+The location is the Google authorization URL.
+The location contains the client id, the loopback redirect, `state`, and `nonce`.
+The location does not contain the client secret.
+The response body is not the mock sign-in page.
+The script then presses Revoke without a City Breeze session.
+That cold revoke issues a session and then drops it.
+The later actions are Medium, Spawn agent, Hard, and UDP block.
+
+Without the two variables, the same request returns 400.
+The body names both variables.
+
+`ORBLX_OIDC_MODE=mock` keeps the local sign-in path.
+CI sets the public client id and a stand-in secret.
+The stand-in secret is not a Google secret.
+CI uses it only to prove the authorize redirect.
+CI does not exchange a token.

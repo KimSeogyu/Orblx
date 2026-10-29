@@ -6,7 +6,7 @@ The default page is a game.
 The game is City Breeze, Agent JIT, and Radioactive NAT.
 The board reads StackFeed JSON version 1.
 `GET /events` sends that JSON.
-The board also reads the same JSON from `GET /api/state` when the page opens after the mock IdP callback.
+The board also reads the same JSON from `GET /api/state` when the page opens after the Google callback.
 The page does not invent counters.
 The page does not play a canned story.
 A feed event moves the board.
@@ -97,19 +97,16 @@ The inspector does not add a counter.
 ## City Breeze
 
 1. Click Play City Breeze.
-2. The mock IdP page opens.
-3. The page shows the issuer `https://oidc.gyeol.local`.
-4. The page shows the audience `gyeol-issue`.
-5. The page shows the subject `ada`.
-6. Click Sign in.
-7. The browser returns to the game.
-8. The board shows `svid.issued`.
-9. The board shows `ticket.verified`.
-10. The board shows `quic_hello`.
-11. The board shows the overlay ping frames.
-12. The board shows `connector_https` for `app-a.orblx.test` with status 200.
-13. The board shows `connector_https` for `app-b.orblx.test` with status 200.
-14. The board shows `session_up`.
+2. The browser opens Google sign-in.
+3. Complete the Google consent.
+4. The browser returns to the game.
+5. The board shows `svid.issued`.
+6. The board shows `ticket.verified`.
+7. The board shows `quic_hello`.
+8. The board shows the overlay ping frames.
+9. The board shows `connector_https` for `app-a.orblx.test` with status 200.
+10. The board shows `connector_https` for `app-b.orblx.test` with status 200.
+11. The board shows `session_up`.
 
 The feed detail is the sentence on the board.
 The SVID chip and the ticket chip change from those events.
@@ -169,7 +166,7 @@ The card prints the feed detail for that event.
 Next Level starts the next difficulty.
 City Breeze goes to Agent JIT.
 Agent JIT goes to Radioactive NAT.
-Radioactive NAT opens the mock IdP for City Breeze.
+Radioactive NAT opens Google sign-in for City Breeze.
 
 Each level has its own board art.
 City Breeze uses a street line.
@@ -201,7 +198,7 @@ The script rejects a canned keyframe animation.
 ## Notes for accept
 
 This page is a playable board on the gyeol-sim feed.
-The player drives City Breeze through the mock IdP.
+The player drives City Breeze through Google sign-in.
 The player drives Agent JIT and Radioactive NAT from the same URL.
 UDP block shows the fault and the Relay recovery on that board.
 The picture uses feed fields only.
