@@ -38,10 +38,9 @@ build_image() {
   local image_dir bin
   bin="$ROOT/target/debug/orblx"
   cargo build -p orblx-cli --bin orblx
-  image_dir="$(mktemp -d)"
-  cp "$bin" "$image_dir/orblx"
-  cp "$ROOT/scripts/proof/Dockerfile" "$image_dir/Dockerfile"
-  cp "$ROOT/scripts/proof/entrypoint.sh" "$image_dir/entrypoint.sh"
+  # shellcheck source=stage-image.sh
+  source "$ROOT/scripts/proof/stage-image.sh"
+  image_dir="$(stage_proof_image "$ROOT" "$bin")"
   docker build -t orblx-coord:w18 "$image_dir"
   rm -rf "$image_dir"
 }

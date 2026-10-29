@@ -67,10 +67,9 @@ if [[ ! -x "$bin" ]]; then
   cargo build -p orblx-cli --bin orblx --manifest-path "$root/Cargo.toml"
 fi
 
-image_dir=$(mktemp -d)
-cp "$bin" "$image_dir/orblx"
-cp "$root/scripts/proof/Dockerfile" "$image_dir/Dockerfile"
-cp "$root/scripts/proof/entrypoint.sh" "$image_dir/entrypoint.sh"
+# shellcheck source=stage-image.sh
+source "$root/scripts/proof/stage-image.sh"
+image_dir="$(stage_proof_image "$root" "$bin")"
 docker build -t orblx-w18:local "$image_dir"
 
 mkdir -p "$work/a" "$work/b" "$work/c"
