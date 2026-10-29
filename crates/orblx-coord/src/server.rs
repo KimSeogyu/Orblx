@@ -105,6 +105,7 @@ async fn handle_connection(
                 netmap_pub_hex: None,
                 netmap: None,
                 endpoints: None,
+                grants: None,
             }
         }
     };
@@ -181,6 +182,7 @@ async fn dispatch(
                 netmap_pub_hex: Some(encode_hex(&view.netmap_public)),
                 netmap: Some(view.signed_netmap),
                 endpoints: Some(view.endpoints),
+                grants: Some(view.signed_grants),
             })
         }
         _ => Err(CoordError::Protocol(
@@ -199,6 +201,7 @@ fn leaf_response(result: crate::state::EnrollResult) -> Response {
         netmap_pub_hex: Some(encode_hex(&result.netmap_public)),
         netmap: Some(result.signed_netmap),
         endpoints: Some(result.endpoints),
+        grants: Some(result.signed_grants),
     }
 }
 

@@ -4,14 +4,16 @@ use std::time::{Duration, SystemTime};
 
 use orblx_datapath::{Netmap, NetmapPeer, NetmapSelf};
 use orblx_identity::{
-    google_client_id_ok, DenySet, GoogleJwks, IssueGate, IssuedSvid, MiniCa, SpiffeId, MAX_USER_TTL,
+    google_client_id_ok, DenySet, GoogleJwks, IssueGate, IssuedSvid, MiniCa, Policy, SpiffeId,
+    MAX_USER_TTL,
 };
+use sha2::{Digest, Sha256};
 
 use crate::error::CoordError;
 use crate::files::{create_private_dir, read_text, write_bytes, write_text};
 use crate::netmap::{
-    decode_hex_32, verify_signed_endpoint, verify_signed_netmap, NetmapKey, SignedEndpoint,
-    SignedNetmap,
+    decode_hex_32, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap, NetmapKey,
+    SignedEndpoint, SignedGrants, SignedNetmap,
 };
 use crate::store::{CreatedToken, NodeStore};
 
@@ -21,6 +23,8 @@ const CA_KEY_FILE: &str = "ca.key.pem";
 const TRUST_FILE: &str = "trust-bundle.pem";
 const SEED_FILE: &str = "netmap.seed";
 const STORE_FILE: &str = "nodes.json";
+const POLICY_FILE: &str = "policy.hujson";
+const LOADED_POLICY_FILE: &str = "policy.loaded.hujson";
 
 /// How the coordinator checks a laptop enrollment.
 pub enum OidcConfig {
@@ -95,6 +99,12 @@ struct Inner {
     oidc: OidcState,
     /// Life of a node leaf. The maximum is [`MAX_USER_TTL`].
     svid_ttl: Duration,
+    policy_path: PathBuf,
+    policy: Policy,
+    policy_hash: Option<[u8; 32]>,
+    policy_fail: Option<String>,
+    has_good: bool,
+    saw_file: bool,
 }
 
 /// The coordinator state.
@@ -117,6 +127,7 @@ pub struct EnrollResult {
     pub trust_bundle_pem: String,
     pub netmap_public: [u8; 32],
     pub signed_netmap: SignedNetmap,
+    pub signed_grants: SignedGrants,
     pub endpoints: Vec<SignedEndpoint>,
 }
 
@@ -136,6 +147,7 @@ impl std::fmt::Debug for EnrollResult {
 #[derive(Debug, Clone)]
 pub struct NetmapView {
     pub signed_netmap: SignedNetmap,
+    pub signed_grants: SignedGrants,
     pub endpoints: Vec<SignedEndpoint>,
     pub netmap_public: [u8; 32],
 }
@@ -192,7 +204,7 @@ impl Coordinator {
             }
             OidcConfig::Mock(gate) => OidcState::Mock(gate),
         };
-        Ok(Self {
+        let coord = Self {
             inner: Arc::new(Mutex::new(Inner {
                 state_dir: dir.to_path_buf(),
                 coord_name: coord_name.to_string(),
@@ -202,8 +214,34 @@ impl Coordinator {
                 netmap_key,
                 oidc,
                 svid_ttl: MAX_USER_TTL,
+                policy_path: dir.join(POLICY_FILE),
+                policy: Policy::empty(),
+                policy_hash: None,
+                policy_fail: None,
+                has_good: false,
+                saw_file: false,
             })),
-        })
+        };
+        {
+            let mut inner = coord.lock()?;
+            refresh_policy(&mut inner);
+        }
+        Ok(coord)
+    }
+
+    /// Read policy from `path` on later netmap builds.
+    ///
+    /// A failed file does not replace the last good policy.
+    pub fn set_policy_file(&self, path: &Path) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        if inner.policy_path != path {
+            inner.policy_path = path.to_path_buf();
+            inner.policy_hash = None;
+            inner.policy_fail = None;
+            inner.saw_file = false;
+        }
+        refresh_policy(&mut inner);
+        Ok(())
     }
 
     /// Set the life of the next node leaf.
@@ -327,7 +365,93 @@ impl Coordinator {
 
 fn reload(inner: &mut Inner) -> Result<(), CoordError> {
     inner.store = NodeStore::open(&inner.state_dir.join(STORE_FILE))?;
+    refresh_policy(inner);
     Ok(())
+}
+
+fn refresh_policy(inner: &mut Inner) {
+    let path = inner.policy_path.clone();
+    if !path.exists() {
+        if inner.saw_file {
+            note_policy_failure(
+                inner,
+                "The policy file is missing. The coordinator keeps the last good policy.",
+            );
+        } else if !inner.has_good {
+            adopt_saved_policy(inner);
+        }
+        return;
+    }
+    inner.saw_file = true;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            note_policy_failure(
+                inner,
+                "The policy file did not open. The coordinator keeps the last good policy.",
+            );
+            if !inner.has_good {
+                adopt_saved_policy(inner);
+            }
+            return;
+        }
+    };
+    let hash = sha256(&bytes);
+    if inner.has_good && inner.policy_hash == Some(hash) {
+        return;
+    }
+    match Policy::from_hujson(&bytes) {
+        Ok(policy) => {
+            inner.policy = policy;
+            inner.policy_hash = Some(hash);
+            inner.has_good = true;
+            inner.policy_fail = None;
+            let saved = inner.state_dir.join(LOADED_POLICY_FILE);
+            match std::str::from_utf8(&bytes) {
+                Ok(text) => {
+                    if write_text(&saved, text, 0o644).is_err() {
+                        println!("policy load failed: The last good policy was not saved.");
+                    }
+                }
+                Err(_) => {
+                    println!("policy load failed: The last good policy was not saved.");
+                }
+            }
+        }
+        Err(err) => {
+            note_policy_failure(inner, &err.to_string());
+            if !inner.has_good {
+                adopt_saved_policy(inner);
+            }
+        }
+    }
+}
+
+fn adopt_saved_policy(inner: &mut Inner) {
+    let path = inner.state_dir.join(LOADED_POLICY_FILE);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    if let Ok(policy) = Policy::from_hujson(&bytes) {
+        inner.policy = policy;
+        inner.has_good = true;
+        inner.policy_hash = Some(sha256(&bytes));
+    }
+}
+
+fn note_policy_failure(inner: &mut Inner, sentence: &str) {
+    if inner.policy_fail.as_deref() == Some(sentence) {
+        return;
+    }
+    println!("policy load failed: {sentence}");
+    inner.policy_fail = Some(sentence.to_string());
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(bytes);
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&digest);
+    hash
 }
 
 fn finish_enroll(
@@ -352,6 +476,7 @@ fn finish_enroll(
         trust_bundle_pem: inner.ca.trust_bundle_pem().to_string(),
         netmap_public: view.netmap_public,
         signed_netmap: view.signed_netmap,
+        signed_grants: view.signed_grants,
         endpoints: view.endpoints,
     })
 }
@@ -372,6 +497,7 @@ fn issue_leaf(inner: &mut Inner, name: &str, now: SystemTime) -> Result<EnrollRe
         trust_bundle_pem: inner.ca.trust_bundle_pem().to_string(),
         netmap_public: view.netmap_public,
         signed_netmap: view.signed_netmap,
+        signed_grants: view.signed_grants,
         endpoints: view.endpoints,
     })
 }
@@ -408,13 +534,19 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
         peers,
     };
     let signed_netmap = inner.netmap_key.sign_netmap(&payload)?;
+    let receiver = SpiffeId::node(&self_node.name)?;
+    let signed_grants = inner
+        .netmap_key
+        .sign_grants(&inner.policy.receiver_grants(&receiver))?;
     let netmap_public = inner.netmap_key.public();
     verify_signed_netmap(&signed_netmap, &netmap_public)?;
+    verify_signed_grants(&signed_grants, &netmap_public)?;
     for endpoint in &endpoints {
         verify_signed_endpoint(endpoint, &netmap_public)?;
     }
     Ok(NetmapView {
         signed_netmap,
+        signed_grants,
         endpoints,
         netmap_public,
     })
@@ -493,19 +625,30 @@ impl EnrollResult {
             &format!("{}\n", crate::netmap::encode_hex(&self.netmap_public)),
             0o644,
         )?;
-        write_view(dir, &self.signed_netmap, &self.endpoints)
+        write_view(
+            dir,
+            &self.signed_netmap,
+            &self.signed_grants,
+            &self.endpoints,
+        )
     }
 }
 
 impl NetmapView {
     pub fn write_state(&self, dir: &Path) -> Result<(), CoordError> {
-        write_view(dir, &self.signed_netmap, &self.endpoints)
+        write_view(
+            dir,
+            &self.signed_netmap,
+            &self.signed_grants,
+            &self.endpoints,
+        )
     }
 }
 
 fn write_view(
     dir: &Path,
     netmap: &SignedNetmap,
+    grants: &SignedGrants,
     endpoints: &[SignedEndpoint],
 ) -> Result<(), CoordError> {
     let netmap_text = serde_json::to_string(&netmap.netmap)
@@ -516,8 +659,14 @@ fn write_view(
         .map_err(|_| CoordError::Protocol("The netmap is not valid.".to_string()))?;
     let endpoint_text = serde_json::to_string(endpoints)
         .map_err(|_| CoordError::Protocol("The endpoint list is not valid.".to_string()))?;
+    let grant_text = serde_json::to_string(&grants.grants)
+        .map_err(|_| CoordError::Protocol("The grants are not valid.".to_string()))?;
+    let signed_grants = serde_json::to_string(grants)
+        .map_err(|_| CoordError::Protocol("The grants are not valid.".to_string()))?;
     write_text(&dir.join("netmap.json"), &netmap_text, 0o644)?;
     write_text(&dir.join("netmap.signed.json"), &signed_text, 0o644)?;
+    write_text(&dir.join("grants.json"), &grant_text, 0o644)?;
+    write_text(&dir.join("grants.signed.json"), &signed_grants, 0o644)?;
     write_text(&dir.join("endpoints.json"), &endpoint_text, 0o644)?;
     Ok(())
 }

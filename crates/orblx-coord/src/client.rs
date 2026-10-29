@@ -4,7 +4,9 @@ use std::path::Path;
 use orblx_identity::SpiffeId;
 
 use crate::error::CoordError;
-use crate::netmap::{decode_hex_32, verify_signed_endpoint, verify_signed_netmap, SignedNetmap};
+use crate::netmap::{
+    decode_hex_32, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap, SignedNetmap,
+};
 use crate::proto::{self, Request, Response};
 use crate::state::{read_node_material, EnrollResult, NetmapView, NodeMaterial};
 use crate::tlsutil::{self, ClientTls};
@@ -125,6 +127,7 @@ pub async fn fetch_netmap(
     .await?;
     let view = NetmapView {
         signed_netmap: result.signed_netmap,
+        signed_grants: result.signed_grants,
         endpoints: result.endpoints,
         netmap_public: result.netmap_public,
     };
@@ -259,6 +262,16 @@ fn enroll_from_response(
         }
     }
     verify_signed_netmap(&signed, &public)?;
+    let grants = response
+        .grants
+        .ok_or_else(|| CoordError::Protocol("The grants are not valid.".to_string()))?;
+    verify_signed_grants(&grants, &public)?;
+    let receiver = format!("spiffe://orblx.local/node/{}", signed.netmap.self_node.name);
+    if grants.grants.receiver != receiver {
+        return Err(CoordError::Protocol(
+            "The grant receiver does not match the node.".to_string(),
+        ));
+    }
     for endpoint in &endpoints {
         verify_signed_endpoint(endpoint, &public)?;
     }
@@ -285,6 +298,7 @@ fn enroll_from_response(
         trust_bundle_pem: bundle_pem.to_string(),
         netmap_public: public,
         signed_netmap: signed,
+        signed_grants: grants,
         endpoints,
     })
 }

@@ -13,6 +13,8 @@
 //! An agent capability ticket is separate from the SVID.
 //! The agent ticket allows one destination.
 //! Every other agent destination is denied.
+//! `Policy::from_hujson` loads groups, tags, accept rules, and inline tests.
+//! A failed test rejects the file.
 //! Node enrollment calls `IssueGate::owner_subject`.
 //! That call does not issue the node SVID.
 //!
@@ -29,6 +31,7 @@ mod deny;
 mod error;
 mod google;
 mod oidc;
+mod policy;
 mod spiffe;
 mod ticket;
 
@@ -47,6 +50,7 @@ pub use google::{
     OIDC_MODE_ENV,
 };
 pub use oidc::{AgentSvid, IssueGate, MockOidc, MOCK_OIDC_ISSUER, OIDC_AUDIENCE};
+pub use policy::{Policy, PolicyAssertion, PolicyError, ReceiverGrant, ReceiverGrants};
 pub use spiffe::{SpiffeId, WorkloadKind, TRUST_DOMAIN};
 pub use ticket::{
     allow_agent_jit, sign_agent_jit_ticket, sign_ticket, ticket_hash, verify_ticket,
