@@ -8,8 +8,11 @@ The board also reads the same JSON from `GET /api/state` when the page opens aft
 The page does not invent counters.
 The page does not play a canned story.
 A feed event moves the board.
-The wait between events lets a person see each event.
+The page spaces one full level across about 35 seconds.
+The gap is the wait between feed events.
 The wait does not create events.
+A short poke uses a shorter gap.
+The gap stays between 0.8 seconds and 4 seconds.
 
 ## One command
 
@@ -34,6 +37,60 @@ The first `cargo` build can take longer than a later start.
 After that build, start the same command again.
 The play page is that URL.
 No other setup is required.
+
+## Level select
+
+The level select is three cartridges.
+Each cartridge has one fault line from the level machine.
+
+- City Breeze uses the Easy note.
+- Agent JIT uses the Medium note.
+- Radioactive NAT uses the Hard note.
+
+The notes come from `Difficulty::note`.
+The page copies the note from `GET /api/state`.
+
+## Difficulty curve
+
+The curve has three steps.
+The steps are Easy, Medium, and Hard.
+The order is the order in the level machine.
+The selected step is the stored difficulty.
+The line under the curve is `fault_detail`.
+The page does not add a fault percent.
+The page does not add a throughput number.
+
+## Nodes
+
+The board has five nodes.
+The nodes are the human, the hub, application A, application B, and the Relay.
+Each node has a color state.
+The states are `up`, `degraded`, `down`, and `revoked`.
+`idle` means the feed has not named that node in this run.
+A feed event sets the state.
+`svid.issued` and `agent.spawned` set the human node to `up`.
+`svid.revoked` sets the human node to `revoked`.
+`svid.expired` sets the human node to `down`.
+`path.direct` with `ok` false sets the hub to `degraded`.
+`path.relay`, `relay.hop`, and `path.up` with path `relay` set the Relay node to `up`.
+`jit.allow` sets application A to `up`.
+`jit.deny` sets application B to `down`.
+`connector_https` with status 200 sets that application to `up`.
+
+## Packet labels
+
+A feed event moves the packet.
+The label uses the feed kind or a feed field.
+The labels are `SVID`, `ticket`, `Direct`, `Relay`, `Allow`, and `Deny` when the kind is one of those events.
+Other labels use the kind, the host, the status, the mode, or the reason from that same event.
+
+## Inspector
+
+Click a node or click Path.
+The inspector shows the last feed object for that target.
+The fields are the fields on that object.
+`seq` and `ts_ms` change when a new feed event arrives.
+The inspector does not add a counter.
 
 ## City Breeze
 
@@ -76,6 +133,7 @@ The path label changes when `session_down` arrives.
 
 ## Poke
 
+The poke box stays in the corner.
 UDP block is the fault and recovery poke.
 
 1. Click UDP block.
@@ -89,6 +147,34 @@ UDP block is the fault and recovery poke.
 
 Revoke drops the current SVID on the same board.
 Spawn agent runs the agent path on the same board.
+
+## Timed run
+
+Pick a level.
+The board then plays that run.
+A progress bar shows the feed count for the run.
+The text is `Feed N of M`.
+`N` is the number of feed events the board has shown.
+`M` is the number of feed events in the run.
+The bar does not measure bandwidth.
+
+The end card opens when the run has no more feed events.
+`Soft win` follows `session_up`, `path.up`, or `svid.expired`.
+`Soft win` also follows `session_down` with reason `expired`.
+`Soft loss` follows `svid.revoked`, `session.dropped`, or reason `revoked`.
+`path.direct` with `ok` false is a soft loss until a later `path.up`.
+The card prints the feed detail for that event.
+Next Level starts the next difficulty.
+City Breeze goes to Agent JIT.
+Agent JIT goes to Radioactive NAT.
+Radioactive NAT opens the mock IdP for City Breeze.
+
+Each level has its own board art.
+City Breeze uses a street line.
+Agent JIT uses a cool grid.
+Radioactive NAT uses a hazard stripe.
+The art is static.
+The art changes when the feed `level` field changes.
 
 ## Engineering view
 

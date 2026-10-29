@@ -19,15 +19,28 @@
   <noscript>
     <p>The game needs JavaScript.</p>
   </noscript>
-  <main id="game">
-    <section class="play" aria-labelledby="play-title">
-      <h2 id="play-title">Play</h2>
+  <main id="game" data-level="none">
+    <section class="cartridges" aria-labelledby="play-title">
+      <h2 id="play-title">Levels</h2>
       <div class="row">
-        <button type="button" class="choice" id="play-city" aria-pressed="false">Play City Breeze</button>
-        <button type="button" class="choice" id="play-agent" aria-pressed="false">Play Agent JIT</button>
-        <button type="button" class="choice" id="play-hard" aria-pressed="false">Play Radioactive NAT</button>
+        <article class="cartridge" data-level="city_breeze">
+          <button type="button" class="choice" id="play-city" aria-pressed="false">Play City Breeze</button>
+          <p class="blurb" id="blurb-easy">Easy opens the mock IdP sign-in page. Press Revoke to drop the human SVID.</p>
+        </article>
+        <article class="cartridge" data-level="agent_jit">
+          <button type="button" class="choice" id="play-agent" aria-pressed="false">Play Agent JIT</button>
+          <p class="blurb" id="blurb-medium">Spawn agent allows application A and denies application B.</p>
+        </article>
+        <article class="cartridge" data-level="radioactive_nat">
+          <button type="button" class="choice" id="play-hard" aria-pressed="false">Play Radioactive NAT</button>
+          <p class="blurb" id="blurb-hard">UDP block moves the path to the TCP Relay.</p>
+        </article>
       </div>
-      <p class="hint">City Breeze opens the mock IdP. Sign in as ada. Medium and Hard run on this board. The board moves only when a feed event arrives.</p>
+      <div class="curve-wrap">
+        <h2 id="curve-title">Difficulty</h2>
+        <ol id="curve"></ol>
+        <p id="fault-line"></p>
+      </div>
     </section>
     <section class="board" aria-labelledby="board-title">
       <div class="board-head">
@@ -35,47 +48,98 @@
         <p id="level-name">No level yet.</p>
         <p id="path-state" data-mode="idle">No path yet.</p>
       </div>
-      <div class="map" id="mesh-link" data-mode="idle">
-        <article class="node" id="node-spoke">
-          <h3 id="spoke-name">Human</h3>
-          <p id="svid-chip" data-state="none">SVID</p>
-          <p id="ticket-chip" data-state="none">Ticket</p>
-        </article>
-        <div id="packet" class="packet idle" hidden></div>
-        <article class="node" id="node-hub">
-          <h3>Hub</h3>
-          <p>QUIC path</p>
-        </article>
-        <article class="node app" id="app-a" data-acl="idle">
-          <h3>app-a.orblx.test</h3>
-          <p id="app-a-status">Waiting</p>
-        </article>
-        <article class="node app" id="app-b" data-acl="idle">
-          <h3>app-b.orblx.test</h3>
-          <p id="app-b-status">Waiting</p>
-        </article>
-        <article class="node" id="node-relay" data-lit="false">
-          <h3>Relay</h3>
-          <p id="relay-status">Idle</p>
-        </article>
+      <div class="run-row">
+        <progress id="runbar" max="1" value="0">Feed 0 of 0</progress>
+        <p id="run-count"></p>
       </div>
-      <p id="beat" aria-live="polite">Choose a level.</p>
+      <div class="stage">
+        <svg class="art art-city" viewBox="0 0 360 72" aria-hidden="true">
+          <rect x="8" y="28" width="28" height="40"></rect>
+          <rect x="42" y="16" width="22" height="52"></rect>
+          <rect x="70" y="34" width="36" height="34"></rect>
+          <rect x="250" y="22" width="26" height="46"></rect>
+          <rect x="282" y="36" width="40" height="32"></rect>
+          <path d="M120 40 C 160 18, 200 58, 240 28"></path>
+        </svg>
+        <svg class="art art-agent" viewBox="0 0 360 72" aria-hidden="true">
+          <rect x="16" y="16" width="36" height="36"></rect>
+          <rect x="70" y="16" width="36" height="36"></rect>
+          <rect x="124" y="16" width="36" height="36"></rect>
+          <path d="M52 34 H70 M106 34 H124 M160 34 H210"></path>
+          <circle cx="230" cy="34" r="14"></circle>
+          <path d="M250 34 H320"></path>
+        </svg>
+        <svg class="art art-nat" viewBox="0 0 360 72" aria-hidden="true">
+          <path d="M24 58 L48 16 L72 58 Z"></path>
+          <path d="M96 58 L120 16 L144 58 Z"></path>
+          <path d="M180 36 H250"></path>
+          <path d="M250 36 L236 28 M250 36 L236 44"></path>
+          <rect x="270" y="18" width="64" height="36"></rect>
+        </svg>
+        <div class="map" id="mesh-link" data-mode="idle">
+          <button type="button" class="node" id="node-spoke" data-state="idle" aria-pressed="false">
+            <span class="node-title" id="spoke-name">Human</span>
+            <span class="node-state" id="node-spoke-state">idle</span>
+            <span id="svid-chip" data-state="none">SVID</span>
+            <span id="ticket-chip" data-state="none">Ticket</span>
+          </button>
+          <button type="button" id="inspect-path" class="path-hit" aria-pressed="false">Path</button>
+          <div id="packet" class="packet idle" hidden></div>
+          <p id="float-label" class="float-label" hidden></p>
+          <button type="button" class="node" id="node-hub" data-state="idle" aria-pressed="false">
+            <span class="node-title">Hub</span>
+            <span class="node-state" id="node-hub-state">idle</span>
+            <span class="node-note">QUIC path</span>
+          </button>
+          <button type="button" class="node app" id="app-a" data-state="idle" data-acl="idle" aria-pressed="false">
+            <span class="node-title">app-a.orblx.test</span>
+            <span class="node-state" id="app-a-state">idle</span>
+            <span class="node-note" id="app-a-status">Waiting</span>
+          </button>
+          <button type="button" class="node app" id="app-b" data-state="idle" data-acl="idle" aria-pressed="false">
+            <span class="node-title">app-b.orblx.test</span>
+            <span class="node-state" id="app-b-state">idle</span>
+            <span class="node-note" id="app-b-status">Waiting</span>
+          </button>
+          <button type="button" class="node" id="node-relay" data-state="idle" data-lit="false" aria-pressed="false">
+            <span class="node-title">Relay</span>
+            <span class="node-state" id="node-relay-state">idle</span>
+            <span class="node-note" id="relay-status">Idle</span>
+          </button>
+        </div>
+      </div>
+      <ul class="legend">
+        <li data-state="up">up</li>
+        <li data-state="degraded">degraded</li>
+        <li data-state="down">down</li>
+        <li data-state="revoked">revoked</li>
+      </ul>
+      <p id="beat" aria-live="polite">Pick a level.</p>
       <p id="clear" hidden></p>
-    </section>
-    <section class="poke" aria-labelledby="poke-title">
-      <h2 id="poke-title">Poke</h2>
-      <div class="row">
-        <button type="button" id="smash-revoke">Revoke</button>
-        <button type="button" id="smash-udp-block">UDP block</button>
-        <button type="button" id="smash-agent-spawn">Spawn agent</button>
+      <div id="endcard" hidden>
+        <p id="end-tone"></p>
+        <p id="end-copy"></p>
+        <button type="button" id="next-level">Next Level</button>
       </div>
-      <p class="hint">Revoke drops the SVID on this board. UDP block shows Direct not ok, then the TCP Relay. Spawn agent runs the agent allow and deny path.</p>
+    </section>
+    <section id="inspector" aria-live="polite" aria-labelledby="inspector-title">
+      <h2 id="inspector-title">Inspector</h2>
+      <p id="inspect-target">Click a node or the path.</p>
+      <dl id="inspect-fields"></dl>
     </section>
     <section aria-labelledby="tape-title">
       <h2 id="tape-title">Feed</h2>
       <ol id="tape"></ol>
     </section>
   </main>
+  <aside class="toolbox" id="toolbox" aria-labelledby="poke-title">
+    <h2 id="poke-title">Poke</h2>
+    <div class="row">
+      <button type="button" id="smash-revoke">Revoke</button>
+      <button type="button" id="smash-udp-block">UDP block</button>
+      <button type="button" id="smash-agent-spawn">Spawn agent</button>
+    </div>
+  </aside>
   <div id="eng" hidden>
     <p id="notice"></p>
     <div class="layout">

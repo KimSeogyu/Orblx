@@ -77,6 +77,22 @@ if 'Play City Breeze' not in page or 'UDP block' not in page:
     raise SystemExit("The game controls are missing.")
 if 'new EventSource("/events")' not in script or "applyFeed" not in script:
     raise SystemExit("The game does not read the feed.")
+for needle in (
+    'id="curve"',
+    'id="runbar"',
+    'id="inspector"',
+    'id="toolbox"',
+    'id="endcard"',
+    "Next Level",
+    "data-state=\"up\"",
+    "data-state=\"degraded\"",
+    "data-state=\"down\"",
+    "data-state=\"revoked\"",
+):
+    if needle not in page:
+        raise SystemExit("The game page is missing " + needle + ".")
+if "RUN_MS = 35000" not in script or "Soft win" not in script:
+    raise SystemExit("The timed run or the end card is missing.")
 print("The default page is the game. The game reads the feed. The page has no canned keyframe animation.")
 PY
 

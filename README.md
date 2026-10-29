@@ -345,6 +345,18 @@ The game reads StackFeed JSON.
 `GET /events` sends that JSON.
 The board moves when a feed event arrives.
 The board does not play a canned story.
+Three cartridges select the levels.
+Each cartridge shows the fault note for Easy, Medium, or Hard.
+A curve shows those three difficulties.
+The curve does not add a fault percent.
+The nodes use `up`, `degraded`, `down`, and `revoked` from feed events.
+A feed event moves the packet and shows a label from that event.
+Click a node or the path to read the feed fields.
+The poke box is Revoke, UDP block, and Spawn agent.
+One level plays for about 35 seconds.
+The progress bar counts feed events in that run.
+The end card is a soft win or a soft loss.
+Next Level starts the next difficulty.
 
 One command:
 
@@ -386,6 +398,9 @@ Radioactive NAT and the UDP poke:
 The engineering panels stay hidden.
 Click Engineering view to open them.
 Read the click path in [docs/w15-demo-ui.md](docs/w15-demo-ui.md).
+
+City Breeze, Agent JIT, and Radioactive NAT each use a different board picture.
+The picture changes from the feed `level` field.
 
 ## Demo
 
