@@ -3,7 +3,10 @@ use std::fmt;
 /// A failure from the identity crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityError {
-    /// The token audience is not `gyeol-issue`.
+    /// The token audience does not match this gate.
+    ///
+    /// A mock gate requires `gyeol-issue`.
+    /// A Google gate requires the OAuth client id.
     Audience,
     /// The certificate check failed.
     Certificate,
@@ -33,12 +36,14 @@ pub enum IdentityError {
     Time,
     /// The token check failed.
     Token,
+    /// The OIDC configuration is not valid.
+    Config,
 }
 
 impl fmt::Display for IdentityError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let text = match self {
-            IdentityError::Audience => "The token audience is not gyeol-issue.",
+            IdentityError::Audience => "The token audience is not valid.",
             IdentityError::Certificate => "The certificate check failed.",
             IdentityError::DenyDocument => "The deny document check failed.",
             IdentityError::Denied => "The destination is not allowed.",
@@ -53,6 +58,7 @@ impl fmt::Display for IdentityError {
             IdentityError::Ticket => "The ticket check failed.",
             IdentityError::Time => "The time value check failed.",
             IdentityError::Token => "The token check failed.",
+            IdentityError::Config => "The OIDC configuration is not valid.",
         };
         formatter.write_str(text)
     }

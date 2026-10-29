@@ -1,7 +1,10 @@
-//! Mini CA, mock OIDC issue, capability tickets, and the deny list.
+//! Mini CA, OIDC issue, capability tickets, and the deny list.
 //!
 //! The trust domain is `gyeol.local`.
 //! A human SVID is `spiffe://gyeol.local/user/{oidc_sub}`.
+//! City Breeze uses a Google ID token.
+//! The Google subject is the SPIFFE user name.
+//! `MockOidc` remains for CI and the harness when `ORBLX_OIDC_MODE=mock`.
 //! An agent SVID is `spiffe://gyeol.local/agent/{id}`.
 //! The agent SVID requires a parent human ID token.
 //! The agent SVID life is at most 5 minutes.
@@ -22,6 +25,7 @@ mod clock;
 mod codec;
 mod deny;
 mod error;
+mod google;
 mod oidc;
 mod spiffe;
 mod ticket;
@@ -33,6 +37,12 @@ pub use cert::{
 pub use clock::{MAX_AGENT_TTL, MAX_SKEW, MAX_USER_TTL};
 pub use deny::{DenyApply, DenySet};
 pub use error::IdentityError;
+pub use google::{
+    GoogleClient, GoogleIdClaims, GoogleJwks, GoogleTokenRequest, OidcMode,
+    GOOGLE_AUTHORIZE_ENDPOINT, GOOGLE_CLIENT_ID_ENV, GOOGLE_CLIENT_SECRET_ENV, GOOGLE_ISSUER,
+    GOOGLE_JWKS_URL, GOOGLE_REDIRECT_LOCALHOST, GOOGLE_REDIRECT_LOOPBACK, GOOGLE_TOKEN_ENDPOINT,
+    OIDC_MODE_ENV,
+};
 pub use oidc::{AgentSvid, IssueGate, MockOidc, MOCK_OIDC_ISSUER, OIDC_AUDIENCE};
 pub use spiffe::{SpiffeId, WorkloadKind, TRUST_DOMAIN};
 pub use ticket::{
