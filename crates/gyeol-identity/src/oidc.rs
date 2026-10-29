@@ -9,6 +9,7 @@ use crate::cert::TrustBundle;
 use crate::clock::{in_window, unix_time, whole_seconds, MAX_AGENT_TTL, MAX_USER_TTL};
 use crate::deny::DenySet;
 use crate::error::IdentityError;
+use crate::google::{GoogleIdClaims, GoogleJwks, OidcMode};
 use crate::spiffe::SpiffeId;
 
 /// The required OIDC audience for a human SVID.
@@ -94,22 +95,75 @@ impl MockOidc {
     }
 }
 
-/// The gate that turns a mock OIDC token into a human SVID.
+/// The gate that turns an ID token into a human SVID.
+///
+/// [`IssueGate::new`] trusts the mock IdP.
+/// [`IssueGate::from_google`] trusts a Google ID token.
 pub struct IssueGate {
     ca: MiniCa,
-    issuer: String,
-    decoding: DecodingKey,
+    idp: IdpKey,
+}
+
+enum IdpKey {
+    Mock {
+        issuer: String,
+        decoding: DecodingKey,
+    },
+    Google {
+        client_id: String,
+        jwks: GoogleJwks,
+    },
 }
 
 impl IssueGate {
+    /// Trust the mock IdP.
+    ///
+    /// CI and the harness use this constructor when [`OidcMode`] is mock.
+    /// City Breeze does not use this constructor by default.
     pub fn new(ca: MiniCa, oidc: &MockOidc) -> Result<Self, IdentityError> {
         let decoding = DecodingKey::from_ed_pem(oidc.public_key_pem().as_bytes())
             .map_err(|_| IdentityError::Token)?;
         Ok(Self {
             ca,
-            issuer: oidc.issuer().to_string(),
-            decoding,
+            idp: IdpKey::Mock {
+                issuer: oidc.issuer().to_string(),
+                decoding,
+            },
         })
+    }
+
+    /// Trust Google JWKS for one OAuth client id.
+    ///
+    /// The human SVID subject is the Google `sub` claim.
+    pub fn from_google(
+        ca: MiniCa,
+        client_id: &str,
+        jwks: GoogleJwks,
+    ) -> Result<Self, IdentityError> {
+        crate::google::require_client_id(client_id)?;
+        Ok(Self {
+            ca,
+            idp: IdpKey::Google {
+                client_id: client_id.to_string(),
+                jwks,
+            },
+        })
+    }
+
+    /// The IdP this gate trusts.
+    pub fn mode(&self) -> OidcMode {
+        match &self.idp {
+            IdpKey::Mock { .. } => OidcMode::Mock,
+            IdpKey::Google { .. } => OidcMode::Google,
+        }
+    }
+
+    /// The Google client id, when this gate trusts Google.
+    pub fn client_id(&self) -> Option<&str> {
+        match &self.idp {
+            IdpKey::Mock { .. } => None,
+            IdpKey::Google { client_id, .. } => Some(client_id),
+        }
     }
 
     pub fn trust_bundle(&self) -> &TrustBundle {
@@ -125,7 +179,10 @@ impl IssueGate {
         self.ca.public_key()
     }
 
-    /// Verify the ID token and issue `spiffe://gyeol.local/user/{sub}`.
+    /// Verify a mock ID token and issue `spiffe://gyeol.local/user/{sub}`.
+    ///
+    /// This method accepts only the mock IdP.
+    /// A Google gate returns [`IdentityError::Token`].
     pub fn issue_human_svid(
         &self,
         id_token: &str,
@@ -133,19 +190,33 @@ impl IssueGate {
         deny: &DenySet,
     ) -> Result<crate::ca::IssuedSvid, IdentityError> {
         let claims = self.verify_token(id_token, now)?;
-        let id = SpiffeId::user(&claims.sub)?;
-        let now_unix = unix_time(now)?;
-        if claims.exp <= now_unix {
-            return Err(IdentityError::Expired);
-        }
-        let remaining = claims.exp - now_unix;
-        let ttl_secs = remaining.min(MAX_USER_TTL.as_secs());
-        self.ca.issue(&id, now, Duration::from_secs(ttl_secs), deny)
+        self.mint_human(&claims.sub, claims.exp, now, deny)
     }
 
-    /// Verify a parent human ID token and issue `spiffe://gyeol.local/agent/{name}`.
+    /// Verify a Google ID token and issue a short human SVID.
     ///
-    /// The parent token must pass the same checks as a human SVID.
+    /// The subject is the Google `sub` claim.
+    /// The SVID life is the remaining token life, at most 15 minutes.
+    /// `nonce` must match the ID token.
+    /// This method accepts only a Google gate.
+    pub fn issue_google_human_svid(
+        &self,
+        id_token: &str,
+        nonce: &str,
+        now: SystemTime,
+        deny: &DenySet,
+    ) -> Result<crate::ca::IssuedSvid, IdentityError> {
+        let IdpKey::Google { client_id, jwks } = &self.idp else {
+            return Err(IdentityError::Token);
+        };
+        let claims: GoogleIdClaims = jwks.verify(id_token, client_id, nonce, now)?;
+        self.mint_human(&claims.subject, claims.expires_at, now, deny)
+    }
+
+    /// Verify a parent mock ID token and issue `spiffe://gyeol.local/agent/{name}`.
+    ///
+    /// The parent token must pass the same checks as a mock human SVID.
+    /// A Google gate returns [`IdentityError::Token`].
     /// `ttl` must be at most 5 minutes.
     /// `ttl` must not exceed the remaining life of the parent token.
     /// The function returns the SVID in memory.
@@ -175,14 +246,34 @@ impl IssueGate {
         Ok(AgentSvid { parent, svid })
     }
 
+    fn mint_human(
+        &self,
+        subject: &str,
+        exp: u64,
+        now: SystemTime,
+        deny: &DenySet,
+    ) -> Result<crate::ca::IssuedSvid, IdentityError> {
+        let id = SpiffeId::user(subject)?;
+        let now_unix = unix_time(now)?;
+        if exp <= now_unix {
+            return Err(IdentityError::Expired);
+        }
+        let remaining = exp - now_unix;
+        let ttl_secs = remaining.min(MAX_USER_TTL.as_secs());
+        self.ca.issue(&id, now, Duration::from_secs(ttl_secs), deny)
+    }
+
     fn verify_token(&self, id_token: &str, now: SystemTime) -> Result<OidcClaims, IdentityError> {
+        let IdpKey::Mock { issuer, decoding } = &self.idp else {
+            return Err(IdentityError::Token);
+        };
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.set_audience(&[OIDC_AUDIENCE]);
-        validation.set_issuer(&[&self.issuer]);
+        validation.set_issuer(&[issuer]);
         validation.set_required_spec_claims(&["exp", "nbf", "aud", "iss", "sub"]);
         validation.validate_exp = false;
         validation.validate_nbf = false;
-        let data = decode::<OidcClaims>(id_token, &self.decoding, &validation).map_err(map_jwt)?;
+        let data = decode::<OidcClaims>(id_token, decoding, &validation).map_err(map_jwt)?;
         let now_unix = unix_time(now)?;
         if data.claims.exp < data.claims.nbf {
             return Err(IdentityError::Token);
