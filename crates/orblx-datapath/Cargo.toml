@@ -1,6 +1,6 @@
 [package]
 name = "orblx-datapath"
-description = "Data path crate for Orblx. This crate encodes frames, moves IPv4 packets over QUIC, routes overlay packets to peers, and forwards two HTTPS apps on the connector path."
+description = "Data path crate for Orblx. This crate encodes frames, moves IPv4 packets over QUIC, routes overlay packets to peers, answers overlay DNS names, and forwards two HTTPS apps on the connector path."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true

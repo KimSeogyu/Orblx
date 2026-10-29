@@ -9,6 +9,9 @@ use crate::HelloError;
 /// The default UDP port for hello-quic.
 pub const DEFAULT_UDP_PORT: u16 = 443;
 
+/// The Linux TUN device name for `orblx up`.
+pub const LINUX_TUN_NAME: &str = "orblx0";
+
 /// The operator note for the TUN privilege.
 #[must_use]
 pub fn tun_capability_note() -> &'static str {

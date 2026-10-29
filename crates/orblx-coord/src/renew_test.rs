@@ -2,12 +2,13 @@ use std::collections::HashSet;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_crypto::{mac_input, ticket_mac, TicketKey, TicketRing};
 use orblx_datapath::{
-    ipv4_packet, run_memory_node, MemoryDevice, Netmap, NodeRequest, RenewedLeaf, SvidRenewer,
-    NODE_STATUS_FILE,
+    ipv4_packet, run_memory_node, AllowPeers, MemoryDevice, Netmap, NodeRequest, RenewedLeaf,
+    SvidRenewer, NODE_STATUS_FILE,
 };
 use orblx_identity::{
     decode_certificate_pem, leaf_validity, sign_ticket, SpiffeId, TicketClaims, TicketFlags,
@@ -319,11 +320,13 @@ fn node_request(
         config,
         netmap,
         listen: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        netmap_path: state_dir.join("netmap.json"),
         state_dir,
         renew: Some(renew),
         stop: Some(stop),
         accept_routes: false,
         forward_routes: Vec::new(),
+        visibility: Arc::new(AllowPeers),
     }
 }
 

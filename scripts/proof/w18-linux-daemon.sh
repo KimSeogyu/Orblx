@@ -93,6 +93,7 @@ fi
 image_dir=$(mktemp -d)
 cp "$bin" "$image_dir/orblx"
 cp "$root/scripts/proof/Dockerfile" "$image_dir/Dockerfile"
+cp "$root/scripts/proof/entrypoint.sh" "$image_dir/entrypoint.sh"
 docker build -t orblx-w18:local "$image_dir"
 
 mkdir -p "$work/a" "$work/b" "$work/c"

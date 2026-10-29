@@ -34,6 +34,12 @@ pub struct NetmapSelf {
     pub name: String,
     /// The overlay IPv4 address.
     pub overlay_ip: String,
+    /// The DNS owner label.
+    ///
+    /// Empty means the node has no `<node>.<owner>.orblx` name.
+    /// The short name is still the node name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
 }
 
 /// One remote node in a netmap.
@@ -50,6 +56,11 @@ pub struct NetmapPeer {
     pub endpoints: Vec<String>,
     /// Extra destination CIDRs that this peer owns.
     pub routes: Vec<String>,
+    /// The DNS owner label.
+    ///
+    /// Empty means the peer has no `<node>.<owner>.orblx` name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
 }
 
 /// A netmap document is not valid.
@@ -97,6 +108,11 @@ pub enum NetmapError {
         /// The repeated value.
         value: String,
     },
+    /// The owner is not a DNS name.
+    Owner {
+        /// The rejected owner.
+        owner: String,
+    },
 }
 
 impl std::fmt::Display for NetmapError {
@@ -121,6 +137,7 @@ impl std::fmt::Display for NetmapError {
             Self::Duplicate { value } => {
                 write!(formatter, "The netmap repeats {value}.")
             }
+            Self::Owner { owner } => write!(formatter, "The owner {owner} is not a DNS name."),
         }
     }
 }
@@ -153,6 +170,7 @@ impl Netmap {
             });
         }
         check_name(&self.self_node.name)?;
+        check_owner(&self.self_node.owner)?;
         let self_ip = check_overlay(&self.self_node.overlay_ip)?;
         let mut names = HashSet::new();
         let mut addresses = HashSet::new();
@@ -168,6 +186,7 @@ impl Netmap {
         }
         for peer in &self.peers {
             check_name(&peer.name)?;
+            check_owner(&peer.owner)?;
             let overlay = check_overlay(&peer.overlay_ip)?;
             check_svid(&peer.name, &peer.svid)?;
             if peer.endpoints.is_empty() {
@@ -248,6 +267,38 @@ pub(crate) fn ipv4_mask(prefix_len: u8) -> u32 {
     } else {
         u32::MAX << (32 - prefix_len)
     }
+}
+
+fn check_owner(owner: &str) -> Result<(), NetmapError> {
+    if owner.is_empty() || valid_owner_name(owner) {
+        return Ok(());
+    }
+    Err(NetmapError::Owner {
+        owner: owner.to_string(),
+    })
+}
+
+/// The owner is one or more DNS labels.
+///
+/// An empty owner is not valid here. The caller allows an empty owner.
+pub(crate) fn valid_owner_name(owner: &str) -> bool {
+    if owner.is_empty() || owner.len() > 253 {
+        return false;
+    }
+    owner.split('.').all(valid_ldh_label)
+}
+
+fn valid_ldh_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    if bytes.is_empty() || bytes.len() > 63 {
+        return false;
+    }
+    if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
 }
 
 fn check_name(name: &str) -> Result<(), NetmapError> {
@@ -349,6 +400,37 @@ mod tests {
         let text = sample().replace("10.1.0.0/24", "10.1.0.9/24");
         let err = Netmap::from_slice(text.as_bytes()).unwrap_err();
         assert!(matches!(err, NetmapError::Route { .. }));
+    }
+
+    #[test]
+    fn an_empty_owner_stays_out_of_the_json() {
+        let map = Netmap::from_slice(sample().as_bytes()).unwrap();
+        assert!(map.self_node.owner.is_empty());
+        assert!(map.peers[0].owner.is_empty());
+        let text = serde_json::to_string(&map).unwrap();
+        assert!(!text.contains("owner"));
+    }
+
+    #[test]
+    fn an_owner_round_trips() {
+        let text = sample().replace(
+            r#""name": "a", "overlay_ip": "100.64.0.1""#,
+            r#""name": "a", "overlay_ip": "100.64.0.1", "owner": "lab""#,
+        );
+        let map = Netmap::from_slice(text.as_bytes()).unwrap();
+        assert_eq!(map.self_node.owner, "lab");
+        let again = serde_json::to_string(&map).unwrap();
+        assert!(again.contains("\"owner\":\"lab\""));
+    }
+
+    #[test]
+    fn a_bad_owner_is_rejected() {
+        let text = sample().replace(
+            r#""name": "a", "overlay_ip": "100.64.0.1""#,
+            r#""name": "a", "overlay_ip": "100.64.0.1", "owner": "no owner""#,
+        );
+        let err = Netmap::from_slice(text.as_bytes()).unwrap_err();
+        assert!(matches!(err, NetmapError::Owner { .. }));
     }
 
     #[test]

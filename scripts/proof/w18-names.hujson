@@ -1,0 +1,35 @@
+{
+  // Node a may reach node b. Node a may not reach node c.
+  // The DNS responder on node a uses the signed reach list.
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a"],
+      "proto": "tcp",
+      "dst": ["spiffe://orblx.local/node/b:8080"],
+    },
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/b"],
+      "proto": "tcp",
+      "dst": [
+        "spiffe://orblx.local/node/a:8080",
+        "spiffe://orblx.local/node/c:8080",
+      ],
+    },
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/c"],
+      "proto": "tcp",
+      "dst": ["spiffe://orblx.local/node/b:8080"],
+    },
+  ],
+  "tests": [
+    {
+      "src": "spiffe://orblx.local/node/a",
+      "proto": "tcp",
+      "accept": ["spiffe://orblx.local/node/b:8080"],
+      "deny": ["spiffe://orblx.local/node/c:8080"],
+    },
+  ],
+}

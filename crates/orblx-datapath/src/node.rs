@@ -12,7 +12,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,6 +21,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::dns::{
+    refresh_resolver, serve_dns, DnsTable, LinkResolverGuard, PeerVisibility, ResolvConfForwarder,
+    DNS_PORT,
+};
 #[cfg(target_os = "macos")]
 use crate::netmap::{ipv4_mask, parse_cidr};
 use crate::netmap::{parse_ipv4, Netmap, NetmapPeer};
@@ -44,8 +48,6 @@ const PATH_DOWN: &str = "down";
 /// A session with no received frame for this long is `stale`.
 const STALE_AFTER: Duration = Duration::from_secs(2);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
-#[cfg(target_os = "linux")]
-const TUN_NAME: &str = "orblx0";
 
 static LINK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -129,6 +131,11 @@ pub struct NodeRequest {
     pub accept_routes: bool,
     /// Local CIDRs this node forwards onto a connected LAN.
     pub forward_routes: Vec<String>,
+    /// The netmap file. The node reads it again when the file changes.
+    pub netmap_path: PathBuf,
+    /// [`crate::GrantPeers`] hides peers the signed grants do not let this node reach.
+    /// [`crate::AllowPeers`] allows every peer when the node has no grant file.
+    pub visibility: Arc<dyn PeerVisibility>,
 }
 
 /// One peer line in `orblx status`.
@@ -299,7 +306,12 @@ pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
         .enable_all()
         .build()
         .map_err(|err| HelloError::Io(err.to_string()))?;
-    runtime.block_on(run_mesh(prepared, bridge.from_tun, bridge.to_tun))
+    runtime.block_on(run_mesh(
+        prepared,
+        bridge.from_tun,
+        bridge.to_tun,
+        Some(bridge.name),
+    ))
 }
 
 /// Run the node with in-memory packets.
@@ -315,7 +327,7 @@ pub async fn run_memory_node(request: NodeRequest, device: MemoryDevice) -> Resu
     );
     println!("The TUN device is memory.");
     announce_renew(&prepared.request);
-    run_mesh(prepared, device.from_tun, device.to_tun).await
+    run_mesh(prepared, device.from_tun, device.to_tun, None).await
 }
 
 struct PreparedNode {
@@ -372,9 +384,12 @@ async fn run_mesh_inner(
     router: RouterTable,
     from_tun: mpsc::Receiver<Vec<u8>>,
     to_tun: mpsc::Sender<Vec<u8>>,
+    interface: Option<String>,
     _pid_guard: PidGuard,
 ) -> Result<(), HelloError> {
     let identity = Arc::new(Mutex::new(request.config.clone()));
+    let netmap_path = request.netmap_path.clone();
+    let visibility = Arc::clone(&request.visibility);
     let endpoint = Arc::new(HelloEndpoint::bind_node(request.config, request.listen)?);
     let bound = endpoint.local_addr()?;
     println!("The node {} listens on UDP {bound}.", view.name);
@@ -398,6 +413,7 @@ async fn run_mesh_inner(
     }));
 
     let netmap = Arc::new(request.netmap);
+    let dns_shutdown = shutdown_rx.clone();
     let mesh = Mesh {
         endpoint: Arc::clone(&endpoint),
         identity,
@@ -452,8 +468,31 @@ async fn run_mesh_inner(
         }
     }));
 
+    let resolver = if let Some(interface) = interface {
+        let overlay =
+            parse_ipv4(&node.overlay_ip).map_err(|err| HelloError::Node(err.to_string()))?;
+        let (guard, dns_tasks) = spawn_overlay_dns(
+            DnsSpawn {
+                interface,
+                overlay,
+                netmap_path,
+                node_name: node.name.clone(),
+                node_overlay: node.overlay_ip.clone(),
+                visibility,
+                shutdown: dns_shutdown,
+            },
+            &netmap,
+        )
+        .await;
+        tasks.extend(dns_tasks);
+        Some(guard)
+    } else {
+        None
+    };
+
     wait_for_stop(request.stop).await;
     let _ = shutdown_tx.send(true);
+    drop(resolver);
     endpoint.close();
     tokio::time::sleep(Duration::from_millis(200)).await;
     for task in &tasks {
@@ -472,6 +511,7 @@ async fn run_mesh(
     prepared: PreparedNode,
     from_tun: mpsc::Receiver<Vec<u8>>,
     to_tun: mpsc::Sender<Vec<u8>>,
+    interface: Option<String>,
 ) -> Result<(), HelloError> {
     let PreparedNode {
         request,
@@ -480,7 +520,10 @@ async fn run_mesh(
         _pid_guard,
         ..
     } = prepared;
-    run_mesh_inner(request, view, router, from_tun, to_tun, _pid_guard).await
+    run_mesh_inner(
+        request, view, router, from_tun, to_tun, interface, _pid_guard,
+    )
+    .await
 }
 
 fn local_view(request: &NodeRequest) -> Result<NodeView, HelloError> {
@@ -1216,7 +1259,7 @@ fn process_is_running(pid: u32) -> bool {
 
 #[cfg(target_os = "linux")]
 fn tun_device_name() -> Option<String> {
-    Some(TUN_NAME.to_string())
+    Some(crate::tun_dev::LINUX_TUN_NAME.to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -1285,6 +1328,169 @@ fn run_ip(args: &[&str]) -> Result<(), HelloError> {
         "The ip command failed. ip {} {detail}",
         args.join(" ")
     )))
+}
+
+struct DnsSpawn {
+    interface: String,
+    overlay: Ipv4Addr,
+    netmap_path: PathBuf,
+    node_name: String,
+    node_overlay: String,
+    visibility: Arc<dyn PeerVisibility>,
+    shutdown: watch::Receiver<bool>,
+}
+
+async fn spawn_overlay_dns(
+    dns: DnsSpawn,
+    netmap: &Netmap,
+) -> (LinkResolverGuard, Vec<JoinHandle<()>>) {
+    let guard = LinkResolverGuard::new(&dns.interface);
+    let table = DnsTable::from_netmap(netmap);
+    let bind_at = SocketAddr::from((dns.overlay, DNS_PORT));
+    let socket = match tokio::net::UdpSocket::bind(bind_at).await {
+        Ok(socket) => socket,
+        Err(err) => {
+            eprintln!("The DNS responder did not bind {bind_at}. {err} The node continues.");
+            return (guard, Vec::new());
+        }
+    };
+    println!("The DNS responder listens on {bind_at}.");
+    refresh_resolver(
+        &dns.interface,
+        dns.overlay,
+        &table,
+        dns.visibility.as_ref(),
+        &guard.armed_flag(),
+    );
+    let (table_tx, table_rx) = watch::channel(table);
+    let mut tasks = Vec::new();
+    let serve_visibility = Arc::clone(&dns.visibility);
+    let serve_shutdown = dns.shutdown.clone();
+    let overlay = dns.overlay;
+    tasks.push(tokio::spawn(async move {
+        serve_dns(
+            socket,
+            table_rx,
+            serve_visibility,
+            Arc::new(ResolvConfForwarder::new(overlay)),
+            serve_shutdown,
+        )
+        .await;
+    }));
+    let armed = guard.armed_flag();
+    tasks.push(tokio::spawn(async move {
+        watch_netmap_dns(DnsWatch {
+            path: dns.netmap_path,
+            node_name: dns.node_name,
+            node_overlay: dns.node_overlay,
+            interface: dns.interface,
+            overlay,
+            visibility: dns.visibility,
+            armed,
+            tables: table_tx,
+            shutdown: dns.shutdown,
+        })
+        .await;
+    }));
+    (guard, tasks)
+}
+
+struct DnsWatch {
+    path: PathBuf,
+    node_name: String,
+    node_overlay: String,
+    interface: String,
+    overlay: Ipv4Addr,
+    visibility: Arc<dyn PeerVisibility>,
+    armed: Arc<AtomicBool>,
+    tables: watch::Sender<DnsTable>,
+    shutdown: watch::Receiver<bool>,
+}
+
+async fn watch_netmap_dns(mut watch_state: DnsWatch) {
+    let mut last = fs::read(&watch_state.path).unwrap_or_default();
+    let mut last_error = String::new();
+    let mut grant_revision = watch_state.visibility.revision();
+    loop {
+        tokio::select! {
+            changed = watch_state.shutdown.changed() => {
+                if changed.is_err() || *watch_state.shutdown.borrow() {
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                let next = watch_state.visibility.revision();
+                if next != grant_revision {
+                    grant_revision = next;
+                    let table = watch_state.tables.borrow().clone();
+                    refresh_resolver(
+                        &watch_state.interface,
+                        watch_state.overlay,
+                        &table,
+                        watch_state.visibility.as_ref(),
+                        &watch_state.armed,
+                    );
+                    println!("The DNS answers follow the new grants.");
+                }
+                reload_dns_file(&watch_state, &mut last, &mut last_error);
+            }
+        }
+    }
+}
+
+fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut String) {
+    match fs::read(&watch_state.path) {
+        Ok(bytes) if bytes == *last => {}
+        Ok(bytes) => match Netmap::from_slice(&bytes) {
+            Ok(map) if self_matches(&map, &watch_state.node_name, &watch_state.node_overlay) => {
+                last.clone_from(&bytes);
+                last_error.clear();
+                let table = DnsTable::from_netmap(&map);
+                refresh_resolver(
+                    &watch_state.interface,
+                    watch_state.overlay,
+                    &table,
+                    watch_state.visibility.as_ref(),
+                    &watch_state.armed,
+                );
+                let _ = watch_state.tables.send(table);
+                println!("The DNS answers follow the new netmap.");
+            }
+            Ok(_) => {
+                *last = bytes;
+                let text = "The netmap self node does not match the running node.".to_string();
+                if text != *last_error {
+                    eprintln!("The node keeps the current DNS answers. {text}");
+                    *last_error = text;
+                }
+            }
+            Err(err) => {
+                *last = bytes;
+                let text = err.to_string();
+                if text != *last_error {
+                    eprintln!("The node did not load the netmap for DNS. {text}");
+                    *last_error = text;
+                }
+            }
+        },
+        Err(err) => {
+            let text = err.to_string();
+            if text != *last_error {
+                eprintln!("The node did not read the netmap for DNS. {text}");
+                *last_error = text;
+            }
+        }
+    }
+}
+
+fn self_matches(map: &Netmap, name: &str, overlay: &str) -> bool {
+    if map.self_node.name != name {
+        return false;
+    }
+    match parse_ipv4(&map.self_node.overlay_ip) {
+        Ok(ip) => ip.to_string() == overlay,
+        Err(_) => false,
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

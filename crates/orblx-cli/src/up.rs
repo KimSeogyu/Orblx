@@ -10,17 +10,24 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use orblx_coord::{advertise_routes_blocking, renew_svid_blocking};
+use orblx_coord::{
+    advertise_routes_blocking, decode_hex_32, encode_hex, renew_svid_blocking,
+    verify_signed_grants, NetmapKey, SignedGrants,
+};
 use orblx_crypto::{mac_input, ticket_mac};
 use orblx_datapath::{
-    read_status_text, run_node, running_pid, HelloConfig, Netmap, NodeRequest, RenewedLeaf,
-    SvidRenewer, DEFAULT_UDP_PORT,
+    read_status_text, remove_link_resolver, run_node, running_pid, AllowPeers, HelloConfig, Netmap,
+    NetmapPeer, NodeRequest, PeerVisibility, RenewedLeaf, SvidRenewer, DEFAULT_UDP_PORT,
+    LINUX_TUN_NAME,
 };
 use orblx_identity::{
-    sign_ticket, DenySet, MiniCa, SpiffeId, TicketClaims, TicketFlags, TicketSigner, MAX_USER_TTL,
+    sign_ticket, DenySet, MiniCa, Policy, SpiffeId, TicketClaims, TicketFlags, TicketSigner,
+    MAX_USER_TTL,
 };
 
 use super::{parse_socket, take_value};
@@ -61,6 +68,7 @@ pub(crate) struct StateOptions {
 pub(crate) struct IssueOptions {
     out: PathBuf,
     nodes: Vec<(String, Ipv4Addr)>,
+    policy: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Command {
@@ -84,6 +92,7 @@ impl std::fmt::Debug for Command {
                 .debug_struct("Issue")
                 .field("out", &options.out)
                 .field("nodes", &options.nodes.len())
+                .field("policy", &options.policy)
                 .finish(),
         }
     }
@@ -164,6 +173,7 @@ pub(crate) fn parse_issue(args: &[String]) -> Result<Command, String> {
     }
     let mut out = None;
     let mut nodes = Vec::new();
+    let mut policy = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -172,6 +182,7 @@ pub(crate) fn parse_issue(args: &[String]) -> Result<Command, String> {
         match flag {
             "--out" => out = Some(PathBuf::from(value)),
             "--node" => nodes.push(parse_node(&value)?),
+            "--policy" => policy = Some(PathBuf::from(value)),
             other => return Err(format!("The flag {other} is not valid.\n{}", help_text())),
         }
     }
@@ -179,7 +190,7 @@ pub(crate) fn parse_issue(args: &[String]) -> Result<Command, String> {
     if nodes.is_empty() {
         return Err(format!("The command needs --node.\n{}", help_text()));
     }
-    Ok(Command::Issue(IssueOptions { out, nodes }))
+    Ok(Command::Issue(IssueOptions { out, nodes, policy }))
 }
 
 pub(crate) fn run(command: Command) -> Result<(), String> {
@@ -200,6 +211,7 @@ fn run_up(options: UpOptions) -> Result<(), String> {
     let netmap = Netmap::from_path(&netmap_path).map_err(|err| err.to_string())?;
     let config = load_config(&options.state_dir)?;
     let renew = load_renewer(&options.state_dir, options.coord, options.coord_name)?;
+    let visibility = load_visibility(&options.state_dir, &netmap.self_node.name)?;
     run_node(NodeRequest {
         config,
         netmap,
@@ -209,6 +221,8 @@ fn run_up(options: UpOptions) -> Result<(), String> {
         stop: None,
         accept_routes: options.accept_routes,
         forward_routes,
+        netmap_path,
+        visibility,
     })
     .map_err(|err| err.to_string())
 }
@@ -327,6 +341,7 @@ fn publish_routes(options: &UpOptions) -> Result<(PathBuf, Vec<String>), String>
 fn run_down(options: StateOptions) -> Result<(), String> {
     let Some(pid) = running_pid(&options.state_dir) else {
         println!("The node is down.");
+        let _ = remove_link_resolver(LINUX_TUN_NAME);
         return Ok(());
     };
     let status = std::process::Command::new("kill")
@@ -339,6 +354,7 @@ fn run_down(options: StateOptions) -> Result<(), String> {
     for _ in 0..50 {
         if running_pid(&options.state_dir).is_none() {
             println!("The node is down.");
+            let _ = remove_link_resolver(LINUX_TUN_NAME);
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
@@ -436,6 +452,158 @@ fn run_issue(options: IssueOptions) -> Result<(), String> {
             dir.display()
         );
     }
+    if let Some(policy) = &options.policy {
+        write_signed_grants(&options.out, &options.nodes, policy)?;
+    }
+    Ok(())
+}
+
+fn load_visibility(dir: &Path, self_name: &str) -> Result<Arc<dyn PeerVisibility>, String> {
+    let path = dir.join("grants.signed.json");
+    if !path.exists() {
+        return Ok(Arc::new(AllowPeers));
+    }
+    let live = LiveGrants::open(&path, dir, self_name)?;
+    println!(
+        "The DNS responder uses the signed grants. This node can reach {} peers.",
+        live.reach_len()
+    );
+    Ok(Arc::new(live))
+}
+
+/// Signed grants that the node reads again after a renewal.
+struct LiveGrants {
+    path: PathBuf,
+    public: [u8; 32],
+    receiver: String,
+    reach: Mutex<HashSet<String>>,
+    seen: Mutex<Vec<u8>>,
+    revision: AtomicU64,
+    error: Mutex<String>,
+}
+
+impl LiveGrants {
+    fn open(path: &Path, dir: &Path, self_name: &str) -> Result<Self, String> {
+        let bytes = fs::read(path)
+            .map_err(|err| format!("The file {} did not open. {err}", path.display()))?;
+        let signed = parse_grants(&bytes)?;
+        let public = decode_hex_32(read_text(&dir.join("netmap.pub"))?.trim())
+            .map_err(|_| "The netmap public key is not valid.".to_string())?;
+        verify_signed_grants(&signed, &public)
+            .map_err(|_| "The grant signature is not valid.".to_string())?;
+        let receiver = SpiffeId::node(self_name).map_err(|err| err.to_string())?;
+        if signed.grants.receiver != receiver.as_uri() {
+            return Err("The grant receiver does not match the node.".to_string());
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            public,
+            receiver: receiver.as_uri().to_string(),
+            reach: Mutex::new(signed.grants.reach.into_iter().collect()),
+            seen: Mutex::new(bytes),
+            revision: AtomicU64::new(1),
+            error: Mutex::new(String::new()),
+        })
+    }
+
+    fn reach_len(&self) -> usize {
+        self.reach
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .len()
+    }
+
+    fn refresh(&self) {
+        let Ok(bytes) = fs::read(&self.path) else {
+            return;
+        };
+        {
+            let seen = self.seen.lock().unwrap_or_else(|err| err.into_inner());
+            if *seen == bytes {
+                return;
+            }
+        }
+        let signed = match parse_grants(&bytes) {
+            Ok(signed) => signed,
+            Err(text) => {
+                self.keep_previous(bytes, &text);
+                return;
+            }
+        };
+        if verify_signed_grants(&signed, &self.public).is_err() {
+            self.keep_previous(bytes, "The grant signature is not valid.");
+            return;
+        }
+        if signed.grants.receiver != self.receiver {
+            self.keep_previous(bytes, "The grant receiver does not match the node.");
+            return;
+        }
+        let count = signed.grants.reach.len();
+        *self.reach.lock().unwrap_or_else(|err| err.into_inner()) =
+            signed.grants.reach.into_iter().collect();
+        *self.seen.lock().unwrap_or_else(|err| err.into_inner()) = bytes;
+        self.revision.fetch_add(1, Ordering::Relaxed);
+        println!("The DNS responder loaded new signed grants. This node can reach {count} peers.");
+    }
+
+    fn keep_previous(&self, bytes: Vec<u8>, text: &str) {
+        *self.seen.lock().unwrap_or_else(|err| err.into_inner()) = bytes;
+        let mut error = self.error.lock().unwrap_or_else(|err| err.into_inner());
+        if *error != text {
+            eprintln!("The node keeps the current DNS grants. {text}");
+            *error = text.to_string();
+        }
+    }
+}
+
+impl PeerVisibility for LiveGrants {
+    fn is_visible(&self, peer: &NetmapPeer) -> bool {
+        self.refresh();
+        self.reach
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .contains(&peer.svid)
+    }
+
+    fn revision(&self) -> u64 {
+        self.refresh();
+        self.revision.load(Ordering::Relaxed)
+    }
+}
+
+fn parse_grants(bytes: &[u8]) -> Result<SignedGrants, String> {
+    serde_json::from_slice(bytes).map_err(|_| "The grants are not valid.".to_string())
+}
+
+fn write_signed_grants(
+    out: &Path,
+    nodes: &[(String, Ipv4Addr)],
+    policy_path: &Path,
+) -> Result<(), String> {
+    let policy = Policy::from_path(policy_path).map_err(|err| err.to_string())?;
+    let key = NetmapKey::generate();
+    let public = format!("{}\n", encode_hex(&key.public()));
+    for (name, _) in nodes {
+        let id = SpiffeId::node(name).map_err(|err| err.to_string())?;
+        let grants = policy.receiver_grants(&id);
+        let signed = key.sign_grants(&grants).map_err(|err| err.to_string())?;
+        let dir = out.join(name);
+        let signed_text =
+            serde_json::to_string(&signed).map_err(|_| "The grants are not valid.".to_string())?;
+        let grant_text = serde_json::to_string(&signed.grants)
+            .map_err(|_| "The grants are not valid.".to_string())?;
+        write_mode(
+            &dir.join("grants.signed.json"),
+            signed_text.as_bytes(),
+            FILE_PUBLIC,
+        )?;
+        write_mode(&dir.join("grants.json"), grant_text.as_bytes(), FILE_PUBLIC)?;
+        write_mode(&dir.join("netmap.pub"), public.as_bytes(), FILE_PUBLIC)?;
+        println!(
+            "The command wrote signed grants for {name}. reach {}",
+            grants.reach.len()
+        );
+    }
     Ok(())
 }
 
@@ -496,10 +664,23 @@ fn help_text() -> String {
 orblx up [--netmap FILE] [--state-dir DIR] [--listen ADDR] [--accept-routes] [--advertise-routes CIDR] [--coord ADDR] [--bundle FILE] [--coord-name NAME]
 orblx down [--state-dir DIR]
 orblx status [--state-dir DIR]
-orblx node-issue --out DIR --node NAME=OVERLAY_IP [--node NAME=OVERLAY_IP ...]
+orblx node-issue --out DIR --node NAME=OVERLAY_IP [--node NAME=OVERLAY_IP ...] [--policy FILE]
 
 The node keeps one QUIC session for each peer.
 The router sends each outbound TUN packet to the peer that owns the destination.
+The node answers DNS on the overlay address at port 53.
+A netmap name is <node>.<owner>.orblx and the short name <node>.
+The node forwards every other name.
+The node reads grants.signed.json from the state directory.
+That file is the signed grant document from the netmap.
+A peer absent from the reach list is NXDOMAIN.
+A new grants.signed.json file replaces the DNS reach list.
+A missing grant file allows every peer.
+The --policy file writes those signed grants during node-issue.
+The node does not read the policy file.
+On Linux the node sets the per-link domain ~orblx on the TUN device.
+On macOS the node writes /etc/resolver/orblx.
+orblx down removes that resolver configuration.
 The default state directory is {DEFAULT_STATE_DIR}.
 The default netmap file is {DEFAULT_STATE_DIR}/netmap.json.
 The node stores the overlay IP in that directory.
@@ -646,5 +827,111 @@ mod tests {
         assert!(config.certificate_pem.contains("CERTIFICATE"));
         assert!(!config.private_key_pem.is_empty());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn node_issue_signs_grants_that_hide_a_denied_peer() {
+        let dir = std::env::temp_dir().join(format!("orblx-w18-grants-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let policy = dir.join("policy.hujson");
+        fs::write(
+            &policy,
+            r#"{
+                "acls": [
+                    {"action": "accept", "src": ["spiffe://orblx.local/node/a"], "proto": "tcp", "dst": ["spiffe://orblx.local/node/b:8080"]},
+                    {"action": "accept", "src": ["spiffe://orblx.local/node/b"], "proto": "tcp", "dst": ["spiffe://orblx.local/node/a:8080"]}
+                ],
+                "tests": [{
+                    "src": "spiffe://orblx.local/node/a",
+                    "proto": "tcp",
+                    "accept": ["spiffe://orblx.local/node/b:8080"],
+                    "deny": ["spiffe://orblx.local/node/c:8080"]
+                }]
+            }"#,
+        )
+        .unwrap();
+        run(parse_issue(&[
+            "--out".to_string(),
+            dir.to_string_lossy().to_string(),
+            "--policy".to_string(),
+            policy.to_string_lossy().to_string(),
+            "--node".to_string(),
+            "a=100.64.0.1".to_string(),
+            "--node".to_string(),
+            "b=100.64.0.2".to_string(),
+            "--node".to_string(),
+            "c=100.64.0.3".to_string(),
+        ])
+        .unwrap())
+        .unwrap();
+        let visibility = super::load_visibility(&dir.join("a"), "a").unwrap();
+        let peer_b = orblx_datapath::NetmapPeer {
+            name: "b".to_string(),
+            overlay_ip: "100.64.0.2".to_string(),
+            svid: "spiffe://orblx.local/node/b".to_string(),
+            endpoints: vec!["172.28.18.12:443".to_string()],
+            routes: Vec::new(),
+            owner: "lab".to_string(),
+        };
+        let mut peer_c = peer_b.clone();
+        peer_c.name = "c".to_string();
+        peer_c.overlay_ip = "100.64.0.3".to_string();
+        peer_c.svid = "spiffe://orblx.local/node/c".to_string();
+        assert!(visibility.is_visible(&peer_b));
+        assert!(!visibility.is_visible(&peer_c));
+        let mut signed = fs::read_to_string(dir.join("a").join("grants.signed.json")).unwrap();
+        signed.push('x');
+        fs::write(dir.join("a").join("grants.signed.json"), signed).unwrap();
+        assert!(super::load_visibility(&dir.join("a"), "a").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_grant_file_replaces_the_dns_reach_list() {
+        let dir =
+            std::env::temp_dir().join(format!("orblx-w18-live-grants-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let key = orblx_coord::NetmapKey::generate();
+        fs::write(
+            dir.join("netmap.pub"),
+            format!("{}\n", orblx_coord::encode_hex(&key.public())),
+        )
+        .unwrap();
+        let peer = grant_peer("b");
+        write_reach(&dir, &key, vec![peer.svid.clone()]);
+        let visibility = super::load_visibility(&dir, "a").unwrap();
+        assert!(visibility.is_visible(&peer));
+        let first = visibility.revision();
+        write_reach(&dir, &key, Vec::new());
+        assert!(!visibility.is_visible(&peer));
+        assert!(visibility.revision() > first);
+        fs::write(dir.join("grants.signed.json"), b"not-json").unwrap();
+        assert!(!visibility.is_visible(&peer));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn grant_peer(name: &str) -> orblx_datapath::NetmapPeer {
+        orblx_datapath::NetmapPeer {
+            name: name.to_string(),
+            overlay_ip: "100.64.0.2".to_string(),
+            svid: format!("spiffe://orblx.local/node/{name}"),
+            endpoints: Vec::new(),
+            routes: Vec::new(),
+            owner: "lab".to_string(),
+        }
+    }
+
+    fn write_reach(dir: &std::path::Path, key: &orblx_coord::NetmapKey, reach: Vec<String>) {
+        let grants = orblx_identity::ReceiverGrants {
+            version: 1,
+            receiver: "spiffe://orblx.local/node/a".to_string(),
+            grants: Vec::new(),
+            reach,
+        };
+        let signed = key.sign_grants(&grants).unwrap();
+        let text = serde_json::to_string(&signed).unwrap();
+        fs::write(dir.join("grants.signed.json"), text).unwrap();
     }
 }

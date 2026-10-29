@@ -557,6 +557,7 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
             svid: node.svid.clone(),
             endpoints: node.endpoints.clone(),
             routes: published_routes(&inner.policy, &node.svid, &node.routes),
+            owner: String::new(),
         });
     }
     let payload = Netmap {
@@ -564,6 +565,7 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
         self_node: NetmapSelf {
             name: self_node.name.clone(),
             overlay_ip: self_node.overlay_ip.clone(),
+            owner: String::new(),
         },
         peers,
     };
