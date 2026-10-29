@@ -53,6 +53,7 @@ Register these JavaScript origins on the Google client:
 
 `GoogleClient::authorize_url` accepts only the two redirect URIs.
 Another port is not a registered redirect.
+City Breeze always shows the Google account chooser.
 
 ## Checks
 
