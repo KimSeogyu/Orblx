@@ -1,5 +1,6 @@
 use std::fmt;
 
+mod acl;
 mod connector;
 mod error;
 mod framing;
@@ -14,6 +15,7 @@ mod tun_bench;
 mod tun_dev;
 mod tun_macos;
 
+pub use acl::enforce_receiver_tcp;
 pub use connector::{
     issue_connector_lab, prove_lab_directory, prove_two_https_apps, run_hub_dir, run_spoke_dir,
     serve_apps_dir, serve_userspace, AppFetch, TwoAppProof, APP_A_BODY, APP_A_HOST, APP_A_OVERLAY,

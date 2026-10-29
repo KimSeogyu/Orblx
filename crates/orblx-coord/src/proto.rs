@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::CoordError;
-use crate::netmap::{SignedEndpoint, SignedNetmap};
+use crate::netmap::{SignedEndpoint, SignedGrants, SignedNetmap};
 
 pub const MAX_MESSAGE: usize = 256 * 1024;
 
@@ -38,6 +38,8 @@ pub struct Response {
     pub netmap: Option<SignedNetmap>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoints: Option<Vec<SignedEndpoint>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants: Option<SignedGrants>,
 }
 
 impl std::fmt::Debug for Response {

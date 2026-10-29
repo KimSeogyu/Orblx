@@ -3,8 +3,8 @@ use std::time::SystemTime;
 
 use orblx_crypto::{verify_ticket, TicketProof, TicketRing};
 use orblx_identity::{
-    allow_agent_jit, extract_spiffe_id, DenySet, Ipv4Destination, SpiffeId, TrustBundle,
-    WorkloadKind,
+    allow_agent_jit, extract_spiffe_id, DenySet, Ipv4Destination, ReceiverGrants, SpiffeId,
+    TrustBundle, WorkloadKind,
 };
 
 use crate::ipv4::tcp_udp_destination;
@@ -22,6 +22,9 @@ use crate::{is_ipv4_packet, Frame, FrameType, HelloError};
 pub struct PeerGate {
     peer: Option<SpiffeId>,
     admitted: Option<AdmittedTicket>,
+    /// `None` keeps the legacy human path.
+    /// `Some` enforces the receiver grant set, including an empty set.
+    grants: Option<ReceiverGrants>,
 }
 
 #[derive(Clone)]
@@ -37,6 +40,10 @@ impl fmt::Debug for PeerGate {
             .debug_struct("PeerGate")
             .field("peer", &self.peer)
             .field("ticket", &self.admitted.as_ref().map(|_| "admitted"))
+            .field(
+                "grants",
+                &self.grants.as_ref().map(|grants| grants.grants.len()),
+            )
             .finish()
     }
 }
@@ -54,6 +61,7 @@ impl PeerGate {
         Self {
             peer: None,
             admitted: None,
+            grants: None,
         }
     }
 
@@ -66,6 +74,7 @@ impl PeerGate {
         Self {
             peer: Some(peer),
             admitted: None,
+            grants: None,
         }
     }
 
@@ -97,6 +106,19 @@ impl PeerGate {
         self.peer = Some(authed);
         self.admitted = None;
         self.peer.as_ref().ok_or(HelloError::PeerNotBound)
+    }
+
+    /// Install the receiver grant set.
+    ///
+    /// Call this function after the coordinator pushes the signed grants.
+    /// An empty set denies every TCP and UDP packet.
+    /// A missing install keeps the legacy human path.
+    pub fn install_receiver_grants(&mut self, grants: ReceiverGrants) -> Result<(), HelloError> {
+        grants
+            .check()
+            .map_err(|err| HelloError::Node(err.to_string()))?;
+        self.grants = Some(grants);
+        Ok(())
     }
 
     /// Check one presented capability ticket and store it.
@@ -201,6 +223,13 @@ impl PeerGate {
         }
         if peer.kind() == WorkloadKind::Agent {
             admit_agent_destination(&proof, &frame.payload)?;
+        }
+        if let Some(grants) = &self.grants {
+            let parsed =
+                tcp_udp_destination(&frame.payload).ok_or(HelloError::DestinationDenied)?;
+            if !grants.permits(peer, parsed.proto, parsed.port) {
+                return Err(HelloError::DestinationDenied);
+            }
         }
         Ok(&frame.payload)
     }

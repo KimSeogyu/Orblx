@@ -1,0 +1,29 @@
+{
+  // The Mac node may open SSH on the box.
+  // Every other TCP port stays denied. Port 5432 is the deny proof.
+  "groups": {
+    "group:humans": ["spiffe://orblx.local/node/mac"],
+  },
+  "tags": {
+    "tag:box": ["spiffe://orblx.local/node/box"],
+  },
+  "tagOwners": {
+    "tag:box": ["group:humans"],
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["group:humans"],
+      "proto": "tcp",
+      "dst": ["tag:box:22"],
+    },
+  ],
+  "tests": [
+    {
+      "src": "spiffe://orblx.local/node/mac",
+      "proto": "tcp",
+      "accept": ["tag:box:22"],
+      "deny": ["spiffe://orblx.local/node/box:5432"],
+    },
+  ],
+}

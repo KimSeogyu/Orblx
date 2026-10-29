@@ -5,6 +5,7 @@ use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use orblx_datapath::{Netmap, NetmapError};
 use orblx_edge::endpoint_sign_payload;
+use orblx_identity::ReceiverGrants;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +19,17 @@ use crate::ippool::is_overlay_ip;
 #[serde(deny_unknown_fields)]
 pub struct SignedNetmap {
     pub netmap: Netmap,
+    pub sig: String,
+    pub key_id: String,
+}
+
+/// The receiver grant set, signed with the netmap key.
+///
+/// `sig` is the base64 Ed25519 signature over the canonical JSON of `grants`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedGrants {
+    pub grants: ReceiverGrants,
     pub sig: String,
     pub key_id: String,
 }
@@ -82,6 +94,20 @@ impl NetmapKey {
         })
     }
 
+    pub fn sign_grants(&self, grants: &ReceiverGrants) -> Result<SignedGrants, CoordError> {
+        grants
+            .check()
+            .map_err(|err| CoordError::Protocol(err.to_string()))?;
+        let bytes = serde_json::to_vec(grants)
+            .map_err(|_| CoordError::Protocol("The grants are not valid.".to_string()))?;
+        let sig = STANDARD.encode(self.signing.sign(&bytes).to_bytes());
+        Ok(SignedGrants {
+            grants: grants.clone(),
+            sig,
+            key_id: self.key_id(),
+        })
+    }
+
     pub fn sign_endpoint(&self, name: &str, endpoint: &str) -> Result<SignedEndpoint, CoordError> {
         let payload = endpoint_sign_payload(name, endpoint).map_err(|_| CoordError::Endpoint)?;
         let sig = STANDARD.encode(self.signing.sign(payload.as_bytes()).to_bytes());
@@ -100,6 +126,19 @@ pub fn verify_signed_netmap(signed: &SignedNetmap, public: &[u8; 32]) -> Result<
     }
     validate_payload(&signed.netmap)?;
     let bytes = canonical_payload(&signed.netmap)?;
+    verify_b64(public, &bytes, &signed.sig)
+}
+
+pub fn verify_signed_grants(signed: &SignedGrants, public: &[u8; 32]) -> Result<(), CoordError> {
+    if signed.key_id != encode_hex(public) {
+        return Err(CoordError::Signature);
+    }
+    signed
+        .grants
+        .check()
+        .map_err(|err| CoordError::Protocol(err.to_string()))?;
+    let bytes = serde_json::to_vec(&signed.grants)
+        .map_err(|_| CoordError::Protocol("The grants are not valid.".to_string()))?;
     verify_b64(public, &bytes, &signed.sig)
 }
 
@@ -232,6 +271,29 @@ mod tests {
         let mut bad_sig = signed.clone();
         bad_sig.sig.pop();
         assert!(verify_signed_netmap(&bad_sig, &key.public()).is_err());
+    }
+
+    #[test]
+    fn tampered_grants_are_rejected() {
+        use orblx_identity::{ReceiverGrant, ReceiverGrants};
+
+        let key = NetmapKey::generate();
+        let grants = ReceiverGrants {
+            version: 1,
+            receiver: "spiffe://orblx.local/node/box".to_string(),
+            grants: vec![ReceiverGrant {
+                src: "spiffe://orblx.local/node/mac".to_string(),
+                proto: 6,
+                port_start: 22,
+                port_end: 22,
+            }],
+        };
+        let signed = key.sign_grants(&grants).unwrap();
+        super::verify_signed_grants(&signed, &key.public()).unwrap();
+        let mut tampered = signed.clone();
+        tampered.grants.grants[0].port_start = 5432;
+        tampered.grants.grants[0].port_end = 5432;
+        assert!(super::verify_signed_grants(&tampered, &key.public()).is_err());
     }
 
     #[test]

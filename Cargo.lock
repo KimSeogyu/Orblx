@@ -1019,6 +1019,7 @@ dependencies = [
  "orblx-edge",
  "orblx-identity",
  "orblx-relay",
+ "serde_json",
 ]
 
 [[package]]
@@ -1057,6 +1058,7 @@ name = "orblx-datapath"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "orblx-audit",
  "orblx-crypto",
  "orblx-identity",
  "quinn",

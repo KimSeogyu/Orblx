@@ -18,3 +18,4 @@ orblx-datapath = { path = "../orblx-datapath" }
 orblx-edge = { path = "../orblx-edge" }
 orblx-identity = { path = "../orblx-identity" }
 orblx-relay = { path = "../orblx-relay" }
+serde_json = "1"
