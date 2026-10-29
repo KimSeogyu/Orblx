@@ -9,7 +9,7 @@
 
 ## Context
 
-gyeol-quic is the primary stack.
+orblx-quic is the primary stack.
 The record protection is QUIC TLS 1.3 mTLS.
 Quinn and rustls run that flight.
 The leaf is an X.509-SVID from Identity.
@@ -83,7 +83,7 @@ Reject an all-zero X25519 shared secret.
 | `c ap traffic` | Hash through server Finished | Application traffic secret |
 | `s ap traffic` | Hash through server Finished | Application traffic secret |
 | `exp master` | Hash through server Finished | Exporter master secret |
-| `gyeol policy` | `Hash("")` on the exporter master | Policy secret |
+| `orblx policy` | `Hash("")` on the exporter master | Policy secret |
 | `exporter` | `Hash(policy context)` | 32-byte policy binder |
 
 `HKDF-Expand-Label` uses the `tls13 ` prefix.
@@ -176,7 +176,7 @@ Reject a leaf whose remaining life is longer than the SVID cap.
 
 ## Consequences
 
-`crates/gyeol-crypto` contains this scaffold.
+`crates/orblx-crypto` contains this scaffold.
 The crate does not open a UDP socket.
 The crate does not replace the Datapath Quinn path.
 Full HMAC vectors land after the frame freeze.

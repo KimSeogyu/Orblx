@@ -21,7 +21,7 @@ The gap stays between 0.8 seconds and 4 seconds.
 Install a stable Rust toolchain.
 
 ```bash
-cargo run -p gyeol-sim
+cargo run -p orblx-sim
 ```
 
 Open `http://127.0.0.1:8787`.
@@ -30,7 +30,7 @@ The process prints `Open http://127.0.0.1:8787` when the port is ready.
 Use another address when port 8787 is busy:
 
 ```bash
-cargo run -p gyeol-sim -- --listen 127.0.0.1:8790
+cargo run -p orblx-sim -- --listen 127.0.0.1:8790
 ```
 
 Open `http://127.0.0.1:8790`.
@@ -197,13 +197,13 @@ The script rejects a canned keyframe animation.
 
 ## Notes for accept
 
-This page is a playable board on the gyeol-sim feed.
+This page is a playable board on the orblx-sim feed.
 The player drives City Breeze through Google sign-in.
 The player drives Agent JIT and Radioactive NAT from the same URL.
 UDP block shows the fault and the Relay recovery on that board.
 The picture uses feed fields only.
 The picture does not add a throughput number.
-The engine is still the level machine in `gyeol-sim`.
+The engine is still the level machine in `orblx-sim`.
 The game is not a second stack and it is not a WASM rewrite.
 A still screenshot does not show the play.
 A play session has to include the clicks and the feed steps.

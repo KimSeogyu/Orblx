@@ -1,0 +1,17 @@
+[package]
+name = "orblx-audit"
+description = "Session audit hash chain. The chain records session start, session end, and session deny."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+# This crate checks a hash chain file.
+# This crate does not use the data path.
+
+[dependencies]
+orblx-identity = { path = "../orblx-identity" }
+orblx-relay = { path = "../orblx-relay" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.8"

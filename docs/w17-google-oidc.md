@@ -4,7 +4,7 @@ City Breeze uses Google authorization-code OIDC.
 The issuer is `https://accounts.google.com`.
 `IssueGate` checks a real Google `id_token`.
 `IssueGate` writes a short human SVID.
-The SVID is `spiffe://gyeol.local/user/{sub}`.
+The SVID is `spiffe://orblx.local/user/{sub}`.
 `{sub}` is the Google `sub` claim.
 The library does not use a fixed subject.
 
@@ -18,7 +18,7 @@ The harness must not start the mock IdP when the mode is Google.
 
 ## Client
 
-The Google OAuth Web client name is `Orblx gyeol-sim`.
+The Google OAuth Web client name is `Orblx orblx-sim`.
 The client is in Testing mode.
 The operator sets both environment variables.
 Do not commit the client secret.
@@ -89,7 +89,7 @@ The function does not use a key from the token header.
 
 `IssueGate::from_google` stores the client id and the JWKS document.
 `IssueGate::issue_google_human_svid` verifies the ID token.
-The method issues `spiffe://gyeol.local/user/{sub}`.
+The method issues `spiffe://orblx.local/user/{sub}`.
 The SVID life is the remaining ID token life.
 The life is at most 15 minutes.
 15 minutes is `MAX_USER_TTL`.
@@ -103,8 +103,8 @@ A Google gate returns a token error for those two methods.
 
 `ORBLX_OIDC_MODE=mock` selects `OidcMode::Mock`.
 `IssueGate::new` trusts `MockOidc`.
-The mock issuer is `https://oidc.gyeol.local`.
-The mock audience is `gyeol-issue`.
+The mock issuer is `https://oidc.orblx.local`.
+The mock audience is `orblx-issue`.
 Use this path for CI and the harness.
 Do not use this path as the City Breeze default.
 
@@ -158,7 +158,7 @@ Leave `ORBLX_OIDC_MODE` unset.
 ```bash
 export ORBLX_GOOGLE_CLIENT_ID=949089074205-hpspmac5i7uld6q5p3f019tvmojhoipi.apps.googleusercontent.com
 export ORBLX_GOOGLE_CLIENT_SECRET=
-cargo run -p gyeol-sim
+cargo run -p orblx-sim
 ```
 
 Put the client secret in `ORBLX_GOOGLE_CLIENT_SECRET`.

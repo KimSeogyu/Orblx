@@ -68,13 +68,13 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 
 echo "K3 tun_ready true"
-bin="$root/target/debug/gyeol"
+bin="$root/target/debug/orblx"
 if [[ ! -x "$bin" ]]; then
   if ! command -v cargo >/dev/null 2>&1; then
-    echo "Build target/debug/gyeol before you run this script."
+    echo "Build target/debug/orblx before you run this script."
     exit 1
   fi
-  cargo build -p gyeol-cli
+  cargo build -p orblx-cli
 fi
 
 work=$(mktemp -d)

@@ -12,9 +12,9 @@ dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT
 chain="$dir/chain.jsonl"
 
-demo=$(cargo run -q -p gyeol-cli -- audit demo --out "$chain")
+demo=$(cargo run -q -p orblx-cli -- audit demo --out "$chain")
 printf '%s\n' "$demo"
-verify=$(cargo run -q -p gyeol-cli -- audit verify --file "$chain")
+verify=$(cargo run -q -p orblx-cli -- audit verify --file "$chain")
 printf '%s\n' "$verify"
 
 need_line() {

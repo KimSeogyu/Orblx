@@ -6,17 +6,17 @@
 
 ## Context
 
-gyeol must connect through CGNAT.
-gyeol must connect through symmetric NAT.
-gyeol must connect through UDP-blocked egress.
-gyeol must connect through flaky home and cloud paths.
+orblx must connect through CGNAT.
+orblx must connect through symmetric NAT.
+orblx must connect through UDP-blocked egress.
+orblx must connect through flaky home and cloud paths.
 The project does not use Tailscale DERP as a foundation.
 The project does not use WireGuard as a foundation.
 The project does not use Headscale as a foundation.
 N-Edge owns discovery.
 N-Edge owns STUN.
 N-Edge owns hole punching.
-N-Edge owns the gyeol Relay.
+N-Edge owns the orblx Relay.
 N-Edge owns path selection.
 D-Path consumes opaque path_id values.
 C-Key owns the handshake and AEAD.
@@ -43,7 +43,7 @@ The Direct attempt fails after 3 seconds.
 
 ### Relay
 
-The peers attach through the gyeol Relay binary.
+The peers attach through the orblx Relay binary.
 The Relay routes by session_id only.
 The payload stays end-to-end encrypted.
 The preferred path is UDP port 443.

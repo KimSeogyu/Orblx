@@ -13,7 +13,7 @@ The scene does not play a canned keyframe story.
 Install a stable Rust toolchain.
 
 ```bash
-cargo run -p gyeol-sim
+cargo run -p orblx-sim
 ```
 
 Open `http://127.0.0.1:8787`.
@@ -22,7 +22,7 @@ The process prints `Open http://127.0.0.1:8787` when the port is ready.
 Use another address when port 8787 is busy:
 
 ```bash
-cargo run -p gyeol-sim -- --listen 127.0.0.1:8790
+cargo run -p orblx-sim -- --listen 127.0.0.1:8790
 ```
 
 Open `http://127.0.0.1:8790`.
@@ -165,7 +165,7 @@ The player drives Agent JIT and Radioactive NAT from the same URL.
 UDP block shows the Direct fault and the Relay recovery on that board.
 The picture uses feed fields only.
 The picture does not add a throughput number.
-The engine is still the level machine in `gyeol-sim`.
+The engine is still the level machine in `orblx-sim`.
 The scene is not a second stack and it is not a WASM rewrite.
 A still screenshot does not show the play.
 A play session has to include City Breeze and one fault beat.

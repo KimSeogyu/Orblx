@@ -3,9 +3,9 @@
 The product name is Orblx.
 This document records the macOS utun path.
 This pull request does not add the node daemon.
-W18-1 adds `gyeol up`.
-`gyeol up` opens this utun device.
-When `--netmap` is absent, the netmap file is `/var/lib/gyeol/netmap.json`.
+W18-1 adds `orblx up`.
+`orblx up` opens this utun device.
+When `--netmap` is absent, the netmap file is `/var/lib/orblx/netmap.json`.
 This path does not use WireGuard.
 This path does not use Headscale.
 This path does not use DERP.
@@ -14,7 +14,7 @@ This path does not use DERP.
 
 `open_tun` opens a utun device on macOS.
 The packet bytes on the bridge are one IPv4 packet.
-The 4-byte utun family header stays in `crates/gyeol-datapath/src/tun_macos.rs`.
+The 4-byte utun family header stays in `crates/orblx-datapath/src/tun_macos.rs`.
 The process needs root.
 A requested interface name must be `utun` plus a number, for example `utun4`.
 An empty name lets the kernel choose the utun device.
@@ -31,14 +31,14 @@ A route that is already present is success.
 Tests use a recording installer.
 The tests do not open a utun device.
 
-`scripts/dev.gyeol.plist` is the launchd unit.
-The label is `dev.gyeol`.
-The unit runs `/usr/local/bin/gyeol up` as root.
-The working directory is `/var/lib/gyeol`.
+`scripts/dev.orblx.plist` is the launchd unit.
+The label is `dev.orblx`.
+The unit runs `/usr/local/bin/orblx up` as root.
+The working directory is `/var/lib/orblx`.
 The unit starts at load.
 A non-zero exit starts the process again after 10 seconds.
 A zero exit stays down.
-Load this unit after W18-1 installs the `gyeol up` command.
+Load this unit after W18-1 installs the `orblx up` command.
 
 CI runs one `macos-latest` job.
 That job checks the format, builds the workspace, runs Clippy with warnings denied, and runs the tests.
@@ -51,7 +51,7 @@ This check does not prove traffic to a second host.
 Use the PEM files from the hello-quic example.
 
 ```bash
-sudo cargo run -p gyeol-cli -- hello-quic server \
+sudo cargo run -p orblx-cli -- hello-quic server \
   --cert server.pem --key server-key.pem \
   --bundle trust-bundle.pem --ticket ticket.bin \
   --tun-address 100.64.0.2 --tun-netmask 255.255.255.0
@@ -71,7 +71,7 @@ The second command shows `100.64.0.0` and a `utun` interface.
 
 Eng Lead runs this proof after W18-1 merges.
 This pull request does not contain the command output.
-The `gyeol-sim` demo is not this proof.
+The `orblx-sim` demo is not this proof.
 
 Use one real Mac and one real Linux host.
 The hosts are on different networks.
@@ -83,7 +83,7 @@ Do not use `100.64.0.0/24` for another network on either host.
 | Mac | 100.64.0.2 | 255.255.255.0 |
 
 W18-1 reads peers from a netmap file.
-W18-1 stores node state in `/var/lib/gyeol`.
+W18-1 stores node state in `/var/lib/orblx`.
 Use the netmap file format from `docs/w18-linux-daemon.md`.
 Put both nodes in that file.
 The Linux node address is 100.64.0.1.
@@ -92,20 +92,20 @@ The Mac node address is 100.64.0.2.
 ### Linux host
 
 ```bash
-cargo build --release -p gyeol-cli
-sudo install -m 755 target/release/gyeol /usr/local/bin/gyeol
-sudo mkdir -p /var/lib/gyeol
+cargo build --release -p orblx-cli
+sudo install -m 755 target/release/orblx /usr/local/bin/orblx
+sudo mkdir -p /var/lib/orblx
 ```
 
-Copy the W18-1 netmap file to `/var/lib/gyeol/netmap.json` before you start the node.
+Copy the W18-1 netmap file to `/var/lib/orblx/netmap.json` before you start the node.
 Start the node with the W18-1 service or with:
 
 ```bash
-sudo gyeol up
-sudo gyeol status
+sudo orblx up
+sudo orblx status
 ```
 
-`gyeol status` shows the Mac peer.
+`orblx status` shows the Mac peer.
 Find the interface that owns 100.64.0.1:
 
 ```bash
@@ -127,20 +127,20 @@ Leave the HTTP server running.
 Build the same main branch. W18-1 is merged. This pull request is merged.
 
 ```bash
-cargo build --release -p gyeol-cli
-sudo install -m 755 target/release/gyeol /usr/local/bin/gyeol
-sudo mkdir -p /var/lib/gyeol /var/log
+cargo build --release -p orblx-cli
+sudo install -m 755 target/release/orblx /usr/local/bin/orblx
+sudo mkdir -p /var/lib/orblx /var/log
 ```
 
-Copy the W18-1 netmap file to `/var/lib/gyeol/netmap.json`.
+Copy the W18-1 netmap file to `/var/lib/orblx/netmap.json`.
 Install the launchd unit:
 
 ```bash
-sudo cp scripts/dev.gyeol.plist /Library/LaunchDaemons/dev.gyeol.plist
-sudo chown root:wheel /Library/LaunchDaemons/dev.gyeol.plist
-sudo chmod 644 /Library/LaunchDaemons/dev.gyeol.plist
-sudo launchctl bootstrap system /Library/LaunchDaemons/dev.gyeol.plist
-sudo launchctl print system/dev.gyeol
+sudo cp scripts/dev.orblx.plist /Library/LaunchDaemons/dev.orblx.plist
+sudo chown root:wheel /Library/LaunchDaemons/dev.orblx.plist
+sudo chmod 644 /Library/LaunchDaemons/dev.orblx.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/dev.orblx.plist
+sudo launchctl print system/dev.orblx
 ```
 
 Confirm the address and the route:

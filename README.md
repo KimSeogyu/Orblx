@@ -1,11 +1,13 @@
-# gyeol
+# orblx
 
-gyeol is a low-level overlay network.
-The primary stack name is gyeol-quic.
-gyeol-quic uses a userspace TUN device.
-gyeol-quic uses QUIC on UDP port 443.
-gyeol-quic uses short SPIFFE SVIDs.
-gyeol-quic uses the gyeol Relay.
+Former name: gyeol
+
+orblx is a low-level overlay network.
+The primary stack name is orblx-quic.
+orblx-quic uses a userspace TUN device.
+orblx-quic uses QUIC on UDP port 443.
+orblx-quic uses short SPIFFE SVIDs.
+orblx-quic uses the orblx Relay.
 
 This repository does not include WireGuard.
 This repository does not include Headscale.
@@ -31,16 +33,16 @@ Week 1 does not issue identities.
 
 | Path | Week 1 contents |
 | --- | --- |
-| `crates/gyeol-datapath` | Temporary name function |
-| `crates/gyeol-crypto` | Temporary name function |
-| `crates/gyeol-edge` | Temporary name function |
-| `crates/gyeol-identity` | Temporary name function |
-| `crates/gyeol-coord` | Temporary name function |
-| `crates/gyeol-cli` | `gyeol` command |
+| `crates/orblx-datapath` | Temporary name function |
+| `crates/orblx-crypto` | Temporary name function |
+| `crates/orblx-edge` | Temporary name function |
+| `crates/orblx-identity` | Temporary name function |
+| `crates/orblx-coord` | Temporary name function |
+| `crates/orblx-cli` | `orblx` command |
 
-The `gyeol` command prints a hello line.
-The `gyeol` command prints the version when you use `--version`.
-The `gyeol` command prints the version when you use `-V`.
+The `orblx` command prints a hello line.
+The `orblx` command prints the version when you use `--version`.
+The `orblx` command prints the version when you use `-V`.
 
 The data path uses Quinn, rustls, and ring.
 You can use aws-lc-rs as the crypto backend for rustls.
@@ -52,13 +54,13 @@ Week 3 adds the hello-quic path.
 The path reads an IPv4 packet.
 The path wraps the packet in one ADR-0002 DATA frame.
 The path writes the frame on one QUIC bidirectional stream.
-The path checks the peer leaf with `gyeol-identity`.
+The path checks the peer leaf with `orblx-identity`.
 The record in [docs/adr/0002-frame-hello-quic.md](docs/adr/0002-frame-hello-quic.md) stays Proposed.
 
 Run the server:
 
 ```bash
-cargo run -p gyeol-cli -- hello-quic server \
+cargo run -p orblx-cli -- hello-quic server \
   --cert server.pem --key server-key.pem \
   --bundle trust-bundle.pem --ticket ticket.bin \
   --tun-address 10.8.0.1
@@ -67,7 +69,7 @@ cargo run -p gyeol-cli -- hello-quic server \
 Run the client:
 
 ```bash
-cargo run -p gyeol-cli -- hello-quic client \
+cargo run -p orblx-cli -- hello-quic client \
   --cert client.pem --key client-key.pem \
   --bundle trust-bundle.pem --ticket ticket.bin \
   --connect 127.0.0.1:443 \
@@ -81,7 +83,7 @@ The tests use an in-memory packet path.
 
 ## Edge path
 
-`gyeol-edge` gathers one reflexive address with in-tree STUN.
+`orblx-edge` gathers one reflexive address with in-tree STUN.
 The path machine starts in Allocate.
 Allocate stores one unsigned candidate.
 ADR 0003 leaves the Coordinator candidate owner open.
@@ -90,7 +92,7 @@ Direct then proves hello-quic on the same UDP socket.
 `direct_is_up` is true after that proof.
 The Direct budget is 3 seconds.
 The QUIC policy port is UDP 443.
-When Direct is down, the peers attach to the gyeol Relay.
+When Direct is down, the peers attach to the orblx Relay.
 The Relay routes by session id only.
 The payload stays end-to-end encrypted.
 UDP port 443 is the preferred Relay socket.
@@ -103,7 +105,7 @@ Stick and upgrade is in [Stick and upgrade](#stick-and-upgrade).
 Run the in-process same-NAT lab:
 
 ```bash
-cargo run -p gyeol-cli -- edge-smoke
+cargo run -p orblx-cli -- edge-smoke
 ```
 
 The lab uses a local STUN server.
@@ -116,7 +118,7 @@ When that bind is not permitted, the server uses an ephemeral port.
 Run the same lab on UDP port 443 when the process can bind that port:
 
 ```bash
-cargo run -p gyeol-cli -- edge-smoke --bind 127.0.0.1:443
+cargo run -p orblx-cli -- edge-smoke --bind 127.0.0.1:443
 ```
 
 [`scripts/edge-smoke.sh`](scripts/edge-smoke.sh) runs the userspace lab.
@@ -128,13 +130,13 @@ The QUIC server binds UDP port 443.
 Gather against a STUN server:
 
 ```bash
-cargo run -p gyeol-cli -- stun --server 127.0.0.1:3478
+cargo run -p orblx-cli -- stun --server 127.0.0.1:3478
 ```
 
 Answer Binding requests in the lab:
 
 ```bash
-cargo run -p gyeol-cli -- stun-serve --listen 127.0.0.1:3478
+cargo run -p orblx-cli -- stun-serve --listen 127.0.0.1:3478
 ```
 
 ## Stick and upgrade
@@ -148,7 +150,7 @@ The method is reconnect.
 The details and the lab results are in [docs/w13-stick-upgrade.md](docs/w13-stick-upgrade.md).
 
 ```bash
-cargo run -p gyeol-cli -- stick-upgrade
+cargo run -p orblx-cli -- stick-upgrade
 ```
 
 ## Relay
@@ -156,7 +158,7 @@ cargo run -p gyeol-cli -- stick-upgrade
 Run the Relay on UDP port 443 and TCP port 443:
 
 ```bash
-cargo run -p gyeol-cli -- relay --udp 0.0.0.0:443 --tcp 0.0.0.0:443
+cargo run -p orblx-cli -- relay --udp 0.0.0.0:443 --tcp 0.0.0.0:443
 ```
 
 The Relay does not mint a session id.
@@ -164,7 +166,7 @@ Give the same session id to both peers.
 The peers prove QUIC through the Relay.
 
 ```bash
-cargo run -p gyeol-cli -- relay-peer \
+cargo run -p orblx-cli -- relay-peer \
   --role server \
   --bind 0.0.0.0:0 \
   --stun 127.0.0.1:3478 \
@@ -181,8 +183,8 @@ cargo run -p gyeol-cli -- relay-peer \
 Run the in-process labs:
 
 ```bash
-cargo run -p gyeol-cli -- relay-smoke udp
-cargo run -p gyeol-cli -- relay-smoke tcp
+cargo run -p orblx-cli -- relay-smoke udp
+cargo run -p orblx-cli -- relay-smoke tcp
 ```
 
 [`scripts/edge-smoke.sh`](scripts/edge-smoke.sh) runs the Direct labs and the Relay labs.
@@ -192,7 +194,7 @@ The netns Relay labs need root, iproute2, and iptables.
 ## Connector hub
 
 The product name is Orblx.
-The command name is gyeol.
+The command name is orblx.
 Week 9 adds the connector hub-spoke path.
 The path carries HTTPS for two apps.
 The apps are `app-a.orblx.test` and `app-b.orblx.test`.
@@ -210,7 +212,7 @@ Run the userspace proof.
 The proof does not open a TUN device.
 
 ```bash
-cargo run -p gyeol-cli -- connector smoke
+cargo run -p orblx-cli -- connector smoke
 ```
 
 The command prints status 200 for both apps.
@@ -228,25 +230,25 @@ When the TUN device is not available, use `connector smoke`.
 ## Session audit
 
 Week 10 adds a session audit hash chain.
-The crate is `crates/gyeol-audit`.
+The crate is `crates/orblx-audit`.
 The chain records session start, session end, and session deny.
 Each record stores the previous SHA-256 hash.
 The hash covers the previous hash and the event bytes.
 The Relay session id is `RelaySessionId`.
 The frame session id is the datapath frame `session_id`.
-The peer is a SPIFFE ID from `gyeol-identity`.
-The ticket hash is `gyeol_identity::ticket_hash`.
+The peer is a SPIFFE ID from `orblx-identity`.
+The ticket hash is `orblx_identity::ticket_hash`.
 
 Export one deny and one successful session:
 
 ```bash
-cargo run -p gyeol-cli -- audit demo --out chain.jsonl
+cargo run -p orblx-cli -- audit demo --out chain.jsonl
 ```
 
 Check the file:
 
 ```bash
-cargo run -p gyeol-cli -- audit verify --file chain.jsonl
+cargo run -p orblx-cli -- audit verify --file chain.jsonl
 ```
 
 The check reads the chain file.
@@ -272,7 +274,7 @@ The 12-week work is complete when all of these statements are true:
 - The AI agent that can open application A cannot open application B.
 - The system writes a log record when the system denies application B.
 - On a symmetric NAT, a direct session is valid.
-- On a symmetric NAT, a session through the gyeol Relay is valid.
+- On a symmetric NAT, a session through the orblx Relay is valid.
 - When an SVID expires, new packets stop within 60 seconds.
 - When a ticket expires, new packets stop within 60 seconds.
 - When the system revokes an SVID, new packets stop within 60 seconds.
@@ -325,13 +327,13 @@ Read the measured result in [docs/w12-tun-bench.md](docs/w12-tun-bench.md).
 Start the command:
 
 ```bash
-cargo run -p gyeol-cli
+cargo run -p orblx-cli
 ```
 
 Show the version:
 
 ```bash
-cargo run -p gyeol-cli -- --version
+cargo run -p orblx-cli -- --version
 ```
 
 GitHub Actions runs the format check, Clippy, and the tests.
@@ -362,7 +364,7 @@ One command:
 ```bash
 export ORBLX_GOOGLE_CLIENT_ID=949089074205-hpspmac5i7uld6q5p3f019tvmojhoipi.apps.googleusercontent.com
 export ORBLX_GOOGLE_CLIENT_SECRET=
-cargo run -p gyeol-sim
+cargo run -p orblx-sim
 ```
 
 Put the client secret in `ORBLX_GOOGLE_CLIENT_SECRET`.
@@ -425,7 +427,7 @@ The default address is `http://127.0.0.1:8787`.
 Google sign-in uses that address or `localhost:8787`.
 
 ```bash
-ORBLX_OIDC_MODE=mock GYEOL_DEMO_ADDR=127.0.0.1:8790 ./scripts/demo.sh
+ORBLX_OIDC_MODE=mock ORBLX_DEMO_ADDR=127.0.0.1:8790 ./scripts/demo.sh
 ```
 
 ## Browser sign-in
@@ -446,7 +448,7 @@ Start the game:
 ```bash
 export ORBLX_GOOGLE_CLIENT_ID=949089074205-hpspmac5i7uld6q5p3f019tvmojhoipi.apps.googleusercontent.com
 export ORBLX_GOOGLE_CLIENT_SECRET=
-cargo run -p gyeol-sim
+cargo run -p orblx-sim
 ```
 
 Open `http://127.0.0.1:8787`.
@@ -474,13 +476,13 @@ A pass prints `demo pass`.
 
 ## Sim harness
 
-The sim harness crate is `gyeol-sim`.
+The sim harness crate is `orblx-sim`.
 The harness runs three levels.
 The levels are City Breeze, Agent JIT, and Radioactive NAT.
 The default page is the character scene in [Play](#play).
 The engineering view shows peers, packets, and session panels.
 The event log shows feed JSON from those runs.
-UDP block calls `gyeol_edge::run_nat_smash`.
+UDP block calls `orblx_edge::run_nat_smash`.
 Characters and paths move from feed events.
 The scene does not play a canned animation.
 Read the feed fields in [docs/w11-feed-v1.md](docs/w11-feed-v1.md).
@@ -491,7 +493,7 @@ Read the run steps in [docs/demo-sim.md](docs/demo-sim.md).
 Run the harness:
 
 ```bash
-cargo run -p gyeol-sim
+cargo run -p orblx-sim
 ```
 
 Open `http://127.0.0.1:8787`.
@@ -506,7 +508,7 @@ Google sign-in uses `127.0.0.1:8787` or `localhost:8787`.
 `ORBLX_OIDC_MODE=mock` can use another local address:
 
 ```bash
-ORBLX_OIDC_MODE=mock cargo run -p gyeol-sim -- --listen 127.0.0.1:8790
+ORBLX_OIDC_MODE=mock cargo run -p orblx-sim -- --listen 127.0.0.1:8790
 ```
 
 ### Easy — City Breeze

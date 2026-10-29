@@ -2,7 +2,7 @@
 
 The product name is Orblx.
 The bench measures one local TUN round trip on a Linux host.
-The bench uses the in-tree TUN path in `gyeol-datapath`.
+The bench uses the in-tree TUN path in `orblx-datapath`.
 The bench does not use WireGuard.
 The bench does not use Headscale.
 The bench does not use DERP.
@@ -139,7 +139,7 @@ The `ip` version line is `ip utility, iproute2-6.1.0, libbpf 1.3.0`.
 
 ## Constants
 
-The constants are in `crates/gyeol-datapath/src/tun_bench.rs`.
+The constants are in `crates/orblx-datapath/src/tun_bench.rs`.
 
 | Name | Value |
 | --- | --- |

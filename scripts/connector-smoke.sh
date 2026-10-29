@@ -8,7 +8,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 
-out=$(cargo run -q -p gyeol-cli -- connector smoke)
+out=$(cargo run -q -p orblx-cli -- connector smoke)
 printf '%s\n' "$out"
 
 need_line() {

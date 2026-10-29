@@ -4,12 +4,12 @@
 - Language: English ASD-STE100 (Eng Lead rule)
 - Date: 2026-10-28 (Asia/Seoul)
 - Deciders: Datapath (frame freeze authority at W4), Crypto (ticket/SVID), Eng Lead
-- Repo: https://github.com/KimSeogyu/gyeol
+- Repo: https://github.com/KimSeogyu/orblx
 - Design: https://cursor.com/canvas/store-c49a327e-0259-44d4-8d57-5cb0abf5a922/0cab346c-7130-490c-8f0a-156b863acdaa
 
 ## Context
 
-gyeol primary stack is **gyeol-quic**: userspace TUN + QUIC (UDP/443) + SPIFFE SVID mTLS.
+orblx primary stack is **orblx-quic**: userspace TUN + QUIC (UDP/443) + SPIFFE SVID mTLS.
 WireGuard / Headscale / DERP are forbidden dependencies.
 QUIC/TLS provides record crypto. App-layer double AEAD is deferred (Variant A only if W6 kills QUIC).
 
@@ -63,7 +63,7 @@ byte30..:   payload
 
 W1–W3 path:
 
-1. **W1**: this ADR + stub `gyeol-datapath` types (`Frame`, `FrameType`, encode/decode unit tests with fixed vectors).
+1. **W1**: this ADR + stub `orblx-datapath` types (`Frame`, `FrameType`, encode/decode unit tests with fixed vectors).
 2. **W2** (blocked on Identity): accept SVID-backed Quinn endpoint config from Crypto/Identity crates (trait, no keys in Datapath).
 3. **W3 hello-quic**:
    - Process A: open TUN, read IPv4 → wrap DATA frame → write QUIC bi-stream.
@@ -85,13 +85,13 @@ No GSO/GRO in W1–W3. No kernel module.
 ## Consequences
 
 - Frame byte freeze slips only with full-team agree after W4.
-- Crypto’s earlier SessionAead-over-UDP proposal applies to **Variant A (gyeol-noise)** only, not primary.
+- Crypto’s earlier SessionAead-over-UDP proposal applies to **Variant A (orblx-noise)** only, not primary.
 - Replay: Datapath keeps sliding window on `(session_id, seq)` as defense-in-depth; QUIC already numbers records.
 
 ## hello-quic W1 checklist
 
 - [ ] `docs/adr/0002-frame-hello-quic.md` merged (this doc)
-- [ ] `gyeol-datapath`: `Frame::{encode,decode}` + golden tests
+- [ ] `orblx-datapath`: `Frame::{encode,decode}` + golden tests
 - [ ] No `wireguard*` / `boringtun` / `defguard` deps in workspace
 - [ ] ShipPlatform CI green on stub
 
@@ -102,8 +102,8 @@ W4 accepts this ADR.
 W4 freezes the on-wire frame header. The header is 30 bytes. Decision 2 is the layout.
 W4 freezes the `ticket_hash` definition in that header.
 `ticket_hash` is the first 16 bytes of SHA-256 over the raw ticket bytes.
-`gyeol_identity::ticket_hash` returns that value.
-The frozen value for `crates/gyeol-identity/fixtures/ticket-valid.bin` is `f60953411557e1fd443f384a8592bad3`.
+`orblx_identity::ticket_hash` returns that value.
+The frozen value for `crates/orblx-identity/fixtures/ticket-valid.bin` is `44f62776f5ddb2c2a259539c36db2cc4`.
 
 W4 does not freeze the CTRL payload layout.
 W4 does not freeze the TICKET payload layout.
@@ -116,20 +116,20 @@ W4 does not change the header layout.
 
 ## Frozen vectors
 
-The files in `crates/gyeol-datapath/testdata/` are the frozen bytes.
+The files in `crates/orblx-datapath/testdata/` are the frozen bytes.
 `Frame::encode` must emit these bytes.
 `Frame::decode` must accept these bytes and return the same frame.
 
 | Vector | File | What is frozen |
 |--------|------|----------------|
-| DATA header plus payload `ping` | `crates/gyeol-datapath/testdata/frame-data-ping.hex` | 30-byte header and payload |
-| Frame type DATA | `crates/gyeol-datapath/testdata/frame-type-data.hex` | type nibble 1, payload `01` |
-| Frame type CTRL | `crates/gyeol-datapath/testdata/frame-type-ctrl.hex` | type nibble 2, payload `02` |
-| Frame type TICKET | `crates/gyeol-datapath/testdata/frame-type-ticket.hex` | type nibble 3, payload `03` |
-| `FLAG_REKEY_REQ` | `crates/gyeol-datapath/testdata/frame-flag-rekey-req.hex` | flag byte `01` |
-| `FLAG_EOS` | `crates/gyeol-datapath/testdata/frame-flag-eos.hex` | flag byte `02` |
-| DATA header with fixture `ticket_hash` | `crates/gyeol-datapath/testdata/frame-data-ticket-hash.hex` | header bytes 14..29 |
-| Fixture `ticket_hash` | `crates/gyeol-datapath/testdata/ticket-valid-hash.hex` | 16-byte prefix |
+| DATA header plus payload `ping` | `crates/orblx-datapath/testdata/frame-data-ping.hex` | 30-byte header and payload |
+| Frame type DATA | `crates/orblx-datapath/testdata/frame-type-data.hex` | type nibble 1, payload `01` |
+| Frame type CTRL | `crates/orblx-datapath/testdata/frame-type-ctrl.hex` | type nibble 2, payload `02` |
+| Frame type TICKET | `crates/orblx-datapath/testdata/frame-type-ticket.hex` | type nibble 3, payload `03` |
+| `FLAG_REKEY_REQ` | `crates/orblx-datapath/testdata/frame-flag-rekey-req.hex` | flag byte `01` |
+| `FLAG_EOS` | `crates/orblx-datapath/testdata/frame-flag-eos.hex` | flag byte `02` |
+| DATA header with fixture `ticket_hash` | `crates/orblx-datapath/testdata/frame-data-ticket-hash.hex` | header bytes 14..29 |
+| Fixture `ticket_hash` | `crates/orblx-datapath/testdata/ticket-valid-hash.hex` | 16-byte prefix |
 
 ### DATA header plus payload `ping`
 
@@ -165,17 +165,17 @@ FLAG_EOS:       110200000000000000000000000000000000000000000000000000000000
 
 ### `ticket_hash`
 
-`crates/gyeol-identity/fixtures/ticket-valid.bin` hashes to:
+`crates/orblx-identity/fixtures/ticket-valid.bin` hashes to:
 
 ```text
-f60953411557e1fd443f384a8592bad3
+44f62776f5ddb2c2a259539c36db2cc4
 ```
 
 The DATA frame below places that value in header bytes 14..29.
 `session_id` is 1. `seq` is 1. The payload is `ok`.
 
 ```text
-1100000000010000000000000001f60953411557e1fd443f384a8592bad36f6b
+110000000001000000000000000144f62776f5ddb2c2a259539c36db2cc46f6b
 ```
 
 ## Open questions

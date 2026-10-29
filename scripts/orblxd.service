@@ -1,0 +1,17 @@
+[Unit]
+Description=Orblx node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/orblx up --netmap /etc/orblx/netmap.json --state-dir /var/lib/orblx
+ExecStop=/usr/local/bin/orblx down --state-dir /var/lib/orblx
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+StateDirectory=orblx
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

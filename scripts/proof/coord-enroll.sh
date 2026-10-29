@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Token enrollment proof for the coordinator container.
-# The script deletes the gyeol-coord-proof volumes at the start.
+# The script deletes the orblx-coord-proof volumes at the start.
 # The script does not print enroll tokens or private keys.
 set -euo pipefail
 
@@ -36,19 +36,19 @@ open_legacy_forward() {
 
 build_image() {
   local image_dir bin
-  bin="$ROOT/target/debug/gyeol"
-  cargo build -p gyeol-cli --bin gyeol
+  bin="$ROOT/target/debug/orblx"
+  cargo build -p orblx-cli --bin orblx
   image_dir="$(mktemp -d)"
-  cp "$bin" "$image_dir/gyeol"
+  cp "$bin" "$image_dir/orblx"
   cp "$ROOT/scripts/proof/Dockerfile" "$image_dir/Dockerfile"
-  docker build -t gyeol-coord:w18 "$image_dir"
+  docker build -t orblx-coord:w18 "$image_dir"
   rm -rf "$image_dir"
 }
 
 wait_bundle() {
   local i
   for i in $(seq 1 90); do
-    if dc exec -T coord cat /var/lib/gyeol/trust-bundle.pem >/dev/null 2>&1; then
+    if dc exec -T coord cat /var/lib/orblx/trust-bundle.pem >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -70,15 +70,15 @@ dc up -d coord
 wait_bundle
 
 echo "=== [C] token server-a ==="
-dc exec -T coord gyeol coord token create --state /var/lib/gyeol --ttl 3600 --out /var/lib/gyeol/tokens/server-a
+dc exec -T coord orblx coord token create --state /var/lib/orblx --ttl 3600 --out /var/lib/orblx/tokens/server-a
 echo "=== [C] token server-b ==="
-dc exec -T coord gyeol coord token create --state /var/lib/gyeol --ttl 3600 --out /var/lib/gyeol/tokens/server-b
+dc exec -T coord orblx coord token create --state /var/lib/orblx --ttl 3600 --out /var/lib/orblx/tokens/server-b
 
-if dc exec -T coord cat /var/lib/gyeol/nodes.json | grep -q 'ge1\.'; then
+if dc exec -T coord cat /var/lib/orblx/nodes.json | grep -q 'ge1\.'; then
   echo "The node store contains an enroll token." >&2
   exit 1
 fi
-if dc exec -T coord cat /var/lib/gyeol/nodes.json | grep -q 'PRIVATE KEY'; then
+if dc exec -T coord cat /var/lib/orblx/nodes.json | grep -q 'PRIVATE KEY'; then
   echo "The node store contains a private key." >&2
   exit 1
 fi
@@ -98,7 +98,7 @@ dc --profile nodes run --rm node-a \
   --coord "${coord_ip}:443" \
   --bundle /coord-state/trust-bundle.pem \
   --token-file /coord-state/tokens/server-a \
-  --state /var/lib/gyeol \
+  --state /var/lib/orblx \
   --endpoint server-a:443
 
 echo "=== [C] enroll server-b ==="
@@ -108,11 +108,11 @@ dc --profile nodes run --rm node-b \
   --coord "${coord_ip}:443" \
   --bundle /coord-state/trust-bundle.pem \
   --token-file /coord-state/tokens/server-b \
-  --state /var/lib/gyeol \
+  --state /var/lib/orblx \
   --endpoint server-b:443
 
 echo "=== [C] netmap before restart ==="
-before="$(dc --profile nodes run --rm node-a coord netmap --coord ${coord_ip}:443 --bundle /coord-state/trust-bundle.pem --state /var/lib/gyeol)"
+before="$(dc --profile nodes run --rm node-a coord netmap --coord ${coord_ip}:443 --bundle /coord-state/trust-bundle.pem --state /var/lib/orblx)"
 printf '%s\n' "$before"
 
 echo "=== [C] restart coordinator ==="
@@ -121,7 +121,7 @@ wait_bundle
 sleep 1
 
 echo "=== [C] netmap after restart ==="
-after="$(dc --profile nodes run --rm node-a coord netmap --coord ${coord_ip}:443 --bundle /coord-state/trust-bundle.pem --state /var/lib/gyeol)"
+after="$(dc --profile nodes run --rm node-a coord netmap --coord ${coord_ip}:443 --bundle /coord-state/trust-bundle.pem --state /var/lib/orblx)"
 printf '%s\n' "$after"
 
 ip_before="$(printf '%s\n' "$before" | awk '/^overlay_ip /{print $2; exit}')"
@@ -152,27 +152,27 @@ fi
 echo "reused_token rejected"
 
 echo "=== [C] netmap json ==="
-dc --profile nodes run --rm --entrypoint cat node-a /var/lib/gyeol/netmap.json
+dc --profile nodes run --rm --entrypoint cat node-a /var/lib/orblx/netmap.json
 echo
 
-echo "=== [C] gyeol up reads netmap.json ==="
+echo "=== [C] orblx up reads netmap.json ==="
 set +e
-up_out="$(dc --profile nodes run --rm node-a up --state-dir /var/lib/gyeol 2>&1)"
+up_out="$(dc --profile nodes run --rm node-a up --state-dir /var/lib/orblx 2>&1)"
 up_code=$?
 set -e
 printf '%s\n' "$up_out"
 if [[ "$up_code" -eq 0 ]]; then
-  echo "gyeol up started without the capability ticket." >&2
+  echo "orblx up started without the capability ticket." >&2
   exit 1
 fi
 if printf '%s\n' "$up_out" | grep -q 'The netmap is not valid'; then
-  echo "gyeol up rejected the coordinator netmap." >&2
+  echo "orblx up rejected the coordinator netmap." >&2
   exit 1
 fi
 if ! printf '%s\n' "$up_out" | grep -q 'ticket.bin'; then
-  echo "gyeol up did not accept the netmap." >&2
+  echo "orblx up did not accept the netmap." >&2
   exit 1
 fi
-echo "gyeol_up_read_netmap true"
+echo "orblx_up_read_netmap true"
 echo
 echo "proof_ok"

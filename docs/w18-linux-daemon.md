@@ -1,33 +1,33 @@
 # W18 Linux node daemon
 
 The product name is Orblx.
-One Linux process holds one gyeol-quic session for each peer.
+One Linux process holds one orblx-quic session for each peer.
 L3 is the primary path.
-The CLI commands are `gyeol up`, `gyeol down`, and `gyeol status`.
-The default state directory is `/var/lib/gyeol`.
+The CLI commands are `orblx up`, `orblx down`, and `orblx status`.
+The default state directory is `/var/lib/orblx`.
 The flag `--state-dir` selects another directory.
 The file `node.json` in that directory stores the node name and the overlay IP.
 A later start reads that file.
 A netmap overlay IP that differs from the stored IP is an error.
 The process keeps the stored IP.
-`gyeol status` prints each peer, the path kind, and the SVID expiry.
+`orblx status` prints each peer, the path kind, and the SVID expiry.
 The path kind is `direct` when the QUIC session is up.
 The path kind is `down` when the session is down.
 The router sends each outbound TUN packet to the peer that owns the destination overlay IP.
-The TUN device name is `gyeol0`.
-The systemd unit is `scripts/gyeold.service`.
+The TUN device name is `orblx0`.
+The systemd unit is `scripts/orblxd.service`.
 
 ## Docker proof
 
 The proof uses three Linux containers on one bridge.
 The image file is `scripts/proof/Dockerfile`.
-The image name is `gyeol-w18:local`.
+The image name is `orblx-w18:local`.
 The base image is `ubuntu:24.04`.
 The compose file is `scripts/proof/compose.w18.yml`.
-The compose project name is `gyeol-w18`.
+The compose project name is `orblx-w18`.
 Each service has `cap_add: NET_ADMIN`.
 Each service has the device `/dev/net/tun`.
-Each service runs `gyeol up` from its netmap.
+Each service runs `orblx up` from its netmap.
 The bridge subnet is `172.28.18.0/24`.
 The gateway is `172.28.18.1`.
 
@@ -47,13 +47,13 @@ The script exits 0 when the user is not root.
 The script exits 0 when Docker is absent.
 The CI workflow runs fmt, clippy, and the workspace tests.
 The proof script is a root command on a Docker host.
-The script builds `target/debug/gyeol` when that file is absent.
+The script builds `target/debug/orblx` when that file is absent.
 The script issues node material for a, b, and c.
 The script writes one netmap for each node.
 The script starts the compose project.
 Each node pings the other two overlay addresses.
 The script then restarts `node-b`.
-The script checks the overlay IP in `gyeol status`, in `node.json`, and on `gyeol0`.
+The script checks the overlay IP in `orblx status`, in `node.json`, and on `orblx0`.
 
 The shared TUN poll is 50 ms.
 A ping RTT near 50 ms or near 100 ms is the expected result.
@@ -61,11 +61,11 @@ A ping RTT near 50 ms or near 100 ms is the expected result.
 ## Result
 
 This host ran `sudo ./scripts/proof/w18-linux-daemon.sh`.
-The script built the image `gyeol-w18:local` and then printed these lines:
+The script built the image `orblx-w18:local` and then printed these lines:
 
 ```
 W18 Linux daemon proof
-image gyeol-w18:local
+image orblx-w18:local
 node a overlay 100.64.0.1 underlay 172.28.18.11
 node b overlay 100.64.0.2 underlay 172.28.18.12
 node c overlay 100.64.0.3 underlay 172.28.18.13
@@ -73,26 +73,26 @@ node c overlay 100.64.0.3 underlay 172.28.18.13
 state up
 name a
 overlay_ip 100.64.0.1
-svid spiffe://gyeol.local/node/a
+svid spiffe://orblx.local/node/a
 svid_expiry 1793276982
-peer b overlay_ip 100.64.0.2 path direct svid spiffe://gyeol.local/node/b svid_expiry 1793276982
-peer c overlay_ip 100.64.0.3 path direct svid spiffe://gyeol.local/node/c svid_expiry 1793276982
+peer b overlay_ip 100.64.0.2 path direct svid spiffe://orblx.local/node/b svid_expiry 1793276982
+peer c overlay_ip 100.64.0.3 path direct svid spiffe://orblx.local/node/c svid_expiry 1793276982
 ---- status b ----
 state up
 name b
 overlay_ip 100.64.0.2
-svid spiffe://gyeol.local/node/b
+svid spiffe://orblx.local/node/b
 svid_expiry 1793276982
-peer a overlay_ip 100.64.0.1 path direct svid spiffe://gyeol.local/node/a svid_expiry 1793276982
-peer c overlay_ip 100.64.0.3 path direct svid spiffe://gyeol.local/node/c svid_expiry 1793276982
+peer a overlay_ip 100.64.0.1 path direct svid spiffe://orblx.local/node/a svid_expiry 1793276982
+peer c overlay_ip 100.64.0.3 path direct svid spiffe://orblx.local/node/c svid_expiry 1793276982
 ---- status c ----
 state up
 name c
 overlay_ip 100.64.0.3
-svid spiffe://gyeol.local/node/c
+svid spiffe://orblx.local/node/c
 svid_expiry 1793276982
-peer a overlay_ip 100.64.0.1 path direct svid spiffe://gyeol.local/node/a svid_expiry 1793276982
-peer b overlay_ip 100.64.0.2 path direct svid spiffe://gyeol.local/node/b svid_expiry 1793276982
+peer a overlay_ip 100.64.0.1 path direct svid spiffe://orblx.local/node/a svid_expiry 1793276982
+peer b overlay_ip 100.64.0.2 path direct svid spiffe://orblx.local/node/b svid_expiry 1793276982
 ---- ping ----
 PING 100.64.0.2 (100.64.0.2) 56(84) bytes of data.
 64 bytes from 100.64.0.2: icmp_seq=1 ttl=127 time=100 ms
@@ -151,16 +151,16 @@ node-c to 100.64.0.2 ok
 ---- restart b ----
 overlay_ip_before 100.64.0.2
 node_json_before 100.64.0.2
- Container gyeol-w18-node-b-1  Restarting
- Container gyeol-w18-node-b-1  Started
+ Container orblx-w18-node-b-1  Restarting
+ Container orblx-w18-node-b-1  Started
 ---- status b after restart ----
 state up
 name b
 overlay_ip 100.64.0.2
-svid spiffe://gyeol.local/node/b
+svid spiffe://orblx.local/node/b
 svid_expiry 1793276982
-peer a overlay_ip 100.64.0.1 path direct svid spiffe://gyeol.local/node/a svid_expiry 1793276982
-peer c overlay_ip 100.64.0.3 path direct svid spiffe://gyeol.local/node/c svid_expiry 1793276982
+peer a overlay_ip 100.64.0.1 path direct svid spiffe://orblx.local/node/a svid_expiry 1793276982
+peer c overlay_ip 100.64.0.3 path direct svid spiffe://orblx.local/node/c svid_expiry 1793276982
 overlay_ip_after 100.64.0.2
 node_json_after 100.64.0.2
 tun_address_after 100.64.0.2/32
@@ -217,7 +217,7 @@ The script printed `W18 proof passed`.
 
 The compose file sets `net.ipv4.conf.all.rp_filter=0` and `net.ipv4.conf.default.rp_filter=0`.
 The new TUN device inherits that value.
-Inside the container, `/proc/sys` is read-only, so the node log can report a failed write of `gyeol0` rp_filter.
+Inside the container, `/proc/sys` is read-only, so the node log can report a failed write of `orblx0` rp_filter.
 The node continues when those defaults are already 0.
 
 On this VM, container-to-container ICMP needed these host settings before the proof:
@@ -235,11 +235,11 @@ The proof script leaves those sysctls unchanged.
 Use one real Mac, one real Linux host, and the three containers on that Linux host.
 The containers are extra Linux nodes.
 The Linux host also runs one native node.
-Linux opens the TUN device `gyeol0`.
+Linux opens the TUN device `orblx0`.
 macOS opens a utun device.
 The kernel chooses the utun name.
-`gyeol up` prints that name.
-The Mac command is the same `gyeol up`.
+`orblx up` prints that name.
+The Mac command is the same `orblx up`.
 The utun details are in `docs/w18-macos.md`.
 
 Set `LINUX_LAN` to the Linux host address on the LAN.
@@ -249,16 +249,16 @@ Allow UDP 443 on the Mac from the Linux host.
 
 Issue one shared lab on the Linux host.
 The SVID life and the ticket life are 15 minutes.
-Run `gyeol node-issue` again after that life ends.
+Run `orblx node-issue` again after that life ends.
 Copy the `mac` directory to the Mac.
 Leave `key.pem` and `ticket-mac.key` unread on the terminal.
 
 ```
-cargo build -p gyeol-cli --bin gyeol
-sudo install -m 755 target/debug/gyeol /usr/local/bin/gyeol
-sudo mkdir -p /var/lib/gyeol-lab
-sudo /usr/local/bin/gyeol node-issue \
-  --out /var/lib/gyeol-lab \
+cargo build -p orblx-cli --bin orblx
+sudo install -m 755 target/debug/orblx /usr/local/bin/orblx
+sudo mkdir -p /var/lib/orblx-lab
+sudo /usr/local/bin/orblx node-issue \
+  --out /var/lib/orblx-lab \
   --node a=100.64.0.1 \
   --node b=100.64.0.2 \
   --node c=100.64.0.3 \
@@ -272,17 +272,17 @@ The node with the smaller name dials.
 The node with the larger name accepts.
 The name order here is `a`, `b`, `c`, `host`, `mac`.
 
-Write `/var/lib/gyeol-lab/netmap-a.json`:
+Write `/var/lib/orblx-lab/netmap-a.json`:
 
 ```json
 {
   "version": 1,
   "self": {"name": "a", "overlay_ip": "100.64.0.1"},
   "peers": [
-    {"name": "b", "overlay_ip": "100.64.0.2", "svid": "spiffe://gyeol.local/node/b", "endpoints": ["172.28.18.12:443"], "routes": ["100.64.0.2/32"]},
-    {"name": "c", "overlay_ip": "100.64.0.3", "svid": "spiffe://gyeol.local/node/c", "endpoints": ["172.28.18.13:443"], "routes": ["100.64.0.3/32"]},
-    {"name": "host", "overlay_ip": "100.64.0.4", "svid": "spiffe://gyeol.local/node/host", "endpoints": ["172.28.18.1:443"], "routes": ["100.64.0.4/32"]},
-    {"name": "mac", "overlay_ip": "100.64.0.5", "svid": "spiffe://gyeol.local/node/mac", "endpoints": ["MAC_LAN:443"], "routes": ["100.64.0.5/32"]}
+    {"name": "b", "overlay_ip": "100.64.0.2", "svid": "spiffe://orblx.local/node/b", "endpoints": ["172.28.18.12:443"], "routes": ["100.64.0.2/32"]},
+    {"name": "c", "overlay_ip": "100.64.0.3", "svid": "spiffe://orblx.local/node/c", "endpoints": ["172.28.18.13:443"], "routes": ["100.64.0.3/32"]},
+    {"name": "host", "overlay_ip": "100.64.0.4", "svid": "spiffe://orblx.local/node/host", "endpoints": ["172.28.18.1:443"], "routes": ["100.64.0.4/32"]},
+    {"name": "mac", "overlay_ip": "100.64.0.5", "svid": "spiffe://orblx.local/node/mac", "endpoints": ["MAC_LAN:443"], "routes": ["100.64.0.5/32"]}
   ]
 }
 ```
@@ -293,7 +293,7 @@ Node b uses bridge addresses `172.28.18.11` for a and `172.28.18.13` for c.
 Node c uses bridge addresses `172.28.18.11` for a and `172.28.18.12` for b.
 Both use `172.28.18.1:443` for host and `MAC_LAN:443` for mac.
 
-Write `/var/lib/gyeol-lab/netmap-host.json` with self `host` / `100.64.0.4`.
+Write `/var/lib/orblx-lab/netmap-host.json` with self `host` / `100.64.0.4`.
 The host reaches the containers on the bridge:
 
 | Peer | Endpoint |
@@ -317,36 +317,36 @@ Start the containers from the Linux host with the commands below.
 The proof script writes netmaps for a, b, and c only.
 
 ```
-sudo install -d -m 755 /var/lib/gyeol /etc/gyeol
-sudo cp -a /var/lib/gyeol-lab/host/. /var/lib/gyeol/
-sudo cp /var/lib/gyeol-lab/netmap-host.json /etc/gyeol/netmap.json
-export W18_STATE_A=/var/lib/gyeol-lab/a
-export W18_STATE_B=/var/lib/gyeol-lab/b
-export W18_STATE_C=/var/lib/gyeol-lab/c
-export W18_NETMAP_A=/var/lib/gyeol-lab/netmap-a.json
-export W18_NETMAP_B=/var/lib/gyeol-lab/netmap-b.json
-export W18_NETMAP_C=/var/lib/gyeol-lab/netmap-c.json
+sudo install -d -m 755 /var/lib/orblx /etc/orblx
+sudo cp -a /var/lib/orblx-lab/host/. /var/lib/orblx/
+sudo cp /var/lib/orblx-lab/netmap-host.json /etc/orblx/netmap.json
+export W18_STATE_A=/var/lib/orblx-lab/a
+export W18_STATE_B=/var/lib/orblx-lab/b
+export W18_STATE_C=/var/lib/orblx-lab/c
+export W18_NETMAP_A=/var/lib/orblx-lab/netmap-a.json
+export W18_NETMAP_B=/var/lib/orblx-lab/netmap-b.json
+export W18_NETMAP_C=/var/lib/orblx-lab/netmap-c.json
 image_dir=$(mktemp -d)
-cp target/debug/gyeol "$image_dir/gyeol"
+cp target/debug/orblx "$image_dir/orblx"
 cp scripts/proof/Dockerfile "$image_dir/Dockerfile"
-docker build -t gyeol-w18:local "$image_dir"
+docker build -t orblx-w18:local "$image_dir"
 sudo docker compose -f scripts/proof/compose.w18.yml up -d
-sudo install -m 644 scripts/gyeold.service /etc/systemd/system/gyeold.service
+sudo install -m 644 scripts/orblxd.service /etc/systemd/system/orblxd.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now gyeold
+sudo systemctl enable --now orblxd
 ```
 
-The unit runs `/usr/local/bin/gyeol up --netmap /etc/gyeol/netmap.json --state-dir /var/lib/gyeol`.
-The unit stops the node with `gyeol down`.
-The manual command is the same `gyeol up` line.
+The unit runs `/usr/local/bin/orblx up --netmap /etc/orblx/netmap.json --state-dir /var/lib/orblx`.
+The unit stops the node with `orblx down`.
+The manual command is the same `orblx up` line.
 
 On the Mac, run the same command as root.
-The state directory default is `/var/lib/gyeol`.
-When `--netmap` is absent, the file is `/var/lib/gyeol/netmap.json`.
-`scripts/dev.gyeol.plist` runs `gyeol up` with that default.
+The state directory default is `/var/lib/orblx`.
+When `--netmap` is absent, the file is `/var/lib/orblx/netmap.json`.
+`scripts/dev.orblx.plist` runs `orblx up` with that default.
 
 ```
-sudo gyeol up --netmap netmap-mac.json --state-dir /var/lib/gyeol --listen 0.0.0.0:443
+sudo orblx up --netmap netmap-mac.json --state-dir /var/lib/orblx --listen 0.0.0.0:443
 ifconfig | grep 100.64.0.5
 ```
 
@@ -355,7 +355,7 @@ The `ifconfig` line shows `100.64.0.5` on a `utun` interface.
 Check the Linux host:
 
 ```
-sudo gyeol status --state-dir /var/lib/gyeol
+sudo orblx status --state-dir /var/lib/orblx
 ping -c 3 100.64.0.1
 ping -c 3 100.64.0.2
 ping -c 3 100.64.0.3
@@ -372,10 +372,10 @@ Restart one container and read the same overlay IP:
 
 ```
 sudo docker compose -f scripts/proof/compose.w18.yml restart node-b
-sudo docker compose -f scripts/proof/compose.w18.yml exec node-b gyeol status
-sudo docker compose -f scripts/proof/compose.w18.yml exec node-b ip -4 -o addr show dev gyeol0
+sudo docker compose -f scripts/proof/compose.w18.yml exec node-b orblx status
+sudo docker compose -f scripts/proof/compose.w18.yml exec node-b ip -4 -o addr show dev orblx0
 ```
 
-`gyeol status` prints `overlay_ip 100.64.0.2`.
+`orblx status` prints `overlay_ip 100.64.0.2`.
 The TUN line prints `100.64.0.2/32`.
-`/var/lib/gyeol-lab/b/node.json` still contains `100.64.0.2`.
+`/var/lib/orblx-lab/b/node.json` still contains `100.64.0.2`.

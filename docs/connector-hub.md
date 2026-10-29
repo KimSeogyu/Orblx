@@ -1,7 +1,7 @@
 # Orblx connector hub
 
 The product name is Orblx.
-The command name is gyeol.
+The command name is orblx.
 The connector is the hub-spoke path for two HTTPS apps.
 The apps are `app-a.orblx.test` and `app-b.orblx.test`.
 The overlay addresses are `10.8.0.10` and `10.8.0.11`.
@@ -28,7 +28,7 @@ The test `two_https_apps_answer_through_the_mesh` runs the same proof.
 Run the proof:
 
 ```bash
-cargo run -p gyeol-cli -- connector smoke
+cargo run -p orblx-cli -- connector smoke
 ```
 
 You must see both of these results:
@@ -51,7 +51,7 @@ One process runs the hub, the spoke, and the two apps.
 The HTTPS bytes still cross the QUIC mesh.
 
 ```bash
-cargo run -p gyeol-cli -- connector serve --ingress 127.0.0.1:8443 --ca-out orblx-app-ca.pem
+cargo run -p orblx-cli -- connector serve --ingress 127.0.0.1:8443 --ca-out orblx-app-ca.pem
 ```
 
 In a second terminal:
@@ -78,14 +78,14 @@ The sidecar names match `hello-quic`.
 The command still loads those files from disk.
 
 ```bash
-cargo run -p gyeol-cli -- connector issue --out /tmp/orblx-w9
-cargo run -p gyeol-cli -- connector hub --dir /tmp/orblx-w9 --listen 127.0.0.1:7443
+cargo run -p orblx-cli -- connector issue --out /tmp/orblx-w9
+cargo run -p orblx-cli -- connector hub --dir /tmp/orblx-w9 --listen 127.0.0.1:7443
 ```
 
 In a second terminal:
 
 ```bash
-cargo run -p gyeol-cli -- connector spoke \
+cargo run -p orblx-cli -- connector spoke \
   --dir /tmp/orblx-w9 \
   --connect 127.0.0.1:7443 \
   --ingress 127.0.0.1:8443
@@ -136,7 +136,7 @@ Build the binary, then run the lab.
 Root may not have cargo on `PATH`.
 
 ```bash
-cargo build -p gyeol-cli
+cargo build -p orblx-cli
 sudo ./scripts/connector-tun.sh
 ```
 
@@ -144,13 +144,13 @@ A manual run uses the same commands.
 Build the binary first:
 
 ```bash
-cargo build -p gyeol-cli
+cargo build -p orblx-cli
 ```
 
 Create the lab files:
 
 ```bash
-cargo run -p gyeol-cli -- connector issue --out /tmp/orblx-w9
+cargo run -p orblx-cli -- connector issue --out /tmp/orblx-w9
 ```
 
 Hub namespace, after the TUN device `orblxh` is up:
@@ -158,7 +158,7 @@ Hub namespace, after the TUN device `orblxh` is up:
 ```bash
 sudo ip addr add 10.8.0.10/32 dev orblxh
 sudo ip addr add 10.8.0.11/32 dev orblxh
-sudo ./target/debug/gyeol connector apps \
+sudo ./target/debug/orblx connector apps \
   --dir /tmp/orblx-w9 \
   --bind-a 10.8.0.10:443 \
   --bind-b 10.8.0.11:443

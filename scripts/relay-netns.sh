@@ -4,7 +4,7 @@
 # dual-udp: two peers behind two NATs. Relay UDP/443.
 # dual-tcp: two NATs. UDP/443 is dropped. Relay TCP/443.
 # The script needs root, iproute2, and iptables.
-# The gyeol binary must already be built.
+# The orblx binary must already be built.
 
 set -euo pipefail
 
@@ -16,11 +16,11 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-bin="$root/target/debug/gyeol"
+bin="$root/target/debug/orblx"
 kind=${1:-same-udp}
 
 if [[ ! -x "$bin" ]]; then
-  echo "The gyeol binary is missing. Build it before the Relay netns lab."
+  echo "The orblx binary is missing. Build it before the Relay netns lab."
   exit 1
 fi
 
@@ -32,7 +32,7 @@ case "$kind" in
     ;;
 esac
 
-prefix="gyeol-w6-${kind}"
+prefix="orblx-w6-${kind}"
 work=$(mktemp -d)
 stun_pid=""
 relay_pid=""
@@ -314,7 +314,7 @@ fi
 
 "$bin" direct-issue --out "$work/id" >/dev/null
 session_hex=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
-needle_hex=$(python3 -c 'print(b"gyeol-w6-relay-probe".hex())')
+needle_hex=$(python3 -c 'print(b"orblx-w6-relay-probe".hex())')
 
 ip netns exec "$relay_ns" "$bin" stun-serve --listen 10.30.0.1:3478 >"$work/stun.log" 2>&1 &
 stun_pid=$!
