@@ -25,7 +25,7 @@ use crate::dns::{
     refresh_resolver, serve_dns, DnsTable, LinkResolverGuard, PeerVisibility, ResolvConfForwarder,
     DNS_PORT,
 };
-use crate::ipv4::icmp_echo_reply;
+use crate::ipv4::{inbound_action, InboundAction};
 #[cfg(target_os = "macos")]
 use crate::netmap::{ipv4_mask, parse_cidr};
 use crate::netmap::{parse_ipv4, Netmap, NetmapPeer};
@@ -224,6 +224,7 @@ struct Mesh {
     peers: Arc<Mutex<Vec<PeerView>>>,
     counters: Arc<NodeCounters>,
     to_tun: mpsc::Sender<Vec<u8>>,
+    overlay: Ipv4Addr,
     state_dir: Arc<PathBuf>,
     shutdown: watch::Receiver<bool>,
     rekey_tx: watch::Sender<u64>,
@@ -439,6 +440,7 @@ async fn run_mesh_inner(
     }));
 
     let netmap = Arc::new(request.netmap);
+    let overlay = parse_ipv4(&node.overlay_ip).map_err(|err| HelloError::Node(err.to_string()))?;
     let dns_shutdown = shutdown_rx.clone();
     let mesh = Mesh {
         endpoint: Arc::clone(&endpoint),
@@ -450,6 +452,7 @@ async fn run_mesh_inner(
         peers: Arc::clone(&peers),
         counters: Arc::clone(&counters),
         to_tun: to_tun.clone(),
+        overlay,
         state_dir: Arc::clone(&state_dir),
         shutdown: shutdown_rx,
         rekey_tx,
@@ -958,6 +961,7 @@ async fn run_link(
             packets: rx,
             cancel: cancel_rx,
             to_tun: mesh.to_tun.clone(),
+            overlay: mesh.overlay,
             ask_rekey: ask_rx,
             remote_rekey,
             counters: Arc::clone(&mesh.counters),
@@ -986,6 +990,7 @@ struct SessionIo {
     packets: mpsc::Receiver<Vec<u8>>,
     cancel: watch::Receiver<bool>,
     to_tun: mpsc::Sender<Vec<u8>>,
+    overlay: Ipv4Addr,
     ask_rekey: watch::Receiver<u64>,
     remote_rekey: watch::Sender<u64>,
     counters: Arc<NodeCounters>,
@@ -998,6 +1003,7 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
         mut packets,
         mut cancel,
         to_tun,
+        overlay,
         mut ask_rekey,
         remote_rekey,
         counters,
@@ -1037,13 +1043,18 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     Ok(SessionEvent::Packet(packet)) => {
                         on_rx();
                         counters.rx.fetch_add(1, Ordering::Relaxed);
-                        if let Some(reply) = icmp_echo_reply(&packet) {
-                            if sender.send_ipv4(&reply).await.is_ok() {
+                        match inbound_action(&packet, overlay) {
+                            InboundAction::Reply(reply) => {
+                                if sender.send_ipv4(&reply).await.is_err() {
+                                    return;
+                                }
                                 counters.tx.fetch_add(1, Ordering::Relaxed);
                             }
-                        }
-                        if to_tun.send(packet).await.is_err() {
-                            return;
+                            InboundAction::Forward => {
+                                if to_tun.send(packet).await.is_err() {
+                                    return;
+                                }
+                            }
                         }
                     }
                     Ok(SessionEvent::Keepalive) => on_rx(),

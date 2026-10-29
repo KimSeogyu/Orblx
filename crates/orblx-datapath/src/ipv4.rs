@@ -71,11 +71,68 @@ pub fn icmp_echo_request(
     Ok(packet)
 }
 
+/// The action for one IPv4 packet that a peer sent to this node.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InboundAction {
+    /// Send this ICMP echo reply to the peer. Do not write the request to TUN.
+    Reply(Vec<u8>),
+    /// Write the packet to TUN without a change.
+    Forward,
+}
+
+/// Select the action for one inbound overlay packet.
+///
+/// The node answers an ICMP echo request only when the destination is `overlay`.
+/// The node then keeps the request out of TUN, so the host kernel does not send a second reply.
+/// Packets for other destinations, such as subnet hosts or exit traffic, go to TUN.
+pub(crate) fn inbound_action(packet: &[u8], overlay: Ipv4Addr) -> InboundAction {
+    if ipv4_destination(packet) != Some(overlay) {
+        return InboundAction::Forward;
+    }
+    match icmp_echo_reply(packet) {
+        Some(reply) => InboundAction::Reply(reply),
+        None => InboundAction::Forward,
+    }
+}
+
+/// Return true when `packet` is the ICMP echo reply for one request.
+///
+/// The reply must come from `peer`, go to `local`, and carry `ident` and `seq`.
+#[must_use]
+pub fn is_icmp_echo_reply(
+    packet: &[u8],
+    peer: Ipv4Addr,
+    local: Ipv4Addr,
+    ident: u16,
+    seq: u16,
+) -> bool {
+    if !is_ipv4_packet(packet) || packet[9] != 1 || is_fragment(packet) {
+        return false;
+    }
+    if packet[12..16] != peer.octets() || packet[16..20] != local.octets() {
+        return false;
+    }
+    let header_len = usize::from(packet[0] & 0x0f) * 4;
+    let Some(icmp) = packet.get(header_len..) else {
+        return false;
+    };
+    icmp.len() >= 8
+        && icmp[0] == 0
+        && icmp[1] == 0
+        && icmp[4..6] == ident.to_be_bytes()
+        && icmp[6..8] == seq.to_be_bytes()
+}
+
+fn is_fragment(packet: &[u8]) -> bool {
+    let flags_offset = u16::from_be_bytes([packet[6], packet[7]]);
+    flags_offset & 0x3fff != 0
+}
+
 /// Build the ICMP echo reply for one echo request.
 ///
-/// The function returns `None` when `request` is not an echo request.
+/// The function returns `None` when `request` is not one unfragmented echo request.
 pub(crate) fn icmp_echo_reply(request: &[u8]) -> Option<Vec<u8>> {
-    if !is_ipv4_packet(request) || request[9] != 1 {
+    if !is_ipv4_packet(request) || request[9] != 1 || is_fragment(request) {
         return None;
     }
     let header_len = usize::from(request[0] & 0x0f) * 4;
@@ -294,10 +351,65 @@ pub(crate) fn tcp_ipv4_packet(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_tcp_segment, encode_tcp_segment, ipv4_packet, is_ipv4_packet, tcp_ipv4_packet,
-        tcp_udp_destination, TCP_FLAG_ACK, TCP_FLAG_PSH,
+        decode_tcp_segment, encode_tcp_segment, icmp_echo_reply, icmp_echo_request, inbound_action,
+        ipv4_packet, is_icmp_echo_reply, is_ipv4_packet, tcp_ipv4_packet, tcp_udp_destination,
+        InboundAction, TCP_FLAG_ACK, TCP_FLAG_PSH,
     };
     use std::net::Ipv4Addr;
+
+    const PEER: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
+    const SELF: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
+    const SUBNET_HOST: Ipv4Addr = Ipv4Addr::new(192, 168, 50, 10);
+
+    fn udp_packet(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
+        let mut packet = ipv4_packet(src, dst, &[0u8; 8]).unwrap();
+        packet[9] = 17;
+        packet
+    }
+
+    #[test]
+    fn an_echo_to_the_own_overlay_ip_gets_one_reply_and_stays_out_of_tun() {
+        let request = icmp_echo_request(PEER, SELF, 7, 3, b"orblx").unwrap();
+        let InboundAction::Reply(reply) = inbound_action(&request, SELF) else {
+            panic!("The node did not answer the echo to its own address.");
+        };
+        assert!(is_icmp_echo_reply(&reply, SELF, PEER, 7, 3));
+        assert_eq!(&reply[28..], b"orblx");
+    }
+
+    #[test]
+    fn an_echo_to_a_subnet_host_goes_to_tun_without_a_reply() {
+        let request = icmp_echo_request(PEER, SUBNET_HOST, 7, 3, b"orblx").unwrap();
+        assert_eq!(inbound_action(&request, SELF), InboundAction::Forward);
+        let exit = icmp_echo_request(PEER, Ipv4Addr::new(1, 1, 1, 1), 7, 3, b"x").unwrap();
+        assert_eq!(inbound_action(&exit, SELF), InboundAction::Forward);
+    }
+
+    #[test]
+    fn other_packets_to_the_own_overlay_ip_go_to_tun() {
+        let reply = icmp_echo_reply(&icmp_echo_request(SELF, PEER, 1, 1, b"x").unwrap()).unwrap();
+        assert_eq!(inbound_action(&reply, PEER), InboundAction::Forward);
+        let udp = udp_packet(PEER, SELF);
+        assert_eq!(inbound_action(&udp, SELF), InboundAction::Forward);
+        let mut fragment = icmp_echo_request(PEER, SELF, 1, 1, b"x").unwrap();
+        fragment[6] = 0x20;
+        assert_eq!(inbound_action(&fragment, SELF), InboundAction::Forward);
+    }
+
+    #[test]
+    fn the_ping_ignores_a_packet_that_is_not_its_echo_reply() {
+        let request = icmp_echo_request(SELF, PEER, 1, 1, b"orblx").unwrap();
+        let reply = icmp_echo_reply(&request).unwrap();
+        assert!(is_icmp_echo_reply(&reply, PEER, SELF, 1, 1));
+        assert!(!is_icmp_echo_reply(&request, PEER, SELF, 1, 1));
+        assert!(!is_icmp_echo_reply(&reply, PEER, SELF, 2, 1));
+        assert!(!is_icmp_echo_reply(&reply, PEER, SELF, 1, 2));
+        assert!(!is_icmp_echo_reply(&reply, SUBNET_HOST, SELF, 1, 1));
+        assert!(!is_icmp_echo_reply(&reply, PEER, SUBNET_HOST, 1, 1));
+        let udp = udp_packet(PEER, SELF);
+        assert!(!is_icmp_echo_reply(&udp, PEER, SELF, 1, 1));
+        assert!(!is_icmp_echo_reply(&[0u8; 4], PEER, SELF, 1, 1));
+    }
 
     #[test]
     fn ipv4_packet_round_trip_check() {

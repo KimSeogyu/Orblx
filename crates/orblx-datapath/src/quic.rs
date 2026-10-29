@@ -826,7 +826,13 @@ fn auth_from(config: &HelloConfig) -> Auth {
     }
 }
 
+const PING_IDENT: u16 = 1;
+const PING_SEQ: u16 = 1;
+
 /// Open one hello-quic session, exchange one ICMP echo, and return the elapsed time.
+///
+/// The time starts after the handshake.
+/// The function skips packets that are not the echo reply from `dst` with the same ident and sequence.
 ///
 /// The function binds an ephemeral UDP socket.
 /// The function does not open a TUN device.
@@ -838,7 +844,7 @@ pub fn measure_hello_rtt(
     src: std::net::Ipv4Addr,
     dst: std::net::Ipv4Addr,
 ) -> Result<Duration, HelloError> {
-    let packet = crate::ipv4::icmp_echo_request(src, dst, 1, 1, b"orblx")?;
+    let packet = crate::ipv4::icmp_echo_request(src, dst, PING_IDENT, PING_SEQ, b"orblx")?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -852,8 +858,12 @@ pub fn measure_hello_rtt(
             let mut session = endpoint.connect_one(peer).await?;
             let started = tokio::time::Instant::now();
             session.send_ipv4(&packet).await?;
-            let _reply = session.recv_overlay().await?;
-            Ok(started.elapsed())
+            loop {
+                let packet = session.recv_overlay().await?;
+                if crate::ipv4::is_icmp_echo_reply(&packet, dst, src, PING_IDENT, PING_SEQ) {
+                    return Ok(started.elapsed());
+                }
+            }
         };
         let elapsed = tokio::time::timeout(timeout, exchange)
             .await

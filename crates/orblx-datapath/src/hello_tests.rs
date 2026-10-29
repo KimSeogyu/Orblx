@@ -1062,7 +1062,7 @@ fn a_ping_increments_the_overlay_counters() {
     .unwrap();
     let (stop_tx, stop_rx) = watch::channel(false);
     let (from_tx, from_rx) = mpsc::channel(4);
-    let (to_tx, to_rx) = mpsc::channel(4);
+    let (to_tx, mut to_rx) = mpsc::channel(4);
     let server = pair.server;
     let state_dir = dir.clone();
     let node = thread::spawn(move || {
@@ -1072,7 +1072,6 @@ fn a_ping_increments_the_overlay_counters() {
             .unwrap();
         runtime.block_on(async move {
             let _hold_host_packets = from_tx;
-            let _hold_peer_packets = to_rx;
             let _ = crate::run_memory_node(
                 NodeRequest {
                     config: server,
@@ -1114,11 +1113,38 @@ fn a_ping_increments_the_overlay_counters() {
         }
         thread::sleep(Duration::from_millis(50));
     }
+    let own_echo_in_tun = to_rx.try_recv().is_ok();
+    let subnet_host = Ipv4Addr::new(192, 168, 50, 10);
+    let subnet_ping = measure_hello_rtt(
+        pair.client.clone(),
+        listen,
+        Duration::from_millis(500),
+        Ipv4Addr::new(100, 64, 0, 1),
+        subnet_host,
+    );
+    let mut forwarded = None;
+    for _ in 0..40 {
+        if let Ok(packet) = to_rx.try_recv() {
+            forwarded = Some(packet);
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
     let body = metrics_body(metrics);
     let _ = stop_tx.send(true);
     let _ = node.join();
     let _ = std::fs::remove_dir_all(&dir);
     assert!(passed, "{last}");
+    assert!(
+        !own_echo_in_tun,
+        "The echo to the own overlay IP went to TUN."
+    );
+    assert!(
+        subnet_ping.is_err(),
+        "The node answered an echo for a subnet host."
+    );
+    let forwarded = forwarded.expect("The echo for the subnet host did not go to TUN.");
+    assert_eq!(crate::ipv4_destination(&forwarded), Some(subnet_host));
     let tx = metric_value(&body, "orblx_node_packets_tx");
     let rx = metric_value(&body, "orblx_node_packets_rx");
     assert!(tx > 0, "{body}");
