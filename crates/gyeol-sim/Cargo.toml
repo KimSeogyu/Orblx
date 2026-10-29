@@ -33,4 +33,6 @@ webpki-roots = "=0.26.11"
 base64 = "=0.22.1"
 jsonwebtoken = { version = "=10.3.0", features = ["rust_crypto"] }
 rand = "=0.8.8"
+rcgen = "=0.14.7"
 rsa = { version = "=0.9.10", features = ["pem", "sha2"] }
+rustls-pemfile = "=2.2.0"
