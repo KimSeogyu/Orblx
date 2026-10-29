@@ -6,6 +6,7 @@
 //! `ORBLX_OIDC_MODE=mock` keeps the local IdP off the default path.
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -360,20 +361,34 @@ async fn write_https(
         .connect(name, tcp)
         .await
         .map_err(|_| HttpsFail::Transport)?;
+    complete_exchange(&mut tls, request).await
+}
+
+async fn complete_exchange<S>(tls: &mut S, request: &[u8]) -> Result<String, HttpsFail>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
     tls.write_all(request)
         .await
         .map_err(|_| HttpsFail::Transport)?;
+    // rustls does not promise that write_all sends the last record.
+    tls.flush().await.map_err(|_| HttpsFail::Transport)?;
     let mut bytes = Vec::new();
     let mut tmp = [0u8; 4096];
     loop {
-        let size = tls.read(&mut tmp).await.map_err(|_| HttpsFail::Transport)?;
-        if size == 0 {
-            break;
+        match tls.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(size) => {
+                if bytes.len().saturating_add(size) > MAX_HTTP_BYTES {
+                    return Err(HttpsFail::Body);
+                }
+                bytes.extend_from_slice(&tmp[..size]);
+            }
+            // Google closes the token socket without a TLS close_notify.
+            // The HTTP response is already in `bytes`.
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof && !bytes.is_empty() => break,
+            Err(_) => return Err(HttpsFail::Transport),
         }
-        if bytes.len().saturating_add(size) > MAX_HTTP_BYTES {
-            return Err(HttpsFail::Body);
-        }
-        bytes.extend_from_slice(&tmp[..size]);
     }
     parse_http_body(&bytes)
 }
@@ -499,12 +514,23 @@ mod scripted {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
     use super::{
-        redirect_for_host, GoogleSession, GOOGLE_REDIRECT_LOCALHOST, GOOGLE_REDIRECT_LOOPBACK,
+        complete_exchange, redirect_for_host, GoogleSession, GOOGLE_REDIRECT_LOCALHOST,
+        GOOGLE_REDIRECT_LOOPBACK,
     };
     use gyeol_identity::GoogleClient;
+    use rcgen::{CertificateParams, KeyPair};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+    use rustls::RootCertStore;
+    use rustls_pemfile::{certs, private_key};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::timeout;
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
 
     const CLIENT_ID: &str =
         "949089074205-hpspmac5i7uld6q5p3f019tvmojhoipi.apps.googleusercontent.com";
@@ -544,5 +570,99 @@ mod tests {
         assert_eq!(super::parse_http_body(chunks).unwrap(), "hello");
         let rejected = b"HTTP/1.1 400 Bad\r\nContent-Length: 2\r\n\r\nno";
         assert!(super::parse_http_body(rejected).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_tls_client_flushes_the_token_request() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let key = KeyPair::generate().expect("The test key did not generate.");
+        let params = CertificateParams::new(vec!["localhost".to_string()])
+            .expect("The test certificate parameters were rejected.");
+        let certificate = params
+            .self_signed(&key)
+            .expect("The test certificate was not signed.");
+        let cert = load_cert(&certificate.pem());
+        let private = load_key(&key.serialize_pem());
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], private)
+            .expect("The test server certificate was rejected.");
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(cert)
+            .expect("The test trust anchor was rejected.");
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("The test listener did not bind.");
+        let address = listener
+            .local_addr()
+            .expect("The test listener has no address.");
+        let acceptor = TlsAcceptor::from(Arc::new(server));
+        let server_task = tokio::spawn(async move {
+            let (tcp, _) = listener
+                .accept()
+                .await
+                .expect("The test server did not accept.");
+            let mut tls = acceptor
+                .accept(tcp)
+                .await
+                .expect("The test server handshake failed.");
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let size = tls
+                    .read(&mut tmp)
+                    .await
+                    .expect("The test server did not read the request.");
+                if size == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..size]);
+                if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(buf
+                .windows(b"POST /token".len())
+                .any(|window| window == b"POST /token"));
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+            tls.write_all(response)
+                .await
+                .expect("The test server did not write the response.");
+            tls.flush()
+                .await
+                .expect("The test server did not flush the response.");
+            // Drop the socket. Do not send a TLS close_notify.
+        });
+        let tcp = TcpStream::connect(address)
+            .await
+            .expect("The test client did not connect.");
+        let name = ServerName::try_from("localhost".to_string())
+            .expect("The test server name is not valid.");
+        let mut tls = TlsConnector::from(Arc::new(client))
+            .connect(name, tcp)
+            .await
+            .expect("The test client handshake failed.");
+        let request = b"POST /token HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx";
+        let answered = timeout(Duration::from_secs(2), complete_exchange(&mut tls, request)).await;
+        let body = answered.expect("The TLS exchange did not finish.");
+        assert_eq!(body.expect("The TLS response is not valid."), "ok");
+        server_task.await.expect("The test server stopped.");
+    }
+
+    fn load_cert(pem: &str) -> CertificateDer<'static> {
+        certs(&mut Cursor::new(pem.as_bytes()))
+            .next()
+            .expect("The test certificate PEM is empty.")
+            .expect("The test certificate PEM did not parse.")
+    }
+
+    fn load_key(pem: &str) -> PrivateKeyDer<'static> {
+        private_key(&mut Cursor::new(pem.as_bytes()))
+            .expect("The test key PEM did not parse.")
+            .expect("The test key PEM is empty.")
     }
 }
