@@ -11,6 +11,7 @@ mod node;
 mod quic;
 mod router;
 mod run;
+mod subnet;
 mod tun_bench;
 mod tun_dev;
 mod tun_macos;

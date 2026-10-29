@@ -106,6 +106,8 @@ async fn handle_connection(
                 netmap: None,
                 endpoints: None,
                 grants: None,
+                approved_routes: None,
+                advertised_routes: None,
             }
         }
     };
@@ -158,17 +160,16 @@ async fn dispatch(
                     ))
                 }
             };
-            Ok(Response {
-                ok: true,
-                error: None,
-                certificate_pem: Some(result.certificate_pem),
-                private_key_pem: Some(result.private_key_pem),
-                trust_bundle_pem: Some(result.trust_bundle_pem),
-                netmap_pub_hex: Some(encode_hex(&result.netmap_public)),
-                netmap: Some(result.signed_netmap),
-                endpoints: Some(result.endpoints),
-                grants: Some(result.signed_grants),
-            })
+            Ok(enroll_response(result))
+        }
+        "advertise" => {
+            let peer = peer_node(connection, &coord.tls_material()?.trust_pem)?;
+            let peer = peer.ok_or(CoordError::Peer)?;
+            if peer != request.name {
+                return Err(CoordError::Peer);
+            }
+            let view = coord.advertise_routes(&request.name, &request.routes)?;
+            Ok(netmap_response(&view))
         }
         "netmap" => {
             let peer = peer_node(connection, &coord.tls_material()?.trust_pem)?;
@@ -178,21 +179,43 @@ async fn dispatch(
             }
             let view = coord.netmap_for(&request.name)?;
             println!("netmap {}", request.name);
-            Ok(Response {
-                ok: true,
-                error: None,
-                certificate_pem: None,
-                private_key_pem: None,
-                trust_bundle_pem: None,
-                netmap_pub_hex: Some(encode_hex(&view.netmap_public)),
-                netmap: Some(view.signed_netmap),
-                endpoints: Some(view.endpoints),
-                grants: Some(view.signed_grants),
-            })
+            Ok(netmap_response(&view))
         }
         _ => Err(CoordError::Protocol(
             "The request is not valid.".to_string(),
         )),
+    }
+}
+
+fn enroll_response(result: crate::state::EnrollResult) -> Response {
+    Response {
+        ok: true,
+        error: None,
+        certificate_pem: Some(result.certificate_pem),
+        private_key_pem: Some(result.private_key_pem),
+        trust_bundle_pem: Some(result.trust_bundle_pem),
+        netmap_pub_hex: Some(encode_hex(&result.netmap_public)),
+        approved_routes: Some(result.approved_routes),
+        advertised_routes: Some(result.advertised_routes),
+        netmap: Some(result.signed_netmap),
+        endpoints: Some(result.endpoints),
+        grants: Some(result.signed_grants),
+    }
+}
+
+fn netmap_response(view: &crate::state::NetmapView) -> Response {
+    Response {
+        ok: true,
+        error: None,
+        certificate_pem: None,
+        private_key_pem: None,
+        trust_bundle_pem: None,
+        netmap_pub_hex: Some(encode_hex(&view.netmap_public)),
+        netmap: Some(view.signed_netmap.clone()),
+        endpoints: Some(view.endpoints.clone()),
+        grants: Some(view.signed_grants.clone()),
+        approved_routes: Some(view.approved_routes.clone()),
+        advertised_routes: Some(view.advertised_routes.clone()),
     }
 }
 

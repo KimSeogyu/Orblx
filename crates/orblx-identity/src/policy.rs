@@ -1,4 +1,4 @@
-//! HuJSON policy for groups, tags, and receiver grants.
+//! HuJSON policy for groups, tags, receiver grants, and subnet route approval.
 //!
 //! The file is JSON with `//` comments, `/* */` comments, and trailing commas.
 //! A rule names a source, a destination, and a port.
@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::net::Ipv4Addr;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -156,11 +157,20 @@ struct StoredTest {
     deny: Vec<(SpiffeId, u16)>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct RouteRule {
+    src: SpiffeId,
+    prefix: Ipv4Addr,
+    prefix_len: u8,
+    exact: bool,
+}
+
 /// A loaded policy whose inline tests passed.
 #[derive(Clone)]
 pub struct Policy {
     grants: Vec<CompiledGrant>,
     tests: Vec<StoredTest>,
+    routes: Vec<RouteRule>,
 }
 
 impl std::fmt::Debug for Policy {
@@ -169,6 +179,7 @@ impl std::fmt::Debug for Policy {
             .debug_struct("Policy")
             .field("grants", &self.grants.len())
             .field("tests", &self.tests.len())
+            .field("routes", &self.routes.len())
             .finish()
     }
 }
@@ -182,6 +193,7 @@ impl Policy {
         Self {
             grants: Vec::new(),
             tests: Vec::new(),
+            routes: Vec::new(),
         }
     }
 
@@ -246,6 +258,24 @@ impl Policy {
             receiver: receiver.as_uri().to_string(),
             grants,
         }
+    }
+
+    /// Return true when the policy approves `cidr` for `node`.
+    ///
+    /// `autoApprovers` approves the listed prefix and a longer prefix inside it.
+    /// `routeApprovals` approves one exact CIDR.
+    /// `0.0.0.0/0` is an exit route. This function returns false for that prefix.
+    #[must_use]
+    pub fn approves_route(&self, node: &SpiffeId, cidr: &str) -> bool {
+        let Ok((prefix, prefix_len)) = parse_route_cidr(cidr) else {
+            return false;
+        };
+        if prefix_len == 0 {
+            return false;
+        }
+        self.routes
+            .iter()
+            .any(|rule| rule.src == *node && route_matches(rule, prefix, prefix_len))
     }
 
     /// Return the inline assertions.
@@ -324,8 +354,26 @@ struct PolicyFile {
     tag_owners: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     acls: Vec<AclFile>,
+    #[serde(default, rename = "autoApprovers")]
+    auto_approvers: AutoApproversFile,
+    #[serde(default, rename = "routeApprovals")]
+    route_approvals: Vec<RouteApprovalFile>,
     #[serde(default)]
     tests: Vec<TestFile>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct AutoApproversFile {
+    #[serde(default)]
+    routes: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteApprovalFile {
+    src: Vec<String>,
+    routes: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -434,7 +482,115 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
     for test in &file.tests {
         tests.push(compile_test(&catalog, test)?);
     }
-    Ok(Policy { grants, tests })
+    let routes = compile_routes(&catalog, file)?;
+    Ok(Policy {
+        grants,
+        tests,
+        routes,
+    })
+}
+
+fn compile_routes(catalog: &Catalog, file: &PolicyFile) -> Result<Vec<RouteRule>, PolicyError> {
+    let mut routes = Vec::new();
+    for (cidr, selectors) in &file.auto_approvers.routes {
+        push_route_rules(catalog, &mut routes, cidr, selectors, false)?;
+    }
+    for approval in &file.route_approvals {
+        if approval.src.is_empty() || approval.routes.is_empty() {
+            return Err(PolicyError::new(
+                "The route approval needs a source and a route.",
+            ));
+        }
+        for cidr in &approval.routes {
+            push_route_rules(catalog, &mut routes, cidr, &approval.src, true)?;
+        }
+    }
+    routes.sort_by(|left, right| {
+        (
+            left.src.as_uri(),
+            left.prefix_len,
+            u32::from(left.prefix),
+            left.exact,
+        )
+            .cmp(&(
+                right.src.as_uri(),
+                right.prefix_len,
+                u32::from(right.prefix),
+                right.exact,
+            ))
+    });
+    routes.dedup();
+    Ok(routes)
+}
+
+fn push_route_rules(
+    catalog: &Catalog,
+    routes: &mut Vec<RouteRule>,
+    cidr: &str,
+    selectors: &[String],
+    exact: bool,
+) -> Result<(), PolicyError> {
+    if selectors.is_empty() {
+        return Err(PolicyError::new("The route approval needs a source."));
+    }
+    let (prefix, prefix_len) = parse_route_cidr(cidr)
+        .map_err(|_| PolicyError::new(format!("The route {} is not valid.", safe_label(cidr))))?;
+    if prefix_len == 0 {
+        return Err(PolicyError::new("The route 0.0.0.0/0 is an exit route."));
+    }
+    for selector in selectors {
+        for src in expand(catalog, selector)? {
+            if routes.len() >= MAX_GRANTS {
+                return Err(PolicyError::new("The policy has too many grants."));
+            }
+            routes.push(RouteRule {
+                src,
+                prefix,
+                prefix_len,
+                exact,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn route_matches(rule: &RouteRule, prefix: Ipv4Addr, prefix_len: u8) -> bool {
+    if rule.exact {
+        return rule.prefix == prefix && rule.prefix_len == prefix_len;
+    }
+    if prefix_len < rule.prefix_len {
+        return false;
+    }
+    let mask = ipv4_mask(rule.prefix_len);
+    u32::from(prefix) & mask == u32::from(rule.prefix)
+}
+
+fn parse_route_cidr(text: &str) -> Result<(Ipv4Addr, u8), ()> {
+    let (addr, prefix_text) = text.split_once('/').ok_or(())?;
+    if prefix_text.is_empty()
+        || (prefix_text.len() > 1 && prefix_text.starts_with('0'))
+        || !prefix_text.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(());
+    }
+    let prefix_len: u32 = prefix_text.parse().map_err(|_| ())?;
+    if prefix_len > 32 {
+        return Err(());
+    }
+    let prefix_len = u8::try_from(prefix_len).map_err(|_| ())?;
+    let ip = addr.parse::<Ipv4Addr>().map_err(|_| ())?;
+    if u32::from(ip) & !ipv4_mask(prefix_len) != 0 {
+        return Err(());
+    }
+    Ok((ip, prefix_len))
+}
+
+fn ipv4_mask(prefix_len: u8) -> u32 {
+    if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    }
 }
 
 fn compile_test(catalog: &Catalog, test: &TestFile) -> Result<StoredTest, PolicyError> {
@@ -935,5 +1091,50 @@ mod tests {
         let mac = super::SpiffeId::parse(MAC).unwrap();
         let box_id = super::SpiffeId::parse(BOX).unwrap();
         assert!(!policy.allows(&mac, &box_id, PROTO_TCP, 22));
+    }
+
+    #[test]
+    fn auto_approvers_accept_a_contained_route_and_reject_the_rest() {
+        let text = r#"{
+          "tags": {
+            "tag:router": ["spiffe://orblx.local/node/router"]
+          },
+          "tagOwners": {
+            "tag:router": ["spiffe://orblx.local/node/mac"]
+          },
+          "autoApprovers": {
+            "routes": {
+              "10.88.0.0/16": ["tag:router"]
+            }
+          },
+          "routeApprovals": [{
+            "src": ["spiffe://orblx.local/node/router"],
+            "routes": ["192.168.50.0/24"]
+          }]
+        }"#;
+        let policy = Policy::from_hujson(text.as_bytes()).unwrap();
+        let router = super::SpiffeId::parse("spiffe://orblx.local/node/router").unwrap();
+        let mac = super::SpiffeId::parse(MAC).unwrap();
+        assert!(policy.approves_route(&router, "10.88.0.0/16"));
+        assert!(policy.approves_route(&router, "10.88.9.0/24"));
+        assert!(!policy.approves_route(&router, "10.89.0.0/24"));
+        assert!(!policy.approves_route(&router, "10.0.0.0/8"));
+        assert!(policy.approves_route(&router, "192.168.50.0/24"));
+        assert!(!policy.approves_route(&router, "192.168.50.0/25"));
+        assert!(!policy.approves_route(&mac, "10.88.0.0/16"));
+        assert!(!policy.approves_route(&router, "0.0.0.0/0"));
+    }
+
+    #[test]
+    fn an_exit_route_in_auto_approvers_is_rejected() {
+        let text = r#"{
+          "autoApprovers": {
+            "routes": {
+              "0.0.0.0/0": ["spiffe://orblx.local/node/router"]
+            }
+          }
+        }"#;
+        let err = Policy::from_hujson(text.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("exit route"));
     }
 }

@@ -76,12 +76,26 @@ impl RouterTable {
     /// Return the peer that owns `dest`.
     ///
     /// The longest prefix wins.
+    /// A prefix of length 0 is an exit route. This function skips it.
     /// The function returns `None` when no prefix owns `dest`.
     #[must_use]
     pub fn lookup(&self, dest: Ipv4Addr) -> Option<&str> {
+        self.lookup_for(dest, true)
+    }
+
+    /// Return the peer that owns `dest` for the routes this node accepts.
+    ///
+    /// Overlay `/32` routes stay active.
+    /// A subnet route is active when `accept_routes` is true.
+    /// A prefix of length 0 stays outside the TUN.
+    #[must_use]
+    pub fn lookup_for(&self, dest: Ipv4Addr, accept_routes: bool) -> Option<&str> {
         let dest_bits = u32::from(dest);
         let mut best: Option<(u8, &str)> = None;
         for route in &self.routes {
+            if !route_is_active(route.prefix_len, accept_routes) {
+                continue;
+            }
             let mask = ipv4_mask(route.prefix_len);
             if dest_bits & mask != u32::from(route.prefix) {
                 continue;
@@ -100,8 +114,19 @@ impl RouterTable {
     /// Return the CIDRs that the kernel should send into the TUN device.
     #[must_use]
     pub fn destinations(&self) -> Vec<String> {
+        self.install_cidrs(true)
+    }
+
+    /// Return the CIDRs to install on the TUN device.
+    ///
+    /// The node always installs overlay `/32` routes.
+    /// The node installs a subnet route when `accept_routes` is true.
+    /// The node does not install `0.0.0.0/0`.
+    #[must_use]
+    pub fn install_cidrs(&self, accept_routes: bool) -> Vec<String> {
         self.routes
             .iter()
+            .filter(|route| route_is_active(route.prefix_len, accept_routes))
             .map(|route| format!("{}/{}", route.prefix, route.prefix_len))
             .collect()
     }
@@ -134,14 +159,26 @@ impl RouterTable {
     }
 }
 
+fn route_is_active(prefix_len: u8, accept_routes: bool) -> bool {
+    if prefix_len == 0 {
+        return false;
+    }
+    prefix_len == 32 || accept_routes
+}
+
 /// Return the peer that owns the destination of one IPv4 packet.
 ///
 /// The function returns `None` when the packet is not IPv4.
 /// The function returns `None` when the table has no matching prefix.
+/// `accept_routes` selects subnet prefixes. Overlay `/32` prefixes stay active.
 #[must_use]
-pub fn route_packet<'a>(table: &'a RouterTable, packet: &[u8]) -> Option<&'a str> {
+pub fn route_packet<'a>(
+    table: &'a RouterTable,
+    packet: &[u8],
+    accept_routes: bool,
+) -> Option<&'a str> {
     let dest = ipv4_destination(packet)?;
-    table.lookup(dest)
+    table.lookup_for(dest, accept_routes)
 }
 
 #[cfg(test)]
@@ -199,8 +236,32 @@ mod tests {
             b"ping",
         )
         .unwrap();
-        assert_eq!(route_packet(&table, &packet), Some("b"));
-        assert_eq!(route_packet(&table, &[0x60, 0x00]), None);
+        assert_eq!(route_packet(&table, &packet, true), Some("b"));
+        assert_eq!(route_packet(&table, &packet, false), None);
+        assert_eq!(route_packet(&table, &[0x60, 0x00], true), None);
+    }
+
+    #[test]
+    fn accept_routes_gates_subnet_prefixes_and_keeps_overlay_routes() {
+        let table =
+            RouterTable::from_netmap(&map_with("\"10.88.0.0/24\",\"0.0.0.0/0\"", "")).unwrap();
+        assert_eq!(
+            table.lookup_for(Ipv4Addr::new(100, 64, 0, 2), false),
+            Some("b")
+        );
+        assert_eq!(table.lookup_for(Ipv4Addr::new(10, 88, 0, 5), false), None);
+        assert_eq!(
+            table.lookup_for(Ipv4Addr::new(10, 88, 0, 5), true),
+            Some("b")
+        );
+        assert_eq!(table.lookup_for(Ipv4Addr::new(1, 1, 1, 1), true), None);
+        let installed = table.install_cidrs(true);
+        assert!(installed.iter().any(|cidr| cidr == "10.88.0.0/24"));
+        assert!(installed.iter().any(|cidr| cidr == "100.64.0.2/32"));
+        assert!(!installed.iter().any(|cidr| cidr == "0.0.0.0/0"));
+        let overlay_only = table.install_cidrs(false);
+        assert!(!overlay_only.iter().any(|cidr| cidr.contains("10.88")));
+        assert!(overlay_only.iter().any(|cidr| cidr == "100.64.0.2/32"));
     }
 
     #[test]
