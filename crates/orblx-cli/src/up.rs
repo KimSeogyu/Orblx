@@ -43,7 +43,7 @@ const DIR_PRIVATE: u32 = 0o700;
 
 pub(crate) enum Command {
     Help(String),
-    Up(UpOptions),
+    Up(Box<UpOptions>),
     Down(StateOptions),
     Status(StateOptions),
     Issue(IssueOptions),
@@ -70,6 +70,7 @@ pub(crate) struct UpOptions {
     pub(crate) coord: Option<SocketAddr>,
     pub(crate) coord_name: Option<String>,
     pub(crate) bundle: Option<PathBuf>,
+    pub(crate) metrics: Option<SocketAddr>,
 }
 
 pub(crate) struct StateOptions {
@@ -98,6 +99,7 @@ impl std::fmt::Debug for Command {
                 .field("allow_lan", &options.allow_lan)
                 .field("relay", &options.relay)
                 .field("coord", &options.coord)
+                .field("metrics", &options.metrics)
                 .finish(),
             Self::Set(options) => formatter
                 .debug_struct("Set")
@@ -135,6 +137,7 @@ pub(crate) fn parse_up(args: &[String]) -> Result<Command, String> {
     let mut coord = None;
     let mut coord_name = None;
     let mut bundle = None;
+    let mut metrics = Some(orblx_audit::default_metrics_addr());
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -162,6 +165,13 @@ pub(crate) fn parse_up(args: &[String]) -> Result<Command, String> {
             "--coord" => coord = Some(parse_socket(&value, 443)?),
             "--coord-name" => coord_name = Some(value),
             "--bundle" => bundle = Some(PathBuf::from(value)),
+            "--metrics" => {
+                metrics = if value == "off" {
+                    None
+                } else {
+                    Some(parse_socket(&value, orblx_audit::DEFAULT_METRICS_PORT)?)
+                };
+            }
             other => return Err(format!("The flag {other} is not valid.\n{}", help_text())),
         }
     }
@@ -179,7 +189,7 @@ pub(crate) fn parse_up(args: &[String]) -> Result<Command, String> {
             return Err(format!("The exit node name is empty.\n{}", help_text()));
         }
     }
-    Ok(Command::Up(UpOptions {
+    Ok(Command::Up(Box::new(UpOptions {
         netmap,
         netmap_set,
         state_dir,
@@ -194,7 +204,8 @@ pub(crate) fn parse_up(args: &[String]) -> Result<Command, String> {
         coord,
         coord_name,
         bundle,
-    }))
+        metrics,
+    })))
 }
 
 pub(crate) fn parse_set(args: &[String]) -> Result<Command, String> {
@@ -277,7 +288,7 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             println!("{text}");
             Ok(())
         }
-        Command::Up(options) => run_up(options),
+        Command::Up(options) => run_up(*options),
         Command::Down(options) => run_down(options),
         Command::Status(options) => run_status(options),
         Command::Issue(options) => run_issue(options),
@@ -290,13 +301,10 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
     let (netmap_path, forward_routes, forward_exit) = publish_routes(&options)?;
     let netmap = Netmap::from_path(&netmap_path).map_err(|err| err.to_string())?;
     let config = load_config(&options.state_dir)?;
-    let renew = load_renewer(
-        &options.state_dir,
-        options.coord,
-        options.coord_name.clone(),
-    )?;
     let visibility = load_visibility(&options.state_dir, &netmap.self_node.name)?;
+    spawn_deny_refresh(&options);
     let underlay = underlay_for(&netmap, options.coord, options.relay);
+    let renew = load_renewer(&options.state_dir, options.coord, options.coord_name)?;
     run_node(NodeRequest {
         config,
         netmap,
@@ -313,6 +321,7 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
         relay: options.relay,
         netmap_path,
         visibility,
+        metrics: options.metrics,
     })
     .map_err(|err| err.to_string())
 }
@@ -539,6 +548,39 @@ struct ExitPrefs {
     exit_node: String,
     #[serde(default)]
     allow_lan: bool,
+}
+
+fn spawn_deny_refresh(options: &UpOptions) {
+    let coord = match options.coord {
+        Some(addr) => addr,
+        None => {
+            let path = options.state_dir.join("coord-addr");
+            let Ok(text) = fs::read_to_string(&path) else {
+                return;
+            };
+            let Ok(addr) = text.trim().parse::<SocketAddr>() else {
+                return;
+            };
+            addr
+        }
+    };
+    let name = match &options.coord_name {
+        Some(name) => name.clone(),
+        None => fs::read_to_string(options.state_dir.join("coord-name"))
+            .ok()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "coord".to_string()),
+    };
+    let state = options.state_dir.clone();
+    thread::spawn(move || loop {
+        if let Ok(bundle) = fs::read_to_string(state.join(BUNDLE_FILE)) {
+            if let Ok(text) = orblx_coord::fetch_deny_blocking(coord, &name, &bundle, &state) {
+                let _ = fs::write(state.join("deny.json"), text.as_bytes());
+            }
+        }
+        thread::sleep(Duration::from_secs(10));
+    });
 }
 
 fn run_down(options: StateOptions) -> Result<(), String> {

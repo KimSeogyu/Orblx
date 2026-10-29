@@ -13,7 +13,7 @@
 //! An agent capability ticket is separate from the SVID.
 //! The agent ticket allows one destination.
 //! Every other agent destination is denied.
-//! `Policy::from_hujson` loads groups, tags, accept rules, route approval, and inline tests.
+//! `Policy::from_hujson` loads groups, tags, accept rules, route approval, node approval, owners, and inline tests.
 //! A failed test rejects the file.
 //! `autoApprovers` and `routeApprovals` approve subnet CIDRs.
 //! `autoApprovers.exitNode` approves an exit node.

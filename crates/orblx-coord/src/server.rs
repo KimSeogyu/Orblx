@@ -1,14 +1,16 @@
 use std::net::SocketAddr;
 use std::time::SystemTime;
 
-use orblx_identity::{DenySet, GoogleJwks, TrustBundle, WorkloadKind};
+use orblx_identity::{GoogleJwks, TrustBundle, WorkloadKind};
 use rustls::pki_types::CertificateDer;
 
+use crate::admin;
 use crate::error::CoordError;
 use crate::http_util::fetch_google_jwks;
 use crate::netmap::encode_hex;
 use crate::proto::{self, Request, Response};
 use crate::state::Coordinator;
+use crate::ticket::ticket_response_fields;
 use crate::tlsutil;
 
 /// Run the coordinator until the process stops.
@@ -99,16 +101,7 @@ async fn handle_connection(
             Response {
                 ok: false,
                 error: Some(err.public_text()),
-                certificate_pem: None,
-                private_key_pem: None,
-                trust_bundle_pem: None,
-                netmap_pub_hex: None,
-                netmap: None,
-                endpoints: None,
-                grants: None,
-                approved_routes: None,
-                advertised_routes: None,
-                exit_approved: None,
+                ..Response::default()
             }
         }
     };
@@ -159,8 +152,7 @@ async fn dispatch(
             Ok(leaf_response(result))
         }
         "renew" => {
-            let peer = peer_node(connection, &coord.tls_material()?.trust_pem)?;
-            let peer = peer.ok_or(CoordError::Peer)?;
+            let peer = peer_node(coord, connection)?;
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
@@ -169,8 +161,7 @@ async fn dispatch(
             Ok(leaf_response(result))
         }
         "advertise" => {
-            let peer = peer_node(connection, &coord.tls_material()?.trust_pem)?;
-            let peer = peer.ok_or(CoordError::Peer)?;
+            let peer = peer_node(coord, connection)?;
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
@@ -178,8 +169,7 @@ async fn dispatch(
             Ok(netmap_response(&view))
         }
         "exit" => {
-            let peer = peer_node(connection, &coord.tls_material()?.trust_pem)?;
-            let peer = peer.ok_or(CoordError::Peer)?;
+            let peer = peer_node(coord, connection)?;
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
@@ -187,8 +177,7 @@ async fn dispatch(
             Ok(netmap_response(&view))
         }
         "netmap" => {
-            let peer = peer_node(connection, &coord.tls_material()?.trust_pem)?;
-            let peer = peer.ok_or(CoordError::Peer)?;
+            let peer = peer_node(coord, connection)?;
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
@@ -196,16 +185,65 @@ async fn dispatch(
             println!("netmap {}", request.name);
             Ok(netmap_response(&view))
         }
+        "deny" => {
+            let peer = peer_node(coord, connection)?;
+            if peer != request.name {
+                return Err(CoordError::Peer);
+            }
+            let detail = admin::deny_json(coord, now)?;
+            Ok(Response {
+                ok: true,
+                detail: Some(detail),
+                ..Response::default()
+            })
+        }
+        "admin-nodes" | "admin-users" | "admin-approve" | "admin-revoke" | "admin-expire"
+        | "admin-routes" => dispatch_admin(coord, connection, &request, now),
         _ => Err(CoordError::Protocol(
             "The request is not valid.".to_string(),
         )),
     }
 }
 
+fn dispatch_admin(
+    coord: &Coordinator,
+    connection: &quinn::Connection,
+    request: &Request,
+    now: SystemTime,
+) -> Result<Response, CoordError> {
+    let caller = peer_id(coord, connection)?;
+    if !coord.caller_is_owner(&caller)? {
+        return Err(CoordError::Protocol(
+            "The caller is not an owner.".to_string(),
+        ));
+    }
+    let value = match request.op.as_str() {
+        "admin-nodes" => admin::nodes(coord)?,
+        "admin-users" => admin::users(coord)?,
+        "admin-approve" => admin::approve(coord, &request.name)?,
+        "admin-revoke" => admin::revoke(coord, &request.name, now)?,
+        "admin-expire" => admin::expire(coord, &request.name)?,
+        "admin-routes" => admin::routes(coord)?,
+        _ => {
+            return Err(CoordError::Protocol(
+                "The request is not valid.".to_string(),
+            ))
+        }
+    };
+    let detail = serde_json::to_string(&value)
+        .map_err(|_| CoordError::Protocol("The request is not valid.".to_string()))?;
+    println!("admin {}", request.op.trim_start_matches("admin-"));
+    Ok(Response {
+        ok: true,
+        detail: Some(detail),
+        ..Response::default()
+    })
+}
+
 fn leaf_response(result: crate::state::EnrollResult) -> Response {
+    let wire = result.ticket.as_ref().map(ticket_response_fields);
     Response {
         ok: true,
-        error: None,
         certificate_pem: Some(result.certificate_pem),
         private_key_pem: Some(result.private_key_pem),
         trust_bundle_pem: Some(result.trust_bundle_pem),
@@ -216,16 +254,20 @@ fn leaf_response(result: crate::state::EnrollResult) -> Response {
         approved_routes: Some(result.approved_routes),
         advertised_routes: Some(result.advertised_routes),
         exit_approved: Some(result.exit_approved),
+        ticket_hex: wire.as_ref().map(|item| item.ticket_hex.clone()),
+        ticket_mac_hex: wire.as_ref().map(|item| item.ticket_mac_hex.clone()),
+        ticket_verifier_pem: wire.as_ref().map(|item| item.ticket_verifier_pem.clone()),
+        ticket_mac_key_hex: wire.as_ref().map(|item| item.ticket_mac_key_hex.clone()),
+        ticket_not_before: wire.as_ref().map(|item| item.ticket_not_before),
+        ticket_not_after: wire.as_ref().map(|item| item.ticket_not_after),
+        svid_ca_pub_hex: wire.as_ref().map(|item| item.svid_ca_pub_hex.clone()),
+        ..Response::default()
     }
 }
 
 fn netmap_response(view: &crate::state::NetmapView) -> Response {
     Response {
         ok: true,
-        error: None,
-        certificate_pem: None,
-        private_key_pem: None,
-        trust_bundle_pem: None,
         netmap_pub_hex: Some(encode_hex(&view.netmap_public)),
         netmap: Some(view.signed_netmap.clone()),
         endpoints: Some(view.endpoints.clone()),
@@ -233,26 +275,37 @@ fn netmap_response(view: &crate::state::NetmapView) -> Response {
         approved_routes: Some(view.approved_routes.clone()),
         advertised_routes: Some(view.advertised_routes.clone()),
         exit_approved: Some(view.exit_approved),
+        ..Response::default()
     }
 }
 
-fn peer_node(
+fn peer_node(coord: &Coordinator, connection: &quinn::Connection) -> Result<String, CoordError> {
+    let id = peer_id(coord, connection)?;
+    if id.kind() != WorkloadKind::Node {
+        return Err(CoordError::Peer);
+    }
+    Ok(id.name().to_string())
+}
+
+fn peer_id(
+    coord: &Coordinator,
     connection: &quinn::Connection,
-    trust_pem: &str,
-) -> Result<Option<String>, CoordError> {
+) -> Result<orblx_identity::SpiffeId, CoordError> {
     let Some(identity) = connection.peer_identity() else {
-        return Ok(None);
+        return Err(CoordError::Peer);
     };
     let chain = identity
         .downcast::<Vec<CertificateDer<'static>>>()
         .map_err(|_| CoordError::Peer)?;
     let Some(leaf) = chain.first() else {
-        return Ok(None);
+        return Err(CoordError::Peer);
     };
-    let trust = TrustBundle::from_pem(trust_pem)?;
-    let id = trust.authenticate_leaf(leaf.as_ref(), SystemTime::now(), &DenySet::empty())?;
-    if id.kind() != WorkloadKind::Node {
+    let material = coord.tls_material()?;
+    let trust = TrustBundle::from_pem(&material.trust_pem)?;
+    let deny = admin::deny_set(coord, SystemTime::now())?;
+    let id = trust.authenticate_leaf(leaf.as_ref(), SystemTime::now(), &deny)?;
+    if id.kind() != WorkloadKind::Node && id.kind() != WorkloadKind::User {
         return Err(CoordError::Peer);
     }
-    Ok(Some(id.name().to_string()))
+    Ok(id)
 }

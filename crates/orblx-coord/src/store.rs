@@ -25,6 +25,10 @@ struct DiskStore {
     tokens: Vec<TokenRecord>,
 }
 
+fn default_approved() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NodeRecord {
     name: String,
@@ -36,6 +40,10 @@ struct NodeRecord {
     #[serde(default)]
     exit_node: bool,
     enrolled_unix: u64,
+    #[serde(default = "default_approved")]
+    approved: bool,
+    #[serde(default)]
+    expired: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,9 +82,12 @@ pub struct StoredNode {
     pub name: String,
     pub overlay_ip: String,
     pub svid: String,
+    pub owner: String,
     pub endpoints: Vec<String>,
     pub routes: Vec<String>,
     pub exit_node: bool,
+    pub approved: bool,
+    pub expired: bool,
 }
 
 impl NodeStore {
@@ -116,9 +127,12 @@ impl NodeStore {
                 name: node.name.clone(),
                 overlay_ip: node.overlay_ip.clone(),
                 svid: node.svid.clone(),
+                owner: node.owner.clone(),
                 endpoints: node.endpoints.clone(),
                 routes: node.routes.clone(),
                 exit_node: node.exit_node,
+                approved: node.approved,
+                expired: node.expired,
             })
             .collect()
     }
@@ -235,19 +249,24 @@ impl NodeStore {
             name: plan.name.clone(),
             overlay_ip: plan.overlay_ip.clone(),
             svid,
-            owner: plan.owner,
+            owner: plan.owner.clone(),
             endpoints: plan.endpoints.clone(),
             routes: plan.routes.clone(),
             exit_node: false,
             enrolled_unix: now_unix,
+            approved: true,
+            expired: false,
         };
         let stored = StoredNode {
             name: node.name.clone(),
             overlay_ip: node.overlay_ip.clone(),
             svid: node.svid.clone(),
+            owner: node.owner.clone(),
             endpoints: node.endpoints.clone(),
             routes: node.routes.clone(),
             exit_node: node.exit_node,
+            approved: node.approved,
+            expired: node.expired,
         };
         self.disk.nodes.push(node);
         self.disk.next_index = plan.next_index;
@@ -281,6 +300,37 @@ impl NodeStore {
             .find(|node| node.name == name)
             .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
         node.exit_node = enabled;
+        self.persist()
+    }
+
+    /// Mark a node approved or waiting.
+    ///
+    /// Approve also clears key expiry.
+    pub fn set_approved(&mut self, name: &str, approved: bool) -> Result<(), CoordError> {
+        let node = self
+            .disk
+            .nodes
+            .iter_mut()
+            .find(|node| node.name == name)
+            .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        node.approved = approved;
+        if approved {
+            node.expired = false;
+        }
+        self.persist()
+    }
+
+    /// Mark the node key expired.
+    ///
+    /// An expired node stays out of every netmap.
+    pub fn set_expired(&mut self, name: &str) -> Result<(), CoordError> {
+        let node = self
+            .disk
+            .nodes
+            .iter_mut()
+            .find(|node| node.name == name)
+            .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        node.expired = true;
         self.persist()
     }
 

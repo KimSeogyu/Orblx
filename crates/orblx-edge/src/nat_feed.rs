@@ -212,6 +212,90 @@ impl PathKind {
     }
 }
 
+/// The NAT kind a reachability probe reports.
+///
+/// `orblx netcheck` prints [`NatKind::slug`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NatKind {
+    /// The mapped port equals the local port.
+    Open,
+    /// UDP works and the mapping is stable.
+    Cone,
+    /// Two probes return different mapped ports.
+    Symmetric,
+    /// UDP port 443 does not answer.
+    UdpBlocked,
+}
+
+impl NatKind {
+    /// The text `orblx netcheck` prints.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Cone => "cone",
+            Self::Symmetric => "symmetric",
+            Self::UdpBlocked => "udp_blocked",
+        }
+    }
+
+    /// Classify one UDP probe.
+    ///
+    /// `udp_ok` is false when UDP port 443 does not answer.
+    /// `local_port` is the local UDP port.
+    /// `mapped_port` is the first reflexive port.
+    /// `second_mapped_port` is a second reflexive port.
+    /// A different second port selects symmetric NAT.
+    #[must_use]
+    pub fn classify(
+        udp_ok: bool,
+        local_port: Option<u16>,
+        mapped_port: Option<u16>,
+        second_mapped_port: Option<u16>,
+    ) -> Self {
+        if !udp_ok {
+            return Self::UdpBlocked;
+        }
+        if let (Some(first), Some(second)) = (mapped_port, second_mapped_port) {
+            if first != second {
+                return Self::Symmetric;
+            }
+        }
+        if let (Some(local), Some(mapped)) = (local_port, mapped_port) {
+            if local == mapped {
+                return Self::Open;
+            }
+        }
+        Self::Cone
+    }
+}
+
+#[cfg(test)]
+mod nat_kind_tests {
+    use super::NatKind;
+
+    #[test]
+    fn classify_reports_the_probe_kind() {
+        assert_eq!(
+            NatKind::classify(false, None, None, None),
+            NatKind::UdpBlocked
+        );
+        assert_eq!(
+            NatKind::classify(true, Some(443), Some(443), None),
+            NatKind::Open
+        );
+        assert_eq!(
+            NatKind::classify(true, Some(40000), Some(51000), Some(51000)),
+            NatKind::Cone
+        );
+        assert_eq!(
+            NatKind::classify(true, Some(40000), Some(51000), Some(52000)),
+            NatKind::Symmetric
+        );
+        assert_eq!(NatKind::Symmetric.slug(), "symmetric");
+    }
+}
+
 /// Report whether the feed arms a NAT inject.
 ///
 /// The feed arms the inject when the difficulty is Hard.

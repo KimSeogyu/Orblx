@@ -332,6 +332,7 @@ fn node_request(
         underlay: Vec::new(),
         relay: None,
         visibility: Arc::new(AllowPeers),
+        metrics: None,
     }
 }
 

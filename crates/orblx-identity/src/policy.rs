@@ -198,6 +198,8 @@ pub struct Policy {
     tests: Vec<StoredTest>,
     routes: Vec<RouteRule>,
     exit_nodes: Vec<SpiffeId>,
+    node_approval: bool,
+    owners: Vec<SpiffeId>,
 }
 
 impl std::fmt::Debug for Policy {
@@ -223,7 +225,29 @@ impl Policy {
             tests: Vec::new(),
             routes: Vec::new(),
             exit_nodes: Vec::new(),
+            node_approval: false,
+            owners: Vec::new(),
         }
+    }
+
+    /// Return true when a new node waits for `orblx admin approve`.
+    #[must_use]
+    pub fn node_approval(&self) -> bool {
+        self.node_approval
+    }
+
+    /// Return the owner SPIFFE IDs.
+    ///
+    /// An owner SVID can call the coordinator admin API.
+    #[must_use]
+    pub fn owners(&self) -> &[SpiffeId] {
+        &self.owners
+    }
+
+    /// Return true when `id` is an owner.
+    #[must_use]
+    pub fn is_owner(&self, id: &SpiffeId) -> bool {
+        self.owners.iter().any(|owner| owner == id)
     }
 
     /// Read one HuJSON policy file and run its tests.
@@ -408,6 +432,10 @@ struct PolicyFile {
     route_approvals: Vec<RouteApprovalFile>,
     #[serde(default)]
     tests: Vec<TestFile>,
+    #[serde(default, rename = "nodeApproval")]
+    node_approval: bool,
+    #[serde(default)]
+    owners: Vec<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -534,11 +562,14 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
     }
     let routes = compile_routes(&catalog, file)?;
     let exit_nodes = compile_exit_nodes(&catalog, &file.auto_approvers.exit_node)?;
+    let owners = compile_owners(&file.owners)?;
     Ok(Policy {
         grants,
         tests,
         routes,
         exit_nodes,
+        node_approval: file.node_approval,
+        owners,
     })
 }
 
@@ -559,6 +590,24 @@ fn compile_exit_nodes(
     }
     exit_nodes.sort_by(|left, right| left.as_uri().cmp(right.as_uri()));
     Ok(exit_nodes)
+}
+
+fn compile_owners(owners: &[String]) -> Result<Vec<SpiffeId>, PolicyError> {
+    let mut ids = Vec::new();
+    for owner in owners {
+        let id = SpiffeId::parse(owner)
+            .map_err(|_| PolicyError::new("The owner SPIFFE ID is not valid."))?;
+        if id.kind() != WorkloadKind::Node && id.kind() != WorkloadKind::User {
+            return Err(PolicyError::new(
+                "The owner SPIFFE ID is not a node or a user.",
+            ));
+        }
+        if ids.iter().any(|item: &SpiffeId| item == &id) {
+            return Err(PolicyError::new("The owner list repeats a SPIFFE ID."));
+        }
+        ids.push(id);
+    }
+    Ok(ids)
 }
 
 fn compile_routes(catalog: &Catalog, file: &PolicyFile) -> Result<Vec<RouteRule>, PolicyError> {

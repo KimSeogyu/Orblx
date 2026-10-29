@@ -15,7 +15,8 @@ use crate::netmap::{
     decode_hex_32, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap, NetmapKey,
     SignedEndpoint, SignedGrants, SignedNetmap,
 };
-use crate::store::{CreatedToken, NodeStore};
+use crate::store::{CreatedToken, NodeStore, StoredNode};
+use crate::ticket::{self, IssuedTicket};
 
 const COORD_NAME_FILE: &str = "coord-name";
 const CA_CERT_FILE: &str = "ca.crt.pem";
@@ -132,6 +133,7 @@ pub struct EnrollResult {
     pub approved_routes: Vec<String>,
     pub advertised_routes: Vec<String>,
     pub exit_approved: bool,
+    pub ticket: Option<IssuedTicket>,
 }
 
 impl std::fmt::Debug for EnrollResult {
@@ -142,6 +144,7 @@ impl std::fmt::Debug for EnrollResult {
             .field("overlay_ip", &self.overlay_ip)
             .field("svid", &self.svid)
             .field("private_key_pem", &"[elided]")
+            .field("ticket", &"[elided]")
             .finish()
     }
 }
@@ -273,10 +276,14 @@ impl Coordinator {
         let _ = SpiffeId::node(name)?;
         let mut inner = self.lock()?;
         reload(&mut inner)?;
-        if !inner.store.nodes().iter().any(|node| node.name == name) {
-            return Err(CoordError::Protocol(
-                "The node is not enrolled.".to_string(),
-            ));
+        let node = inner
+            .store
+            .nodes()
+            .into_iter()
+            .find(|node| node.name == name)
+            .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        if node.expired {
+            return Err(CoordError::Protocol("The node key is expired.".to_string()));
         }
         issue_leaf(&mut inner, name, now)
     }
@@ -394,6 +401,62 @@ impl Coordinator {
             } => Some(client_id.clone()),
             OidcState::Google { .. } | OidcState::TokenOnly | OidcState::Mock(_) => None,
         })
+    }
+
+    /// Approve a node and clear key expiry.
+    pub fn approve_node(&self, name: &str) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        inner.store.set_approved(name, true)
+    }
+
+    /// Expire a node key.
+    ///
+    /// The node leaves every netmap until approve.
+    pub fn expire_node(&self, name: &str) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        inner.store.set_expired(name)
+    }
+
+    /// Return the enrolled nodes.
+    pub fn node_list(&self) -> Result<Vec<StoredNode>, CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        Ok(inner.store.nodes())
+    }
+
+    /// Return true when `id` is an owner in the loaded policy.
+    pub fn caller_is_owner(&self, id: &SpiffeId) -> Result<bool, CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        Ok(inner.policy.is_owner(id))
+    }
+
+    /// Return the state directory.
+    pub fn state_dir(&self) -> Result<PathBuf, CoordError> {
+        let inner = self.lock()?;
+        Ok(inner.state_dir.clone())
+    }
+
+    /// Return advertised and approved routes for every node.
+    pub fn route_report(&self) -> Result<Vec<serde_json::Value>, CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        let mut rows = Vec::new();
+        for node in inner.store.nodes() {
+            let approved = if node_visible(&node) {
+                published_routes(&inner.policy, &node.svid, &node.routes)
+            } else {
+                Vec::new()
+            };
+            rows.push(serde_json::json!({
+                "name": node.name,
+                "advertised": node.routes,
+                "approved": approved
+            }));
+        }
+        Ok(rows)
     }
 
     pub fn install_google_jwks(&self, jwks: GoogleJwks) -> Result<(), CoordError> {
@@ -515,7 +578,11 @@ fn finish_enroll(
     let stored = inner
         .store
         .commit(plan, issued.spiffe_id.as_uri().to_string(), now)?;
+    if !initial_approved(&inner.policy, &stored.name) {
+        inner.store.set_approved(&stored.name, false)?;
+    }
     let view = sign_view(inner, &stored.name)?;
+    let ticket = issue_ticket(inner, &stored.name, now)?;
     Ok(EnrollResult {
         name: stored.name,
         overlay_ip: stored.overlay_ip,
@@ -530,7 +597,29 @@ fn finish_enroll(
         approved_routes: view.approved_routes,
         advertised_routes: view.advertised_routes,
         exit_approved: view.exit_approved,
+        ticket: Some(ticket),
     })
+}
+
+fn initial_approved(policy: &Policy, name: &str) -> bool {
+    if !policy.node_approval() {
+        return true;
+    }
+    match SpiffeId::node(name) {
+        Ok(id) => policy.is_owner(&id),
+        Err(_) => false,
+    }
+}
+
+fn issue_ticket(inner: &Inner, name: &str, now: SystemTime) -> Result<IssuedTicket, CoordError> {
+    ticket::issue_node_ticket(
+        &inner.state_dir,
+        inner.ca.public_key(),
+        &inner.coord_name,
+        name,
+        now,
+        inner.svid_ttl,
+    )
 }
 
 fn issue_leaf(inner: &mut Inner, name: &str, now: SystemTime) -> Result<EnrollResult, CoordError> {
@@ -540,6 +629,7 @@ fn issue_leaf(inner: &mut Inner, name: &str, now: SystemTime) -> Result<EnrollRe
         .issue(&id, now, inner.svid_ttl, &DenySet::empty())?;
     let view = sign_view(inner, name)?;
     let self_node = view.signed_netmap.netmap.self_node.clone();
+    let ticket = issue_ticket(inner, name, now)?;
     Ok(EnrollResult {
         name: self_node.name,
         overlay_ip: self_node.overlay_ip,
@@ -554,7 +644,12 @@ fn issue_leaf(inner: &mut Inner, name: &str, now: SystemTime) -> Result<EnrollRe
         approved_routes: view.approved_routes,
         advertised_routes: view.advertised_routes,
         exit_approved: view.exit_approved,
+        ticket: Some(ticket),
     })
+}
+
+fn node_visible(node: &StoredNode) -> bool {
+    node.approved && !node.expired
 }
 
 fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
@@ -562,25 +657,29 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
     let self_node = nodes
         .iter()
         .find(|node| node.name == name)
-        .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?
+        .clone();
+    let self_visible = node_visible(&self_node);
     let mut peers = Vec::new();
     let mut endpoints = Vec::new();
-    for node in &nodes {
-        for endpoint in &node.endpoints {
-            endpoints.push(inner.netmap_key.sign_endpoint(&node.name, endpoint)?);
+    if self_visible {
+        for node in nodes.iter().filter(|node| node_visible(node)) {
+            for endpoint in &node.endpoints {
+                endpoints.push(inner.netmap_key.sign_endpoint(&node.name, endpoint)?);
+            }
+            if node.name == self_node.name {
+                continue;
+            }
+            peers.push(NetmapPeer {
+                name: node.name.clone(),
+                overlay_ip: node.overlay_ip.clone(),
+                svid: node.svid.clone(),
+                endpoints: node.endpoints.clone(),
+                routes: published_routes(&inner.policy, &node.svid, &node.routes),
+                exit_node: published_exit(&inner.policy, &node.svid, node.exit_node),
+                owner: String::new(),
+            });
         }
-        if node.name == self_node.name {
-            continue;
-        }
-        peers.push(NetmapPeer {
-            name: node.name.clone(),
-            overlay_ip: node.overlay_ip.clone(),
-            svid: node.svid.clone(),
-            endpoints: node.endpoints.clone(),
-            routes: published_routes(&inner.policy, &node.svid, &node.routes),
-            exit_node: published_exit(&inner.policy, &node.svid, node.exit_node),
-            owner: String::new(),
-        });
     }
     let payload = Netmap {
         version: 1,
@@ -593,9 +692,8 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
     };
     let signed_netmap = inner.netmap_key.sign_netmap(&payload)?;
     let receiver = SpiffeId::node(&self_node.name)?;
-    let signed_grants = inner
-        .netmap_key
-        .sign_grants(&inner.policy.receiver_grants(&receiver))?;
+    let grants = filtered_grants(inner, &receiver, self_visible);
+    let signed_grants = inner.netmap_key.sign_grants(&grants)?;
     let netmap_public = inner.netmap_key.public();
     verify_signed_netmap(&signed_netmap, &netmap_public)?;
     verify_signed_grants(&signed_grants, &netmap_public)?;
@@ -623,6 +721,32 @@ fn published_exit(policy: &Policy, svid: &str, offered: bool) -> bool {
         return false;
     };
     policy.approves_exit_node(&id)
+}
+
+fn filtered_grants(
+    inner: &Inner,
+    receiver: &SpiffeId,
+    self_visible: bool,
+) -> orblx_identity::ReceiverGrants {
+    if !self_visible {
+        return orblx_identity::ReceiverGrants {
+            version: 1,
+            receiver: receiver.as_uri().to_string(),
+            grants: Vec::new(),
+            reach: Vec::new(),
+        };
+    }
+    let hidden: std::collections::BTreeSet<String> = inner
+        .store
+        .nodes()
+        .into_iter()
+        .filter(|node| !node_visible(node))
+        .map(|node| node.svid)
+        .collect();
+    let mut grants = inner.policy.receiver_grants(receiver);
+    grants.grants.retain(|grant| !hidden.contains(&grant.src));
+    grants.reach.retain(|dst| !hidden.contains(dst));
+    grants
 }
 
 fn published_routes(policy: &Policy, svid: &str, routes: &[String]) -> Vec<String> {
@@ -714,8 +838,35 @@ impl EnrollResult {
             &self.signed_netmap,
             &self.signed_grants,
             &self.endpoints,
-        )
+        )?;
+        if let Some(ticket) = &self.ticket {
+            write_ticket_files(dir, ticket)?;
+        }
+        Ok(())
     }
+}
+
+fn write_ticket_files(dir: &Path, ticket: &IssuedTicket) -> Result<(), CoordError> {
+    write_bytes(&dir.join("ticket.bin"), &ticket.bytes, 0o600)?;
+    write_bytes(&dir.join("ticket.bin.mac"), &ticket.mac, 0o600)?;
+    write_text(
+        &dir.join("ticket-verifier.pem"),
+        &ticket.verifier_pem,
+        0o644,
+    )?;
+    write_bytes(&dir.join("ticket-mac.key"), &ticket.mac_key, 0o600)?;
+    write_bytes(&dir.join("svid-ca.pub"), &ticket.svid_ca_pub, 0o644)?;
+    write_text(
+        &dir.join("ticket-not-before"),
+        &format!("{}\n", ticket.not_before),
+        0o644,
+    )?;
+    write_text(
+        &dir.join("ticket-not-after"),
+        &format!("{}\n", ticket.not_after),
+        0o644,
+    )?;
+    Ok(())
 }
 
 impl NetmapView {

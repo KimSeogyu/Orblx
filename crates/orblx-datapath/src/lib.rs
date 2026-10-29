@@ -42,8 +42,8 @@ pub use node::{
     NODE_STATUS_FILE,
 };
 pub use quic::{
-    prove_hello_socket, HelloConfig, HelloEndpoint, HelloReceiver, HelloSender, HelloSession,
-    HelloSocketRole,
+    measure_hello_rtt, prove_hello_socket, HelloConfig, HelloEndpoint, HelloReceiver, HelloSender,
+    HelloSession, HelloSocketRole,
 };
 pub use router::{route_packet, RouterError, RouterTable};
 pub use run::{run_hello, HelloRequest, HelloRole};
