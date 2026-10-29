@@ -4,6 +4,8 @@
 //! The node receives `spiffe://orblx.local/node/{name}`.
 //! The node receives one address from `100.64.0.0/10`.
 //! The coordinator signs each netmap and each endpoint with Ed25519.
+//! The coordinator also signs the receiver grant set with that key.
+//! A policy file with a failed test does not replace the last good policy.
 //! The listener uses QUIC on UDP 443 with the SVID `spiffe://orblx.local/coord/{name}`.
 //! Enrollment uses server authentication because the node SVID does not exist yet.
 //! A later netmap fetch uses the node SVID as the client certificate.
@@ -26,7 +28,10 @@ pub use client::{
 };
 pub use error::CoordError;
 pub use http_util::{fetch_google_jwks_blocking, post_google_token_blocking};
-pub use netmap::{verify_signed_endpoint, verify_signed_netmap, SignedEndpoint, SignedNetmap};
+pub use netmap::{
+    decode_hex_32, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap,
+    SignedEndpoint, SignedGrants, SignedNetmap,
+};
 pub use server::serve_blocking;
 pub use state::{
     oidc_config, read_node_material, Coordinator, EnrollResult, NetmapView, OidcConfig,
@@ -233,5 +238,56 @@ mod tests {
         .await;
         assert!(reused.unwrap_err().to_string().contains("already used"));
         handle.abort();
+    }
+
+    #[test]
+    fn a_failing_policy_keeps_the_last_good_grants() {
+        let scratch = Scratch::new();
+        let good = r#"{
+          "acls": [{
+            "action": "accept",
+            "src": ["spiffe://orblx.local/node/mac"],
+            "proto": "tcp",
+            "dst": ["spiffe://orblx.local/node/box:22"]
+          }],
+          "tests": [{
+            "src": "spiffe://orblx.local/node/mac",
+            "proto": "tcp",
+            "accept": ["spiffe://orblx.local/node/box:22"],
+            "deny": ["spiffe://orblx.local/node/box:5432"]
+          }]
+        }"#;
+        fs::write(scratch.0.join("policy.hujson"), good).unwrap();
+        let now = SystemTime::now();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+        coord
+            .enroll_token("box", &token.secret, &["box:443".to_string()], &[], now)
+            .unwrap();
+        let view = coord.netmap_for("box").unwrap();
+        assert_eq!(view.signed_grants.grants.grants.len(), 1);
+        assert_eq!(view.signed_grants.grants.grants[0].port_start, 22);
+        verify_signed_netmap(&view.signed_netmap, &view.netmap_public).unwrap();
+        super::verify_signed_grants(&view.signed_grants, &view.netmap_public).unwrap();
+        let bad = r#"{
+          "acls": [{
+            "action": "accept",
+            "src": ["spiffe://orblx.local/node/mac"],
+            "proto": "tcp",
+            "dst": ["spiffe://orblx.local/node/box:22"]
+          }],
+          "tests": [{
+            "src": "spiffe://orblx.local/node/mac",
+            "accept": ["spiffe://orblx.local/node/box:5432"]
+          }]
+        }"#;
+        fs::write(scratch.0.join("policy.hujson"), bad).unwrap();
+        let again = coord.netmap_for("box").unwrap();
+        assert_eq!(again.signed_grants.grants, view.signed_grants.grants);
+        drop(coord);
+        let reopened = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let kept = reopened.netmap_for("box").unwrap();
+        assert_eq!(kept.signed_grants.grants.grants[0].port_start, 22);
+        assert!(scratch.0.join("policy.loaded.hujson").exists());
     }
 }

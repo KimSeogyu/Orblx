@@ -1,0 +1,60 @@
+# Policy proof stack.
+# `docker compose up` starts only the coordinator.
+# The mac and box services enroll through the nodes profile.
+name: orblx-policy-proof
+
+services:
+  coord:
+    image: orblx-coord:w18
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /var/lib/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+    ports:
+      - "443:443/udp"
+    volumes:
+      - orblx-policy-store:/var/lib/orblx
+      - ${POLICY_FILE:?set POLICY_FILE}:/var/lib/orblx/policy.hujson:ro
+    networks:
+      - proof
+
+  mac:
+    image: orblx-coord:w18
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    volumes:
+      - orblx-policy-store:/coord-state:ro
+      - orblx-policy-mac:/var/lib/orblx
+    networks:
+      - proof
+
+  box:
+    image: orblx-coord:w18
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    volumes:
+      - orblx-policy-store:/coord-state:ro
+      - orblx-policy-box:/var/lib/orblx
+    networks:
+      - proof
+
+volumes:
+  orblx-policy-store:
+  orblx-policy-mac:
+  orblx-policy-box:
+
+networks:
+  proof:

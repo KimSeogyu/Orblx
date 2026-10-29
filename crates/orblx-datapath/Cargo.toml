@@ -14,6 +14,7 @@ path = "src/bin/tun-bench.rs"
 # Do not add WireGuard, Headscale, or DERP crates.
 
 [dependencies]
+orblx-audit = { path = "../orblx-audit" }
 orblx-crypto = { path = "../orblx-crypto" }
 orblx-identity = { path = "../orblx-identity" }
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }

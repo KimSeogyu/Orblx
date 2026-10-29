@@ -23,6 +23,7 @@ pub(crate) enum Command {
         state: PathBuf,
         listen: SocketAddr,
         name: String,
+        policy: Option<PathBuf>,
     },
     TokenCreate {
         state: PathBuf,
@@ -70,6 +71,7 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             state,
             listen,
             name,
+            policy,
         } => {
             let mode = OidcMode::from_env().map_err(|err| err.to_string())?;
             let client_id = std::env::var(GOOGLE_CLIENT_ID_ENV).ok();
@@ -80,6 +82,11 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             }
             let oidc = oidc_config(mode, client_id).map_err(|err| err.to_string())?;
             let coord = Coordinator::open(&state, &name, oidc).map_err(|err| err.to_string())?;
+            if let Some(policy) = policy {
+                coord
+                    .set_policy_file(&policy)
+                    .map_err(|err| err.to_string())?;
+            }
             println!("state {}", state.display());
             serve_blocking(&coord, listen).map_err(|err| err.to_string())
         }
@@ -147,6 +154,7 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
                 println!("peer {} {}", peer.name, peer.overlay_ip);
             }
             println!("endpoints_ok {}", view.endpoints.len());
+            println!("grants {}", view.signed_grants.grants.grants.len());
             Ok(())
         }
     }
@@ -204,6 +212,7 @@ fn parse_serve(args: &[String]) -> Result<Command, String> {
     let mut state = None;
     let mut listen = None;
     let mut name = None;
+    let mut policy = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -213,6 +222,7 @@ fn parse_serve(args: &[String]) -> Result<Command, String> {
             "--state" => state = Some(PathBuf::from(value)),
             "--listen" => listen = Some(parse_socket(&value, DEFAULT_PORT)?),
             "--name" => name = Some(value),
+            "--policy" => policy = Some(PathBuf::from(value)),
             other => return Err(format!("The flag {other} is not valid.\n{}", help())),
         }
     }
@@ -220,6 +230,7 @@ fn parse_serve(args: &[String]) -> Result<Command, String> {
         state: state.ok_or_else(|| "The command needs --state.".to_string())?,
         listen: listen.unwrap_or_else(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_PORT))),
         name: name.unwrap_or_else(|| "coord".to_string()),
+        policy,
     })
 }
 
@@ -320,7 +331,7 @@ fn parse_netmap(args: &[String]) -> Result<Command, String> {
 
 fn help() -> String {
     "\
-orblx coord serve --state DIR [--listen ADDR] [--name NAME]
+orblx coord serve --state DIR [--listen ADDR] [--name NAME] [--policy FILE]
 orblx coord token create --state DIR --out FILE [--ttl SECS]
 orblx coord enroll --name NAME --coord ADDR --bundle FILE --token-file FILE --state DIR [--coord-name NAME] [--endpoint HOST:PORT] [--route CIDR]
 orblx coord netmap --coord ADDR --bundle FILE --state DIR [--coord-name NAME]
@@ -333,6 +344,9 @@ The coordinator SVID is spiffe://orblx.local/coord/{name}.
 An enroll token is one use.
 The command writes the token only to --out.
 The command does not print the token.
+The default policy file is DIR/policy.hujson.
+A failed policy test keeps the last good policy.
+The coordinator logs one error line for that failure.
 "
     .to_string()
 }

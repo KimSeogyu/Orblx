@@ -21,6 +21,22 @@ pub struct SessionIds {
     pub ticket_hash: [u8; 16],
 }
 
+impl SessionIds {
+    /// Build the session names for one receiver ACL decision.
+    ///
+    /// The decision does not use the Relay.
+    /// The Relay session id is 16 zero bytes.
+    #[must_use]
+    pub fn receiver_acl(peer: SpiffeId, frame: u32, ticket_hash: [u8; 16]) -> Self {
+        Self {
+            relay: RelaySessionId::from_bytes([0u8; 16]),
+            frame,
+            peer,
+            ticket_hash,
+        }
+    }
+}
+
 /// The three session event classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {

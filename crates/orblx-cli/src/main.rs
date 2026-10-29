@@ -15,6 +15,7 @@ mod coord;
 mod direct;
 mod edge;
 mod login;
+mod policy;
 mod relay;
 mod ticket_load;
 mod up;
@@ -33,6 +34,7 @@ enum Action {
     Node(up::Command),
     Coord(coord::Command),
     Login(login::Command),
+    Policy(policy::Command),
 }
 
 #[derive(Debug)]
@@ -115,6 +117,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Ok(Action::Policy(command)) => {
+            if let Err(err) = policy::run(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
         Err(err) => {
             eprintln!("{err}");
             std::process::exit(1);
@@ -180,6 +188,9 @@ where
     }
     if args.first().map(String::as_str) == Some("login") {
         return login::parse(&args[1..]).map(Action::Login);
+    }
+    if args.first().map(String::as_str) == Some("policy") {
+        return policy::parse(&args[1..]).map(Action::Policy);
     }
     for arg in &args {
         if arg == "--version" || arg == "-V" {
