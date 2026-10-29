@@ -150,7 +150,13 @@ ping_name() {
   local attempt
   for attempt in $(seq 1 20); do
     if docker compose -f "$compose_file" exec -T "$node" ping -c 1 -W 2 "$host" >/dev/null 2>&1; then
-      docker compose -f "$compose_file" exec -T "$node" ping -c 3 -W 2 "$host"
+      local out
+      out=$(docker compose -f "$compose_file" exec -T "$node" ping -c 3 -W 2 "$host")
+      printf '%s\n' "$out"
+      if printf '%s\n' "$out" | grep -q 'DUP!'; then
+        echo "The ping from ${node} to ${host} got duplicate replies."
+        return 1
+      fi
       echo "[C] ${node} to ${host} ok"
       return 0
     fi
