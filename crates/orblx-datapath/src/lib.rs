@@ -2,6 +2,7 @@ use std::fmt;
 
 mod acl;
 mod connector;
+mod dns;
 mod error;
 mod framing;
 mod gate;
@@ -22,6 +23,10 @@ pub use connector::{
     serve_apps_dir, serve_userspace, AppFetch, TwoAppProof, APP_A_BODY, APP_A_HOST, APP_A_OVERLAY,
     APP_B_BODY, APP_B_HOST, APP_B_OVERLAY, APP_OVERLAY_PORT, SPOKE_OVERLAY,
 };
+pub use dns::{
+    install_link_resolver, is_visible, remove_link_resolver, AllowPeers, DnsTable, GrantPeers,
+    PeerVisibility, MACOS_RESOLVER_PATH,
+};
 
 pub use error::HelloError;
 pub use framing::{decode_length_prefixed, encode_length_prefixed, MAX_FRAME_LEN};
@@ -39,7 +44,7 @@ pub use quic::{
 pub use router::{route_packet, RouterError, RouterTable};
 pub use run::{run_hello, HelloRequest, HelloRole};
 pub use tun_bench::{run_local_tun_bench, TunBenchOutcome, TunBenchReport};
-pub use tun_dev::{tun_capability_note, TunBridge, TunConfig, DEFAULT_UDP_PORT};
+pub use tun_dev::{tun_capability_note, TunBridge, TunConfig, DEFAULT_UDP_PORT, LINUX_TUN_NAME};
 
 #[cfg(test)]
 mod golden;

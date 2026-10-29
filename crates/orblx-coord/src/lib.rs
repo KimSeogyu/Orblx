@@ -29,8 +29,8 @@ pub use client::{
 pub use error::CoordError;
 pub use http_util::{fetch_google_jwks_blocking, post_google_token_blocking};
 pub use netmap::{
-    decode_hex_32, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap,
-    SignedEndpoint, SignedGrants, SignedNetmap,
+    decode_hex_32, encode_hex, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap,
+    NetmapKey, SignedEndpoint, SignedGrants, SignedNetmap,
 };
 pub use server::serve_blocking;
 pub use state::{
