@@ -45,6 +45,12 @@ else
   exit 1
 fi
 
+# The proof LANs are 10.19.0.0/16.
+# The router does not forward between two LANs.
+# A node can reach another node only through the public address of that node's router.
+iptables -I FORWARD 1 -d 10.19.0.0/16 ! -o "$LAN" -j DROP
+iptables -I FORWARD 2 -s 10.19.0.0/16 ! -i "$LAN" -j DROP
+
 iptables -A FORWARD -i "$LAN" -o "$WAN" -j ACCEPT
 iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 

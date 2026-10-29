@@ -1,6 +1,6 @@
 # NAT proof stack.
 # router-1 and router-3 are endpoint-independent NAT.
-# router-2 is symmetric NAT.
+# router-2 and router-4 are symmetric NAT.
 # The coordinator and the relay sit on the public network.
 name: orblx-nat-proof
 
@@ -78,6 +78,21 @@ services:
       lanz:
         ipv4_address: 10.19.3.2
 
+  router-4:
+    image: orblx-nat:w19
+    entrypoint: ["/bin/sh", "/nat-router.sh"]
+    command: ["172.29.19.14", "10.19.4.2", "10.19.4.10", "symmetric"]
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./nat-router.sh:/nat-router.sh:ro
+    networks:
+      public:
+        ipv4_address: 172.29.19.14
+      lanw:
+        ipv4_address: 10.19.4.2
+
   node-x:
     image: orblx-nat:w19
     profiles: ["nodes"]
@@ -120,11 +135,26 @@ services:
       lanz:
         ipv4_address: 10.19.3.10
 
+  node-w:
+    image: orblx-nat:w19
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - orblx-nat-coord:/coord-state:ro
+      - orblx-nat-w:/var/lib/orblx
+    networks:
+      lanw:
+        ipv4_address: 10.19.4.10
+
 volumes:
   orblx-nat-coord:
   orblx-nat-x:
   orblx-nat-y:
   orblx-nat-z:
+  orblx-nat-w:
 
 networks:
   public:
@@ -143,3 +173,7 @@ networks:
     ipam:
       config:
         - subnet: 10.19.3.0/24
+  lanw:
+    ipam:
+      config:
+        - subnet: 10.19.4.0/24

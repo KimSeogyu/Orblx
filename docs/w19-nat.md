@@ -60,14 +60,68 @@ Router-1 uses SNAT to `172.29.19.11` and DNAT of UDP port 443.
 Router-2 is symmetric NAT.
 Router-2 uses `MASQUERADE --random-fully` for UDP.
 Router-3 is a second endpoint-independent NAT at `172.29.19.13`.
+Router-4 is a second symmetric NAT at `172.29.19.14`.
 Node X is behind router-1.
 Node Y is behind router-2.
 Node Z is behind router-3.
+Node W is behind router-4.
+Each node has its own LAN: `10.19.1.0/24`, `10.19.2.0/24`, `10.19.3.0/24`, and `10.19.4.0/24`.
 
 The REAL host must let the [C] routers forward by MAC.
 `scripts/proof/nat.sh` sets `iptables-legacy` FORWARD to ACCEPT when that policy is DROP.
 The script sets `bridge-nf-call-iptables` to 0.
 That stop keeps the host from routing the frame around the [C] router.
+
+## No topology shortcut
+
+The proof does not let two nodes meet on a LAN.
+The proof checks these items before case 1:
+
+- Each node has one address on its own LAN and a default route through its router.
+  No two nodes share a subnet.
+- Each router drops a forwarded packet to `10.19.0.0/16` unless the packet leaves on the LAN of that router.
+  Each router drops a forwarded packet from `10.19.0.0/16` unless the packet comes in on the LAN of that router.
+- Node X pings the other node LANs and the other router LAN addresses.
+  All the pings fail, and the proof prints `lan_shortcut false`.
+- No router has a DNAT rule on its LAN interface, so no router does a hairpin.
+  The only DNAT rule is the UDP 443 rule on the WAN interface of a cone router.
+- A node publishes only its STUN reflexive address.
+  The coordinator replaces the endpoint set for that node, so no LAN address is a candidate.
+
+## Router mapping probe
+
+The proof measures the NAT kind before it starts the nodes.
+A [C] UDP server runs on the coordinator and on the Relay.
+Each server answers with the source address that it saw.
+A node sends from one inner port, 40000, to both servers.
+
+- Router-2 gives the inner port a different external port for each destination.
+  The proof stops when the two ports are equal.
+- Router-4 also gives two different external ports.
+- Router-1 keeps one external port for both destinations.
+
+## Why cone to symmetric is direct
+
+The two "cone" routers are endpoint-independent.
+Each one also has a static DNAT of UDP 443 to its node.
+That DNAT is a port forward, so a cone router accepts UDP 443 from any source address and any source port.
+
+Node Y sends a punch from behind router-2 to `172.29.19.11:443`.
+Router-2 gives that flow a new external port.
+That port is not the port in the signed candidate for node Y, because the candidate came from the STUN flow.
+Router-1 accepts the punch on UDP 443 and sends it to node X.
+Node X accepts the new source port because the IP is the signed IP of node Y.
+Node X answers to that address.
+Router-2 has a mapping for that flow, so the answer gets to node Y.
+
+The case 2 log shows this result.
+The signed candidate for node Y and the address that the punch reached have the same IP, `172.29.19.12`, but different ports.
+Node Y reached `172.29.19.11:443`, which is the WAN address of router-1.
+The direct path does not use a LAN address, a shared subnet, or a hairpin.
+
+Two symmetric routers do not have a port forward.
+Each side sends to a port that the other router did not open for that flow.
+Case 5 proves that such a pair uses the Relay.
 
 ## Command
 
