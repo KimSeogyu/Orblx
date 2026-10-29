@@ -6,7 +6,6 @@
 //! `ORBLX_OIDC_MODE=mock` keeps the local IdP off the default path.
 
 use std::collections::HashMap;
-use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -384,9 +383,9 @@ where
                 }
                 bytes.extend_from_slice(&tmp[..size]);
             }
-            // Google closes the token socket without a TLS close_notify.
-            // The HTTP response is already in `bytes`.
-            Err(err) if err.kind() == ErrorKind::UnexpectedEof && !bytes.is_empty() => break,
+            // Google and some egress paths omit close_notify after Connection: close.
+            // Bytes already read are the HTTP response. An empty read stays a transport failure.
+            Err(_) if !bytes.is_empty() => break,
             Err(_) => return Err(HttpsFail::Transport),
         }
     }
