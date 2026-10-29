@@ -63,7 +63,23 @@ const FIELD_KEYS = [
   "bytes",
   "detail",
 ];
-const NODE_IDS = ["node-spoke", "node-hub", "app-a", "app-b", "node-relay"];
+const NODE_IDS = ["node-spoke", "actor-agent", "node-hub", "app-a", "app-b", "node-relay"];
+const FX_ANCHOR = {
+  "node-spoke": ["18%", "18%"],
+  "actor-agent": ["18%", "48%"],
+  "node-hub": ["46%", "44%"],
+  "app-a": ["74%", "16%"],
+  "app-b": ["74%", "70%"],
+  "node-relay": ["18%", "74%"],
+};
+const BOND_POS = {
+  "node-spoke": [18, 22],
+  "actor-agent": [18, 50],
+  "node-hub": [50, 50],
+  "app-a": [82, 20],
+  "app-b": [82, 78],
+  "node-relay": [18, 80],
+};
 
 let lastPayload = "";
 let seenSeq = 0;
@@ -264,7 +280,7 @@ function finishBoot() {
     }
   }
   for (let index = 0; index < start; index += 1) {
-    applyFeed(fresh[index]);
+    applyFeed(fresh[index], false);
   }
   for (let index = start; index < fresh.length; index += 1) {
     enqueue(fresh[index]);
@@ -340,7 +356,7 @@ function updateBar() {
   label.textContent = text;
 }
 
-function applyFeed(body) {
+function applyFeed(body, live) {
   if (RESET_KINDS[body.kind]) {
     resetBoard();
   }
@@ -360,6 +376,10 @@ function applyFeed(body) {
   placeMarker(laneFor(body), labelFor(body));
   remember(body);
   noteResult(body);
+  if (live !== false) {
+    linkCast(body);
+    spawnFx(body);
+  }
 }
 
 function beatText(body) {
@@ -431,8 +451,14 @@ function pushTape(body) {
 function resetBoard() {
   document.getElementById("tape").replaceChildren();
   document.getElementById("spoke-name").textContent = "Human";
-  setChip("svid-chip", "none", "SVID");
-  setChip("ticket-chip", "none", "Ticket");
+  document.getElementById("fx").replaceChildren();
+  const game = document.getElementById("game");
+  game.dataset.result = "";
+  const mesh = document.getElementById("mesh-link");
+  mesh.dataset.link = "idle";
+  clearReach();
+  setChip("svid-chip", "none");
+  setChip("ticket-chip", "none");
   setPath("idle", "No path yet.");
   document.getElementById("relay-status").textContent = "Idle";
   setApp("app-a", "idle", "Waiting");
@@ -454,10 +480,8 @@ function resetBoard() {
   document.getElementById("endcard").hidden = true;
 }
 
-function setChip(id, state, text) {
-  const chip = document.getElementById(id);
-  chip.dataset.state = state;
-  chip.textContent = text;
+function setChip(id, state) {
+  document.getElementById(id).dataset.state = state;
 }
 
 function setNode(id, state) {
@@ -487,23 +511,19 @@ function setApp(id, acl, text) {
 }
 
 function applyIdentity(body) {
-  if (body.peer_uri) {
-    document.getElementById("spoke-name").textContent = body.peer_uri;
-  }
   if (body.kind === "svid.issued" || body.kind === "agent.spawned") {
-    setChip("svid-chip", "up", "SVID up");
+    setChip("svid-chip", "up");
   }
   if (body.kind === "svid.revoked") {
-    setChip("svid-chip", "revoked", "SVID revoked");
+    setChip("svid-chip", "revoked");
     setPath("down", "SVID revoked");
   }
   if (body.kind === "svid.expired") {
-    setChip("svid-chip", "expired", "SVID expired");
+    setChip("svid-chip", "expired");
     setPath("down", "SVID expired");
   }
   if (body.kind === "ticket.verified") {
-    const hash = body.ticket_hash ? String(body.ticket_hash).slice(0, 8) : "";
-    setChip("ticket-chip", "up", hash.length > 0 ? "Ticket " + hash : "Ticket");
+    setChip("ticket-chip", "up");
   }
   if (body.kind === "session.dropped") {
     setPath("down", body.within_s !== undefined ? "Dropped within_s " + String(body.within_s) : "Dropped");
@@ -666,6 +686,35 @@ function paintNodes(body) {
   if (kind === "jit.deny" && host.length > 0) {
     setNode(host, "down");
   }
+  paintAgent(body);
+}
+
+function paintAgent(body) {
+  const agent = document.getElementById("actor-agent");
+  const kind = body.kind;
+  if (kind === "agent.spawned") {
+    setNode("actor-agent", "up");
+    return;
+  }
+  if (kind === "jit.allow" || kind === "jit.deny") {
+    if (agent.dataset.state === "idle") {
+      setNode("actor-agent", "up");
+    }
+    return;
+  }
+  if (kind === "svid.expired" && body.level === "agent_jit") {
+    setNode("actor-agent", "down");
+    return;
+  }
+  if (
+    kind === "svid.revoked" ||
+    kind === "session.dropped" ||
+    (kind === "session_down" && body.reason === "revoked")
+  ) {
+    if (agent.dataset.state !== "idle") {
+      setNode("actor-agent", "revoked");
+    }
+  }
 }
 
 function laneFor(body) {
@@ -676,6 +725,9 @@ function laneFor(body) {
   }
   if (host === "app-a") {
     return "a";
+  }
+  if (body.kind === "agent.spawned") {
+    return "agent";
   }
   if (body.kind === "frame_rx" || text.indexOf("came back") !== -1) {
     return "spoke";
@@ -786,6 +838,9 @@ function targetsFor(body) {
   ) {
     targets.push("node-spoke");
   }
+  if (kind === "agent.spawned" || kind === "jit.allow" || kind === "jit.deny") {
+    targets.push("actor-agent");
+  }
   if (
     kind === "quic_hello" ||
     kind === "path.direct" ||
@@ -872,6 +927,7 @@ function selectInspect(id) {
     const button = buttons[index];
     button.setAttribute("aria-pressed", button.id === id ? "true" : "false");
   }
+  document.getElementById("inspector").dataset.open = "true";
   renderInspector();
 }
 
@@ -925,6 +981,186 @@ function noteResult(body) {
     return;
   }
   runResult = { tone: tone, body: body };
+  document.getElementById("game").dataset.result = tone;
+}
+
+function clearReach() {
+  const nodes = document.querySelectorAll(".node");
+  for (let index = 0; index < nodes.length; index += 1) {
+    nodes[index].classList.remove("reach");
+  }
+}
+
+function pairFor(body) {
+  const kind = body.kind;
+  const host = namedHost(body);
+  if (kind === "agent.spawned") {
+    return ["node-spoke", "actor-agent"];
+  }
+  if (kind === "jit.allow") {
+    return ["actor-agent", "app-a"];
+  }
+  if (kind === "jit.deny") {
+    return ["actor-agent", "app-b"];
+  }
+  if (kind === "svid.expired" && body.level === "agent_jit") {
+    return ["actor-agent", "node-spoke"];
+  }
+  if ((kind === "connector_https" || kind === "frame_tx" || kind === "frame_rx") && host.length > 0) {
+    return ["node-hub", host];
+  }
+  if (kind === "path.relay" || kind === "relay.hop" || (kind === "path.up" && body.path === "relay")) {
+    return ["node-hub", "node-relay"];
+  }
+  if (kind === "path.switch" || kind === "path.allocate") {
+    return ["node-hub", "node-relay"];
+  }
+  if (
+    kind === "path.direct" ||
+    kind === "path.down" ||
+    kind === "nat.inject" ||
+    kind === "nat.probe" ||
+    kind === "quic_hello" ||
+    kind === "frame_tx" ||
+    kind === "frame_rx" ||
+    kind === "session_up" ||
+    kind === "svid.issued" ||
+    kind === "ticket.verified" ||
+    kind === "svid.revoked" ||
+    kind === "svid.expired" ||
+    kind === "session.dropped"
+  ) {
+    return ["node-spoke", "node-hub"];
+  }
+  if (kind === "session_down" && (body.reason === "revoked" || body.reason === "expired")) {
+    return ["node-spoke", "node-hub"];
+  }
+  return [];
+}
+
+function linkCast(body) {
+  clearReach();
+  const mesh = document.getElementById("mesh-link");
+  const line = document.getElementById("bond-live");
+  const pair = pairFor(body);
+  if (pair.length < 2) {
+    mesh.dataset.link = "idle";
+    return;
+  }
+  for (let index = 0; index < pair.length; index += 1) {
+    const actor = document.getElementById(pair[index]);
+    if (actor) {
+      actor.classList.add("reach");
+    }
+  }
+  const start = BOND_POS[pair[0]];
+  const end = BOND_POS[pair[1]];
+  if (!start || !end) {
+    mesh.dataset.link = "idle";
+    return;
+  }
+  line.setAttribute("x1", String(start[0]));
+  line.setAttribute("y1", String(start[1]));
+  line.setAttribute("x2", String(end[0]));
+  line.setAttribute("y2", String(end[1]));
+  mesh.dataset.link = "live";
+}
+
+function fxSpec(body) {
+  const kind = body.kind;
+  if (kind === "svid.issued") {
+    return { at: "node-spoke", tone: "mint", count: 7 };
+  }
+  if (kind === "agent.spawned") {
+    return { at: "actor-agent", tone: "mint", count: 7 };
+  }
+  if (kind === "ticket.verified") {
+    return { at: "node-spoke", tone: "ticket", count: 5 };
+  }
+  if (kind === "path.direct" && body.ok === false) {
+    return { at: "node-hub", tone: "break", count: 8 };
+  }
+  if (kind === "nat.inject" || kind === "path.down") {
+    return { at: "node-hub", tone: "break", count: 6 };
+  }
+  if (kind === "path.relay" || kind === "relay.hop" || (kind === "path.up" && body.path === "relay")) {
+    return { at: "node-relay", tone: "relay", count: 7 };
+  }
+  if (kind === "jit.allow") {
+    return { at: "app-a", tone: "allow", count: 6 };
+  }
+  if (kind === "jit.deny") {
+    return { at: "app-b", tone: "deny", count: 6 };
+  }
+  if (kind === "svid.revoked" || kind === "session.dropped") {
+    return { at: "node-spoke", tone: "revoke", count: 8 };
+  }
+  if (kind === "session_down" && body.reason === "revoked") {
+    return { at: "node-spoke", tone: "revoke", count: 6 };
+  }
+  if (kind === "svid.expired") {
+    return { at: body.level === "agent_jit" ? "actor-agent" : "node-spoke", tone: "break", count: 5 };
+  }
+  if (kind === "connector_https") {
+    const host = namedHost(body);
+    if (host.length > 0) {
+      const bad = typeof body.status === "number" && body.status >= 400;
+      return { at: host, tone: bad ? "deny" : "allow", count: 4 };
+    }
+  }
+  if (kind === "quic_hello" || kind === "frame_tx" || kind === "frame_rx" || kind === "path.switch") {
+    const lane = laneFor(body);
+    return { at: nodeForLane(lane), tone: "ticket", count: 3 };
+  }
+  return null;
+}
+
+function nodeForLane(lane) {
+  if (lane === "spoke") {
+    return "node-spoke";
+  }
+  if (lane === "agent") {
+    return "actor-agent";
+  }
+  if (lane === "hub") {
+    return "node-hub";
+  }
+  if (lane === "a") {
+    return "app-a";
+  }
+  if (lane === "b") {
+    return "app-b";
+  }
+  if (lane === "relay") {
+    return "node-relay";
+  }
+  return "node-hub";
+}
+
+function spawnFx(body) {
+  const spec = fxSpec(body);
+  if (!spec) {
+    return;
+  }
+  const origin = FX_ANCHOR[spec.at] || FX_ANCHOR["node-hub"];
+  const layer = document.getElementById("fx");
+  for (let index = 0; index < spec.count; index += 1) {
+    const mote = document.createElement("span");
+    mote.className = "mote " + spec.tone;
+    mote.style.left = origin[0];
+    mote.style.top = origin[1];
+    const angle = (Math.PI * 2 * index) / spec.count;
+    const dist = 26 + (index % 3) * 14;
+    mote.style.setProperty("--dx", String(Math.round(Math.cos(angle) * dist)) + "px");
+    mote.style.setProperty("--dy", String(Math.round(Math.sin(angle) * dist)) + "px");
+    layer.append(mote);
+    window.setTimeout(function () {
+      mote.classList.add("go");
+    }, 30);
+    window.setTimeout(function () {
+      mote.remove();
+    }, 780);
+  }
 }
 
 function showEnd() {
@@ -1195,8 +1431,10 @@ document.getElementById("eng-toggle").addEventListener("click", function () {
   const open = eng.hasAttribute("hidden");
   if (open) {
     eng.removeAttribute("hidden");
+    document.body.classList.add("eng-open");
   } else {
     eng.setAttribute("hidden", "");
+    document.body.classList.remove("eng-open");
   }
   this.setAttribute("aria-pressed", open ? "true" : "false");
 });

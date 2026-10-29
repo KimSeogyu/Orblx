@@ -340,23 +340,22 @@ GitHub Actions runs this workflow on each push to the main branch.
 
 ## Play
 
-The play page is the game.
-The game reads StackFeed JSON.
+The play page is a character scene.
+The scene reads StackFeed JSON.
 `GET /events` sends that JSON.
-The board moves when a feed event arrives.
-The board does not play a canned story.
-Three cartridges select the levels.
-Each cartridge shows the fault note for Easy, Medium, or Hard.
-A curve shows those three difficulties.
-The curve does not add a fault percent.
-The nodes use `up`, `degraded`, `down`, and `revoked` from feed events.
-A feed event moves the packet and shows a label from that event.
-Click a node or the path to read the feed fields.
+A feed event moves a character, a path, or both.
+The scene does not play a canned story.
+The cast is the human session, the agent SVID, application A, application B, the Direct path, and the Relay path.
+Sprite pose uses `up`, `degraded`, `down`, `revoked`, `allow`, and `deny` from feed events.
+Mint, ticket, break, relay, allow, deny, and revoke motes use the feed kind for that event.
+Click a character or Path to open the inspector.
 The poke box is Revoke, UDP block, and Spawn agent.
+A poke uses the same board.
 One level plays for about 35 seconds.
 The progress bar counts feed events in that run.
-The end card is a soft win or a soft loss.
+Soft win and soft loss use the character pose.
 Next Level starts the next difficulty.
+Read the scene in [docs/w16-char-fx.md](docs/w16-char-fx.md).
 
 One command:
 
@@ -379,25 +378,27 @@ City Breeze:
 1. Click Play City Breeze.
 2. The mock IdP page opens.
 3. Click Sign in.
-4. The board shows the SVID, the ticket, the QUIC hello, and the two applications.
-5. `app-a.orblx.test` and `app-b.orblx.test` show status 200.
+4. The human receives the SVID and the ticket.
+5. The Direct path meets `app-a.orblx.test` and `app-b.orblx.test`.
+6. Each application returns status 200.
 
 Agent JIT:
 
 1. Click Play Agent JIT.
-2. The board shows allow for application A.
-3. The board shows deny for application B.
+2. The agent allows application A.
+3. The agent denies application B.
 
 Radioactive NAT and the UDP poke:
 
 1. Click Play Radioactive NAT or click UDP block.
-2. The board shows Direct not ok.
-3. The board then shows the TCP Relay.
+2. The Direct character shows the failed Direct path.
+3. The Relay character shows the TCP Relay.
 4. UDP block leaves the Relay path up.
 
 The engineering panels stay hidden.
 Click Engineering view to open them.
-Read the click path in [docs/w15-demo-ui.md](docs/w15-demo-ui.md).
+Read the character scene in [docs/w16-char-fx.md](docs/w16-char-fx.md).
+Read the level machine in [docs/w15-demo-ui.md](docs/w15-demo-ui.md).
 
 City Breeze, Agent JIT, and Radioactive NAT each use a different board picture.
 The picture changes from the feed `level` field.
@@ -474,14 +475,15 @@ Read the route list in [docs/w14-oidc-ui.md](docs/w14-oidc-ui.md).
 The sim harness crate is `gyeol-sim`.
 The harness runs three levels.
 The levels are City Breeze, Agent JIT, and Radioactive NAT.
-The default page is the game in [Play](#play).
+The default page is the character scene in [Play](#play).
 The engineering view shows peers, packets, and session panels.
 The event log shows feed JSON from those runs.
 UDP block calls `gyeol_edge::run_nat_smash`.
-The board moves from feed events.
-The board does not play a canned animation.
+Characters and paths move from feed events.
+The scene does not play a canned animation.
 Read the feed fields in [docs/w11-feed-v1.md](docs/w11-feed-v1.md).
-Read the play path in [docs/w15-demo-ui.md](docs/w15-demo-ui.md).
+Read the character scene in [docs/w16-char-fx.md](docs/w16-char-fx.md).
+Read the level machine in [docs/w15-demo-ui.md](docs/w15-demo-ui.md).
 Read the run steps in [docs/demo-sim.md](docs/demo-sim.md).
 
 Run the harness:
