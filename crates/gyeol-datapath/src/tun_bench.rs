@@ -6,6 +6,8 @@
 //! The bench writes the packet back to the TUN device.
 //! The bench does not use WireGuard, Headscale, or DERP.
 
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
