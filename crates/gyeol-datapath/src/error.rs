@@ -46,6 +46,10 @@ pub enum HelloError {
     DestinationDenied,
     /// The connector hub-spoke path failed.
     Connector(String),
+    /// The QUIC endpoint is closed.
+    EndpointClosed,
+    /// The node daemon failed.
+    Node(String),
 }
 
 impl fmt::Display for HelloError {
@@ -85,6 +89,8 @@ impl fmt::Display for HelloError {
                 formatter.write_str("The destination is not allowed. The path rejects DATA.")
             }
             Self::Connector(detail) => write!(formatter, "The connector failed. {detail}"),
+            Self::EndpointClosed => formatter.write_str("The QUIC endpoint is closed."),
+            Self::Node(detail) => write!(formatter, "The node failed. {detail}"),
         }
     }
 }
@@ -110,7 +116,9 @@ impl std::error::Error for HelloError {
             | Self::TicketMissing
             | Self::TicketHash
             | Self::DestinationDenied
-            | Self::Connector(_) => None,
+            | Self::Connector(_)
+            | Self::EndpointClosed
+            | Self::Node(_) => None,
         }
     }
 }

@@ -32,7 +32,8 @@ mod ticket;
 
 pub use ca::{IssuedSvid, MiniCa};
 pub use cert::{
-    decode_certificate_pem, decode_certificate_pem_file, extract_spiffe_id, TrustBundle,
+    decode_certificate_pem, decode_certificate_pem_file, extract_spiffe_id, leaf_not_after,
+    TrustBundle,
 };
 pub use clock::{MAX_AGENT_TTL, MAX_SKEW, MAX_USER_TTL};
 pub use deny::{DenyApply, DenySet};

@@ -5,7 +5,10 @@ mod error;
 mod framing;
 mod gate;
 mod ipv4;
+mod netmap;
+mod node;
 mod quic;
+mod router;
 mod run;
 mod tun_bench;
 mod tun_dev;
@@ -20,11 +23,17 @@ pub use connector::{
 pub use error::HelloError;
 pub use framing::{decode_length_prefixed, encode_length_prefixed, MAX_FRAME_LEN};
 pub use gate::PeerGate;
-pub use ipv4::{ipv4_packet, is_ipv4_packet};
+pub use ipv4::{ipv4_destination, ipv4_packet, is_ipv4_packet};
+pub use netmap::{Netmap, NetmapError, NetmapPeer, NetmapSelf};
+pub use node::{
+    format_node_status, read_status_text, run_node, running_pid, NodeRequest, NodeStatus,
+    StatusPeer, NODE_PID_FILE, NODE_RECORD_FILE, NODE_STATUS_FILE,
+};
 pub use quic::{
     prove_hello_socket, HelloConfig, HelloEndpoint, HelloReceiver, HelloSender, HelloSession,
     HelloSocketRole,
 };
+pub use router::{route_packet, RouterError, RouterTable};
 pub use run::{run_hello, HelloRequest, HelloRole};
 pub use tun_bench::{run_local_tun_bench, TunBenchOutcome, TunBenchReport};
 pub use tun_dev::{tun_capability_note, TunBridge, TunConfig, DEFAULT_UDP_PORT};

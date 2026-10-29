@@ -23,6 +23,19 @@ pub fn is_ipv4_packet(packet: &[u8]) -> bool {
     total == packet.len() && total >= header_len
 }
 
+/// Return the IPv4 destination address.
+///
+/// The function returns `None` when `packet` is not one complete IPv4 packet.
+#[must_use]
+pub fn ipv4_destination(packet: &[u8]) -> Option<Ipv4Addr> {
+    if !is_ipv4_packet(packet) {
+        return None;
+    }
+    Some(Ipv4Addr::new(
+        packet[16], packet[17], packet[18], packet[19],
+    ))
+}
+
 /// Build one IPv4 packet with a 20-byte header.
 ///
 /// The checksum field is zero.
