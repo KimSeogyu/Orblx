@@ -479,6 +479,11 @@ fn kid_ok(kid: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+/// Return ok when `value` is a Google OAuth client id.
+pub fn google_client_id_ok(value: &str) -> Result<(), IdentityError> {
+    require_client_id(value)
+}
+
 pub(crate) fn require_client_id(value: &str) -> Result<(), IdentityError> {
     if value.len() <= CLIENT_ID_SUFFIX.len()
         || value.len() > 200

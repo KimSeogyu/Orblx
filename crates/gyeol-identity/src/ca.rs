@@ -2,14 +2,6 @@ use std::fmt;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use ed25519_dalek::SigningKey;
-use rcgen::string::Ia5String;
-use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose, SanType, PKCS_ED25519,
-};
-use time::OffsetDateTime;
-
 use crate::cert::{
     cert_validity, certificate_ed25519_public_key, decode_certificate_pem, extract_spiffe_id,
     TrustBundle,
@@ -19,13 +11,20 @@ use crate::codec::{ed25519_seed_from_pkcs8, pem_blocks, read_pem_file};
 use crate::deny::DenySet;
 use crate::error::IdentityError;
 use crate::spiffe::SpiffeId;
+use ed25519_dalek::SigningKey;
+use rcgen::string::Ia5String;
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, SanType, PKCS_ED25519,
+};
 
 const CA_COMMON_NAME: &str = "gyeol-svid-ca";
 
 /// An Ed25519 mini CA that issues leaf X.509-SVIDs.
 pub struct MiniCa {
     key: KeyPair,
-    params: CertificateParams,
+    not_before: u64,
+    not_after: u64,
     bundle: TrustBundle,
     certificate_pem: String,
     public_key: [u8; 32],
@@ -44,8 +43,6 @@ impl MiniCa {
     /// Generate a new root and a matching trust bundle.
     pub fn generate(now: SystemTime) -> Result<Self, IdentityError> {
         let key = KeyPair::generate_for(&PKCS_ED25519).map_err(|_| IdentityError::Certificate)?;
-        let public_key =
-            <[u8; 32]>::try_from(key.public_key_raw()).map_err(|_| IdentityError::Certificate)?;
         let now_unix = unix_time(now)?;
         let not_before = now_unix.saturating_sub(MAX_SKEW_SECS);
         let not_after = now_unix
@@ -65,11 +62,37 @@ impl MiniCa {
         let certificate = params
             .self_signed(&key)
             .map_err(|_| IdentityError::Certificate)?;
-        let certificate_pem = certificate.pem();
+        Self::from_parts(key, certificate.pem())
+    }
+
+    /// Load a root from the certificate PEM and the private key PEM.
+    ///
+    /// The coordinator stores these files so a restart keeps the same CA.
+    pub fn from_pem(certificate_pem: &str, private_key_pem: &str) -> Result<Self, IdentityError> {
+        let key = KeyPair::from_pem(private_key_pem).map_err(|_| IdentityError::Certificate)?;
+        Self::from_parts(key, certificate_pem.to_string())
+    }
+
+    /// The CA private key PEM.
+    ///
+    /// The caller must not write this value to a log.
+    pub fn private_key_pem(&self) -> String {
+        self.key.serialize_pem()
+    }
+
+    fn from_parts(key: KeyPair, certificate_pem: String) -> Result<Self, IdentityError> {
+        let public_key =
+            <[u8; 32]>::try_from(key.public_key_raw()).map_err(|_| IdentityError::Certificate)?;
+        let der = decode_certificate_pem(&certificate_pem)?;
+        if certificate_ed25519_public_key(&der)? != public_key {
+            return Err(IdentityError::Certificate);
+        }
         let bundle = TrustBundle::from_pem(&certificate_pem)?;
+        let (not_before, not_after) = cert_validity(&der)?;
         Ok(Self {
             key,
-            params,
+            not_before,
+            not_after,
             bundle,
             certificate_pem,
             public_key,
@@ -109,9 +132,7 @@ impl MiniCa {
         }
         let now_unix = unix_time(now)?;
         let not_after = now_unix.checked_add(ttl_secs).ok_or(IdentityError::Time)?;
-        let ca_not_before = unix_time_of_offset(self.params.not_before)?;
-        let ca_not_after = unix_time_of_offset(self.params.not_after)?;
-        if now_unix < ca_not_before || not_after > ca_not_after {
+        if now_unix < self.not_before || not_after > self.not_after {
             return Err(IdentityError::Time);
         }
 
@@ -131,7 +152,8 @@ impl MiniCa {
             ExtendedKeyUsagePurpose::ServerAuth,
         ];
         params.use_authority_key_identifier_extension = true;
-        let issuer = Issuer::from_params(&self.params, &self.key);
+        let issuer = Issuer::from_ca_cert_pem(&self.certificate_pem, &self.key)
+            .map_err(|_| IdentityError::Certificate)?;
         let certificate = params
             .signed_by(&leaf_key, &issuer)
             .map_err(|_| IdentityError::Certificate)?;
@@ -155,10 +177,6 @@ impl MiniCa {
             not_after: parsed_not_after,
         })
     }
-}
-
-fn unix_time_of_offset(value: OffsetDateTime) -> Result<u64, IdentityError> {
-    u64::try_from(value.unix_timestamp()).map_err(|_| IdentityError::Time)
 }
 
 /// A leaf certificate and the matching private key.

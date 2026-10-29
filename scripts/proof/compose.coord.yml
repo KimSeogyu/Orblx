@@ -1,0 +1,58 @@
+# Coordinator proof stack.
+# `docker compose up` starts only the coordinator.
+# Node containers use the same image through the node-a and node-b services.
+name: gyeol-coord-proof
+
+services:
+  coord:
+    image: gyeol-coord:w18
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/gyeol
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+    environment:
+      ORBLX_GOOGLE_CLIENT_ID: ${ORBLX_GOOGLE_CLIENT_ID:-}
+      ORBLX_OIDC_MODE: ${ORBLX_OIDC_MODE:-google}
+    ports:
+      - "443:443/udp"
+    volumes:
+      - gyeol-coord-store:/var/lib/gyeol
+    networks:
+      - proof
+
+  node-a:
+    image: gyeol-coord:w18
+    profiles: ["nodes"]
+    entrypoint: ["gyeol"]
+    depends_on:
+      - coord
+    volumes:
+      - gyeol-coord-store:/coord-state:ro
+      - gyeol-node-a:/var/lib/gyeol
+    networks:
+      - proof
+
+  node-b:
+    image: gyeol-coord:w18
+    profiles: ["nodes"]
+    entrypoint: ["gyeol"]
+    depends_on:
+      - coord
+    volumes:
+      - gyeol-coord-store:/coord-state:ro
+      - gyeol-node-b:/var/lib/gyeol
+    networks:
+      - proof
+
+volumes:
+  gyeol-coord-store:
+  gyeol-node-a:
+  gyeol-node-b:
+
+networks:
+  proof:

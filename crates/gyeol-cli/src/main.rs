@@ -11,8 +11,10 @@ use gyeol_identity::TrustBundle;
 
 mod audit;
 mod connector;
+mod coord;
 mod direct;
 mod edge;
+mod login;
 mod relay;
 mod ticket_load;
 mod up;
@@ -29,6 +31,8 @@ enum Action {
     Connector(connector::Command),
     Audit(audit::Command),
     Node(up::Command),
+    Coord(coord::Command),
+    Login(login::Command),
 }
 
 #[derive(Debug)]
@@ -99,6 +103,18 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Ok(Action::Coord(command)) => {
+            if let Err(err) = coord::run(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
+        Ok(Action::Login(command)) => {
+            if let Err(err) = login::run(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
         Err(err) => {
             eprintln!("{err}");
             std::process::exit(1);
@@ -158,6 +174,12 @@ where
     }
     if args.first().map(String::as_str) == Some("node-issue") {
         return up::parse_issue(&args[1..]).map(Action::Node);
+    }
+    if args.first().map(String::as_str) == Some("coord") {
+        return coord::parse(&args[1..]).map(Action::Coord);
+    }
+    if args.first().map(String::as_str) == Some("login") {
+        return login::parse(&args[1..]).map(Action::Login);
     }
     for arg in &args {
         if arg == "--version" || arg == "-V" {
