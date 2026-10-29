@@ -15,15 +15,15 @@ Fire is not measured.
 Checks on `main` at `f4ce5c86d18108ffe71d70325a8f958230d60147`:
 
 - [connector-hub.md](connector-hub.md) says this week does not replace the PEM load from disk.
-- `crates/gyeol-cli/src/ticket_load.rs` reads `ticket-verifier.pem` from disk.
-- `crates/gyeol-datapath/src/connector/lab.rs` writes SVID PEM files and reads those files.
-- `crates/gyeol-identity/src/ca.rs` returns `certificate_pem` and `private_key_pem`.
-- `TrustBundle::from_pem` in `crates/gyeol-identity/src/cert.rs` reads PEM text in memory.
+- `crates/orblx-cli/src/ticket_load.rs` reads `ticket-verifier.pem` from disk.
+- `crates/orblx-datapath/src/connector/lab.rs` writes SVID PEM files and reads those files.
+- `crates/orblx-identity/src/ca.rs` returns `certificate_pem` and `private_key_pem`.
+- `TrustBundle::from_pem` in `crates/orblx-identity/src/cert.rs` reads PEM text in memory.
 - `decode_certificate_pem_file` is absent.
 - `TrustBundle::from_pem_file` is absent.
 - `IssuedSvid::from_pem` is absent.
 - `IssuedSvid::from_pem_files` is absent.
-- The City Breeze feed test in `crates/gyeol-sim/src/sim.rs` rejects the strings `BEGIN` and `PRIVATE` in the event JSON.
+- The City Breeze feed test in `crates/orblx-sim/src/sim.rs` rejects the strings `BEGIN` and `PRIVATE` in the event JSON.
 - That feed test does not remove the disk PEM load.
 
 Open pull request: https://github.com/KimSeogyu/Orblx/pull/22
@@ -34,10 +34,10 @@ The head commit message is `Load SVID and trust-bundle PEM from disk paths.`
 
 That head contains these functions:
 
-- `decode_certificate_pem_file` in `crates/gyeol-identity/src/cert.rs`
-- `TrustBundle::from_pem_file` in `crates/gyeol-identity/src/cert.rs`
-- `IssuedSvid::from_pem` in `crates/gyeol-identity/src/ca.rs`
-- `IssuedSvid::from_pem_files` in `crates/gyeol-identity/src/ca.rs`
+- `decode_certificate_pem_file` in `crates/orblx-identity/src/cert.rs`
+- `TrustBundle::from_pem_file` in `crates/orblx-identity/src/cert.rs`
+- `IssuedSvid::from_pem` in `crates/orblx-identity/src/ca.rs`
+- `IssuedSvid::from_pem_files` in `crates/orblx-identity/src/ca.rs`
 
 The residual clearance is on that open pull request.
 It is not on `main`.
@@ -87,7 +87,7 @@ The page check found no animation.
 Command: `./scripts/audit-smoke.sh`
 Result: `The session audit chain check passed.`
 `audit verify` printed `ok`, start 1, end 1, deny 1, and records 3.
-The tip was `7292992ea22a6755b81526c80ae3adfdf601a8753c3a4303b9a3f8509b552e92`.
+The tip was `1c3a5250c530008bd15bd9d0eb1e0437acda65dfb26c46adb0dfda66c0f50a6e`.
 
 Command: `./scripts/connector-smoke.sh`
 Result: `The userspace connector proof passed.`

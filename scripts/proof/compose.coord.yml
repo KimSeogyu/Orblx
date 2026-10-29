@@ -1,16 +1,16 @@
 # Coordinator proof stack.
 # `docker compose up` starts only the coordinator.
 # Node containers use the same image through the node-a and node-b services.
-name: gyeol-coord-proof
+name: orblx-coord-proof
 
 services:
   coord:
-    image: gyeol-coord:w18
+    image: orblx-coord:w18
     command:
       - coord
       - serve
       - --state
-      - /var/lib/gyeol
+      - /var/lib/orblx
       - --listen
       - 0.0.0.0:443
       - --name
@@ -21,38 +21,38 @@ services:
     ports:
       - "443:443/udp"
     volumes:
-      - gyeol-coord-store:/var/lib/gyeol
+      - orblx-coord-store:/var/lib/orblx
     networks:
       - proof
 
   node-a:
-    image: gyeol-coord:w18
+    image: orblx-coord:w18
     profiles: ["nodes"]
-    entrypoint: ["gyeol"]
+    entrypoint: ["orblx"]
     depends_on:
       - coord
     volumes:
-      - gyeol-coord-store:/coord-state:ro
-      - gyeol-node-a:/var/lib/gyeol
+      - orblx-coord-store:/coord-state:ro
+      - orblx-node-a:/var/lib/orblx
     networks:
       - proof
 
   node-b:
-    image: gyeol-coord:w18
+    image: orblx-coord:w18
     profiles: ["nodes"]
-    entrypoint: ["gyeol"]
+    entrypoint: ["orblx"]
     depends_on:
       - coord
     volumes:
-      - gyeol-coord-store:/coord-state:ro
-      - gyeol-node-b:/var/lib/gyeol
+      - orblx-coord-store:/coord-state:ro
+      - orblx-node-b:/var/lib/orblx
     networks:
       - proof
 
 volumes:
-  gyeol-coord-store:
-  gyeol-node-a:
-  gyeol-node-b:
+  orblx-coord-store:
+  orblx-node-a:
+  orblx-node-b:
 
 networks:
   proof:

@@ -1,12 +1,12 @@
 # Three Linux nodes on one bridge.
-# The proof script builds the image gyeol-w18:local and sets the W18_* paths.
+# The proof script builds the image orblx-w18:local and sets the W18_* paths.
 # UDP 4431, 4432, and 4433 let a Mac reach the containers. The Mac cannot use the bridge addresses.
 
-name: gyeol-w18
+name: orblx-w18
 
 services:
   node-a:
-    image: gyeol-w18:local
+    image: orblx-w18:local
     cap_add:
       - NET_ADMIN
     devices:
@@ -15,25 +15,25 @@ services:
       net.ipv4.conf.all.rp_filter: "0"
       net.ipv4.conf.default.rp_filter: "0"
     volumes:
-      - ${W18_STATE_A}:/var/lib/gyeol
-      - ${W18_NETMAP_A}:/etc/gyeol/netmap.json:ro
+      - ${W18_STATE_A}:/var/lib/orblx
+      - ${W18_NETMAP_A}:/etc/orblx/netmap.json:ro
     command:
       - up
       - --netmap
-      - /etc/gyeol/netmap.json
+      - /etc/orblx/netmap.json
       - --state-dir
-      - /var/lib/gyeol
+      - /var/lib/orblx
       - --listen
       - 0.0.0.0:443
     ports:
       - "4431:443/udp"
     stop_grace_period: 10s
     networks:
-      gyeol:
+      orblx:
         ipv4_address: 172.28.18.11
 
   node-b:
-    image: gyeol-w18:local
+    image: orblx-w18:local
     cap_add:
       - NET_ADMIN
     devices:
@@ -42,25 +42,25 @@ services:
       net.ipv4.conf.all.rp_filter: "0"
       net.ipv4.conf.default.rp_filter: "0"
     volumes:
-      - ${W18_STATE_B}:/var/lib/gyeol
-      - ${W18_NETMAP_B}:/etc/gyeol/netmap.json:ro
+      - ${W18_STATE_B}:/var/lib/orblx
+      - ${W18_NETMAP_B}:/etc/orblx/netmap.json:ro
     command:
       - up
       - --netmap
-      - /etc/gyeol/netmap.json
+      - /etc/orblx/netmap.json
       - --state-dir
-      - /var/lib/gyeol
+      - /var/lib/orblx
       - --listen
       - 0.0.0.0:443
     ports:
       - "4432:443/udp"
     stop_grace_period: 10s
     networks:
-      gyeol:
+      orblx:
         ipv4_address: 172.28.18.12
 
   node-c:
-    image: gyeol-w18:local
+    image: orblx-w18:local
     cap_add:
       - NET_ADMIN
     devices:
@@ -69,25 +69,25 @@ services:
       net.ipv4.conf.all.rp_filter: "0"
       net.ipv4.conf.default.rp_filter: "0"
     volumes:
-      - ${W18_STATE_C}:/var/lib/gyeol
-      - ${W18_NETMAP_C}:/etc/gyeol/netmap.json:ro
+      - ${W18_STATE_C}:/var/lib/orblx
+      - ${W18_NETMAP_C}:/etc/orblx/netmap.json:ro
     command:
       - up
       - --netmap
-      - /etc/gyeol/netmap.json
+      - /etc/orblx/netmap.json
       - --state-dir
-      - /var/lib/gyeol
+      - /var/lib/orblx
       - --listen
       - 0.0.0.0:443
     ports:
       - "4433:443/udp"
     stop_grace_period: 10s
     networks:
-      gyeol:
+      orblx:
         ipv4_address: 172.28.18.13
 
 networks:
-  gyeol:
+  orblx:
     driver: bridge
     ipam:
       config:

@@ -1,0 +1,16 @@
+[package]
+name = "orblx-crypto"
+description = "Handshake and key-schedule scaffold for orblx-quic."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+orblx-identity = { path = "../orblx-identity" }
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10.8"
+
+[dev-dependencies]
+orblx-identity = { path = "../orblx-identity" }

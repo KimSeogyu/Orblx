@@ -5,7 +5,7 @@
 # The netns lab needs root, iproute2, and iptables.
 # The Direct lab sends hole-punch datagrams.
 # The Direct lab proves direct QUIC.
-# The Relay lab uses the gyeol Relay when Direct is down.
+# The Relay lab uses the orblx Relay when Direct is down.
 # The Relay lab uses TCP port 443 when UDP is blocked.
 
 set -euo pipefail
@@ -107,15 +107,15 @@ check_userspace() {
 run_userspace() {
   echo "=== userspace lab ==="
   local userspace
-  userspace=$(cargo run -q -p gyeol-cli -- edge-smoke)
+  userspace=$(cargo run -q -p orblx-cli -- edge-smoke)
   check_userspace "$userspace"
 }
 
 run_udp443() {
   echo "=== UDP 443 lab ==="
-  local bin="$root/target/debug/gyeol"
+  local bin="$root/target/debug/orblx"
   if [[ ! -x "$bin" ]]; then
-    cargo build -q -p gyeol-cli
+    cargo build -q -p orblx-cli
   fi
   local text
   text=$("$bin" edge-smoke --bind 127.0.0.1:443)
@@ -186,9 +186,9 @@ check_peer() {
 
 run_netns() {
   echo "=== netns source NAT lab ==="
-  local bin="$root/target/debug/gyeol"
+  local bin="$root/target/debug/orblx"
   if [[ ! -x "$bin" ]]; then
-    echo "The gyeol binary is missing. Build it before the netns lab."
+    echo "The orblx binary is missing. Build it before the netns lab."
     exit 1
   fi
   if ! command -v ip >/dev/null 2>&1 || ! command -v iptables >/dev/null 2>&1; then
@@ -196,10 +196,10 @@ run_netns() {
     exit 1
   fi
 
-  local ns_a=gyeol-w5-a
-  local ns_b=gyeol-w5-b
-  local ns_n=gyeol-w5-nat
-  local ns_s=gyeol-w5-stun
+  local ns_a=orblx-w5-a
+  local ns_b=orblx-w5-b
+  local ns_n=orblx-w5-nat
+  local ns_s=orblx-w5-stun
   local work
   work=$(mktemp -d)
   local server_out="$work/server.out"
@@ -371,10 +371,10 @@ run_netns() {
 run_relay_userspace() {
   echo "=== userspace Relay UDP lab ==="
   local udp tcp
-  udp=$(cargo run -q -p gyeol-cli -- relay-smoke udp)
+  udp=$(cargo run -q -p orblx-cli -- relay-smoke udp)
   check_relay_smoke "$udp" udp
   echo "=== userspace Relay TCP lab ==="
-  tcp=$(cargo run -q -p gyeol-cli -- relay-smoke tcp)
+  tcp=$(cargo run -q -p orblx-cli -- relay-smoke tcp)
   check_relay_smoke "$tcp" tcp
 }
 
@@ -484,7 +484,7 @@ if [[ "$mode" == "all" && "$(id -u)" -ne 0 ]]; then
     echo "Root is required for UDP port 443 and the source-NAT lab."
     exit 0
   fi
-  cargo build -q -p gyeol-cli
+  cargo build -q -p orblx-cli
   exec sudo -n -E env PATH="$PATH" "$0" --privileged
 fi
 
@@ -514,9 +514,9 @@ fi
 
 run_relay_443() {
   echo "=== Relay bind UDP and TCP port 443 ==="
-  local bin="$root/target/debug/gyeol"
+  local bin="$root/target/debug/orblx"
   if [[ ! -x "$bin" ]]; then
-    echo "The gyeol binary is missing. Build it before the Relay port 443 lab."
+    echo "The orblx binary is missing. Build it before the Relay port 443 lab."
     exit 1
   fi
   local udp tcp

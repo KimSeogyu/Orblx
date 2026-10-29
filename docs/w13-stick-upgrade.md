@@ -14,7 +14,7 @@ The data path uses Quinn 0.11.
 That session exchanges one IPv4 packet.
 That session then closes.
 The Relay path binds Quinn to a loopback socket.
-A bridge copies those datagrams to the gyeol Relay.
+A bridge copies those datagrams to the orblx Relay.
 The Quinn remote address is the local bridge.
 The Quinn remote address is not the peer.
 
@@ -52,28 +52,28 @@ That exchange does not increase the Relay forward count.
 Run the in-process labs:
 
 ```bash
-cargo test -p gyeol-edge --lib stick::tests -- --test-threads=1
+cargo test -p orblx-edge --lib stick::tests -- --test-threads=1
 ```
 
 Run the same labs from the command:
 
 ```bash
-cargo run -p gyeol-cli -- stick-upgrade
+cargo run -p orblx-cli -- stick-upgrade
 ```
 
 The labs call `PathMachine`.
 They call `begin_relay`, `finish_relay`, and `retry_direct`.
 They do not use a second state machine.
 
-gyeol-sim Hard still calls `run_nat_smash`.
+orblx-sim Hard still calls `run_nat_smash`.
 That smash ends on Relay.
 Direct stays down.
 The smash feed does not record stick.
 
 ## Results
 
-`cargo test -p gyeol-edge --lib stick::tests -- --test-threads=1` passed on this machine.
-`cargo run -p gyeol-cli -- stick-upgrade` exited 0 on this machine.
+`cargo test -p orblx-edge --lib stick::tests -- --test-threads=1` passed on this machine.
+`cargo run -p orblx-cli -- stick-upgrade` exited 0 on this machine.
 The runs used the in-process labs.
 The runs did not use network namespaces.
 The runs did not print throughput or RTT percentiles.

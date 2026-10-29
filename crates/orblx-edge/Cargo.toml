@@ -1,0 +1,15 @@
+[package]
+name = "orblx-edge"
+description = "Edge crate. This crate gathers a STUN reflexive address, brings up same-NAT direct QUIC, and falls back to the orblx Relay."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+getrandom = "0.2.17"
+orblx-crypto = { path = "../orblx-crypto" }
+orblx-datapath = { path = "../orblx-datapath" }
+orblx-identity = { path = "../orblx-identity" }
+orblx-relay = { path = "../orblx-relay" }
+serde_json = { version = "1", features = ["preserve_order"] }

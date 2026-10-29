@@ -1,0 +1,70 @@
+//! Mini CA, OIDC issue, capability tickets, and the deny list.
+//!
+//! The trust domain is `orblx.local`.
+//! A human SVID is `spiffe://orblx.local/user/{oidc_sub}`.
+//! City Breeze uses a Google ID token.
+//! The Google subject is the SPIFFE user name.
+//! `MockOidc` remains for CI and the harness when `ORBLX_OIDC_MODE=mock`.
+//! An agent SVID is `spiffe://orblx.local/agent/{id}`.
+//! The agent SVID requires a parent human ID token.
+//! The agent SVID life is at most 5 minutes.
+//! The SVID key is Ed25519.
+//! The ticket key is a different Ed25519 key.
+//! An agent capability ticket is separate from the SVID.
+//! The agent ticket allows one destination.
+//! Every other agent destination is denied.
+//! Node enrollment calls `IssueGate::owner_subject`.
+//! That call does not issue the node SVID.
+//!
+//! `decode_certificate_pem_file` reads one certificate PEM file.
+//! `TrustBundle::from_pem_file` reads a trust bundle PEM file.
+//! `IssuedSvid::from_pem_files` reads a leaf certificate PEM file and a private key PEM file.
+//! Those functions read the file text and call the in-memory PEM decode path.
+
+mod ca;
+mod cert;
+mod clock;
+mod codec;
+mod deny;
+mod error;
+mod google;
+mod oidc;
+mod spiffe;
+mod ticket;
+
+pub use ca::{IssuedSvid, MiniCa};
+pub use cert::{
+    decode_certificate_pem, decode_certificate_pem_file, extract_spiffe_id, leaf_not_after,
+    TrustBundle,
+};
+pub use clock::{MAX_AGENT_TTL, MAX_SKEW, MAX_USER_TTL};
+pub use deny::{DenyApply, DenySet};
+pub use error::IdentityError;
+pub use google::{
+    google_client_id_ok, GoogleClient, GoogleIdClaims, GoogleJwks, GoogleTokenRequest, OidcMode,
+    GOOGLE_AUTHORIZE_ENDPOINT, GOOGLE_CLIENT_ID_ENV, GOOGLE_CLIENT_SECRET_ENV, GOOGLE_ISSUER,
+    GOOGLE_JWKS_URL, GOOGLE_REDIRECT_LOCALHOST, GOOGLE_REDIRECT_LOOPBACK, GOOGLE_TOKEN_ENDPOINT,
+    OIDC_MODE_ENV,
+};
+pub use oidc::{AgentSvid, IssueGate, MockOidc, MOCK_OIDC_ISSUER, OIDC_AUDIENCE};
+pub use spiffe::{SpiffeId, WorkloadKind, TRUST_DOMAIN};
+pub use ticket::{
+    allow_agent_jit, sign_agent_jit_ticket, sign_ticket, ticket_hash, verify_ticket,
+    Ipv4Destination, SignedTicket, TicketClaims, TicketFlags, TicketSigner, TicketVerifier,
+    VerifiedTicket, FLAG_AGENT_JIT, FLAG_ONE_SHOT,
+};
+
+/// This function returns the name of this crate.
+pub fn crate_name() -> &'static str {
+    "orblx-identity"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::crate_name;
+
+    #[test]
+    fn crate_name_is_stable() {
+        assert_eq!(crate_name(), "orblx-identity");
+    }
+}

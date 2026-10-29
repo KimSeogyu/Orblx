@@ -1,7 +1,7 @@
 # Sim harness
 
 The sim harness runs three levels.
-The crate name is `gyeol-sim`.
+The crate name is `orblx-sim`.
 The harness serves the game.
 The default page is the game.
 The engineering view shows peers, packets, the QUIC path, the SVID, and the ticket.
@@ -41,7 +41,7 @@ Install a stable Rust toolchain.
 Run the harness:
 
 ```bash
-cargo run -p gyeol-sim
+cargo run -p orblx-sim
 ```
 
 Open `http://127.0.0.1:8787`.
@@ -50,13 +50,13 @@ The page is the game.
 Use a different local address when port 8787 is busy:
 
 ```bash
-cargo run -p gyeol-sim -- --listen 127.0.0.1:8790
+cargo run -p orblx-sim -- --listen 127.0.0.1:8790
 ```
 
 Show the command help:
 
 ```bash
-cargo run -p gyeol-sim -- --help
+cargo run -p orblx-sim -- --help
 ```
 
 ## Levels
@@ -68,7 +68,7 @@ Hard runs Radioactive NAT.
 
 - City Breeze. A human signs in with Google. The callback issues an SVID. The human sends an overlay ping. The human opens two HTTPS applications. Press Revoke to drop that SVID. Read the click path in [w17-google-oidc.md](w17-google-oidc.md).
 - Agent JIT. Spawn agent creates the agent SVID. Application A allows the agent. Application B denies the agent. The ticket TTL expiry is visible.
-- Radioactive NAT. UDP block calls `gyeol_edge::run_nat_smash`. Direct fails. The path then uses the TCP Relay. The overlay address is `10.8.0.1`. An SVID revoke drops new packets within 60 seconds. This smash does not upgrade to Direct. Stick and upgrade is in [w13-stick-upgrade.md](w13-stick-upgrade.md).
+- Radioactive NAT. UDP block calls `orblx_edge::run_nat_smash`. Direct fails. The path then uses the TCP Relay. The overlay address is `10.8.0.1`. An SVID revoke drops new packets within 60 seconds. This smash does not upgrade to Direct. Stick and upgrade is in [w13-stick-upgrade.md](w13-stick-upgrade.md).
 
 A passed step has the status `pass`.
 

@@ -1,0 +1,32 @@
+[package]
+name = "orblx-datapath"
+description = "Data path crate for Orblx. This crate encodes frames, moves IPv4 packets over QUIC, routes overlay packets to peers, and forwards two HTTPS apps on the connector path."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "tun-bench"
+path = "src/bin/tun-bench.rs"
+
+# `tun-bench` measures one local TUN round trip.
+# Do not add WireGuard, Headscale, or DERP crates.
+
+[dependencies]
+orblx-crypto = { path = "../orblx-crypto" }
+orblx-identity = { path = "../orblx-identity" }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rand = "0.8"
+rcgen = { version = "=0.14.7", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "logging"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3.36", default-features = false }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+tokio-rustls = { version = "=0.26.2", default-features = false, features = ["ring", "tls12", "logging"] }
+tun = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

@@ -663,142 +663,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gyeol-audit"
-version = "0.1.0"
-dependencies = [
- "gyeol-identity",
- "gyeol-relay",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "gyeol-cli"
-version = "0.1.0"
-dependencies = [
- "gyeol-audit",
- "gyeol-coord",
- "gyeol-crypto",
- "gyeol-datapath",
- "gyeol-edge",
- "gyeol-identity",
- "gyeol-relay",
-]
-
-[[package]]
-name = "gyeol-coord"
-version = "0.1.0"
-dependencies = [
- "base64",
- "ed25519-dalek",
- "gyeol-datapath",
- "gyeol-edge",
- "gyeol-identity",
- "quinn",
- "rand 0.8.8",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tokio-rustls",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "gyeol-crypto"
-version = "0.1.0"
-dependencies = [
- "gyeol-identity",
- "hkdf",
- "hmac",
- "sha2",
-]
-
-[[package]]
-name = "gyeol-datapath"
-version = "0.1.0"
-dependencies = [
- "gyeol-crypto",
- "gyeol-identity",
- "libc",
- "quinn",
- "rand 0.8.8",
- "rcgen",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "time",
- "tokio",
- "tokio-rustls",
- "tun",
-]
-
-[[package]]
-name = "gyeol-edge"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.2.17",
- "gyeol-crypto",
- "gyeol-datapath",
- "gyeol-identity",
- "gyeol-relay",
- "serde_json",
-]
-
-[[package]]
-name = "gyeol-identity"
-version = "0.1.0"
-dependencies = [
- "base64",
- "ed25519-dalek",
- "jsonwebtoken",
- "rand 0.8.8",
- "rcgen",
- "rsa",
- "serde",
- "serde_json",
- "sha2",
- "time",
- "x509-parser",
-]
-
-[[package]]
-name = "gyeol-relay"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.2.17",
-]
-
-[[package]]
-name = "gyeol-sim"
-version = "0.1.0"
-dependencies = [
- "axum",
- "base64",
- "futures",
- "gyeol-audit",
- "gyeol-datapath",
- "gyeol-edge",
- "gyeol-identity",
- "gyeol-relay",
- "jsonwebtoken",
- "rand 0.8.8",
- "rcgen",
- "rsa",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "tokio",
- "tokio-rustls",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1132,6 +996,142 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "orblx-audit"
+version = "0.1.0"
+dependencies = [
+ "orblx-identity",
+ "orblx-relay",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "orblx-cli"
+version = "0.1.0"
+dependencies = [
+ "orblx-audit",
+ "orblx-coord",
+ "orblx-crypto",
+ "orblx-datapath",
+ "orblx-edge",
+ "orblx-identity",
+ "orblx-relay",
+]
+
+[[package]]
+name = "orblx-coord"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "ed25519-dalek",
+ "orblx-datapath",
+ "orblx-edge",
+ "orblx-identity",
+ "quinn",
+ "rand 0.8.8",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "orblx-crypto"
+version = "0.1.0"
+dependencies = [
+ "hkdf",
+ "hmac",
+ "orblx-identity",
+ "sha2",
+]
+
+[[package]]
+name = "orblx-datapath"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "orblx-crypto",
+ "orblx-identity",
+ "quinn",
+ "rand 0.8.8",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tun",
+]
+
+[[package]]
+name = "orblx-edge"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "orblx-crypto",
+ "orblx-datapath",
+ "orblx-identity",
+ "orblx-relay",
+ "serde_json",
+]
+
+[[package]]
+name = "orblx-identity"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "ed25519-dalek",
+ "jsonwebtoken",
+ "rand 0.8.8",
+ "rcgen",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2",
+ "time",
+ "x509-parser",
+]
+
+[[package]]
+name = "orblx-relay"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+]
+
+[[package]]
+name = "orblx-sim"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64",
+ "futures",
+ "jsonwebtoken",
+ "orblx-audit",
+ "orblx-datapath",
+ "orblx-edge",
+ "orblx-identity",
+ "orblx-relay",
+ "rand 0.8.8",
+ "rcgen",
+ "rsa",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots 0.26.11",
+]
 
 [[package]]
 name = "p256"

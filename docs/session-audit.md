@@ -1,8 +1,8 @@
 # Session audit hash chain
 
 The product name is Orblx.
-The command name is gyeol.
-The crate is `gyeol-audit`.
+The command name is orblx.
+The crate is `orblx-audit`.
 The chain records three session events.
 The events are session start, session end, and session deny.
 Each record stores the previous SHA-256 hash.
@@ -14,10 +14,10 @@ The check does not use WireGuard.
 The check does not use Headscale.
 The check does not use DERP.
 
-The Relay session id is `RelaySessionId` from `gyeol-relay`.
+The Relay session id is `RelaySessionId` from `orblx-relay`.
 The frame session id is the datapath frame `session_id`.
-The peer is a SPIFFE ID from `gyeol-identity`.
-The ticket hash is `gyeol_identity::ticket_hash`.
+The peer is a SPIFFE ID from `orblx-identity`.
+The ticket hash is `orblx_identity::ticket_hash`.
 That function returns the first 16 bytes of SHA-256 over the ticket bytes.
 
 ## Export
@@ -28,7 +28,7 @@ The successful session is one start and one end.
 The ids and the times are fixed.
 
 ```bash
-cargo run -p gyeol-cli -- audit demo --out chain.jsonl
+cargo run -p orblx-cli -- audit demo --out chain.jsonl
 ```
 
 The command prints the file path.
@@ -36,11 +36,11 @@ The command prints the tip hash.
 The command prints the start counter.
 The command prints the end counter.
 The command prints the deny counter.
-The demo tip is `7292992ea22a6755b81526c80ae3adfdf601a8753c3a4303b9a3f8509b552e92`.
+The demo tip is `1c3a5250c530008bd15bd9d0eb1e0437acda65dfb26c46adb0dfda66c0f50a6e`.
 
 The demo deny uses these values:
 
-- The peer is `spiffe://gyeol.local/agent/worker`.
+- The peer is `spiffe://orblx.local/agent/worker`.
 - The Relay session id is 16 bytes of `0xde`.
 - The frame session id is 7.
 - The ticket bytes are `w10-deny-ticket`.
@@ -49,7 +49,7 @@ The demo deny uses these values:
 
 The demo session uses these values:
 
-- The peer is `spiffe://gyeol.local/user/ada`.
+- The peer is `spiffe://orblx.local/user/ada`.
 - The Relay session id is 16 bytes of `0x11`.
 - The frame session id is 42.
 - The ticket bytes are `w10-ok-ticket`.
@@ -67,7 +67,7 @@ A deny reason is `destination`, `revoked`, `ticket`, `expired`, or `missing`.
 ## Check
 
 ```bash
-cargo run -p gyeol-cli -- audit verify --file chain.jsonl
+cargo run -p orblx-cli -- audit verify --file chain.jsonl
 ```
 
 A valid file prints `ok`.

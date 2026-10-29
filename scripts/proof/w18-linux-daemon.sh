@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Run three gyeol nodes in Docker.
+# Run three orblx nodes in Docker.
 # Each node pings the other two overlay addresses.
 # One container then restarts and keeps the same overlay IP.
 # The script skips the proof when it is not root.
-# The script needs Docker and a built gyeol binary.
+# The script needs Docker and a built orblx binary.
 
 set -euo pipefail
 
@@ -25,7 +25,7 @@ if ! docker compose version >/dev/null 2>&1; then
 fi
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
-bin="$root/target/debug/gyeol"
+bin="$root/target/debug/orblx"
 compose_file="$root/scripts/proof/compose.w18.yml"
 work=$(mktemp -d)
 image_dir=""
@@ -47,13 +47,13 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ ! -x "$bin" ]]; then
-  cargo build -p gyeol-cli --bin gyeol --manifest-path "$root/Cargo.toml"
+  cargo build -p orblx-cli --bin orblx --manifest-path "$root/Cargo.toml"
 fi
 
 image_dir=$(mktemp -d)
-cp "$bin" "$image_dir/gyeol"
+cp "$bin" "$image_dir/orblx"
 cp "$root/scripts/proof/Dockerfile" "$image_dir/Dockerfile"
-docker build -t gyeol-w18:local "$image_dir"
+docker build -t orblx-w18:local "$image_dir"
 
 mkdir -p "$work/a" "$work/b" "$work/c"
 "$bin" node-issue \
@@ -80,14 +80,14 @@ write_netmap() {
     {
       "name": "${peer1_name}",
       "overlay_ip": "${peer1_ip}",
-      "svid": "spiffe://gyeol.local/node/${peer1_name}",
+      "svid": "spiffe://orblx.local/node/${peer1_name}",
       "endpoints": ["${peer1_underlay}:443"],
       "routes": ["${peer1_ip}/32"]
     },
     {
       "name": "${peer2_name}",
       "overlay_ip": "${peer2_ip}",
-      "svid": "spiffe://gyeol.local/node/${peer2_name}",
+      "svid": "spiffe://orblx.local/node/${peer2_name}",
       "endpoints": ["${peer2_underlay}:443"],
       "routes": ["${peer2_ip}/32"]
     }
@@ -118,13 +118,13 @@ wait_direct() {
   local peer=$2
   local attempt
   for attempt in $(seq 1 40); do
-    if docker compose -f "$compose_file" exec -T "$node" gyeol status | grep -q "peer ${peer} overlay_ip .* path direct "; then
+    if docker compose -f "$compose_file" exec -T "$node" orblx status | grep -q "peer ${peer} overlay_ip .* path direct "; then
       return 0
     fi
     sleep 1
   done
   echo "The path from ${node} to ${peer} is not direct."
-  docker compose -f "$compose_file" exec -T "$node" gyeol status || true
+  docker compose -f "$compose_file" exec -T "$node" orblx status || true
   return 1
 }
 
@@ -136,7 +136,7 @@ ping_peer() {
 }
 
 echo "W18 Linux daemon proof"
-echo "image gyeol-w18:local"
+echo "image orblx-w18:local"
 echo "node a overlay 100.64.0.1 underlay 172.28.18.11"
 echo "node b overlay 100.64.0.2 underlay 172.28.18.12"
 echo "node c overlay 100.64.0.3 underlay 172.28.18.13"
@@ -149,11 +149,11 @@ wait_direct node-c a
 wait_direct node-c b
 
 echo "---- status a ----"
-docker compose -f "$compose_file" exec -T node-a gyeol status
+docker compose -f "$compose_file" exec -T node-a orblx status
 echo "---- status b ----"
-docker compose -f "$compose_file" exec -T node-b gyeol status
+docker compose -f "$compose_file" exec -T node-b orblx status
 echo "---- status c ----"
-docker compose -f "$compose_file" exec -T node-c gyeol status
+docker compose -f "$compose_file" exec -T node-c orblx status
 
 echo "---- ping ----"
 ping_peer node-a 100.64.0.2
@@ -163,7 +163,7 @@ ping_peer node-b 100.64.0.3
 ping_peer node-c 100.64.0.1
 ping_peer node-c 100.64.0.2
 
-overlay_before=$(docker compose -f "$compose_file" exec -T node-b gyeol status | awk '/^overlay_ip / { print $2; exit }')
+overlay_before=$(docker compose -f "$compose_file" exec -T node-b orblx status | awk '/^overlay_ip / { print $2; exit }')
 json_before=$(record_ip "$work/b/node.json")
 echo "---- restart b ----"
 echo "overlay_ip_before ${overlay_before}"
@@ -174,11 +174,11 @@ wait_direct node-b c
 wait_direct node-a b
 wait_direct node-c b
 
-overlay_after=$(docker compose -f "$compose_file" exec -T node-b gyeol status | awk '/^overlay_ip / { print $2; exit }')
+overlay_after=$(docker compose -f "$compose_file" exec -T node-b orblx status | awk '/^overlay_ip / { print $2; exit }')
 json_after=$(record_ip "$work/b/node.json")
-tun_after=$(docker compose -f "$compose_file" exec -T node-b ip -4 -o addr show dev gyeol0 | awk '{ print $4 }')
+tun_after=$(docker compose -f "$compose_file" exec -T node-b ip -4 -o addr show dev orblx0 | awk '{ print $4 }')
 echo "---- status b after restart ----"
-docker compose -f "$compose_file" exec -T node-b gyeol status
+docker compose -f "$compose_file" exec -T node-b orblx status
 echo "overlay_ip_after ${overlay_after}"
 echo "node_json_after ${json_after}"
 echo "tun_address_after ${tun_after}"

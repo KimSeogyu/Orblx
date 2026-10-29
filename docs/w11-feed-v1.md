@@ -1,7 +1,7 @@
 # Feed version 1
 
 The sim harness owns this feed.
-The crate is `gyeol-sim`.
+The crate is `orblx-sim`.
 `StackFeed::drain` returns one JSON object per string.
 The HTTP server sends the same JSON on `GET /events`.
 The same handler also serves `GET /v0/events`.
@@ -47,7 +47,7 @@ The identity kinds are `svid.issued`, `agent.spawned`, `ticket.verified`, `jit.a
 
 ## EdgeNAT kinds
 
-Radioactive NAT UDP block calls `gyeol_edge::run_nat_smash`.
+Radioactive NAT UDP block calls `orblx_edge::run_nat_smash`.
 The call uses `NatDifficulty::Hard`, `NatLevel::RadioactiveNat`, and `NatInjectMode::UdpBlock`.
 `NatEventLog::drain` returns the JSON lines.
 The harness does not build a second NAT state machine.
@@ -83,7 +83,7 @@ The host is `app-a.orblx.test` or `app-b.orblx.test`.
 
 ## Adapters
 
-The harness calls `gyeol-identity` to issue an SVID and a ticket.
+The harness calls `orblx-identity` to issue an SVID and a ticket.
 The harness calls `allow_agent_jit` for application A and application B.
 The harness calls `TrustBundle::authenticate_leaf` for expiry and for revoke.
 The harness calls `DenySet::apply_json` for revoke.
@@ -92,12 +92,12 @@ The harness calls `PathMachine::start_allocate` and `gather_reflexive` for Alloc
 The harness does not call `establish_direct` when UDP is blocked.
 `direct_is_up` stays false.
 The harness then encodes one Relay datagram and one TCP record.
-The harness appends session start, session end, and session deny on the `gyeol-audit` chain.
+The harness appends session start, session end, and session deny on the `orblx-audit` chain.
 
 ## Run
 
 ```bash
-cargo run -p gyeol-sim
+cargo run -p orblx-sim
 ```
 
 Open `http://127.0.0.1:8787`.

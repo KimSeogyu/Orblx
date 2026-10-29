@@ -12,7 +12,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 
-addr="${GYEOL_DEMO_ADDR:-127.0.0.1:8787}"
+addr="${ORBLX_DEMO_ADDR:-127.0.0.1:8787}"
 base="http://${addr}"
 log=$(mktemp)
 work=$(mktemp -d)
@@ -34,7 +34,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "The demo starts the harness at ${base}."
-setsid cargo run -q -p gyeol-sim -- --listen "$addr" >"$log" 2>&1 &
+setsid cargo run -q -p orblx-sim -- --listen "$addr" >"$log" 2>&1 &
 pid=$!
 
 ready=0
@@ -166,7 +166,7 @@ oidc_easy() {
   local page="${work}/login.html"
   local login_code
   login_code=$(curl --silent --show-error --output "$page" --write-out '%{http_code}' \
-    "${base}/oidc/authorize?client_id=gyeol-sim&response_type=code&redirect_uri=%2Foidc%2Fcallback&state=${state}&scope=openid")
+    "${base}/oidc/authorize?client_id=orblx-sim&response_type=code&redirect_uri=%2Foidc%2Fcallback&state=${state}&scope=openid")
   if [[ "$login_code" != "200" ]]; then
     echo "The mock IdP login page returned ${login_code}."
     exit 1
@@ -177,8 +177,8 @@ page, state = sys.argv[1:3]
 text = open(page, encoding="utf-8").read()
 for needle in (
     "Sign in",
-    "https://oidc.gyeol.local",
-    "gyeol-issue",
+    "https://oidc.orblx.local",
+    "orblx-issue",
     "Subject: ada",
     f'value="{state}"',
 ):
@@ -193,7 +193,7 @@ PY
   local post_code
   post_code=$(curl --silent --show-error --dump-header "$headers" --output "$posted" --write-out '%{http_code}' \
     --data-urlencode "subject=ada" \
-    --data-urlencode "client_id=gyeol-sim" \
+    --data-urlencode "client_id=orblx-sim" \
     --data-urlencode "response_type=code" \
     --data-urlencode "redirect_uri=/oidc/callback" \
     --data-urlencode "state=${state}" \

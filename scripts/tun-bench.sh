@@ -55,7 +55,7 @@ if [[ "${1:-}" != "--as-root" ]]; then
       echo "Build target/release/tun-bench before you run this script."
       exit 1
     fi
-    cargo build --release -p gyeol-datapath --bin tun-bench
+    cargo build --release -p orblx-datapath --bin tun-bench
     exec sudo -n --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME "$root/scripts/tun-bench.sh" --as-root
   fi
 fi
@@ -70,7 +70,7 @@ if [[ ! -x "$bin" ]]; then
     echo "Build target/release/tun-bench before you run this script."
     exit 1
   fi
-  cargo build --release -p gyeol-datapath --bin tun-bench
+  cargo build --release -p orblx-datapath --bin tun-bench
 fi
 
 echo "host_uname=$(uname -a)"

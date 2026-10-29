@@ -1,15 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/gyeol-audit",
-    "crates/gyeol-cli",
-    "crates/gyeol-coord",
-    "crates/gyeol-crypto",
-    "crates/gyeol-datapath",
-    "crates/gyeol-edge",
-    "crates/gyeol-identity",
-    "crates/gyeol-relay",
-    "crates/gyeol-sim",
+    "crates/orblx-audit",
+    "crates/orblx-cli",
+    "crates/orblx-coord",
+    "crates/orblx-crypto",
+    "crates/orblx-datapath",
+    "crates/orblx-edge",
+    "crates/orblx-identity",
+    "crates/orblx-relay",
+    "crates/orblx-sim",
 ]
 
 # The data path uses Quinn, rustls, and ring.

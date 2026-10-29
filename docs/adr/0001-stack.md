@@ -1,14 +1,14 @@
-# ADR 0001: The primary stack is gyeol-quic
+# ADR 0001: The primary stack is orblx-quic
 
 - Status: Accepted
 - Date: 2026-10-28
 
 ## Context
 
-gyeol is a low-level overlay network.
+orblx is a low-level overlay network.
 The project must record the primary stack before work starts on the data path.
 The project must record the primary stack before work starts on identity.
-The project must record the primary stack before work starts on the gyeol Relay.
+The project must record the primary stack before work starts on the orblx Relay.
 This record stores the primary stack decision.
 Later ADR files will record the handshake.
 Later ADR files will record NAT traversal.
@@ -16,11 +16,11 @@ Later ADR files will record the crypto design.
 
 ## Decision
 
-The primary stack is gyeol-quic.
-gyeol-quic uses a userspace TUN device.
-gyeol-quic uses QUIC on UDP port 443.
-gyeol-quic uses short SPIFFE SVIDs.
-gyeol-quic uses the gyeol Relay.
+The primary stack is orblx-quic.
+orblx-quic uses a userspace TUN device.
+orblx-quic uses QUIC on UDP port 443.
+orblx-quic uses short SPIFFE SVIDs.
+orblx-quic uses the orblx Relay.
 
 ## Excluded foundations
 

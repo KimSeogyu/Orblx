@@ -6,17 +6,17 @@ This page describes `ORBLX_OIDC_MODE=mock`.
 The harness serves a local OIDC sign-in page on that mode.
 City Breeze uses that page when the mode is mock.
 The page is the browser path for a human SVID.
-The signer is the built-in `MockOidc` in `gyeol-identity`.
+The signer is the built-in `MockOidc` in `orblx-identity`.
 `IssueGate` turns the ID token into the human SVID.
 
 ## Issuer
 
 | Field | Value |
 | --- | --- |
-| Issuer | `https://oidc.gyeol.local` |
-| Audience | `gyeol-issue` |
+| Issuer | `https://oidc.orblx.local` |
+| Audience | `orblx-issue` |
 | Subject | `ada` |
-| Client | `gyeol-sim` |
+| Client | `orblx-sim` |
 | Response type | `code` |
 | Scope | `openid` |
 | Key | Ed25519 |
@@ -24,11 +24,11 @@ The signer is the built-in `MockOidc` in `gyeol-identity`.
 The issuer string is `MOCK_OIDC_ISSUER`.
 The audience string is `OIDC_AUDIENCE`.
 The subject is the City Breeze human `ada`.
-The SVID is `spiffe://gyeol.local/user/ada`.
+The SVID is `spiffe://orblx.local/user/ada`.
 
 ## Click path
 
-1. Start the harness with `cargo run -p gyeol-sim`.
+1. Start the harness with `cargo run -p orblx-sim`.
 2. Open `http://127.0.0.1:8787`.
 3. Click Play City Breeze. Easy in the engineering view opens the same page.
 4. The browser requests `GET /oidc/authorize`.
@@ -48,7 +48,7 @@ The SVID is `spiffe://gyeol.local/user/ada`.
 Use another local address when port 8787 is busy:
 
 ```bash
-cargo run -p gyeol-sim -- --listen 127.0.0.1:8790
+cargo run -p orblx-sim -- --listen 127.0.0.1:8790
 ```
 
 Open `http://127.0.0.1:8790` and follow the same clicks.
@@ -63,7 +63,7 @@ Open `http://127.0.0.1:8790` and follow the same clicks.
 
 `GET /oidc/authorize` requires these query fields:
 
-- `client_id=gyeol-sim`
+- `client_id=orblx-sim`
 - `response_type=code`
 - `redirect_uri` is `/oidc/callback` or the same path on this host
 - `state` is 16 to 128 lowercase hex characters
@@ -106,7 +106,7 @@ The City Breeze kinds stay in this order:
 11. `session_up`
 
 `svid.issued` remains the identity kind for the human SVID.
-The callback detail names the mock IdP and the audience `gyeol-issue`.
+The callback detail names the mock IdP and the audience `orblx-issue`.
 
 ## Demo script
 
@@ -123,10 +123,10 @@ A pass prints `demo pass`.
 ./scripts/demo.sh
 ```
 
-Set `GYEOL_DEMO_ADDR` when port 8787 is busy.
+Set `ORBLX_DEMO_ADDR` when port 8787 is busy.
 
 ```bash
-GYEOL_DEMO_ADDR=127.0.0.1:8790 ./scripts/demo.sh
+ORBLX_DEMO_ADDR=127.0.0.1:8790 ./scripts/demo.sh
 ```
 
 ## Other levels
