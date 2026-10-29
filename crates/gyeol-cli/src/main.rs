@@ -15,6 +15,7 @@ mod direct;
 mod edge;
 mod relay;
 mod ticket_load;
+mod up;
 
 #[derive(Debug)]
 enum Action {
@@ -27,6 +28,7 @@ enum Action {
     Relay(relay::Command),
     Connector(connector::Command),
     Audit(audit::Command),
+    Node(up::Command),
 }
 
 #[derive(Debug)]
@@ -91,6 +93,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Ok(Action::Node(command)) => {
+            if let Err(err) = up::run(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
         Err(err) => {
             eprintln!("{err}");
             std::process::exit(1);
@@ -138,6 +146,18 @@ where
     }
     if args.first().map(String::as_str) == Some("audit") {
         return audit::parse(&args[1..]).map(Action::Audit);
+    }
+    if args.first().map(String::as_str) == Some("up") {
+        return up::parse_up(&args[1..]).map(Action::Node);
+    }
+    if args.first().map(String::as_str) == Some("down") {
+        return up::parse_down(&args[1..]).map(Action::Node);
+    }
+    if args.first().map(String::as_str) == Some("status") {
+        return up::parse_status(&args[1..]).map(Action::Node);
+    }
+    if args.first().map(String::as_str) == Some("node-issue") {
+        return up::parse_issue(&args[1..]).map(Action::Node);
     }
     for arg in &args {
         if arg == "--version" || arg == "-V" {
@@ -379,16 +399,7 @@ mod tests {
                 assert!(command.tun_address.is_none());
                 assert!(command.connect.is_none());
             }
-            Action::Hello
-            | Action::Version
-            | Action::HelpHelloQuic
-            | Action::Edge(_)
-            | Action::Direct(_)
-            | Action::Relay(_)
-            | Action::Connector(_)
-            | Action::Audit(_) => {
-                panic!("the parser did not select hello-quic");
-            }
+            other => panic!("the parser did not select hello-quic: {other:?}"),
         }
     }
 
@@ -420,16 +431,7 @@ mod tests {
                     std::net::Ipv4Addr::new(10, 8, 0, 2)
                 );
             }
-            Action::Hello
-            | Action::Version
-            | Action::HelpHelloQuic
-            | Action::Edge(_)
-            | Action::Direct(_)
-            | Action::Relay(_)
-            | Action::Connector(_)
-            | Action::Audit(_) => {
-                panic!("the parser did not select hello-quic");
-            }
+            other => panic!("the parser did not select hello-quic: {other:?}"),
         }
     }
 

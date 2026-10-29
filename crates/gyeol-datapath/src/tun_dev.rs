@@ -39,6 +39,8 @@ pub struct TunBridge {
     pub from_tun: mpsc::Receiver<Vec<u8>>,
     /// Packets that the TUN device writes.
     pub to_tun: mpsc::Sender<Vec<u8>>,
+    /// The kernel interface name.
+    pub name: String,
 }
 
 /// Open a TUN device and start the packet thread.
@@ -81,9 +83,13 @@ mod linux {
     use super::{tun_capability_note, Duration, HelloError, TunBridge, TunConfig};
     use std::io::ErrorKind;
     use tokio::sync::mpsc::{self, error::TryRecvError};
+    use tun::AbstractDevice;
 
     pub(super) fn open(config: &TunConfig) -> Result<TunBridge, HelloError> {
         let device = open_device(config)?;
+        let name = device
+            .tun_name()
+            .map_err(|err| HelloError::Tun(err.to_string()))?;
         let (from_tun_tx, from_tun_rx) = mpsc::channel(32);
         let (to_tun_tx, to_tun_rx) = mpsc::channel(32);
         std::thread::Builder::new()
@@ -93,6 +99,7 @@ mod linux {
         Ok(TunBridge {
             from_tun: from_tun_rx,
             to_tun: to_tun_tx,
+            name,
         })
     }
 

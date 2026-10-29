@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use gyeol_crypto::TicketRing;
-use gyeol_identity::{decode_certificate_pem, DenySet, SpiffeId, TrustBundle};
+use gyeol_identity::{decode_certificate_pem, leaf_not_after, DenySet, SpiffeId, TrustBundle};
 use rand::RngCore;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -116,9 +116,41 @@ impl HelloEndpoint {
         })
     }
 
+    /// Bind one UDP socket that accepts peers and dials peers.
+    ///
+    /// Call this function inside a Tokio runtime.
+    /// The node daemon uses this socket for every peer.
+    pub fn bind_node(config: HelloConfig, listen: SocketAddr) -> Result<Self, HelloError> {
+        let (server_config, auth) = server_rustls(&config)?;
+        let (client_config, _) = client_rustls(&config)?;
+        let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(server_config)
+            .map_err(|err| HelloError::Tls(err.to_string()))?;
+        let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+        server.transport_config(transport_config());
+        let mut endpoint = quinn::Endpoint::server(server, listen).map_err(io_error)?;
+        let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client_config)
+            .map_err(|err| HelloError::Tls(err.to_string()))?;
+        let mut client = quinn::ClientConfig::new(Arc::new(quic_client));
+        client.transport_config(transport_config());
+        endpoint.set_default_client_config(client);
+        Ok(Self {
+            endpoint,
+            auth: Arc::new(auth),
+        })
+    }
+
     /// Return the local UDP address.
     pub fn local_addr(&self) -> Result<SocketAddr, HelloError> {
         self.endpoint.local_addr().map_err(io_error)
+    }
+
+    /// Close the UDP socket.
+    ///
+    /// Open connections stop.
+    /// `accept_one` returns [`HelloError::EndpointClosed`].
+    pub fn close(&self) {
+        self.endpoint
+            .close(quinn::VarInt::from_u32(0), b"node down");
     }
 
     /// Accept one peer and one bidirectional stream.
@@ -127,7 +159,7 @@ impl HelloEndpoint {
             .endpoint
             .accept()
             .await
-            .ok_or_else(|| HelloError::Quic("The endpoint is closed.".to_string()))?;
+            .ok_or(HelloError::EndpointClosed)?;
         let connection = incoming
             .await
             .map_err(|err| HelloError::Quic(err.to_string()))?;
@@ -277,6 +309,7 @@ pub struct HelloSession {
     connection: quinn::Connection,
     sender: HelloSender,
     receiver: HelloReceiver,
+    peer_not_after: u64,
 }
 
 impl HelloSession {
@@ -284,6 +317,12 @@ impl HelloSession {
     #[must_use]
     pub fn peer_id(&self) -> &SpiffeId {
         self.sender.peer()
+    }
+
+    /// Return the peer leaf `not_after` time as Unix seconds.
+    #[must_use]
+    pub fn peer_not_after(&self) -> u64 {
+        self.peer_not_after
     }
 
     /// Return the local session id.
@@ -435,6 +474,7 @@ async fn bind_session(
         return Err(err);
     }
     let peer = gate.peer().cloned().ok_or(HelloError::PeerNotBound)?;
+    let peer_not_after = leaf_not_after(&leaf).map_err(HelloError::Identity)?;
     let (mut send, mut recv) = open_stream(&connection, role).await?;
     if let Err(err) = exchange_ticket(&mut send, &mut recv, role, auth, &mut gate).await {
         reject_ticket(&connection);
@@ -458,6 +498,7 @@ async fn bind_session(
             gate,
             deny: auth.deny.clone(),
         },
+        peer_not_after,
     })
 }
 
