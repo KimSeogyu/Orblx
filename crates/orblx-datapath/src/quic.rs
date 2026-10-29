@@ -393,6 +393,18 @@ impl HelloSession {
         self.receiver.recv_ipv4().await
     }
 
+    /// Read one IPv4 packet.
+    ///
+    /// CTRL frames stay on the session and are skipped.
+    async fn recv_overlay(&mut self) -> Result<Vec<u8>, HelloError> {
+        loop {
+            match self.receiver.recv_event().await? {
+                SessionEvent::Packet(packet) => return Ok(packet),
+                SessionEvent::Keepalive | SessionEvent::Rekey => {}
+            }
+        }
+    }
+
     /// Wait until the connection closes.
     pub async fn wait_closed(&self) {
         self.connection.closed().await;
@@ -814,15 +826,19 @@ fn auth_from(config: &HelloConfig) -> Auth {
     }
 }
 
-/// Open one hello-quic session and return the elapsed time.
+/// Open one hello-quic session, exchange one ICMP echo, and return the elapsed time.
 ///
 /// The function binds an ephemeral UDP socket.
 /// The function does not open a TUN device.
+/// `src` and `dst` are the overlay addresses in the echo request.
 pub fn measure_hello_rtt(
     config: HelloConfig,
     peer: SocketAddr,
     timeout: Duration,
+    src: std::net::Ipv4Addr,
+    dst: std::net::Ipv4Addr,
 ) -> Result<Duration, HelloError> {
+    let packet = crate::ipv4::icmp_echo_request(src, dst, 1, 1, b"orblx")?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -832,12 +848,16 @@ pub fn measure_hello_rtt(
             config,
             SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)),
         )?;
-        let started = tokio::time::Instant::now();
-        let session = tokio::time::timeout(timeout, endpoint.connect_one(peer))
+        let exchange = async {
+            let mut session = endpoint.connect_one(peer).await?;
+            let started = tokio::time::Instant::now();
+            session.send_ipv4(&packet).await?;
+            let _reply = session.recv_overlay().await?;
+            Ok(started.elapsed())
+        };
+        let elapsed = tokio::time::timeout(timeout, exchange)
             .await
             .map_err(|_| HelloError::Quic("The ping timed out.".to_string()))??;
-        let elapsed = started.elapsed();
-        drop(session);
         endpoint.close();
         Ok(elapsed)
     })

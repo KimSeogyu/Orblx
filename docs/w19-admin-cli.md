@@ -141,14 +141,14 @@ grants 1
 === [C] start node b ===
 === [C] ping after approve ===
 path direct
-rtt_ms 24
+rtt_ms 13
 === [C] status json ===
-{"state":"up","name":"b","overlay_ip":"100.64.0.3","svid":"spiffe://orblx.local/node/b","svid_expiry":1793313243,"peers":[{"name":"a","overlay_ip":"100.64.0.2","path":"stale","svid":"spiffe://orblx.local/node/a","svid_expiry":1793313243},{"name":"owner","overlay_ip":"100.64.0.1","path":"down","svid":"spiffe://orblx.local/node/owner","svid_expiry":null}]}
+{"state":"up","name":"b","overlay_ip":"100.64.0.3","svid":"spiffe://orblx.local/node/b","svid_expiry":1793314255,"peers":[{"name":"a","overlay_ip":"100.64.0.2","path":"direct","svid":"spiffe://orblx.local/node/a","svid_expiry":1793314254},{"name":"owner","overlay_ip":"100.64.0.1","path":"down","svid":"spiffe://orblx.local/node/owner","svid_expiry":null}]}
 === [C] node metrics ===
 # TYPE orblx_node_packets_tx counter
-orblx_node_packets_tx 0
+orblx_node_packets_tx 3
 # TYPE orblx_node_packets_rx counter
-orblx_node_packets_rx 0
+orblx_node_packets_rx 1
 # TYPE orblx_node_sessions gauge
 orblx_node_sessions 1
 === [C] start relay ===
@@ -172,12 +172,14 @@ revoked b
 deny_version 1
 === [C] ping after revoke ===
 The node cannot send packets. The node b is revoked.
-revoke_stop_s 0
+revoke_stop_s 1
 proof_ok
 ```
 
 `jq` on the REAL host parsed the status JSON.
 The node metrics and the Relay metrics returned counters.
+`orblx_node_packets_tx` and `orblx_node_packets_rx` are greater than 0 after the ping.
+The proof stops when either counter stays at 0.
 The NAT kind is `cone` because UDP 443 answered and the proof has no STUN server.
 The ping after revoke stopped in the same second.
 That interval is inside the 60 second limit.

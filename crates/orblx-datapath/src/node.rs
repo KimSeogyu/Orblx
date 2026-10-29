@@ -25,6 +25,7 @@ use crate::dns::{
     refresh_resolver, serve_dns, DnsTable, LinkResolverGuard, PeerVisibility, ResolvConfForwarder,
     DNS_PORT,
 };
+use crate::ipv4::icmp_echo_reply;
 #[cfg(target_os = "macos")]
 use crate::netmap::{ipv4_mask, parse_cidr};
 use crate::netmap::{parse_ipv4, Netmap, NetmapPeer};
@@ -1036,6 +1037,11 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     Ok(SessionEvent::Packet(packet)) => {
                         on_rx();
                         counters.rx.fetch_add(1, Ordering::Relaxed);
+                        if let Some(reply) = icmp_echo_reply(&packet) {
+                            if sender.send_ipv4(&reply).await.is_ok() {
+                                counters.tx.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                         if to_tun.send(packet).await.is_err() {
                             return;
                         }

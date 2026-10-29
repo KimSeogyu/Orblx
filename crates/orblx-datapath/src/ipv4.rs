@@ -36,6 +36,98 @@ pub fn ipv4_destination(packet: &[u8]) -> Option<Ipv4Addr> {
     ))
 }
 
+/// Build one ICMP echo request.
+///
+/// The packet uses protocol 1.
+/// The IP checksum and the ICMP checksum are set.
+pub fn icmp_echo_request(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    ident: u16,
+    seq: u16,
+    payload: &[u8],
+) -> Result<Vec<u8>, HelloError> {
+    let icmp_len = 8usize
+        .checked_add(payload.len())
+        .ok_or(HelloError::NotIpv4)?;
+    let total = 20usize.checked_add(icmp_len).ok_or(HelloError::NotIpv4)?;
+    if total > 65_535 {
+        return Err(HelloError::NotIpv4);
+    }
+    let total_u16 = u16::try_from(total).map_err(|_| HelloError::NotIpv4)?;
+    let mut packet = vec![0u8; total];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&total_u16.to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 1;
+    packet[12..16].copy_from_slice(&src.octets());
+    packet[16..20].copy_from_slice(&dst.octets());
+    write_internet_checksum(&mut packet[..20]);
+    packet[20] = 8;
+    packet[24..26].copy_from_slice(&ident.to_be_bytes());
+    packet[26..28].copy_from_slice(&seq.to_be_bytes());
+    packet[28..].copy_from_slice(payload);
+    write_internet_checksum(&mut packet[20..]);
+    Ok(packet)
+}
+
+/// Build the ICMP echo reply for one echo request.
+///
+/// The function returns `None` when `request` is not an echo request.
+pub(crate) fn icmp_echo_reply(request: &[u8]) -> Option<Vec<u8>> {
+    if !is_ipv4_packet(request) || request[9] != 1 {
+        return None;
+    }
+    let header_len = usize::from(request[0] & 0x0f) * 4;
+    let icmp = request.get(header_len..)?;
+    if icmp.len() < 8 || icmp[0] != 8 {
+        return None;
+    }
+    let mut reply = request.to_vec();
+    let source = [reply[12], reply[13], reply[14], reply[15]];
+    reply.copy_within(16..20, 12);
+    reply[16..20].copy_from_slice(&source);
+    reply[10] = 0;
+    reply[11] = 0;
+    write_internet_checksum(&mut reply[..header_len]);
+    reply[header_len] = 0;
+    reply[header_len + 2] = 0;
+    reply[header_len + 3] = 0;
+    write_internet_checksum(&mut reply[header_len..]);
+    Some(reply)
+}
+
+fn write_internet_checksum(data: &mut [u8]) {
+    if data.len() < 2 {
+        return;
+    }
+    let sum = internet_sum(data);
+    let checksum = (!sum).to_be_bytes();
+    if data.len() >= 20 && data[0] >> 4 == 4 {
+        data[10] = checksum[0];
+        data[11] = checksum[1];
+        return;
+    }
+    data[2] = checksum[0];
+    data[3] = checksum[1];
+}
+
+fn internet_sum(data: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut index = 0;
+    while index + 1 < data.len() {
+        sum += u32::from(u16::from_be_bytes([data[index], data[index + 1]]));
+        index += 2;
+    }
+    if index < data.len() {
+        sum += u32::from(data[index]) << 8;
+    }
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    u16::try_from(sum).unwrap_or(0xffff)
+}
+
 /// Build one IPv4 packet with a 20-byte header.
 ///
 /// The checksum field is zero.
