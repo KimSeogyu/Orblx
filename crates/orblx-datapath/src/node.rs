@@ -30,7 +30,7 @@ use crate::netmap::{ipv4_mask, parse_cidr};
 use crate::netmap::{parse_ipv4, Netmap, NetmapPeer};
 use crate::quic::HelloEndpoint;
 use crate::router::{route_packet, RouterTable};
-use crate::tun_dev::{open_tun, TunConfig, LINUX_TUN_NAME};
+use crate::tun_dev::{open_tun, TunConfig};
 use crate::{HelloConfig, HelloError, HelloSession};
 
 /// The node record file in the state directory.
@@ -750,7 +750,7 @@ fn process_is_running(pid: u32) -> bool {
 
 #[cfg(target_os = "linux")]
 fn tun_device_name() -> Option<String> {
-    Some(LINUX_TUN_NAME.to_string())
+    Some(crate::tun_dev::LINUX_TUN_NAME.to_string())
 }
 
 #[cfg(target_os = "macos")]
