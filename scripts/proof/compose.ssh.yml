@@ -1,0 +1,98 @@
+# Three Linux nodes on one bridge.
+# The proof script builds the image orblx-ssh:local and sets the SSH_* paths.
+# Each node accepts SSH on its overlay address.
+# The containers stand in for other hosts.
+
+name: orblx-ssh
+
+services:
+  node-a:
+    image: orblx-ssh:local
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    volumes:
+      - ${SSH_STATE_A}:/var/lib/orblx
+      - ${SSH_NETMAP_A}:/etc/orblx/netmap.json:ro
+      - ${SSH_USERS}:/var/lib/orblx-id/users:ro
+      - ${SSH_AGENTS}:/var/lib/orblx-id/agents:ro
+      - ${SSH_PEERS}:/var/lib/orblx-peers:ro
+    command:
+      - up
+      - --netmap
+      - /etc/orblx/netmap.json
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+    stop_grace_period: 10s
+    networks:
+      orblx:
+        ipv4_address: 172.28.19.11
+
+  node-b:
+    image: orblx-ssh:local
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    volumes:
+      - ${SSH_STATE_B}:/var/lib/orblx
+      - ${SSH_NETMAP_B}:/etc/orblx/netmap.json:ro
+      - ${SSH_USERS}:/var/lib/orblx-id/users:ro
+      - ${SSH_AGENTS}:/var/lib/orblx-id/agents:ro
+      - ${SSH_PEERS}:/var/lib/orblx-peers:ro
+    command:
+      - up
+      - --netmap
+      - /etc/orblx/netmap.json
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+    stop_grace_period: 10s
+    networks:
+      orblx:
+        ipv4_address: 172.28.19.12
+
+  node-c:
+    image: orblx-ssh:local
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    volumes:
+      - ${SSH_STATE_C}:/var/lib/orblx
+      - ${SSH_NETMAP_C}:/etc/orblx/netmap.json:ro
+      - ${SSH_USERS}:/var/lib/orblx-id/users:ro
+      - ${SSH_AGENTS}:/var/lib/orblx-id/agents:ro
+      - ${SSH_PEERS}:/var/lib/orblx-peers:ro
+    command:
+      - up
+      - --netmap
+      - /etc/orblx/netmap.json
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+    stop_grace_period: 10s
+    networks:
+      orblx:
+        ipv4_address: 172.28.19.13
+
+networks:
+  orblx:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.19.0/24

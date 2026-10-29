@@ -20,6 +20,7 @@ mod netcheck;
 mod ping;
 mod policy;
 mod relay;
+mod ssh;
 mod status;
 mod ticket_load;
 mod up;
@@ -40,6 +41,7 @@ enum Action {
     Coord(coord::Command),
     Login(login::Command),
     Policy(policy::Command),
+    Ssh(ssh::Command),
     Admin(admin::Command),
     Netcheck(netcheck::Command),
     Ping(ping::Command),
@@ -127,6 +129,12 @@ fn main() {
         }
         Ok(Action::Policy(command)) => {
             if let Err(err) = policy::run(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
+        Ok(Action::Ssh(command)) => {
+            if let Err(err) = ssh::run(command) {
                 eprintln!("{err}");
                 std::process::exit(1);
             }
@@ -232,6 +240,9 @@ where
     }
     if args.first().map(String::as_str) == Some("policy") {
         return policy::parse(&args[1..]).map(Action::Policy);
+    }
+    if args.first().map(String::as_str) == Some("ssh") {
+        return ssh::parse(&args[1..]).map(Action::Ssh);
     }
     for arg in &args {
         if arg == "--version" || arg == "-V" {

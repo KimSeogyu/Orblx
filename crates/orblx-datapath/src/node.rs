@@ -136,6 +136,11 @@ pub struct NodeRequest {
     /// [`crate::GrantPeers`] hides peers the signed grants do not let this node reach.
     /// [`crate::AllowPeers`] allows every peer when the node has no grant file.
     pub visibility: Arc<dyn PeerVisibility>,
+    /// Runs after the overlay address is ready.
+    ///
+    /// The node daemon starts SSH from this hook.
+    /// `None` starts no extra listener.
+    pub on_ready: Option<Box<dyn FnOnce(Ipv4Addr) + Send>>,
     /// Loopback Prometheus address.
     ///
     /// `None` does not open the metrics port.
@@ -289,7 +294,7 @@ pub fn running_pid(state_dir: &Path) -> Option<u32> {
 
 /// Run the node until the process receives SIGINT or SIGTERM.
 pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
-    let prepared = prepare_node(request)?;
+    let mut prepared = prepare_node(request)?;
     let install = prepared
         .router
         .install_cidrs(prepared.request.accept_routes);
@@ -313,6 +318,11 @@ pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
     );
     println!("The TUN device is {}.", bridge.name);
     announce_renew(&prepared.request);
+    let overlay =
+        parse_ipv4(&prepared.record.overlay_ip).map_err(|err| HelloError::Node(err.to_string()))?;
+    if let Some(on_ready) = prepared.request.on_ready.take() {
+        on_ready(overlay);
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -331,7 +341,7 @@ pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
 /// Call this function inside a Tokio runtime.
 /// The function does not open a TUN device.
 pub async fn run_memory_node(request: NodeRequest, device: MemoryDevice) -> Result<(), HelloError> {
-    let prepared = prepare_node(request)?;
+    let mut prepared = prepare_node(request)?;
     println!("The overlay IP is {}.", prepared.record.overlay_ip);
     println!(
         "The state directory is {}.",
@@ -339,6 +349,11 @@ pub async fn run_memory_node(request: NodeRequest, device: MemoryDevice) -> Resu
     );
     println!("The TUN device is memory.");
     announce_renew(&prepared.request);
+    let overlay =
+        parse_ipv4(&prepared.record.overlay_ip).map_err(|err| HelloError::Node(err.to_string()))?;
+    if let Some(on_ready) = prepared.request.on_ready.take() {
+        on_ready(overlay);
+    }
     run_mesh(prepared, device.from_tun, device.to_tun, None).await
 }
 
