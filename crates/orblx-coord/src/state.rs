@@ -129,6 +129,8 @@ pub struct EnrollResult {
     pub signed_netmap: SignedNetmap,
     pub signed_grants: SignedGrants,
     pub endpoints: Vec<SignedEndpoint>,
+    pub approved_routes: Vec<String>,
+    pub advertised_routes: Vec<String>,
 }
 
 impl std::fmt::Debug for EnrollResult {
@@ -150,6 +152,10 @@ pub struct NetmapView {
     pub signed_grants: SignedGrants,
     pub endpoints: Vec<SignedEndpoint>,
     pub netmap_public: [u8; 32],
+    /// Advertised CIDRs that the policy approved for this node.
+    pub approved_routes: Vec<String>,
+    /// Every CIDR this node advertised, including held routes.
+    pub advertised_routes: Vec<String>,
 }
 
 /// Files a node keeps after enrollment.
@@ -326,6 +332,30 @@ impl Coordinator {
         sign_view(&inner, name)
     }
 
+    /// Store advertised subnet routes and return a fresh signed netmap.
+    ///
+    /// The signed netmap contains a route only when [`Policy::approves_route`] allows it.
+    pub fn advertise_routes(
+        &self,
+        name: &str,
+        routes: &[String],
+    ) -> Result<NetmapView, CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        inner.store.set_routes(name, routes)?;
+        let view = sign_view(&inner, name)?;
+        println!("advertise {name} approved {}", view.approved_routes.len());
+        for route in &view.approved_routes {
+            println!("approved route {route}");
+        }
+        for route in &view.advertised_routes {
+            if !view.approved_routes.iter().any(|item| item == route) {
+                println!("held route {route}");
+            }
+        }
+        Ok(view)
+    }
+
     pub fn tls_material(&self) -> Result<TlsMaterial, CoordError> {
         let inner = self.lock()?;
         Ok(TlsMaterial {
@@ -478,6 +508,8 @@ fn finish_enroll(
         signed_netmap: view.signed_netmap,
         signed_grants: view.signed_grants,
         endpoints: view.endpoints,
+        approved_routes: view.approved_routes,
+        advertised_routes: view.advertised_routes,
     })
 }
 
@@ -499,6 +531,8 @@ fn issue_leaf(inner: &mut Inner, name: &str, now: SystemTime) -> Result<EnrollRe
         signed_netmap: view.signed_netmap,
         signed_grants: view.signed_grants,
         endpoints: view.endpoints,
+        approved_routes: view.approved_routes,
+        advertised_routes: view.advertised_routes,
     })
 }
 
@@ -522,7 +556,7 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
             overlay_ip: node.overlay_ip.clone(),
             svid: node.svid.clone(),
             endpoints: node.endpoints.clone(),
-            routes: node.routes.clone(),
+            routes: published_routes(&inner.policy, &node.svid, &node.routes),
         });
     }
     let payload = Netmap {
@@ -544,12 +578,26 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
     for endpoint in &endpoints {
         verify_signed_endpoint(endpoint, &netmap_public)?;
     }
+    let approved_routes = published_routes(&inner.policy, &self_node.svid, &self_node.routes);
     Ok(NetmapView {
         signed_netmap,
         signed_grants,
         endpoints,
         netmap_public,
+        approved_routes,
+        advertised_routes: self_node.routes.clone(),
     })
+}
+
+fn published_routes(policy: &Policy, svid: &str, routes: &[String]) -> Vec<String> {
+    let Ok(id) = SpiffeId::parse(svid) else {
+        return Vec::new();
+    };
+    routes
+        .iter()
+        .filter(|route| policy.approves_route(&id, route))
+        .cloned()
+        .collect()
 }
 
 fn owner_from_oidc(

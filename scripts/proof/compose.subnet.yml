@@ -1,0 +1,128 @@
+# Subnet route proof.
+# The coordinator, the router, and the client share the proof network.
+# The router and the LAN device share the lan network.
+# The LAN device has no overlay.
+
+name: orblx-subnet-proof
+
+services:
+  coord:
+    image: orblx-subnet:local
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /var/lib/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+    volumes:
+      - ${SUBNET_COORD_STATE:?set SUBNET_COORD_STATE}:/var/lib/orblx
+      - ${SUBNET_POLICY:?set SUBNET_POLICY}:/var/lib/orblx/policy.hujson:ro
+    networks:
+      proof:
+        ipv4_address: 172.30.18.2
+
+  tool:
+    image: orblx-subnet:local
+    profiles: ["tool"]
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    volumes:
+      - ${SUBNET_TOOL_STATE:?set SUBNET_TOOL_STATE}:/var/lib/orblx
+      - ${SUBNET_COORD_STATE:?set SUBNET_COORD_STATE}:/coord-state:ro
+    networks:
+      - proof
+
+  router:
+    image: orblx-subnet:local
+    profiles: ["nodes"]
+    # The router writes ip_forward and iptables. The container needs a writable /proc/sys.
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    volumes:
+      - ${SUBNET_ROUTER_STATE:?set SUBNET_ROUTER_STATE}:/var/lib/orblx
+      - ${SUBNET_ROUTER_NETMAP:?set SUBNET_ROUTER_NETMAP}:/etc/orblx/netmap.json:ro
+    command:
+      - up
+      - --netmap
+      - /etc/orblx/netmap.json
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --advertise-routes
+      - 10.88.0.0/24
+    stop_grace_period: 10s
+    networks:
+      proof:
+        ipv4_address: 172.30.18.3
+      lan:
+        ipv4_address: 10.88.0.2
+
+  client:
+    image: orblx-subnet:local
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    volumes:
+      - ${SUBNET_CLIENT_STATE:?set SUBNET_CLIENT_STATE}:/var/lib/orblx
+      - ${SUBNET_CLIENT_NETMAP:?set SUBNET_CLIENT_NETMAP}:/etc/orblx/netmap.json:ro
+    command:
+      - up
+      - --netmap
+      - /etc/orblx/netmap.json
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --accept-routes
+    stop_grace_period: 10s
+    networks:
+      proof:
+        ipv4_address: 172.30.18.4
+
+  lan:
+    image: busybox:1.36
+    profiles: ["nodes"]
+    command:
+      - sh
+      - -c
+      - mkdir -p /www && echo lan-ok > /www/index.html && httpd -f -p 80 -h /www
+    networks:
+      lan:
+        ipv4_address: 10.88.0.5
+
+networks:
+  proof:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.18.0/24
+          gateway: 172.30.18.1
+  lan:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.88.0.0/24
+          gateway: 10.88.0.1

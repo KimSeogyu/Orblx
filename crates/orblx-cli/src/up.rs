@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use orblx_coord::renew_svid_blocking;
+use orblx_coord::{advertise_routes_blocking, renew_svid_blocking};
 use orblx_crypto::{mac_input, ticket_mac};
 use orblx_datapath::{
     read_status_text, run_node, running_pid, HelloConfig, Netmap, NodeRequest, RenewedLeaf,
@@ -44,10 +44,14 @@ pub(crate) enum Command {
 
 pub(crate) struct UpOptions {
     pub(crate) netmap: PathBuf,
+    pub(crate) netmap_set: bool,
     pub(crate) state_dir: PathBuf,
     pub(crate) listen: SocketAddr,
-    pub(crate) coord: Option<String>,
+    pub(crate) accept_routes: bool,
+    pub(crate) advertise_routes: Vec<String>,
+    pub(crate) coord: Option<SocketAddr>,
     pub(crate) coord_name: Option<String>,
+    pub(crate) bundle: Option<PathBuf>,
 }
 
 pub(crate) struct StateOptions {
@@ -68,6 +72,8 @@ impl std::fmt::Debug for Command {
                 .field("netmap", &options.netmap)
                 .field("state_dir", &options.state_dir)
                 .field("listen", &options.listen)
+                .field("accept_routes", &options.accept_routes)
+                .field("advertise_routes", &options.advertise_routes.len())
                 .field("coord", &options.coord)
                 .finish(),
             Self::Down(options) | Self::Status(options) => formatter
@@ -90,31 +96,51 @@ pub(crate) fn parse_up(args: &[String]) -> Result<Command, String> {
     let mut netmap = None;
     let mut state_dir = None;
     let mut listen = None;
+    let mut accept_routes = false;
+    let mut advertise_routes = Vec::new();
     let mut coord = None;
     let mut coord_name = None;
+    let mut bundle = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
         index += 1;
+        if flag == "--accept-routes" {
+            accept_routes = true;
+            continue;
+        }
         let value = take_value(args, &mut index)?;
         match flag {
             "--netmap" => netmap = Some(PathBuf::from(value)),
             "--state-dir" => state_dir = Some(PathBuf::from(value)),
             "--listen" => listen = Some(parse_socket(&value, DEFAULT_UDP_PORT)?),
-            "--coord" => coord = Some(value),
+            "--advertise-routes" => advertise_routes.push(value),
+            "--coord" => coord = Some(parse_socket(&value, 443)?),
             "--coord-name" => coord_name = Some(value),
+            "--bundle" => bundle = Some(PathBuf::from(value)),
             other => return Err(format!("The flag {other} is not valid.\n{}", help_text())),
         }
     }
     let state_dir = state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR));
+    let netmap_set = netmap.is_some();
     let netmap = netmap.unwrap_or_else(|| state_dir.join("netmap.json"));
+    if !advertise_routes.is_empty() && coord.is_some() && bundle.is_none() {
+        return Err(format!("The command needs --bundle.\n{}", help_text()));
+    }
+    if accept_routes && coord.is_some() && bundle.is_none() && advertise_routes.is_empty() {
+        return Err(format!("The command needs --bundle.\n{}", help_text()));
+    }
     Ok(Command::Up(UpOptions {
         netmap,
+        netmap_set,
         state_dir,
         listen: listen
             .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_UDP_PORT))),
+        accept_routes,
+        advertise_routes,
         coord,
         coord_name,
+        bundle,
     }))
 }
 
@@ -170,7 +196,8 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
 }
 
 fn run_up(options: UpOptions) -> Result<(), String> {
-    let netmap = Netmap::from_path(&options.netmap).map_err(|err| err.to_string())?;
+    let (netmap_path, forward_routes) = publish_routes(&options)?;
+    let netmap = Netmap::from_path(&netmap_path).map_err(|err| err.to_string())?;
     let config = load_config(&options.state_dir)?;
     let renew = load_renewer(&options.state_dir, options.coord, options.coord_name)?;
     run_node(NodeRequest {
@@ -180,13 +207,15 @@ fn run_up(options: UpOptions) -> Result<(), String> {
         state_dir: options.state_dir,
         renew,
         stop: None,
+        accept_routes: options.accept_routes,
+        forward_routes,
     })
     .map_err(|err| err.to_string())
 }
 
 fn load_renewer(
     state: &Path,
-    coord: Option<String>,
+    coord: Option<SocketAddr>,
     coord_name: Option<String>,
 ) -> Result<Option<SvidRenewer>, String> {
     let address = match coord {
@@ -197,12 +226,13 @@ fn load_renewer(
                 return Ok(None);
             }
             let text = read_text(&path)?;
-            text.trim().to_string()
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            resolve_coord(trimmed)?
         }
     };
-    if address.is_empty() {
-        return Ok(None);
-    }
     let name = match coord_name {
         Some(value) => value,
         None => {
@@ -222,12 +252,11 @@ fn load_renewer(
     };
     let state = state.to_path_buf();
     Ok(Some(SvidRenewer::new(move || {
-        renew_from_coord(&state, &address, &name)
+        renew_from_coord(&state, address, &name)
     })))
 }
 
-fn renew_from_coord(state: &Path, address: &str, name: &str) -> Result<RenewedLeaf, String> {
-    let coord = resolve_coord(address)?;
+fn renew_from_coord(state: &Path, coord: SocketAddr, name: &str) -> Result<RenewedLeaf, String> {
     let bundle = read_text(&state.join(BUNDLE_FILE))?;
     let result = renew_svid_blocking(coord, name, &bundle, state).map_err(|err| err.to_string())?;
     Ok(RenewedLeaf {
@@ -246,6 +275,53 @@ fn resolve_coord(text: &str) -> Result<SocketAddr, String> {
     addrs
         .next()
         .ok_or_else(|| format!("The coordinator address {text} is not valid."))
+}
+
+fn publish_routes(options: &UpOptions) -> Result<(PathBuf, Vec<String>), String> {
+    if options.advertise_routes.is_empty() && !(options.accept_routes && options.coord.is_some()) {
+        return Ok((options.netmap.clone(), options.advertise_routes.clone()));
+    }
+    let Some(coord) = options.coord else {
+        return Ok((options.netmap.clone(), options.advertise_routes.clone()));
+    };
+    let bundle = options
+        .bundle
+        .as_ref()
+        .ok_or_else(|| format!("The command needs --bundle.\n{}", help_text()))?;
+    let bundle_pem = fs::read_to_string(bundle)
+        .map_err(|err| format!("The file {} did not open. {err}", bundle.display()))?;
+    let coord_name = options.coord_name.as_deref().unwrap_or("coord");
+    if options.advertise_routes.is_empty() {
+        orblx_coord::fetch_netmap_blocking(coord, coord_name, &bundle_pem, &options.state_dir)
+            .map_err(|err| err.to_string())?;
+        println!("The node uses the coordinator netmap.");
+        return Ok((options.state_dir.join("netmap.json"), Vec::new()));
+    }
+    let view = advertise_routes_blocking(
+        coord,
+        coord_name,
+        &bundle_pem,
+        &options.state_dir,
+        &options.advertise_routes,
+    )
+    .map_err(|err| err.to_string())?;
+    for route in &view.approved_routes {
+        println!("approved route {route}");
+    }
+    for route in &view.advertised_routes {
+        if !view.approved_routes.iter().any(|item| item == route) {
+            println!("held route {route}");
+        }
+    }
+    let path = if options.netmap_set {
+        fs::copy(options.state_dir.join("netmap.json"), &options.netmap)
+            .map_err(|err| format!("The netmap file was not written. {err}"))?;
+        options.netmap.clone()
+    } else {
+        options.state_dir.join("netmap.json")
+    };
+    println!("The node uses the coordinator netmap.");
+    Ok((path, view.approved_routes))
 }
 
 fn run_down(options: StateOptions) -> Result<(), String> {
@@ -417,7 +493,7 @@ fn wants_help(args: &[String]) -> bool {
 fn help_text() -> String {
     format!(
         "\
-orblx up [--netmap FILE] [--state-dir DIR] [--listen ADDR] [--coord ADDR] [--coord-name NAME]
+orblx up [--netmap FILE] [--state-dir DIR] [--listen ADDR] [--accept-routes] [--advertise-routes CIDR] [--coord ADDR] [--bundle FILE] [--coord-name NAME]
 orblx down [--state-dir DIR]
 orblx status [--state-dir DIR]
 orblx node-issue --out DIR --node NAME=OVERLAY_IP [--node NAME=OVERLAY_IP ...]
@@ -439,6 +515,12 @@ The path kind is down when the session is down.
 The node renews the SVID from the coordinator at two thirds of the certificate life.
 The coordinator address is --coord or the file coord-addr in the state directory.
 The command does not print the private key or a token.
+--advertise-routes sends the CIDR to the coordinator when --coord and --bundle are set.
+The coordinator publishes a route after the policy approves it.
+A route that the policy does not approve stays off the signed netmap.
+--accept-routes installs approved subnet routes on the TUN device.
+The node does not install 0.0.0.0/0.
+The router forwards an approved local subnet with kernel masquerade.
 "
     )
 }
@@ -500,6 +582,8 @@ mod tests {
                     SocketAddr::from((Ipv4Addr::UNSPECIFIED, 443))
                 );
                 assert_eq!(options.netmap, PathBuf::from("netmap.json"));
+                assert!(!options.accept_routes);
+                assert!(options.advertise_routes.is_empty());
             }
             Command::Help(_) | Command::Down(_) | Command::Status(_) | Command::Issue(_) => {
                 panic!("the parser did not select up");
@@ -516,6 +600,29 @@ mod tests {
                     options.netmap,
                     PathBuf::from(DEFAULT_STATE_DIR).join("netmap.json")
                 );
+                assert!(!options.netmap_set);
+            }
+            Command::Help(_) | Command::Down(_) | Command::Status(_) | Command::Issue(_) => {
+                panic!("the parser did not select up");
+            }
+        }
+    }
+
+    #[test]
+    fn up_accepts_route_flags() {
+        let command = parse_up(&[
+            "--accept-routes".to_string(),
+            "--advertise-routes".to_string(),
+            "10.88.0.0/24".to_string(),
+            "--advertise-routes".to_string(),
+            "10.99.0.0/24".to_string(),
+        ])
+        .unwrap();
+        match command {
+            Command::Up(options) => {
+                assert!(options.accept_routes);
+                assert_eq!(options.advertise_routes.len(), 2);
+                assert!(options.coord.is_none());
             }
             Command::Help(_) | Command::Down(_) | Command::Status(_) | Command::Issue(_) => {
                 panic!("the parser did not select up");

@@ -40,6 +40,10 @@ pub struct Response {
     pub endpoints: Option<Vec<SignedEndpoint>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grants: Option<SignedGrants>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_routes: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertised_routes: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for Response {

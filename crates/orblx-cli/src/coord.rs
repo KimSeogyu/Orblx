@@ -9,8 +9,8 @@ use orblx_identity::{OidcMode, GOOGLE_CLIENT_ID_ENV, MAX_USER_TTL};
 
 use super::{parse_socket, take_value};
 use orblx_coord::{
-    enroll_with_token_blocking, fetch_netmap_blocking, oidc_config, serve_blocking, Coordinator,
-    OidcConfig,
+    advertise_routes_blocking, enroll_with_token_blocking, fetch_netmap_blocking, oidc_config,
+    serve_blocking, Coordinator, OidcConfig,
 };
 
 const DEFAULT_PORT: u16 = 443;
@@ -46,6 +46,13 @@ pub(crate) enum Command {
         bundle: PathBuf,
         state: PathBuf,
     },
+    Advertise {
+        coord: SocketAddr,
+        coord_name: String,
+        bundle: PathBuf,
+        state: PathBuf,
+        routes: Vec<String>,
+    },
 }
 
 pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
@@ -57,6 +64,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         "token" => parse_token(&args[1..]),
         "enroll" => parse_enroll(&args[1..]),
         "netmap" => parse_netmap(&args[1..]),
+        "advertise" => parse_advertise(&args[1..]),
         other => Err(format!("The mode {other} is not valid.\n{}", help())),
     }
 }
@@ -139,6 +147,28 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             result.write_state(&state).map_err(|err| err.to_string())?;
             remember_coord(&state, coord, &coord_name)?;
             print_enrolled(&result);
+            Ok(())
+        }
+        Command::Advertise {
+            coord,
+            coord_name,
+            bundle,
+            state,
+            routes,
+        } => {
+            let bundle_pem = fs::read_to_string(&bundle)
+                .map_err(|err| format!("The file {} did not open. {err}", bundle.display()))?;
+            let view = advertise_routes_blocking(coord, &coord_name, &bundle_pem, &state, &routes)
+                .map_err(|err| err.to_string())?;
+            for route in &view.approved_routes {
+                println!("approved route {route}");
+            }
+            for route in &view.advertised_routes {
+                if !view.approved_routes.iter().any(|item| item == route) {
+                    println!("held route {route}");
+                }
+            }
+            println!("advertised {}", view.advertised_routes.len());
             Ok(())
         }
         Command::Netmap {
@@ -346,6 +376,38 @@ fn parse_enroll(args: &[String]) -> Result<Command, String> {
     })
 }
 
+fn parse_advertise(args: &[String]) -> Result<Command, String> {
+    let mut coord = None;
+    let mut coord_name = None;
+    let mut bundle = None;
+    let mut state = None;
+    let mut routes = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        index += 1;
+        let value = take_value(args, &mut index)?;
+        match flag {
+            "--coord" => coord = Some(parse_socket(&value, DEFAULT_PORT)?),
+            "--coord-name" => coord_name = Some(value),
+            "--bundle" => bundle = Some(PathBuf::from(value)),
+            "--state" => state = Some(PathBuf::from(value)),
+            "--route" => routes.push(value),
+            other => return Err(format!("The flag {other} is not valid.\n{}", help())),
+        }
+    }
+    if routes.is_empty() {
+        return Err(format!("The command needs --route.\n{}", help()));
+    }
+    Ok(Command::Advertise {
+        coord: coord.ok_or_else(|| "The command needs --coord.".to_string())?,
+        coord_name: coord_name.unwrap_or_else(|| "coord".to_string()),
+        bundle: bundle.ok_or_else(|| "The command needs --bundle.".to_string())?,
+        state: state.ok_or_else(|| "The command needs --state.".to_string())?,
+        routes,
+    })
+}
+
 fn parse_netmap(args: &[String]) -> Result<Command, String> {
     let mut coord = None;
     let mut coord_name = None;
@@ -377,6 +439,7 @@ fn help() -> String {
 orblx coord serve --state DIR [--listen ADDR] [--name NAME] [--policy FILE]
 orblx coord token create --state DIR --out FILE [--ttl SECS]
 orblx coord enroll --name NAME --coord ADDR --bundle FILE --token-file FILE --state DIR [--coord-name NAME] [--endpoint HOST:PORT] [--route CIDR]
+orblx coord advertise --coord ADDR --bundle FILE --state DIR --route CIDR [--route CIDR] [--coord-name NAME]
 orblx coord netmap --coord ADDR --bundle FILE --state DIR [--coord-name NAME]
 
 The coordinator listens with QUIC.
@@ -393,6 +456,10 @@ The enroll command stores the coordinator address in the state directory.
 The default policy file is DIR/policy.hujson.
 A failed policy test keeps the last good policy.
 The coordinator logs one error line for that failure.
+orblx coord advertise stores subnet CIDRs for an enrolled node.
+The signed netmap includes a route after the policy approves it.
+A route that the policy does not approve stays out of the signed netmap.
+The route 0.0.0.0/0 is an exit route.
 "
     .to_string()
 }
@@ -429,7 +496,8 @@ mod tests {
             Command::Help
             | Command::TokenCreate { .. }
             | Command::Enroll { .. }
-            | Command::Netmap { .. } => {
+            | Command::Netmap { .. }
+            | Command::Advertise { .. } => {
                 panic!("the parser did not select serve");
             }
         }

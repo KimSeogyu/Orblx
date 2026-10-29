@@ -97,6 +97,55 @@ pub fn enroll_with_oidc_blocking(input: OidcEnroll<'_>) -> Result<EnrollResult, 
     block_on(enroll_with_oidc(input))
 }
 
+/// Replace the advertised routes and store the fresh netmap.
+///
+/// Call this function outside a Tokio runtime.
+pub fn advertise_routes_blocking(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+    routes: &[String],
+) -> Result<NetmapView, CoordError> {
+    block_on(advertise_routes(
+        coord, coord_name, bundle_pem, state_dir, routes,
+    ))
+}
+
+/// Replace the advertised routes and store the fresh netmap.
+pub async fn advertise_routes(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+    routes: &[String],
+) -> Result<NetmapView, CoordError> {
+    let material = read_node_material(state_dir)?;
+    let pinned = material.netmap_public;
+    let request = Request {
+        op: "advertise".to_string(),
+        name: material.name.clone(),
+        token: None,
+        id_token: None,
+        nonce: None,
+        endpoints: Vec::new(),
+        routes: routes.to_vec(),
+    };
+    let result = round_trip(
+        coord,
+        coord_name,
+        bundle_pem,
+        Some(material),
+        request,
+        Some(pinned),
+        false,
+    )
+    .await?;
+    let view = view_from_result(result);
+    view.write_state(state_dir)?;
+    Ok(view)
+}
+
 /// Fetch a fresh netmap with the stored node SVID.
 pub async fn fetch_netmap(
     coord: SocketAddr,
@@ -125,14 +174,20 @@ pub async fn fetch_netmap(
         false,
     )
     .await?;
-    let view = NetmapView {
+    let view = view_from_result(result);
+    view.write_state(state_dir)?;
+    Ok(view)
+}
+
+fn view_from_result(result: EnrollResult) -> NetmapView {
+    NetmapView {
         signed_netmap: result.signed_netmap,
         signed_grants: result.signed_grants,
         endpoints: result.endpoints,
         netmap_public: result.netmap_public,
-    };
-    view.write_state(state_dir)?;
-    Ok(view)
+        approved_routes: result.approved_routes,
+        advertised_routes: result.advertised_routes,
+    }
 }
 
 /// Renew the node SVID with the stored leaf.
@@ -300,6 +355,8 @@ fn enroll_from_response(
         signed_netmap: signed,
         signed_grants: grants,
         endpoints,
+        approved_routes: response.approved_routes.unwrap_or_default(),
+        advertised_routes: response.advertised_routes.unwrap_or_default(),
     })
 }
 

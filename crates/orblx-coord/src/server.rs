@@ -106,6 +106,8 @@ async fn handle_connection(
                 netmap: None,
                 endpoints: None,
                 grants: None,
+                approved_routes: None,
+                advertised_routes: None,
             }
         }
     };
@@ -165,6 +167,15 @@ async fn dispatch(
             println!("renewed {}", result.name);
             Ok(leaf_response(result))
         }
+        "advertise" => {
+            let peer = peer_node(connection, &coord.tls_material()?.trust_pem)?;
+            let peer = peer.ok_or(CoordError::Peer)?;
+            if peer != request.name {
+                return Err(CoordError::Peer);
+            }
+            let view = coord.advertise_routes(&request.name, &request.routes)?;
+            Ok(netmap_response(&view))
+        }
         "netmap" => {
             let peer = peer_node(connection, &coord.tls_material()?.trust_pem)?;
             let peer = peer.ok_or(CoordError::Peer)?;
@@ -173,17 +184,7 @@ async fn dispatch(
             }
             let view = coord.netmap_for(&request.name)?;
             println!("netmap {}", request.name);
-            Ok(Response {
-                ok: true,
-                error: None,
-                certificate_pem: None,
-                private_key_pem: None,
-                trust_bundle_pem: None,
-                netmap_pub_hex: Some(encode_hex(&view.netmap_public)),
-                netmap: Some(view.signed_netmap),
-                endpoints: Some(view.endpoints),
-                grants: Some(view.signed_grants),
-            })
+            Ok(netmap_response(&view))
         }
         _ => Err(CoordError::Protocol(
             "The request is not valid.".to_string(),
@@ -202,6 +203,24 @@ fn leaf_response(result: crate::state::EnrollResult) -> Response {
         netmap: Some(result.signed_netmap),
         endpoints: Some(result.endpoints),
         grants: Some(result.signed_grants),
+        approved_routes: Some(result.approved_routes),
+        advertised_routes: Some(result.advertised_routes),
+    }
+}
+
+fn netmap_response(view: &crate::state::NetmapView) -> Response {
+    Response {
+        ok: true,
+        error: None,
+        certificate_pem: None,
+        private_key_pem: None,
+        trust_bundle_pem: None,
+        netmap_pub_hex: Some(encode_hex(&view.netmap_public)),
+        netmap: Some(view.signed_netmap.clone()),
+        endpoints: Some(view.endpoints.clone()),
+        grants: Some(view.signed_grants.clone()),
+        approved_routes: Some(view.approved_routes.clone()),
+        advertised_routes: Some(view.advertised_routes.clone()),
     }
 }
 

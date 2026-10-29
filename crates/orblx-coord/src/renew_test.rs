@@ -322,6 +322,8 @@ fn node_request(
         state_dir,
         renew: Some(renew),
         stop: Some(stop),
+        accept_routes: false,
+        forward_routes: Vec::new(),
     }
 }
 
