@@ -1,0 +1,32 @@
+{
+  // The exit node class is a list of selectors.
+  // 0.0.0.0/0 stays out of autoApprovers.routes.
+  "groups": {
+    "group:humans": ["spiffe://orblx.local/node/client"],
+  },
+  "tags": {
+    "tag:exit": ["spiffe://orblx.local/node/exit"],
+  },
+  "tagOwners": {
+    "tag:exit": ["group:humans"],
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["group:humans"],
+      "proto": "tcp",
+      "dst": ["tag:exit:80"],
+    },
+  ],
+  "autoApprovers": {
+    "exitNode": ["tag:exit"],
+  },
+  "tests": [
+    {
+      "src": "spiffe://orblx.local/node/client",
+      "proto": "tcp",
+      "accept": ["tag:exit:80"],
+      "deny": ["spiffe://orblx.local/node/exit:22"],
+    },
+  ],
+}

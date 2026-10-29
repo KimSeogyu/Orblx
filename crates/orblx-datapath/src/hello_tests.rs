@@ -1,4 +1,8 @@
-use std::net::{Ipv4Addr, SocketAddr};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orblx_crypto::{mac_input, ticket_hash, ticket_mac, CryptoError, TicketKey, TicketRing};
@@ -7,13 +11,13 @@ use orblx_identity::{
     Ipv4Destination, IssueGate, MiniCa, MockOidc, SpiffeId, TicketClaims, TicketFlags,
     TicketSigner, TrustBundle, MAX_AGENT_TTL, MOCK_OIDC_ISSUER,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::ipv4::tcp_ipv4_packet;
 use crate::quic::pump_packets;
 use crate::{
-    ipv4_packet, tun_capability_note, HelloConfig, HelloEndpoint, HelloError, PeerGate,
-    DEFAULT_UDP_PORT,
+    ipv4_packet, measure_hello_rtt, tun_capability_note, AllowPeers, HelloConfig, HelloEndpoint,
+    HelloError, MemoryDevice, Netmap, NodeRequest, PeerGate, DEFAULT_UDP_PORT,
 };
 
 const FIXTURE_UNIX: u64 = 1_793_196_196;
@@ -1027,6 +1031,204 @@ async fn agent_quic_acl() {
         matches!(second, HelloError::DestinationDenied),
         "application B was allowed: {second}"
     );
+}
+
+#[test]
+fn a_ping_increments_the_overlay_counters() {
+    let now = SystemTime::now();
+    let (_ca, pair) = issue_node_pair(now);
+    let listen = free_udp();
+    let metrics = free_tcp();
+    let dir = std::env::temp_dir().join(format!(
+        "orblx-ping-counters-{}-{}",
+        std::process::id(),
+        listen.port()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let netmap = Netmap::from_slice(
+        br#"{
+            "version": 1,
+            "self": {"name": "b", "overlay_ip": "100.64.0.2"},
+            "peers": [{
+                "name": "a",
+                "overlay_ip": "100.64.0.1",
+                "svid": "spiffe://orblx.local/node/a",
+                "endpoints": ["127.0.0.1:1"],
+                "routes": []
+            }]
+        }"#,
+    )
+    .unwrap();
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let (from_tx, from_rx) = mpsc::channel(4);
+    let (to_tx, mut to_rx) = mpsc::channel(4);
+    let server = pair.server;
+    let state_dir = dir.clone();
+    let node = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let _hold_host_packets = from_tx;
+            let _ = crate::run_memory_node(
+                NodeRequest {
+                    config: server,
+                    netmap,
+                    listen,
+                    state_dir,
+                    renew: None,
+                    stop: Some(stop_rx),
+                    accept_routes: false,
+                    forward_routes: Vec::new(),
+                    forward_exit: false,
+                    exit_node: None,
+                    allow_lan: false,
+                    underlay: Vec::new(),
+                    relay: None,
+                    netmap_path: PathBuf::from("netmap.json"),
+                    visibility: Arc::new(AllowPeers),
+                    on_ready: None,
+                    metrics: Some(metrics),
+                },
+                MemoryDevice {
+                    from_tun: from_rx,
+                    to_tun: to_tx,
+                },
+            )
+            .await;
+        });
+    });
+    let mut last = String::new();
+    let mut passed = false;
+    for _ in 0..20 {
+        match measure_hello_rtt(
+            pair.client.clone(),
+            listen,
+            Duration::from_secs(2),
+            Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(100, 64, 0, 2),
+        ) {
+            Ok(elapsed) => {
+                assert!(elapsed.as_millis() > 0 || elapsed.as_micros() > 0);
+                passed = true;
+                break;
+            }
+            Err(err) => last = err.to_string(),
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let own_echo_in_tun = to_rx.try_recv().is_ok();
+    let subnet_host = Ipv4Addr::new(192, 168, 50, 10);
+    let subnet_ping = measure_hello_rtt(
+        pair.client.clone(),
+        listen,
+        Duration::from_millis(500),
+        Ipv4Addr::new(100, 64, 0, 1),
+        subnet_host,
+    );
+    let mut forwarded = None;
+    for _ in 0..40 {
+        if let Ok(packet) = to_rx.try_recv() {
+            forwarded = Some(packet);
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let body = metrics_body(metrics);
+    let _ = stop_tx.send(true);
+    let _ = node.join();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(passed, "{last}");
+    assert!(
+        !own_echo_in_tun,
+        "The echo to the own overlay IP went to TUN."
+    );
+    assert!(
+        subnet_ping.is_err(),
+        "The node answered an echo for a subnet host."
+    );
+    let forwarded = forwarded.expect("The echo for the subnet host did not go to TUN.");
+    assert_eq!(crate::ipv4_destination(&forwarded), Some(subnet_host));
+    let tx = metric_value(&body, "orblx_node_packets_tx");
+    let rx = metric_value(&body, "orblx_node_packets_rx");
+    assert!(tx > 0, "{body}");
+    assert!(rx > 0, "{body}");
+}
+
+fn issue_node_pair(now: SystemTime) -> (MiniCa, IssuedPair) {
+    let ca = MiniCa::generate(now).unwrap();
+    let deny = DenySet::empty();
+    let ttl = Duration::from_secs(300);
+    let server_id = SpiffeId::node("b").unwrap();
+    let client_id = SpiffeId::node("a").unwrap();
+    let server = ca.issue(&server_id, now, ttl, &deny).unwrap();
+    let client = ca.issue(&client_id, now, ttl, &deny).unwrap();
+    let signer = TicketSigner::generate();
+    let mac_key = [0x24; 32];
+    let ring = ring_for(&ca, &signer, mac_key, now);
+    let server_ticket = present(&signer, &mac_key, now, &server_id, 600);
+    let client_ticket = present(&signer, &mac_key, now, &client_id, 600);
+    let trust = ca.trust_bundle().clone();
+    let pair = IssuedPair {
+        server: config_for(
+            &server.certificate_pem,
+            &server.private_key_pem,
+            trust.clone(),
+            &server_ticket,
+            &ring,
+        ),
+        client: config_for(
+            &client.certificate_pem,
+            &client.private_key_pem,
+            trust,
+            &client_ticket,
+            &ring,
+        ),
+        server_id,
+        client_id,
+        signer,
+        mac_key,
+    };
+    (ca, pair)
+}
+
+fn free_udp() -> SocketAddr {
+    let socket = std::net::UdpSocket::bind(loopback(0)).unwrap();
+    let addr = socket.local_addr().unwrap();
+    drop(socket);
+    addr
+}
+
+fn free_tcp() -> SocketAddr {
+    let listener = std::net::TcpListener::bind(loopback(0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    addr
+}
+
+fn metrics_body(addr: SocketAddr) -> String {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut body = String::new();
+    stream.read_to_string(&mut body).unwrap();
+    body
+}
+
+fn metric_value(body: &str, name: &str) -> u64 {
+    body.lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            if parts.next() == Some(name) {
+                parts.next().and_then(|value| value.parse().ok())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
 }
 
 async fn connector_error(server: HelloConfig, client: HelloConfig) -> HelloError {

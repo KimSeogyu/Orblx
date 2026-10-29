@@ -4,7 +4,7 @@
 //! A revoked node cannot send packets.
 
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -121,7 +121,9 @@ fn run_ping(options: Options) -> Result<(), String> {
         .ok_or_else(|| "The peer has no endpoint.".to_string())?;
     let direct = resolve_endpoint(endpoint)?;
     let config = load_config(&options.state)?;
-    if let Ok(elapsed) = measure_hello_rtt(config, direct, options.timeout) {
+    let src = parse_overlay(&netmap.self_node.overlay_ip)?;
+    let dst = parse_overlay(&peer.overlay_ip)?;
+    if let Ok(elapsed) = measure_hello_rtt(config, direct, options.timeout, src, dst) {
         println!("path direct");
         println!("rtt_ms {}", elapsed.as_millis());
         return Ok(());
@@ -178,6 +180,11 @@ fn load_config(state: &Path) -> Result<orblx_datapath::HelloConfig, String> {
         trust,
         &state.join("ticket.bin"),
     )
+}
+
+fn parse_overlay(text: &str) -> Result<Ipv4Addr, String> {
+    text.parse::<Ipv4Addr>()
+        .map_err(|_| format!("The overlay address {text} is not valid."))
 }
 
 fn resolve_endpoint(text: &str) -> Result<SocketAddr, String> {

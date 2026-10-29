@@ -453,6 +453,7 @@ impl Hub {
             overlay_ip: self.overlay.to_string(),
             svid: self.svid.clone(),
             svid_expiry: self.svid_expiry,
+            exit_node: None,
             peers: vec![StatusPeer {
                 name: self.peer_name.clone(),
                 overlay_ip: self.peer_overlay.to_string(),

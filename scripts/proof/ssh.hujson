@@ -1,0 +1,43 @@
+{
+  // Alice may open SSH on node b.
+  "ssh": [
+    {
+      "src": ["spiffe://orblx.local/user/alice"],
+      "dst": ["spiffe://orblx.local/node/b"],
+      "users": ["alice", "root"],
+      "checkPeriod": "30s",
+    },
+    {
+      "src": ["spiffe://orblx.local/agent/helper"],
+      "dst": ["spiffe://orblx.local/node/b"],
+      "users": ["alice"],
+      "checkPeriod": "30s",
+    },
+  ],
+  "sshTests": [
+    {
+      "src": "spiffe://orblx.local/user/alice",
+      "dst": "spiffe://orblx.local/node/b",
+      "user": "alice",
+      "action": "accept",
+    },
+    {
+      "src": "spiffe://orblx.local/user/mallory",
+      "dst": "spiffe://orblx.local/node/b",
+      "user": "mallory",
+      "action": "deny",
+    },
+    {
+      "src": "spiffe://orblx.local/user/alice",
+      "dst": "spiffe://orblx.local/node/c",
+      "user": "alice",
+      "action": "deny",
+    },
+    {
+      "src": "spiffe://orblx.local/agent/helper",
+      "dst": "spiffe://orblx.local/node/b",
+      "user": "root",
+      "action": "deny",
+    },
+  ],
+}

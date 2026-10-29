@@ -20,6 +20,7 @@ struct Route {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouterTable {
     routes: Vec<Route>,
+    exits: Vec<String>,
 }
 
 /// The router rejected a netmap route.
@@ -61,16 +62,31 @@ impl RouterTable {
     /// Each peer also owns the CIDRs in `routes`.
     pub fn from_netmap(map: &Netmap) -> Result<Self, RouterError> {
         map.check().map_err(RouterError::Netmap)?;
-        let mut table = Self { routes: Vec::new() };
+        let mut table = Self {
+            routes: Vec::new(),
+            exits: Vec::new(),
+        };
         for peer in &map.peers {
             let overlay = parse_ipv4(&peer.overlay_ip).map_err(RouterError::Netmap)?;
             table.insert(&peer.name, overlay, 32, &format!("{overlay}/32"))?;
+            if peer.exit_node {
+                table.exits.push(peer.name.clone());
+            }
             for route in &peer.routes {
                 let (prefix, prefix_len) = parse_cidr(route).map_err(RouterError::Netmap)?;
+                if prefix_len == 0 {
+                    continue;
+                }
                 table.insert(&peer.name, prefix, prefix_len, route)?;
             }
         }
         Ok(table)
+    }
+
+    /// Return true when the netmap lists `name` as an approved exit node.
+    #[must_use]
+    pub fn is_exit(&self, name: &str) -> bool {
+        self.exits.iter().any(|peer| peer == name)
     }
 
     /// Return the peer that owns `dest`.
@@ -90,6 +106,21 @@ impl RouterTable {
     /// A prefix of length 0 stays outside the TUN.
     #[must_use]
     pub fn lookup_for(&self, dest: Ipv4Addr, accept_routes: bool) -> Option<&str> {
+        self.lookup_exit(dest, accept_routes, None)
+    }
+
+    /// Return the peer that owns `dest`.
+    ///
+    /// `exit` is the selected exit node name.
+    /// The function uses that peer for a destination with no longer prefix.
+    /// A name that is not an approved exit node is not used.
+    #[must_use]
+    pub fn lookup_exit(
+        &self,
+        dest: Ipv4Addr,
+        accept_routes: bool,
+        exit: Option<&str>,
+    ) -> Option<&str> {
         let dest_bits = u32::from(dest);
         let mut best: Option<(u8, &str)> = None;
         for route in &self.routes {
@@ -108,7 +139,15 @@ impl RouterTable {
                 best = Some((route.prefix_len, route.peer.as_str()));
             }
         }
-        best.map(|(_, peer)| peer)
+        if let Some((_, peer)) = best {
+            return Some(peer);
+        }
+        let name = exit?;
+        if self.is_exit(name) {
+            Some(self.exits.iter().find(|peer| *peer == name)?.as_str())
+        } else {
+            None
+        }
     }
 
     /// Return the CIDRs that the kernel should send into the TUN device.
@@ -176,9 +215,10 @@ pub fn route_packet<'a>(
     table: &'a RouterTable,
     packet: &[u8],
     accept_routes: bool,
+    exit: Option<&str>,
 ) -> Option<&'a str> {
     let dest = ipv4_destination(packet)?;
-    table.lookup_for(dest, accept_routes)
+    table.lookup_exit(dest, accept_routes, exit)
 }
 
 #[cfg(test)]
@@ -236,9 +276,9 @@ mod tests {
             b"ping",
         )
         .unwrap();
-        assert_eq!(route_packet(&table, &packet, true), Some("b"));
-        assert_eq!(route_packet(&table, &packet, false), None);
-        assert_eq!(route_packet(&table, &[0x60, 0x00], true), None);
+        assert_eq!(route_packet(&table, &packet, true, None), Some("b"));
+        assert_eq!(route_packet(&table, &packet, false, None), None);
+        assert_eq!(route_packet(&table, &[0x60, 0x00], true, None), None);
     }
 
     #[test]
@@ -262,6 +302,76 @@ mod tests {
         let overlay_only = table.install_cidrs(false);
         assert!(!overlay_only.iter().any(|cidr| cidr.contains("10.88")));
         assert!(overlay_only.iter().any(|cidr| cidr == "100.64.0.2/32"));
+    }
+
+    fn map_with_exit(exit_b: bool, exit_c: bool) -> Netmap {
+        let flag_b = if exit_b { "true" } else { "false" };
+        let flag_c = if exit_c { "true" } else { "false" };
+        let text = format!(
+            r#"{{
+                "version": 1,
+                "self": {{"name": "a", "overlay_ip": "100.64.0.1"}},
+                "peers": [
+                    {{
+                        "name": "b",
+                        "overlay_ip": "100.64.0.2",
+                        "svid": "spiffe://orblx.local/node/b",
+                        "endpoints": ["172.28.18.12:443"],
+                        "routes": ["10.88.0.0/24"],
+                        "exit_node": {flag_b}
+                    }},
+                    {{
+                        "name": "c",
+                        "overlay_ip": "100.64.0.3",
+                        "svid": "spiffe://orblx.local/node/c",
+                        "endpoints": ["172.28.18.13:443"],
+                        "routes": [],
+                        "exit_node": {flag_c}
+                    }}
+                ]
+            }}"#
+        );
+        Netmap::from_slice(text.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn an_approved_exit_node_owns_addresses_without_a_longer_prefix() {
+        let table = RouterTable::from_netmap(&map_with_exit(true, false)).unwrap();
+        assert!(table.is_exit("b"));
+        assert!(!table.is_exit("c"));
+        assert_eq!(
+            table.lookup_exit(Ipv4Addr::new(1, 1, 1, 1), true, Some("b")),
+            Some("b")
+        );
+        assert_eq!(
+            table.lookup_exit(Ipv4Addr::new(10, 88, 0, 5), true, Some("b")),
+            Some("b")
+        );
+        assert_eq!(
+            table.lookup_exit(Ipv4Addr::new(100, 64, 0, 3), true, Some("b")),
+            Some("c")
+        );
+        assert_eq!(
+            table.lookup_exit(Ipv4Addr::new(1, 1, 1, 1), true, None),
+            None
+        );
+        assert_eq!(
+            table.lookup_exit(Ipv4Addr::new(1, 1, 1, 1), true, Some("c")),
+            None
+        );
+        let packet = ipv4_packet(
+            Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(8, 8, 8, 8),
+            b"dns",
+        )
+        .unwrap();
+        assert_eq!(route_packet(&table, &packet, false, Some("b")), Some("b"));
+        assert_eq!(route_packet(&table, &packet, false, Some("missing")), None);
+        let held = RouterTable::from_netmap(&map_with_exit(false, false)).unwrap();
+        assert_eq!(
+            held.lookup_exit(Ipv4Addr::new(8, 8, 8, 8), true, Some("b")),
+            None
+        );
     }
 
     #[test]

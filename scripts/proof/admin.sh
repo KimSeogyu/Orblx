@@ -224,6 +224,12 @@ printf '%s\n' "$node_metrics"
 printf '%s\n' "$node_metrics" | grep -q '^orblx_node_packets_tx '
 printf '%s\n' "$node_metrics" | grep -q '^orblx_node_packets_rx '
 printf '%s\n' "$node_metrics" | grep -q '^orblx_node_sessions '
+tx_count="$(printf '%s\n' "$node_metrics" | awk '/^orblx_node_packets_tx /{print $2; exit}')"
+rx_count="$(printf '%s\n' "$node_metrics" | awk '/^orblx_node_packets_rx /{print $2; exit}')"
+if [[ -z "$tx_count" || -z "$rx_count" || "$tx_count" -eq 0 || "$rx_count" -eq 0 ]]; then
+  echo "The ping left the packet counters at 0." >&2
+  exit 1
+fi
 
 echo "=== [C] start relay ==="
 dc --profile nodes up -d relay

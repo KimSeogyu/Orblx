@@ -37,6 +37,8 @@ struct NodeRecord {
     owner: String,
     endpoints: Vec<String>,
     routes: Vec<String>,
+    #[serde(default)]
+    exit_node: bool,
     enrolled_unix: u64,
     #[serde(default = "default_approved")]
     approved: bool,
@@ -83,6 +85,7 @@ pub struct StoredNode {
     pub owner: String,
     pub endpoints: Vec<String>,
     pub routes: Vec<String>,
+    pub exit_node: bool,
     pub approved: bool,
     pub expired: bool,
 }
@@ -127,6 +130,7 @@ impl NodeStore {
                 owner: node.owner.clone(),
                 endpoints: node.endpoints.clone(),
                 routes: node.routes.clone(),
+                exit_node: node.exit_node,
                 approved: node.approved,
                 expired: node.expired,
             })
@@ -248,6 +252,7 @@ impl NodeStore {
             owner: plan.owner.clone(),
             endpoints: plan.endpoints.clone(),
             routes: plan.routes.clone(),
+            exit_node: false,
             enrolled_unix: now_unix,
             approved: true,
             expired: false,
@@ -259,6 +264,7 @@ impl NodeStore {
             owner: node.owner.clone(),
             endpoints: node.endpoints.clone(),
             routes: node.routes.clone(),
+            exit_node: node.exit_node,
             approved: node.approved,
             expired: node.expired,
         };
@@ -280,6 +286,20 @@ impl NodeStore {
             .find(|node| node.name == name)
             .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
         node.routes = canonical_routes;
+        self.persist()
+    }
+
+    /// Store whether this node offers to be an exit node.
+    ///
+    /// The signed netmap sets the flag only after policy approval.
+    pub fn set_exit_node(&mut self, name: &str, enabled: bool) -> Result<(), CoordError> {
+        let node = self
+            .disk
+            .nodes
+            .iter_mut()
+            .find(|node| node.name == name)
+            .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        node.exit_node = enabled;
         self.persist()
     }
 

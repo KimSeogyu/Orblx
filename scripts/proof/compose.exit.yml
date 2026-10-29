@@ -1,0 +1,144 @@
+# Exit node proof.
+# The client is not on the internet network.
+# The exit node and the HTTP echo server share that network.
+# The echo server has no overlay.
+
+name: orblx-exit-proof
+
+services:
+  coord:
+    image: orblx-exit:local
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /var/lib/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+    volumes:
+      - ${EXIT_COORD_STATE:?set EXIT_COORD_STATE}:/var/lib/orblx
+      - ${EXIT_POLICY:?set EXIT_POLICY}:/var/lib/orblx/policy.hujson:ro
+    networks:
+      proof:
+        ipv4_address: 172.30.19.2
+
+  tool:
+    image: orblx-exit:local
+    profiles: ["tool"]
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    volumes:
+      - ${EXIT_TOOL_STATE:?set EXIT_TOOL_STATE}:/var/lib/orblx
+      - ${EXIT_COORD_STATE:?set EXIT_COORD_STATE}:/coord-state:ro
+    networks:
+      - proof
+
+  relay:
+    image: orblx-exit:local
+    profiles: ["nodes"]
+    command:
+      - relay
+      - --udp
+      - 0.0.0.0:443
+      - --tcp
+      - 0.0.0.0:443
+    networks:
+      proof:
+        ipv4_address: 172.30.19.5
+
+  web:
+    image: orblx-exit:local
+    profiles: ["nodes"]
+    entrypoint: ["python3", "/opt/echo-ip.py"]
+    volumes:
+      - ${EXIT_ECHO_PY:?set EXIT_ECHO_PY}:/opt/echo-ip.py:ro
+    networks:
+      inet:
+        ipv4_address: 10.77.0.5
+
+  exit:
+    image: orblx-exit:local
+    profiles: ["nodes"]
+    # The exit node writes ip_forward and iptables. The container needs a writable /proc/sys.
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    volumes:
+      - ${EXIT_NODE_STATE:?set EXIT_NODE_STATE}:/var/lib/orblx
+    command:
+      - up
+      - --advertise-exit-node
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.19.2:443
+      - --bundle
+      - /var/lib/orblx/trust-bundle.pem
+      - --relay
+      - 172.30.19.5:443
+    stop_grace_period: 15s
+    networks:
+      proof:
+        ipv4_address: 172.30.19.3
+      inet:
+        ipv4_address: 10.77.0.2
+
+  client:
+    image: orblx-exit:local
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    volumes:
+      - ${EXIT_CLIENT_STATE:?set EXIT_CLIENT_STATE}:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.19.2:443
+      - --bundle
+      - /var/lib/orblx/trust-bundle.pem
+      - --relay
+      - 172.30.19.5:443
+    stop_grace_period: 15s
+    networks:
+      proof:
+        ipv4_address: 172.30.19.4
+
+networks:
+  proof:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.19.0/24
+          gateway: 172.30.19.1
+  inet:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.77.0.0/24
+          gateway: 10.77.0.1

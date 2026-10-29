@@ -21,6 +21,7 @@ mod netcheck;
 mod ping;
 mod policy;
 mod relay;
+mod ssh;
 mod status;
 mod ticket_load;
 mod up;
@@ -41,6 +42,7 @@ enum Action {
     Coord(coord::Command),
     Login(login::Command),
     Policy(policy::Command),
+    Ssh(ssh::Command),
     Admin(admin::Command),
     Nat(nat::Command),
     Netcheck(netcheck::Command),
@@ -133,6 +135,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Ok(Action::Ssh(command)) => {
+            if let Err(err) = ssh::run(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
         Ok(Action::Status(command)) => {
             if let Err(err) = status::run(command) {
                 eprintln!("{err}");
@@ -214,6 +222,9 @@ where
     if args.first().map(String::as_str) == Some("up") {
         return up::parse_up(&args[1..]).map(Action::Node);
     }
+    if args.first().map(String::as_str) == Some("set") {
+        return up::parse_set(&args[1..]).map(Action::Node);
+    }
     if args.first().map(String::as_str) == Some("down") {
         return up::parse_down(&args[1..]).map(Action::Node);
     }
@@ -243,6 +254,9 @@ where
     }
     if args.first().map(String::as_str) == Some("nat") {
         return nat::parse(&args[1..]).map(Action::Nat);
+    }
+    if args.first().map(String::as_str) == Some("ssh") {
+        return ssh::parse(&args[1..]).map(Action::Ssh);
     }
     for arg in &args {
         if arg == "--version" || arg == "-V" {

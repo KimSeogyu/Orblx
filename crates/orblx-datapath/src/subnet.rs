@@ -19,6 +19,23 @@ use std::process::Command;
 use crate::netmap::parse_cidr;
 use crate::HelloError;
 
+/// Enable IPv4 forwarding and masquerade for exit-node traffic.
+///
+/// Packets from `100.64.0.0/10` that leave a physical interface use SNAT.
+/// The TUN device is not a masquerade target.
+pub fn enable_exit_masquerade() -> Result<(), HelloError> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_exit_masquerade()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(HelloError::Node(
+            "Exit node forwarding runs on Linux.".to_string(),
+        ))
+    }
+}
+
 /// Enable IPv4 forwarding and masquerade for each connected route.
 pub fn enable_kernel_forward(routes: &[String]) -> Result<(), HelloError> {
     #[cfg(target_os = "linux")]
@@ -32,6 +49,112 @@ pub fn enable_kernel_forward(routes: &[String]) -> Result<(), HelloError> {
             "Subnet forwarding runs on Linux.".to_string(),
         ))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_exit_masquerade() -> Result<(), HelloError> {
+    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1\n").map_err(|err| {
+        HelloError::Node(format!("The node did not enable IPv4 forwarding. {err}"))
+    })?;
+    relax_rp_filter();
+    let mut forwarded = 0u32;
+    for device in physical_devices() {
+        ensure_rule(
+            &[
+                "-t",
+                "nat",
+                "-C",
+                "POSTROUTING",
+                "-s",
+                "100.64.0.0/10",
+                "-o",
+                &device,
+                "-j",
+                "MASQUERADE",
+            ],
+            &[
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-s",
+                "100.64.0.0/10",
+                "-o",
+                &device,
+                "-j",
+                "MASQUERADE",
+            ],
+        )?;
+        ensure_rule(
+            &[
+                "-C",
+                "FORWARD",
+                "-o",
+                &device,
+                "-s",
+                "100.64.0.0/10",
+                "-j",
+                "ACCEPT",
+            ],
+            &[
+                "-A",
+                "FORWARD",
+                "-o",
+                &device,
+                "-s",
+                "100.64.0.0/10",
+                "-j",
+                "ACCEPT",
+            ],
+        )?;
+        ensure_rule(
+            &[
+                "-C",
+                "FORWARD",
+                "-i",
+                &device,
+                "-d",
+                "100.64.0.0/10",
+                "-j",
+                "ACCEPT",
+            ],
+            &[
+                "-A",
+                "FORWARD",
+                "-i",
+                &device,
+                "-d",
+                "100.64.0.0/10",
+                "-j",
+                "ACCEPT",
+            ],
+        )?;
+        println!("The node forwards exit traffic on {device}.");
+        forwarded += 1;
+    }
+    if forwarded == 0 {
+        return Err(HelloError::Node(
+            "The node did not find an interface for exit traffic.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn physical_devices() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == "lo" || name == "orblx0" || name.starts_with("utun") || name.starts_with("tun") {
+            continue;
+        }
+        names.push(name);
+    }
+    names.sort();
+    names
 }
 
 #[cfg(target_os = "linux")]

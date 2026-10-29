@@ -47,6 +47,7 @@ fn status_json(text: &str) -> Result<String, String> {
     let mut overlay_ip = String::new();
     let mut svid = String::new();
     let mut svid_expiry = Value::Null;
+    let mut exit_node = Value::Null;
     let mut peers = Vec::new();
     for line in text.lines() {
         if line.is_empty() {
@@ -65,6 +66,7 @@ fn status_json(text: &str) -> Result<String, String> {
                     Err(_) => Value::Null,
                 };
             }
+            Some("exit_node") => exit_node = json!(rest(parts)),
             Some("peer") => peers.push(parse_peer(line)?),
             Some(_) | None => {}
         }
@@ -78,6 +80,7 @@ fn status_json(text: &str) -> Result<String, String> {
         "overlay_ip": overlay_ip,
         "svid": svid,
         "svid_expiry": svid_expiry,
+        "exit_node": exit_node,
         "peers": peers,
     });
     serde_json::to_string(&value).map_err(|_| "The status text is not valid.".to_string())
@@ -151,7 +154,12 @@ peer b overlay_ip 100.64.0.2 path direct svid spiffe://orblx.local/node/b svid_e
         let json = status_json(text).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["state"], "up");
+        assert!(value["exit_node"].is_null());
         assert_eq!(value["peers"][0]["path"], "direct");
         assert_eq!(value["peers"][0]["svid_expiry"], 200);
+        let selected =
+            status_json("state up\nname a\noverlay_ip 100.64.0.1\nexit_node exit\n").unwrap();
+        let selected: serde_json::Value = serde_json::from_str(&selected).unwrap();
+        assert_eq!(selected["exit_node"], "exit");
     }
 }
