@@ -24,7 +24,7 @@ ROUTER_IP="172.30.18.3"
 CLIENT_IP="172.30.18.4"
 
 cleanup() {
-  dc down -v --remove-orphans >/dev/null 2>&1 || true
+  dc --profile nodes --profile tool down -v --remove-orphans >/dev/null 2>&1 || true
   if [[ "$(id -u)" -eq 0 ]]; then
     rm -rf "$WORK"
   else
@@ -101,7 +101,7 @@ else
 fi
 
 echo "=== [C] remove old proof containers ==="
-dc down -v --remove-orphans || true
+dc --profile nodes --profile tool down -v --remove-orphans || true
 open_legacy_forward
 
 echo "=== [C] build image ==="

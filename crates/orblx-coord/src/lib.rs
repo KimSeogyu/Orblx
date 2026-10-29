@@ -30,7 +30,7 @@ mod tlsutil;
 
 pub use admin::{approve, deny_json, deny_set, expire, nodes, revoke, routes, users};
 pub use client::{
-    admin_blocking, advertise_routes_blocking, enroll_with_oidc_blocking,
+    admin_blocking, advertise_exit_blocking, advertise_routes_blocking, enroll_with_oidc_blocking,
     enroll_with_token_blocking, fetch_deny_blocking, fetch_netmap_blocking, netmap_json,
     renew_svid_blocking, OidcEnroll,
 };
@@ -367,6 +367,64 @@ mod tests {
         );
         let exit = coord.advertise_routes("router", &["0.0.0.0/0".to_string()]);
         assert!(exit.unwrap_err().to_string().contains("exit route"));
+    }
+
+    #[test]
+    fn an_unapproved_exit_node_stays_out_of_the_signed_netmap() {
+        let scratch = Scratch::new();
+        let policy = r#"{
+          "tags": {
+            "tag:exit": ["spiffe://orblx.local/node/exit"]
+          },
+          "tagOwners": {
+            "tag:exit": ["spiffe://orblx.local/node/client"]
+          },
+          "autoApprovers": {
+            "exitNode": ["tag:exit"]
+          }
+        }"#;
+        fs::write(scratch.0.join("policy.hujson"), policy).unwrap();
+        let now = SystemTime::now();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let exit_token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+        let client_token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+        coord
+            .enroll_token(
+                "exit",
+                &exit_token.secret,
+                &["exit:443".to_string()],
+                &[],
+                now,
+            )
+            .unwrap();
+        coord
+            .enroll_token(
+                "client",
+                &client_token.secret,
+                &["client:443".to_string()],
+                &[],
+                now,
+            )
+            .unwrap();
+        let held = coord.advertise_exit("other", true);
+        assert!(held.is_err());
+        let denied = coord.advertise_exit("client", true).unwrap();
+        assert!(!denied.exit_approved);
+        let client = coord.netmap_for("client").unwrap();
+        assert!(!client.signed_netmap.netmap.peers[0].exit_node);
+        let approved = coord.advertise_exit("exit", true).unwrap();
+        assert!(approved.exit_approved);
+        let again = coord.netmap_for("client").unwrap();
+        let peer = again
+            .signed_netmap
+            .netmap
+            .peers
+            .iter()
+            .find(|peer| peer.name == "exit")
+            .unwrap();
+        assert!(peer.exit_node);
+        let cleared = coord.advertise_exit("exit", false).unwrap();
+        assert!(!cleared.exit_approved);
     }
 
     #[test]

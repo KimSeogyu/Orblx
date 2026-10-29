@@ -16,6 +16,7 @@
 //! `Policy::from_hujson` loads groups, tags, accept rules, route approval, node approval, owners, SSH rules, and inline tests.
 //! A failed test rejects the file.
 //! `autoApprovers` and `routeApprovals` approve subnet CIDRs.
+//! `autoApprovers.exitNode` approves an exit node.
 //! `0.0.0.0/0` stays an exit route.
 //! Node enrollment calls `IssueGate::owner_subject`.
 //! That call does not issue the node SVID.

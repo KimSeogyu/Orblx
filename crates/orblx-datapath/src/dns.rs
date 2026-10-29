@@ -14,7 +14,7 @@ use std::fs;
 use std::io::ErrorKind;
 #[cfg(target_os = "linux")]
 use std::io::Read;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -159,6 +159,59 @@ pub(crate) struct ResolvConfForwarder {
 impl ResolvConfForwarder {
     pub(crate) fn new(avoid: Ipv4Addr) -> Self {
         Self { avoid }
+    }
+}
+
+/// Forwards a non-overlay query to the exit node.
+///
+/// The packet uses the node overlay address as the source.
+/// The exit node then uses its own resolver.
+pub(crate) struct ExitNodeForwarder {
+    exit: Ipv4Addr,
+    name: String,
+    source: Ipv4Addr,
+}
+
+impl ExitNodeForwarder {
+    pub(crate) fn new(exit: Ipv4Addr, name: String, source: Ipv4Addr) -> Self {
+        Self { exit, name, source }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn target(&self) -> SocketAddr {
+        SocketAddr::from((self.exit, DNS_PORT))
+    }
+}
+
+impl QueryForwarder for ExitNodeForwarder {
+    fn forward(&self, query: &[u8]) -> Result<Vec<u8>, ForwardError> {
+        let name = dns_query_name(query).unwrap_or_else(|| "a name".to_string());
+        println!(
+            "The node sends a DNS query for {name} through the exit node {}.",
+            self.name
+        );
+        let socket =
+            UdpSocket::bind(SocketAddr::from((self.source, 0))).map_err(|_| ForwardError)?;
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(|_| ForwardError)?;
+        let server = SocketAddr::from((self.exit, DNS_PORT));
+        if query.len() < 2 {
+            return Err(ForwardError);
+        }
+        let id = u16::from_be_bytes([query[0], query[1]]);
+        socket.send_to(query, server).map_err(|_| ForwardError)?;
+        let mut buf = [0u8; 1500];
+        match socket.recv_from(&mut buf) {
+            Ok((size, from)) if size >= 12 && from == server => {
+                let response_id = u16::from_be_bytes([buf[0], buf[1]]);
+                if response_id == id {
+                    return Ok(buf[..size].to_vec());
+                }
+                Err(ForwardError)
+            }
+            Ok(_) | Err(_) => Err(ForwardError),
+        }
     }
 }
 
@@ -345,12 +398,15 @@ fn node_fqdn(name: &str, owner: &str) -> Option<String> {
 /// The routing domain `~orblx` is always present.
 #[must_use]
 #[cfg(any(test, target_os = "linux"))]
-pub(crate) fn domain_args(interface: &str, search: &[String]) -> Vec<String> {
+pub(crate) fn domain_args(interface: &str, search: &[String], capture_all: bool) -> Vec<String> {
     let mut args = vec![
         "domain".to_string(),
         interface.to_string(),
         "~orblx".to_string(),
     ];
+    if capture_all {
+        args.push("~.".to_string());
+    }
     for domain in search {
         if domain.starts_with('-') || domain.contains([' ', '\t', '\n']) {
             continue;
@@ -387,18 +443,20 @@ pub fn install_link_resolver(
     interface: &str,
     nameserver: Ipv4Addr,
     search: &[String],
+    capture_all: bool,
 ) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        linux_install(interface, nameserver, search)
+        linux_install(interface, nameserver, search, capture_all)
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = capture_all;
         macos_install(interface, nameserver, search)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (interface, nameserver, search);
+        let _ = (interface, nameserver, search, capture_all);
         Err("The node sets the DNS resolver on Linux or macOS. The node continues.".to_string())
     }
 }
@@ -429,9 +487,10 @@ pub(crate) fn refresh_resolver(
     table: &DnsTable,
     visibility: &dyn PeerVisibility,
     armed: &AtomicBool,
+    capture_all: bool,
 ) {
     let search = search_domains(table, visibility);
-    match install_link_resolver(interface, nameserver, &search) {
+    match install_link_resolver(interface, nameserver, &search, capture_all) {
         Ok(()) => {
             armed.store(true, Ordering::Relaxed);
             println!("The DNS resolver for {interface} uses {nameserver} and the domain ~orblx.");
@@ -446,6 +505,7 @@ pub(crate) async fn serve_dns(
     tables: watch::Receiver<DnsTable>,
     visibility: Arc<dyn PeerVisibility>,
     forwarder: Arc<dyn QueryForwarder>,
+    local: Ipv4Addr,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let socket = Arc::new(socket);
@@ -463,6 +523,14 @@ pub(crate) async fn serve_dns(
                     Err(_) => continue,
                 };
                 let query = buf[..size].to_vec();
+                if let Some(name) = dns_query_name(&query) {
+                    if is_cgnat(peer.ip()) && peer.ip() != IpAddr::V4(local) {
+                        println!(
+                            "The node received a DNS query for {name} from {}.",
+                            peer.ip()
+                        );
+                    }
+                }
                 let table = tables.borrow().clone();
                 let visibility = Arc::clone(&visibility);
                 let forwarder = Arc::clone(&forwarder);
@@ -673,6 +741,23 @@ fn read_name(msg: &[u8], start: usize) -> Result<(String, usize), ()> {
     Ok((name, end))
 }
 
+fn dns_query_name(query: &[u8]) -> Option<String> {
+    let parsed = parse_query(query)?;
+    if parsed.name.is_empty() {
+        None
+    } else {
+        Some(parsed.name)
+    }
+}
+
+fn is_cgnat(ip: IpAddr) -> bool {
+    let IpAddr::V4(ip) = ip else {
+        return false;
+    };
+    let octets = ip.octets();
+    octets[0] == 100 && (64..128).contains(&octets[1])
+}
+
 fn in_overlay_zone(name: &str) -> bool {
     name == "orblx" || name.ends_with(".orblx")
 }
@@ -741,22 +826,45 @@ pub(crate) fn nameservers_from_resolv(text: &str, avoid: Ipv4Addr) -> Vec<Socket
 }
 
 #[cfg(target_os = "linux")]
-fn linux_install(interface: &str, nameserver: Ipv4Addr, search: &[String]) -> Result<(), String> {
+fn linux_install(
+    interface: &str,
+    nameserver: Ipv4Addr,
+    search: &[String],
+    capture_all: bool,
+) -> Result<(), String> {
     let dns = vec![
         "dns".to_string(),
         interface.to_string(),
         nameserver.to_string(),
     ];
-    let domain = domain_args(interface, search);
+    let domain = domain_args(interface, search, capture_all);
+    let route_flag = if capture_all { "true" } else { "false" };
     let default_route = vec![
         "default-route".to_string(),
         interface.to_string(),
-        "false".to_string(),
+        route_flag.to_string(),
     ];
     for args in [dns, domain, default_route] {
-        run_resolvectl(&args).map_err(|err| resolvectl_message(interface, err))?;
+        run_resolvectl_retry(&args).map_err(|err| resolvectl_message(interface, err))?;
+    }
+    if capture_all {
+        silence_other_links(interface);
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn silence_other_links(keep: &str) {
+    let Ok(entries) = fs::read_dir("/sys/class/net") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == keep || name == "lo" {
+            continue;
+        }
+        let _ = run_resolvectl(&["default-route".to_string(), name, "false".to_string()]);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -785,6 +893,25 @@ fn resolvectl_message(interface: &str, err: CommandError) -> String {
 enum CommandError {
     Missing,
     Failed(String),
+}
+
+#[cfg(target_os = "linux")]
+fn run_resolvectl_retry(args: &[String]) -> Result<(), CommandError> {
+    let mut attempt = 0;
+    loop {
+        match run_resolvectl(args) {
+            Ok(()) => return Ok(()),
+            Err(CommandError::Missing) => return Err(CommandError::Missing),
+            Err(CommandError::Failed(detail)) => {
+                let transient = detail.contains("Connection refused") || detail.contains("sd_bus");
+                if !transient || attempt == 19 {
+                    return Err(CommandError::Failed(detail));
+                }
+                attempt += 1;
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -926,8 +1053,8 @@ mod tests {
 
     use super::{
         domain_args, encode_query, first_a, macos_resolver_text, nameservers_from_resolv, rcode,
-        respond, serve_dns, AllowPeers, DnsTable, ForwardError, GrantPeers, PeerVisibility,
-        QueryForwarder,
+        respond, serve_dns, AllowPeers, DnsTable, ExitNodeForwarder, ForwardError, GrantPeers,
+        PeerVisibility, QueryForwarder,
     };
     use crate::netmap::{Netmap, NetmapPeer};
 
@@ -1122,8 +1249,21 @@ mod tests {
     }
 
     #[test]
+    fn the_exit_node_forwarder_targets_the_exit_overlay() {
+        let forwarder = ExitNodeForwarder::new(
+            Ipv4Addr::new(100, 64, 0, 2),
+            "exit".to_string(),
+            Ipv4Addr::new(100, 64, 0, 4),
+        );
+        assert_eq!(
+            forwarder.target(),
+            std::net::SocketAddr::from((Ipv4Addr::new(100, 64, 0, 2), 53))
+        );
+    }
+
+    #[test]
     fn the_linux_domain_list_starts_with_the_orblx_route() {
-        let args = domain_args("orblx0", &["lab.orblx".to_string()]);
+        let args = domain_args("orblx0", &["lab.orblx".to_string()], false);
         assert_eq!(
             args,
             vec![
@@ -1133,6 +1273,8 @@ mod tests {
                 "lab.orblx".to_string()
             ]
         );
+        let captured = domain_args("orblx0", &[], true);
+        assert!(captured.iter().any(|item| item == "~."));
     }
 
     #[test]
@@ -1186,6 +1328,7 @@ mod tests {
             table_rx,
             Arc::new(AllowPeers),
             Arc::new(CountingForward::new()),
+            Ipv4Addr::new(100, 64, 0, 1),
             stop_rx,
         ));
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();

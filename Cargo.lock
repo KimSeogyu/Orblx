@@ -1319,6 +1319,7 @@ dependencies = [
  "orblx-identity",
  "orblx-relay",
  "orblx-ssh",
+ "serde",
  "serde_json",
  "tokio",
 ]
@@ -1363,6 +1364,7 @@ dependencies = [
  "orblx-audit",
  "orblx-crypto",
  "orblx-identity",
+ "orblx-relay",
  "quinn",
  "rand 0.8.8",
  "rcgen",
@@ -1370,6 +1372,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "sha2",
  "time",
  "tokio",
  "tokio-rustls",
