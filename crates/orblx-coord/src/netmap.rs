@@ -292,6 +292,7 @@ mod tests {
                 port_start: 22,
                 port_end: 22,
             }],
+            reach: vec!["spiffe://orblx.local/node/mac".to_string()],
         };
         let signed = key.sign_grants(&grants).unwrap();
         super::verify_signed_grants(&signed, &key.public()).unwrap();
@@ -299,6 +300,9 @@ mod tests {
         tampered.grants.grants[0].port_start = 5432;
         tampered.grants.grants[0].port_end = 5432;
         assert!(super::verify_signed_grants(&tampered, &key.public()).is_err());
+        let mut hidden = signed.clone();
+        hidden.grants.reach.clear();
+        assert!(super::verify_signed_grants(&hidden, &key.public()).is_err());
     }
 
     #[test]

@@ -138,6 +138,7 @@ mod tests {
                 port_start: 22,
                 port_end: 22,
             }],
+            reach: Vec::new(),
         }
     }
 

@@ -5,9 +5,11 @@
 //! Names outside that set go to the system resolver.
 //! A hidden peer gets NXDOMAIN. The responder does not forward that name.
 //!
-//! W18-5 replaces [`AllowPeers`]. The default allows every peer.
+//! [`GrantPeers`] reads the `reach` list on the signed grants.
+//! A peer absent from that list is NXDOMAIN.
+//! [`AllowPeers`] allows every peer when the node has no grant file.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 #[cfg(target_os = "linux")]
@@ -21,6 +23,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use orblx_identity::ReceiverGrants;
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::watch;
 
@@ -45,15 +48,13 @@ const RCODE_REFUSED: u8 = 5;
 #[cfg(target_os = "linux")]
 const COMMAND_WAIT: Duration = Duration::from_secs(5);
 
-/// W18-5 implements this hook.
-///
-/// The node calls it for each peer before it answers a DNS name.
+/// The node calls this hook for each peer before it answers a DNS name.
 pub trait PeerVisibility: Send + Sync {
     /// Return true when the node may answer names for this peer.
     fn is_visible(&self, peer: &NetmapPeer) -> bool;
 }
 
-/// The default visibility hook.
+/// The visibility hook for a node that has no signed grants.
 ///
 /// It allows every peer.
 #[derive(Debug, Clone, Copy, Default)]
@@ -66,12 +67,35 @@ impl PeerVisibility for AllowPeers {
 }
 
 /// The default check. It allows every peer.
-///
-/// W18-5 can replace the call with a policy check.
 #[must_use]
 pub fn is_visible(peer: &NetmapPeer) -> bool {
     let _ = peer;
     true
+}
+
+/// Peers the signed grants let this node reach.
+///
+/// The list is the `reach` field of [`ReceiverGrants`].
+/// The node does not read a second policy file.
+#[derive(Debug, Clone)]
+pub struct GrantPeers {
+    reach: HashSet<String>,
+}
+
+impl GrantPeers {
+    /// Build the hook from the signed grant document.
+    #[must_use]
+    pub fn from_grants(grants: &ReceiverGrants) -> Self {
+        Self {
+            reach: grants.reach.iter().cloned().collect(),
+        }
+    }
+}
+
+impl PeerVisibility for GrantPeers {
+    fn is_visible(&self, peer: &NetmapPeer) -> bool {
+        self.reach.contains(&peer.svid)
+    }
 }
 
 /// One DNS answer set built from a netmap.
@@ -891,9 +915,12 @@ mod tests {
     use tokio::net::UdpSocket;
     use tokio::sync::watch;
 
+    use orblx_identity::{Policy, SpiffeId};
+
     use super::{
         domain_args, encode_query, first_a, macos_resolver_text, nameservers_from_resolv, rcode,
-        respond, serve_dns, AllowPeers, DnsTable, ForwardError, PeerVisibility, QueryForwarder,
+        respond, serve_dns, AllowPeers, DnsTable, ForwardError, GrantPeers, PeerVisibility,
+        QueryForwarder,
     };
     use crate::netmap::{Netmap, NetmapPeer};
 
@@ -1006,6 +1033,69 @@ mod tests {
         assert_eq!(forwarder.calls(), 0);
         let visible = respond(&table, &DenyPeer, &encode_query("a"), &forwarder);
         assert_eq!(first_a(&visible), Some(Ipv4Addr::new(100, 64, 0, 1)));
+    }
+
+    #[test]
+    fn signed_grants_hide_a_peer_this_node_cannot_reach() {
+        let policy = Policy::from_hujson(
+            r#"{
+                "acls": [{
+                    "action": "accept",
+                    "src": ["spiffe://orblx.local/node/a"],
+                    "proto": "tcp",
+                    "dst": ["spiffe://orblx.local/node/b:8080"]
+                }],
+                "tests": [{
+                    "src": "spiffe://orblx.local/node/a",
+                    "proto": "tcp",
+                    "accept": ["spiffe://orblx.local/node/b:8080"],
+                    "deny": ["spiffe://orblx.local/node/c:8080"]
+                }]
+            }"#
+            .as_bytes(),
+        )
+        .unwrap();
+        let grants = policy.receiver_grants(&SpiffeId::node("a").unwrap());
+        let hook = GrantPeers::from_grants(&grants);
+        let text = r#"{
+            "version": 1,
+            "self": {"name": "a", "overlay_ip": "100.64.0.1", "owner": "lab"},
+            "peers": [
+                {
+                    "name": "b",
+                    "overlay_ip": "100.64.0.2",
+                    "owner": "lab",
+                    "svid": "spiffe://orblx.local/node/b",
+                    "endpoints": ["172.28.18.12:443"],
+                    "routes": []
+                },
+                {
+                    "name": "c",
+                    "overlay_ip": "100.64.0.3",
+                    "owner": "lab",
+                    "svid": "spiffe://orblx.local/node/c",
+                    "endpoints": ["172.28.18.13:443"],
+                    "routes": []
+                }
+            ]
+        }"#;
+        let table = DnsTable::from_netmap(&Netmap::from_slice(text.as_bytes()).unwrap());
+        let forwarder = CountingForward::new();
+        for name in ["b", "b.lab.orblx"] {
+            let response = respond(&table, &hook, &encode_query(name), &forwarder);
+            assert_eq!(rcode(&response), 0, "{name}");
+            assert_eq!(
+                first_a(&response),
+                Some(Ipv4Addr::new(100, 64, 0, 2)),
+                "{name}"
+            );
+        }
+        for name in ["c", "c.lab.orblx"] {
+            let response = respond(&table, &hook, &encode_query(name), &forwarder);
+            assert_eq!(rcode(&response), 3, "{name}");
+            assert!(response.windows(4).all(|bytes| bytes != [100, 64, 0, 3]));
+        }
+        assert_eq!(forwarder.calls(), 0);
     }
 
     #[test]

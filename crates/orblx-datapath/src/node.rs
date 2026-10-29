@@ -63,7 +63,8 @@ pub struct NodeRequest {
     pub forward_routes: Vec<String>,
     /// The netmap file. The node reads it again when the file changes.
     pub netmap_path: PathBuf,
-    /// W18-5 replaces this hook. [`crate::AllowPeers`] allows every peer.
+    /// [`crate::GrantPeers`] hides peers the signed grants do not let this node reach.
+    /// [`crate::AllowPeers`] allows every peer when the node has no grant file.
     pub visibility: Arc<dyn PeerVisibility>,
 }
 

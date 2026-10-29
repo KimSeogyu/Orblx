@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Run three orblx nodes in Docker and resolve overlay names.
 # Each node answers <node>.lab.orblx and the short name <node>.
+# The policy denies node a to node c.
+# On node a, c and c.lab.orblx are NXDOMAIN.
+# Node b still resolves and answers.
 # The script skips the proof when it is not root.
 # The script needs Docker and a built orblx binary.
 
@@ -29,7 +32,7 @@ fi
 if command -v iptables-legacy >/dev/null 2>&1; then
   if iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP'; then
     if ! command -v iptables-nft >/dev/null 2>&1 || iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT'; then
-      echo "set iptables-legacy FORWARD ACCEPT"
+      echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
       iptables-legacy -P FORWARD ACCEPT
     fi
   fi
@@ -73,6 +76,7 @@ docker build -t orblx-w18:local "$image_dir"
 mkdir -p "$work/a" "$work/b" "$work/c"
 "$bin" node-issue \
   --out "$work" \
+  --policy "$root/scripts/proof/w18-names.hujson" \
   --node a=100.64.0.1 \
   --node b=100.64.0.2 \
   --node c=100.64.0.3
@@ -131,7 +135,7 @@ wait_direct() {
   local peer=$2
   local attempt
   for attempt in $(seq 1 40); do
-    if docker compose -f "$compose_file" exec -T "$node" orblx status | grep -q "peer ${peer} overlay_ip .* path direct "; then
+    if docker compose -f "$compose_file" exec -T "$node" orblx status 2>/dev/null | grep -q "peer ${peer} overlay_ip .* path direct "; then
       return 0
     fi
     sleep 1
@@ -148,7 +152,7 @@ ping_name() {
   for attempt in $(seq 1 20); do
     if docker compose -f "$compose_file" exec -T "$node" ping -c 1 -W 2 "$host" >/dev/null 2>&1; then
       docker compose -f "$compose_file" exec -T "$node" ping -c 3 -W 2 "$host"
-      echo "${node} to ${host} ok"
+      echo "[C] ${node} to ${host} ok"
       return 0
     fi
     sleep 1
@@ -183,14 +187,43 @@ wait_http() {
 curl_name() {
   local node=$1
   local host=$2
-  echo "---- curl ${node} http://${host}:8080/orblx-name.txt ----"
+  echo "---- [C] curl ${node} http://${host}:8080/orblx-name.txt ----"
   docker compose -f "$compose_file" exec -T "$node" curl -fsS --max-time 10 "http://${host}:8080/orblx-name.txt"
-  echo "${node} to http://${host}:8080/orblx-name.txt ok"
+  echo "[C] ${node} to http://${host}:8080/orblx-name.txt ok"
 }
 
-echo "W18 overlay name proof"
+expect_nxdomain() {
+  local node=$1
+  local name=$2
+  local server=$3
+  echo "---- [C] dns ${node} ${name} ----"
+  docker compose -f "$compose_file" exec -T "$node" \
+    python3 -c 'import socket,sys
+name,server=sys.argv[1],sys.argv[2]
+def encode(qname):
+    out=b""
+    for label in qname.strip(".").split("."):
+        raw=label.encode()
+        out+=bytes([len(raw)])+raw
+    return out+b"\x00"
+query=b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"+encode(name)+b"\x00\x01\x00\x01"
+sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+sock.settimeout(3)
+sock.sendto(query,(server,53))
+data,_=sock.recvfrom(512)
+rcode=data[3]&15
+answers=int.from_bytes(data[6:8],"big")
+print("%s rcode %s answers %s"%(name,rcode,answers))
+if rcode!=3 or answers!=0:
+    raise SystemExit("The name %s is not NXDOMAIN."%name)
+' "$name" "$server"
+  echo "[C] ${node} ${name} nxdomain"
+}
+
+echo "=== REAL W18 overlay name proof ==="
 echo "image orblx-w18:local"
 echo "owner lab"
+echo "policy deny a to c"
 echo "node a overlay 100.64.0.1 name a.lab.orblx"
 echo "node b overlay 100.64.0.2 name b.lab.orblx"
 echo "node c overlay 100.64.0.3 name c.lab.orblx"
@@ -202,9 +235,9 @@ wait_direct node-b c
 wait_direct node-c a
 wait_direct node-c b
 
-echo "---- resolvectl domain node-a ----"
+echo "---- [C] resolvectl domain node-a ----"
 docker compose -f "$compose_file" exec -T node-a resolvectl domain orblx0
-echo "---- resolvectl dns node-a ----"
+echo "---- [C] resolvectl dns node-a ----"
 docker compose -f "$compose_file" exec -T node-a resolvectl dns orblx0
 
 start_http node-a 100.64.0.1
@@ -214,19 +247,20 @@ wait_http node-a 100.64.0.2
 wait_http node-b 100.64.0.1
 wait_http node-a 100.64.0.3
 
-echo "---- ping ----"
+echo "---- [C] ping ----"
 ping_name node-a b
 ping_name node-a b.lab.orblx
-ping_name node-a c
-ping_name node-a c.lab.orblx
+expect_nxdomain node-a c 100.64.0.1
+expect_nxdomain node-a c.lab.orblx 100.64.0.1
+echo "---- [C] resolvectl query node-a c.lab.orblx ----"
+docker compose -f "$compose_file" exec -T node-a resolvectl query c.lab.orblx || true
 ping_name node-b a
 ping_name node-b a.lab.orblx
 ping_name node-c b
 ping_name node-c b.lab.orblx
 
-echo "---- http ----"
+echo "---- [C] http ----"
 curl_name node-a b.lab.orblx
 curl_name node-b a.lab.orblx
-curl_name node-a c.lab.orblx
 
 echo "proof_ok"

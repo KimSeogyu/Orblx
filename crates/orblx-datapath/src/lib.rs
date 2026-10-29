@@ -24,8 +24,8 @@ pub use connector::{
     APP_B_BODY, APP_B_HOST, APP_B_OVERLAY, APP_OVERLAY_PORT, SPOKE_OVERLAY,
 };
 pub use dns::{
-    install_link_resolver, is_visible, remove_link_resolver, AllowPeers, DnsTable, PeerVisibility,
-    MACOS_RESOLVER_PATH,
+    install_link_resolver, is_visible, remove_link_resolver, AllowPeers, DnsTable, GrantPeers,
+    PeerVisibility, MACOS_RESOLVER_PATH,
 };
 
 pub use error::HelloError;

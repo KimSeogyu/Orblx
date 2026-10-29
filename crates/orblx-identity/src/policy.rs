@@ -8,7 +8,7 @@
 //! `tests` lists allow and deny assertions.
 //! A failed assertion rejects the file.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -94,6 +94,8 @@ pub struct ReceiverGrant {
 ///
 /// The coordinator signs this document with the netmap key.
 /// The receiver permits a packet only when one grant matches.
+/// `reach` lists the peers this node may reach.
+/// The DNS responder reads that list from this same document.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReceiverGrants {
@@ -103,6 +105,12 @@ pub struct ReceiverGrants {
     pub receiver: String,
     /// Allow rows for this receiver.
     pub grants: Vec<ReceiverGrant>,
+    /// Destination SPIFFE IDs this node may reach.
+    ///
+    /// The coordinator fills the list from the same policy that builds `grants`.
+    /// An empty list means this node can reach no peer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reach: Vec<String>,
 }
 
 impl ReceiverGrants {
@@ -125,6 +133,15 @@ impl ReceiverGrants {
                 return Err(PolicyError::new("The grant port range is not valid."));
             }
         }
+        for (index, dst) in self.reach.iter().enumerate() {
+            let _ = SpiffeId::parse(dst)
+                .map_err(|_| PolicyError::new("The grant reach SPIFFE ID is not valid."))?;
+            if self.reach[..index].iter().any(|item| item == dst) {
+                return Err(PolicyError::new(
+                    "The grant reach list repeats a SPIFFE ID.",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -137,6 +154,15 @@ impl ReceiverGrants {
                 && port >= grant.port_start
                 && port <= grant.port_end
         })
+    }
+
+    /// Return true when this node may reach `dst`.
+    ///
+    /// The check uses the `reach` list.
+    /// The packet filter uses [`ReceiverGrants::permits`].
+    #[must_use]
+    pub fn reaches(&self, dst: &SpiffeId) -> bool {
+        self.reach.iter().any(|item| item == dst.as_uri())
     }
 }
 
@@ -239,10 +265,18 @@ impl Policy {
     }
 
     /// Build the signed body for one receiving node.
+    ///
+    /// `grants` lists sources that may reach this node.
+    /// `reach` lists destinations this node may reach.
+    /// Both lists come from this policy.
     #[must_use]
     pub fn receiver_grants(&self, receiver: &SpiffeId) -> ReceiverGrants {
         let mut grants = Vec::new();
+        let mut reach = BTreeSet::new();
         for grant in &self.grants {
+            if grant.src == *receiver {
+                reach.insert(grant.dst.as_uri().to_string());
+            }
             if grant.dst != *receiver {
                 continue;
             }
@@ -257,6 +291,7 @@ impl Policy {
             version: 1,
             receiver: receiver.as_uri().to_string(),
             grants,
+            reach: reach.into_iter().collect(),
         }
     }
 
@@ -1023,8 +1058,13 @@ mod tests {
         assert!(!policy.allows(&agent, &box_id, PROTO_TCP, 80));
         let grants = policy.receiver_grants(&box_id);
         assert_eq!(grants.grants.len(), 2);
+        assert!(grants.reach.is_empty());
+        assert!(!serde_json::to_string(&grants).unwrap().contains("reach"));
         assert!(grants.permits(&mac, PROTO_TCP, 22));
         assert!(!grants.permits(&mac, PROTO_TCP, 5432));
+        let mac_grants = policy.receiver_grants(&mac);
+        assert!(mac_grants.reaches(&box_id));
+        assert!(!mac_grants.reaches(&mac));
         let lines: Vec<String> = policy.assertions().iter().map(|item| item.line()).collect();
         assert!(lines
             .iter()
