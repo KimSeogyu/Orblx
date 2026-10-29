@@ -17,6 +17,8 @@ The ticket names that host, TCP, and port 22.
 The server spends the ticket once.
 A new session reads `deny.json`.
 A revoked SVID fails that check.
+`orblx admin revoke` writes the node SVID into that deny file.
+The SSH server refuses a new session when the node SVID is in the file.
 The audit chain is `ssh-audit.jsonl` in the node state directory.
 
 | Host | Label | Role |
@@ -62,14 +64,19 @@ The script printed this result:
 Linux
 x86_64
 === [C] issue SVIDs ===
-The command wrote the node a material for overlay 100.64.0.1 in /tmp/tmp.Jpu7vKDa5I/a.
-The command wrote the node b material for overlay 100.64.0.2 in /tmp/tmp.Jpu7vKDa5I/b.
-The command wrote the node c material for overlay 100.64.0.3 in /tmp/tmp.Jpu7vKDa5I/c.
-The command wrote the user alice material in /tmp/tmp.Jpu7vKDa5I/users/alice.
-The command wrote the user mallory material in /tmp/tmp.Jpu7vKDa5I/users/mallory.
-The command wrote the agent helper ticket for host 100.64.0.2 user alice in /tmp/tmp.Jpu7vKDa5I/agents/helper.
+The command wrote the node a material for overlay 100.64.0.1 in /tmp/tmp.1xeD9C42Ft/a.
+The command wrote the node b material for overlay 100.64.0.2 in /tmp/tmp.1xeD9C42Ft/b.
+The command wrote the node c material for overlay 100.64.0.3 in /tmp/tmp.1xeD9C42Ft/c.
+The command wrote the user alice material in /tmp/tmp.1xeD9C42Ft/users/alice.
+The command wrote the user mallory material in /tmp/tmp.1xeD9C42Ft/users/mallory.
+The command wrote the agent helper ticket for host 100.64.0.2 user alice in /tmp/tmp.1xeD9C42Ft/agents/helper.
 === [C] start nodes ===
 === [C] alice to node b ===
+alice
+=== [C] admin revoke of node b through deny.json ===
+The SSH session was refused.
+denied node-b
+node_revoke_seconds 1
 alice
 === [C] mallory denied ===
 The SSH session was refused.
@@ -87,14 +94,14 @@ denied revoked
 revoke_seconds 0
 === [C] audit chain on node b ===
 ok
-tip fa16b8e8a8ce4f6f61c959e85bfccfa997d537e76cdb0cab397327c602117b9d
-start 2
-end 2
-deny 3
-records 7
+tip cf472d20339d58e85a511c22dddc05a34a4fc04738fb5076c1e812182311663b
+start 3
+end 3
+deny 4
+records 10
 === [C] audit chain on node c ===
 ok
-tip 80feb4375c9b725d53cf88c7a2dc29cef811680a00eda2ae163638690d0e7033
+tip 605f402a05def3a947ffbe0fdbadcc7db5dac40daa4fe962e0a5cb461a930642
 start 0
 end 0
 deny 1
@@ -103,9 +110,13 @@ proof_ok
 ```
 
 `alice` on node `b` returned the login name.
+The deny file then named `spiffe://orblx.local/node/b`.
+That is the URI `orblx admin revoke` writes.
+The next SSH session failed in 1 second.
+A later deny file with no URIs allowed alice again.
 Mallory was denied.
 Alice to node `c` was denied.
 The agent ticket worked once and the replay was denied.
 After the deny file revoked the alice SVID, the next session failed in 0 seconds.
-The node `b` chain has start 2, end 2, and deny 3.
+The node `b` chain has start 3, end 3, and deny 4.
 The node `c` chain has deny 1.

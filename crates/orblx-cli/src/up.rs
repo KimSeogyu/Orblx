@@ -59,6 +59,7 @@ pub(crate) struct UpOptions {
     pub(crate) coord: Option<SocketAddr>,
     pub(crate) coord_name: Option<String>,
     pub(crate) bundle: Option<PathBuf>,
+    pub(crate) metrics: Option<SocketAddr>,
 }
 
 pub(crate) struct StateOptions {
@@ -99,6 +100,7 @@ impl std::fmt::Debug for Command {
                 .field("accept_routes", &options.accept_routes)
                 .field("advertise_routes", &options.advertise_routes.len())
                 .field("coord", &options.coord)
+                .field("metrics", &options.metrics)
                 .finish(),
             Self::Down(options) | Self::Status(options) => formatter
                 .debug_struct("State")
@@ -128,6 +130,7 @@ pub(crate) fn parse_up(args: &[String]) -> Result<Command, String> {
     let mut coord = None;
     let mut coord_name = None;
     let mut bundle = None;
+    let mut metrics = Some(orblx_audit::default_metrics_addr());
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -145,6 +148,13 @@ pub(crate) fn parse_up(args: &[String]) -> Result<Command, String> {
             "--coord" => coord = Some(parse_socket(&value, 443)?),
             "--coord-name" => coord_name = Some(value),
             "--bundle" => bundle = Some(PathBuf::from(value)),
+            "--metrics" => {
+                metrics = if value == "off" {
+                    None
+                } else {
+                    Some(parse_socket(&value, orblx_audit::DEFAULT_METRICS_PORT)?)
+                };
+            }
             other => return Err(format!("The flag {other} is not valid.\n{}", help_text())),
         }
     }
@@ -168,6 +178,7 @@ pub(crate) fn parse_up(args: &[String]) -> Result<Command, String> {
         coord,
         coord_name,
         bundle,
+        metrics,
     }))
 }
 
@@ -305,9 +316,10 @@ fn run_up(options: UpOptions) -> Result<(), String> {
     let (netmap_path, forward_routes) = publish_routes(&options)?;
     let netmap = Netmap::from_path(&netmap_path).map_err(|err| err.to_string())?;
     let config = load_config(&options.state_dir)?;
-    let renew = load_renewer(&options.state_dir, options.coord, options.coord_name)?;
     let visibility = load_visibility(&options.state_dir, &netmap.self_node.name)?;
     let ssh_state = options.state_dir.clone();
+    spawn_deny_refresh(&options);
+    let renew = load_renewer(&options.state_dir, options.coord, options.coord_name)?;
     run_node(NodeRequest {
         config,
         netmap,
@@ -324,6 +336,7 @@ fn run_up(options: UpOptions) -> Result<(), String> {
                 eprintln!("The SSH server did not start. {err}");
             }
         })),
+        metrics: options.metrics,
     })
     .map_err(|err| err.to_string())
 }
@@ -437,6 +450,39 @@ fn publish_routes(options: &UpOptions) -> Result<(PathBuf, Vec<String>), String>
     };
     println!("The node uses the coordinator netmap.");
     Ok((path, view.approved_routes))
+}
+
+fn spawn_deny_refresh(options: &UpOptions) {
+    let coord = match options.coord {
+        Some(addr) => addr,
+        None => {
+            let path = options.state_dir.join("coord-addr");
+            let Ok(text) = fs::read_to_string(&path) else {
+                return;
+            };
+            let Ok(addr) = text.trim().parse::<SocketAddr>() else {
+                return;
+            };
+            addr
+        }
+    };
+    let name = match &options.coord_name {
+        Some(name) => name.clone(),
+        None => fs::read_to_string(options.state_dir.join("coord-name"))
+            .ok()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "coord".to_string()),
+    };
+    let state = options.state_dir.clone();
+    thread::spawn(move || loop {
+        if let Ok(bundle) = fs::read_to_string(state.join(BUNDLE_FILE)) {
+            if let Ok(text) = orblx_coord::fetch_deny_blocking(coord, &name, &bundle, &state) {
+                let _ = fs::write(state.join("deny.json"), text.as_bytes());
+            }
+        }
+        thread::sleep(Duration::from_secs(10));
+    });
 }
 
 fn run_down(options: StateOptions) -> Result<(), String> {

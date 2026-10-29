@@ -1,0 +1,106 @@
+# Admin CLI proof stack.
+# `docker compose up` starts only the coordinator.
+# The node and relay services use the nodes profile.
+name: orblx-admin-proof
+
+services:
+  coord:
+    image: orblx-admin:w19
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /var/lib/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+    volumes:
+      - orblx-admin-store:/var/lib/orblx
+      - ${POLICY_FILE:?set POLICY_FILE}:/var/lib/orblx/policy.hujson:ro
+    networks:
+      - proof
+
+  owner:
+    image: orblx-admin:w19
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    volumes:
+      - orblx-admin-store:/coord-state:ro
+      - orblx-admin-owner:/var/lib/orblx
+    networks:
+      - proof
+
+  a:
+    image: orblx-admin:w19
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    volumes:
+      - orblx-admin-store:/coord-state:ro
+      - orblx-admin-a:/var/lib/orblx
+    networks:
+      - proof
+
+  b:
+    image: orblx-admin:w19
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+      - --accept-routes
+      - --metrics
+      - 127.0.0.1:9464
+    volumes:
+      - orblx-admin-store:/coord-state:ro
+      - orblx-admin-b:/var/lib/orblx
+    networks:
+      - proof
+
+  relay:
+    image: orblx-admin:w19
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    command:
+      - relay
+      - --udp
+      - 0.0.0.0:443
+      - --metrics
+      - 127.0.0.1:9464
+    networks:
+      - proof
+
+volumes:
+  orblx-admin-store:
+  orblx-admin-owner:
+  orblx-admin-a:
+  orblx-admin-b:
+
+networks:
+  proof:

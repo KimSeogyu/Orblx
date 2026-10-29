@@ -229,6 +229,8 @@ pub struct Policy {
     grants: Vec<CompiledGrant>,
     tests: Vec<StoredTest>,
     routes: Vec<RouteRule>,
+    node_approval: bool,
+    owners: Vec<SpiffeId>,
     ssh: Vec<SshGrant>,
     ssh_tests: Vec<StoredSshTest>,
 }
@@ -256,6 +258,8 @@ impl std::fmt::Debug for Policy {
             .field("grants", &self.grants.len())
             .field("tests", &self.tests.len())
             .field("routes", &self.routes.len())
+            .field("node_approval", &self.node_approval)
+            .field("owners", &self.owners.len())
             .field("ssh", &self.ssh.len())
             .finish()
     }
@@ -271,9 +275,31 @@ impl Policy {
             grants: Vec::new(),
             tests: Vec::new(),
             routes: Vec::new(),
+            node_approval: false,
+            owners: Vec::new(),
             ssh: Vec::new(),
             ssh_tests: Vec::new(),
         }
+    }
+
+    /// Return true when a new node waits for `orblx admin approve`.
+    #[must_use]
+    pub fn node_approval(&self) -> bool {
+        self.node_approval
+    }
+
+    /// Return the owner SPIFFE IDs.
+    ///
+    /// An owner SVID can call the coordinator admin API.
+    #[must_use]
+    pub fn owners(&self) -> &[SpiffeId] {
+        &self.owners
+    }
+
+    /// Return true when `id` is an owner.
+    #[must_use]
+    pub fn is_owner(&self, id: &SpiffeId) -> bool {
+        self.owners.iter().any(|owner| owner == id)
     }
 
     /// Read one HuJSON policy file and run its tests.
@@ -507,6 +533,10 @@ struct PolicyFile {
     route_approvals: Vec<RouteApprovalFile>,
     #[serde(default)]
     tests: Vec<TestFile>,
+    #[serde(default, rename = "nodeApproval")]
+    node_approval: bool,
+    #[serde(default)]
+    owners: Vec<String>,
     #[serde(default)]
     ssh: Vec<SshRuleFile>,
     #[serde(default, rename = "sshTests")]
@@ -653,6 +683,7 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
         tests.push(compile_test(&catalog, test)?);
     }
     let routes = compile_routes(&catalog, file)?;
+    let owners = compile_owners(&file.owners)?;
     let ssh = compile_ssh(&catalog, &file.ssh)?;
     let mut ssh_tests = Vec::new();
     for test in &file.ssh_tests {
@@ -662,6 +693,8 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
         grants,
         tests,
         routes,
+        node_approval: file.node_approval,
+        owners,
         ssh,
         ssh_tests,
     })
@@ -808,6 +841,24 @@ fn parse_check_period(text: &str) -> Result<u64, PolicyError> {
         return Err(PolicyError::new("The SSH check period is not valid."));
     }
     Ok(seconds)
+}
+
+fn compile_owners(owners: &[String]) -> Result<Vec<SpiffeId>, PolicyError> {
+    let mut ids = Vec::new();
+    for owner in owners {
+        let id = SpiffeId::parse(owner)
+            .map_err(|_| PolicyError::new("The owner SPIFFE ID is not valid."))?;
+        if id.kind() != WorkloadKind::Node && id.kind() != WorkloadKind::User {
+            return Err(PolicyError::new(
+                "The owner SPIFFE ID is not a node or a user.",
+            ));
+        }
+        if ids.iter().any(|item: &SpiffeId| item == &id) {
+            return Err(PolicyError::new("The owner list repeats a SPIFFE ID."));
+        }
+        ids.push(id);
+    }
+    Ok(ids)
 }
 
 fn compile_routes(catalog: &Catalog, file: &PolicyFile) -> Result<Vec<RouteRule>, PolicyError> {

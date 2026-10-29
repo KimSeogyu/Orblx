@@ -11,6 +11,7 @@
 //! A later netmap fetch uses the node SVID as the client certificate.
 //! A later renew call uses the node SVID and returns a new leaf.
 
+mod admin;
 mod client;
 mod error;
 
@@ -24,11 +25,14 @@ mod renew_test;
 mod server;
 mod state;
 mod store;
+mod ticket;
 mod tlsutil;
 
+pub use admin::{approve, deny_json, deny_set, expire, nodes, revoke, routes, users};
 pub use client::{
-    advertise_routes_blocking, enroll_with_oidc_blocking, enroll_with_token_blocking,
-    fetch_netmap_blocking, netmap_json, renew_svid_blocking, OidcEnroll,
+    admin_blocking, advertise_routes_blocking, enroll_with_oidc_blocking,
+    enroll_with_token_blocking, fetch_deny_blocking, fetch_netmap_blocking, netmap_json,
+    renew_svid_blocking, OidcEnroll,
 };
 pub use error::CoordError;
 pub use http_util::{fetch_google_jwks_blocking, post_google_token_blocking};
@@ -363,5 +367,81 @@ mod tests {
         );
         let exit = coord.advertise_routes("router", &["0.0.0.0/0".to_string()]);
         assert!(exit.unwrap_err().to_string().contains("exit route"));
+    }
+
+    #[test]
+    fn node_approval_hides_a_node_until_approve_and_revoke_denies_it() {
+        let scratch = Scratch::new();
+        let policy = r#"{
+          "nodeApproval": true,
+          "owners": ["spiffe://orblx.local/node/owner"],
+          "acls": [{
+            "action": "accept",
+            "src": ["spiffe://orblx.local/node/a"],
+            "proto": "tcp",
+            "dst": ["spiffe://orblx.local/node/b:22"]
+          }]
+        }"#;
+        fs::write(scratch.0.join("policy.hujson"), policy).unwrap();
+        let now = SystemTime::now();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        for name in ["owner", "a", "b"] {
+            let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+            coord
+                .enroll_token(name, &token.secret, &[format!("{name}:443")], &[], now)
+                .unwrap();
+        }
+        let owner = coord.netmap_for("owner").unwrap();
+        assert!(!owner
+            .signed_netmap
+            .netmap
+            .peers
+            .iter()
+            .any(|peer| peer.name == "a"));
+        assert!(owner.signed_grants.grants.grants.is_empty());
+        let pending = coord.netmap_for("a").unwrap();
+        assert!(pending.signed_netmap.netmap.peers.is_empty());
+        assert!(pending.signed_grants.grants.grants.is_empty());
+        coord.approve_node("a").unwrap();
+        coord.approve_node("b").unwrap();
+        let approved = coord.netmap_for("a").unwrap();
+        assert!(approved
+            .signed_netmap
+            .netmap
+            .peers
+            .iter()
+            .any(|peer| peer.name == "b"));
+        assert!(approved
+            .signed_netmap
+            .netmap
+            .peers
+            .iter()
+            .any(|peer| peer.name == "owner"));
+        assert_eq!(approved.signed_grants.grants.reach.len(), 1);
+        coord.expire_node("b").unwrap();
+        let expired = coord.netmap_for("a").unwrap();
+        assert!(!expired
+            .signed_netmap
+            .netmap
+            .peers
+            .iter()
+            .any(|peer| peer.name == "b"));
+        coord.approve_node("b").unwrap();
+        let back = coord.netmap_for("a").unwrap();
+        assert!(back
+            .signed_netmap
+            .netmap
+            .peers
+            .iter()
+            .any(|peer| peer.name == "b"));
+        let version = super::admin::revoke(&coord, "b", now).unwrap();
+        assert_eq!(version["deny_version"], 1);
+        let deny = super::admin::deny_set(&coord, now).unwrap();
+        let id = orblx_identity::SpiffeId::node("b").unwrap();
+        assert!(deny.reject_uri(&id).is_err());
+        let nodes = super::admin::nodes(&coord).unwrap();
+        let text = nodes.to_string();
+        assert!(text.contains("\"name\":\"b\""));
+        assert!(text.contains("\"approved\":true"));
     }
 }

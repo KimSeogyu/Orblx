@@ -10,6 +10,7 @@ RUN printf '%s\n' '#!/bin/sh' 'exit 101' > /usr/sbin/policy-rc.d \
         iputils-ping \
         iptables \
         curl \
+        jq \
         python3 \
         ca-certificates \
         dbus \

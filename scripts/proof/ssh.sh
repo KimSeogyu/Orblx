@@ -188,6 +188,25 @@ alice_out="$(ssh_from node-a alice@b /var/lib/orblx-id/users/alice /var/lib/orbl
 printf '%s\n' "$alice_out"
 [[ "$alice_out" == "alice" ]]
 
+echo "=== [C] admin revoke of node b through deny.json ==="
+stamp="$(date +%s)"
+cat >"$WORK/b/deny.json" <<EOF
+{"version":1,"generated_at":${stamp},"revoked_uris":["spiffe://orblx.local/node/b"],"revoked_ticket_nonces":[]}
+EOF
+start_sec="$(date +%s)"
+expect_deny node-b node-a alice@b /var/lib/orblx-id/users/alice /var/lib/orblx-peers/b.pem
+end_sec="$(date +%s)"
+elapsed="$((end_sec - start_sec))"
+echo "node_revoke_seconds ${elapsed}"
+[[ "$elapsed" -lt 60 ]]
+stamp="$(date +%s)"
+cat >"$WORK/b/deny.json" <<EOF
+{"version":2,"generated_at":${stamp},"revoked_uris":[],"revoked_ticket_nonces":[]}
+EOF
+alice_out="$(ssh_from node-a alice@b /var/lib/orblx-id/users/alice /var/lib/orblx-peers/b.pem)"
+printf '%s\n' "$alice_out"
+[[ "$alice_out" == "alice" ]]
+
 echo "=== [C] mallory denied ==="
 expect_deny mallory node-a mallory@b /var/lib/orblx-id/users/mallory /var/lib/orblx-peers/b.pem
 
@@ -203,7 +222,7 @@ expect_deny replay node-a alice@b /var/lib/orblx-id/agents/helper /var/lib/orblx
 echo "=== [C] revoke alice ==="
 stamp="$(date +%s)"
 cat >"$WORK/b/deny.json" <<EOF
-{"version":1,"generated_at":${stamp},"revoked_uris":["spiffe://orblx.local/user/alice"],"revoked_ticket_nonces":[]}
+{"version":3,"generated_at":${stamp},"revoked_uris":["spiffe://orblx.local/user/alice"],"revoked_ticket_nonces":[]}
 EOF
 start_sec="$(date +%s)"
 expect_deny revoked node-a alice@b /var/lib/orblx-id/users/alice /var/lib/orblx-peers/b.pem

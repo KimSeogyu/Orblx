@@ -9,15 +9,19 @@ use orblx_edge::crate_name as edge_crate;
 use orblx_identity::crate_name as identity_crate;
 use orblx_identity::TrustBundle;
 
+mod admin;
 mod audit;
 mod connector;
 mod coord;
 mod direct;
 mod edge;
 mod login;
+mod netcheck;
+mod ping;
 mod policy;
 mod relay;
 mod ssh;
+mod status;
 mod ticket_load;
 mod up;
 
@@ -33,10 +37,14 @@ enum Action {
     Connector(connector::Command),
     Audit(audit::Command),
     Node(up::Command),
+    Status(status::Command),
     Coord(coord::Command),
     Login(login::Command),
     Policy(policy::Command),
     Ssh(ssh::Command),
+    Admin(admin::Command),
+    Netcheck(netcheck::Command),
+    Ping(ping::Command),
 }
 
 #[derive(Debug)]
@@ -131,6 +139,30 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Ok(Action::Status(command)) => {
+            if let Err(err) = status::run(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
+        Ok(Action::Admin(command)) => {
+            if let Err(err) = admin::run(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
+        Ok(Action::Netcheck(command)) => {
+            if let Err(err) = netcheck::run(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
+        Ok(Action::Ping(command)) => {
+            if let Err(err) = ping::run(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
         Err(err) => {
             eprintln!("{err}");
             std::process::exit(1);
@@ -186,7 +218,16 @@ where
         return up::parse_down(&args[1..]).map(Action::Node);
     }
     if args.first().map(String::as_str) == Some("status") {
-        return up::parse_status(&args[1..]).map(Action::Node);
+        return status::parse(&args[1..]).map(Action::Status);
+    }
+    if args.first().map(String::as_str) == Some("admin") {
+        return admin::parse(&args[1..]).map(Action::Admin);
+    }
+    if args.first().map(String::as_str) == Some("netcheck") {
+        return netcheck::parse(&args[1..]).map(Action::Netcheck);
+    }
+    if args.first().map(String::as_str) == Some("ping") {
+        return ping::parse(&args[1..]).map(Action::Ping);
     }
     if args.first().map(String::as_str) == Some("node-issue") {
         return up::parse_issue(&args[1..]).map(Action::Node);

@@ -115,6 +115,14 @@ impl SshHandler {
     fn decide(&mut self, user: &str, password: &str) -> Auth {
         let policy = load_policy(&self.shared.state_dir.join("policy.hujson"));
         let deny = load_deny(&self.shared.state_dir.join("deny.json"));
+        if deny.reject_uri(&self.shared.node_id).is_err() {
+            self.audit_refuse(&RefusedLogin {
+                peer: self.shared.node_id.clone(),
+                reason: orblx_audit::DenyReason::Revoked,
+                ticket_hash: [0u8; 16],
+            });
+            return Auth::reject();
+        }
         let spent = self
             .shared
             .spent
@@ -232,6 +240,13 @@ fn session_ids(admitted: &Admitted) -> SessionIds {
 fn recheck(shared: &Shared, admitted: &Admitted) -> Result<(), RefusedLogin> {
     let policy = load_policy(&shared.state_dir.join("policy.hujson"));
     let deny = load_deny(&shared.state_dir.join("deny.json"));
+    if deny.reject_uri(&shared.node_id).is_err() {
+        return Err(RefusedLogin {
+            peer: shared.node_id.clone(),
+            reason: orblx_audit::DenyReason::Revoked,
+            ticket_hash: admitted.ticket_hash,
+        });
+    }
     if deny.reject_uri(&admitted.src).is_err() {
         return Err(RefusedLogin {
             peer: admitted.src.clone(),
@@ -628,7 +643,7 @@ mod tests {
             user: "alice".to_string(),
             addr,
             dst: node.clone(),
-            identity_dir: alice_dir,
+            identity_dir: alice_dir.clone(),
             peer_cert: dir.join("peer.pem"),
             command: "printf '%s\\n' \"$ORBLX_SSH_USER\"".to_string(),
         })
@@ -636,6 +651,40 @@ mod tests {
         .unwrap();
         assert_eq!(ok.exit_status, 0);
         assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "alice");
+
+        let node_deny = format!(
+            r#"{{"version":1,"generated_at":1,"revoked_uris":["{}"],"revoked_ticket_nonces":[]}}"#,
+            node.as_uri()
+        );
+        std::fs::write(dir.join("deny.json"), node_deny).unwrap();
+        let node_started = std::time::Instant::now();
+        let node_revoked = session_within(SessionRequest {
+            user: "alice".to_string(),
+            addr,
+            dst: node.clone(),
+            identity_dir: alice_dir.clone(),
+            peer_cert: dir.join("peer.pem"),
+            command: "printf %s\\n node".to_string(),
+        })
+        .await;
+        assert!(node_revoked.is_err());
+        assert!(node_started.elapsed() < Duration::from_secs(60));
+        std::fs::write(
+            dir.join("deny.json"),
+            r#"{"version":2,"generated_at":2,"revoked_uris":[],"revoked_ticket_nonces":[]}"#,
+        )
+        .unwrap();
+        let again = session_within(SessionRequest {
+            user: "alice".to_string(),
+            addr,
+            dst: node.clone(),
+            identity_dir: alice_dir.clone(),
+            peer_cert: dir.join("peer.pem"),
+            command: "printf '%s\\n' \"$ORBLX_SSH_USER\"".to_string(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&again.stdout).trim(), "alice");
 
         let denied = session_within(SessionRequest {
             user: "mallory".to_string(),
@@ -671,7 +720,7 @@ mod tests {
         assert!(replay.is_err());
 
         let document = format!(
-            r#"{{"version":1,"generated_at":1,"revoked_uris":["{}"],"revoked_ticket_nonces":[]}}"#,
+            r#"{{"version":3,"generated_at":3,"revoked_uris":["{}"],"revoked_ticket_nonces":[]}}"#,
             alice.as_uri()
         );
         std::fs::write(dir.join("deny.json"), document).unwrap();
