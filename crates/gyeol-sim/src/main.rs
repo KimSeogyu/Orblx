@@ -58,12 +58,14 @@ The command serves the Orblx game.
 The default address is {addr}.
 Open that URL in a browser.
 The default page is the game.
-Easy and City Breeze open the mock IdP.
-Sign in on that page.
+Easy and City Breeze open Google sign-in.
+The redirect URI is http://127.0.0.1:8787/oidc/callback.
+Set ORBLX_GOOGLE_CLIENT_ID and ORBLX_GOOGLE_CLIENT_SECRET.
 The callback issues the human SVID.
 The board shows the feed events.
 Select Medium or Hard on the board.
 Press UDP block to see Direct fail and the Relay recover.
+ORBLX_OIDC_MODE=mock selects the local mock IdP.
 ",
         addr = default_listen(),
     )
@@ -98,7 +100,9 @@ mod tests {
         assert_eq!(command, Command::Help);
         assert!(help_text().contains("8787"));
         assert!(help_text().contains("Easy"));
-        assert!(help_text().contains("mock IdP"));
+        assert!(help_text().contains("Google"));
+        assert!(help_text().contains("ORBLX_GOOGLE_CLIENT_ID"));
+        assert!(help_text().contains("ORBLX_OIDC_MODE=mock"));
     }
 
     #[test]

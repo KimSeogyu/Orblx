@@ -130,6 +130,20 @@ impl Harness {
         self.stage(lines);
     }
 
+    /// Finish City Breeze from a verified Google callback.
+    pub fn complete_google_city(
+        &mut self,
+        client_id: &str,
+        jwks_json: &str,
+        id_token: &str,
+        nonce: &str,
+    ) {
+        let lines = self
+            .engine
+            .complete_google_city(client_id, jwks_json, id_token, nonce);
+        self.stage(lines);
+    }
+
     /// Run one smash action.
     pub fn smash(&mut self, action: Smash) {
         let lines = match action {

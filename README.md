@@ -360,24 +360,21 @@ Read the scene in [docs/w16-char-fx.md](docs/w16-char-fx.md).
 One command:
 
 ```bash
+export ORBLX_GOOGLE_CLIENT_ID=949089074205-hpspmac5i7uld6q5p3f019tvmojhoipi.apps.googleusercontent.com
+export ORBLX_GOOGLE_CLIENT_SECRET=
 cargo run -p gyeol-sim
 ```
 
+Put the client secret in `ORBLX_GOOGLE_CLIENT_SECRET`.
 Open `http://127.0.0.1:8787`.
-
-Use another local address when port 8787 is busy:
-
-```bash
-cargo run -p gyeol-sim -- --listen 127.0.0.1:8790
-```
-
-Open `http://127.0.0.1:8790`.
+`http://localhost:8787` is the other registered origin.
+Read the sign-in steps in [docs/w17-google-oidc.md](docs/w17-google-oidc.md).
 
 City Breeze:
 
 1. Click Play City Breeze.
-2. The mock IdP page opens.
-3. Click Sign in.
+2. The browser opens Google sign-in.
+3. Complete the Google consent.
 4. The human receives the SVID and the ticket.
 5. The Direct path meets `app-a.orblx.test` and `app-b.orblx.test`.
 6. Each application returns status 200.
@@ -407,8 +404,9 @@ The picture changes from the feed `level` field.
 
 [`scripts/demo.sh`](scripts/demo.sh) checks the live harness.
 The script starts the game server.
-The script signs in at the mock IdP for City Breeze.
+The default path checks the Google authorize redirect.
 The script posts Revoke, Medium, Spawn agent, Hard, and UDP block.
+`ORBLX_OIDC_MODE=mock` signs in at the local IdP for City Breeze.
 Each action runs the live level machine.
 The script reads the event kinds from the harness response.
 The script checks that the default page is the game.
@@ -424,39 +422,41 @@ Run the demo:
 ```
 
 The default address is `http://127.0.0.1:8787`.
-Set `GYEOL_DEMO_ADDR` when port 8787 is busy.
+Google sign-in uses that address or `localhost:8787`.
 
 ```bash
-GYEOL_DEMO_ADDR=127.0.0.1:8790 ./scripts/demo.sh
+ORBLX_OIDC_MODE=mock GYEOL_DEMO_ADDR=127.0.0.1:8790 ./scripts/demo.sh
 ```
 
 ## Browser sign-in
 
-City Breeze uses the local mock IdP.
+City Breeze uses Google authorization-code OIDC.
 The play path is [Play](#play).
-The issuer is `https://oidc.gyeol.local`.
-The audience is `gyeol-issue`.
-The subject is `ada`.
-The client id is `gyeol-sim`.
-The IdP is the built-in `MockOidc` signer.
-The built-in signer is enough for this demo.
+The issuer is `https://accounts.google.com`.
+Set `ORBLX_GOOGLE_CLIENT_ID` and `ORBLX_GOOGLE_CLIENT_SECRET`.
+The public client id is `949089074205-hpspmac5i7uld6q5p3f019tvmojhoipi.apps.googleusercontent.com`.
+The redirect URI is `http://127.0.0.1:8787/oidc/callback`.
+`http://localhost:8787/oidc/callback` is the other registered redirect.
+The harness reads `OidcMode::from_env`.
+An absent mode selects Google.
+The harness does not open the mock IdP on that path.
 
 Start the game:
 
 ```bash
+export ORBLX_GOOGLE_CLIENT_ID=949089074205-hpspmac5i7uld6q5p3f019tvmojhoipi.apps.googleusercontent.com
+export ORBLX_GOOGLE_CLIENT_SECRET=
 cargo run -p gyeol-sim
 ```
 
 Open `http://127.0.0.1:8787`.
 
 Click Play City Breeze.
-The browser opens the mock IdP sign-in page.
-The page shows the issuer, the audience, and the subject.
-Click Sign in.
-The browser sends the sign-in form.
-The harness redirects the browser to `/oidc/callback`.
-The callback checks the one-time code and the state value.
-The callback issues the human SVID through `IssueGate`.
+The browser opens the Google authorization page.
+Google returns the browser to `/oidc/callback`.
+The callback posts the token request.
+The callback checks the ID token with `IssueGate`.
+The callback issues the human SVID.
 The harness verifies the human ticket.
 The harness opens `app-a.orblx.test` and `app-b.orblx.test`.
 Each application returns status 200.
@@ -464,11 +464,13 @@ The browser returns to the harness page.
 The SVID state is `up`.
 The QUIC path state is `up`.
 
-`./scripts/demo.sh` follows this same sign-in path.
+`ORBLX_OIDC_MODE=mock` selects the local IdP.
+Read that path in [docs/w14-oidc-ui.md](docs/w14-oidc-ui.md).
+Read the Google checks in [docs/w17-google-oidc.md](docs/w17-google-oidc.md).
+
+`./scripts/demo.sh` checks the Google authorize redirect.
 The script uses `curl`.
 A pass prints `demo pass`.
-
-Read the route list in [docs/w14-oidc-ui.md](docs/w14-oidc-ui.md).
 
 ## Sim harness
 
@@ -500,17 +502,17 @@ The log then writes the edge NAT lines.
 The log then writes the datapath lines.
 The lists below use that order.
 
-Use a different local address when port 8787 is busy:
+Google sign-in uses `127.0.0.1:8787` or `localhost:8787`.
+`ORBLX_OIDC_MODE=mock` can use another local address:
 
 ```bash
-cargo run -p gyeol-sim -- --listen 127.0.0.1:8790
+ORBLX_OIDC_MODE=mock cargo run -p gyeol-sim -- --listen 127.0.0.1:8790
 ```
 
 ### Easy — City Breeze
 
 Click Play City Breeze.
-City Breeze opens the mock IdP sign-in page.
-Sign in on that page.
+City Breeze opens Google sign-in.
 The callback runs City Breeze.
 The event kinds are, in order:
 

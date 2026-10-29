@@ -26,7 +26,7 @@ Run the demo:
 ```
 
 The script starts this harness.
-The script signs in at the mock IdP for City Breeze.
+The script checks the Google authorize redirect for City Breeze.
 The script then posts Revoke, Medium, Spawn agent, Hard, and UDP block.
 The script reads the event kinds from the harness.
 The script checks that the default page is the game.
@@ -66,7 +66,7 @@ Easy runs City Breeze.
 Medium runs Agent JIT.
 Hard runs Radioactive NAT.
 
-- City Breeze. A human signs in at the mock IdP. The callback issues an SVID. The human sends an overlay ping. The human opens two HTTPS applications. Press Revoke to drop that SVID. Read the click path in [w14-oidc-ui.md](w14-oidc-ui.md).
+- City Breeze. A human signs in with Google. The callback issues an SVID. The human sends an overlay ping. The human opens two HTTPS applications. Press Revoke to drop that SVID. Read the click path in [w17-google-oidc.md](w17-google-oidc.md).
 - Agent JIT. Spawn agent creates the agent SVID. Application A allows the agent. Application B denies the agent. The ticket TTL expiry is visible.
 - Radioactive NAT. UDP block calls `gyeol_edge::run_nat_smash`. Direct fails. The path then uses the TCP Relay. The overlay address is `10.8.0.1`. An SVID revoke drops new packets within 60 seconds. This smash does not upgrade to Direct. Stick and upgrade is in [w13-stick-upgrade.md](w13-stick-upgrade.md).
 
@@ -84,7 +84,7 @@ The path uses the TCP Relay.
 ## Page
 
 The default page is the game.
-Play City Breeze opens the mock IdP sign-in page.
+Play City Breeze opens Google sign-in.
 Read the clicks in [w15-demo-ui.md](w15-demo-ui.md).
 Easy and City Breeze in the engineering view open the same sign-in page.
 Sign in on that page before the level runs.
