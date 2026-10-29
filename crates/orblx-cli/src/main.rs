@@ -16,6 +16,7 @@ mod coord;
 mod direct;
 mod edge;
 mod login;
+mod nat;
 mod netcheck;
 mod ping;
 mod policy;
@@ -41,6 +42,7 @@ enum Action {
     Login(login::Command),
     Policy(policy::Command),
     Admin(admin::Command),
+    Nat(nat::Command),
     Netcheck(netcheck::Command),
     Ping(ping::Command),
 }
@@ -143,6 +145,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Ok(Action::Nat(command)) => {
+            if let Err(err) = nat::run(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
         Ok(Action::Netcheck(command)) => {
             if let Err(err) = netcheck::run(command) {
                 eprintln!("{err}");
@@ -232,6 +240,9 @@ where
     }
     if args.first().map(String::as_str) == Some("policy") {
         return policy::parse(&args[1..]).map(Action::Policy);
+    }
+    if args.first().map(String::as_str) == Some("nat") {
+        return nat::parse(&args[1..]).map(Action::Nat);
     }
     for arg in &args {
         if arg == "--version" || arg == "-V" {

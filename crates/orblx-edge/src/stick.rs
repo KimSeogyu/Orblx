@@ -511,6 +511,7 @@ fn hold_failed(machine: &mut PathMachine) -> Result<bool, EdgeError> {
         | Err(EdgeError::DirectBudget)
         | Err(EdgeError::EchoMismatch)
         | Err(EdgeError::BadCandidate)
+        | Err(EdgeError::Signature)
         | Err(EdgeError::BadToken)
         | Err(EdgeError::Identity(_))
         | Err(EdgeError::Quic(_))

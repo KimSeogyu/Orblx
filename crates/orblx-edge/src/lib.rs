@@ -3,9 +3,10 @@
 //! The client sends a Binding request.
 //! The client reads a Binding success response.
 //! Allocate stores the reflexive address.
-//! The candidate set is unsigned.
+//! The candidate set for the lab smoke is unsigned.
 //! `endpoint_sign_payload` is the byte string the coordinator signs.
-//! ADR 0003 does not name the owner of the Coordinator blob.
+//! The coordinator signs that string with the netmap Ed25519 key.
+//! The NAT node verifies the signature before it uses the address.
 //! Direct sends hole-punch datagrams.
 //! Direct then proves QUIC on the same UDP socket.
 //! The Direct attempt uses the 3 second budget.
@@ -23,11 +24,14 @@ mod direct;
 mod error;
 mod lab;
 mod nat_feed;
+mod nat_path;
+mod nat_run;
 mod nat_smash;
 mod path;
 mod punch;
 mod relay;
 mod same_nat;
+mod signed;
 mod stick;
 mod stun;
 
@@ -47,6 +51,8 @@ pub use nat_feed::{
     KIND_PATH_DOWN, KIND_PATH_RELAY, KIND_PATH_SWITCH, KIND_PATH_UP, KIND_RELAY_HOP,
     LAB_OVERLAY_IP, NAT_EVENT_VERSION, NAT_FEED_SOURCE,
 };
+pub use nat_path::{select_path, session_id, OverlayPath, PathSelect};
+pub use nat_run::{prepare_nat_gateway, run_nat_node, NatConfig};
 pub use nat_smash::{run_nat_smash, NatSmash, NatSmashReport};
 pub use path::{
     AllocatePhase, DirectPhase, PathId, PathMachine, PathState, RelayPhase, DIRECT_ATTEMPT_BUDGET,
@@ -58,6 +64,7 @@ pub use relay::{
     RelaySmokeMode, RELAY_PROOF_PAYLOAD,
 };
 pub use same_nat::{run_same_nat_bound, run_same_nat_direct, SameNatReport};
+pub use signed::{candidate_reject_line, decode_hex_key, verify_signed_candidate, SignedCandidate};
 pub use stick::{run_stick_upgrade, StickNatKind, StickReport};
 pub use stun::{LabStunServer, StunClient};
 

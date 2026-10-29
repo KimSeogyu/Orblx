@@ -32,7 +32,7 @@ pub use admin::{approve, deny_json, deny_set, expire, nodes, revoke, routes, use
 pub use client::{
     admin_blocking, advertise_routes_blocking, enroll_with_oidc_blocking,
     enroll_with_token_blocking, fetch_deny_blocking, fetch_netmap_blocking, netmap_json,
-    renew_svid_blocking, OidcEnroll,
+    publish_candidates_blocking, renew_svid_blocking, OidcEnroll,
 };
 pub use error::CoordError;
 pub use http_util::{fetch_google_jwks_blocking, post_google_token_blocking};

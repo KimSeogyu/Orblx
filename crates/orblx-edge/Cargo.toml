@@ -7,9 +7,16 @@ publish.workspace = true
 version.workspace = true
 
 [dependencies]
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 getrandom = "0.2.17"
+hkdf = "0.12"
+libc = "0.2"
 orblx-crypto = { path = "../orblx-crypto" }
 orblx-datapath = { path = "../orblx-datapath" }
 orblx-identity = { path = "../orblx-identity" }
 orblx-relay = { path = "../orblx-relay" }
 serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }

@@ -70,7 +70,7 @@ impl PunchToken {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PunchKind {
+pub(crate) enum PunchKind {
     Check,
     Ack,
 }
@@ -130,6 +130,17 @@ pub struct PunchFailure {
     pub error: EdgeError,
 }
 
+/// How a received punch address matches the signed candidate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Nominate {
+    /// The source address equals the signed address.
+    Exact,
+    /// The source address has the signed IP.
+    ///
+    /// A symmetric NAT can change the port.
+    SameIp,
+}
+
 /// Send hole-punch datagrams until `preferred` answers or `deadline` elapses.
 ///
 /// A check or an ack from `preferred` completes the punch.
@@ -140,6 +151,38 @@ pub fn exchange(
     preferred: SocketAddr,
     token: PunchToken,
     deadline: Instant,
+) -> Result<PunchOutcome, PunchFailure> {
+    exchange_mode(socket, targets, preferred, token, deadline, Nominate::Exact)
+}
+
+/// Send hole-punch datagrams and accept a new port on the signed IP.
+///
+/// A symmetric NAT uses a new source port for each peer.
+/// The returned peer address is the address that answered.
+pub fn exchange_same_ip(
+    socket: &UdpSocket,
+    targets: &[SocketAddr],
+    preferred: SocketAddr,
+    token: PunchToken,
+    deadline: Instant,
+) -> Result<PunchOutcome, PunchFailure> {
+    exchange_mode(
+        socket,
+        targets,
+        preferred,
+        token,
+        deadline,
+        Nominate::SameIp,
+    )
+}
+
+fn exchange_mode(
+    socket: &UdpSocket,
+    targets: &[SocketAddr],
+    preferred: SocketAddr,
+    token: PunchToken,
+    deadline: Instant,
+    nominate: Nominate,
 ) -> Result<PunchOutcome, PunchFailure> {
     let check = encode_punch(PunchKind::Check, token);
     let ack = encode_punch(PunchKind::Ack, token);
@@ -171,7 +214,7 @@ pub fn exchange(
                             Err(error) => return Err(PunchFailure { counts, error }),
                         }
                     }
-                    if from == preferred {
+                    if nominate_match(nominate, from, preferred) {
                         return Ok(PunchOutcome { counts, peer: from });
                     }
                 }
@@ -184,7 +227,14 @@ pub fn exchange(
     })
 }
 
-fn encode_punch(kind: PunchKind, token: PunchToken) -> [u8; PUNCH_LEN] {
+fn nominate_match(nominate: Nominate, from: SocketAddr, preferred: SocketAddr) -> bool {
+    match nominate {
+        Nominate::Exact => from == preferred,
+        Nominate::SameIp => from.ip() == preferred.ip(),
+    }
+}
+
+pub(crate) fn encode_punch(kind: PunchKind, token: PunchToken) -> [u8; PUNCH_LEN] {
     let mut packet = [0u8; PUNCH_LEN];
     packet[..8].copy_from_slice(&PUNCH_MAGIC);
     packet[8] = match kind {
@@ -195,7 +245,7 @@ fn encode_punch(kind: PunchKind, token: PunchToken) -> [u8; PUNCH_LEN] {
     packet
 }
 
-fn decode_punch(buf: &[u8], token: PunchToken) -> Option<PunchKind> {
+pub(crate) fn decode_punch(buf: &[u8], token: PunchToken) -> Option<PunchKind> {
     if buf.len() != PUNCH_LEN || buf[..8] != PUNCH_MAGIC || buf[9..] != token.bytes() {
         return None;
     }
@@ -303,6 +353,34 @@ mod tests {
         assert_eq!(preferred, remote.local);
         assert_eq!(targets[0], remote.local);
         assert_eq!(targets[1], remote.reflexive);
+    }
+
+    #[test]
+    fn same_ip_punch_accepts_a_new_port() {
+        use std::net::UdpSocket;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        use super::exchange_same_ip;
+
+        let left = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let right = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let right_addr = right.local_addr().unwrap();
+        let signed = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
+        assert_ne!(right_addr.port(), signed.port());
+        let token = PunchToken::from_bytes([9, 9, 9, 9, 9, 9, 9, 9]);
+        let left_addr = left.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            exchange_same_ip(&right, &[left_addr], left_addr, token, deadline)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let outcome =
+            exchange_same_ip(&left, &[signed, right_addr], signed, token, deadline).expect("punch");
+        let other = worker.join().unwrap().expect("peer punch");
+        assert_eq!(outcome.peer, right_addr);
+        assert_eq!(other.peer.ip(), left_addr.ip());
+        assert_ne!(outcome.peer.port(), signed.port());
     }
 
     fn candidate(host: u8, host_port: u16, mapped: u16) -> EndpointCandidate {

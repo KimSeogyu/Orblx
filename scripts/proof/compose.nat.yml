@@ -1,0 +1,145 @@
+# NAT proof stack.
+# router-1 and router-3 are endpoint-independent NAT.
+# router-2 is symmetric NAT.
+# The coordinator and the relay sit on the public network.
+name: orblx-nat-proof
+
+services:
+  coord:
+    image: orblx-nat:w19
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+    environment:
+      ORBLX_OIDC_MODE: mock
+    volumes:
+      - orblx-nat-coord:/var/lib/orblx
+    networks:
+      public:
+        ipv4_address: 172.29.19.10
+
+  relay:
+    image: orblx-nat:w19
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "orblx stun-serve --listen 0.0.0.0:3478 & exec orblx relay --udp 0.0.0.0:443 --tcp 0.0.0.0:443"
+    networks:
+      public:
+        ipv4_address: 172.29.19.20
+
+  router-1:
+    image: orblx-nat:w19
+    entrypoint: ["/bin/sh", "/nat-router.sh"]
+    command: ["172.29.19.11", "10.19.1.2", "10.19.1.10", "cone"]
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./nat-router.sh:/nat-router.sh:ro
+    networks:
+      public:
+        ipv4_address: 172.29.19.11
+      lanx:
+        ipv4_address: 10.19.1.2
+
+  router-2:
+    image: orblx-nat:w19
+    entrypoint: ["/bin/sh", "/nat-router.sh"]
+    command: ["172.29.19.12", "10.19.2.2", "10.19.2.10", "symmetric"]
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./nat-router.sh:/nat-router.sh:ro
+    networks:
+      public:
+        ipv4_address: 172.29.19.12
+      lany:
+        ipv4_address: 10.19.2.2
+
+  router-3:
+    image: orblx-nat:w19
+    entrypoint: ["/bin/sh", "/nat-router.sh"]
+    command: ["172.29.19.13", "10.19.3.2", "10.19.3.10", "cone"]
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./nat-router.sh:/nat-router.sh:ro
+    networks:
+      public:
+        ipv4_address: 172.29.19.13
+      lanz:
+        ipv4_address: 10.19.3.2
+
+  node-x:
+    image: orblx-nat:w19
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - orblx-nat-coord:/coord-state:ro
+      - orblx-nat-x:/var/lib/orblx
+    networks:
+      lanx:
+        ipv4_address: 10.19.1.10
+
+  node-y:
+    image: orblx-nat:w19
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - orblx-nat-coord:/coord-state:ro
+      - orblx-nat-y:/var/lib/orblx
+    networks:
+      lany:
+        ipv4_address: 10.19.2.10
+
+  node-z:
+    image: orblx-nat:w19
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - orblx-nat-coord:/coord-state:ro
+      - orblx-nat-z:/var/lib/orblx
+    networks:
+      lanz:
+        ipv4_address: 10.19.3.10
+
+volumes:
+  orblx-nat-coord:
+  orblx-nat-x:
+  orblx-nat-y:
+  orblx-nat-z:
+
+networks:
+  public:
+    ipam:
+      config:
+        - subnet: 172.29.19.0/24
+  lanx:
+    ipam:
+      config:
+        - subnet: 10.19.1.0/24
+  lany:
+    ipam:
+      config:
+        - subnet: 10.19.2.0/24
+  lanz:
+    ipam:
+      config:
+        - subnet: 10.19.3.0/24
