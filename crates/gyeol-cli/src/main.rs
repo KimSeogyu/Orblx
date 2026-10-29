@@ -349,6 +349,9 @@ mod tests {
     #[test]
     fn hello_quic_help_names_the_capability_and_port() {
         let help = hello_quic_help();
+        #[cfg(target_os = "macos")]
+        assert!(help.contains("root"));
+        #[cfg(not(target_os = "macos"))]
         assert!(help.contains("CAP_NET_ADMIN"));
         assert!(help.contains("443"));
         let action = action_from_args(["hello-quic".to_string(), "--help".to_string()]).unwrap();

@@ -173,7 +173,7 @@ pub fn run_local_tun_bench() -> Result<TunBenchOutcome, String> {
     #[cfg(not(target_os = "linux"))]
     {
         Ok(TunBenchOutcome::Skipped(
-            "K3: This host is not Linux. The TUN device in this tree is a Linux TUN device."
+            "K3: This host is not Linux. The local TUN bench measures a Linux TUN device."
                 .to_string(),
         ))
     }
