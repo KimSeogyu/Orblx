@@ -7,6 +7,7 @@
 use std::net::Ipv4Addr;
 
 /// Routing table for the exit-node default route.
+#[cfg(target_os = "linux")]
 pub const EXIT_TABLE: u32 = 5200;
 
 /// One plan for the exit-node routes.
@@ -94,6 +95,7 @@ pub fn install_exit_routes(
 
 /// Removes the exit-node routing rule.
 pub struct ExitRouteGuard {
+    #[cfg(target_os = "linux")]
     installed: bool,
 }
 
