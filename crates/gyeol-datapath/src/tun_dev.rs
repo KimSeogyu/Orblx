@@ -1,4 +1,5 @@
 use std::net::Ipv4Addr;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 use tokio::sync::mpsc;

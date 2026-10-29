@@ -8,8 +8,6 @@
 
 use std::net::Ipv4Addr;
 
-use crate::HelloError;
-
 /// The utun MTU. This matches the Linux TUN MTU.
 const UTUN_MTU: u16 = 1500;
 
@@ -261,7 +259,7 @@ mod device {
 
     const CONTROL_NAME: &[u8] = b"com.apple.net.utun_control";
 
-    pub(super) fn open(config: &TunConfig) -> Result<TunBridge, HelloError> {
+    pub(crate) fn open(config: &TunConfig) -> Result<TunBridge, HelloError> {
         let (fd, name) = open_utun_fd(config.name.as_deref())?;
         let mut installer = ShellInstaller {
             runner: SystemCommand,
@@ -312,6 +310,11 @@ mod device {
             ctl_name: [0; 96],
         };
         info.ctl_name[..CONTROL_NAME.len()].copy_from_slice(CONTROL_NAME);
+        debug_assert_eq!(std::mem::size_of::<CtlInfo>(), 100);
+        debug_assert_eq!(
+            libc::CTLIOCGINFO,
+            libc::c_ulong::from(bsd_ioctl_readwrite(b'N', 3, 100))
+        );
         let rc = unsafe {
             libc::ioctl(
                 fd.as_raw_fd(),
