@@ -141,12 +141,12 @@ grants 1
 === [C] start node b ===
 === [C] ping after approve ===
 path direct
-rtt_ms 13
+rtt_ms 14
 === [C] status json ===
-{"state":"up","name":"b","overlay_ip":"100.64.0.3","svid":"spiffe://orblx.local/node/b","svid_expiry":1793314255,"peers":[{"name":"a","overlay_ip":"100.64.0.2","path":"direct","svid":"spiffe://orblx.local/node/a","svid_expiry":1793314254},{"name":"owner","overlay_ip":"100.64.0.1","path":"down","svid":"spiffe://orblx.local/node/owner","svid_expiry":null}]}
+{"state":"up","name":"b","overlay_ip":"100.64.0.3","svid":"spiffe://orblx.local/node/b","svid_expiry":1793316695,"exit_node":null,"peers":[{"name":"a","overlay_ip":"100.64.0.2","path":"direct","svid":"spiffe://orblx.local/node/a","svid_expiry":1793316694},{"name":"owner","overlay_ip":"100.64.0.1","path":"down","svid":"spiffe://orblx.local/node/owner","svid_expiry":null}]}
 === [C] node metrics ===
 # TYPE orblx_node_packets_tx counter
-orblx_node_packets_tx 3
+orblx_node_packets_tx 1
 # TYPE orblx_node_packets_rx counter
 orblx_node_packets_rx 1
 # TYPE orblx_node_sessions gauge
@@ -179,6 +179,9 @@ proof_ok
 `jq` on the REAL host parsed the status JSON.
 The node metrics and the Relay metrics returned counters.
 `orblx_node_packets_tx` and `orblx_node_packets_rx` are greater than 0 after the ping.
+Node b received one echo request and sent one echo reply.
+The node answers an echo to its own overlay IP in user space.
+The node does not also send that request to TUN, so the kernel does not send a second reply.
 The proof stops when either counter stays at 0.
 The NAT kind is `cone` because UDP 443 answered and the proof has no STUN server.
 The ping after revoke stopped in the same second.
