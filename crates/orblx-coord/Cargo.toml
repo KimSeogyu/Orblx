@@ -22,3 +22,6 @@ sha2 = "0.10.8"
 tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { version = "=0.26.2", default-features = false, features = ["ring", "tls12", "logging"] }
 webpki-roots = "=0.26.11"
+
+[dev-dependencies]
+orblx-crypto = { path = "../orblx-crypto" }

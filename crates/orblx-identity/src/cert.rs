@@ -147,6 +147,11 @@ pub(crate) fn cert_validity(der: &[u8]) -> Result<(u64, u64), IdentityError> {
     validity_unix(&cert)
 }
 
+/// Return the leaf `not_before` and `not_after` times as Unix seconds.
+pub fn leaf_validity(der: &[u8]) -> Result<(u64, u64), IdentityError> {
+    cert_validity(der)
+}
+
 /// Return the leaf `not_after` time as Unix seconds.
 pub fn leaf_not_after(der: &[u8]) -> Result<u64, IdentityError> {
     cert_validity(der).map(|(_not_before, not_after)| not_after)

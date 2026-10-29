@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# Issue 2 minute node SVIDs and keep one session up for at least 6 minutes.
+# The script pings once per second and reports loss.
+# The script skips the proof when it is not root or when Docker is absent.
+set -euo pipefail
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "The SVID renewal proof needs root. The script skips the proof."
+  exit 0
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "The SVID renewal proof needs Docker. The script skips the proof."
+  exit 0
+fi
+
+if ! docker compose version >/dev/null 2>&1; then
+  echo "The SVID renewal proof needs Docker Compose."
+  exit 1
+fi
+
+root=$(cd "$(dirname "$0")/../.." && pwd)
+bin="$root/target/debug/orblx"
+compose_file="$root/scripts/proof/compose.svid.yml"
+work=$(mktemp -d)
+env_file=""
+image_dir=""
+ping_count=370
+
+require_toolchain() {
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "The SVID renewal proof needs cargo on PATH."
+    exit 1
+  fi
+  if ! command -v rustc >/dev/null 2>&1; then
+    echo "The SVID renewal proof needs rustc on PATH."
+    exit 1
+  fi
+  local msrv rustc_ver oldest
+  msrv=$(awk '
+    $0 ~ /^\[workspace\.package\]/ { in_pkg = 1; next }
+    in_pkg && $0 ~ /^\[/ { in_pkg = 0 }
+    in_pkg && $1 == "rust-version" {
+      gsub(/"/, "", $3)
+      print $3
+      exit
+    }
+  ' "$root/Cargo.toml")
+  if [[ -z "$msrv" ]]; then
+    echo "The crate MSRV is missing from Cargo.toml."
+    exit 1
+  fi
+  rustc_ver=$(rustc --version | awk '{ print $2 }')
+  oldest=$(printf '%s\n%s\n' "$msrv" "$rustc_ver" | sort -V | head -n 1)
+  if [[ "$oldest" != "$msrv" ]]; then
+    echo "rustc ${rustc_ver} is older than the crate MSRV ${msrv}."
+    exit 1
+  fi
+}
+
+compose() {
+  docker compose --env-file "$env_file" -f "$compose_file" "$@"
+}
+
+cleanup() {
+  local status=$?
+  if [[ "$status" -ne 0 ]]; then
+    echo "---- docker logs ----"
+    if [[ -n "$env_file" && -f "$env_file" ]]; then
+      compose logs || true
+    fi
+  fi
+  if [[ -n "$env_file" && -f "$env_file" ]]; then
+    compose down --remove-orphans >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$image_dir" ]]; then
+    rm -rf "$image_dir"
+  fi
+  rm -rf "$work"
+}
+trap cleanup EXIT
+
+open_legacy_forward() {
+  command -v iptables-legacy >/dev/null 2>&1 || return 0
+  iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  if command -v iptables-nft >/dev/null 2>&1; then
+    iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+  fi
+  echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
+  iptables-legacy -P FORWARD ACCEPT
+}
+
+require_toolchain
+open_legacy_forward
+
+if [[ ! -x "$bin" ]]; then
+  cargo build -p orblx-cli --bin orblx --manifest-path "$root/Cargo.toml"
+fi
+
+image_dir=$(mktemp -d)
+cp "$bin" "$image_dir/orblx"
+cp "$root/scripts/proof/Dockerfile" "$image_dir/Dockerfile"
+docker build -t orblx-svid:local "$image_dir"
+
+mkdir -p "$work/coord" "$work/a" "$work/b" "$work/tickets"
+"$bin" node-issue \
+  --out "$work/tickets" \
+  --node a=100.64.0.1 \
+  --node b=100.64.0.2
+
+cat >"$work/netmap-a.json" <<'EOF'
+{
+  "version": 1,
+  "self": {"name": "a", "overlay_ip": "100.64.0.1"},
+  "peers": [{
+    "name": "b",
+    "overlay_ip": "100.64.0.2",
+    "svid": "spiffe://orblx.local/node/b",
+    "endpoints": ["172.28.19.12:443"],
+    "routes": ["100.64.0.2/32"]
+  }]
+}
+EOF
+cat >"$work/netmap-b.json" <<'EOF'
+{
+  "version": 1,
+  "self": {"name": "b", "overlay_ip": "100.64.0.2"},
+  "peers": [{
+    "name": "a",
+    "overlay_ip": "100.64.0.1",
+    "svid": "spiffe://orblx.local/node/a",
+    "endpoints": ["172.28.19.11:443"],
+    "routes": ["100.64.0.1/32"]
+  }]
+}
+EOF
+
+env_file="$work/svid.env"
+cat >"$env_file" <<EOF
+SVID_COORD_STATE=$work/coord
+SVID_STATE_A=$work/a
+SVID_STATE_B=$work/b
+SVID_NETMAP_A=$work/netmap-a.json
+SVID_NETMAP_B=$work/netmap-b.json
+EOF
+echo "env_file ${env_file}"
+
+echo "=== [C] start coordinator ==="
+compose up -d coord
+for _ in $(seq 1 90); do
+  if compose exec -T coord cat /var/lib/orblx/trust-bundle.pem >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+compose exec -T coord cat /var/lib/orblx/trust-bundle.pem >/dev/null
+
+echo "=== [C] token a ==="
+compose exec -T coord orblx coord token create --state /var/lib/orblx --ttl 3600 --out /var/lib/orblx/tokens/a
+echo "=== [C] token b ==="
+compose exec -T coord orblx coord token create --state /var/lib/orblx --ttl 3600 --out /var/lib/orblx/tokens/b
+
+copy_token() {
+  local name=$1
+  mkdir -p "$work/tokens"
+  compose exec -T coord cat "/var/lib/orblx/tokens/${name}" >"$work/tokens/${name}"
+  chmod 600 "$work/tokens/${name}"
+}
+copy_token a
+copy_token b
+
+echo "=== [C] enroll a ==="
+"$bin" coord enroll \
+  --name a \
+  --coord 172.28.19.10:443 \
+  --coord-name coord \
+  --bundle "$work/coord/trust-bundle.pem" \
+  --token-file "$work/tokens/a" \
+  --state "$work/a" \
+  --endpoint 172.28.19.11:443
+echo "=== [C] enroll b ==="
+"$bin" coord enroll \
+  --name b \
+  --coord 172.28.19.10:443 \
+  --coord-name coord \
+  --bundle "$work/coord/trust-bundle.pem" \
+  --token-file "$work/tokens/b" \
+  --state "$work/b" \
+  --endpoint 172.28.19.12:443
+
+copy_tickets() {
+  local name=$1
+  local dest=$2
+  local file
+  for file in ticket.bin ticket.bin.mac ticket-verifier.pem ticket-mac.key svid-ca.pub ticket-not-before ticket-not-after; do
+    cp "$work/tickets/${name}/${file}" "$dest/${file}"
+  done
+  chmod 600 "$dest/ticket.bin" "$dest/ticket.bin.mac" "$dest/ticket-mac.key"
+}
+copy_tickets a "$work/a"
+copy_tickets b "$work/b"
+
+echo "=== [C] start nodes ==="
+compose up -d node-a node-b
+
+wait_direct() {
+  local node=$1
+  local peer=$2
+  local attempt
+  for attempt in $(seq 1 40); do
+    if compose exec -T "$node" orblx status | grep -q "peer ${peer} overlay_ip .* path direct "; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "The path from ${node} to ${peer} is not direct."
+  compose exec -T "$node" orblx status || true
+  return 1
+}
+wait_direct node-a b
+wait_direct node-b a
+
+echo "=== [C] ping every second ==="
+ping_log="$work/ping.txt"
+compose exec -T node-a ping -n -D -O -i 1 -c "$ping_count" -W 1 100.64.0.2 >"$ping_log"
+cat "$ping_log"
+
+sent=$(awk '/packets transmitted/ { print $1; exit }' "$ping_log")
+received=$(awk '/packets transmitted/ { print $4; exit }' "$ping_log")
+loss=$(awk -F',' '/packet loss/ { gsub(/[^0-9.]/, "", $3); print $3; exit }' "$ping_log")
+consecutive=0
+max_consecutive=0
+while IFS= read -r line; do
+  if [[ "$line" == *"no answer"* ]]; then
+    consecutive=$((consecutive + 1))
+    if [[ "$consecutive" -gt "$max_consecutive" ]]; then
+      max_consecutive=$consecutive
+    fi
+  elif [[ "$line" == *"bytes from"* ]]; then
+    consecutive=0
+  fi
+done <"$ping_log"
+
+mapfile -t expiry_lines < <(compose logs node-a | awk '/The node renewed the SVID/ { print $NF }' | sed 's/\.$//')
+end_expiry=$(compose exec -T node-a orblx status | awk '/^svid_expiry / { print $2; exit }')
+
+echo "ping_seconds ${ping_count}"
+echo "sent ${sent}"
+echo "received ${received}"
+echo "loss_percent ${loss}"
+echo "max_consecutive_loss ${max_consecutive}"
+echo "svid_expiry_end ${end_expiry}"
+echo "renew_lines ${#expiry_lines[@]}"
+
+if [[ -z "$sent" || -z "$received" ]]; then
+  echo "The ping summary is missing."
+  exit 1
+fi
+if [[ "$max_consecutive" -ge 2 ]]; then
+  echo "The packet loss window is over 2 seconds."
+  exit 1
+fi
+if [[ "$received" -lt $((sent - 3)) ]]; then
+  echo "The ping loss is too high."
+  exit 1
+fi
+if [[ "${#expiry_lines[@]}" -lt 2 ]]; then
+  echo "The node did not renew the SVID."
+  exit 1
+fi
+echo "loss_window_ok true"
+echo "proof_ok"

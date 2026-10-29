@@ -28,7 +28,7 @@ pub async fn enroll_with_token(
         endpoints: endpoints.to_vec(),
         routes: routes.to_vec(),
     };
-    round_trip(coord, coord_name, bundle_pem, None, request, None).await
+    round_trip(coord, coord_name, bundle_pem, None, request, None, true).await
 }
 
 /// Enroll with a one-use token.
@@ -82,6 +82,7 @@ pub async fn enroll_with_oidc(input: OidcEnroll<'_>) -> Result<EnrollResult, Coo
         None,
         request,
         None,
+        true,
     )
     .await
 }
@@ -119,6 +120,7 @@ pub async fn fetch_netmap(
         Some(material),
         request,
         Some(pinned),
+        false,
     )
     .await?;
     let view = NetmapView {
@@ -128,6 +130,54 @@ pub async fn fetch_netmap(
     };
     view.write_state(state_dir)?;
     Ok(view)
+}
+
+/// Renew the node SVID with the stored leaf.
+///
+/// The function writes the new leaf into `state_dir`.
+/// The caller must not log the private key.
+pub async fn renew_svid(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+) -> Result<EnrollResult, CoordError> {
+    let material = read_node_material(state_dir)?;
+    let pinned = material.netmap_public;
+    let request = Request {
+        op: "renew".to_string(),
+        name: material.name.clone(),
+        token: None,
+        id_token: None,
+        nonce: None,
+        endpoints: Vec::new(),
+        routes: Vec::new(),
+    };
+    let result = round_trip(
+        coord,
+        coord_name,
+        bundle_pem,
+        Some(material),
+        request,
+        Some(pinned),
+        true,
+    )
+    .await?;
+    result.write_state(state_dir)?;
+    Ok(result)
+}
+
+/// Renew the node SVID with the stored leaf.
+///
+/// Call this function outside a Tokio runtime.
+/// The caller must not log the private key.
+pub fn renew_svid_blocking(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+) -> Result<EnrollResult, CoordError> {
+    block_on(renew_svid(coord, coord_name, bundle_pem, state_dir))
 }
 
 /// Fetch a fresh netmap with the stored node SVID.
@@ -149,6 +199,7 @@ async fn round_trip(
     material: Option<NodeMaterial>,
     request: Request,
     pinned_public: Option<[u8; 32]>,
+    require_leaf: bool,
 ) -> Result<EnrollResult, CoordError> {
     let expect_coord = SpiffeId::coord(coord_name)?;
     let client_tls = ClientTls {
@@ -174,13 +225,14 @@ async fn round_trip(
     let response: Response = proto::read_json(&mut recv).await?;
     connection.close(quinn::VarInt::from_u32(0), b"done");
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.wait_idle()).await;
-    enroll_from_response(response, bundle_pem, pinned_public)
+    enroll_from_response(response, bundle_pem, pinned_public, require_leaf)
 }
 
 fn enroll_from_response(
     response: Response,
     bundle_pem: &str,
     pinned_public: Option<[u8; 32]>,
+    require_leaf: bool,
 ) -> Result<EnrollResult, CoordError> {
     if !response.ok {
         let text = response
@@ -219,6 +271,11 @@ fn enroll_from_response(
     }
     let certificate_pem = response.certificate_pem.unwrap_or_default();
     let private_key_pem = response.private_key_pem.unwrap_or_default();
+    if require_leaf && (certificate_pem.trim().is_empty() || private_key_pem.trim().is_empty()) {
+        return Err(CoordError::Protocol(
+            "The coordinator request failed.".to_string(),
+        ));
+    }
     Ok(EnrollResult {
         name: signed.netmap.self_node.name.clone(),
         overlay_ip: signed.netmap.self_node.overlay_ip.clone(),

@@ -11,8 +11,10 @@ A later start reads that file.
 A netmap overlay IP that differs from the stored IP is an error.
 The process keeps the stored IP.
 `orblx status` prints each peer, the path kind, and the SVID expiry.
-The path kind is `direct` when the QUIC session is up.
+The path kind is `direct` when the session received a frame in the last 2 seconds.
+The path kind is `stale` when the session is up and that frame is older.
 The path kind is `down` when the session is down.
+A coordinator address in `--coord` or in `coord-addr` makes the node renew the SVID at two thirds of the certificate life.
 The router sends each outbound TUN packet to the peer that owns the destination overlay IP.
 The TUN device name is `orblx0`.
 The systemd unit is `scripts/orblxd.service`.
@@ -48,12 +50,25 @@ The script exits 0 when Docker is absent.
 The CI workflow runs fmt, clippy, and the workspace tests.
 The proof script is a root command on a Docker host.
 The script builds `target/debug/orblx` when that file is absent.
+The script uses `cargo` and `rustc` from `PATH`.
+The script stops when `rustc` is older than the crate MSRV in `Cargo.toml`.
 The script issues node material for a, b, and c.
 The script writes one netmap for each node.
 The script starts the compose project.
 Each node pings the other two overlay addresses.
 The script then restarts `node-b`.
 The script checks the overlay IP in `orblx status`, in `node.json`, and on `orblx0`.
+The script writes an env file and prints `env_file`.
+A new shell passes that file to Compose.
+
+```
+docker compose --env-file ENV_FILE -f scripts/proof/compose.w18.yml exec node-a orblx status
+docker compose --env-file ENV_FILE -f scripts/proof/compose.w18.yml down
+```
+
+`ENV_FILE` is the printed path.
+Without the env file, Compose has no `W18_*` values.
+`exec` and `down` then fail.
 
 The shared TUN poll is 50 ms.
 A ping RTT near 50 ms or near 100 ms is the expected result.
@@ -249,7 +264,9 @@ Allow UDP 443 on the Mac from the Linux host.
 
 Issue one shared lab on the Linux host.
 The SVID life and the ticket life are 15 minutes.
+This lab has no coordinator address.
 Run `orblx node-issue` again after that life ends.
+A node with a coordinator address renews the SVID without `node-issue`.
 Copy the `mac` directory to the Mac.
 Leave `key.pem` and `ticket-mac.key` unread on the terminal.
 
@@ -320,17 +337,22 @@ The proof script writes netmaps for a, b, and c only.
 sudo install -d -m 755 /var/lib/orblx /etc/orblx
 sudo cp -a /var/lib/orblx-lab/host/. /var/lib/orblx/
 sudo cp /var/lib/orblx-lab/netmap-host.json /etc/orblx/netmap.json
-export W18_STATE_A=/var/lib/orblx-lab/a
-export W18_STATE_B=/var/lib/orblx-lab/b
-export W18_STATE_C=/var/lib/orblx-lab/c
-export W18_NETMAP_A=/var/lib/orblx-lab/netmap-a.json
-export W18_NETMAP_B=/var/lib/orblx-lab/netmap-b.json
-export W18_NETMAP_C=/var/lib/orblx-lab/netmap-c.json
+sudo tee /etc/orblx/w18.env >/dev/null <<'EOF'
+W18_STATE_A=/var/lib/orblx-lab/a
+W18_STATE_B=/var/lib/orblx-lab/b
+W18_STATE_C=/var/lib/orblx-lab/c
+W18_NETMAP_A=/var/lib/orblx-lab/netmap-a.json
+W18_NETMAP_B=/var/lib/orblx-lab/netmap-b.json
+W18_NETMAP_C=/var/lib/orblx-lab/netmap-c.json
+EOF
+set -a
+source /etc/orblx/w18.env
+set +a
 image_dir=$(mktemp -d)
 cp target/debug/orblx "$image_dir/orblx"
 cp scripts/proof/Dockerfile "$image_dir/Dockerfile"
 docker build -t orblx-w18:local "$image_dir"
-sudo docker compose -f scripts/proof/compose.w18.yml up -d
+sudo docker compose --env-file /etc/orblx/w18.env -f scripts/proof/compose.w18.yml up -d
 sudo install -m 644 scripts/orblxd.service /etc/systemd/system/orblxd.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now orblxd
@@ -364,18 +386,24 @@ ping -c 3 100.64.0.3
 Check one container:
 
 ```
-sudo docker compose -f scripts/proof/compose.w18.yml exec node-a ping -c 3 100.64.0.2
-sudo docker compose -f scripts/proof/compose.w18.yml exec node-a ping -c 3 100.64.0.4
+sudo docker compose --env-file /etc/orblx/w18.env -f scripts/proof/compose.w18.yml exec node-a ping -c 3 100.64.0.2
+sudo docker compose --env-file /etc/orblx/w18.env -f scripts/proof/compose.w18.yml exec node-a ping -c 3 100.64.0.4
 ```
 
 Restart one container and read the same overlay IP:
 
 ```
-sudo docker compose -f scripts/proof/compose.w18.yml restart node-b
-sudo docker compose -f scripts/proof/compose.w18.yml exec node-b orblx status
-sudo docker compose -f scripts/proof/compose.w18.yml exec node-b ip -4 -o addr show dev orblx0
+sudo docker compose --env-file /etc/orblx/w18.env -f scripts/proof/compose.w18.yml restart node-b
+sudo docker compose --env-file /etc/orblx/w18.env -f scripts/proof/compose.w18.yml exec node-b orblx status
+sudo docker compose --env-file /etc/orblx/w18.env -f scripts/proof/compose.w18.yml exec node-b ip -4 -o addr show dev orblx0
 ```
 
 `orblx status` prints `overlay_ip 100.64.0.2`.
 The TUN line prints `100.64.0.2/32`.
 `/var/lib/orblx-lab/b/node.json` still contains `100.64.0.2`.
+
+Stop the containers from a new shell:
+
+```
+sudo docker compose --env-file /etc/orblx/w18.env -f scripts/proof/compose.w18.yml down
+```

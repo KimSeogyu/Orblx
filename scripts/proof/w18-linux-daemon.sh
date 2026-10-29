@@ -7,8 +7,6 @@
 
 set -euo pipefail
 
-export PATH="/usr/local/cargo/bin:/usr/sbin:/sbin:/usr/bin:/bin:${PATH:-}"
-
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "The W18 Docker proof needs root. The script skips the proof."
   exit 0
@@ -28,15 +26,55 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 bin="$root/target/debug/orblx"
 compose_file="$root/scripts/proof/compose.w18.yml"
 work=$(mktemp -d)
+env_file=""
 image_dir=""
+
+require_toolchain() {
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "The W18 Docker proof needs cargo on PATH."
+    exit 1
+  fi
+  if ! command -v rustc >/dev/null 2>&1; then
+    echo "The W18 Docker proof needs rustc on PATH."
+    exit 1
+  fi
+  local msrv rustc_ver oldest
+  msrv=$(awk '
+    $0 ~ /^\[workspace\.package\]/ { in_pkg = 1; next }
+    in_pkg && $0 ~ /^\[/ { in_pkg = 0 }
+    in_pkg && $1 == "rust-version" {
+      gsub(/"/, "", $3)
+      print $3
+      exit
+    }
+  ' "$root/Cargo.toml")
+  if [[ -z "$msrv" ]]; then
+    echo "The crate MSRV is missing from Cargo.toml."
+    exit 1
+  fi
+  rustc_ver=$(rustc --version | awk '{ print $2 }')
+  oldest=$(printf '%s\n%s\n' "$msrv" "$rustc_ver" | sort -V | head -n 1)
+  if [[ "$oldest" != "$msrv" ]]; then
+    echo "rustc ${rustc_ver} is older than the crate MSRV ${msrv}."
+    exit 1
+  fi
+}
+
+compose() {
+  if [[ -n "$env_file" && -f "$env_file" ]]; then
+    docker compose --env-file "$env_file" -f "$compose_file" "$@"
+  else
+    docker compose -f "$compose_file" "$@"
+  fi
+}
 
 cleanup() {
   local status=$?
   if [[ "$status" -ne 0 ]]; then
     echo "---- docker logs ----"
-    docker compose -f "$compose_file" logs || true
+    compose logs || true
   fi
-  docker compose -f "$compose_file" down --remove-orphans >/dev/null 2>&1 || true
+  compose down --remove-orphans >/dev/null 2>&1 || true
   if [[ -n "${image_dir}" ]]; then
     rm -rf "$image_dir"
   fi
@@ -45,6 +83,8 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+require_toolchain
 
 if [[ ! -x "$bin" ]]; then
   cargo build -p orblx-cli --bin orblx --manifest-path "$root/Cargo.toml"
@@ -100,14 +140,18 @@ write_netmap "$work/netmap-a.json" a 100.64.0.1 b 100.64.0.2 172.28.18.12 c 100.
 write_netmap "$work/netmap-b.json" b 100.64.0.2 a 100.64.0.1 172.28.18.11 c 100.64.0.3 172.28.18.13
 write_netmap "$work/netmap-c.json" c 100.64.0.3 a 100.64.0.1 172.28.18.11 b 100.64.0.2 172.28.18.12
 
-export W18_STATE_A="$work/a"
-export W18_STATE_B="$work/b"
-export W18_STATE_C="$work/c"
-export W18_NETMAP_A="$work/netmap-a.json"
-export W18_NETMAP_B="$work/netmap-b.json"
-export W18_NETMAP_C="$work/netmap-c.json"
+env_file="$work/w18.env"
+cat >"$env_file" <<EOF
+W18_STATE_A=$work/a
+W18_STATE_B=$work/b
+W18_STATE_C=$work/c
+W18_NETMAP_A=$work/netmap-a.json
+W18_NETMAP_B=$work/netmap-b.json
+W18_NETMAP_C=$work/netmap-c.json
+EOF
+echo "env_file ${env_file}"
 
-docker compose -f "$compose_file" up -d --remove-orphans
+compose up -d --remove-orphans
 
 record_ip() {
   awk -F'"' '/overlay_ip/ { print $4; exit }' "$1"
@@ -118,20 +162,20 @@ wait_direct() {
   local peer=$2
   local attempt
   for attempt in $(seq 1 40); do
-    if docker compose -f "$compose_file" exec -T "$node" orblx status | grep -q "peer ${peer} overlay_ip .* path direct "; then
+    if compose exec -T "$node" orblx status | grep -q "peer ${peer} overlay_ip .* path direct "; then
       return 0
     fi
     sleep 1
   done
   echo "The path from ${node} to ${peer} is not direct."
-  docker compose -f "$compose_file" exec -T "$node" orblx status || true
+  compose exec -T "$node" orblx status || true
   return 1
 }
 
 ping_peer() {
   local node=$1
   local ip=$2
-  docker compose -f "$compose_file" exec -T "$node" ping -c 3 -W 2 "$ip"
+  compose exec -T "$node" ping -c 3 -W 2 "$ip"
   echo "${node} to ${ip} ok"
 }
 
@@ -149,11 +193,11 @@ wait_direct node-c a
 wait_direct node-c b
 
 echo "---- status a ----"
-docker compose -f "$compose_file" exec -T node-a orblx status
+compose exec -T node-a orblx status
 echo "---- status b ----"
-docker compose -f "$compose_file" exec -T node-b orblx status
+compose exec -T node-b orblx status
 echo "---- status c ----"
-docker compose -f "$compose_file" exec -T node-c orblx status
+compose exec -T node-c orblx status
 
 echo "---- ping ----"
 ping_peer node-a 100.64.0.2
@@ -163,22 +207,22 @@ ping_peer node-b 100.64.0.3
 ping_peer node-c 100.64.0.1
 ping_peer node-c 100.64.0.2
 
-overlay_before=$(docker compose -f "$compose_file" exec -T node-b orblx status | awk '/^overlay_ip / { print $2; exit }')
+overlay_before=$(compose exec -T node-b orblx status | awk '/^overlay_ip / { print $2; exit }')
 json_before=$(record_ip "$work/b/node.json")
 echo "---- restart b ----"
 echo "overlay_ip_before ${overlay_before}"
 echo "node_json_before ${json_before}"
-docker compose -f "$compose_file" restart node-b
+compose restart node-b
 wait_direct node-b a
 wait_direct node-b c
 wait_direct node-a b
 wait_direct node-c b
 
-overlay_after=$(docker compose -f "$compose_file" exec -T node-b orblx status | awk '/^overlay_ip / { print $2; exit }')
+overlay_after=$(compose exec -T node-b orblx status | awk '/^overlay_ip / { print $2; exit }')
 json_after=$(record_ip "$work/b/node.json")
-tun_after=$(docker compose -f "$compose_file" exec -T node-b ip -4 -o addr show dev orblx0 | awk '{ print $4 }')
+tun_after=$(compose exec -T node-b ip -4 -o addr show dev orblx0 | awk '{ print $4 }')
 echo "---- status b after restart ----"
-docker compose -f "$compose_file" exec -T node-b orblx status
+compose exec -T node-b orblx status
 echo "overlay_ip_after ${overlay_after}"
 echo "node_json_after ${json_after}"
 echo "tun_address_after ${tun_after}"

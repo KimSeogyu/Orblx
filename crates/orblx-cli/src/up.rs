@@ -7,15 +7,17 @@
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use orblx_coord::renew_svid_blocking;
 use orblx_crypto::{mac_input, ticket_mac};
 use orblx_datapath::{
-    read_status_text, run_node, running_pid, HelloConfig, Netmap, NodeRequest, DEFAULT_UDP_PORT,
+    read_status_text, run_node, running_pid, HelloConfig, Netmap, NodeRequest, RenewedLeaf,
+    SvidRenewer, DEFAULT_UDP_PORT,
 };
 use orblx_identity::{
     sign_ticket, DenySet, MiniCa, SpiffeId, TicketClaims, TicketFlags, TicketSigner, MAX_USER_TTL,
@@ -44,6 +46,8 @@ pub(crate) struct UpOptions {
     pub(crate) netmap: PathBuf,
     pub(crate) state_dir: PathBuf,
     pub(crate) listen: SocketAddr,
+    pub(crate) coord: Option<String>,
+    pub(crate) coord_name: Option<String>,
 }
 
 pub(crate) struct StateOptions {
@@ -64,6 +68,7 @@ impl std::fmt::Debug for Command {
                 .field("netmap", &options.netmap)
                 .field("state_dir", &options.state_dir)
                 .field("listen", &options.listen)
+                .field("coord", &options.coord)
                 .finish(),
             Self::Down(options) | Self::Status(options) => formatter
                 .debug_struct("State")
@@ -85,6 +90,8 @@ pub(crate) fn parse_up(args: &[String]) -> Result<Command, String> {
     let mut netmap = None;
     let mut state_dir = None;
     let mut listen = None;
+    let mut coord = None;
+    let mut coord_name = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -94,6 +101,8 @@ pub(crate) fn parse_up(args: &[String]) -> Result<Command, String> {
             "--netmap" => netmap = Some(PathBuf::from(value)),
             "--state-dir" => state_dir = Some(PathBuf::from(value)),
             "--listen" => listen = Some(parse_socket(&value, DEFAULT_UDP_PORT)?),
+            "--coord" => coord = Some(value),
+            "--coord-name" => coord_name = Some(value),
             other => return Err(format!("The flag {other} is not valid.\n{}", help_text())),
         }
     }
@@ -104,6 +113,8 @@ pub(crate) fn parse_up(args: &[String]) -> Result<Command, String> {
         state_dir,
         listen: listen
             .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_UDP_PORT))),
+        coord,
+        coord_name,
     }))
 }
 
@@ -161,13 +172,80 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
 fn run_up(options: UpOptions) -> Result<(), String> {
     let netmap = Netmap::from_path(&options.netmap).map_err(|err| err.to_string())?;
     let config = load_config(&options.state_dir)?;
+    let renew = load_renewer(&options.state_dir, options.coord, options.coord_name)?;
     run_node(NodeRequest {
         config,
         netmap,
         listen: options.listen,
         state_dir: options.state_dir,
+        renew,
+        stop: None,
     })
     .map_err(|err| err.to_string())
+}
+
+fn load_renewer(
+    state: &Path,
+    coord: Option<String>,
+    coord_name: Option<String>,
+) -> Result<Option<SvidRenewer>, String> {
+    let address = match coord {
+        Some(value) => value,
+        None => {
+            let path = state.join("coord-addr");
+            if !path.exists() {
+                return Ok(None);
+            }
+            let text = read_text(&path)?;
+            text.trim().to_string()
+        }
+    };
+    if address.is_empty() {
+        return Ok(None);
+    }
+    let name = match coord_name {
+        Some(value) => value,
+        None => {
+            let path = state.join("coord-name");
+            if path.exists() {
+                let text = read_text(&path)?;
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    "coord".to_string()
+                } else {
+                    trimmed.to_string()
+                }
+            } else {
+                "coord".to_string()
+            }
+        }
+    };
+    let state = state.to_path_buf();
+    Ok(Some(SvidRenewer::new(move || {
+        renew_from_coord(&state, &address, &name)
+    })))
+}
+
+fn renew_from_coord(state: &Path, address: &str, name: &str) -> Result<RenewedLeaf, String> {
+    let coord = resolve_coord(address)?;
+    let bundle = read_text(&state.join(BUNDLE_FILE))?;
+    let result = renew_svid_blocking(coord, name, &bundle, state).map_err(|err| err.to_string())?;
+    Ok(RenewedLeaf {
+        certificate_pem: result.certificate_pem,
+        private_key_pem: result.private_key_pem,
+    })
+}
+
+fn resolve_coord(text: &str) -> Result<SocketAddr, String> {
+    if let Ok(addr) = text.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    let mut addrs = text
+        .to_socket_addrs()
+        .map_err(|_| format!("The coordinator address {text} is not valid."))?;
+    addrs
+        .next()
+        .ok_or_else(|| format!("The coordinator address {text} is not valid."))
 }
 
 fn run_down(options: StateOptions) -> Result<(), String> {
@@ -339,7 +417,7 @@ fn wants_help(args: &[String]) -> bool {
 fn help_text() -> String {
     format!(
         "\
-orblx up [--netmap FILE] [--state-dir DIR] [--listen ADDR]
+orblx up [--netmap FILE] [--state-dir DIR] [--listen ADDR] [--coord ADDR] [--coord-name NAME]
 orblx down [--state-dir DIR]
 orblx status [--state-dir DIR]
 orblx node-issue --out DIR --node NAME=OVERLAY_IP [--node NAME=OVERLAY_IP ...]
@@ -355,7 +433,12 @@ The default port is {DEFAULT_UDP_PORT}.
 The state directory holds the node certificate, the private key, the trust bundle, and the capability ticket.
 The command does not print the private key or the ticket MAC key.
 orblx status prints each peer, the path kind, and the SVID expiry.
-The path kind is direct when the QUIC session is up.
+The path kind is direct when the session received a frame in the last 2 seconds.
+The path kind is stale when the session is up and that frame is older.
+The path kind is down when the session is down.
+The node renews the SVID from the coordinator at two thirds of the certificate life.
+The coordinator address is --coord or the file coord-addr in the state directory.
+The command does not print the private key or a token.
 "
     )
 }
