@@ -706,6 +706,13 @@ fn spawn_deny_refresh(options: &UpOptions) {
             .unwrap_or_else(|| "coord".to_string()),
     };
     let state = options.state_dir.clone();
+    // W25-6: the node first waits for a new netmap, grant set, or deny list (`policy-wait`).
+    // The coordinator replies when one of them changes. The node writes the files, and the
+    // running watchers apply them. No restart and no manual fetch is necessary.
+    // A node that runs with its own --netmap file keeps that file. It gets the grants and the
+    // deny list.
+    // When `policy-wait` fails (for example an old coordinator), the node uses `deny-wait`
+    // and tries `policy-wait` again after DENY_WAIT_RETRY.
     // W25-2: the node waits for a new deny list (`deny-wait`). The coordinator replies when the
     // list changes, or after DENY_WAIT_HOLD with the same list.
     // When the wait fails (for example an old coordinator), the node fetches the list each
@@ -713,12 +720,33 @@ fn spawn_deny_refresh(options: &UpOptions) {
     thread::spawn(move || {
         let mut etag: Option<String> = None;
         let mut wait_after = Instant::now();
+        let mut policy_etag: Option<String> = None;
+        let mut policy_after = Instant::now();
         loop {
             let start = Instant::now();
             let Ok(bundle) = fs::read_to_string(state.join(BUNDLE_FILE)) else {
                 thread::sleep(DENY_REFRESH);
                 continue;
             };
+            if start >= policy_after {
+                match orblx_coord::fetch_policy_wait_blocking(
+                    coord,
+                    &name,
+                    &bundle,
+                    &state,
+                    policy_etag.as_deref(),
+                ) {
+                    Ok(sync) => {
+                        if policy_etag.as_deref() != Some(sync.etag.as_str()) {
+                            apply_policy_sync(&state, &sync, policy_etag.is_some());
+                        }
+                        policy_etag = Some(sync.etag);
+                        thread::sleep(DENY_WAIT_GAP.saturating_sub(start.elapsed()));
+                        continue;
+                    }
+                    Err(_) => policy_after = Instant::now() + DENY_WAIT_RETRY,
+                }
+            }
             if start >= wait_after {
                 match orblx_coord::fetch_deny_wait_blocking(
                     coord,
@@ -744,6 +772,27 @@ fn spawn_deny_refresh(options: &UpOptions) {
             thread::sleep(DENY_REFRESH.saturating_sub(start.elapsed()));
         }
     });
+}
+
+/// Write the files of one `policy-wait` reply (W25-6).
+///
+/// The deny list goes first, so a revoke reaches the datapath before the netmap.
+/// The datapath reads `deny.json` each 100 ms. The DNS responder and the packet filter read
+/// `netmap.json` and `grants.signed.json` each second. Each writer writes a temp file and renames it.
+fn apply_policy_sync(state: &Path, sync: &orblx_coord::PolicySync, announce: bool) {
+    if let Err(err) = store_deny(state, &sync.deny) {
+        eprintln!("The node did not write the new deny list. {err}");
+    }
+    if let Err(err) = sync.view.write_state(state) {
+        eprintln!(
+            "The node did not write the new netmap. {}",
+            err.public_text()
+        );
+        return;
+    }
+    if announce {
+        println!("The node applied a new policy from the coordinator.");
+    }
 }
 
 /// The shortest time between two `deny-wait` requests (W25-2).

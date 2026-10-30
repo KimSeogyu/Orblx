@@ -27,6 +27,7 @@ pub struct Request {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_token: Option<String>,
     /// The ETag of the deny list that the node has (W25-2 `deny-wait`).
+    /// For `policy-wait` (W25-6), the ETag of the netmap, grants, and deny list that the node has.
     /// An old coordinator ignores the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_etag: Option<String>,
@@ -99,6 +100,9 @@ pub struct Response {
     pub ticket_not_after: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub svid_ca_pub_hex: Option<String>,
+    /// The ETag of a `policy-wait` reply (W25-6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_etag: Option<String>,
 }
 
 impl std::fmt::Debug for Response {

@@ -357,6 +357,173 @@ async fn session_stays_up_for_three_svid_lifetimes() {
     );
 }
 
+/// W25-6: a peer that enrolls after a node started becomes reachable in 2 s or less.
+///
+/// Node a runs with a netmap that has no peer. A sync loop does what `orblx up --coord`
+/// does: it waits with `policy-wait` and writes the new files. Then b enrolls and starts.
+/// Node a must add b from the new netmap file and dial b. No node restarts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_that_enrolls_later_is_reachable_in_two_seconds() {
+    let scratch = Scratch::new("late");
+    let node_a = Scratch::new("late-a");
+    let node_b = Scratch::new("late-b");
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    let (addr, handle) = server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+    let port_a = free_port();
+    let port_b = free_port();
+    let token_a = coord.create_token(Duration::from_secs(600)).unwrap();
+    let enrolled_a = client::enroll_with_token(
+        addr,
+        "coord",
+        &bundle,
+        "a",
+        &token_a.secret,
+        &[format!("127.0.0.1:{port_a}")],
+        &[],
+    )
+    .await
+    .unwrap();
+    enrolled_a.write_state(&node_a.0).unwrap();
+    let map_a = Netmap::from_path(&node_a.0.join("netmap.json")).unwrap();
+    assert!(map_a.peers.is_empty());
+
+    let trust = TrustBundle::from_pem(&bundle).unwrap();
+    let signer = TicketSigner::generate();
+    let mac_key = [0x45; 32];
+    let now = SystemTime::now();
+    let ticket_key = TicketKey::new(
+        signer.verifier(),
+        mac_key,
+        now - Duration::from_secs(60),
+        now + Duration::from_secs(3_600),
+    )
+    .unwrap();
+    let ring = TicketRing::single(ticket_key, &[8; 32]).unwrap();
+    let config_a = leaf_config(&enrolled_a, &trust, &signer, &mac_key, &ring, now);
+
+    let (stop_tx, stop_a) = watch::channel(false);
+    let stop_b = stop_a.clone();
+    let (a_in_tx, a_in_rx) = mpsc::channel(64);
+    let (a_out_tx, _a_out_rx) = mpsc::channel(64);
+    let (_b_in_tx, b_in_rx) = mpsc::channel(64);
+    let (b_out_tx, mut b_out_rx) = mpsc::channel(64);
+    let task_a = tokio::spawn(run_memory_node(
+        node_request(
+            config_a,
+            map_a,
+            port_a,
+            node_a.0.clone(),
+            renewer(
+                addr,
+                bundle.clone(),
+                node_a.0.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+            stop_a,
+        ),
+        MemoryDevice {
+            from_tun: a_in_rx,
+            to_tun: a_out_tx,
+        },
+    ));
+    let sync_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sync = {
+        let (stop, bundle, dir) = (Arc::clone(&sync_stop), bundle.clone(), node_a.0.clone());
+        tokio::task::spawn_blocking(move || {
+            let mut etag: Option<String> = None;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match client::fetch_policy_wait_blocking(
+                    addr,
+                    "coord",
+                    &bundle,
+                    &dir,
+                    etag.as_deref(),
+                ) {
+                    Ok(next) => {
+                        if etag.as_deref() != Some(next.etag.as_str()) {
+                            next.view.write_state(&dir).unwrap();
+                        }
+                        etag = Some(next.etag);
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(100)),
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let enrolled_at = Instant::now();
+    let token_b = coord.create_token(Duration::from_secs(600)).unwrap();
+    let enrolled_b = client::enroll_with_token(
+        addr,
+        "coord",
+        &bundle,
+        "b",
+        &token_b.secret,
+        &[format!("127.0.0.1:{port_b}")],
+        &[],
+    )
+    .await
+    .unwrap();
+    enrolled_b.write_state(&node_b.0).unwrap();
+    let map_b = Netmap::from_path(&node_b.0.join("netmap.json")).unwrap();
+    let config_b = leaf_config(&enrolled_b, &trust, &signer, &mac_key, &ring, now);
+    let task_b = tokio::spawn(run_memory_node(
+        node_request(
+            config_b,
+            map_b,
+            port_b,
+            node_b.0.clone(),
+            renewer(
+                addr,
+                bundle.clone(),
+                node_b.0.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+            stop_b,
+        ),
+        MemoryDevice {
+            from_tun: b_in_rx,
+            to_tun: b_out_tx,
+        },
+    ));
+    let mut reached = None;
+    while enrolled_at.elapsed() < Duration::from_secs(6) {
+        let _ = a_in_tx
+            .send(
+                ipv4_packet(
+                    Ipv4Addr::new(100, 64, 0, 1),
+                    Ipv4Addr::new(100, 64, 0, 2),
+                    b"late",
+                )
+                .unwrap(),
+            )
+            .await;
+        if let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(50), b_out_rx.recv()).await
+        {
+            reached = Some(enrolled_at.elapsed());
+            break;
+        }
+    }
+    sync_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(3), task_a).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), task_b).await;
+    handle.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(25), sync).await;
+    let reached = reached.expect("node a did not reach the late peer b");
+    println!("late_peer_reachable_ms {}", reached.as_millis());
+    assert!(
+        reached <= Duration::from_secs(2),
+        "the late peer took {} ms",
+        reached.as_millis()
+    );
+}
+
 /// The renewal window: from 1 s before a renew call to 3 s after it (W25-11).
 const RENEW_WINDOW_BEFORE: Duration = Duration::from_secs(1);
 const RENEW_WINDOW_AFTER: Duration = Duration::from_secs(3);

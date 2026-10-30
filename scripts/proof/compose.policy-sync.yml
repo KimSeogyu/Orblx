@@ -1,0 +1,164 @@
+# W25-6 policy sync proof stack.
+# `docker compose up` starts only the coordinator. The nodes use the nodes profile.
+# Each node runs `orblx up --coord`. No service runs `orblx coord netmap` after the start.
+name: ${PROOF_PROJECT:-orblx-w256-sync-proof}
+
+x-node: &node
+  image: ${ORBLX_SYNC_IMAGE:-orblx-w256-sync:local}
+  profiles: ["nodes"]
+  entrypoint: ["orblx"]
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+  devices:
+    - /dev/net/tun:/dev/net/tun
+  sysctls:
+    net.ipv4.conf.all.rp_filter: "0"
+    net.ipv4.conf.default.rp_filter: "0"
+  stop_grace_period: 10s
+
+services:
+  coord:
+    image: ${ORBLX_SYNC_IMAGE:-orblx-w256-sync:local}
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /etc/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+    volumes:
+      - ${SYNC_COORD_STATE:?set SYNC_COORD_STATE}:/var/lib/orblx
+      # The script changes the policy with a rename in this directory.
+      - ${SYNC_POLICY_DIR:?set SYNC_POLICY_DIR}:/etc/orblx:ro
+    networks:
+      proof:
+        ipv4_address: 172.30.126.2
+
+  tool:
+    image: ${ORBLX_SYNC_IMAGE:-orblx-w256-sync:local}
+    profiles: ["tool"]
+    entrypoint: ["orblx"]
+    volumes:
+      - ${SYNC_WORK:?set SYNC_WORK}:/work
+      - ${SYNC_COORD_STATE:?set SYNC_COORD_STATE}:/coord-state:ro
+    networks:
+      - proof
+
+  # Gate 3: 50 extra enrolled identities run `orblx coord netmap --watch`.
+  load:
+    image: ${ORBLX_SYNC_IMAGE:-orblx-w256-sync:local}
+    profiles: ["load"]
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - ${SYNC_WORK:?set SYNC_WORK}:/work
+      - ${SYNC_COORD_STATE:?set SYNC_COORD_STATE}:/coord-state:ro
+    networks:
+      proof:
+        ipv4_address: 172.30.126.9
+
+  sysdns:
+    image: ${ORBLX_SYNC_IMAGE:-orblx-w256-sync:local}
+    profiles: ["nodes"]
+    entrypoint: ["python3", "-u", "/proof/split-dns-server.py", "sys", "172.30.126.53"]
+    volumes:
+      - ./:/proof:ro
+    networks:
+      proof:
+        ipv4_address: 172.30.126.53
+
+  landns:
+    image: ${ORBLX_SYNC_IMAGE:-orblx-w256-sync:local}
+    profiles: ["nodes"]
+    entrypoint: ["python3", "-u", "/proof/split-dns-server.py", "lan", "10.88.26.53"]
+    volumes:
+      - ./:/proof:ro
+    networks:
+      lan:
+        ipv4_address: 10.88.26.53
+
+  router:
+    <<: *node
+    # The router writes ip_forward and iptables. The container needs a writable /proc/sys.
+    privileged: true
+    volumes:
+      - ${SYNC_ROUTER_STATE:?set SYNC_ROUTER_STATE}:/var/lib/orblx
+      - ./:/proof:ro
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.126.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --advertise-routes
+      - 10.88.26.0/24
+    networks:
+      proof:
+        ipv4_address: 172.30.126.3
+      lan:
+        ipv4_address: 10.88.26.2
+
+  a:
+    <<: *node
+    volumes:
+      - ${SYNC_A_STATE:?set SYNC_A_STATE}:/var/lib/orblx
+      - ./resolv.policy-sync.conf:/etc/resolv.conf:ro
+      - ./:/proof:ro
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.126.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --accept-routes
+    networks:
+      proof:
+        ipv4_address: 172.30.126.4
+
+  # Gate 4: b enrolls and starts after a and the router run.
+  b:
+    <<: *node
+    volumes:
+      - ${SYNC_B_STATE:?set SYNC_B_STATE}:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.126.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+    networks:
+      proof:
+        ipv4_address: 172.30.126.5
+
+networks:
+  proof:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.126.0/24
+          gateway: 172.30.126.1
+          ip_range: 172.30.126.128/25
+  lan:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.88.26.0/24

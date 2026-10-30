@@ -53,6 +53,7 @@ A renewal writes the status file, so this stall comes at a renewal too.
 4. One OS thread (`orblx-status`) writes `status.txt` (`StatusFile`). A newer text replaces a text that is not written yet.
    The last `down` text is written when the node stops.
 5. The node reads `deny.json` on a blocking thread (`spawn_blocking`).
+6. The node reads the netmap file of the W25-6 peer watch (each 250 ms) on a blocking thread (`spawn_blocking`).
 
 The fix adds no sleep and no retry. The test limits do not change.
 
