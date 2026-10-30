@@ -38,3 +38,27 @@ require_root() {
     exit 1
   fi
 }
+
+# W25-14: the steady ping gate. Read the last 2 lines of a ping run on stdin.
+# Arguments: label, pings sent, most lost pings, most max RTT in ms.
+# Print "<label> steady lost L/N max_ms M limit_ms X". Return 1 when the loss or the
+# max RTT is more than the limit, or when the summary is missing.
+steady_ping_gate() {
+  local label="$1" pings="$2" max_loss="$3" max_ms="$4" input received max
+  input="$(cat)"
+  received="$(printf '%s\n' "$input" | awk '/packets transmitted/ {v = $4} END {print v}')"
+  max="$(printf '%s\n' "$input" | awk -F'/' '/^rtt / {v = $6} END {print v}')"
+  if [[ -z "$received" || ( "$received" != "0" && -z "$max" ) ]]; then
+    echo "${label} has no ping summary." >&2
+    return 1
+  fi
+  echo "${label} steady lost $((pings - received))/${pings} max_ms ${max:-none} limit_ms ${max_ms}"
+  if (( pings - received > max_loss )); then
+    echo "${label} lost too many pings on a stable path." >&2
+    return 1
+  fi
+  if ! awk -v m="$max" -v l="$max_ms" 'BEGIN {exit !(m + 0 <= l + 0)}'; then
+    echo "${label} max ping RTT ${max} ms is more than ${max_ms} ms on a stable path." >&2
+    return 1
+  fi
+}
