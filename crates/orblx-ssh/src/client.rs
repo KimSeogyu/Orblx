@@ -14,8 +14,8 @@ use orblx_identity::{
     decode_certificate_pem, ed25519_public_key_from_certificate_pem, DenySet, SpiffeId, TrustBundle,
 };
 use russh::client::{self, Handler};
-use russh::keys::ssh_key::PublicKey;
-use russh::{ChannelMsg, CryptoVec, Disconnect};
+use russh::keys::PublicKeyOrCertificate;
+use russh::{ChannelMsg, Disconnect};
 
 use crate::auth::{command_ok, seal_login};
 use crate::hostkey::ed25519_public_bytes;
@@ -148,14 +148,13 @@ pub async fn run_session(request: SessionRequest) -> Result<SessionOutput, Strin
     })
 }
 
-fn append_capped(stdout: &mut Vec<u8>, data: &CryptoVec) {
+fn append_capped(stdout: &mut Vec<u8>, data: &[u8]) {
     if stdout.len() >= 4096 {
         return;
     }
     let room = 4096 - stdout.len();
-    let bytes: &[u8] = data;
-    let take = bytes.len().min(room);
-    stdout.extend_from_slice(&bytes[..take]);
+    let take = data.len().min(room);
+    stdout.extend_from_slice(&data[..take]);
 }
 
 fn read_text(path: &std::path::Path) -> Result<String, String> {
@@ -171,9 +170,13 @@ impl Handler for ClientHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &PublicKey,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        Ok(ed25519_public_bytes(server_public_key) == Some(self.expect))
+        // The host key is a raw Ed25519 key. The client refuses an SSH certificate.
+        let PublicKeyOrCertificate::PublicKey { key, .. } = server_public_key else {
+            return Ok(false);
+        };
+        Ok(ed25519_public_bytes(key) == Some(self.expect))
     }
 }
 

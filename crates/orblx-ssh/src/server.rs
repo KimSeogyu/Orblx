@@ -20,7 +20,8 @@ use orblx_identity::{
     ed25519_public_key_from_certificate_pem, ed25519_seed_from_private_pem, DenyApply, DenySet,
     Policy, SpiffeId, TicketVerifier, TrustBundle,
 };
-use russh::server::{Auth, Handler, Msg, Session};
+use russh::keys::ssh_encoding::bytes::Bytes;
+use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use tokio::net::TcpListener;
 
@@ -84,9 +85,11 @@ impl Handler for SshHandler {
     async fn channel_open_session(
         &mut self,
         _channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
     }
 
     async fn exec_request(
@@ -99,7 +102,7 @@ impl Handler for SshHandler {
         let outcome = self.exec_command(&command);
         if let Some((code, stdout)) = outcome {
             let _ = session.channel_success(channel);
-            let _ = session.data(channel, stdout.into());
+            let _ = session.data(channel, Bytes::from(stdout));
             let _ = session.exit_status_request(channel, code);
             let _ = session.eof(channel);
             let _ = session.close(channel);
