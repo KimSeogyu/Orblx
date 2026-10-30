@@ -672,6 +672,24 @@ impl ConfigExport {
 mod tests {
     use super::*;
 
+    /// W25-13: the SIEM verifier script has the same action codes as the chain.
+    #[test]
+    fn the_siem_verifier_knows_each_action_code() {
+        let script = include_str!("../../../scripts/siem/orblx-siem-verify.py");
+        let start = script.find("ACTIONS = [").unwrap();
+        let end = start + script[start..].find(']').unwrap();
+        let names: Vec<&str> = script[start + "ACTIONS = [".len()..end]
+            .split(',')
+            .map(|name| name.trim().trim_matches('"'))
+            .filter(|name| !name.is_empty())
+            .collect();
+        assert_eq!(names.len(), ConfigAction::ALL.len());
+        for (at, action) in ConfigAction::ALL.iter().enumerate() {
+            assert_eq!(usize::from(action.code()), at + 1, "{}", action.as_str());
+            assert_eq!(names[at], action.as_str());
+        }
+    }
+
     struct Scratch(PathBuf);
 
     impl Scratch {

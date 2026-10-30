@@ -200,4 +200,62 @@ mod tests {
         assert_eq!(syslog_host("bad host"), "-");
         assert_eq!(sd_value("a\"b]c\\"), "a\\\"b\\]c\\\\");
     }
+
+    /// Run the verifier script on `data`. Return `None` when python3 is not present.
+    fn verify_with_script(format: &str, data: &[u8], count: usize) -> Option<bool> {
+        let dir =
+            std::env::temp_dir().join(format!("orblx-siem-script-{format}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("sink.out");
+        std::fs::write(&file, data).unwrap();
+        let script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/siem/orblx-siem-verify.py"
+        );
+        let out = std::process::Command::new("python3")
+            .arg(script)
+            .args(["--format", format, "--count", &count.to_string()])
+            .arg(&file)
+            .output()
+            .ok()?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Some(out.status.success())
+    }
+
+    #[test]
+    fn the_verifier_script_accepts_each_format_and_finds_a_change() {
+        let bodies = bodies("script");
+        let mut syslog = String::new();
+        for body in &bodies {
+            syslog.push_str(&syslog_frame(body, "coord"));
+        }
+        let cases = [
+            ("ndjson", ndjson_batch(&bodies)),
+            ("hec", splunk_hec_batch(&bodies, "coord").unwrap()),
+            ("datadog", datadog_batch(&bodies, "coord").unwrap() + "\n"),
+            ("syslog", syslog),
+        ];
+        for (format, data) in cases {
+            let Some(ok) = verify_with_script(format, data.as_bytes(), bodies.len()) else {
+                return;
+            };
+            assert!(ok, "{format}");
+            // A changed target fails the hash check. Datadog has the body as an escaped string.
+            let changed = data
+                .replacen(r#""target":"b""#, r#""target":"c""#, 1)
+                .replacen(r#"\"target\":\"b\""#, r#"\"target\":\"c\""#, 1);
+            assert_ne!(changed, data, "{format}");
+            assert_eq!(
+                verify_with_script(format, changed.as_bytes(), bodies.len()),
+                Some(false),
+                "{format}"
+            );
+            // A missing last record fails the count check.
+            assert_eq!(
+                verify_with_script(format, data.as_bytes(), bodies.len() + 1),
+                Some(false),
+                "{format}"
+            );
+        }
+    }
 }
