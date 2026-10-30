@@ -1641,6 +1641,7 @@ dependencies = [
  "orblx-crypto",
  "orblx-datapath",
  "orblx-edge",
+ "orblx-file",
  "orblx-identity",
  "orblx-relay",
  "orblx-serve",
@@ -1725,6 +1726,17 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "x25519-dalek",
+]
+
+[[package]]
+name = "orblx-file"
+version = "0.1.0-rc.1"
+dependencies = [
+ "ed25519-dalek 2.2.0",
+ "orblx-audit",
+ "orblx-identity",
+ "rand 0.8.8",
+ "sha2 0.10.9",
 ]
 
 [[package]]

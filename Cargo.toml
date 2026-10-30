@@ -8,6 +8,7 @@ members = [
     "crates/orblx-crypto",
     "crates/orblx-datapath",
     "crates/orblx-edge",
+    "crates/orblx-file",
     "crates/orblx-identity",
     "crates/orblx-relay",
     "crates/orblx-serve",

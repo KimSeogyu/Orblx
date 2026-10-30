@@ -16,6 +16,7 @@ mod connector;
 mod coord;
 mod direct;
 mod edge;
+mod file;
 mod lock;
 mod login;
 mod nat;
@@ -49,6 +50,7 @@ enum Action {
     Serve(serve::Command),
     Admin(admin::Command),
     Lock(lock::Command),
+    File(file::Command),
     Agent(agent::Command),
     Nat(nat::Command),
     Netcheck(netcheck::Command),
@@ -171,6 +173,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Ok(Action::File(command)) => {
+            if let Err(err) = file::run(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
         Ok(Action::Agent(command)) => match agent::run(command) {
             Ok(0) => {}
             Ok(code) => std::process::exit(code),
@@ -262,6 +270,9 @@ where
     }
     if args.first().map(String::as_str) == Some("lock") {
         return lock::parse(&args[1..]).map(Action::Lock);
+    }
+    if args.first().map(String::as_str) == Some("file") {
+        return file::parse(&args[1..]).map(Action::File);
     }
     if args.first().map(String::as_str) == Some("agent") {
         return agent::parse(&args[1..]).map(Action::Agent);
