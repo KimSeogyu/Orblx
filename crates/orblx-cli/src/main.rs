@@ -23,6 +23,7 @@ mod nat;
 mod netcheck;
 mod ping;
 mod policy;
+mod policy_gitops;
 mod relay;
 mod serve;
 mod ssh;

@@ -26,6 +26,10 @@ pub struct Request {
     /// A scoped admin API token (W25-3). The caller then needs no client certificate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_token: Option<String>,
+    /// W25-9: `admin-policy-set` writes only when the live policy has this sha256.
+    /// The text `none` means that no policy file is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_sha256: Option<String>,
 }
 
 /// One agent grant request.
