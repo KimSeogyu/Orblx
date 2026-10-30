@@ -113,3 +113,31 @@ Each record becomes one body object, the same object as a W25-7 webhook body:
 
 Script: `scripts/proof/siem-streaming.sh` (compose file `scripts/proof/compose.siem-streaming.yml`, receivers
 `scripts/proof/siem-sink-receiver.py`). The script takes the W25-5 proof lock.
+
+The sinks in the proof: `hec` (splunk-hec), `datadog`, `ndjson` (all on the HTTPS receiver `siemhttp`), `syslog`
+(syslog TLS, certificate from the lab CA), and `bad` (syslog TLS, certificate from a different CA).
+The lab CA, the server certificates, and the three credentials are files that the script makes with `openssl` and
+Python `secrets`. The coordinator gets them read-only in `/sinks`.
+
+Branch run: 2026-10-31 01:12 to 01:14 KST, commit `1013d94`, log `w25-m-siem-streaming-branch-1013d94.log`.
+
+| Gate | Result | Mark |
+| --- | --- | --- |
+| 1. 1000 events to each sink | Each of the 4 sinks: 1000 of 1000 (records 50..1049), 0 gaps, 0 duplicates, order ok. Record latency max 107.3 to 114.0 ms. First write to last arrival 5116 to 5215 ms (limit 10000 ms). | [C] |
+| 2. Verifier from sink output only | 4 of 4 formats `siem_verify_ok` (1050 records, the tip of the coordinator chain). A changed record, a removed middle record, and a removed last record each fail in each format (12 of 12). | [C] |
+| 3. 60 s outage | Sinks down 60094 ms, 248 records written in that time. After recovery each sink got 248 of 248, 0 gaps, 0 duplicates, order ok. Admin p50: off 120.260 ms, on 116.374 ms (delta -3.886), sinks dead 119.615 ms (delta -0.645), limit 10 ms. | [C] |
+| 4. SIGKILL restart | 104 records waiting. The cursors (`next` 1341) were the same after the restart. Each sink got 106 of 106 (records 1341..1446), 0 gaps, 0 duplicates. Final: 1447 records in each sink, `arrivals.jsonl` 1447 lines (no duplicate body). | [C] |
+| 5. TLS certificate check | Sink `bad`: 0 records received, 28 server handshake failures, 28 coordinator `tls` failures, 1 `sink-error` record. | [C] |
+| 6. Owner only; credential files only | Token `policy:write`: remove, add, and change a sink each get 403; the same sinks with a new ACL gets 200; 3 `token-deny` records with reason `sinks`. Credential hits 0 in the coordinator state, the 9 sink output files, 3657 container log lines, 1452 audit records, the policy, and the proof log. The control check found 3 of 3 credential files and 2 of 2 token files. | [C] |
+| 7. W23-4 nat-realism | See below. | [C] |
+
+Notes:
+
+- The record latency is the receiver arrival time minus the Docker log time of the `config audit N` line. The Docker log
+  time is up to about 60 ms late, so the minimum latency is negative (-61.1 ms).
+- In gate 3 the records written during the outage wait for the sinks, so their latency is 50.8 to 60.6 s.
+  The retry backoff maximum is 4 s.
+- Gate 4 stops the receivers before the SIGKILL, so no batch is in flight. A kill between a delivery and the cursor
+  write sends that batch again (at least once, section 4). The proof does not test that window.
+- The receivers stand in for Splunk HEC, Datadog intake, and a syslog server. They check the auth header and keep the bytes.
+  The proof did not send to a real vendor service.
