@@ -185,8 +185,10 @@ coord_ticks() {
 }
 
 # Print the last ms value in a tick file on b. Print 0 when the file is missing.
+# A writer truncates the file before it writes, so one read can be empty.
+# Read again until the value is not empty.
 tick() {
-  dc exec -T b sh -c "cat $1 2>/dev/null || echo 0" | tr -d '\r\n '
+  dc exec -T b sh -c "for n in 1 2 3 4 5 6 7 8 9 10; do v=\$(cat $1 2>/dev/null); [ -n \"\$v\" ] && break; sleep 0.01; done; echo \${v:-0}" | tr -d '\r\n '
 }
 
 cp "$ROOT/scripts/proof/revoke-followup.hujson" "$POLICY_FILE"
