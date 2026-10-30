@@ -130,21 +130,37 @@ Nodes a, b, g, and g2 serve HTTP on TCP 8080. Node b also runs a byte counter on
 
 ### Results W25-1b [C]
 
-Head `80a507f` (branch `w25-share-port-acl` with main `372138c`). Debug build. Two runs, one for each policy:
-`/workspace/orblx-w18-proof/w25a1b-node-share-branch-80a507f-acl.log` (`node-share.hujson`, with `acls`) and
-`/workspace/orblx-w18-proof/w25a1b-node-share-branch-80a507f-noacl.log` (`node-share-noacl.hujson`, no `acls`).
+Head `e63ca12` (branch `w25-share-port-acl` with main `4ac56c1`). Debug build. Two runs, one for each policy, under the W25-5 box proof lock:
+`/workspace/orblx-w18-proof/w25a1b-node-share-branch-e63ca12-acl.log` (`node-share.hujson`, with `acls`) and
+`/workspace/orblx-w18-proof/w25a1b-node-share-branch-e63ca12-noacl.log` (`node-share-noacl.hujson`, no `acls`).
 
 | Gate | With `acls` [C] | No `acls` [C] |
 |---|---|---|
 | 1. A shared user reaches only the shared ports | g -> b:8080 and g2 -> b:8080 `200 OK`. g -> b:9090 refused. g -> a:8080 refused. | Same. |
 | 2. g -> b:9090: 0 bytes, 1 `packet-deny` record | **0 bytes** from g (65536 TCP + 65536 UDP sent). Control a -> b:9090: 65536 bytes (TCP; the ACL a -> b allows TCP only). **1** record actor g, target `tcp/9090` (also 1 for `udp/9090`). `verify-config ok`. | **0 bytes** from g. Control a -> b:9090: 131072 bytes. **1** record actor g, target `tcp/9090` (also 1 for `udp/9090`). `verify-config ok`. |
 | Shared node to guest | b -> g:8080 refused. | b -> g:8080 refused. |
-| 3. Unshare blocks access in <= 1000 ms | **unshare_deny_ms 516**. Hold probes: 0 failures. Share again: 1354 ms, no restart. | **unshare_deny_ms 457**. Hold probes: 0 failures. Share again: 1727 ms, no restart. |
-| 4. Secrets and audit chain | 0 enroll tokens, 0 ID tokens, 0 `PRIVATE KEY`. Coordinator chain `verify ok`; share 1, unshare 1, policy-replace 0. | Same. Coordinator chain `verify ok` (8 records). |
+| 3. Unshare blocks access in <= 1000 ms | **unshare_deny_ms 434**. Hold probes: 0 failures. Share again: 2398 ms, no restart. | **unshare_deny_ms 555**. Hold probes: 0 failures. Share again: 2334 ms, no restart. |
+| 4. Secrets and audit chain | 0 enroll tokens, 0 ID tokens, 0 `PRIVATE KEY`. Coordinator chain `verify ok` (8 records); share 1, unshare 1, policy-replace 0. | Same. Coordinator chain `verify ok` (8 records). |
+
+Earlier runs on head `80a507f` (main `372138c`): deny 516 ms (acls) and 457 ms (no acls), the same gate values (`w25a1b-node-share-branch-80a507f-{acl,noacl}.log`).
 
 Unit tests (REAL, `cargo test`): `filter_tests::guarded_peer_gets_only_its_grants_without_an_acl_list` and `share_test` (the `guarded` lists of b, g, and a, before and after the unshare).
 
-NATR_RESULTS
+W23-4 performance gates (release nat-realism, prefix `orblx-w25a-natr-`, head `e63ca12`). The three runs held the W25-5 box proof lock: 0 contended samples, 0 other orblx containers.
+Logs: `/workspace/orblx-w18-proof/w25a1b-branch-e63ca12-run{1,2,3}-release-nat-realism.log`.
+
+| Value (Mbit/s or ms) | Run 1 / 2 / 3 | Median | W22 |
+|---|---|---|---|
+| Direct throughput (prc_prc) | 1474.47 / 1011.59 / 1442.56 | **1442.56** | 1094 |
+| Relay throughput (prc_prc) | 1372.82 / 1139.08 / 1196.63 | **1196.63** | 1128 |
+| Relay throughput (sym_sym) | 1316.75 / 1257.89 / 1129.45 | **1257.89** | 1113 |
+| Relay RTT avg prc / direct avg | 0.951/0.561, 1.013/0.657, 1.101/0.606 | | relay <= direct + 1 |
+| Relay RTT avg sym / direct avg | 1.060/0.561, 0.945/0.657, 0.985/0.606 | | relay <= direct + 1 |
+| Lost pings | 0/50 in each relay RTT check | | 0/50 |
+| Max ping | 4.197 / 1.94 / 7.28 | | <= 20 |
+
+The nat-realism policy has no `guests`, so `guarded` is empty and the filter is off, as on main.
+Earlier runs on head `80a507f` without the lock (`w25a1b-branch-80a507f-run{1,2,3}-release-nat-realism.log`) also passed the RTT and loss gates. Run 2 had a ping max of 121.701 ms (prc_sym steady) and sym relay 348.44 Mbit/s, with 7 other proof containers running.
 
 ### Results W25-1 [C]
 
