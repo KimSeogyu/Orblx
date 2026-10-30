@@ -128,8 +128,8 @@ ALL_SINKS="${SINK_HEC}, ${SINK_DD}, ${SINK_ND}, ${SINK_SYS}, ${SINK_BAD}"
 
 # policy_json SINKS_TEXT [PROTO] prints a policy with these sinks.
 policy_json() {
-  printf '{"nodeApproval": false, "owners": ["%s"], "auditSinks": [%s], "acls": [{"action": "accept", "src": ["*"], "proto": "%s", "dst": ["*:*"]}]}\n' \
-    "$OWNER_ID" "$1" "${2:-tcp}"
+  printf '{"nodeApproval": false, "owners": ["%s"], "auditSinks": [%s], "acls": [{"action": "accept", "src": ["%s"], "proto": "%s", "dst": ["%s:*"]}]}\n' \
+    "$OWNER_ID" "$1" "$OWNER_ID" "${2:-tcp}" "$OWNER_ID"
 }
 
 # Set the policy with the owner SVID (mTLS).
@@ -363,6 +363,8 @@ coord_ip="$(dc exec -T client getent ahostsv4 coord | awk '{print $1; exit}')"
 COORD="${coord_ip}:443"
 ADMIN=(--coord "$COORD" --state /var/lib/orblx --bundle /var/lib/orblx/bundle.pem)
 echo "coord ${COORD}"
+logs="$(dc logs --no-log-prefix coord 2>&1)"
+! has_line '^policy load failed' "$logs" || fail "the coordinator did not load the policy"
 out="$(dc exec -T coord orblx coord token create --state /var/lib/orblx --ttl 600 --out /var/lib/orblx/tokens/owner)"
 grep -E '^token_id' <<< "$out" || true
 out="$(dc run --rm --no-deps -T owner coord enroll --name owner --coord "$COORD" \
