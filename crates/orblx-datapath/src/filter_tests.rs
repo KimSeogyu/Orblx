@@ -27,6 +27,7 @@ fn grants(filter: bool, rows: &[(&str, u8, u16, u16)]) -> ReceiverGrants {
         reach: Vec::new(),
         filter,
         subnets: Vec::new(),
+        guarded: Vec::new(),
     }
 }
 
@@ -227,4 +228,53 @@ fn subnet_route_needs_a_subnet_grant() {
     let open = PacketFilter::new(ME, &grants(false, &[]), None);
     open.set_routes(&["10.88.24.0/24".to_string()]);
     assert!(open.allow_inbound(BOB, &l4(17, PEER, 40000, lan_dns, 53)));
+}
+
+#[test]
+fn guarded_peer_gets_only_its_grants_without_an_acl_list() {
+    // W25-1b: the policy has no `acls` list, and BOB is a shared peer of another tenant.
+    let mut doc = grants(false, &[(BOB, 6, 8080, 8080)]);
+    doc.guarded = vec![BOB.to_string()];
+    let dir = std::env::temp_dir().join(format!("orblx-w25a1b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let path = dir.join(PACKET_AUDIT_FILE);
+    let filter = PacketFilter::new(ME, &doc, Some(path.clone()));
+    assert!(filter.active());
+    assert!(!filter.strict());
+    assert!(filter.allow_inbound(BOB, &l4(6, PEER, 40000, ME, 8080)));
+    assert!(!filter.allow_inbound(BOB, &l4(6, PEER, 40000, ME, 9090)));
+    assert!(!filter.allow_inbound(BOB, &l4(17, PEER, 40000, ME, 8080)));
+    assert!(!filter.allow_inbound(BOB, &echo(8, PEER, ME, 7)));
+    // A share gives one node. Another address (for example a route) is dropped for BOB.
+    assert!(!filter.allow_inbound(BOB, &l4(6, PEER, 40000, Ipv4Addr::new(10, 1, 2, 3), 80)));
+    // A peer of the same tenant keeps the old behavior.
+    assert!(filter.allow_inbound(ALICE, &l4(6, PEER, 40000, ME, 9090)));
+    assert!(filter.allow_inbound(ALICE, &l4(6, PEER, 40000, Ipv4Addr::new(10, 1, 2, 3), 80)));
+    // A reply to a flow that this node started passes.
+    filter.note_outbound(&l4(6, ME, 40005, PEER, 7000));
+    assert!(filter.allow_inbound(BOB, &l4(6, PEER, 7000, ME, 40005)));
+    assert_eq!(filter.stats().denied, 4);
+    // The unshare takes the peer out of the list. Then the old behavior is back.
+    filter.replace(&grants(false, &[]));
+    assert!(!filter.active());
+    assert!(filter.allow_inbound(BOB, &l4(6, PEER, 40000, ME, 9090)));
+    let audited = filter.stats().audited;
+    assert!(audited >= 1);
+    drop(filter);
+    let mut records = 0;
+    for _ in 0..100 {
+        if let Ok(checked) = verify_config_file(&path) {
+            records = checked.records.len();
+            if records as u64 == audited {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(records as u64, audited);
+    let checked = verify_config_file(&path).expect("verify");
+    assert_eq!(checked.records[0].event.actor, BOB);
+    assert_eq!(checked.records[0].event.target, "tcp/9090");
+    let _ = std::fs::remove_dir_all(&dir);
 }
