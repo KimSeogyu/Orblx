@@ -21,6 +21,8 @@ PROOFS = {
     "pipe.sh": "set -o pipefail\nseq 1 200000 | cat >/dev/null\necho 'proof_ok extra 1'\n",
     "lock.sh": "echo held=${ORBLX_PROOF_LOCK_HELD:-none}\necho proof_ok\n",
     "quiet.sh": "echo 'nothing to see'\nexit 5\n",
+    "steps.sh": "mkdir -p target/st\nprintf 'step a line\\nproof_ok\\n' >target/st/run1.log\nprintf 'step b line\\n' >target/st/run2.log\necho 'gate_x ok: 2 runs'\n",
+    "gatefail.sh": "echo proof_ok\necho 'gate_x failed: median low'\n",
     "loud.sh": "seq 1 100000\necho 'to stderr' >&2\nprintf 'no newline at end'\necho\necho proof_ok\n",
 }
 
@@ -33,6 +35,10 @@ LIST = "\n".join([
     "lock|scripts/proof/lock.sh|7|-|-",
     "quiet|scripts/proof/quiet.sh|8|-|-",
     "loud|scripts/proof/loud.sh|9|-|-",
+])
+GATE_LIST = "\n".join([
+    "steps|scripts/proof/steps.sh|gate|-|-|^gate_x ok: |target/st/run*.log",
+    "gatefail|scripts/proof/gatefail.sh|gate|-|-|^gate_x ok: ",
 ])
 
 
@@ -49,12 +55,12 @@ class ReleaseSweepTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp)
 
-    def run_sweep(self, only=None, mode=None):
+    def run_sweep(self, only=None, mode=None, plist=LIST):
         env = dict(os.environ)
         env.update({
             "ORBLX_SWEEP_TEST_ROOT": self.root,
             "ORBLX_SWEEP_OUT": self.out,
-            "ORBLX_SWEEP_LIST": LIST,
+            "ORBLX_SWEEP_LIST": plist,
             "ORBLX_PROOF_LOCK": os.path.join(self.tmp, "proof.lock"),
             "ORBLX_SWEEP_TIMEOUT": "60",
         })
@@ -114,6 +120,18 @@ class ReleaseSweepTest(unittest.TestCase):
         body = [l for l in lines if not l.startswith(("proof_lock ", "proof_context ", "proof_contention ", "release_sweep: "))]
         self.assertEqual(body[:100000], [str(i) for i in range(1, 100001)])
         self.assertEqual(body[100000:], ["to stderr", "no newline at end", "proof_ok"])
+
+    def test_a_pass_line_and_step_logs_of_a_proof(self):
+        out = self.run_sweep(plist=GATE_LIST)
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        rows = self.rows()
+        self.assertTrue(rows["steps"].endswith("| proof_ok |"), rows["steps"])
+        # proof_ok alone is not the pass line of this proof.
+        self.assertIn("FAIL (exit 0, no pass line ^gate_x ok: ): gate_x failed: median low", rows["gatefail"])
+        with open(os.path.join(self.out, "rc3-sweep-testsha-steps.log")) as f:
+            log = f.read()
+        self.assertIn("=== release_sweep: step log target/st/run1.log (full) ===\nstep a line\nproof_ok\n", log)
+        self.assertIn("=== release_sweep: step log target/st/run2.log (full) ===\nstep b line\n", log)
 
     def test_unknown_proof_name_is_refused(self):
         out = self.run_sweep(only="nope")

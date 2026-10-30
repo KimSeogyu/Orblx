@@ -72,9 +72,12 @@ OK_RE='^(proof_ok( .*)?|W18 proof passed)$'
 ERR_RE='(error|Error|ERROR|FAIL|panicked|[Ff]ailed|: line [0-9]+:|command not found|No such file|[Tt]imed out|Traceback|show_matching: no line matches|secret_scan: )'
 LOCK_LINE_RE='^proof_(lock|context|contention) '
 
-# One proof for each line: name|script|gap rows|env|images.
+# One proof for each line: name|script|gap rows|env|images[|pass line ERE[|step logs]].
 # env: space-separated NAME=VALUE words ("-" for none). @BIN@ is the release orblx binary.
 # images: the image tags that the proof builds. The sweep removes them after the proof.
+# pass line ERE: the line that a pass needs, instead of proof_ok (optional).
+# step logs: a glob under the worktree of the logs that the proof writes to files of its own
+#   (optional). The sweep adds each one, whole, to the end of the sweep log of the proof.
 # The map comes from the docs/wNN-*.md files of each shipped row (docs/rc3-release-sweep.md).
 PROOFS='w18-linux-daemon|scripts/proof/w18-linux-daemon.sh|1, 54, 61|-|orblx-w18:local
 coord-enroll|scripts/proof/coord-enroll.sh|33, 61|-|orblx-coord:w18
@@ -97,7 +100,8 @@ file-send|scripts/proof/file-send.sh|45|-|orblx-w23a-file:w23
 config-audit|scripts/proof/config-audit.sh|49|-|orblx-audit:w20
 audit-webhooks|scripts/proof/audit-webhooks.sh|52|HOOKS_BIN=@BIN@ HOOKS_PROJECT=orblx-rc3sw-webhooks HOOKS_IMAGE=orblx-rc3sw-webhooks:local|orblx-rc3sw-webhooks:local
 docker-image|scripts/proof/docker-image.sh|58|ORBLX_DIMG_PREFIX=orblx-rc3sw-dimg ORBLX_DIMG_IMAGE=orblx-rc3sw-image:local|orblx-rc3sw-image:local
-policy-sync|scripts/proof/policy-sync.sh|17|ORBLX_SYNC_PROFILE=release PROOF_PROJECT=orblx-rc3sw-sync ORBLX_SYNC_IMAGE=orblx-rc3sw-sync:local|orblx-rc3sw-sync:local'
+policy-sync|scripts/proof/policy-sync.sh|17|ORBLX_SYNC_PROFILE=release PROOF_PROJECT=orblx-rc3sw-sync ORBLX_SYNC_IMAGE=orblx-rc3sw-sync:local|orblx-rc3sw-sync:local
+sym-throughput|scripts/proof/sym-throughput.sh|W23-4 sym gate (no shipped row)|ORBLX_NATR_PREFIX=orblx-rc3sw-symt- ORBLX_NATR_PROJECT=orblx-rc3sw-symt ORBLX_NATR_IMAGE=orblx-rc3sw-symt:local|orblx-rc3sw-symt:local|^sym_gate ok: |target/sym-throughput/run*.log'
 PROOFS="${ORBLX_SWEEP_LIST:-$PROOFS}"
 
 now() { date '+%Y-%m-%dT%H:%M:%S%z'; }
@@ -261,7 +265,8 @@ esac
 failed=0
 ran=0
 for line in "${specs[@]}"; do
-  IFS='|' read -r name path rows envs images <<<"$line"
+  IFS='|' read -r name path rows envs images ok_re step_logs <<<"$line"
+  ok_re="${ok_re:-$OK_RE}"
   if [[ -n "$ONLY" && " $ONLY " != *" $name "* ]]; then
     continue
   fi
@@ -299,14 +304,29 @@ for line in "${specs[@]}"; do
       >>"$log" 2>&1 </dev/null || rc=$?
   fi
   secs=$(( $(date +%s) - started ))
-  if [[ "$rc" -eq 0 ]] && has_line "$OK_RE" <"$log"; then
+  if [[ -n "${step_logs:-}" ]]; then
+    # The full output of the steps that the proof wrote to its own files (root owned).
+    tool_env bash -c '
+      cd "$1" || exit 0
+      shopt -s nullglob
+      for f in $2; do
+        echo "=== release_sweep: step log $f (full) ==="
+        cat "$f"
+      done
+    ' release-sweep-step-logs "$ROOT" "$step_logs" >>"$log" 2>&1 </dev/null || true
+  fi
+  if [[ "$rc" -eq 0 ]] && has_line "$ok_re" <"$log"; then
     result="proof_ok"
   else
     failed=$((failed + 1))
     if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
       result="FAIL (exit $rc, timeout ${TIMEOUT} s): $(first_error "$log")"
     elif [[ "$rc" -eq 0 ]]; then
-      result="FAIL (exit 0, no proof_ok line): $(first_error "$log")"
+      if [[ "$ok_re" == "$OK_RE" ]]; then
+        result="FAIL (exit 0, no proof_ok line): $(first_error "$log")"
+      else
+        result="FAIL (exit 0, no pass line ${ok_re}): $(first_error "$log")"
+      fi
     else
       result="FAIL (exit $rc): $(first_error "$log")"
     fi
