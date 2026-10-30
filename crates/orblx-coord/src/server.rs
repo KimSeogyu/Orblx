@@ -42,6 +42,7 @@ pub async fn spawn(
     listen: SocketAddr,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), CoordError> {
     coord.enable_config_audit()?;
+    crate::webhook::start(coord);
     let material = coord.tls_material()?;
     let endpoint = tlsutil::server_endpoint(&material, listen)?;
     let addr = endpoint.local_addr().map_err(CoordError::io)?;
@@ -461,9 +462,14 @@ fn dispatch_token(
     };
     // W25-3b: a token cannot change the policy owners. The owner check and the
     // write use the same lock.
+    // W25-7: a token cannot change the audit webhooks. A token that could remove a
+    // webhook could hide its later calls from the receiver.
     let rule = || match &policy_lock {
         Some(lock) if !admin::policy_keeps_owners(coord, lock, &request.name)? => {
             Ok(Some(apitoken::Refusal::Owners))
+        }
+        Some(lock) if !admin::policy_keeps_webhooks(coord, lock, &request.name)? => {
+            Ok(Some(apitoken::Refusal::Webhooks))
         }
         _ => Ok(None),
     };
@@ -838,6 +844,56 @@ mod tests {
                     && line.contains(&format!("reason {reason} status 403"))
             })
             .count()
+    }
+
+    /// W25-7: no token adds, removes, or changes an audit webhook URL.
+    #[test]
+    fn a_token_cannot_change_the_audit_webhooks() {
+        let dir = std::env::temp_dir().join(format!("orblx-server-hooks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        let hooks = |urls: &[&str], port: u16| {
+            let base = policy_text(&[OWNER], port);
+            let list: Vec<String> = urls.iter().map(|url| format!("\"{url}\"")).collect();
+            format!("{{\"auditWebhooks\": [{}], {}", list.join(", "), &base[1..])
+        };
+        let policy_path = dir.join("policy.hujson");
+        let siem = "http://siem:9000/hook";
+        std::fs::write(&policy_path, hooks(&[siem], 22)).unwrap();
+        coord.set_policy_file(&policy_path).unwrap();
+        assert_eq!(coord.audit_webhook_urls().unwrap(), [siem]);
+        let now = SystemTime::now();
+        let made = apitoken::create(
+            &coord,
+            &CreateAsk {
+                scopes: all_scopes().iter().map(|s| s.to_string()).collect(),
+                ttl_secs: 60,
+            },
+            OWNER,
+            now,
+        )
+        .unwrap();
+        let before = sha(&policy_path);
+        for urls in [
+            vec![],
+            vec![siem, "http://other:9000/hook"],
+            vec!["http://other:9000/hook"],
+        ] {
+            let ask = call_with("admin-policy-set", &hooks(&urls, 22), &made.secret);
+            let reply = dispatch_token(&coord, &ask, &made.secret, now);
+            assert_eq!(reply.status, Some(403), "{urls:?}");
+        }
+        assert_eq!(sha(&policy_path), before);
+        assert_eq!(coord.audit_webhook_urls().unwrap(), [siem]);
+        assert_eq!(deny_count(&coord, &made.id, "webhooks"), 3);
+        // The same webhooks in a new policy is allowed.
+        let ask = call_with("admin-policy-set", &hooks(&[siem], 2222), &made.secret);
+        let reply = dispatch_token(&coord, &ask, &made.secret, now);
+        assert_eq!(reply.status, Some(200));
+        assert_ne!(sha(&policy_path), before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// W25-3b: no token changes the owners, the node lock signers, or the token rules.
