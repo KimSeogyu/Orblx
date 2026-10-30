@@ -103,7 +103,7 @@ The sweep has 22 proofs. The proof list is the `PROOFS` variable in the script. 
 
 This dry run is for early detection only. **It does not count for rc.3.** The real sweep runs later on a commit that has the W25-14 merge.
 
-Commit: `cd6c8eea` (main on 2026-10-31 00:40 KST, before W25-6, W25-14 and the FIFO lock). Started 00:29:53 KST, lock mode `proof`. The build took about 1 min. The other proofs of the box ran at the same time, so most of each proof time below is the wait for the lock. The live table is `/workspace/orblx-w18-proof/rc3-sweep-cd6c8eea.md`. `policy-sync` is not in this commit.
+Commit: `cd6c8eea` (main at the start of the dry run, before W25-6, W25-14 and the FIFO lock). Started 00:29:53 KST, lock mode `proof`. The build took about 1 min. The other proofs of the box ran at the same time, so most of each proof time below is the wait for the lock. The live table is `/workspace/orblx-w18-proof/rc3-sweep-cd6c8eea.md`. `policy-sync` is not in this commit.
 
 State at the merge of this PR (16 of 21 proofs done; `ssh`, `file-send`, `config-audit`, `audit-webhooks` and `docker-image` still ran):
 
