@@ -6,20 +6,34 @@
 //! The proxy sends the body to `127.0.0.1:PORT` with one `Content-Length` header and no
 //! `Transfer-Encoding` header, so the local web app reads one clear body length.
 //! The proxy removes hop-by-hop headers in both directions.
+//!
+//! W25-4: a WebSocket upgrade (`GET`, HTTP/1.1, `Upgrade: websocket`, `Connection: upgrade`,
+//! `Sec-WebSocket-Key`, `Sec-WebSocket-Version`, and no body) goes to the local web app.
+//! When the app answers `101 Switching Protocols` with `Upgrade: websocket`, the proxy copies
+//! the bytes in both directions on the same TLS connection. There is no second listener.
+//! Each other upgrade (for example `h2c`) still gets `501 Not Implemented`.
+//! The ingress checks and the ACL check in `server.rs` run before TLS, so they apply to
+//! upgrade requests too. The proxy does not log the request path or the WebSocket key.
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr};
+use std::pin::Pin;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Either, Full};
 use hyper::body::Incoming;
-use hyper::header::{HeaderMap, HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, HOST};
+use hyper::header::{
+    HeaderMap, HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING,
+    UPGRADE,
+};
 use hyper::{Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 
 /// The time limit to read the request head.
 const HEAD_LIMIT: Duration = Duration::from_secs(10);
@@ -58,6 +72,17 @@ pub(crate) struct Target {
 
 type ProxyBody = Either<Full<Bytes>, Incoming>;
 
+/// The byte copy of one upgraded WebSocket connection.
+type Tunnel = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// What `serve_connection` gives to each request.
+#[derive(Clone)]
+struct Conn {
+    target: Target,
+    stop: watch::Receiver<()>,
+    tunnels: mpsc::UnboundedSender<Tunnel>,
+}
+
 /// Serve HTTP/1.1 on one client stream until the client closes it.
 ///
 /// The function returns when the connection ends.
@@ -68,25 +93,55 @@ where
 {
     // The upstream connection tasks stop when `_stop` drops.
     let (_stop, stop_rx) = watch::channel(());
+    // An upgraded WebSocket connection sends its byte copy here.
+    // This future owns the copies. When the caller drops this future, the copies stop too.
+    let (tunnel_tx, mut tunnel_rx) = mpsc::unbounded_channel::<Tunnel>();
+    let conn = Conn {
+        target,
+        stop: stop_rx,
+        tunnels: tunnel_tx,
+    };
     let service = hyper::service::service_fn(move |request| {
-        let stop_rx = stop_rx.clone();
-        async move { Ok::<_, Infallible>(proxy(request, target, stop_rx).await) }
+        let conn = conn.clone();
+        async move { Ok::<_, Infallible>(proxy(request, conn).await) }
     });
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder
         .timer(TokioTimer::new())
         .header_read_timeout(HEAD_LIMIT)
         .keep_alive(true);
-    let _ = builder.serve_connection(TokioIo::new(io), service).await;
+    let mut http = Box::pin(
+        builder
+            .serve_connection(TokioIo::new(io), service)
+            .with_upgrades(),
+    );
+    let mut tunnels = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = &mut http => break,
+            Some(tunnel) = tunnel_rx.recv() => {
+                tunnels.spawn(tunnel);
+            }
+        }
+    }
+    // The HTTP connection ended or gave its stream to an upgrade. Drop it, then run the
+    // byte copies to their end.
+    drop(http);
+    while let Ok(tunnel) = tunnel_rx.try_recv() {
+        tunnels.spawn(tunnel);
+    }
+    while tunnels.join_next().await.is_some() {}
 }
 
-async fn proxy(
-    request: Request<Incoming>,
-    target: Target,
-    stop: watch::Receiver<()>,
-) -> Response<ProxyBody> {
-    if request.headers().contains_key(hyper::header::UPGRADE) {
-        return status(StatusCode::NOT_IMPLEMENTED, "Upgrade is not supported.\n");
+async fn proxy(request: Request<Incoming>, conn: Conn) -> Response<ProxyBody> {
+    let target = conn.target;
+    let stop = conn.stop.clone();
+    if request.headers().contains_key(UPGRADE) {
+        if !is_websocket(&request) {
+            println!("{}_upgrade_refused from {}", target.face, target.client);
+            return status(StatusCode::NOT_IMPLEMENTED, "Upgrade is not supported.\n");
+        }
+        return websocket(request, conn).await;
     }
     let declared = match declared_length(request.headers()) {
         Ok(declared) => declared,
@@ -130,31 +185,11 @@ async fn proxy(
         },
     };
 
-    let mut upstream = Request::builder()
-        .method(parts.method.clone())
-        .uri(origin_form(&parts.uri))
-        .version(Version::HTTP_11);
+    let mut upstream = upstream_head(&parts, target);
     if let Some(headers) = upstream.headers_mut() {
-        copy_end_to_end(&parts.headers, headers);
-        if !headers.contains_key(HOST) {
-            if let Some(authority) = parts.uri.authority() {
-                if let Ok(value) = HeaderValue::from_str(authority.as_str()) {
-                    headers.insert(HOST, value);
-                }
-            }
-        }
-        headers.remove(CONTENT_LENGTH);
         if !body.is_empty() || declared.is_some() || parts.method == hyper::Method::POST {
             headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
         }
-        // The proxy sets these values. A client value is not kept.
-        headers.remove("forwarded");
-        headers.remove("x-forwarded-for");
-        headers.remove("x-forwarded-proto");
-        if let Ok(value) = HeaderValue::from_str(&target.client.to_string()) {
-            headers.insert("x-forwarded-for", value);
-        }
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
     }
     let Ok(upstream) = upstream.body(Full::new(body)) else {
         return closing(StatusCode::BAD_REQUEST, "The request is not valid.\n");
@@ -195,6 +230,171 @@ async fn proxy(
     // The client connection has its own HTTP version. hyper writes HTTP/1.0 to an HTTP/1.0 client.
     parts.version = Version::HTTP_11;
     Response::from_parts(parts, Either::Right(body))
+}
+
+/// The request line and the end-to-end headers for the local web app.
+///
+/// The head has no `Content-Length`. The proxy sets `X-Forwarded-For` and `X-Forwarded-Proto`.
+fn upstream_head(
+    parts: &hyper::http::request::Parts,
+    target: Target,
+) -> hyper::http::request::Builder {
+    let mut upstream = Request::builder()
+        .method(parts.method.clone())
+        .uri(origin_form(&parts.uri))
+        .version(Version::HTTP_11);
+    if let Some(headers) = upstream.headers_mut() {
+        copy_end_to_end(&parts.headers, headers);
+        if !headers.contains_key(HOST) {
+            if let Some(authority) = parts.uri.authority() {
+                if let Ok(value) = HeaderValue::from_str(authority.as_str()) {
+                    headers.insert(HOST, value);
+                }
+            }
+        }
+        headers.remove(CONTENT_LENGTH);
+        // The proxy sets these values. A client value is not kept.
+        headers.remove("forwarded");
+        headers.remove("x-forwarded-for");
+        headers.remove("x-forwarded-proto");
+        if let Ok(value) = HeaderValue::from_str(&target.client.to_string()) {
+            headers.insert("x-forwarded-for", value);
+        }
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+    }
+    upstream
+}
+
+/// True when one header has the token `token` (case-insensitive, comma-separated list).
+fn has_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|item| item.trim().eq_ignore_ascii_case(token))
+}
+
+/// True for a WebSocket opening request (RFC 6455 section 4.1) with no body.
+///
+/// The `Upgrade` header must name only `websocket`. A list such as `websocket, h2c` is refused.
+fn is_websocket(request: &Request<Incoming>) -> bool {
+    let headers = request.headers();
+    let upgrade: Vec<&str> = headers
+        .get_all(UPGRADE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .collect();
+    let only_websocket = upgrade.len() == 1 && upgrade[0].eq_ignore_ascii_case("websocket");
+    let no_body = !headers.contains_key(TRANSFER_ENCODING)
+        && headers
+            .get(CONTENT_LENGTH)
+            .is_none_or(|value| value.as_bytes() == b"0");
+    request.method() == hyper::Method::GET
+        && request.version() == Version::HTTP_11
+        && only_websocket
+        && has_token(headers, CONNECTION, "upgrade")
+        && headers.contains_key("sec-websocket-key")
+        && headers.contains_key("sec-websocket-version")
+        && no_body
+}
+
+/// Send a WebSocket opening request to the local web app.
+///
+/// On `101` with `Upgrade: websocket`, the function sends the byte copy to `serve_connection`
+/// and returns the `101` response. Any other app response goes back to the client as it is.
+async fn websocket(mut request: Request<Incoming>, conn: Conn) -> Response<ProxyBody> {
+    let target = conn.target;
+    let client_upgrade = hyper::upgrade::on(&mut request);
+    let (parts, _body) = request.into_parts();
+    let mut upstream = upstream_head(&parts, target);
+    if let Some(headers) = upstream.headers_mut() {
+        headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+        headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+    }
+    let Ok(upstream) = upstream.body(Full::new(Bytes::new())) else {
+        return closing(StatusCode::BAD_REQUEST, "The request is not valid.\n");
+    };
+    let Ok(stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, target.port)).await else {
+        eprintln!(
+            "The local port 127.0.0.1:{} did not accept the connection.",
+            target.port
+        );
+        return status(StatusCode::BAD_GATEWAY, "The local web app is not open.\n");
+    };
+    let Ok((mut sender, app_conn)) =
+        hyper::client::conn::http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream)).await
+    else {
+        return status(
+            StatusCode::BAD_GATEWAY,
+            "The local web app did not answer.\n",
+        );
+    };
+    let mut stop = conn.stop.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = app_conn.with_upgrades() => {}
+            _ = stop.changed() => {}
+        }
+    });
+    let Ok(mut response) = sender.send_request(upstream).await else {
+        return status(
+            StatusCode::BAD_GATEWAY,
+            "The local web app did not answer.\n",
+        );
+    };
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        // The app refused the upgrade. The client gets the app response.
+        let (mut parts, body) = response.into_parts();
+        let mut headers = HeaderMap::new();
+        copy_end_to_end(&parts.headers, &mut headers);
+        parts.headers = headers;
+        parts.version = Version::HTTP_11;
+        return Response::from_parts(parts, Either::Right(body));
+    }
+    let only_websocket = response
+        .headers()
+        .get(UPGRADE)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    if !only_websocket {
+        return closing(
+            StatusCode::BAD_GATEWAY,
+            "The local web app switched to a protocol that is not WebSocket.\n",
+        );
+    }
+    let app_upgrade = hyper::upgrade::on(&mut response);
+    let mut headers = HeaderMap::new();
+    copy_end_to_end(response.headers(), &mut headers);
+    headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+    headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+    let mut reply = Response::new(Either::Left(Full::new(Bytes::new())));
+    *reply.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    *reply.headers_mut() = headers;
+    let face = target.face;
+    let client = target.client;
+    let tunnel: Tunnel = Box::pin(async move {
+        let (Ok(client_io), Ok(app_io)) = tokio::join!(client_upgrade, app_upgrade) else {
+            println!("{face}_ws_failed from {client}");
+            return;
+        };
+        let mut client_io = TokioIo::new(client_io);
+        let mut app_io = TokioIo::new(app_io);
+        match tokio::io::copy_bidirectional(&mut client_io, &mut app_io).await {
+            Ok((up, down)) => println!("{face}_ws_closed from {client} up {up} down {down}"),
+            Err(_) => println!("{face}_ws_closed from {client} error"),
+        }
+    });
+    if conn.tunnels.send(tunnel).is_err() {
+        return closing(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The connection is closing.\n",
+        );
+    }
+    println!("{face}_ws_open from {client}");
+    reply
 }
 
 enum BodyError {
@@ -531,6 +731,206 @@ mod tests {
             .await;
             assert!(!reply.contains("got "), "{reply}");
             assert!(reply.is_empty() || reply.starts_with("HTTP/1.1 400"), "{reply}");
+        });
+    }
+
+    /// A local app that answers an upgrade with `101` and then echoes raw bytes.
+    /// It counts the requests that reach it. `refuse` makes it answer `403` instead.
+    async fn upgrade_app(refuse: bool) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap_or_else(|_| panic!("bind"));
+        let port = listener
+            .local_addr()
+            .unwrap_or_else(|_| panic!("addr"))
+            .port();
+        let seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let count = std::sync::Arc::clone(&count);
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if stream.read_exact(&mut byte).await.is_err() {
+                            return;
+                        }
+                        head.push(byte[0]);
+                    }
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                    if refuse {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 3\r\n\r\nno\n")
+                            .await;
+                        return;
+                    }
+                    assert!(text.contains("upgrade: websocket"), "{text}");
+                    assert!(text.contains("connection: upgrade"), "{text}");
+                    assert!(text.contains("x-forwarded-for: 127.0.0.1"), "{text}");
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: test\r\n\r\n")
+                        .await;
+                    let (mut read, mut write) = stream.split();
+                    let _ = tokio::io::copy(&mut read, &mut write).await;
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    const WS_HEAD: &[u8] = b"GET /chat HTTP/1.1\r\nHost: b\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    async fn read_head(stream: &mut TcpStream) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if stream.read_exact(&mut byte).await.is_err() {
+                break;
+            }
+            head.push(byte[0]);
+        }
+        String::from_utf8_lossy(&head).to_string()
+    }
+
+    #[test]
+    fn a_websocket_upgrade_passes_100_messages_both_ways() {
+        runtime().block_on(async {
+            let (app, seen) = upgrade_app(false).await;
+            let port = proxy_on(app, 1024).await;
+            let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                .await
+                .unwrap_or_else(|_| panic!("connect"));
+            stream
+                .write_all(WS_HEAD)
+                .await
+                .unwrap_or_else(|_| panic!("write"));
+            let head = read_head(&mut stream).await;
+            assert!(
+                head.starts_with("HTTP/1.1 101 Switching Protocols"),
+                "{head}"
+            );
+            let lower = head.to_ascii_lowercase();
+            assert!(lower.contains("upgrade: websocket"), "{head}");
+            assert!(lower.contains("sec-websocket-accept: test"), "{head}");
+            for index in 0..100u32 {
+                // The byte stream is above the body limit in total. Upgraded bytes have no body limit.
+                let message = format!("message {index} {}\n", "x".repeat(index as usize));
+                stream
+                    .write_all(message.as_bytes())
+                    .await
+                    .unwrap_or_else(|_| panic!("write"));
+                let mut echo = vec![0u8; message.len()];
+                tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut echo))
+                    .await
+                    .unwrap_or_else(|_| panic!("echo timeout"))
+                    .unwrap_or_else(|_| panic!("echo"));
+                assert_eq!(echo, message.as_bytes());
+            }
+            assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn an_upgrade_that_is_not_websocket_gets_501_and_does_not_reach_the_app() {
+        runtime().block_on(async {
+            let (app, seen) = upgrade_app(false).await;
+            let port = proxy_on(app, 1024).await;
+            let cases: [&[u8]; 6] = [
+                b"GET / HTTP/1.1\r\nHost: b\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAAP__\r\n\r\n",
+                b"GET / HTTP/1.1\r\nHost: b\r\nConnection: Upgrade\r\nUpgrade: websocket, h2c\r\nSec-WebSocket-Key: a\r\nSec-WebSocket-Version: 13\r\n\r\n",
+                b"POST / HTTP/1.1\r\nHost: b\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: a\r\nSec-WebSocket-Version: 13\r\nContent-Length: 0\r\n\r\n",
+                b"GET / HTTP/1.1\r\nHost: b\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n",
+                b"GET / HTTP/1.1\r\nHost: b\r\nConnection: keep-alive\r\nUpgrade: websocket\r\nSec-WebSocket-Key: a\r\nSec-WebSocket-Version: 13\r\n\r\n",
+                b"GET / HTTP/1.1\r\nHost: b\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: a\r\nSec-WebSocket-Version: 13\r\nContent-Length: 4\r\n\r\nabcd",
+            ];
+            for case in cases {
+                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                    .await
+                    .unwrap_or_else(|_| panic!("connect"));
+                stream.write_all(case).await.unwrap_or_else(|_| panic!("write"));
+                let head = read_head(&mut stream).await;
+                assert!(head.starts_with("HTTP/1.1 501 Not Implemented"), "{head}");
+            }
+            assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn an_app_that_refuses_the_upgrade_sends_its_answer_and_no_tunnel() {
+        runtime().block_on(async {
+            let (app, seen) = upgrade_app(true).await;
+            let port = proxy_on(app, 1024).await;
+            let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                .await
+                .unwrap_or_else(|_| panic!("connect"));
+            stream
+                .write_all(WS_HEAD)
+                .await
+                .unwrap_or_else(|_| panic!("write"));
+            let head = read_head(&mut stream).await;
+            assert!(head.starts_with("HTTP/1.1 403 Forbidden"), "{head}");
+            assert!(!head.to_ascii_lowercase().contains("upgrade:"), "{head}");
+            assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn dropping_the_connection_stops_the_tunnel() {
+        runtime().block_on(async {
+            let (app, _seen) = upgrade_app(false).await;
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap_or_else(|_| panic!("bind"));
+            let port = listener
+                .local_addr()
+                .unwrap_or_else(|_| panic!("addr"))
+                .port();
+            let task = tokio::spawn(async move {
+                let Ok((stream, peer)) = listener.accept().await else {
+                    return;
+                };
+                let target = Target {
+                    face: "serve",
+                    port: app,
+                    body_limit: 1024,
+                    client: peer.ip(),
+                };
+                serve_connection(stream, target).await;
+            });
+            let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                .await
+                .unwrap_or_else(|_| panic!("connect"));
+            stream
+                .write_all(WS_HEAD)
+                .await
+                .unwrap_or_else(|_| panic!("write"));
+            let head = read_head(&mut stream).await;
+            assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+            stream
+                .write_all(b"ping\n")
+                .await
+                .unwrap_or_else(|_| panic!("write"));
+            let mut echo = [0u8; 5];
+            stream
+                .read_exact(&mut echo)
+                .await
+                .unwrap_or_else(|_| panic!("echo"));
+            // The listener closes (for example, serve off): the caller aborts the connection task.
+            task.abort();
+            let _ = task.await;
+            let mut rest = Vec::new();
+            let read =
+                tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut rest)).await;
+            assert!(
+                matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+                "the tunnel did not stop"
+            );
         });
     }
 }

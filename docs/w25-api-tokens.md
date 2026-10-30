@@ -47,8 +47,8 @@ so an admin operation cannot be added without a scope decision.
 | none (owner SVID only) | `admin-token-create`, `admin-token-list`, `admin-token-revoke` |
 
 - A token cannot make, list, or revoke tokens. Only the owner SVID (mTLS) can do this.
-- `policy:write` replaces the policy. The policy sets the owners, so `policy:write` has the same power as an owner.
-  Give it only to a client that you trust as an owner.
+- `policy:write` replaces the policy. Since W25-3b, a token cannot add, remove, or change the policy owners
+  (`403`, reason `owners`). Only the owner SVID can change the owners. See `docs/w25-token-no-escalation.md`.
 - `admin-policy-set` checks the new text with `Policy::from_hujson` before it writes the file.
   The write uses a temporary file and a rename. The coordinator then writes a `policy-replace` audit record.
 
@@ -160,5 +160,5 @@ These files are shared with other tracks. The diff in each is small.
 
 - A token is a bearer secret. Keep the token file at mode 0600. Revoke a token that you do not use.
 - The coordinator reads `api-tokens.json` at each token call. This is a small file read and a lock.
-- `policy:write` is equal to owner power (see section 2).
+- `policy:write` cannot change the owners since W25-3b (see section 2).
 - The proof uses one host clock. On real hosts, the client clock can differ from the coordinator clock.
