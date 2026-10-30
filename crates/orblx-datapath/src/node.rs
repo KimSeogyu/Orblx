@@ -259,6 +259,8 @@ struct Mesh {
     rekey_tx: watch::Sender<u64>,
     rekey_rx: watch::Receiver<u64>,
     filter: Option<Arc<crate::PacketFilter>>,
+    wakes: DialWakes,
+    probes: Arc<Mutex<ProbeBudget>>,
 }
 
 /// Format `orblx status` text.
@@ -555,6 +557,8 @@ async fn run_mesh_inner(
 
     let tun_shutdown = shutdown_rx.clone();
     let tun_links = Arc::clone(&links);
+    let wakes: DialWakes = Arc::new(Mutex::new(HashMap::new()));
+    let tun_wakes = Arc::clone(&wakes);
     let tun_counters = Arc::clone(&counters);
     let accept_routes = request.accept_routes;
     let exit_node = request.exit_node.clone();
@@ -563,7 +567,10 @@ async fn run_mesh_inner(
         read_tun(
             from_tun,
             tun_router,
-            tun_links,
+            TunPeers {
+                links: tun_links,
+                wakes: tun_wakes,
+            },
             tun_shutdown,
             accept_routes,
             exit_node,
@@ -592,6 +599,8 @@ async fn run_mesh_inner(
         rekey_tx,
         rekey_rx,
         filter: request.filter.clone(),
+        wakes: Arc::clone(&wakes),
+        probes: Arc::new(Mutex::new(ProbeBudget::new(Instant::now()))),
     };
     if let Some(addr) = request.metrics {
         let metrics_peers = Arc::clone(&peers);
@@ -844,10 +853,16 @@ async fn external_stop(external: Option<watch::Receiver<bool>>) {
     }
 }
 
+/// The sessions and the dial wake channels that [`read_tun`] uses.
+struct TunPeers {
+    links: Arc<Mutex<HashMap<String, LiveLink>>>,
+    wakes: DialWakes,
+}
+
 async fn read_tun(
     mut from_tun: mpsc::Receiver<Vec<u8>>,
     router: watch::Receiver<RouterTable>,
-    links: Arc<Mutex<HashMap<String, LiveLink>>>,
+    peers: TunPeers,
     mut shutdown: watch::Receiver<bool>,
     accept_routes: bool,
     exit_node: Option<String>,
@@ -874,13 +889,18 @@ async fn read_tun(
                     continue;
                 };
                 let tx = {
-                    let map = lock(&links);
+                    let map = lock(&peers.links);
                     map.get(&peer).map(|link| link.tx.clone())
                 };
-                if let Some(tx) = tx {
-                    if tx.send(packet).await.is_ok() {
-                        counters.tx.fetch_add(1, Ordering::Relaxed);
+                match tx {
+                    Some(tx) => {
+                        if tx.send(packet).await.is_ok() {
+                            counters.tx.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
+                    // The node has no session to the peer. Outbound traffic starts a dial
+                    // when the dial task waits after its fast window (W25-28).
+                    None => wake_dial(&peers.wakes, &peer, DialWake::Traffic),
                 }
             }
         }
@@ -962,6 +982,7 @@ async fn watch_netmap_peers(watch: PeerWatch) {
                     continue;
                 };
                 apply_peer_netmap(&watch, &netmap, &mut started, &mut installed);
+                wake_all_dials(&watch.mesh.wakes);
             }
         }
     }
@@ -1127,13 +1148,16 @@ async fn accept_loop(mut mesh: Mesh) {
     }
 }
 
-async fn dial_peer(mut mesh: Mesh, peer: NetmapPeer) {
+async fn dial_peer(mut mesh: Mesh, mut peer: NetmapPeer) {
     let (remote_tx, mut remote_rx) = watch::channel(0u64);
+    let (wake_tx, mut wake_rx) = watch::channel(DialWake::None);
+    lock(&mesh.wakes).insert(peer.name.clone(), wake_tx);
     loop {
         if stopped(&mesh) {
             return;
         }
-        let Some((session, relay_face)) = dial_ready(&mut mesh, &peer).await else {
+        let Some((session, relay_face)) = dial_ready(&mut mesh, &mut peer, &mut wake_rx).await
+        else {
             return;
         };
         let mut task = spawn_link(
@@ -1182,7 +1206,7 @@ async fn reconnect(
     remote_tx: &watch::Sender<u64>,
     task: &mut JoinHandle<()>,
 ) {
-    let Some((session, relay_face)) = dial_once(mesh, peer, false).await else {
+    let Some((session, relay_face)) = dial_once(mesh, peer, DialMode::One).await else {
         return;
     };
     let next = spawn_link(
@@ -1203,29 +1227,87 @@ async fn reconnect(
 
 async fn dial_ready(
     mesh: &mut Mesh,
-    peer: &NetmapPeer,
+    peer: &mut NetmapPeer,
+    wake: &mut watch::Receiver<DialWake>,
 ) -> Option<(HelloSession, Option<crate::relay_path::RelayFace>)> {
     let fast_until = Instant::now() + FAST_DIAL_WINDOW;
+    let mut first = true;
     loop {
         if stopped(mesh) {
             return None;
         }
-        let fast = Instant::now() < fast_until;
-        if let Some(session) = dial_once(mesh, peer, fast).await {
-            return Some(session);
-        }
-        let pause = if fast {
-            FAST_DIAL_PROBE
-        } else {
-            Duration::from_secs(1)
-        };
-        tokio::select! {
-            changed = mesh.shutdown.changed() => {
-                if changed.is_err() || *mesh.shutdown.borrow() {
-                    return None;
-                }
+        if Instant::now() < fast_until {
+            if let Some(session) = dial_once(mesh, peer, DialMode::Fast { first }).await {
+                return Some(session);
             }
-            _ = tokio::time::sleep(pause) => {}
+            first = false;
+            if !pause(mesh, FAST_DIAL_PROBE).await {
+                return None;
+            }
+            continue;
+        }
+        // After the fast window, a dead peer gets no dial until outbound traffic to it,
+        // a netmap change, or IDLE_REDIAL. The node logs each dial and each failure.
+        wake.mark_unchanged();
+        println!(
+            "The fast dial window to {} ended. The node dials {} again on traffic, on a netmap change, or after {} s.",
+            peer.name,
+            peer.name,
+            IDLE_REDIAL.as_secs()
+        );
+        loop {
+            let reason = tokio::select! {
+                changed = mesh.shutdown.changed() => {
+                    if changed.is_err() || *mesh.shutdown.borrow() {
+                        return None;
+                    }
+                    continue;
+                }
+                changed = wake.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    *wake.borrow_and_update()
+                }
+                () = tokio::time::sleep(IDLE_REDIAL) => DialWake::Timer,
+            };
+            if reason == DialWake::Netmap {
+                refresh_endpoints(mesh, peer);
+            }
+            println!(
+                "The node dials {} again. The reason is {}.",
+                peer.name,
+                reason.text()
+            );
+            if let Some(session) = dial_once(mesh, peer, DialMode::One).await {
+                return Some(session);
+            }
+        }
+    }
+}
+
+/// Wait `time`. Return false when the node stops.
+async fn pause(mesh: &mut Mesh, time: Duration) -> bool {
+    tokio::select! {
+        changed = mesh.shutdown.changed() => !(changed.is_err() || *mesh.shutdown.borrow()),
+        () = tokio::time::sleep(time) => true,
+    }
+}
+
+/// Use the endpoints of the peer from the current netmap file.
+fn refresh_endpoints(mesh: &Mesh, peer: &mut NetmapPeer) {
+    let netmap = fresh_netmap(mesh);
+    if let Some(fresh) = netmap
+        .peers
+        .iter()
+        .find(|fresh| fresh.name == peer.name && fresh.svid == peer.svid)
+    {
+        if fresh.endpoints != peer.endpoints {
+            println!(
+                "The node uses the new endpoints of {} from the netmap.",
+                peer.name
+            );
+            peer.endpoints = fresh.endpoints.clone();
         }
     }
 }
@@ -1235,17 +1317,97 @@ async fn dial_ready(
 /// A peer can enroll, and so be in the netmap, before its UDP listener is up.
 /// In this window the node starts a new QUIC attempt each [`FAST_DIAL_PROBE`] in one dial
 /// attempt, and it waits only [`FAST_DIAL_PROBE`] after a failed dial attempt.
-/// After the window, the node uses one QUIC attempt at a time and waits 1 s after a failed dial attempt.
+/// All peers of the node share one [`ProbeBudget`] for these attempts. The first attempt of
+/// a dial task does not use the budget, so the first dial to a peer does not wait (W25-28).
+/// After the window, the node dials the peer only on outbound traffic to the peer, on a netmap
+/// change, or after [`IDLE_REDIAL`]. Each such dial is one QUIC attempt per endpoint.
 const FAST_DIAL_WINDOW: Duration = Duration::from_secs(10);
 /// The time between two QUIC attempts to one endpoint in the fast dial window.
 const FAST_DIAL_PROBE: Duration = Duration::from_millis(250);
 /// The time limit of one dial attempt to one endpoint.
 const DIAL_ATTEMPT: Duration = Duration::from_secs(3);
+/// The longest wait between two dials to a dead peer after the fast window (W25-28).
+const IDLE_REDIAL: Duration = Duration::from_secs(60);
+/// The fast-window QUIC attempts per second for all peers of one node, after the first
+/// attempt of each dial task (W25-28). One attempt sends about 3 Initial packets in 3 s.
+const PROBE_RATE: f64 = 12.0;
+/// The most fast-window attempts that the budget allows at one time.
+const PROBE_BURST: f64 = 4.0;
+
+/// The reason for a dial after the fast window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DialWake {
+    None,
+    Traffic,
+    Netmap,
+    Timer,
+}
+
+impl DialWake {
+    fn text(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Traffic => "outbound traffic",
+            Self::Netmap => "a netmap change",
+            Self::Timer => "the idle timer",
+        }
+    }
+}
+
+/// The wake channel of each dial task, by peer name.
+type DialWakes = Arc<Mutex<HashMap<String, watch::Sender<DialWake>>>>;
+
+fn wake_dial(wakes: &DialWakes, peer: &str, reason: DialWake) {
+    if let Some(tx) = lock(wakes).get(peer) {
+        tx.send_replace(reason);
+    }
+}
+
+fn wake_all_dials(wakes: &DialWakes) {
+    for tx in lock(wakes).values() {
+        tx.send_replace(DialWake::Netmap);
+    }
+}
+
+/// A token bucket for the fast-window QUIC attempts of one node (W25-28).
+struct ProbeBudget {
+    tokens: f64,
+    at: Instant,
+}
+
+impl ProbeBudget {
+    fn new(now: Instant) -> Self {
+        Self {
+            tokens: PROBE_BURST,
+            at: now,
+        }
+    }
+
+    fn take(&mut self, now: Instant) -> bool {
+        let gained = now.saturating_duration_since(self.at).as_secs_f64() * PROBE_RATE;
+        self.tokens = (self.tokens + gained).min(PROBE_BURST);
+        self.at = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DialMode {
+    /// Fast-window attempts. `first` is true for the first dial of the dial task.
+    Fast { first: bool },
+    /// One QUIC attempt per endpoint.
+    One,
+}
 
 async fn dial_once(
     mesh: &mut Mesh,
     peer: &NetmapPeer,
-    fast: bool,
+    mode: DialMode,
 ) -> Option<(HelloSession, Option<crate::relay_path::RelayFace>)> {
     for endpoint_text in &peer.endpoints {
         if stopped(mesh) {
@@ -1262,11 +1424,22 @@ async fn dial_once(
             }
         };
         let endpoint = Arc::clone(&mesh.endpoint);
+        let probes = Arc::clone(&mesh.probes);
         let connect = async move {
-            if fast {
-                endpoint.connect_probed(addr, FAST_DIAL_PROBE).await
-            } else {
-                endpoint.connect_one(addr).await
+            match mode {
+                DialMode::Fast { first } => {
+                    let mut free = first;
+                    let allow = move || {
+                        if std::mem::take(&mut free) {
+                            return true;
+                        }
+                        lock(&probes).take(Instant::now())
+                    };
+                    endpoint
+                        .connect_probed_limited(addr, FAST_DIAL_PROBE, allow)
+                        .await
+                }
+                DialMode::One => endpoint.connect_one(addr).await,
             }
         };
         let result = tokio::select! {
