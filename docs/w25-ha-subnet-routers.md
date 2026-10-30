@@ -106,6 +106,8 @@ Log: `/workspace/orblx-w18-proof/w25ha-routers-full4.log` (03:09:21 to 03:14:42 
 
 The failover time is about `HA_DEAD_AFTER` (1000 ms): the client moves the route at the first packet after 1000 ms with no frame from the active router.
 
+A run on head b145e54 (after the merge of #96 and #99, `route-failover` is code 35) also passed: failover 1067, 993, 1013, 1086, 1020 ms; max gap 991, 970, 990, 1013, 992 ms; ping loss 17 of 160 to 169 in each run; 0 route changes in 60 s; TCP reconnect 1087 ms; leak 0; secret lines 0 (log `w25ha-routers-full5-b145e542.log`, 04:23:37 to 04:28:55 KST). Its 5 s baseline ping lost 1 of 96 packets.
+
 An earlier run on head f2887a7 (before the merge of #92) had the same result: failover 989 to 1074 ms, TCP reconnect 1125 ms (log `w25ha-routers-full3.log`).
 
 
