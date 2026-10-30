@@ -1,7 +1,11 @@
 #!/bin/sh
-# NAT router for the W19 proof.
-# The mode is cone or symmetric.
+# NAT router for the W19 and W20 proofs.
+# The mode is cone, prc, or symmetric.
 # cone keeps the source port and accepts new UDP to port 443.
+# prc is a port-restricted cone NAT.
+#   prc keeps the source port for all destinations (endpoint-independent mapping).
+#   prc has no port forward and no DNAT.
+#   prc accepts inbound UDP only from the IP and port that the inside host sent to.
 # symmetric uses a new source port for each destination.
 
 set -eu
@@ -30,14 +34,25 @@ done
 
 iptables -t nat -F
 iptables -F FORWARD
+iptables -F INPUT
 iptables -P FORWARD ACCEPT
+
+# The router does not answer new UDP on the WAN interface.
+# An ICMP answer makes a conntrack entry.
+# That entry can force a new source port for a later flow from the LAN.
+iptables -A INPUT -i "$WAN" -p udp -m conntrack --ctstate NEW -j DROP
 
 if [ "$MODE" = "cone" ]; then
   iptables -t nat -A POSTROUTING -o "$WAN" -j SNAT --to-source "$WAN_IP"
   iptables -t nat -A PREROUTING -i "$WAN" -p udp --dport 443 -j DNAT --to-destination "${NODE_IP}:443"
   iptables -A FORWARD -i "$WAN" -o "$LAN" -p udp -d "$NODE_IP" --dport 443 -j ACCEPT
+elif [ "$MODE" = "prc" ]; then
+  iptables -t nat -A POSTROUTING -o "$WAN" -j SNAT --to-source "$WAN_IP"
+  # The conntrack 5-tuple is the filter.
+  # Only a reply to a flow from the LAN passes the rule at the end of FORWARD.
+  iptables -A FORWARD -i "$WAN" -o "$LAN" -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP
 elif [ "$MODE" = "symmetric" ]; then
-  iptables -t nat -A POSTROUTING -o "$WAN" -p udp -j MASQUERADE --random-fully
+  iptables -t nat -A POSTROUTING -o "$WAN" -p udp -j MASQUERADE --random-fully --to-ports 1024-65535
   iptables -t nat -A POSTROUTING -o "$WAN" -p tcp -j MASQUERADE
   iptables -t nat -A POSTROUTING -o "$WAN" -p icmp -j MASQUERADE
 else
@@ -60,4 +75,5 @@ echo "router lan ${LAN} ${LAN_IP}"
 echo "router node ${NODE_IP}"
 iptables -t nat -S
 iptables -S FORWARD
+iptables -S INPUT
 exec sleep infinity
