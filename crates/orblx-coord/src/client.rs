@@ -7,9 +7,9 @@ use crate::error::CoordError;
 use crate::netmap::{
     decode_hex_32, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap, SignedNetmap,
 };
-use crate::proto::{self, Request, Response};
+use crate::proto::{self, GrantAsk, Request, Response};
 use crate::state::{read_node_material, EnrollResult, NetmapView, NodeMaterial};
-use crate::ticket::{decode_ticket_wire, IssuedTicket};
+use crate::ticket::{decode_hex, decode_ticket_wire, IssuedTicket};
 use crate::tlsutil::{self, ClientTls};
 
 /// Enroll with a one-use token.
@@ -31,6 +31,7 @@ pub async fn enroll_with_token(
         endpoints: endpoints.to_vec(),
         routes: routes.to_vec(),
         exit_node: false,
+        grant: None,
     };
     round_trip(coord, coord_name, bundle_pem, None, request, None, true).await
 }
@@ -82,6 +83,7 @@ pub async fn enroll_with_oidc(input: OidcEnroll<'_>) -> Result<EnrollResult, Coo
         endpoints: input.endpoints.to_vec(),
         routes: input.routes.to_vec(),
         exit_node: false,
+        grant: None,
     };
     round_trip(
         input.coord,
@@ -137,6 +139,7 @@ pub async fn advertise_routes(
         endpoints: Vec::new(),
         routes: routes.to_vec(),
         exit_node: false,
+        grant: None,
     };
     let result = round_trip(
         coord,
@@ -170,6 +173,7 @@ pub async fn fetch_netmap(
         endpoints: Vec::new(),
         routes: Vec::new(),
         exit_node: false,
+        grant: None,
     };
     let result = round_trip(
         coord,
@@ -219,6 +223,7 @@ pub async fn renew_svid(
         endpoints: Vec::new(),
         routes: Vec::new(),
         exit_node: false,
+        grant: None,
     };
     let result = round_trip(
         coord,
@@ -281,6 +286,7 @@ pub async fn publish_candidates(
         endpoints: endpoints.to_vec(),
         routes: Vec::new(),
         exit_node: false,
+        grant: None,
     };
     let result = round_trip(
         coord,
@@ -331,6 +337,7 @@ pub async fn advertise_exit(
         endpoints: Vec::new(),
         routes: Vec::new(),
         exit_node: enabled,
+        grant: None,
     };
     let result = round_trip(
         coord,
@@ -393,6 +400,7 @@ async fn admin_call(
         endpoints: Vec::new(),
         routes: Vec::new(),
         exit_node: false,
+        grant: None,
     };
     authed_detail(coord, coord_name, bundle_pem, material, request).await
 }
@@ -413,6 +421,7 @@ async fn fetch_deny(
         endpoints: Vec::new(),
         routes: Vec::new(),
         exit_node: false,
+        grant: None,
     };
     authed_detail(coord, coord_name, bundle_pem, material, request).await
 }
@@ -424,6 +433,19 @@ async fn authed_detail(
     material: NodeMaterial,
     request: Request,
 ) -> Result<String, CoordError> {
+    authed_response(coord, coord_name, bundle_pem, material, request)
+        .await?
+        .detail
+        .ok_or_else(|| CoordError::Protocol("The coordinator request failed.".to_string()))
+}
+
+async fn authed_response(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    material: NodeMaterial,
+    request: Request,
+) -> Result<Response, CoordError> {
     let expect_coord = SpiffeId::coord(coord_name)?;
     let client_tls = ClientTls {
         trust_pem: bundle_pem.to_string(),
@@ -454,9 +476,96 @@ async fn authed_detail(
             .unwrap_or_else(|| "The coordinator request failed.".to_string());
         return Err(CoordError::Protocol(text));
     }
-    response
-        .detail
-        .ok_or_else(|| CoordError::Protocol("The coordinator request failed.".to_string()))
+    Ok(response)
+}
+
+/// Ask for one agent JIT grant with the node SVID in `state_dir`.
+///
+/// The result is the reply document with the grant id.
+pub fn agent_grant_request_blocking(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+    ask: GrantAsk,
+) -> Result<String, CoordError> {
+    block_on(async move {
+        let material = read_node_material(state_dir)?;
+        let request = Request {
+            op: "agent-grant".to_string(),
+            name: material.name.clone(),
+            token: None,
+            id_token: None,
+            nonce: None,
+            endpoints: Vec::new(),
+            routes: Vec::new(),
+            exit_node: false,
+            grant: Some(ask),
+        };
+        authed_detail(coord, coord_name, bundle_pem, material, request).await
+    })
+}
+
+/// The reply of one grant fetch.
+pub enum GrantFetch {
+    /// The grant waits for an owner.
+    Pending,
+    /// The grant files. The caller must not log them.
+    Issued(Box<orblx_agent::GrantFiles>),
+}
+
+impl std::fmt::Debug for GrantFetch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => formatter.write_str("Pending"),
+            Self::Issued(_) => formatter.write_str("Issued([elided])"),
+        }
+    }
+}
+
+/// Fetch the material of one approved grant with the node SVID in `state_dir`.
+///
+/// The coordinator returns the material one time.
+pub fn agent_grant_fetch_blocking(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+    id: &str,
+) -> Result<GrantFetch, CoordError> {
+    block_on(async move {
+        let material = read_node_material(state_dir)?;
+        let request = Request {
+            op: "agent-grant-fetch".to_string(),
+            name: id.to_string(),
+            token: None,
+            id_token: None,
+            nonce: None,
+            endpoints: Vec::new(),
+            routes: Vec::new(),
+            exit_node: false,
+            grant: None,
+        };
+        let response = authed_response(coord, coord_name, bundle_pem, material, request).await?;
+        let invalid = || CoordError::Protocol("The grant reply is not valid.".to_string());
+        let (Some(cert_pem), Some(key_pem), Some(ticket_hex), Some(detail)) = (
+            response.certificate_pem,
+            response.private_key_pem,
+            response.ticket_hex,
+            response.detail.clone(),
+        ) else {
+            return Ok(GrantFetch::Pending);
+        };
+        let grant: orblx_agent::SignedAgentGrant =
+            serde_json::from_str(&detail).map_err(|_| invalid())?;
+        let ticket = decode_hex(&ticket_hex).map_err(|_| invalid())?;
+        Ok(GrantFetch::Issued(Box::new(orblx_agent::GrantFiles {
+            cert_pem,
+            key_pem,
+            ticket,
+            grant,
+        })))
+    })
 }
 
 /// Fetch a fresh netmap with the stored node SVID.

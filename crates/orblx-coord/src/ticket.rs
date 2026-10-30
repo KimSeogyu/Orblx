@@ -8,7 +8,10 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orblx_crypto::{mac_input, ticket_mac};
-use orblx_identity::{sign_ticket, SpiffeId, TicketClaims, TicketFlags, TicketSigner};
+use orblx_identity::{
+    sign_agent_jit_ticket, sign_ticket, Ipv4Destination, SignedTicket, SpiffeId, TicketClaims,
+    TicketFlags, TicketSigner,
+};
 
 use crate::error::CoordError;
 use crate::files::{read_text, write_bytes, write_text};
@@ -133,6 +136,30 @@ pub fn issue_node_ticket(
     })
 }
 
+/// Sign one agent JIT ticket for one host and one port.
+///
+/// The ticket uses the node ticket key. The caller must not log the ticket.
+pub(crate) fn issue_agent_ticket(
+    dir: &Path,
+    ca_public: &[u8; 32],
+    coord_name: &str,
+    agent: &SpiffeId,
+    now: SystemTime,
+    ttl: Duration,
+    dest: Ipv4Destination,
+) -> Result<SignedTicket, CoordError> {
+    let material = load_ticket_material(dir, ca_public, now)?;
+    let issuer = SpiffeId::coord(coord_name)?;
+    Ok(sign_agent_jit_ticket(
+        &material.signer,
+        &issuer,
+        agent,
+        now,
+        ttl,
+        dest,
+    )?)
+}
+
 fn read_seed(path: &Path) -> Result<[u8; 32], CoordError> {
     let bytes = std::fs::read(path).map_err(CoordError::io)?;
     bytes.try_into().map_err(|_| CoordError::State)
@@ -204,7 +231,7 @@ pub fn decode_ticket_wire(
     })
 }
 
-fn decode_hex(text: &str) -> Result<Vec<u8>, CoordError> {
+pub(crate) fn decode_hex(text: &str) -> Result<Vec<u8>, CoordError> {
     if text.is_empty() || !text.len().is_multiple_of(2) {
         return Err(CoordError::Protocol("The ticket is not valid.".to_string()));
     }

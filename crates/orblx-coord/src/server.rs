@@ -5,6 +5,7 @@ use orblx_identity::{GoogleJwks, OidcJwks, TrustBundle, WorkloadKind};
 use rustls::pki_types::CertificateDer;
 
 use crate::admin;
+use crate::agent;
 use crate::error::CoordError;
 use crate::http_util::{fetch_google_jwks, https_get};
 use crate::netmap::encode_hex;
@@ -240,8 +241,49 @@ async fn dispatch(
                 ..Response::default()
             })
         }
-        "admin-nodes" | "admin-users" | "admin-approve" | "admin-revoke" | "admin-expire"
-        | "admin-routes" | "admin-audit" => dispatch_admin(coord, connection, &request, now),
+        "agent-grant" => {
+            let peer = peer_node(coord, connection)?;
+            if peer != request.name {
+                return Err(CoordError::Peer);
+            }
+            let ask = request.grant.as_ref().ok_or_else(|| {
+                CoordError::Protocol("The grant request is not valid.".to_string())
+            })?;
+            let value = agent::request(coord, &peer, ask, now)?;
+            println!("agent grant request from {peer}");
+            detail_response(&value)
+        }
+        "agent-grant-fetch" => {
+            let peer = peer_node(coord, connection)?;
+            match agent::fetch(coord, &peer, &request.name, now)? {
+                agent::Fetched::Pending(value) => detail_response(&value),
+                agent::Fetched::Issued(issued) => {
+                    let (material, signed) = *issued;
+                    let detail = serde_json::to_string(&signed)
+                        .map_err(|_| CoordError::Protocol("The grant is not valid.".to_string()))?;
+                    println!("agent grant issued to {peer}");
+                    Ok(Response {
+                        ok: true,
+                        certificate_pem: Some(material.certificate_pem),
+                        private_key_pem: Some(material.private_key_pem),
+                        trust_bundle_pem: Some(material.trust_bundle_pem),
+                        ticket_hex: Some(encode_hex(&material.ticket.bytes)),
+                        detail: Some(detail),
+                        ..Response::default()
+                    })
+                }
+            }
+        }
+        "admin-nodes"
+        | "admin-users"
+        | "admin-approve"
+        | "admin-revoke"
+        | "admin-expire"
+        | "admin-routes"
+        | "admin-audit"
+        | "admin-grants"
+        | "admin-grant-approve"
+        | "admin-grant-revoke" => dispatch_admin(coord, connection, &request, now),
         _ => Err(CoordError::Protocol(
             "The request is not valid.".to_string(),
         )),
@@ -268,6 +310,9 @@ fn dispatch_admin(
         "admin-expire" => admin::expire(coord, &request.name, caller.as_uri())?,
         "admin-routes" => admin::routes(coord)?,
         "admin-audit" => admin::audit(coord, parse_since(&request.name)?)?,
+        "admin-grants" => agent::list(coord, now)?,
+        "admin-grant-approve" => agent::approve(coord, &request.name, caller.as_uri(), now)?,
+        "admin-grant-revoke" => agent::revoke(coord, &request.name, caller.as_uri(), now)?,
         _ => {
             return Err(CoordError::Protocol(
                 "The request is not valid.".to_string(),
@@ -277,6 +322,16 @@ fn dispatch_admin(
     let detail = serde_json::to_string(&value)
         .map_err(|_| CoordError::Protocol("The request is not valid.".to_string()))?;
     println!("admin {}", request.op.trim_start_matches("admin-"));
+    Ok(Response {
+        ok: true,
+        detail: Some(detail),
+        ..Response::default()
+    })
+}
+
+fn detail_response(value: &serde_json::Value) -> Result<Response, CoordError> {
+    let detail = serde_json::to_string(value)
+        .map_err(|_| CoordError::Protocol("The request is not valid.".to_string()))?;
     Ok(Response {
         ok: true,
         detail: Some(detail),

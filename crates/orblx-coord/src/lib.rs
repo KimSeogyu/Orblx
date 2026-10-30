@@ -12,6 +12,7 @@
 //! A later renew call uses the node SVID and returns a new leaf.
 
 mod admin;
+mod agent;
 mod client;
 mod config;
 mod error;
@@ -33,9 +34,10 @@ mod tlsutil;
 
 pub use admin::{approve, audit, deny_json, deny_set, expire, nodes, revoke, routes, users};
 pub use client::{
-    admin_blocking, advertise_exit_blocking, advertise_routes_blocking, enroll_with_oidc_blocking,
-    enroll_with_token_blocking, fetch_deny_blocking, fetch_netmap_blocking, netmap_json,
-    publish_candidates_blocking, renew_svid_blocking, OidcEnroll,
+    admin_blocking, advertise_exit_blocking, advertise_routes_blocking, agent_grant_fetch_blocking,
+    agent_grant_request_blocking, enroll_with_oidc_blocking, enroll_with_token_blocking,
+    fetch_deny_blocking, fetch_netmap_blocking, netmap_json, publish_candidates_blocking,
+    renew_svid_blocking, GrantFetch, OidcEnroll,
 };
 pub use config::{CoordConfig, OidcSection};
 pub use error::CoordError;
@@ -44,6 +46,7 @@ pub use netmap::{
     decode_hex_32, encode_hex, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap,
     NetmapKey, SignedEndpoint, SignedGrants, SignedNetmap,
 };
+pub use proto::GrantAsk;
 pub use server::serve_blocking;
 pub use state::{
     oidc_config, read_node_material, Coordinator, EnrollResult, IssuerFetch, NetmapView,
