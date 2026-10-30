@@ -259,6 +259,15 @@ expect_http() {
   fi
 }
 
+# Print the PID of the api gateway on b. The image has no pgrep.
+gateway_pid() {
+  dc exec -T b sh -c 'for d in /proc/[0-9]*; do
+    if tr "\0" " " <"$d/cmdline" 2>/dev/null | grep -q "^orblx gateway .*--service api "; then
+      basename "$d"
+    fi
+  done' | head -n1
+}
+
 echo "=== [C] start the upstream and the gateways on b ==="
 dc exec -T b sh -c "cat >$STATE/upstream.py" <<'PY'
 import http.server
@@ -358,8 +367,56 @@ wait_file_line b "$STATE/gateway-api.log" "agent grant ${grant1} expired"
 guard_ttl_ms="$(dc exec -T b awk '/^agent deny reason expired /{print $NF; exit}' "$STATE/gateway-api.log")"
 echo "gateway_expired_deny_ms ${guard_ttl_ms} gateway_deny_after_end_ms $(( guard_ttl_ms - expires1_ms ))"
 
+echo "=== [C] restart replay: grant 2, one request, gateway restart, same bytes ==="
+reply="$(api_request 8080 120)"
+printf '%s\n' "$reply"
+grant2="$(printf '%s\n' "$reply" | field grant_id)"
+owner grant-approve "$grant2"
+grant_fetch "$grant2" "$STATE/agent-g2"
+G2="$STATE/agent-g2"
+first_ms="$(date +%s%3N)"
+expect_http "grant 2 request is forwarded and saved" "status 200 " \
+  --grant "$G2" --path /api/items --save-request "$STATE/saved-request.bin"
+dc exec -T a stat -c 'saved_request mode %a' "$STATE/saved-request.bin"
+old_pid="$(gateway_pid)"
+echo "gateway api pid ${old_pid} stop"
+dc exec -T b sh -c "kill ${old_pid}"
+for i in $(seq 1 50); do
+  if [[ -z "$(gateway_pid)" ]]; then
+    break
+  fi
+  sleep 0.1
+done
+[[ -z "$(gateway_pid)" ]]
+dc exec -d b sh -c "orblx gateway --listen ${b_ip}:8080 --service api \
+  --target 127.0.0.1:8081 --audit $STATE/gateway-audit-api.jsonl \
+  --coord ${coord_ip}:443 --state $STATE --bundle $STATE/bundle.pem \
+  --poll-ms 200 --stale-ms 2000 >$STATE/gateway-api-2.log 2>&1"
+wait_file_line b "$STATE/gateway-api-2.log" 'agent gateway service api'
+dc exec -T b cat "$STATE/gateway-api-2.log"
+echo "gateway api pid $(gateway_pid) start"
+sleep 1
+restart_out="$(http "restart replay: the saved bytes again" --to "${b_ip}:8080" \
+  --send-file "$STATE/saved-request.bin" || true)"
+replay_ms="$(date +%s%3N)"
+printf '%s\n' "$restart_out" | grep -q '^http attempt 1 status 403 reason replay '
+restart_gap=$(( replay_ms - first_ms ))
+echo "restart_replay_after_first_ms ${restart_gap} result refused replay"
+if (( restart_gap >= 60000 )); then
+  echo "The replay was not inside the 60 s proof window." >&2
+  exit 1
+fi
+expect_http "a new request with grant 2 after the restart is forwarded" "status 200 " \
+  --grant "$G2" --path /api/items
+wait_file_line b "$STATE/gateway-api-2.log" 'agent deny reason replay '
+restart_record="$(dc exec -T b grep -c 'reason replay ' "$STATE/gateway-audit-api.jsonl")"
+echo "api_chain_replay_records ${restart_record}"
+[[ "$restart_record" -ge 2 ]]
+dc exec -T a rm -f "$STATE/saved-request.bin"
+
 echo "=== [C] gateway logs ==="
 dc exec -T b cat "$STATE/gateway-api.log"
+dc exec -T b cat "$STATE/gateway-api-2.log"
 dc exec -T b cat "$STATE/gateway-db.log"
 
 echo "=== [C] gateway audit chains ==="
@@ -404,7 +461,8 @@ printf '%s\n' "$coord_audit" | grep '^verify '
 echo "=== [C] logs hold no key, ticket, or use proof ==="
 {
   dc logs coord a b 2>&1
-  dc exec -T b cat "$STATE/gateway-api.log" "$STATE/gateway-db.log" "$STATE/upstream.log" \
+  dc exec -T b cat "$STATE/gateway-api.log" "$STATE/gateway-api-2.log" "$STATE/gateway-db.log" \
+    "$STATE/upstream.log" \
     "$STATE/gateway-audit-api.jsonl" "$STATE/gateway-audit-db.jsonl"
   dc exec -T coord cat "$STATE/config-audit.jsonl" 2>/dev/null || true
   cat "$WORK"/*.txt
@@ -428,5 +486,5 @@ for needle in 'PRIVATE KEY' 'T0JMWEFHVDE' 'ge1.' 'orblx-agent-proof' 'q=1'; do
 done
 echo "log_bytes $(wc -c <"$WORK/all-logs.out")"
 
-echo "summary ttl_deny_after_end_ms ${ttl_delta} gateway_ttl_after_end_ms $(( guard_ttl_ms - expires1_ms )) api_requests ${sent} limit_ms ${LIMIT_MS}"
+echo "summary ttl_deny_after_end_ms ${ttl_delta} gateway_ttl_after_end_ms $(( guard_ttl_ms - expires1_ms )) restart_replay_after_first_ms ${restart_gap} restart_replay refused api_requests ${sent} limit_ms ${LIMIT_MS}"
 echo "proof_ok"

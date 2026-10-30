@@ -211,8 +211,11 @@ pub fn run_gateway(config: GuardConfig, fetch: DenyFetch) -> Result<(), AgentErr
         TcpListener::bind(config.listen).map_err(|err| AgentError::Io(err.to_string()))?;
     spawn_poll(Arc::clone(&core), fetch, config.poll);
     println!(
-        "agent gateway service {} listen {} target {}",
-        config.service, config.listen, config.target
+        "agent gateway service {} listen {} target {} nonces_loaded {}",
+        config.service,
+        config.listen,
+        config.target,
+        core.seen_count()
     );
     let service = Arc::new(config.service.clone());
     let port = config.listen.port();

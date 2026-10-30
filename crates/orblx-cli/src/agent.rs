@@ -46,6 +46,8 @@ pub(crate) struct Http {
     timeout: Duration,
     every: Option<Duration>,
     max_wait: Duration,
+    save_request: Option<PathBuf>,
+    send_file: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -249,6 +251,8 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
                     "--timeout",
                     "--every-ms",
                     "--max-wait",
+                    "--save-request",
+                    "--send-file",
                 ],
             )?;
             let to = flags
@@ -256,6 +260,10 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
                 .map(|text| parse_socket(text, 0))
                 .transpose()?;
             let grant = flags.get("--grant").map(PathBuf::from);
+            let send_file = flags.get("--send-file").map(PathBuf::from);
+            if send_file.is_some() && to.is_none() {
+                return Err(format!("--send-file needs --to.\n{}", help()));
+            }
             if grant.is_none() && to.is_none() {
                 return Err(format!("The command needs --grant or --to.\n{}", help()));
             }
@@ -276,6 +284,8 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
                 timeout: Duration::from_secs(flags.number("--timeout", 5)?),
                 every,
                 max_wait: Duration::from_secs(flags.number("--max-wait", 400)?),
+                save_request: flags.get("--save-request").map(PathBuf::from),
+                send_file,
             }))
         }
         _ => Err(format!("The mode is not valid.\n{}", help())),
@@ -630,7 +640,16 @@ fn run_http(command: Http) -> Result<i32, String> {
     };
     let Some(every) = command.every else {
         // One request. With --repeat N the same bytes go N times on new connections.
-        let bytes = build()?;
+        // --save-request keeps the bytes (mode 0600) and --send-file sends them again.
+        // The bytes hold a use proof. The command does not print them.
+        let bytes = match &command.send_file {
+            Some(path) => std::fs::read(path)
+                .map_err(|err| format!("The file {} did not open. {err}", path.display()))?,
+            None => build()?,
+        };
+        if let Some(path) = &command.save_request {
+            write_private(path, &bytes)?;
+        }
         let mut code = 0;
         for attempt in 1..=command.repeat.max(1) {
             let at = now_ms();
@@ -686,6 +705,21 @@ fn run_http(command: Http) -> Result<i32, String> {
     }
 }
 
+fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|err| format!("The file {} did not open. {err}", path.display()))?;
+    file.write_all(bytes)
+        .map_err(|err| format!("The file {} was not written. {err}", path.display()))
+}
+
 fn path_only(target: &str) -> &str {
     target.split(['?', '#']).next().unwrap_or("")
 }
@@ -695,7 +729,7 @@ fn help() -> String {
 orblx agent grant request --agent NAME --node NODE --service NAME --port N [--ttl SECS] [--path PREFIX] --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx agent grant fetch --id ID --out DIR [--wait SECS] --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx agent connect --grant DIR [--to IP:PORT] [--service NAME] [--send TEXT] [--timeout SECS] [--every-ms MS] [--max-wait SECS]
-orblx agent http [--grant DIR] [--to IP:PORT] [--service NAME] [--method M] [--path TARGET] [--body TEXT] [--repeat N] [--timeout SECS] [--every-ms MS] [--max-wait SECS]
+orblx agent http [--grant DIR] [--to IP:PORT] [--service NAME] [--method M] [--path TARGET] [--body TEXT] [--repeat N] [--timeout SECS] [--every-ms MS] [--max-wait SECS] [--save-request FILE] [--send-file FILE]
 orblx gateway --listen IP:PORT --service NAME --target ADDR [--audit FILE] [--poll-ms MS] [--stale-ms MS] [--coord ADDR] [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx agent guard --listen IP:PORT --service NAME --target ADDR [--audit FILE] [--poll-ms MS] [--stale-ms MS] [--coord ADDR] [--state DIR] [--coord-name NAME] [--bundle FILE]
 
@@ -719,6 +753,8 @@ gateway removes the proof headers before it forwards the request. It does not lo
 http sends one HTTP request with a grant proof and a new nonce. Without --grant it sends no proof.
 http with --repeat N sends the same request bytes N times. The second send is a replay.
 http with --every-ms sends a new request each MS until the gateway refuses.
+http with --save-request FILE keeps the request bytes in FILE (mode 0600). The bytes hold a use proof.
+http with --send-file FILE --to IP:PORT sends those bytes again, for a replay test.
 Use orblx audit verify-config --file FILE to check that chain.
 The command does not print private keys or tickets.
 "
@@ -817,5 +853,41 @@ mod tests {
         assert!(parse(&args(&["http", "--path", "/"]))
             .unwrap_err()
             .contains("--to"));
+        let Command::Http(saved) = parse(&args(&[
+            "http",
+            "--to",
+            "100.64.0.3:8080",
+            "--send-file",
+            "/tmp/r",
+            "--save-request",
+            "/tmp/s",
+        ]))
+        .unwrap() else {
+            panic!("not http");
+        };
+        assert_eq!(saved.send_file, Some(std::path::PathBuf::from("/tmp/r")));
+        assert_eq!(saved.save_request, Some(std::path::PathBuf::from("/tmp/s")));
+        assert!(parse(&args(&[
+            "http",
+            "--grant",
+            "/tmp/g",
+            "--send-file",
+            "/tmp/r"
+        ]))
+        .unwrap_err()
+        .contains("--send-file needs --to"));
+    }
+
+    #[test]
+    fn saved_request_is_private() {
+        let path = std::env::temp_dir().join(format!("orblx-req-{}", std::process::id()));
+        super::write_private(&path, b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_file(&path).unwrap();
     }
 }

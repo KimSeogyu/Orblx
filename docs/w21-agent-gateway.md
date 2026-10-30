@@ -106,12 +106,11 @@ Grant: service `api`, port 8080, path `/api`, TTL 20 s.
 
 The log grep covers the Compose logs, the gateway logs, the upstream log, the chains, and the client output.
 
-## Caveats
+## Known limits
 
-- The gateway keeps the nonce set in memory. A gateway restart clears it, so a proof younger than 60 s can be sent again one time after a restart.
-- Each gateway process has its own nonce set and its own chain file.
-- The proof does not cover the request headers other than the proof and the nonce.
+- Each gateway process has its own nonce set and its own audit chain file. Two gateways for the same service do not share the nonce set. A proof that one gateway admitted can go one time to the other gateway within 60 s.
+- The gateway keeps the nonce set across a restart. It reads the recent `agent-use` records from its chain file at start (W22-1). A restart with a different `--audit` file starts with an empty set.
+- The signature covers only the method, the target (path and query), the nonce, and the body hash. Other request headers are not signed. A party on the path between the agent and the gateway can change them. The WireGuard tunnel between the nodes protects the path.
 - The gateway reads one request on each connection. It sends `Connection: close`.
-- The gateway does not support `Transfer-Encoding: chunked`.
-- The gateway does not log the query. It logs the path. Do not put a secret in a path part.
-- The upstream gets plain HTTP on the node loopback. The overlay carries the request between nodes.
+- The gateway does not support `Transfer-Encoding: chunked`. It refuses such a request with `400 request`.
+- A revoke stops all grants for that agent name. See [W21 agent grant](w21-agent-grant.md).

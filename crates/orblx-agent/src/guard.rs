@@ -84,13 +84,16 @@ struct Known {
     revoked: bool,
 }
 
+/// Seen request nonces: (ticket hash, nonce) to a time in Unix seconds.
+type SeenSet = BTreeMap<([u8; 16], [u8; 16]), u64>;
+
 struct CoreState {
     deny: DenySet,
     deny_ok_at: Option<SystemTime>,
     audit: ConfigLog,
     known: BTreeMap<String, Known>,
     /// Seen request nonces: (ticket hash, nonce) to the proof stamp.
-    seen: BTreeMap<([u8; 16], [u8; 16]), u64>,
+    seen: SeenSet,
 }
 
 /// Extra checks for one request after the proof check.
@@ -127,8 +130,10 @@ impl GuardCore {
                 "The listen address is not IPv4.".to_string(),
             ));
         };
+        // `open` checks the chain. A broken chain stops the start (fail closed).
         let audit = ConfigLog::open(&config.audit_path)
             .map_err(|err| AgentError::Audit(err.to_string()))?;
+        let seen = load_seen(&config.audit_path, SystemTime::now())?;
         Ok(Self {
             node: config.node.clone(),
             addr,
@@ -141,9 +146,14 @@ impl GuardCore {
                 deny_ok_at: None,
                 audit,
                 known: BTreeMap::new(),
-                seen: BTreeMap::new(),
+                seen,
             }),
         })
+    }
+
+    /// The number of request nonces that the core knows.
+    pub fn seen_count(&self) -> usize {
+        self.lock().map_or(0, |state| state.seen.len())
     }
 
     /// Apply one deny document and record revoked grants.
@@ -325,8 +335,16 @@ impl GuardCore {
             Ok(admitted) => {
                 self.note_grant(&mut state, &admitted.grant, admitted.nonce, &admitted.agent)?;
                 let detail = format!(
-                    "service {service} port {port}{note} peer {peer} ticket_hash {} at_ms {at_ms}",
-                    encode_hex(&admitted.ticket_hash)
+                    "service {service} port {port}{note} peer {peer} ticket_hash {}{} at_ms {at_ms}",
+                    encode_hex(&admitted.ticket_hash),
+                    check
+                        .nonce
+                        .map(|nonce| format!(
+                            " nonce {} stamp {}",
+                            encode_hex(&nonce),
+                            admitted.stamp
+                        ))
+                        .unwrap_or_default()
                 );
                 let actor = admitted.agent.as_uri().to_string();
                 let id = admitted.grant.id.clone();
@@ -458,6 +476,52 @@ impl GuardCore {
             .lock()
             .map_err(|_| AgentError::Io("The guard state lock failed.".to_string()))
     }
+}
+
+/// Read the request nonces of recent `agent-use` records from the chain.
+///
+/// The gateway writes the use record before it forwards a request. Thus a
+/// restart keeps each used nonce, and a proof that was used before the
+/// restart is refused with `replay`. A record older than two proof windows
+/// cannot match a valid proof, so the core skips it.
+fn load_seen(path: &std::path::Path, now: SystemTime) -> Result<SeenSet, AgentError> {
+    let mut seen = BTreeMap::new();
+    if !path.exists() {
+        return Ok(seen);
+    }
+    let checked =
+        orblx_audit::verify_config_file(path).map_err(|err| AgentError::Audit(err.to_string()))?;
+    let now_secs = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| AgentError::Time)?
+        .as_secs();
+    let keep_after = now_secs.saturating_sub(2 * PROOF_WINDOW_SECS);
+    for record in checked.records {
+        let event = record.event;
+        // A record time is within one proof window of its proof stamp.
+        if event.action != ConfigAction::AgentUse
+            || event.at_unix.saturating_add(PROOF_WINDOW_SECS) < keep_after
+        {
+            continue;
+        }
+        let words: Vec<&str> = event.detail.split(' ').collect();
+        let value = |key: &str| -> Option<[u8; 16]> {
+            let index = words.iter().rposition(|word| *word == key)?;
+            let bytes = crate::hex::decode_hex(words.get(index + 1)?).ok()?;
+            <[u8; 16]>::try_from(bytes).ok()
+        };
+        let stamp = words
+            .iter()
+            .rposition(|word| *word == "stamp")
+            .and_then(|index| words.get(index + 1))
+            .and_then(|text| text.parse::<u64>().ok());
+        if let (Some(hash), Some(nonce), Some(stamp)) =
+            (value("ticket_hash"), value("nonce"), stamp)
+        {
+            seen.insert((hash, nonce), stamp);
+        }
+    }
+    Ok(seen)
 }
 
 fn record_refused(

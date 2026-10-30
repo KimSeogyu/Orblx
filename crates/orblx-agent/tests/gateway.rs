@@ -98,6 +98,13 @@ fn core(fixture: &Fixture, name: &str) -> (GuardCore, PathBuf) {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let audit = dir.join("gateway-audit.jsonl");
+    (open_core(fixture, &audit).unwrap(), audit)
+}
+
+fn open_core(
+    fixture: &Fixture,
+    audit: &std::path::Path,
+) -> Result<GuardCore, orblx_agent::AgentError> {
     let config = GuardConfig {
         listen: SocketAddr::from((ADDR, PORT)),
         service: "api".to_string(),
@@ -106,11 +113,11 @@ fn core(fixture: &Fixture, name: &str) -> (GuardCore, PathBuf) {
         bundle: fixture.ca.trust_bundle().clone(),
         verifier: fixture.signer.verifier(),
         netmap_public: fixture.netmap.verifying_key().to_bytes(),
-        audit_path: audit.clone(),
+        audit_path: audit.to_path_buf(),
         poll: Duration::from_millis(200),
         stale_after: Duration::from_secs(2),
     };
-    (GuardCore::new(&config).unwrap(), audit)
+    GuardCore::new(&config)
 }
 
 fn peer() -> SocketAddr {
@@ -242,4 +249,39 @@ fn a_bad_nonce_is_refused_and_recorded() {
         GatewayDecision::Refuse(403, "ticket")
     );
     assert_eq!(verify_config_file(&audit).unwrap().records.len(), 2);
+}
+
+#[test]
+fn a_restart_keeps_the_used_nonces() {
+    let fixture = fixture(60);
+    let (first, audit) = core(&fixture, "restart");
+    let at = after(&fixture, 1000);
+    first.apply_deny(EMPTY_DENY, at).unwrap();
+    let bytes = sealed(&fixture, "api", "GET", "/api/items", 1, at);
+    assert!(matches!(
+        decide(&first, &bytes, at),
+        GatewayDecision::Forward(_, _)
+    ));
+    drop(first);
+    // A new process reads the use records from the chain.
+    let second = open_core(&fixture, &audit).unwrap();
+    assert_eq!(second.seen_count(), 1);
+    let later = after(&fixture, 5000);
+    second.apply_deny(EMPTY_DENY, later).unwrap();
+    assert_eq!(
+        decide(&second, &bytes, later),
+        GatewayDecision::Refuse(403, "replay")
+    );
+    // A new nonce still works.
+    let fresh = sealed(&fixture, "api", "GET", "/api/items", 2, later);
+    assert!(matches!(
+        decide(&second, &fresh, later),
+        GatewayDecision::Forward(_, _)
+    ));
+    drop(second);
+    assert!(verify_config_file(&audit).is_ok());
+    // A changed chain stops the start.
+    let text = std::fs::read_to_string(&audit).unwrap();
+    std::fs::write(&audit, text.replacen("agent-use", "agent-deny", 1)).unwrap();
+    assert!(open_core(&fixture, &audit).is_err());
 }
