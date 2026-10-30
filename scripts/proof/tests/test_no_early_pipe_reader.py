@@ -224,7 +224,9 @@ class ProofHardeningTest(unittest.TestCase):
                     lines = f.read().split("\n")
                 take = [i for i, l in enumerate(lines) if re.match(r"\s*proof_lock_take ", l)]
                 self.assertTrue(take, "no proof_lock_take")
+                self.assertEqual(lines[take[0]], lines[take[0]].lstrip(), "proof_lock_take is indented")
                 in_function = False
+                depth = 0
                 for i, l in enumerate(lines[: take[0]]):
                     s = l.strip()
                     if re.match(r"^[a-z_][a-z0-9_]*\(\) \{", l):
@@ -235,8 +237,17 @@ class ProofHardeningTest(unittest.TestCase):
                         continue
                     if s.startswith("#"):
                         continue
-                    self.assertIsNone(re.match(r"(docker|dc|cargo|compose)\b", s),
+                    # The lock must not be inside an if, a loop, or a case.
+                    # A line that ends with ":" is Python code in a string, not shell.
+                    if s.endswith(":"):
+                        continue
+                    if re.match(r"(if|for|while|until|case)\b", s) and not re.search(r"\b(fi|done|esac)$", s):
+                        depth += 1
+                    elif re.match(r"(fi|done|esac)\b", s):
+                        depth -= 1
+                    self.assertIsNone(re.match(r"(docker|dc|cargo|compose|iptables\S*|ip|sudo|as_root)\b", s),
                                       "line %d runs before the lock: %s" % (i + 1, s))
+                self.assertEqual(depth, 0, "proof_lock_take is inside an if, a loop, or a case")
 
     @unittest.skipIf(os.geteuid() == 0, "the test runs as root")
     def test_a_root_proof_without_root_stops_in_one_second(self):
