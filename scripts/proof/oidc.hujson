@@ -1,0 +1,11 @@
+{
+  // The OIDC laptop may send UDP to node srv.
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/laptop"],
+      "proto": "udp",
+      "dst": ["spiffe://orblx.local/node/srv:*"]
+    }
+  ]
+}

@@ -3,6 +3,7 @@
 //! The trust domain is `orblx.local`.
 //! A human SVID is `spiffe://orblx.local/user/{oidc_sub}`.
 //! City Breeze uses a Google ID token.
+//! `OidcIssuer` and `OidcJwks` check an ID token from a generic issuer with `RS256` or `ES256`.
 //! The Google subject is the SPIFFE user name.
 //! `MockOidc` remains for CI and the harness when `ORBLX_OIDC_MODE=mock`.
 //! An agent SVID is `spiffe://orblx.local/agent/{id}`.
@@ -33,6 +34,7 @@ mod codec;
 mod deny;
 mod error;
 mod google;
+mod issuer;
 mod oidc;
 mod policy;
 mod spiffe;
@@ -52,6 +54,7 @@ pub use google::{
     GOOGLE_JWKS_URL, GOOGLE_REDIRECT_LOCALHOST, GOOGLE_REDIRECT_LOOPBACK, GOOGLE_TOKEN_ENDPOINT,
     OIDC_MODE_ENV,
 };
+pub use issuer::{token_kid, OidcIdClaims, OidcIssuer, OidcJwks, OidcReject, DISCOVERY_PATH};
 pub use oidc::{AgentSvid, IssueGate, MockOidc, MOCK_OIDC_ISSUER, OIDC_AUDIENCE};
 pub use policy::{
     Policy, PolicyAssertion, PolicyError, ReceiverGrant, ReceiverGrants, SshAssertion,

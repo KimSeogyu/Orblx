@@ -13,11 +13,14 @@
 
 mod admin;
 mod client;
+mod config;
 mod error;
 
 mod files;
 mod http_util;
 mod ippool;
+#[cfg(test)]
+mod issuer_test;
 mod netmap;
 mod proto;
 #[cfg(test)]
@@ -34,6 +37,7 @@ pub use client::{
     enroll_with_token_blocking, fetch_deny_blocking, fetch_netmap_blocking, netmap_json,
     publish_candidates_blocking, renew_svid_blocking, OidcEnroll,
 };
+pub use config::{CoordConfig, OidcSection};
 pub use error::CoordError;
 pub use http_util::{fetch_google_jwks_blocking, post_google_token_blocking};
 pub use netmap::{
@@ -42,8 +46,8 @@ pub use netmap::{
 };
 pub use server::serve_blocking;
 pub use state::{
-    oidc_config, read_node_material, Coordinator, EnrollResult, NetmapView, OidcConfig,
-    CONFIG_AUDIT_FILE,
+    oidc_config, read_node_material, Coordinator, EnrollResult, IssuerFetch, NetmapView,
+    OidcConfig, CONFIG_AUDIT_FILE, ISSUER_JWKS_TTL_SECS, ISSUER_REFETCH_SECS,
 };
 pub use store::CreatedToken;
 

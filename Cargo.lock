@@ -1646,6 +1646,7 @@ dependencies = [
  "orblx-datapath",
  "orblx-edge",
  "orblx-identity",
+ "orblx-test-idp",
  "quinn",
  "rand 0.8.8",
  "rustls",
@@ -1717,6 +1718,7 @@ dependencies = [
  "base64",
  "ed25519-dalek 2.2.0",
  "jsonwebtoken",
+ "orblx-test-idp",
  "rand 0.8.8",
  "rcgen",
  "rsa",
@@ -1771,6 +1773,23 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+]
+
+[[package]]
+name = "orblx-test-idp"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "jsonwebtoken",
+ "rand 0.8.8",
+ "rcgen",
+ "rsa",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
