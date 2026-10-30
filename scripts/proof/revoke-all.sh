@@ -68,6 +68,10 @@ cleanup() {
 . "$PROOF_LIB_DIR/proof-lock.sh"
 trap 'cleanup; proof_lock_end' EXIT
 proof_lock_take "revoke-all"
+# W25-14b: start from a clean compose state (all profiles, all volumes).
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
+proof_compose_clean "orblx-w24d-revoke-all" || exit 1
 
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
