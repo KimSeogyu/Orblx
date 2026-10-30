@@ -46,6 +46,7 @@ pub const SCOPES: &[(&str, &str)] = &[
     ("admin-approve", "nodes:write"),
     ("admin-revoke", "nodes:write"),
     ("admin-revoke-all", "nodes:write"),
+    ("admin-revoke-undo", "nodes:write"),
     ("admin-expire", "nodes:write"),
     ("admin-grants", "grants:read"),
     ("admin-grant-approve", "grants:write"),

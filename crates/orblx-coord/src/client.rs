@@ -33,6 +33,7 @@ pub async fn enroll_with_token(
         exit_node: false,
         grant: None,
         api_token: None,
+        deny_etag: None,
         expect_sha256: None,
     };
     round_trip(coord, coord_name, bundle_pem, None, request, None, true).await
@@ -87,6 +88,7 @@ pub async fn enroll_with_oidc(input: OidcEnroll<'_>) -> Result<EnrollResult, Coo
         exit_node: false,
         grant: None,
         api_token: None,
+        deny_etag: None,
         expect_sha256: None,
     };
     round_trip(
@@ -145,6 +147,7 @@ pub async fn advertise_routes(
         exit_node: false,
         grant: None,
         api_token: None,
+        deny_etag: None,
         expect_sha256: None,
     };
     let result = round_trip(
@@ -181,6 +184,7 @@ pub async fn fetch_netmap(
         exit_node: false,
         grant: None,
         api_token: None,
+        deny_etag: None,
         expect_sha256: None,
     };
     let result = round_trip(
@@ -233,6 +237,7 @@ pub async fn renew_svid(
         exit_node: false,
         grant: None,
         api_token: None,
+        deny_etag: None,
         expect_sha256: None,
     };
     let result = round_trip(
@@ -298,6 +303,7 @@ pub async fn publish_candidates(
         exit_node: false,
         grant: None,
         api_token: None,
+        deny_etag: None,
         expect_sha256: None,
     };
     let result = round_trip(
@@ -351,6 +357,7 @@ pub async fn advertise_exit(
         exit_node: enabled,
         grant: None,
         api_token: None,
+        deny_etag: None,
         expect_sha256: None,
     };
     let result = round_trip(
@@ -443,6 +450,7 @@ pub fn admin_token_expect_blocking(
             exit_node: false,
             grant: None,
             api_token: Some(api_token.to_string()),
+            deny_etag: None,
             expect_sha256: expect.map(str::to_string),
         };
         let endpoint =
@@ -482,6 +490,49 @@ pub fn fetch_deny_blocking(
     block_on(fetch_deny(coord, coord_name, bundle_pem, state_dir))
 }
 
+/// Wait for a new deny list of this node (W25-2).
+///
+/// The coordinator replies at once when the ETag of its deny list for this node is not
+/// `etag`. Otherwise it holds the request until the list changes, or for at most
+/// [`DENY_WAIT_HOLD`]. The function stops after the hold time plus 10 s.
+/// An old coordinator does not know the op and returns an error. Then use
+/// [`fetch_deny_blocking`].
+pub fn fetch_deny_wait_blocking(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+    etag: Option<&str>,
+) -> Result<String, CoordError> {
+    block_on(async {
+        let material = read_node_material(state_dir)?;
+        let request = Request {
+            op: "deny-wait".to_string(),
+            name: material.name.clone(),
+            token: None,
+            id_token: None,
+            nonce: None,
+            endpoints: Vec::new(),
+            routes: Vec::new(),
+            exit_node: false,
+            grant: None,
+            api_token: None,
+            deny_etag: etag.map(str::to_string),
+            expect_sha256: None,
+        };
+        let limit = DENY_WAIT_HOLD + std::time::Duration::from_secs(10);
+        tokio::time::timeout(
+            limit,
+            authed_detail(coord, coord_name, bundle_pem, material, request),
+        )
+        .await
+        .map_err(|_| CoordError::Tls("The deny wait timed out.".to_string()))?
+    })
+}
+
+/// The longest time that the coordinator holds one `deny-wait` request.
+pub const DENY_WAIT_HOLD: std::time::Duration = std::time::Duration::from_secs(20);
+
 async fn admin_call(
     coord: SocketAddr,
     coord_name: &str,
@@ -502,6 +553,7 @@ async fn admin_call(
         exit_node: false,
         grant: None,
         api_token: None,
+        deny_etag: None,
         expect_sha256: None,
     };
     authed_detail(coord, coord_name, bundle_pem, material, request).await
@@ -525,6 +577,7 @@ async fn fetch_deny(
         exit_node: false,
         grant: None,
         api_token: None,
+        deny_etag: None,
         expect_sha256: None,
     };
     authed_detail(coord, coord_name, bundle_pem, material, request).await
@@ -606,6 +659,7 @@ pub fn agent_grant_request_blocking(
             exit_node: false,
             grant: Some(ask),
             api_token: None,
+            deny_etag: None,
             expect_sha256: None,
         };
         authed_detail(coord, coord_name, bundle_pem, material, request).await
@@ -652,6 +706,7 @@ pub fn agent_grant_fetch_blocking(
             exit_node: false,
             grant: None,
             api_token: None,
+            deny_etag: None,
             expect_sha256: None,
         };
         let response = authed_response(coord, coord_name, bundle_pem, material, request).await?;
