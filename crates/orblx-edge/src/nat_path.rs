@@ -2,10 +2,14 @@
 //!
 //! The session id and the send counter stay in place when the path changes.
 //! Direct and relay carry the same sealed frames.
+//! The hello frame carries the X.509-SVID of the sender.
+//! The receiver checks the SVID against the trust bundle before it uses the key.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
+use orblx_identity::{leaf_ed25519_public_key, leaf_not_after, DenySet, TrustBundle};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -33,12 +37,33 @@ impl OverlayPath {
 }
 
 /// Silence that moves an active direct path to relay.
-pub const STALE_MS: u64 = 350;
+///
+/// Each path sends a probe each 100 ms.
+/// Three lost probes in a row make the path stale.
+pub const STALE_MS: u64 = 300;
+
+/// The time between two probes on one path.
+pub const PROBE_GAP_MS: u64 = 100;
+
+/// After a move from relay to direct, the node sends each frame on both paths for this time.
+///
+/// The old path stays up until the new path carries traffic.
+pub const OVERLAP_MS: u64 = 600;
+
+/// After a move from direct to relay, the node sends again the frames from this window.
+///
+/// The receiver drops a copy that it already opened.
+pub const RESEND_MS: u64 = STALE_MS + 2 * PROBE_GAP_MS;
+
+/// The probe flag that tells the peer: "I receive your probes on this path."
+pub const PROBE_HEARS: u8 = 1;
 
 /// The wait after a move to relay before a direct upgrade.
 pub const RELAY_HOLD_MS: u64 = 1_000;
 
-/// Plain hello. The payload is one X25519 public key.
+/// Signed hello.
+///
+/// The payload is the X25519 public key, an Ed25519 signature, and the leaf SVID DER.
 pub const KIND_HELLO: u8 = 1;
 /// Encrypted probe. The frame does not enter the TUN device.
 pub const KIND_PROBE: u8 = 2;
@@ -48,6 +73,9 @@ pub const KIND_DATA: u8 = 3;
 const MAGIC: &[u8; 8] = b"ORBLXNAT";
 const VERSION: u8 = 1;
 const HEADER: usize = 26;
+const HELLO_CONTEXT: &[u8] = b"orblx-nat-hello-v1\n";
+const HELLO_FIXED: usize = 32 + 64;
+const HELLO_DER_MAX: usize = 2048;
 
 /// The path choice for one overlay session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -56,6 +84,52 @@ pub struct PathSelect {
     pub current: Option<OverlayPath>,
     /// Direct stays idle until this monotonic time.
     pub relay_hold_until_ms: u64,
+    /// The relay also carries each frame until this monotonic time.
+    pub overlap_until_ms: u64,
+}
+
+/// The paths that get one sealed frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendPlan {
+    /// No path is up. The node holds the packet.
+    Hold,
+    /// Only the direct path.
+    Direct,
+    /// Only the relay path.
+    Relay,
+    /// The direct path and the relay path.
+    ///
+    /// The receiver opens the first copy and drops the second copy.
+    Both,
+}
+
+impl SendPlan {
+    /// Return true when the plan uses the direct path.
+    #[must_use]
+    pub const fn uses_direct(self) -> bool {
+        matches!(self, Self::Direct | Self::Both)
+    }
+
+    /// Return true when the plan uses the relay path.
+    #[must_use]
+    pub const fn uses_relay(self) -> bool {
+        matches!(self, Self::Relay | Self::Both)
+    }
+}
+
+impl PathSelect {
+    /// The send plan at `now_ms`.
+    ///
+    /// Make before break: after a move to direct, the relay also carries frames for [`OVERLAP_MS`].
+    #[must_use]
+    pub fn plan(&self, now_ms: u64) -> SendPlan {
+        match self.current {
+            None => SendPlan::Hold,
+            Some(OverlayPath::Relay) => SendPlan::Relay,
+            Some(OverlayPath::Direct) if now_ms < self.overlap_until_ms => SendPlan::Both,
+            Some(OverlayPath::Direct) => SendPlan::Direct,
+        }
+    }
 }
 
 /// Return true when the relay may carry TUN packets.
@@ -70,11 +144,12 @@ pub fn relay_allowed(saw_direct: bool, direct_ok: bool, budget_done: bool) -> bo
 
 /// Choose the path that carries the overlay session.
 ///
-/// `direct_ok` means a recent decrypted frame arrived on the direct path.
-/// `relay_ok` means a recent decrypted frame arrived on the relay path.
+/// `direct_ok` means recent probes went both ways on the direct path.
+/// `relay_ok` means recent probes went both ways on the relay path.
 /// `relay_allowed` is false during the first direct attempt.
 /// A move from direct to relay sets a hold.
 /// The hold keeps the session on relay until the hold time.
+/// A move from relay to direct starts an overlap window.
 /// The function does not change a session id.
 pub fn select_path(
     state: &mut PathSelect,
@@ -94,6 +169,9 @@ pub fn select_path(
             }
         }
         Some(OverlayPath::Relay) if direct_ok && now_ms >= state.relay_hold_until_ms => {
+            if relay_ok {
+                state.overlap_until_ms = now_ms.saturating_add(OVERLAP_MS);
+            }
             Some(OverlayPath::Direct)
         }
         Some(OverlayPath::Relay) if relay_ok || !direct_ok => Some(OverlayPath::Relay),
@@ -146,13 +224,50 @@ fn valid_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
-/// Build a hello frame.
-#[must_use]
-pub fn encode_hello(session: &[u8; 16], public_key: &[u8; 32]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(HEADER + 32);
-    push_header(&mut frame, KIND_HELLO, session);
-    frame.extend_from_slice(public_key);
-    frame
+fn hello_message(session: &[u8; 16], public_key: &[u8; 32]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(HELLO_CONTEXT.len() + 48);
+    message.extend_from_slice(HELLO_CONTEXT);
+    message.extend_from_slice(session);
+    message.extend_from_slice(public_key);
+    message
+}
+
+/// The SVID material that signs and checks a hello.
+///
+/// The value does not print the signing key.
+pub struct HelloAuth {
+    /// The local leaf SVID DER.
+    pub cert_der: Vec<u8>,
+    /// The local leaf SVID key.
+    pub signing: SigningKey,
+    /// The trust bundle that issued the peer SVID.
+    pub bundle: TrustBundle,
+    /// The SPIFFE ID that the peer SVID must contain.
+    pub peer_svid: String,
+}
+
+impl HelloAuth {
+    /// Build the material from the leaf DER and the Ed25519 seed of the leaf key.
+    ///
+    /// The caller must not log the seed.
+    #[must_use]
+    pub fn new(cert_der: Vec<u8>, seed: &[u8; 32], bundle: TrustBundle, peer_svid: &str) -> Self {
+        Self {
+            cert_der,
+            signing: SigningKey::from_bytes(seed),
+            bundle,
+            peer_svid: peer_svid.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Debug for HelloAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HelloAuth")
+            .field("peer_svid", &self.peer_svid)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One result from a frame.
@@ -160,8 +275,8 @@ pub fn encode_hello(session: &[u8; 16], public_key: &[u8; 32]) -> Vec<u8> {
 pub enum Opened {
     /// The peer public key is stored.
     Hello,
-    /// A probe opened.
-    Probe,
+    /// A probe opened. The value is the probe flag byte.
+    Probe(u8),
     /// One IPv4 packet.
     Data(Vec<u8>),
 }
@@ -176,7 +291,9 @@ pub struct KeyGate {
     peer_name: String,
     secret: StaticSecret,
     public_key: [u8; 32],
+    auth: HelloAuth,
     peer_public: Option<[u8; 32]>,
+    peer_not_after: Option<u64>,
     key: Option<[u8; 32]>,
     send_counter: u64,
     replay: Replay,
@@ -194,10 +311,13 @@ impl std::fmt::Debug for KeyGate {
 
 impl KeyGate {
     /// Draw an X25519 key for this session.
+    ///
+    /// `auth` signs the local hello and checks the peer hello.
     pub fn generate(
         session: [u8; 16],
         local_name: &str,
         peer_name: &str,
+        auth: HelloAuth,
     ) -> Result<Self, EdgeError> {
         if !valid_name(local_name) || !valid_name(peer_name) {
             return Err(EdgeError::BadCandidate);
@@ -212,17 +332,68 @@ impl KeyGate {
             peer_name: peer_name.to_string(),
             secret,
             public_key,
+            auth,
             peer_public: None,
+            peer_not_after: None,
             key: None,
             send_counter: 0,
             replay: Replay::default(),
         })
     }
 
-    /// The local X25519 public key.
+    /// The signed hello frame for this session.
     #[must_use]
-    pub fn public_key(&self) -> [u8; 32] {
-        self.public_key
+    pub fn hello_frame(&self) -> Vec<u8> {
+        let signature = self
+            .auth
+            .signing
+            .sign(&hello_message(&self.session, &self.public_key));
+        let mut frame = Vec::with_capacity(HEADER + HELLO_FIXED + self.auth.cert_der.len());
+        push_header(&mut frame, KIND_HELLO, &self.session);
+        frame.extend_from_slice(&self.public_key);
+        frame.extend_from_slice(&signature.to_bytes());
+        frame.extend_from_slice(&self.auth.cert_der);
+        frame
+    }
+
+    /// The `not_after` time of the peer SVID as Unix seconds.
+    ///
+    /// The value is `None` until a signed peer hello is checked.
+    #[must_use]
+    pub fn peer_not_after(&self) -> Option<u64> {
+        self.peer_not_after
+    }
+
+    fn check_hello(&mut self, body: &[u8]) -> Result<[u8; 32], EdgeError> {
+        if body.len() <= HELLO_FIXED || body.len() > HELLO_FIXED + HELLO_DER_MAX {
+            return Err(hello_error());
+        }
+        let mut peer = [0u8; 32];
+        peer.copy_from_slice(&body[..32]);
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&body[32..HELLO_FIXED]);
+        let der = &body[HELLO_FIXED..];
+        if self.peer_public == Some(peer) && self.peer_not_after.is_some() {
+            return Ok(peer);
+        }
+        let id = self
+            .auth
+            .bundle
+            .authenticate_leaf(der, std::time::SystemTime::now(), &DenySet::empty())
+            .map_err(|_| hello_error())?;
+        if id.as_uri() != self.auth.peer_svid {
+            return Err(hello_error());
+        }
+        let leaf_key = leaf_ed25519_public_key(der).map_err(|_| hello_error())?;
+        let verifying = VerifyingKey::from_bytes(&leaf_key).map_err(|_| hello_error())?;
+        verifying
+            .verify_strict(
+                &hello_message(&self.session, &peer),
+                &Signature::from_bytes(&signature),
+            )
+            .map_err(|_| hello_error())?;
+        self.peer_not_after = Some(leaf_not_after(der).map_err(|_| hello_error())?);
+        Ok(peer)
     }
 
     /// The session id.
@@ -246,7 +417,7 @@ impl KeyGate {
     /// Store the peer public key and derive the session key.
     ///
     /// The same public key does not reset the send counter.
-    pub fn absorb_peer(&mut self, peer: &[u8; 32]) -> Result<(), EdgeError> {
+    fn absorb_peer(&mut self, peer: &[u8; 32]) -> Result<(), EdgeError> {
         if self.peer_public.as_ref() == Some(peer) {
             return Ok(());
         }
@@ -293,11 +464,7 @@ impl KeyGate {
         }
         match parsed.kind {
             KIND_HELLO => {
-                if parsed.body.len() != 32 {
-                    return Err(EdgeError::BadCandidate);
-                }
-                let mut peer = [0u8; 32];
-                peer.copy_from_slice(&parsed.body);
+                let peer = self.check_hello(&parsed.body)?;
                 self.absorb_peer(&peer)?;
                 Ok(Some(Opened::Hello))
             }
@@ -320,7 +487,7 @@ impl KeyGate {
                     return Ok(None);
                 }
                 if parsed.kind == KIND_PROBE {
-                    Ok(Some(Opened::Probe))
+                    Ok(Some(Opened::Probe(plain.first().copied().unwrap_or(0))))
                 } else {
                     Ok(Some(Opened::Data(plain)))
                 }
@@ -328,6 +495,10 @@ impl KeyGate {
             _ => Err(EdgeError::BadCandidate),
         }
     }
+}
+
+fn hello_error() -> EdgeError {
+    EdgeError::Identity("The peer hello is not valid.".to_string())
 }
 
 struct ParsedFrame {
@@ -475,21 +646,66 @@ impl Replay {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use ed25519_dalek::SigningKey;
+    use orblx_identity::{ed25519_seed_from_private_pem, DenySet, MiniCa, SpiffeId, TrustBundle};
+
     use super::{
-        encode_hello, select_path, session_id, KeyGate, Opened, OverlayPath, PathSelect, KIND_DATA,
-        KIND_PROBE, RELAY_HOLD_MS,
+        relay_allowed, select_path, session_id, HelloAuth, KeyGate, Opened, OverlayPath,
+        PathSelect, SendPlan, KIND_DATA, KIND_PROBE, OVERLAP_MS, RELAY_HOLD_MS,
     };
 
+    struct Lab {
+        ca: MiniCa,
+    }
+
+    impl Lab {
+        fn new() -> Self {
+            Self {
+                ca: MiniCa::generate(SystemTime::now()).unwrap(),
+            }
+        }
+
+        fn auth(&self, local: &str, peer: &str) -> (HelloAuth, u64) {
+            let issued = self
+                .ca
+                .issue(
+                    &SpiffeId::node(local).unwrap(),
+                    SystemTime::now(),
+                    Duration::from_secs(600),
+                    &DenySet::empty(),
+                )
+                .unwrap();
+            let seed = ed25519_seed_from_private_pem(&issued.private_key_pem).unwrap();
+            let auth = HelloAuth {
+                cert_der: issued.certificate_der.clone(),
+                signing: SigningKey::from_bytes(&seed),
+                bundle: TrustBundle::from_pem(self.ca.trust_bundle_pem()).unwrap(),
+                peer_svid: SpiffeId::node(peer).unwrap().as_uri().to_string(),
+            };
+            (auth, issued.not_after)
+        }
+    }
+
+    fn gate(lab: &Lab, local: &str, peer: &str) -> (KeyGate, u64) {
+        let id = session_id(local, peer).unwrap();
+        let (auth, not_after) = lab.auth(local, peer);
+        (KeyGate::generate(id, local, peer, auth).unwrap(), not_after)
+    }
+
     fn pair() -> (KeyGate, KeyGate) {
-        let id = session_id("node-x", "node-z").unwrap();
-        let mut left = KeyGate::generate(id, "node-x", "node-z").unwrap();
-        let mut right = KeyGate::generate(id, "node-z", "node-x").unwrap();
-        let hello_left = encode_hello(&id, &left.public_key());
-        let hello_right = encode_hello(&id, &right.public_key());
+        let lab = Lab::new();
+        let (mut left, left_expiry) = gate(&lab, "node-x", "node-z");
+        let (mut right, right_expiry) = gate(&lab, "node-z", "node-x");
+        let hello_left = left.hello_frame();
+        let hello_right = right.hello_frame();
         assert_eq!(right.open_frame(&hello_left).unwrap(), Some(Opened::Hello));
         assert_eq!(left.open_frame(&hello_right).unwrap(), Some(Opened::Hello));
         assert!(left.ready());
         assert!(right.ready());
+        assert_eq!(left.peer_not_after(), Some(right_expiry));
+        assert_eq!(right.peer_not_after(), Some(left_expiry));
         (left, right)
     }
 
@@ -499,6 +715,41 @@ mod tests {
         let right = session_id("node-z", "node-x").unwrap();
         assert_eq!(left, right);
         assert!(session_id("node-x", "node-x").is_err());
+    }
+
+    #[test]
+    fn hello_from_the_wrong_svid_is_rejected() {
+        let lab = Lab::new();
+        let (mut right, _) = gate(&lab, "node-z", "node-x");
+        // node-y signs a valid hello, but node-z expects node-x.
+        let id = session_id("node-x", "node-z").unwrap();
+        let (auth, _) = lab.auth("node-y", "node-z");
+        let impostor = KeyGate::generate(id, "node-x", "node-z", auth).unwrap();
+        assert!(right.open_frame(&impostor.hello_frame()).is_err());
+        assert!(!right.ready());
+        assert_eq!(right.peer_not_after(), None);
+    }
+
+    #[test]
+    fn hello_from_another_ca_is_rejected() {
+        let lab = Lab::new();
+        let other = Lab::new();
+        let (mut right, _) = gate(&lab, "node-z", "node-x");
+        let (left, _) = gate(&other, "node-x", "node-z");
+        assert!(right.open_frame(&left.hello_frame()).is_err());
+        assert!(!right.ready());
+    }
+
+    #[test]
+    fn hello_with_a_changed_key_is_rejected() {
+        let lab = Lab::new();
+        let (mut right, _) = gate(&lab, "node-z", "node-x");
+        let (left, _) = gate(&lab, "node-x", "node-z");
+        let mut hello = left.hello_frame();
+        // Change one byte of the X25519 key. The signature no longer matches.
+        hello[26] ^= 1;
+        assert!(right.open_frame(&hello).is_err());
+        assert!(!right.ready());
     }
 
     #[test]
@@ -513,14 +764,14 @@ mod tests {
         let path = select_path(&mut select, false, true, true, 100);
         assert_eq!(path, Some(OverlayPath::Relay));
         assert_eq!(select.relay_hold_until_ms, 100 + RELAY_HOLD_MS);
-        let second = left.seal(KIND_PROBE, b"p").unwrap();
+        let second = left.seal(KIND_PROBE, &[1]).unwrap();
         assert_eq!(left.session(), id);
         assert_eq!(left.send_counter(), counter + 1);
         assert_eq!(
             right.open_frame(&first).unwrap(),
             Some(Opened::Data(b"one".to_vec()))
         );
-        assert_eq!(right.open_frame(&second).unwrap(), Some(Opened::Probe));
+        assert_eq!(right.open_frame(&second).unwrap(), Some(Opened::Probe(1)));
         assert_eq!(right.open_frame(&first).unwrap(), None);
         let held = select_path(&mut select, true, true, true, 200);
         assert_eq!(held, Some(OverlayPath::Relay));
@@ -535,6 +786,45 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_to_direct_keeps_the_relay_for_the_overlap() {
+        let mut select = PathSelect {
+            current: Some(OverlayPath::Relay),
+            ..PathSelect::default()
+        };
+        assert_eq!(select.plan(0), SendPlan::Relay);
+        let now = 5_000;
+        assert_eq!(
+            select_path(&mut select, true, true, true, now),
+            Some(OverlayPath::Direct)
+        );
+        assert_eq!(select.plan(now), SendPlan::Both);
+        assert_eq!(select.plan(now + OVERLAP_MS - 1), SendPlan::Both);
+        assert_eq!(select.plan(now + OVERLAP_MS), SendPlan::Direct);
+        assert!(SendPlan::Both.uses_direct() && SendPlan::Both.uses_relay());
+        assert_eq!(PathSelect::default().plan(0), SendPlan::Hold);
+    }
+
+    #[test]
+    fn a_copy_on_the_second_path_is_dropped() {
+        let (mut left, mut right) = pair();
+        let frame = left.seal(KIND_DATA, b"ping").unwrap();
+        assert_eq!(
+            right.open_frame(&frame).unwrap(),
+            Some(Opened::Data(b"ping".to_vec()))
+        );
+        // The same frame on the second path is a replay.
+        assert_eq!(right.open_frame(&frame).unwrap(), None);
+        // A late frame that the receiver did not open is still accepted.
+        let late = left.seal(KIND_DATA, b"late").unwrap();
+        let next = left.seal(KIND_DATA, b"next").unwrap();
+        assert!(right.open_frame(&next).unwrap().is_some());
+        assert_eq!(
+            right.open_frame(&late).unwrap(),
+            Some(Opened::Data(b"late".to_vec()))
+        );
+    }
+
+    #[test]
     fn relay_stays_down_until_the_direct_budget_ends() {
         let mut select = PathSelect::default();
         assert_eq!(select_path(&mut select, false, true, false, 10), None);
@@ -546,7 +836,6 @@ mod tests {
 
     #[test]
     fn the_relay_waits_for_the_direct_attempt() {
-        use super::relay_allowed;
         assert!(!relay_allowed(false, false, false));
         assert!(relay_allowed(false, false, true));
         assert!(!relay_allowed(true, true, true));

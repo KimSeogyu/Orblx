@@ -74,6 +74,13 @@ pub fn ed25519_public_key_from_certificate_pem(pem: &str) -> Result<[u8; 32], Id
     let der = decode_certificate_pem(pem)?;
     cert::certificate_ed25519_public_key(&der)
 }
+/// Return the Ed25519 public key from a leaf certificate DER.
+///
+/// The function does not check the certificate chain.
+/// Call `TrustBundle::authenticate_leaf` first.
+pub fn leaf_ed25519_public_key(der: &[u8]) -> Result<[u8; 32], IdentityError> {
+    cert::certificate_ed25519_public_key(der)
+}
 pub use spiffe::{SpiffeId, WorkloadKind, TRUST_DOMAIN};
 pub use ticket::{
     allow_agent_jit, sign_agent_jit_ticket, sign_ticket, ticket_hash, verify_ticket,
