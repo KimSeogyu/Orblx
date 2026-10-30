@@ -536,6 +536,83 @@ mod tests {
         handle.abort();
     }
 
+    /// W25-16: after each change, the cached view of each node is the view that a new
+    /// signature gives. A coordinator with no cache on the same state is the reference.
+    /// So the cache never serves a view that is older than its inputs.
+    #[test]
+    fn each_change_gives_the_view_of_a_new_signature() {
+        let scratch = Scratch::new();
+        let now = SystemTime::now();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let names = ["diff-a", "diff-b", "diff-c"];
+        for name in names {
+            let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+            coord
+                .enroll_token(name, &token.secret, &[format!("{name}:443")], &[], now)
+                .unwrap();
+        }
+        let policy_path = scratch.0.join("policy.hujson");
+        let routes_policy = r#"{
+          "tags": {
+            "tag:router": ["spiffe://orblx.local/node/diff-b"],
+            "tag:exit": ["spiffe://orblx.local/node/diff-c"]
+          },
+          "tagOwners": {
+            "tag:router": ["spiffe://orblx.local/node/diff-a"],
+            "tag:exit": ["spiffe://orblx.local/node/diff-a"]
+          },
+          "acls": [{"action": "accept", "src": ["spiffe://orblx.local/node/diff-b"],
+            "proto": "tcp", "dst": ["spiffe://orblx.local/node/diff-a:22"]}],
+          "autoApprovers": {
+            "routes": {"10.9.0.0/24": ["tag:router"]},
+            "exitNode": ["tag:exit"]
+          }
+        }"#;
+        let check = |step: &str, seen: &mut Vec<[u8; 32]>| {
+            let reference = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+            for name in names {
+                let cached = coord.netmap_cached(name).unwrap();
+                let fresh = reference.netmap_cached(name).unwrap();
+                assert_eq!(
+                    cached.digest, fresh.digest,
+                    "step {step}: the cached view of {name} is not the new view"
+                );
+                assert_eq!(
+                    serde_json::to_vec(&cached.view.signed_netmap).unwrap(),
+                    serde_json::to_vec(&fresh.view.signed_netmap).unwrap(),
+                    "step {step}: the netmap signature of {name} is old"
+                );
+            }
+            seen.push(coord.netmap_cached("diff-a").unwrap().digest);
+        };
+        let mut seen = Vec::new();
+        check("start", &mut seen);
+        coord
+            .set_candidates("diff-b", &["diff-b:444".to_string()])
+            .unwrap();
+        check("endpoint", &mut seen);
+        fs::write(&policy_path, routes_policy).unwrap();
+        check("policy", &mut seen);
+        coord
+            .advertise_routes("diff-b", &["10.9.0.0/24".to_string()])
+            .unwrap();
+        check("routes", &mut seen);
+        coord.advertise_exit("diff-c", true).unwrap();
+        check("exit", &mut seen);
+        coord.expire_node("diff-c").unwrap();
+        check("expire", &mut seen);
+        let nodes = scratch.0.join("nodes.json");
+        let text = fs::read_to_string(&nodes).unwrap();
+        fs::write(&nodes, text.replace("diff-b:444", "diff-b:445")).unwrap();
+        check("outside edit", &mut seen);
+        fs::write(&policy_path, r#"{"acls": []}"#).unwrap();
+        check("policy again", &mut seen);
+        // Each step changed the view of diff-a, so each step gave a new signed view.
+        for (index, digest) in seen.iter().enumerate().skip(1) {
+            assert_ne!(*digest, seen[index - 1], "step {index} gave no new view");
+        }
+    }
+
     /// W25-16: the coordinator signs a view again only when an input changes.
     #[test]
     fn the_signed_view_cache_follows_the_node_store_and_the_policy() {
