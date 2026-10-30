@@ -67,6 +67,9 @@ struct UserRecord {
     first_unix: u64,
     #[serde(default)]
     changed_unix: u64,
+    /// The store migration approved this user and the config chain has no record yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    migration_unrecorded: bool,
 }
 
 /// One OIDC user (W25-15).
@@ -201,6 +204,7 @@ impl NodeStore {
                 email: None,
                 first_unix: node.enrolled_unix,
                 changed_unix: node.enrolled_unix,
+                migration_unrecorded: true,
             });
         }
         self.disk.users = Some(users);
@@ -259,6 +263,7 @@ impl NodeStore {
                 .map(str::to_string),
             first_unix: now_unix,
             changed_unix: now_unix,
+            migration_unrecorded: false,
         });
         self.persist()?;
         Ok(true)
@@ -285,6 +290,7 @@ impl NodeStore {
         if let Some(stored) = list.iter_mut().find(|stored| stored.user == user) {
             stored.state = state;
             stored.changed_unix = now_unix;
+            stored.migration_unrecorded = false;
         } else {
             if list.len() >= MAX_USERS {
                 return Err(CoordError::Protocol(
@@ -297,8 +303,35 @@ impl NodeStore {
                 email: None,
                 first_unix: now_unix,
                 changed_unix: now_unix,
+                migration_unrecorded: false,
             });
         }
+        self.persist()
+    }
+
+    /// The users that the store migration approved with no config record yet.
+    pub fn migration_unrecorded(&self) -> Vec<String> {
+        self.disk
+            .users
+            .iter()
+            .flatten()
+            .filter(|user| user.migration_unrecorded)
+            .map(|user| user.user.clone())
+            .collect()
+    }
+
+    /// Mark the migration record of `user` as written.
+    pub fn set_migration_recorded(&mut self, user: &str) -> Result<(), CoordError> {
+        let Some(stored) = self
+            .disk
+            .users
+            .iter_mut()
+            .flatten()
+            .find(|stored| stored.user == user)
+        else {
+            return Ok(());
+        };
+        stored.migration_unrecorded = false;
         self.persist()
     }
 

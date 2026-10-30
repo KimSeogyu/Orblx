@@ -778,6 +778,7 @@ impl Coordinator {
                 &sentence,
             )?;
         }
+        record_user_migration(&mut inner, &actor)?;
         Ok(())
     }
 
@@ -1093,6 +1094,10 @@ impl Coordinator {
 fn reload(inner: &mut Inner) -> Result<(), CoordError> {
     inner.store = NodeStore::open(&inner.state_dir.join(STORE_FILE))?;
     refresh_policy(inner);
+    if inner.audit.is_some() && !inner.store.migration_unrecorded().is_empty() {
+        let actor = coord_actor_of(inner)?;
+        record_user_migration(inner, &actor)?;
+    }
     Ok(())
 }
 
@@ -1770,6 +1775,27 @@ fn admit_user(inner: &mut Inner, login: &OidcLogin, now: SystemTime) -> Result<(
         println!("user refused {user} pending");
     }
     Err(CoordError::UserPending)
+}
+
+/// Write one `user-approve` record for each user that the store migration approved (W25-15).
+///
+/// The store migration runs when the store opens. When the chain is not open yet, the store
+/// keeps a mark, and the function runs again when the chain opens. Then each approval has a record.
+fn record_user_migration(inner: &mut Inner, actor: &str) -> Result<(), CoordError> {
+    for user in inner.store.migration_unrecorded() {
+        let after = user_digest(inner.store.user(&user).as_ref());
+        record(
+            inner,
+            actor,
+            ConfigAction::UserApprove,
+            &user,
+            EMPTY_DIGEST,
+            after,
+            "store migration",
+        )?;
+        inner.store.set_migration_recorded(&user)?;
+    }
+    Ok(())
 }
 
 /// Change one user state and write one config record (W25-15).

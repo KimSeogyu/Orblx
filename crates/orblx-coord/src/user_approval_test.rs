@@ -191,10 +191,14 @@ fn users_approved_before_the_change_still_enroll_with_no_action() {
         serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(migrated["users"][0]["user"], "oidc:alice");
     assert_eq!(migrated["users"][0]["state"], "approved");
+    // The migration approval has its own record.
+    assert_eq!(scratch.records().len(), records + 1, "one migration record");
+    assert_eq!(scratch.count(ConfigAction::UserApprove), 2);
+    assert!(migrated["users"][0].get("migration_unrecorded").is_none());
     enroll(&coord, "desk", &alice, now).unwrap();
     assert_eq!(
         scratch.records().len(),
-        records + 1,
+        records + 2,
         "only the enroll record"
     );
     // A user with no node in the old store is a new user.
@@ -203,6 +207,42 @@ fn users_approved_before_the_change_still_enroll_with_no_action() {
         enroll(&coord, "bob-pc", &bob, now),
         Err(CoordError::UserPending)
     ));
+}
+
+#[test]
+fn a_migration_before_the_chain_opens_is_recorded_when_the_chain_opens() {
+    let scratch = Scratch::new();
+    let now = SystemTime::now();
+    {
+        let (coord, oidc) = mock(&scratch, now);
+        let alice = id_token(&oidc, "alice", now);
+        coord.approve_user_by("oidc:alice", OWNER, now).unwrap();
+        enroll(&coord, "laptop", &alice, now).unwrap();
+    }
+    let path = scratch.0.join("nodes.json");
+    let mut disk: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    disk.as_object_mut().unwrap().remove("users").unwrap();
+    fs::write(&path, serde_json::to_string_pretty(&disk).unwrap()).unwrap();
+    let approvals = scratch.count(ConfigAction::UserApprove);
+
+    // The store opens with the chain closed: the migration keeps a mark and writes no record.
+    let oidc = MockOidc::generate(MOCK_OIDC_ISSUER).unwrap();
+    let gate = IssueGate::new(MiniCa::generate(now).unwrap(), &oidc).unwrap();
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::Mock(Box::new(gate))).unwrap();
+    let marked: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(marked["users"][0]["migration_unrecorded"], true);
+    assert_eq!(scratch.count(ConfigAction::UserApprove), approvals);
+
+    // The chain opens: exactly 1 record for the migrated user, and the mark goes away.
+    coord.enable_config_audit().unwrap();
+    assert_eq!(scratch.count(ConfigAction::UserApprove), approvals + 1);
+    let done: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(done["users"][0].get("migration_unrecorded").is_none());
+    assert_eq!(state_of(&coord, "oidc:alice"), Some(UserState::Approved));
+    assert_eq!(scratch.count(ConfigAction::UserApprove), approvals + 1);
 }
 
 #[test]

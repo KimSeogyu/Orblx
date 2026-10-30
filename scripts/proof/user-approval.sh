@@ -2,8 +2,8 @@
 # User approval proof (W25-15).
 # Phase M (migration): a coordinator from before W25-15 (OLD_ORBLX, [C] a main build with no
 #   user approval) enrolls owner and srv with tokens and mia-pc with an ID token of user mia.
-#   Then the script starts the new coordinator on the same store. mia is approved with no action:
-#   mia-pc works and mia enrolls a second node.
+#   Then the script starts the new coordinator on the same store. mia is approved with no action
+#   and 1 user-approve record (detail "store migration"): mia-pc works and mia enrolls a second node.
 # Gate 1: user nina (verified email in an allowed domain) enrolls. The coordinator refuses:
 #   no SVID, no node, and node srv counts 0 bytes from her container.
 # Gate 2: orblx admin users shows nina pending. user-reject rex keeps rex blocked.
@@ -289,6 +289,10 @@ dc logs coord 2>&1 | read_all grep -q "user migration approved 1"
 coord_file nodes.json | jq -c '.users'
 mig_state="$(coord_file nodes.json | jq -r '.users[] | select(.user == "oidc:mia") | .state')"
 [[ "$mig_state" == approved ]]
+# The migration approval writes 1 user-approve record when the chain opens.
+coord_file config-audit.jsonl | jq -c 'select(.action == "user-approve" and .target == "oidc:mia") | {action, actor, target, detail}'
+[[ "$(audit_count user-approve oidc:mia)" -eq 1 ]]
+coord_file nodes.json | jq -e '[.users[] | select(has("migration_unrecorded"))] | length == 0' >/dev/null
 # mia-tab uses a new ID token of the same subject mia.
 idp mint --dir /idp --kid rs1 --issuer "$ISSUER" --aud "$CLIENT" --out /tokens/mia-tab \
   --sub mia --email mia@example.test >/dev/null
@@ -330,7 +334,7 @@ expect_refused "nina-pc pending" "The user waits for owner approval." nina-pc ni
 expect_refused "nina-pc pending again" "The user waits for owner approval." nina-pc nina-pc nina "$STATE"
 nina_files="$(dc run --rm --no-deps --entrypoint sh nina-pc -c "ls -A $STATE | tr '\n' ' '")"
 echo "nina-pc state files: [${nina_files}]"
-if printf '%s' "$nina_files" | grep -q 'svid\|bundle.pem\|netmap'; then
+if printf '%s' "$nina_files" | read_all grep -q 'svid\|bundle.pem\|netmap'; then
   echo "The pending user has an SVID, a bundle, or a netmap." >&2
   exit 1
 fi
@@ -348,7 +352,7 @@ printf '%s\n' "$users_out" | read_all grep -qx 'users_pending 1'
 # The nina-pc container starts and waits for approval. It has no SVID, so it has no TUN.
 dc up -d nina-pc
 wait_log nina-pc "enroll pending:"
-dc logs nina-pc 2>&1 | grep "enroll pending" | head -n 1 | sed 's/^[^|]*| //' || true
+dc logs nina-pc 2>&1 | grep "enroll pending" | awk 'NR == 1' | sed 's/^[^|]*| //' || true
 copy_tools nina-pc
 dc exec -T nina-pc python3 /tmp/share-sink.py send "$srv_ip" 7070 65536 0.8 || true
 sleep 1
@@ -388,30 +392,67 @@ users_out="$(owner users)"
 printf '%s\n' "$users_out"
 user_line nina | read_all grep -q ' pending nodes 0$'
 user_line rex | read_all grep -q ' rejected nodes 0$'
+# The reach probe runs in the nina-pc container (no docker exec in the loop).
+# It tries one HTTP GET to srv:8080 each 50 ms and writes the Unix ms of the first HTTP 200.
+dc exec -T nina-pc sh -c "cat > /tmp/reach.py" <<'PY'
+import socket, sys, time
+host, port, secs, out = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+end = time.time() + secs
+tries = 0
+while time.time() < end:
+    tries += 1
+    try:
+        with socket.create_connection((host, port), timeout=0.3) as s:
+            s.settimeout(0.5)
+            s.sendall(b"GET / HTTP/1.0\r\n\r\n")
+            if s.recv(64).startswith(b"HTTP/1.0 200"):
+                open(out, "w").write(f"first_ok_unix_ms {int(time.time() * 1000)} tries {tries}\n")
+                sys.exit(0)
+    except OSError:
+        pass
+    time.sleep(0.05)
+open(out, "w").write(f"first_ok_unix_ms none tries {tries}\n")
+PY
+dc exec -d nina-pc python3 /tmp/reach.py "$srv_ip" 8080 60 /tmp/reach.out
+sleep 1
 before="$(records)"
 approve_ms="$(now_ms)"
 owner user-approve oidc:nina
 approve_done_ms="$(now_ms)"
-reach_ms=""
-for _ in $(seq 1 200); do
-  if dc exec -T nina-pc python3 /tmp/share-get.py "$srv_ip" 8080 0.3 >/dev/null 2>&1; then
-    reach_ms="$(( $(now_ms) - approve_ms ))"
-    break
-  fi
-  sleep 0.05
+reach_line=""
+for _ in $(seq 1 150); do
+  reach_line="$(dc exec -T nina-pc sh -c 'cat /tmp/reach.out 2>/dev/null || true')"
+  [[ -n "$reach_line" ]] && break
+  sleep 0.5
 done
+echo "reach_probe ${reach_line:-none}"
+first_ok="$(awk '{print $2}' <<<"$reach_line")"
+# The coordinator prints "admin user-approve" when it takes the request. Docker gives the log time.
+coord_ts="$(dc logs -t coord 2>&1 | grep 'admin user-approve' | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z' | tail -n 1 || true)"
+coord_approve_ms="none"
+[[ -n "$coord_ts" ]] && coord_approve_ms="$(date -d "$coord_ts" +%s%3N)"
+reach_ms=""
+reach_cmd_ms="none"
+if [[ "$first_ok" =~ ^[0-9]+$ ]]; then
+  reach_cmd_ms="$(( first_ok - approve_ms ))"
+  if [[ "$coord_approve_ms" =~ ^[0-9]+$ ]]; then
+    reach_ms="$(( first_ok - coord_approve_ms ))"
+  fi
+fi
+echo "coord_approve_after_cmd_start_ms $([[ "$coord_approve_ms" =~ ^[0-9]+$ ]] && echo $(( coord_approve_ms - approve_ms )) || echo none)"
+echo "approve_cmd_start_to_reach_ms ${reach_cmd_ms} (includes the docker run start of the admin CLI)"
 echo "approve_cmd_ms $(( approve_done_ms - approve_ms ))"
 dc logs nina-pc 2>&1 | grep -E "approval_wait_ms|enrolled|The TUN device" | sed 's/^[^|]*| //' || true
 wait_ms="$(dc logs nina-pc 2>&1 | awk '{for (i = 1; i < NF; i++) if ($i == "approval_wait_ms") print $(i + 1)}' | tail -n 1)"
 # approval_wait_ms counts from the start of the container. The Docker log time of that line
 # gives the time from the approve command to the end of the enroll (SVID written).
-svid_ts="$(dc logs -t nina-pc 2>&1 | grep 'approval_wait_ms' | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z' | head -n 1 || true)"
+svid_ts="$(dc logs -t nina-pc 2>&1 | grep 'approval_wait_ms' | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z' | awk 'NR == 1' || true)"
 svid_ms="none"
 if [[ -n "$svid_ts" ]]; then
-  svid_ms="$(( $(date -d "$svid_ts" +%s%3N) - approve_ms ))"
+  svid_ms="$(( $(date -d "$svid_ts" +%s%3N) - ${coord_approve_ms/none/$approve_ms} ))"
 fi
-echo "approve_to_svid_ms ${svid_ms} (Docker log time of the enroll result line)"
-echo "approve_to_reach_ms ${reach_ms:-none} limit_ms ${REACH_LIMIT_MS} (nina-pc -> srv:8080 HTTP 200; srv did not restart)"
+echo "approve_to_svid_ms ${svid_ms} (coordinator approve log time to the Docker log time of the enroll result line)"
+echo "approve_to_reach_ms ${reach_ms:-none} limit_ms ${REACH_LIMIT_MS} (coordinator approve log time to the first HTTP 200 nina-pc -> srv:8080; srv did not restart)"
 [[ "$(audit_count user-approve oidc:nina)" -eq 1 ]]
 has_node nina-pc
 users_out="$(owner users)"
@@ -437,7 +478,7 @@ jq -c 'select(.action == "user-approve" or .action == "user-reject") | {action, 
 n_approve="$(jq -s '[.[] | select(.action == "user-approve")] | length' "$WORK/config-audit.jsonl")"
 n_reject="$(jq -s '[.[] | select(.action == "user-reject")] | length' "$WORK/config-audit.jsonl")"
 echo "audit user_approve ${n_approve} user_reject ${n_reject}"
-[[ "$n_approve" -eq 3 && "$n_reject" -eq 1 ]]
+[[ "$n_approve" -eq 4 && "$n_reject" -eq 1 ]]
 audit_after="$(owner audit --verify)"
 printf '%s\n' "$audit_after" | grep '^verify '
 grep -q '^verify ok ' <<<"$audit_after"
@@ -466,7 +507,7 @@ hits="$(grep -cF 'PRIVATE KEY' "$WORK/all-logs.log" || true)"
 echo "secret_grep tokens 0 id_tokens ${id_tokens} 'PRIVATE KEY' ${hits}"
 [[ "$id_tokens" -eq 0 && "$hits" -eq 0 ]]
 
-echo "summary migration mia approved_with_no_action pending_bytes ${pending_bytes} approve_records 1 reject_records 1 owner_user_never_pending ok auto_default off approval_wait_ms ${wait_ms:-none} approve_to_svid_ms ${svid_ms} approve_to_reach_ms ${reach_ms:-none} limit_ms ${REACH_LIMIT_MS} coord_verify ok"
+echo "summary migration mia approved_with_no_action pending_bytes ${pending_bytes} approve_records 1 reject_records 1 owner_user_never_pending ok auto_default off approval_wait_ms ${wait_ms:-none} approve_to_svid_ms ${svid_ms} approve_to_reach_ms ${reach_ms:-none} approve_cmd_start_to_reach_ms ${reach_cmd_ms} limit_ms ${REACH_LIMIT_MS} coord_verify ok"
 if [[ -z "$reach_ms" ]] || (( reach_ms > REACH_LIMIT_MS )); then
   echo "nina-pc did not reach srv within ${REACH_LIMIT_MS} ms of the approve." >&2
   exit 1
