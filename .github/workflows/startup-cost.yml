@@ -62,7 +62,7 @@ jobs:
             fi
             wait "$load"
             load_code=$?
-            grep -hE '^late_peer |^orblx coord_call' "load${i}.log" | sed "s/^/startup_cost run ${i} /"
+            grep -h '^late_peer ' "load${i}.log" | sed "s/^/startup_cost run ${i} /"
             echo "=== startup_cost run ${i} end $(date -u +%FT%TZ) load_exit ${load_code} ==="
           done
           exit "$status"
