@@ -20,10 +20,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use orblx_datapath::{
-    format_node_status, is_ipv4_packet, open_tun, NodeStatus, StatusPeer, TunConfig,
+    format_node_status, is_ipv4_packet, open_tun_port, NodeStatus, StatusPeer, TunConfig, TunPort,
     LINUX_TUN_NAME, NODE_PID_FILE, NODE_STATUS_FILE,
 };
-use orblx_relay::{send_batch, BatchPeer, RelayPipe, RelaySender, RelaySessionId};
+use orblx_relay::{
+    recv_batch, send_batch, BatchPeer, RecvBatch, RelayPipe, RelaySender, RelaySessionId, UDP_BATCH,
+};
 
 use crate::birthday::{
     local_kind, peer_kind, strategy, MappingKind, RateGate, Spray, Strategy, BIRTHDAY_SOCKETS,
@@ -54,6 +56,18 @@ const DIRECT_READ: Duration = Duration::from_millis(5);
 const RELAY_WAIT: Duration = Duration::from_millis(20);
 /// The send thread also flushes the queues after this time without a wake.
 const SEND_WAIT: Duration = Duration::from_millis(50);
+/// The longest time that the router blocks on the TUN device.
+const ROUTER_WAIT: Duration = Duration::from_millis(10);
+/// A packet that comes after this gap with no other packet is on a quiet flow.
+///
+/// A quiet packet does not go to a second thread. The thread that has it does the kernel call at once.
+/// This removes the wake-up time of a sleeping thread from the RTT.
+/// A busy flow still uses the second thread, so two cores share the work.
+const QUIET_GAP: Duration = Duration::from_millis(1);
+/// The most packets that wait for the TUN write thread. More packets are dropped.
+const TUN_QUEUE_LIMIT: usize = 4096;
+/// The size of one receive slot on the direct socket.
+const DIRECT_SLOT: usize = 65_535;
 /// After a renewal the node sends the new hello on each path for this time.
 const RENEW_HELLO_MS: u64 = 5_000;
 /// The gap between two hello frames after a renewal.
@@ -175,43 +189,19 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
     let gate = KeyGate::generate(session, &config.name, &config.peer_name, config.hello)?;
     write_record(&config.state_dir, &config.name, config.overlay)?;
     let _pid = PidGuard::create(&config.state_dir)?;
-    let bridge = open_tun(&TunConfig {
+    let tun = open_tun_port(&TunConfig {
         name: Some(LINUX_TUN_NAME.to_string()),
         address: config.overlay,
         netmask: Ipv4Addr::new(255, 192, 0, 0),
     })
     .map_err(|err| EdgeError::Io(err.to_string()))?;
-    let tun_name = bridge.name.clone();
+    let tun_name = tun.name.clone();
     let _ = Command::new("ip")
         .args(["link", "set", "dev", &tun_name, "arp", "off"])
         .status();
     let _ = Command::new("ip")
         .args(["route", "replace", "100.64.0.0/10", "dev", &tun_name])
         .status();
-    let (from_tx, from_rx) = std::sync::mpsc::channel();
-    let (to_tx, to_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let mut from_tun = bridge.from_tun;
-    thread::Builder::new()
-        .name("orblx-nat-tun-read".to_string())
-        .spawn(move || {
-            while let Some(packet) = from_tun.blocking_recv() {
-                if from_tx.send(packet).is_err() {
-                    break;
-                }
-            }
-        })
-        .map_err(|err| EdgeError::Io(err.to_string()))?;
-    let to_tun = bridge.to_tun;
-    thread::Builder::new()
-        .name("orblx-nat-tun-write".to_string())
-        .spawn(move || {
-            while let Ok(packet) = to_rx.recv() {
-                if to_tun.blocking_send(packet).is_err() {
-                    break;
-                }
-            }
-        })
-        .map_err(|err| EdgeError::Io(err.to_string()))?;
 
     let hub = Arc::new(Hub {
         state_dir: config.state_dir,
@@ -247,7 +237,10 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         relay_heard: AtomicU64::new(0),
         saw_direct: AtomicBool::new(false),
         peer_confirmed: AtomicBool::new(false),
-        to_tun: Mutex::new(to_tx),
+        flushing: AtomicBool::new(false),
+        tun,
+        tun_lane: Mutex::new(TunLane::default()),
+        tun_ready: Condvar::new(),
     });
     hub.write_status(None);
 
@@ -274,7 +267,12 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
     let router_hub = Arc::clone(&hub);
     thread::Builder::new()
         .name("orblx-nat-router".to_string())
-        .spawn(move || router_loop(router_hub, from_rx))
+        .spawn(move || router_loop(router_hub))
+        .map_err(|err| EdgeError::Io(err.to_string()))?;
+    let tun_hub = Arc::clone(&hub);
+    thread::Builder::new()
+        .name("orblx-nat-tun-write".to_string())
+        .spawn(move || tun_write_loop(tun_hub))
         .map_err(|err| EdgeError::Io(err.to_string()))?;
     if let Some(renew) = config.renew {
         let renew_hub = Arc::clone(&hub);
@@ -429,7 +427,29 @@ struct Hub {
     relay_heard: AtomicU64,
     saw_direct: AtomicBool,
     peer_confirmed: AtomicBool,
-    to_tun: Mutex<std::sync::mpsc::Sender<Vec<u8>>>,
+    /// True while one thread sends the queued frames.
+    ///
+    /// The router and the send thread both send. The flag lets one of them send at a time,
+    /// so the frames of one path keep their order.
+    flushing: AtomicBool,
+    /// The TUN device. The router reads it. The receive threads and the TUN write thread write it.
+    tun: TunPort,
+    /// Packets for the TUN write thread.
+    tun_lane: Mutex<TunLane>,
+    /// Wakes the TUN write thread. It goes with `tun_lane`.
+    tun_ready: Condvar,
+}
+
+/// Opened packets that wait for the TUN write.
+#[derive(Default)]
+struct TunLane {
+    queue: VecDeque<Vec<u8>>,
+    /// True while one thread writes to the TUN device.
+    busy: bool,
+    /// True while the TUN write thread waits on `tun_ready`.
+    waiting: bool,
+    /// The time of the last delivered packet.
+    last: Option<Instant>,
 }
 
 /// Sealed frames for each path, and plain packets that wait for a path.
@@ -597,7 +617,9 @@ impl Hub {
     /// Seal and queue a batch of TUN packets.
     ///
     /// The function takes the key lock one time and the queue lock one time for the batch.
-    fn enqueue_batch(&self, packets: Vec<Vec<u8>>) {
+    /// When `wake` is true, the send thread sends the frames.
+    /// When `wake` is false, the caller sends them with [`Hub::send_now`].
+    fn enqueue_batch(&self, packets: Vec<Vec<u8>>, wake: bool) {
         let plan = self.current_plan();
         let packets = packets.into_iter().filter(|packet| is_ipv4_packet(packet));
         if plan == SendPlan::Hold {
@@ -633,9 +655,29 @@ impl Hub {
         for frame in frames {
             Self::route_locked(&mut queues, frame, plan, now);
         }
+        if !wake {
+            return;
+        }
         queues.wake = true;
         drop(queues);
         self.queued.notify_one();
+    }
+
+    /// Send the queued frames on this thread.
+    ///
+    /// When the send thread sends at this time, the function wakes it again instead.
+    fn send_now(&self) {
+        if self
+            .flushing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.flush_direct();
+            self.flush_relay();
+            self.flushing.store(false, Ordering::Release);
+        } else {
+            self.wake_sender();
+        }
     }
 
     /// Wake the send thread.
@@ -707,23 +749,29 @@ impl Hub {
         }
     }
 
-    fn flush_hold(&self, plan: SendPlan) {
+    /// Seal and queue the held packets. Return true when a frame was queued.
+    fn flush_hold(&self, plan: SendPlan) -> bool {
         if plan == SendPlan::Hold {
-            return;
+            return false;
         }
         let pending: Vec<Vec<u8>> = {
             let mut queues = lock(&self.queues);
             if queues.hold.is_empty() {
-                return;
+                return false;
             }
             queues.hold.drain(..).collect()
         };
+        let mut queued = false;
         for packet in pending {
             match self.seal(KIND_DATA, &packet) {
-                Some(frame) => self.route(frame, plan),
+                Some(frame) => {
+                    self.route(frame, plan);
+                    queued = true;
+                }
                 None => push_bound(&mut lock(&self.queues).hold, packet),
             }
         }
+        queued
     }
 
     /// Send the queued direct frames now, when the direct socket is known.
@@ -787,9 +835,45 @@ impl Hub {
         }
     }
 
-    fn deliver(&self, packet: Vec<u8>) {
-        let sender = lock(&self.to_tun);
-        let _ = sender.send(packet);
+    /// Write opened packets to the TUN device.
+    ///
+    /// A quiet flow writes at once on this thread. A busy flow gives the packets to the TUN write thread.
+    /// One thread writes at a time and the queue goes first, so the packets keep their order.
+    fn deliver(&self, packets: Vec<Vec<u8>>) {
+        if packets.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut lane = lock(&self.tun_lane);
+        let quiet = lane
+            .last
+            .is_none_or(|last| now.duration_since(last) >= QUIET_GAP);
+        lane.last = Some(now);
+        if quiet && !lane.busy && lane.queue.is_empty() {
+            lane.busy = true;
+            drop(lane);
+            for packet in &packets {
+                let _ = self.tun.send(packet);
+            }
+            let mut lane = lock(&self.tun_lane);
+            lane.busy = false;
+            let wake = lane.waiting && !lane.queue.is_empty();
+            drop(lane);
+            if wake {
+                self.tun_ready.notify_one();
+            }
+            return;
+        }
+        for packet in packets {
+            if lane.queue.len() < TUN_QUEUE_LIMIT {
+                lane.queue.push_back(packet);
+            }
+        }
+        let wake = lane.waiting;
+        drop(lane);
+        if wake {
+            self.tun_ready.notify_one();
+        }
     }
 
     fn write_status(&self, path: Option<OverlayPath>) {
@@ -1046,7 +1130,9 @@ fn direct_loop(hub: Arc<Hub>, socket: UdpSocket) {
     let mut last_hello = Instant::now() - HELLO_GAP;
     let mut last_probe = Instant::now() - PROBE_GAP;
     let mut last_punch = Instant::now() - punch_gap;
-    let mut buf = [0u8; 65_535];
+    // One recvmmsg call takes the datagrams that wait, up to one batch.
+    let mut batch = RecvBatch::new(UDP_BATCH, DIRECT_SLOT);
+    let mut opened: Vec<Vec<u8>> = Vec::with_capacity(UDP_BATCH);
     // The direct peer and socket that the router uses. A change stores them again.
     let mut shared: Option<(SocketAddr, Option<SocketAddr>)> = None;
     while !stopped() {
@@ -1115,41 +1201,47 @@ fn direct_loop(hub: Arc<Hub>, socket: UdpSocket) {
                 }
             }
         }
-        match socket.recv_from(&mut buf) {
-            Ok((size, from)) => {
-                if let Some(kind) = decode_punch(&buf[..size], hub.token) {
-                    if let Some(signed) = hub.peer_addr() {
-                        if from.ip() == signed.ip() {
-                            if direct_peer.is_none() {
-                                if let Some(active) = spray.take() {
-                                    println!(
-                                        "The port spray reached {from} after {} probes.",
-                                        active.sent()
-                                    );
+        match recv_batch(&socket, &mut batch) {
+            Ok(_) => {
+                for index in 0..batch.len() {
+                    let Some((bytes, Some(from))) = batch.get(index) else {
+                        continue;
+                    };
+                    if let Some(kind) = decode_punch(bytes, hub.token) {
+                        if let Some(signed) = hub.peer_addr() {
+                            if from.ip() == signed.ip() {
+                                if direct_peer.is_none() {
+                                    if let Some(active) = spray.take() {
+                                        println!(
+                                            "The port spray reached {from} after {} probes.",
+                                            active.sent()
+                                        );
+                                    }
+                                    println!("The hole punch reached {from}.");
                                 }
-                                println!("The hole punch reached {from}.");
-                            }
-                            direct_peer = Some(from);
-                            if kind == PunchKind::Check {
-                                let _ = socket.send_to(&ack, from);
+                                direct_peer = Some(from);
+                                if kind == PunchKind::Check {
+                                    let _ = socket.send_to(&ack, from);
+                                }
                             }
                         }
-                    }
-                } else {
-                    let (packet, fresh_frame) = hub.accept(&buf[..size], Slot::Direct);
-                    // A fresh sealed frame shows the current address of the peer.
-                    if fresh_frame
-                        && direct_peer.is_some_and(|known| known != from)
-                        && hub
-                            .peer_addr()
-                            .is_some_and(|signed| signed.ip() == from.ip())
-                    {
-                        direct_peer = Some(from);
-                    }
-                    if let Some(packet) = packet {
-                        hub.deliver(packet);
+                    } else {
+                        let (packet, fresh_frame) = hub.accept(bytes, Slot::Direct);
+                        // A fresh sealed frame shows the current address of the peer.
+                        if fresh_frame
+                            && direct_peer.is_some_and(|known| known != from)
+                            && hub
+                                .peer_addr()
+                                .is_some_and(|signed| signed.ip() == from.ip())
+                        {
+                            direct_peer = Some(from);
+                        }
+                        if let Some(packet) = packet {
+                            opened.push(packet);
+                        }
                     }
                 }
+                hub.deliver(std::mem::take(&mut opened));
             }
             Err(err) if is_idle(&err) => {}
             Err(err) => {
@@ -1258,12 +1350,16 @@ fn relay_loop(hub: Arc<Hub>) {
             continue;
         };
         let mut broken = false;
+        let mut opened = Vec::new();
         // Read all frames that wait on the relay socket.
         loop {
             match current.recv_opaque() {
                 Ok(Some(frame)) => {
                     if let (Some(packet), _) = hub.accept(&frame, Slot::Relay) {
-                        hub.deliver(packet);
+                        opened.push(packet);
+                    }
+                    if opened.len() >= UDP_BATCH {
+                        hub.deliver(std::mem::take(&mut opened));
                     }
                 }
                 Ok(None) => break,
@@ -1273,6 +1369,7 @@ fn relay_loop(hub: Arc<Hub>) {
                 }
             }
         }
+        hub.deliver(opened);
         if broken {
             eprintln!("The relay path stopped. The node will attach again.");
             hub.set_relay_out(None);
@@ -1403,34 +1500,80 @@ fn send_loop(hub: Arc<Hub>) {
             }
             queues.wake = false;
         }
-        hub.flush_direct();
-        hub.flush_relay();
+        // When the router sends at this time, it sends all queued frames.
+        if hub
+            .flushing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            hub.flush_direct();
+            hub.flush_relay();
+            hub.flushing.store(false, Ordering::Release);
+        }
     }
 }
 
-fn router_loop(hub: Arc<Hub>, packets: std::sync::mpsc::Receiver<Vec<u8>>) {
+/// Write the queued packets of a busy flow to the TUN device.
+fn tun_write_loop(hub: Arc<Hub>) {
+    while !stopped() {
+        let packets: Vec<Vec<u8>> = {
+            let mut lane = lock(&hub.tun_lane);
+            while (lane.queue.is_empty() || lane.busy) && !stopped() {
+                lane.waiting = true;
+                lane = match hub.tun_ready.wait_timeout(lane, SEND_WAIT) {
+                    Ok((guard, _)) => guard,
+                    Err(err) => err.into_inner().0,
+                };
+                lane.waiting = false;
+            }
+            if lane.queue.is_empty() || lane.busy {
+                continue;
+            }
+            lane.busy = true;
+            lane.queue.drain(..).collect()
+        };
+        for packet in &packets {
+            let _ = hub.tun.send(packet);
+        }
+        lock(&hub.tun_lane).busy = false;
+    }
+}
+
+fn router_loop(hub: Arc<Hub>) {
+    let mut buf = vec![0u8; 65_535];
+    let mut last_packet: Option<Instant> = None;
     let mut reported: Option<OverlayPath> = None;
     let mut known = false;
     let mut last_status = Instant::now() - Duration::from_secs(1);
     // The time of the last move off direct, for the resend window.
     let mut left_direct: Option<u64> = None;
     while !stopped() {
-        match packets.recv_timeout(Duration::from_millis(10)) {
-            Ok(packet) => {
+        match hub.tun.recv_timeout(&mut buf, ROUTER_WAIT) {
+            Ok(Some(size)) => {
+                let at = Instant::now();
+                let quiet = last_packet.is_none_or(|last| at.duration_since(last) >= QUIET_GAP);
+                last_packet = Some(at);
                 // Take the packets that already wait, up to one batch.
                 let mut batch = Vec::with_capacity(ROUTER_BATCH);
-                batch.push(packet);
+                batch.push(buf[..size].to_vec());
                 while batch.len() < ROUTER_BATCH {
-                    match packets.try_recv() {
-                        Ok(next) => batch.push(next),
-                        Err(_) => break,
+                    match hub.tun.recv_timeout(&mut buf, Duration::ZERO) {
+                        Ok(Some(size)) => batch.push(buf[..size].to_vec()),
+                        _ => break,
                     }
                 }
-                // The send thread sends the frames. The router does not wait for the kernel send.
-                hub.enqueue_batch(batch);
+                // A busy flow: the send thread sends the frames, and the router seals the next batch.
+                // A quiet flow: the router sends at once, with no thread wake-up.
+                hub.enqueue_batch(batch, !quiet);
+                if quiet {
+                    hub.send_now();
+                }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("The TUN device stopped. {err}");
+                return;
+            }
         }
         let now = hub.now_ms();
         let direct_ok = hub.both_ways(Slot::Direct, now);
@@ -1463,11 +1606,15 @@ fn router_loop(hub: Arc<Hub>, packets: std::sync::mpsc::Receiver<Vec<u8>>) {
                 // Frames from the last stale window may be lost. Send them again on the relay.
                 let count = hub.resend_on_relay(left.saturating_sub(RESEND_MS));
                 println!("The node sent {count} recent frames again on the relay.");
+                if count > 0 {
+                    hub.wake_sender();
+                }
             }
         }
-        hub.flush_hold(plan);
-        // The hold queue and the resend can put frames on the queues.
-        hub.wake_sender();
+        // The hold queue can put frames on the queues.
+        if hub.flush_hold(plan) {
+            hub.wake_sender();
+        }
         if !known || next != reported {
             if let Some(path) = next {
                 println!("The path to {} is {}.", hub.peer_name, path.as_str());

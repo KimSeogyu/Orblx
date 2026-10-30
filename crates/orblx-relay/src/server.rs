@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -217,6 +217,12 @@ impl Drop for RelayServer {
 
 /// Receive buffers that move between the receive thread and the send thread.
 const UDP_POOL: usize = 4;
+/// A batch that comes after this gap with no other batch is on a quiet flow.
+///
+/// When the send thread has no batch, the receive thread sends a quiet batch at once.
+/// This removes the wake-up time of the send thread from the RTT.
+/// A busy flow still uses the send thread, so two cores share the work.
+const QUIET_GAP: Duration = Duration::from_millis(1);
 
 fn udp_loop(socket: Arc<UdpSocket>, shared: Arc<Shared>) {
     // The receive thread reads and routes. The send thread writes.
@@ -231,13 +237,17 @@ fn udp_loop(socket: Arc<UdpSocket>, shared: Arc<Shared>) {
             Vec::with_capacity(UDP_BATCH),
         ));
     }
+    // The batches that the send thread has and did not send yet.
+    let in_flight = Arc::new(AtomicUsize::new(0));
     let send_socket = Arc::clone(&socket);
     let send_shared = Arc::clone(&shared);
+    let send_in_flight = Arc::clone(&in_flight);
     let sender = thread::Builder::new()
         .name("orblx-relay-send".to_string())
         .spawn(move || {
             while let Ok((batch, out)) = full_rx.recv() {
                 send_forwards(&send_shared, &send_socket, &batch, &out);
+                send_in_flight.fetch_sub(1, Ordering::AcqRel);
                 if free_tx.send((batch, out)).is_err() {
                     break;
                 }
@@ -246,9 +256,16 @@ fn udp_loop(socket: Arc<UdpSocket>, shared: Arc<Shared>) {
     let Ok(sender) = sender else {
         return;
     };
+    // The buffers of a batch that this thread sent itself.
+    let mut held: Option<(RecvBatch, Vec<UdpForward>)> = None;
+    let mut last_batch: Option<Instant> = None;
     'run: while !shared.stop.load(Ordering::Relaxed) {
-        let Ok((mut batch, mut out)) = free_rx.recv() else {
-            break;
+        let (mut batch, mut out) = match held.take() {
+            Some(buffers) => buffers,
+            None => match free_rx.recv() {
+                Ok(buffers) => buffers,
+                Err(_) => break,
+            },
         };
         loop {
             if shared.stop.load(Ordering::Relaxed) {
@@ -260,6 +277,9 @@ fn udp_loop(socket: Arc<UdpSocket>, shared: Arc<Shared>) {
                 Err(_) => break 'run,
             }
         }
+        let at = Instant::now();
+        let quiet = last_batch.is_none_or(|last| at.duration_since(last) >= QUIET_GAP);
+        last_batch = Some(at);
         out.clear();
         if !shared.udp_discard {
             for index in 0..batch.len() {
@@ -280,6 +300,13 @@ fn udp_loop(socket: Arc<UdpSocket>, shared: Arc<Shared>) {
                 }
             }
         }
+        // No batch waits for the send thread, so a send on this thread keeps the order.
+        if quiet && in_flight.load(Ordering::Acquire) == 0 {
+            send_forwards(&shared, &socket, &batch, &out);
+            held = Some((batch, out));
+            continue;
+        }
+        in_flight.fetch_add(1, Ordering::AcqRel);
         if full_tx.send((batch, out)).is_err() {
             break;
         }

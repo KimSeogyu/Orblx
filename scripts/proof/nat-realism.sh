@@ -12,6 +12,7 @@
 # W21: the script also fails when the relay ping RTT avg is more than RELAY_SLACK_MS
 # above the direct ping RTT avg, when a relay ping is lost, or when an idle orblx
 # process uses more than IDLE_CPU_PCT percent CPU.
+# W23: RELAY_SLACK_MS is 1. The relay gate also prints the median and the slowest pings.
 # The script measures TCP bulk throughput on the plain, direct and relay paths.
 # The script prints proof_ok.
 set -euo pipefail
@@ -35,7 +36,7 @@ SPRAY_MAX=2048
 # The direct overlay RTT may be at most this much above the plain container RTT.
 RTT_LIMIT_MS="${ORBLX_RTT_LIMIT_MS:-5}"
 # The relay overlay RTT avg may be at most this much above the direct overlay RTT avg.
-RELAY_SLACK_MS="${ORBLX_RELAY_SLACK_MS:-2}"
+RELAY_SLACK_MS="${ORBLX_RELAY_SLACK_MS:-1}"
 # The seconds of each TCP bulk transfer.
 BULK_SECS="${ORBLX_BULK_SECS:-5}"
 # The seconds of each idle CPU sample.
@@ -373,9 +374,26 @@ relay_gate() {
   local label="$1"
   local container="$2"
   local ip="$3"
-  local out avg received lost line
-  out="$(docker exec "$container" ping -n -c "$PINGS" -i 0.2 -W 1 "$ip" | tail -2)"
+  local full out avg received lost line
+  full="$(docker exec "$container" ping -D -n -c "$PINGS" -i 0.2 -W 1 "$ip")"
+  out="$(printf '%s\n' "$full" | tail -2)"
   printf '%s relay %s\n' "$label" "$out"
+  # Print the median and the 3 slowest pings with their seq and time stamp.
+  printf '%s\n' "$full" | python3 -c '
+import re, sys
+label = sys.argv[1]
+rows = []
+for text in sys.stdin:
+    m = re.match(r"\[([0-9.]+)\].*icmp_seq=([0-9]+).*time=([0-9.]+) ms", text)
+    if m:
+        rows.append((float(m.group(3)), int(m.group(2)), m.group(1)))
+if rows:
+    times = sorted(r[0] for r in rows)
+    n = len(times)
+    mid = times[n // 2] if n % 2 else (times[n // 2 - 1] + times[n // 2]) / 2
+    slow = " ".join("seq%d:%.3f@%s" % (r[1], r[0], r[2]) for r in sorted(rows, reverse=True)[:3])
+    print("relay_ping %s median_ms %.3f slowest %s" % (label, mid, slow))
+' "$label"
   avg="$(printf '%s\n' "$out" | rtt_avg)"
   received="$(printf '%s\n' "$out" | awk '/packets transmitted/ {print $4}')"
   lost=$((PINGS - ${received:-0}))
