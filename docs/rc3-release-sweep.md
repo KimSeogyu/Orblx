@@ -110,4 +110,4 @@ The dry run on main is running. This section gets the table before the merge.
 - The `proof_context` and `proof_contention` lines count every other running orblx container. For the proofs with fixed names, this count includes the containers of the proof itself.
 - The proofs with no binary setting use a debug binary, not the release binary.
 - The "first error line" is a text match. A proof that prints an expected error before its real failure gives the expected line. The exit code and the log path are in the row.
-- The sweep is Linux only (`flock`, `timeout`, Docker).
+- The real sweep is Linux only (`flock`, `timeout`, Docker). On a host with no `timeout` (macOS CI), a proof runs with no time limit; with no `flock`, it runs without the lock. The unit test runs on both.

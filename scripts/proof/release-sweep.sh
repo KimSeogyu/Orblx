@@ -281,7 +281,7 @@ for line in "${specs[@]}"; do
   else
     # The wrapper takes the lock, runs the proof, and releases the lock in its EXIT trap.
     # ORBLX_PROOF_LOCK_HELD is the wrapper pid, so a proof that takes the lock itself
-    # (nat-realism.sh) sees that its parent holds it.
+    # (every proof since W25-14) sees that its parent holds it.
     # The timeout counts only the proof, not the wait for the lock.
     tool_env PROOF_LOG="$log" ${env_words[@]+"${env_words[@]}"} \
       bash -c '
@@ -289,7 +289,12 @@ for line in "${specs[@]}"; do
         trap proof_lock_end EXIT
         proof_lock_take "$2" orblx-rc3sw-
         cd "$3"
-        timeout -k 60 "$5" bash "$4"
+        if command -v timeout >/dev/null 2>&1; then
+          timeout -k 60 "$5" bash "$4"
+        else
+          echo "release_sweep: no timeout command on this host, the proof runs with no time limit"
+          bash "$4"
+        fi
       ' release-sweep-proof "$LOCK_LIB" "rc3-sweep:$name" "$ROOT" "$ROOT/$path" "$TIMEOUT" \
       >>"$log" 2>&1 </dev/null || rc=$?
   fi
