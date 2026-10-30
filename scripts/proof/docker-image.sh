@@ -185,6 +185,8 @@ echo "a pid1 token env vars ${env_count}"
 tmp_count="$(docker exec "${PREFIX}-a" sh -c 'ls /tmp | grep -c orblx-token || true')"
 echo "a temp token files ${tmp_count}"
 [[ "$tmp_count" == 0 ]] || die "The temp token file is still in the container."
+dns_lines="$(log_count "${PREFIX}-a" "The command resolvectl is not available.")"
+echo "a resolvectl missing lines ${dns_lines} (the node continues without the ~orblx DNS domain)"
 echo "gate2 ok"
 
 echo "=== [C] gate 3: restart a with the state volume ==="
