@@ -398,14 +398,15 @@ for name in router-a router-b client guest; do
 done
 echo "overlay router-a ${OVERLAY[router-a]} router-b ${OVERLAY[router-b]} client ${OVERLAY[client]} guest ${OVERLAY[guest]}"
 
-echo "=== [C] node material ==="
-"$BIN" node-issue --out "$WORK/nodes" \
-  --node "router-a=${OVERLAY[router-a]}" \
-  --node "router-b=${OVERLAY[router-b]}" \
-  --node "client=${OVERLAY[client]}" \
-  --node "guest=${OVERLAY[guest]}" >/dev/null
+# W25-27: the nodes use only the SVID, the key, and the ticket that the coordinator issued
+# through the normal enroll path. The proof does not make lab tickets.
+echo "=== [C] node material from the coordinator enroll ==="
 for name in router-a router-b client guest; do
-  cp -a "$WORK/nodes/${name}/." "$WORK/state-${name}/"
+  as_root cp -a "$WORK/enroll-${name}/." "$WORK/state-${name}/"
+  for file in cert.pem key.pem bundle.pem ticket.bin ticket.bin.mac ticket-verifier.pem ticket-mac.key svid-ca.pub; do
+    as_root test -s "$WORK/state-${name}/${file}" || fail "The enroll of ${name} did not write ${file}."
+  done
+  echo "${name}: SVID, key, and ticket from the coordinator enroll"
 done
 # The routers use the signed grants, so the port ACL covers the subnet route (W24-A).
 for name in router-a router-b; do
