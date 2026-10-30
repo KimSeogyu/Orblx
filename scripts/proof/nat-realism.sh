@@ -9,6 +9,10 @@
 # when a switch gap is more than 1 second, or when svid_expiry is unknown.
 # The script also fails when the direct ping RTT is more than RTT_LIMIT_MS above
 # the plain container RTT, or when a renewed SVID does not reach the peer line.
+# W21: the script also fails when the relay ping RTT avg is more than RELAY_SLACK_MS
+# above the direct ping RTT avg, when a relay ping is lost, or when an idle orblx
+# process uses more than IDLE_CPU_PCT percent CPU.
+# The script measures TCP bulk throughput on the plain, direct and relay paths.
 # The script prints proof_ok.
 set -euo pipefail
 
@@ -30,6 +34,19 @@ MAX_GAP_MS=1000
 SPRAY_MAX=2048
 # The direct overlay RTT may be at most this much above the plain container RTT.
 RTT_LIMIT_MS="${ORBLX_RTT_LIMIT_MS:-5}"
+# The relay overlay RTT avg may be at most this much above the direct overlay RTT avg.
+RELAY_SLACK_MS="${ORBLX_RELAY_SLACK_MS:-2}"
+# The seconds of each TCP bulk transfer.
+BULK_SECS="${ORBLX_BULK_SECS:-5}"
+# The seconds of each idle CPU sample.
+IDLE_SECS="${ORBLX_IDLE_SECS:-10}"
+# The CPU limit in percent of one core for the idle relay server process and the idle node relay thread.
+IDLE_CPU_PCT="${ORBLX_IDLE_CPU_PCT:-3}"
+# The CPU limit for the whole idle node process. The node sends probes and hellos when idle.
+# This limit finds a spin (near 100 percent). It is not a cost target.
+NODE_IDLE_CPU_PCT="${ORBLX_NODE_IDLE_CPU_PCT:-25}"
+BULK_PORT=5201
+DIRECT_AVG=""
 # The node leaf life in seconds for the renewal case.
 RENEW_TTL=60
 
@@ -73,8 +90,15 @@ open_legacy_forward() {
 
 build_image() {
   local image_dir bin
-  bin="$ROOT/target/debug/orblx"
-  cargo build -p orblx-cli --bin orblx
+  # ORBLX_NATR_PROFILE=release builds an optimized binary. The default is the debug binary.
+  if [[ "${ORBLX_NATR_PROFILE:-debug}" == "release" ]]; then
+    bin="$ROOT/target/release/orblx"
+    cargo build --release -p orblx-cli --bin orblx
+  else
+    bin="$ROOT/target/debug/orblx"
+    cargo build -p orblx-cli --bin orblx
+  fi
+  echo "build profile ${ORBLX_NATR_PROFILE:-debug}"
   # shellcheck source=stage-image.sh
   source "$ROOT/scripts/proof/stage-image.sh"
   image_dir="$(stage_proof_image "$ROOT" "$bin")"
@@ -339,6 +363,138 @@ measure_rtt() {
   fi
   echo "rtt limit_ms ${RTT_LIMIT_MS} ok"
   RTT_LINE="rtt plain_avg_ms ${plain} direct_avg_ms ${overlay} direct_i0.23_avg_ms ${odd}"
+  DIRECT_AVG="$overlay"
+}
+
+# Send 50 pings on the relay path. Fail when one ping is lost,
+# or when the avg is more than RELAY_SLACK_MS above the direct avg.
+# Arguments: label, container, peer overlay IP.
+relay_gate() {
+  local label="$1"
+  local container="$2"
+  local ip="$3"
+  local out avg received lost line
+  out="$(docker exec "$container" ping -n -c "$PINGS" -i 0.2 -W 1 "$ip" | tail -2)"
+  printf '%s relay %s\n' "$label" "$out"
+  avg="$(printf '%s\n' "$out" | rtt_avg)"
+  received="$(printf '%s\n' "$out" | awk '/packets transmitted/ {print $4}')"
+  lost=$((PINGS - ${received:-0}))
+  line="relay_rtt ${label} relay_avg_ms ${avg:-none} direct_avg_ms ${DIRECT_AVG} slack_ms ${RELAY_SLACK_MS} lost ${lost}/${PINGS}"
+  echo "$line"
+  if (( lost > 0 )) || [[ -z "$avg" ]]; then
+    echo "${label} lost a ping on the relay path." >&2
+    exit 1
+  fi
+  if ! python3 -c 'import sys; r, d, s = map(float, sys.argv[1:4]); sys.exit(0 if r <= d + s else 1)' \
+    "$avg" "$DIRECT_AVG" "$RELAY_SLACK_MS"; then
+    echo "${label} relay RTT avg ${avg} ms is more than ${RELAY_SLACK_MS} ms above the direct avg ${DIRECT_AVG} ms." >&2
+    exit 1
+  fi
+  echo "${label} relay_gate ok"
+  SUMMARY+=("$line relay_gate ok")
+}
+
+copy_bulk() {
+  docker cp "$ROOT/scripts/proof/tcp-bulk.py" "$1:/tmp/tcp-bulk.py" >/dev/null
+}
+
+# Measure the throughput of one TCP bulk transfer of BULK_SECS seconds.
+# Arguments: label, client container, server container, target IP.
+bulk() {
+  local label="$1"
+  local client="$2"
+  local server="$3"
+  local ip="$4"
+  local out=""
+  copy_bulk "$client"
+  copy_bulk "$server"
+  docker exec "$server" rm -f /tmp/bulk.txt
+  docker exec -d "$server" python3 /tmp/tcp-bulk.py server 0.0.0.0 "$BULK_PORT" /tmp/bulk.txt
+  sleep 1
+  local tmp name line
+  tmp="$(mktemp -d)"
+  if [[ "$label" != "plain" ]]; then
+    # Sample the CPU of each orblx process and thread during the transfer. This shows where the time goes.
+    copy_bulk "$(dc ps -q relay)"
+    for name in "$client" "$server"; do
+      (sleep 1 && docker exec "$name" python3 /tmp/tcp-bulk.py cpu "orblx nat run" $((BULK_SECS - 2)) >"${tmp}/${name}") &
+    done
+    (sleep 1 && dc exec -T relay python3 /tmp/tcp-bulk.py cpu "orblx relay" $((BULK_SECS - 2)) >"${tmp}/relay") &
+  fi
+  if ! docker exec "$client" timeout $((BULK_SECS + 60)) python3 /tmp/tcp-bulk.py client "$ip" "$BULK_PORT" "$BULK_SECS"; then
+    echo "The ${label} bulk transfer failed." >&2
+    exit 1
+  fi
+  wait
+  if [[ "$label" != "plain" ]]; then
+    for name in "$client" "$server" relay; do
+      while read -r line; do
+        [[ -z "$line" || "$line" == *" ticks 0 "* ]] && continue
+        echo "bulk_cpu ${label} ${name} ${line}"
+      done <"${tmp}/${name}"
+    done
+  fi
+  rm -rf "$tmp"
+  for _ in $(seq 1 20); do
+    out="$(docker exec "$server" cat /tmp/bulk.txt 2>/dev/null || true)"
+    [[ -n "$out" ]] && break
+    sleep 0.5
+  done
+  if [[ -z "$out" ]]; then
+    echo "The ${label} bulk server wrote no result." >&2
+    exit 1
+  fi
+  echo "throughput ${label} ${out}"
+  SUMMARY+=("throughput ${label} ${out}")
+}
+
+# Sample the CPU of idle orblx processes for IDLE_SECS seconds. No ping or bulk runs.
+# Arguments: label, then node containers.
+idle_cpu() {
+  local label="$1"
+  shift
+  local tmp name line pct limit what
+  tmp="$(mktemp -d)"
+  for name in "$@"; do
+    copy_bulk "$name"
+    docker exec "$name" python3 /tmp/tcp-bulk.py cpu "orblx nat run" "$IDLE_SECS" >"${tmp}/${name}" &
+  done
+  copy_bulk "$(dc ps -q relay)"
+  dc exec -T relay python3 /tmp/tcp-bulk.py cpu "orblx relay" "$IDLE_SECS" >"${tmp}/relay" &
+  wait
+  for name in "$@" relay; do
+    if ! grep -q '^cpu ' "${tmp}/${name}"; then
+      echo "The idle CPU sample found no orblx process in ${name}." >&2
+      rm -rf "$tmp"
+      exit 1
+    fi
+    while read -r line; do
+      [[ -z "$line" ]] && continue
+      echo "idle_cpu ${label} ${name} ${line}"
+      SUMMARY+=("idle_cpu ${label} ${name} ${line}")
+      pct="$(printf '%s\n' "$line" | awk '{for (i = 1; i < NF; i++) if ($i == "cpu_pct") print $(i + 1)}')"
+      # The relay server process and the node relay thread must stay near idle.
+      # The whole node process has a loose limit. It finds a spin, not the keepalive cost.
+      limit=""
+      if [[ "$name" == "relay" && "$line" == cpu\ * ]]; then
+        limit="$IDLE_CPU_PCT"
+        what="relay server process"
+      elif [[ "$line" == *" name orblx-nat-relay "* ]]; then
+        limit="$IDLE_CPU_PCT"
+        what="node relay thread"
+      elif [[ "$name" != "relay" && "$line" == cpu\ * ]]; then
+        limit="$NODE_IDLE_CPU_PCT"
+        what="node process"
+      fi
+      [[ -z "$limit" ]] && continue
+      if ! python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)' "$pct" "$limit"; then
+        echo "The idle ${what} in ${name} used ${pct} percent CPU. The limit is ${limit}." >&2
+        rm -rf "$tmp"
+        exit 1
+      fi
+    done <"${tmp}/${name}"
+  done
+  rm -rf "$tmp"
 }
 
 # Enroll a new node name into the state volume of a node service.
@@ -640,8 +796,19 @@ steady_pings prc_prc orblx-natr-a "$IP_B"
 echo "=== [C] RTT on the prc_prc topology ==="
 measure_rtt orblx-natr-a "$WAN_B" "$IP_B"
 
+echo "=== [C] throughput plain and direct, idle CPU on direct ==="
+# plain: node-a -> router-a (NAT) -> router-b. The server runs on router-b. No orblx.
+bulk plain orblx-natr-a "$(dc ps -q router-b)" "$WAN_B"
+bulk prc_prc_direct orblx-natr-a orblx-natr-b "$IP_B"
+idle_cpu prc_prc_direct orblx-natr-a orblx-natr-b
+
 echo "=== [C] switch prc_prc direct to relay (block UDP between router-a and router-b) ==="
 measure_switch "switch prc_prc direct_to_relay" orblx-natr-a node-b "$IP_B" relay block_ab
+echo "=== [C] relay gate, throughput and idle CPU on the prc_prc relay path ==="
+sleep 2
+relay_gate prc_prc orblx-natr-a "$IP_B"
+bulk prc_prc_relay orblx-natr-a orblx-natr-b "$IP_B"
+idle_cpu prc_prc_relay orblx-natr-a orblx-natr-b
 echo "=== [C] switch prc_prc relay to direct (restore UDP) ==="
 measure_switch "switch prc_prc relay_to_direct" orblx-natr-a node-b "$IP_B" direct open_ab
 docker logs orblx-natr-a 2>&1 | grep -E '^The (path to|node sent|relay also)' | sed 's/^/orblx-natr-a: /'
@@ -714,6 +881,9 @@ if docker logs orblx-natr-c 2>&1 | grep -q '^The hole punch reached'; then
   exit 1
 fi
 steady_pings sym_sym orblx-natr-c "$IP_D"
+relay_gate sym_sym orblx-natr-c "$IP_D"
+bulk sym_sym_relay orblx-natr-c orblx-natr-d "$IP_D"
+idle_cpu sym_sym_relay orblx-natr-c orblx-natr-d
 stop_node orblx-natr-c
 stop_node orblx-natr-d
 
