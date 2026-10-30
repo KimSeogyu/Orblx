@@ -1,10 +1,32 @@
 # Three Linux nodes on one bridge.
 # The proof script builds the image orblx-w18:local and sets the W18_* paths.
+# W25-27: the coordinator issues the node SVIDs and tickets (coord enroll).
+# W18_SVID_TTL sets the coordinator ORBLX_SVID_TTL. Empty means the default (900 s).
 # UDP 4431, 4432, and 4433 let a Mac reach the containers. The Mac cannot use the bridge addresses.
 
 name: orblx-w18
 
 services:
+  coord:
+    image: orblx-w18:local
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+    environment:
+      ORBLX_OIDC_MODE: mock
+      ORBLX_SVID_TTL: ${W18_SVID_TTL:-}
+    volumes:
+      - ${W18_COORD_STATE}:/var/lib/orblx
+    networks:
+      orblx:
+        ipv4_address: 172.28.18.10
+
   node-a:
     image: orblx-w18:local
     cap_add:

@@ -20,6 +20,10 @@
 #   5. Remove the images of each proof and, at the end, the worktree and its target.
 # There is no retry and no skip: each proof runs once, and a failed proof does not stop the
 # sweep. A shipped row with no proof is a FAIL.
+# W25-27: the row status has ONE source, docs/matrix-rows.txt (ID|STATUS|FEATURE, copied
+# from the gap matrix Page). The "row" lines of the manifest must be exactly the shipped rows
+# of that file, and each "partial" line must name a partial row of it. Any difference stops
+# the sweep (exit 2) before a proof runs, in --plan and in a run, and names the rows.
 # Exit: 0 every row passed; 1 a proof failed or a row has no proof (the summary names the
 # rows); 2 setup, manifest or build error; 3 ORBLX_SWEEP_ONLY run with no failure (a partial
 # run never counts).
@@ -34,6 +38,8 @@
 #   ORBLX_SWEEP_OUT       Log and summary directory (default /workspace/orblx-w18-proof).
 #   ORBLX_SWEEP_WT        Worktree path (default /workspace/orblx-rc3-sweep-<sha>).
 #   ORBLX_SWEEP_MANIFEST  Manifest file. Default: the manifest of COMMIT, else of this checkout.
+#   ORBLX_SWEEP_ROWS      Rows file. Default: docs/matrix-rows.txt of COMMIT (of the test
+#                         root with ORBLX_SWEEP_TEST_ROOT). No rows file is a setup error.
 #   ORBLX_SWEEP_ONLY      Space list of proof names (a partial run, exit 3 at best).
 #   ORBLX_SWEEP_TIMEOUT   Seconds for each proof, without the lock wait (default 3600).
 #   ORBLX_SWEEP_KEEP      1 keeps the worktree, the target and the images.
@@ -70,6 +76,7 @@ KEEP="${ORBLX_SWEEP_KEEP:-0}"
 TEST_ROOT="${ORBLX_SWEEP_TEST_ROOT:-}"
 PROGRESS="${ORBLX_SWEEP_PROGRESS:-}"
 MANIFEST_REL="scripts/proof/sweep-manifest.txt"
+ROWS_REL="docs/matrix-rows.txt"
 TOOL_CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 TOOL_RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 TOOL_PATH="$TOOL_CARGO_HOME/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -208,7 +215,8 @@ script_at() {
 
 # 2. Read the manifest.
 MANIFEST_TMP="$(mktemp)"
-trap 'rm -f "$MANIFEST_TMP"' EXIT
+ROWS_TMP="$(mktemp)"
+trap 'rm -f "$MANIFEST_TMP" "$ROWS_TMP"' EXIT
 if [[ -n "${ORBLX_SWEEP_MANIFEST:-}" ]]; then
   cp "$ORBLX_SWEEP_MANIFEST" "$MANIFEST_TMP" || die "cannot read $ORBLX_SWEEP_MANIFEST"
   MANIFEST_SRC="$ORBLX_SWEEP_MANIFEST"
@@ -228,8 +236,11 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   [[ -n "$line" && "$line" != \#* ]] || continue
   IFS='|' read -r kind f1 f2 f3 f4 f5 f6 <<<"$line"
   case "$kind" in
-    row|gate)
+    row|gate|partial)
       [[ -n "$f1" && -n "$f3" ]] || die "manifest: bad line: $line"
+      if [[ "$kind" == partial && "$f3" == "-" ]]; then
+        die "manifest: partial row $f1 has no proof (a partial row with no proof is not a sweep row)"
+      fi
       R_KIND+=("$kind"); R_ID+=("$f1"); R_FEAT+=("$f2"); R_PROOFS+=("$f3")
       ;;
     proof)
@@ -241,6 +252,52 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   esac
 done <"$MANIFEST_TMP"
 [[ "${#R_ID[@]}" -gt 0 && "${#P_NAME[@]}" -gt 0 ]] || die "manifest: no rows or no proofs"
+
+# W25-27: the row status source. Read it, then compare it with the manifest rows.
+if [[ -n "${ORBLX_SWEEP_ROWS:-}" ]]; then
+  cp "$ORBLX_SWEEP_ROWS" "$ROWS_TMP" || die "cannot read $ORBLX_SWEEP_ROWS"
+  ROWS_SRC="$ORBLX_SWEEP_ROWS"
+elif [[ -n "$TEST_ROOT" ]]; then
+  cp "$ROOT/$ROWS_REL" "$ROWS_TMP" 2>/dev/null || die "rows: no $ROWS_REL in the test root"
+  ROWS_SRC="$ROOT/$ROWS_REL"
+else
+  git -C "$REPO" show "$SHA:$ROWS_REL" >"$ROWS_TMP" 2>/dev/null || die "rows: no $ROWS_REL at $SHORT"
+  ROWS_SRC="$ROWS_REL at $SHORT"
+fi
+declare -A ROW_STATUS=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+  [[ -n "$line" && "$line" != \#* ]] || continue
+  IFS='|' read -r rid rstatus _ <<<"$line"
+  [[ "$rid" =~ ^[0-9]+$ ]] || die "rows: bad line: $line"
+  case "$rstatus" in shipped|partial|missing) ;; *) die "rows: bad status in line: $line" ;; esac
+  [[ -z "${ROW_STATUS[$rid]:-}" ]] || die "rows: row $rid is listed twice"
+  ROW_STATUS[$rid]="$rstatus"
+done <"$ROWS_TMP"
+[[ "${#ROW_STATUS[@]}" -gt 0 ]] || die "rows: $ROWS_SRC has no rows"
+mismatch=""
+declare -A MAN_ROW=()
+for r in "${!R_ID[@]}"; do
+  kind="${R_KIND[$r]}"
+  [[ "$kind" == gate ]] && continue
+  id="${R_ID[$r]}"
+  [[ -z "${MAN_ROW[$id]:-}" ]] || mismatch="${mismatch}${mismatch:+; }row $id is in the manifest twice"
+  MAN_ROW[$id]="$kind"
+  want=shipped
+  [[ "$kind" == partial ]] && want=partial
+  have="${ROW_STATUS[$id]:-not in the rows file}"
+  if [[ "$have" != "$want" ]]; then
+    mismatch="${mismatch}${mismatch:+; }row $id: manifest $kind, rows file $have"
+  fi
+done
+for id in $(printf '%s\n' "${!ROW_STATUS[@]}" | sort -n); do
+  if [[ "${ROW_STATUS[$id]}" == shipped && -z "${MAN_ROW[$id]:-}" ]]; then
+    mismatch="${mismatch}${mismatch:+; }row $id: rows file shipped, no manifest row line"
+  fi
+done
+if [[ -n "$mismatch" ]]; then
+  die "rows mismatch between the manifest ($MANIFEST_SRC) and the rows file ($ROWS_SRC): $mismatch"
+fi
+note "rows: the manifest matches $ROWS_SRC"
 
 # Report only (PO, W25-17): nat-realism prints a steady_warn line for a steady ping sample over
 # 100 ms. A run is the nat-realism proof log, or one step log section of a proof with step logs
@@ -288,6 +345,15 @@ for want in $ONLY; do
   proof_index "$want" >/dev/null || die "unknown proof $want"
 done
 
+# A partial row shows its status next to its number.
+row_label() {
+  if [[ "${R_KIND[$1]}" == partial ]]; then
+    echo "${R_ID[$1]} (partial)"
+  else
+    echo "${R_ID[$1]}"
+  fi
+}
+
 rows_of() {
   local p="$1" r out=""
   for r in "${!R_ID[@]}"; do
@@ -329,7 +395,7 @@ if [[ "$PLAN" == 1 ]]; then
           bad=1
           bad_rows="${bad_rows:+$bad_rows, }${R_ID[$r]}"
         fi
-        echo "| ${R_ID[$r]} | $(cell "${R_FEAT[$r]}") | $p | $have |"
+        echo "| $(row_label "$r") | $(cell "${R_FEAT[$r]}") | $p | $have |"
       done
     done
     echo
@@ -462,7 +528,7 @@ write_table() {
       res=ok
       for p in ${R_PROOFS[$r]}; do
         i="$(proof_index "$p")"
-        echo "| ${R_ID[$r]} | $(cell "${R_FEAT[$r]}") | $p | ${P_RESULT[$i]} | ${P_LOG[$i]} | ${P_TIME[$i]} | ${P_CONT[$i]} |"
+        echo "| $(row_label "$r") | $(cell "${R_FEAT[$r]}") | $p | ${P_RESULT[$i]} | ${P_LOG[$i]} | ${P_TIME[$i]} | ${P_CONT[$i]} |"
         [[ "${P_RESULT[$i]}" == FAIL* ]] && res=fail
       done
       if [[ "$res" == fail ]]; then
@@ -482,7 +548,7 @@ case "$LOCK_MODE" in
     # One hold for all the proofs. The wrapper of each proof sees ORBLX_PROOF_LOCK_HELD.
     # shellcheck source=proof-lock.sh
     . "$LOCK_LIB"
-    trap 'proof_lock_end; rm -f "$MANIFEST_TMP"' EXIT
+    trap 'proof_lock_end; rm -f "$MANIFEST_TMP" "$ROWS_TMP"' EXIT
     note "lock mode sweep: wait for the lock"
     proof_lock_take "rc3-sweep:$SHORT" orblx-rc3sw-
     note "lock mode sweep: lock taken $(now)"

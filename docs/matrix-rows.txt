@@ -1,0 +1,71 @@
+# W25-27 matrix rows: the one source of row status for scripts/proof/release-sweep.sh.
+# Copied from the Page "Orblx vs Tailscale 기능 격차 매트릭스 + Wave 계획" snapshot of
+# 2026-10-31 08:10 KST, with the PO list of 2026-10-31 (W25-27): rows 1, 9, 10, 11, 16, 17,
+# 28, 29, 40, 41, 43, 44, 54 and 61 are partial. The PO keeps the Page and this file in sync.
+# The sweep fails (exit 2) when the manifest rows and this file differ.
+# ID|STATUS|FEATURE   STATUS: shipped, partial, or missing.
+1|partial|P2P mesh datapath (상시, N peers)
+2|partial|Coordination server / netmap
+3|partial|NAT traversal (STUN + hole punch)
+4|partial|Relay (DERP급)
+5|missing|Peer relays
+6|partial|Roaming / relay→direct 전환
+7|missing|IPv6 overlay/underlay
+8|partial|Throughput / latency (GSO·GRO·MTU)
+9|partial|Subnet routers
+10|partial|Split tunneling / accept-routes
+11|partial|Exit nodes
+12|missing|HA subnet routers
+13|missing|4via6 중복 서브넷
+14|partial|App connectors
+15|missing|Mullvad exit nodes
+16|partial|MagicDNS
+17|partial|Split DNS / nameserver / search domain
+18|partial|HTTPS certificates
+19|shipped|ACL policy file
+20|partial|Tags
+21|shipped|ACL tests
+22|partial|Grants / app capabilities
+23|partial|Just-in-time access
+24|shipped|GitOps for ACLs
+25|missing|Device posture
+26|partial|SSO with IdP
+27|partial|Custom OIDC provider
+28|partial|Node key expiry / auth period
+29|partial|Key / SVID rotation UX
+30|shipped|Revocation / device removal
+31|shipped|Device approval
+32|missing|User approval
+33|shipped|Auth keys (headless 등록)
+34|partial|Ephemeral nodes
+35|shipped|OAuth clients / API tokens
+36|missing|SCIM provisioning
+37|partial|Tailnet Lock
+38|shipped|Node sharing
+39|missing|Admin roles
+40|partial|Tailscale SSH
+41|partial|SSH session recording
+42|missing|SSH console (browser)
+43|partial|Serve
+44|partial|Funnel
+45|shipped|Taildrop
+46|partial|tsnet embedding
+47|missing|Services (VIP)
+48|partial|Aperture (AI agent governance)
+49|shipped|Configuration audit logs
+50|partial|Network flow logs
+51|shipped|Log streaming (SIEM)
+52|shipped|Webhooks
+53|shipped|status / netcheck / ping / metrics
+54|partial|Linux client
+55|partial|macOS client
+56|missing|Windows client
+57|missing|iOS / Android
+58|shipped|Docker image
+59|missing|Kubernetes operator
+60|partial|Install / release / auto-update
+61|partial|CLI UX (login/up/down)
+62|shipped|Admin CLI / console
+63|missing|REST API / Terraform
+64|missing|MDM / system policies
+65|missing|Multiple tailnets

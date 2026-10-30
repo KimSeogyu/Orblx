@@ -16,6 +16,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 SWEEP = os.path.join(HERE, "..", "release-sweep.sh")
 REAL_MANIFEST = os.path.join(HERE, "..", "sweep-manifest.txt")
+REAL_ROWS = os.path.join(HERE, "..", "..", "..", "docs", "matrix-rows.txt")
 
 PROOFS = {
     "ok.sh": "echo step one\necho proof_ok\n",
@@ -84,10 +85,25 @@ class ReleaseSweepTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp)
 
-    def run_sweep(self, manifest, only=None, mode=None, plan=False, min_free_gb=None):
+    @staticmethod
+    def rows_for(manifest):
+        """The rows file that matches MANIFEST: each row line shipped, each partial line partial."""
+        out = []
+        for line in manifest.splitlines():
+            kind = line.split("|")[0]
+            if kind in ("row", "partial"):
+                status = "shipped" if kind == "row" else "partial"
+                out.append("%s|%s|%s" % (line.split("|")[1], status, line.split("|")[2]))
+        return "# test rows\n" + "\n".join(out) + "\n"
+
+    def run_sweep(self, manifest, only=None, mode=None, plan=False, min_free_gb=None, rows=None):
         path = os.path.join(self.tmp, "manifest.txt")
         with open(path, "w") as f:
             f.write(manifest)
+        # W25-27: the rows file. By default the test root has one that matches the manifest.
+        os.makedirs(os.path.join(self.root, "docs"), exist_ok=True)
+        with open(os.path.join(self.root, "docs", "matrix-rows.txt"), "w") as f:
+            f.write(self.rows_for(manifest))
         env = dict(os.environ)
         env.update({
             "ORBLX_SWEEP_TEST_ROOT": self.root,
@@ -103,6 +119,11 @@ class ReleaseSweepTest(unittest.TestCase):
             env["ORBLX_SWEEP_LOCK_MODE"] = mode
         if min_free_gb is not None:
             env["ORBLX_SWEEP_MIN_FREE_GB"] = min_free_gb
+        if rows is not None:
+            rows_path = os.path.join(self.tmp, "rows.txt")
+            with open(rows_path, "w") as f:
+                f.write(rows)
+            env["ORBLX_SWEEP_ROWS"] = rows_path
         args = ["bash", SWEEP] + (["--plan"] if plan else []) + ["testsha"]
         return subprocess.run(args, env=env, capture_output=True, text=True)
 
@@ -238,15 +259,84 @@ class ReleaseSweepTest(unittest.TestCase):
         with open(REAL_MANIFEST) as f:
             lines = [l.rstrip("\n") for l in f if l.strip() and not l.startswith("#")]
         rows = {l.split("|")[1]: l.split("|")[3] for l in lines if l.startswith("row|")}
+        partial = {l.split("|")[1]: l.split("|")[3] for l in lines if l.startswith("partial|")}
         proofs = {l.split("|")[1] for l in lines if l.startswith("proof|")}
-        for row in ["1", "9", "10", "11", "16", "17", "19", "21", "24", "28", "29", "30", "31", "33", "35",
-                    "38", "40", "41", "45", "49", "51", "52", "53", "54", "58", "61", "62"]:
-            self.assertIn(row, rows)
-        self.assertIn("policy-sync", rows["17"].split())
-        for row, names in rows.items():
+        # W25-27: the shipped rows of docs/matrix-rows.txt (Page snapshot 2026-10-31 08:10 KST
+        # and the PO list). Rows 28 and 29 are not shipped: 28 has no sweep line, 29 is partial.
+        self.assertEqual(sorted(rows, key=int), ["19", "21", "24", "30", "31", "33", "35", "38", "45",
+                                                 "49", "51", "52", "53", "58", "62"])
+        self.assertEqual(sorted(partial, key=int), ["1", "9", "10", "11", "16", "17", "29", "40", "41",
+                                                    "54", "61"])
+        self.assertNotIn("28", rows)
+        self.assertNotIn("28", partial)
+        self.assertIn("policy-sync", partial["17"].split())
+        self.assertIn("svid-renew", partial["29"].split())
+        for row, names in list(rows.items()) + list(partial.items()):
+            self.assertNotEqual(names, "-", row)
             for name in names.split():
-                if name != "-":
-                    self.assertIn(name, proofs, row)
+                self.assertIn(name, proofs, row)
+
+    def test_the_real_manifest_matches_the_real_rows_file(self):
+        with open(REAL_ROWS) as f:
+            status = {l.split("|")[0]: l.split("|")[1] for l in f if l.strip() and not l.startswith("#")}
+        self.assertEqual(len(status), 65)
+        for row in ["1", "9", "10", "11", "16", "17", "28", "29", "40", "41", "43", "44", "54", "61"]:
+            self.assertEqual(status[row], "partial", row)
+        with open(REAL_MANIFEST) as f:
+            lines = [l.rstrip("\n") for l in f if l.strip() and not l.startswith("#")]
+        shipped = {l.split("|")[1] for l in lines if l.startswith("row|")}
+        self.assertEqual(shipped, {r for r, s in status.items() if s == "shipped"})
+        for l in lines:
+            if l.startswith("partial|"):
+                self.assertEqual(status[l.split("|")[1]], "partial", l)
+
+    def test_negative_rows_mismatch_stops_the_sweep_before_any_proof(self):
+        good_rows = self.rows_for(GOOD)
+        cases = [
+            # The manifest says shipped, the rows file says partial.
+            (good_rows.replace("3|shipped", "3|partial"), "row 3: manifest row, rows file partial"),
+            # The rows file has a shipped row with no manifest line.
+            (good_rows + "7|shipped|Seven\n", "row 7: rows file shipped, no manifest row line"),
+            # The manifest has a row that the rows file does not list.
+            (good_rows.replace("1|shipped|Mesh\n", ""), "row 1: manifest row, rows file not in the rows file"),
+        ]
+        for rows, want in cases:
+            for plan in (False, True):
+                shutil.rmtree(self.out, ignore_errors=True)
+                out = self.run_sweep(GOOD, rows=rows, plan=plan)
+                self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+                self.assertIn("rows mismatch", out.stderr)
+                self.assertIn(want, out.stderr)
+                self.assertFalse(os.path.exists(os.path.join(self.out, "rc3-sweep-testsha-ok.log")))
+        # A partial manifest line for a shipped row is a mismatch too.
+        out = self.run_sweep(GOOD.replace("row|3|", "partial|3|"), rows=good_rows)
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("row 3: manifest partial, rows file shipped", out.stderr)
+        # The same manifest with a matching rows file runs.
+        self.assertEqual(self.run_sweep(GOOD, rows=good_rows).returncode, 0)
+
+    def test_no_rows_file_or_a_bad_one_is_a_setup_error(self):
+        out = self.run_sweep(GOOD, rows="")
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        out = self.run_sweep(GOOD, rows=self.rows_for(GOOD) + "4|done|Bad status\n")
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("rows: bad status", out.stderr)
+        out = self.run_sweep(GOOD, rows=self.rows_for(GOOD) + "1|shipped|Twice\n")
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("row 1 is listed twice", out.stderr)
+
+    def test_a_partial_row_runs_its_proofs_and_reports_them(self):
+        manifest = GOOD + "partial|29|SVID|lock\n"
+        out = self.run_sweep(manifest)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.rows()[("29 (partial)", "lock")][3], "proof_ok")
+        with open(os.path.join(self.root, "scripts", "proof", "lock.sh"), "w") as f:
+            f.write("#!/usr/bin/env bash\necho 'FAIL: injected'\nexit 1\n")
+        out = self.run_sweep(manifest)
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("Failed rows: 3, 29.", self.table())
+        # A partial row with no proof is not a sweep row.
+        self.assertEqual(self.run_sweep(GOOD + "partial|28|Key expiry|-\n").returncode, 2)
 
 
 if __name__ == "__main__":

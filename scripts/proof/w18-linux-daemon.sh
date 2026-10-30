@@ -2,12 +2,19 @@
 # Run three orblx nodes in Docker.
 # Each node pings the other two overlay addresses.
 # One container then restarts and keeps the same overlay IP.
+# W25-27: a coordinator container issues the node SVIDs and tickets through the
+# normal enroll path (orblx coord enroll). The proof uses no lab tickets.
+# W18_SVID_TTL=SECONDS sets the coordinator SVID and ticket life (1 to 900; empty
+# means the default 900 s). W18_TICKET_ENDS=N (default 0) adds a ping window that
+# crosses N or more ticket ends with no lost peer.
 # The script stops with exit 1 when it is not root.
 # The script needs Docker and a built orblx binary.
 
 set -euo pipefail
 # shellcheck source=scripts/proof/pipe-lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
+# shellcheck source=scripts/proof/enroll-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/enroll-lib.sh"
 # W25-14: this proof needs root. It stops at once without root.
 require_root "$@"
 
@@ -27,6 +34,17 @@ compose_file="$root/scripts/proof/compose.w18.yml"
 work=$(mktemp -d)
 env_file=""
 image_dir=""
+coord_addr="172.28.18.10:443"
+svid_ttl="${W18_SVID_TTL:-}"
+ticket_ends_want="${W18_TICKET_ENDS:-0}"
+if [[ -n "$svid_ttl" && ! "$svid_ttl" =~ ^[1-9][0-9]*$ ]] || [[ -n "$svid_ttl" && "$svid_ttl" -gt 900 ]]; then
+  echo "W18_SVID_TTL must be from 1 to 900 seconds."
+  exit 1
+fi
+if [[ ! "$ticket_ends_want" =~ ^[0-9]+$ ]]; then
+  echo "W18_TICKET_ENDS must be a whole number."
+  exit 1
+fi
 
 require_toolchain() {
   if ! command -v cargo >/dev/null 2>&1; then
@@ -102,12 +120,7 @@ source "$root/scripts/proof/stage-image.sh"
 image_dir="$(stage_proof_image "$root" "$bin")"
 docker build -t orblx-w18:local "$image_dir"
 
-mkdir -p "$work/a" "$work/b" "$work/c"
-"$bin" node-issue \
-  --out "$work" \
-  --node a=100.64.0.1 \
-  --node b=100.64.0.2 \
-  --node c=100.64.0.3
+mkdir -p "$work/coord" "$work/a" "$work/b" "$work/c"
 
 write_netmap() {
   local path=$1
@@ -155,8 +168,21 @@ W18_STATE_C=$work/c
 W18_NETMAP_A=$work/netmap-a.json
 W18_NETMAP_B=$work/netmap-b.json
 W18_NETMAP_C=$work/netmap-c.json
+W18_COORD_STATE=$work/coord
+W18_SVID_TTL=$svid_ttl
 EOF
 echo "env_file ${env_file}"
+
+echo "=== [C] start coordinator ==="
+compose up -d coord
+proof_coord_wait_bundle "$work/coord"
+for name in a b c; do
+  compose exec -T coord orblx coord token create --state /var/lib/orblx --ttl 3600 --out "/var/lib/orblx/tokens/${name}"
+done
+proof_coord_enroll "$bin" "$coord_addr" "$work/coord" "$work/coord/tokens/a" a "$work/a" 172.28.18.11:443 100.64.0.1
+proof_coord_enroll "$bin" "$coord_addr" "$work/coord" "$work/coord/tokens/b" b "$work/b" 172.28.18.12:443 100.64.0.2
+proof_coord_enroll "$bin" "$coord_addr" "$work/coord" "$work/coord/tokens/c" c "$work/c" 172.28.18.13:443 100.64.0.3
+proof_ticket_guard coord "$work/a" "$work/b" "$work/c"
 
 compose up -d --remove-orphans
 
@@ -253,5 +279,103 @@ ping_peer node-a 100.64.0.2
 ping_peer node-b 100.64.0.1
 ping_peer node-b 100.64.0.3
 ping_peer node-c 100.64.0.2
+
+# W25-27: ping every peer pair across W18_TICKET_ENDS ticket ends.
+# A ticket ends at its expires time plus 60 s clock skew. The window ends 15 s after the
+# Nth end of the latest ticket on disk, so every node crosses N or more ends of the
+# tickets it holds. A pair with a 2 s gap or more than 3 lost pings is a lost peer.
+cross_pair() {
+  local node=$1
+  local ip=$2
+  local secs=$3
+  local out=$4
+  compose exec -T "$node" ping -n -D -O -i 1 -W 1 -w "$secs" "$ip" >"$out" 2>&1 || true
+}
+
+cross_lost() {
+  local out=$1
+  awk '
+    /packets transmitted/ { sent = $1; got = $4; seen = 1 }
+    /no answer/ { run++; if (run > max) max = run; next }
+    /bytes from/ { run = 0 }
+    END {
+      if (!seen) { print "no_summary"; exit }
+      if (max >= 2 || got < sent - 3) { printf "lost sent %d received %d max_gap %d\n", sent, got, max; exit }
+      printf "ok sent %d received %d max_gap %d\n", sent, got, max
+    }
+  ' "$out"
+}
+
+if [[ "$ticket_ends_want" -gt 0 ]]; then
+  ttl_used="${svid_ttl:-900}"
+  latest=0
+  for name in a b c; do
+    expires=$(proof_ticket_expires "$work/$name")
+    if [[ "$expires" -gt "$latest" ]]; then
+      latest=$expires
+    fi
+  done
+  window_start=$(date +%s)
+  window_end=$((latest + 60 + (ticket_ends_want - 1) * ttl_used + 15))
+  window_secs=$((window_end - window_start))
+  echo "---- ticket ends ----"
+  echo "ticket_ttl_s ${ttl_used}"
+  echo "ticket_ends_want ${ticket_ends_want}"
+  echo "ticket_window_s ${window_secs}"
+  pids=()
+  for pair in "node-a 100.64.0.2" "node-a 100.64.0.3" "node-b 100.64.0.1" "node-b 100.64.0.3" "node-c 100.64.0.1" "node-c 100.64.0.2"; do
+    read -r node ip <<<"$pair"
+    cross_pair "$node" "$ip" "$window_secs" "$work/cross-${node}-${ip}.txt" &
+    pids+=("$!")
+  done
+  # Record the ticket each node has on disk while the pings run.
+  : >"$work/cross-expires.txt"
+  while [[ "$(date +%s)" -lt "$window_end" ]]; do
+    for name in a b c; do
+      echo "$name $(proof_ticket_expires "$work/$name")" >>"$work/cross-expires.txt"
+    done
+    sleep 5
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid"
+  done
+  lost_peers=0
+  for pair in "node-a 100.64.0.2" "node-a 100.64.0.3" "node-b 100.64.0.1" "node-b 100.64.0.3" "node-c 100.64.0.1" "node-c 100.64.0.2"; do
+    read -r node ip <<<"$pair"
+    result=$(cross_lost "$work/cross-${node}-${ip}.txt")
+    echo "ticket_cross ${node} to ${ip} ${result}"
+    if [[ "$result" != ok* ]]; then
+      lost_peers=$((lost_peers + 1))
+      cat "$work/cross-${node}-${ip}.txt"
+    fi
+  done
+  min_ends=""
+  for name in a b c; do
+    ends=$(awk -v n="$name" -v s="$window_start" -v e="$window_end" '
+      $1 == n && !seen[$2]++ && $2 + 60 >= s && $2 + 60 <= e { c++ }
+      END { print c + 0 }
+    ' "$work/cross-expires.txt")
+    echo "ticket_ends_crossed ${name} ${ends}"
+    if [[ -z "$min_ends" || "$ends" -lt "$min_ends" ]]; then
+      min_ends=$ends
+    fi
+  done
+  echo "ticket_cross_lost_peers ${lost_peers}"
+  if [[ "$min_ends" -lt "$ticket_ends_want" ]]; then
+    echo "A node crossed ${min_ends} ticket ends, fewer than ${ticket_ends_want}."
+    exit 1
+  fi
+  if [[ "$lost_peers" -ne 0 ]]; then
+    echo "${lost_peers} peer pairs lost the path across the ticket ends."
+    exit 1
+  fi
+  wait_direct node-a b
+  wait_direct node-a c
+  wait_direct node-b a
+  wait_direct node-b c
+  wait_direct node-c a
+  wait_direct node-c b
+  echo "ticket_cross_ok true"
+fi
 
 echo "W18 proof passed"

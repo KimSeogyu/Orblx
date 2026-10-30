@@ -6,6 +6,8 @@
 # The proof then removes corp.lan from the policy and prints the time to the new answer.
 # The script deletes the proof containers at the start and at the end.
 # The script does not print enroll tokens or private keys.
+# W25-27: the router, a, and c run on the state from the coordinator enroll
+# (SVID, ticket, signed grants). No lab tickets.
 set -euo pipefail
 # shellcheck source=scripts/proof/pipe-lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
@@ -206,17 +208,11 @@ c_ip="$(overlay_of c "$SPLIT_A_NETMAP")"
 echo "overlay router ${router_ip} a ${a_ip} c ${c_ip}"
 
 echo "=== [C] node material ==="
-"$ROOT/target/debug/orblx" node-issue \
-  --out "$WORK/nodes" \
-  --node "router=${router_ip}" \
-  --node "a=${a_ip}" \
-  --node "c=${c_ip}" >/dev/null
-cp -a "$WORK/nodes/router/." "$SPLIT_ROUTER_STATE/"
 # W24-A: the router uses the signed grants, so the port ACL covers its subnet route.
-cat "$WORK/enroll-router/netmap.pub" > "$SPLIT_ROUTER_STATE/netmap.pub"
-cat "$WORK/enroll-router/grants.signed.json" > "$SPLIT_ROUTER_STATE/grants.signed.json"
-cp -a "$WORK/nodes/a/." "$SPLIT_A_STATE/"
-cp -a "$WORK/nodes/c/." "$SPLIT_C_STATE/"
+cp -a "$WORK/enroll-router/." "$SPLIT_ROUTER_STATE/"
+cp -a "$WORK/enroll-a/." "$SPLIT_A_STATE/"
+cp -a "$WORK/enroll-c/." "$SPLIT_C_STATE/"
+proof_ticket_guard coord "$SPLIT_ROUTER_STATE" "$SPLIT_A_STATE" "$SPLIT_C_STATE"
 
 echo "=== [C] start sysdns, landns, db, router, a, c, fetch-a ==="
 dc --profile nodes up -d sysdns landns db router a c fetch-a

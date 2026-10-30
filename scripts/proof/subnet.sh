@@ -5,6 +5,8 @@
 # A client container reaches a LAN device that has no overlay.
 # The script deletes the orblx-subnet-proof containers at the start.
 # The script does not print enroll tokens or private keys.
+# W25-27: the router and the client run on the state from the coordinator enroll
+# (SVID, ticket, signed grants). No lab tickets.
 # The Mac steps stay in docs/w18-subnet.md. This script does not run them.
 set -euo pipefail
 # shellcheck source=scripts/proof/pipe-lib.sh
@@ -182,13 +184,9 @@ if [[ -z "$router_ip" || -z "$client_ip" ]]; then
 fi
 
 echo "=== [C] node material ==="
-cargo build -p orblx-cli --bin orblx
-"$ROOT/target/debug/orblx" node-issue \
-  --out "$WORK/nodes" \
-  --node "router=${router_ip}" \
-  --node "client=${client_ip}"
-cp -a "$WORK/nodes/router/." "$SUBNET_ROUTER_STATE/"
-cp -a "$WORK/nodes/client/." "$SUBNET_CLIENT_STATE/"
+cp -a "$WORK/enroll-router/." "$SUBNET_ROUTER_STATE/"
+cp -a "$WORK/enroll-client/." "$SUBNET_CLIENT_STATE/"
+proof_ticket_guard coord "$SUBNET_ROUTER_STATE" "$SUBNET_CLIENT_STATE"
 
 echo "=== [C] start lan, router, and client ==="
 dc --profile nodes up -d lan router client
