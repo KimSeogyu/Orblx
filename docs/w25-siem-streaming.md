@@ -129,7 +129,7 @@ Branch run: 2026-10-31 01:12 to 01:14 KST, commit `1013d94`, log `w25-m-siem-str
 | 4. SIGKILL restart | 104 records waiting. The cursors (`next` 1341) were the same after the restart. Each sink got 106 of 106 (records 1341..1446), 0 gaps, 0 duplicates. Final: 1447 records in each sink, `arrivals.jsonl` 1447 lines (no duplicate body). | [C] |
 | 5. TLS certificate check | Sink `bad`: 0 records received, 28 server handshake failures, 28 coordinator `tls` failures, 1 `sink-error` record. | [C] |
 | 6. Owner only; credential files only | Token `policy:write`: remove, add, and change a sink each get 403; the same sinks with a new ACL gets 200; 3 `token-deny` records with reason `sinks`. Credential hits 0 in the coordinator state, the 9 sink output files, 3657 container log lines, 1452 audit records, the policy, and the proof log. The control check found 3 of 3 credential files and 2 of 2 token files. | [C] |
-| 7. W23-4 nat-realism | See below. | [C] |
+| 7. W23-4 nat-realism | `proof_ok` (commit `fc474cc`, log `w25-m-nat-realism-branch-fc474cc.log`). Direct RTT avg 1.097 ms (limit 5 ms). Relay RTT avg prc_prc 1.338 ms, sym_sym 1.463 ms, lost 0/50. All path switches `limits_ok true`. | [C] |
 
 Notes:
 
