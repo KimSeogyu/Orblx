@@ -160,8 +160,12 @@ EOF
   wait_direct node-a b || return 1
   wait_direct node-b a || return 1
   echo "run ${i} ping start $(proof_lock_now) count $((SECS * 20)) interval ${INTERVAL}"
+  host_sample >"$OUT/run${i}.host.tsv" &
+  local sampler=$!
   dc exec -T node-a ping -n -D -O -i "$INTERVAL" -c "$((SECS * 20))" -W 1 100.64.0.2 \
     >"$OUT/run${i}.ping" 2>&1
+  kill "$sampler" 2>/dev/null
+  wait "$sampler" 2>/dev/null
   for name in node-a node-b; do
     dc logs --timestamps --no-log-prefix "$name" 2>/dev/null \
       | awk -v n="$name" '/The node renewed the SVID/ {print "svid_renewal " n " " $1}' >>"$OUT/run${i}.renewals"
@@ -172,6 +176,28 @@ EOF
     fi
   done
   return 0
+}
+
+# Host load each second during the pings (epoch, CPU busy percent, runnable tasks, 1 min load).
+# A spike with a busy host is contention, not renewal. The gate does not use this file.
+host_sample() {
+  local prev_total=0 prev_idle=0
+  echo -e "epoch\tcpu_busy_pct\tprocs_running\tload1"
+  while :; do
+    local line total idle running load
+    line=$(head -1 /proc/stat)
+    read -r _ u n sy id io irq sirq st _ <<<"$line"
+    total=$((u + n + sy + id + io + irq + sirq + st))
+    idle=$((id + io))
+    running=$(awk '/^procs_running/ {print $2}' /proc/stat)
+    load=$(cut -d' ' -f1 /proc/loadavg)
+    if [[ "$prev_total" -gt 0 && "$total" -gt "$prev_total" ]]; then
+      echo -e "$(date +%s.%3N)\t$((100 * ((total - prev_total) - (idle - prev_idle)) / (total - prev_total)))\t${running}\t${load}"
+    fi
+    prev_total=$total
+    prev_idle=$idle
+    sleep 1
+  done
 }
 
 status=0
