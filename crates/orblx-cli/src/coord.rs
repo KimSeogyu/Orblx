@@ -10,8 +10,8 @@ use orblx_identity::{OidcMode, GOOGLE_CLIENT_ID_ENV, MAX_USER_TTL};
 use super::{parse_socket, take_value};
 use orblx_coord::{
     advertise_routes_blocking, enroll_with_oidc_blocking, enroll_with_token_blocking,
-    fetch_netmap_blocking, oidc_config, serve_blocking, CoordConfig, Coordinator, OidcConfig,
-    OidcEnroll,
+    fetch_netmap_blocking, fetch_policy_wait_blocking, oidc_config, serve_blocking, CoordConfig,
+    Coordinator, OidcConfig, OidcEnroll,
 };
 
 const DEFAULT_PORT: u16 = 443;
@@ -59,6 +59,8 @@ pub(crate) enum Command {
         coord_name: String,
         bundle: PathBuf,
         state: PathBuf,
+        /// W25-6: keep the files current with `policy-wait`.
+        watch: bool,
     },
     Advertise {
         coord: SocketAddr,
@@ -258,9 +260,13 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             coord_name,
             bundle,
             state,
+            watch,
         } => {
             let bundle_pem = fs::read_to_string(&bundle)
                 .map_err(|err| format!("The file {} did not open. {err}", bundle.display()))?;
+            if watch {
+                return watch_netmap(coord, &coord_name, &bundle_pem, &state);
+            }
             let view = fetch_netmap_blocking(coord, &coord_name, &bundle_pem, &state)
                 .map_err(|err| err.to_string())?;
             println!("netmap");
@@ -275,6 +281,40 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             println!("endpoints_ok {}", view.endpoints.len());
             println!("grants {}", view.signed_grants.grants.grants.len());
             Ok(())
+        }
+    }
+}
+
+/// Keep the netmap files of `state` current with `policy-wait` (W25-6).
+///
+/// The command prints one `policy_update UNIX_MS` line for each new netmap, grant set,
+/// or deny list. It stops only on a signal.
+fn watch_netmap(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state: &std::path::Path,
+) -> Result<(), String> {
+    let mut etag: Option<String> = None;
+    loop {
+        match fetch_policy_wait_blocking(coord, coord_name, bundle_pem, state, etag.as_deref()) {
+            Ok(sync) => {
+                if etag.as_deref() != Some(sync.etag.as_str()) {
+                    sync.view
+                        .write_state(state)
+                        .map_err(|err| err.public_text())?;
+                    let unix_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |since| since.as_millis());
+                    println!("policy_update {unix_ms}");
+                }
+                etag = Some(sync.etag);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(err) => {
+                eprintln!("The policy wait failed. {}", err.public_text());
+                std::thread::sleep(Duration::from_secs(1));
+            }
         }
     }
 }
@@ -522,6 +562,7 @@ fn parse_advertise(args: &[String]) -> Result<Command, String> {
 }
 
 fn parse_netmap(args: &[String]) -> Result<Command, String> {
+    let mut watch = false;
     let mut coord = None;
     let mut coord_name = None;
     let mut bundle = None;
@@ -530,6 +571,10 @@ fn parse_netmap(args: &[String]) -> Result<Command, String> {
     while index < args.len() {
         let flag = args[index].as_str();
         index += 1;
+        if flag == "--watch" {
+            watch = true;
+            continue;
+        }
         let value = take_value(args, &mut index)?;
         match flag {
             "--coord" => coord = Some(parse_socket(&value, DEFAULT_PORT)?),
@@ -540,6 +585,7 @@ fn parse_netmap(args: &[String]) -> Result<Command, String> {
         }
     }
     Ok(Command::Netmap {
+        watch,
         coord: coord.ok_or_else(|| "The command needs --coord.".to_string())?,
         coord_name: coord_name.unwrap_or_else(|| "coord".to_string()),
         bundle: bundle.ok_or_else(|| "The command needs --bundle.".to_string())?,
@@ -553,7 +599,7 @@ orblx coord serve --state DIR [--listen ADDR] [--name NAME] [--policy FILE] [--c
 orblx coord token create --state DIR --out FILE [--ttl SECS]
 orblx coord enroll --name NAME --coord ADDR --bundle FILE (--token-file FILE | --id-token-file FILE [--nonce HEX]) --state DIR [--coord-name NAME] [--endpoint HOST:PORT] [--route CIDR]
 orblx coord advertise --coord ADDR --bundle FILE --state DIR [--route CIDR]... [--exit-node on|off] [--coord-name NAME]
-orblx coord netmap --coord ADDR --bundle FILE --state DIR [--coord-name NAME]
+orblx coord netmap --coord ADDR --bundle FILE --state DIR [--coord-name NAME] [--watch]
 
 The coordinator listens with QUIC.
 The default listen address is 0.0.0.0:443.
