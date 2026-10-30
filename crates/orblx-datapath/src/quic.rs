@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -73,12 +74,24 @@ impl HelloConfig {
 struct Auth {
     trust: TrustBundle,
     deny: SharedDeny,
+    allow: SharedAllow,
     ticket_bytes: Vec<u8>,
     ticket_mac: [u8; 32],
     ticket_ring: TicketRing,
 }
 
 type SharedDeny = Arc<Mutex<DenySet>>;
+
+/// The SPIFFE IDs that may open a session. None allows every trusted leaf.
+type SharedAllow = Arc<Mutex<Option<HashSet<String>>>>;
+
+fn allowed(allow: &SharedAllow, peer: &str) -> bool {
+    allow
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .is_none_or(|set| set.contains(peer))
+}
 
 fn deny_now(deny: &SharedDeny) -> DenySet {
     deny.lock().unwrap_or_else(|err| err.into_inner()).clone()
@@ -186,6 +199,19 @@ impl HelloEndpoint {
     pub fn replace_deny(&self, deny: DenySet) {
         let mut slot = self.auth.deny.lock().unwrap_or_else(|err| err.into_inner());
         *slot = deny;
+    }
+
+    /// Replace the peer allow list for new sessions (W23-1 node lock).
+    ///
+    /// None allows every peer with a trusted leaf. With a set, the endpoint closes
+    /// a new connection from a peer outside the set before the ticket exchange.
+    pub fn replace_allow(&self, allow: Option<HashSet<String>>) {
+        let mut slot = self
+            .auth
+            .allow
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        *slot = allow;
     }
 
     /// Close the UDP socket.
@@ -592,6 +618,10 @@ async fn bind_session(
         return Err(err);
     }
     let peer = gate.peer().cloned().ok_or(HelloError::PeerNotBound)?;
+    if !allowed(&auth.allow, peer.as_uri()) {
+        reject(&connection);
+        return Err(HelloError::NodeLock(peer.as_uri().to_string()));
+    }
     let peer_not_after = leaf_not_after(&leaf).map_err(HelloError::Identity)?;
     let (mut send, mut recv) = open_stream(&connection, role).await?;
     if let Err(err) = exchange_ticket(&mut send, &mut recv, role, auth, &mut gate).await {
@@ -820,6 +850,7 @@ fn auth_from(config: &HelloConfig) -> Auth {
     Auth {
         trust: config.trust.clone(),
         deny: Arc::new(Mutex::new(config.deny.clone())),
+        allow: Arc::new(Mutex::new(None)),
         ticket_bytes: config.ticket_bytes.clone(),
         ticket_mac: config.ticket_mac,
         ticket_ring: config.ticket_ring.clone(),

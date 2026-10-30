@@ -1,0 +1,26 @@
+{
+  // Node lock proof (W23-1).
+  // The ACL allows TCP between all five nodes. Node lock is the gate in this proof.
+  "nodeApproval": true,
+  "owners": ["spiffe://orblx.local/node/owner"],
+  "acls": [
+    {
+      "action": "accept",
+      "src": [
+        "spiffe://orblx.local/node/a",
+        "spiffe://orblx.local/node/b",
+        "spiffe://orblx.local/node/c",
+        "spiffe://orblx.local/node/ak2",
+        "spiffe://orblx.local/node/arogue",
+      ],
+      "proto": "tcp",
+      "dst": [
+        "spiffe://orblx.local/node/a:*",
+        "spiffe://orblx.local/node/b:*",
+        "spiffe://orblx.local/node/c:*",
+        "spiffe://orblx.local/node/ak2:*",
+        "spiffe://orblx.local/node/arogue:*",
+      ],
+    },
+  ],
+}

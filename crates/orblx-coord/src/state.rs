@@ -697,6 +697,163 @@ impl Coordinator {
         record(&mut inner, actor, action, target, before, after, detail)
     }
 
+    /// Set up node lock with the first trusted owner keys (W23-1).
+    ///
+    /// The call fails when node lock is already set up.
+    pub fn lock_init(&self, keys: &[String], actor: &str) -> Result<serde_json::Value, CoordError> {
+        let mut inner = self.lock()?;
+        let dir = inner.state_dir.clone();
+        let mut store = crate::nodelock::read_store(&dir)?;
+        if store.enabled() {
+            return Err(CoordError::Protocol(
+                "Node lock is already set up.".to_string(),
+            ));
+        }
+        let state = crate::nodelock::LockState::genesis(keys)?;
+        let before = crate::nodelock::store_digest(&dir)?;
+        store.genesis = state.keys.clone();
+        crate::nodelock::write_store(&dir, &store)?;
+        let after = crate::nodelock::store_digest(&dir)?;
+        let prints = fingerprints(&state.keys);
+        record(
+            &mut inner,
+            actor,
+            ConfigAction::LockInit,
+            "node-lock",
+            before,
+            after,
+            &format!("version 0 keys {} fp {prints}", state.keys.len()),
+        )?;
+        Ok(lock_value("lock-init", &store, &state))
+    }
+
+    /// Store one owner signature for one node (W23-1).
+    ///
+    /// The coordinator checks the signature with the current trusted keys.
+    pub fn lock_sign(
+        &self,
+        name: &str,
+        sig: orblx_datapath::NodeLockSig,
+        actor: &str,
+    ) -> Result<serde_json::Value, CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        let dir = inner.state_dir.clone();
+        let mut store = crate::nodelock::read_store(&dir)?;
+        if !store.enabled() {
+            return Err(CoordError::Protocol("Node lock is not set up.".to_string()));
+        }
+        let state = store.current()?;
+        let node = inner
+            .store
+            .nodes()
+            .into_iter()
+            .find(|node| node.name == name)
+            .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        let peer = NetmapPeer {
+            name: node.name.clone(),
+            overlay_ip: node.overlay_ip.clone(),
+            svid: node.svid.clone(),
+            endpoints: Vec::new(),
+            routes: Vec::new(),
+            exit_node: false,
+            owner: String::new(),
+            lock_sig: Some(sig.clone()),
+        };
+        if !state.verify_peer(&peer) {
+            return Err(CoordError::Protocol(
+                "A trusted owner key did not sign this node.".to_string(),
+            ));
+        }
+        let before = crate::nodelock::store_digest(&dir)?;
+        let fp = crate::nodelock::fingerprint(&sig.key_id);
+        store.sigs.insert(node.name.clone(), sig);
+        crate::nodelock::write_store(&dir, &store)?;
+        let after = crate::nodelock::store_digest(&dir)?;
+        record(
+            &mut inner,
+            actor,
+            ConfigAction::LockSign,
+            &node.name,
+            before,
+            after,
+            &format!("version {} key fp {fp}", state.version),
+        )?;
+        let mut value = lock_value("lock-sign", &store, &state);
+        value["name"] = serde_json::Value::String(node.name);
+        Ok(value)
+    }
+
+    /// Add one owner key update (W23-1).
+    ///
+    /// The coordinator checks the chain and the signature with the current trusted keys.
+    pub fn lock_update(
+        &self,
+        update: orblx_datapath::LockUpdate,
+        actor: &str,
+    ) -> Result<serde_json::Value, CoordError> {
+        let mut inner = self.lock()?;
+        let dir = inner.state_dir.clone();
+        let mut store = crate::nodelock::read_store(&dir)?;
+        if !store.enabled() {
+            return Err(CoordError::Protocol("Node lock is not set up.".to_string()));
+        }
+        let current = store.current()?;
+        let next = current.apply(&update)?;
+        let action = if update.action == crate::nodelock::ACTION_ROTATE {
+            ConfigAction::LockRotate
+        } else {
+            ConfigAction::LockRemove
+        };
+        let removed: Vec<String> = current
+            .keys
+            .iter()
+            .filter(|key| !next.keys.contains(key))
+            .cloned()
+            .collect();
+        let added: Vec<String> = next
+            .keys
+            .iter()
+            .filter(|key| !current.keys.contains(key))
+            .cloned()
+            .collect();
+        let before = crate::nodelock::store_digest(&dir)?;
+        store.updates.push(update.clone());
+        crate::nodelock::write_store(&dir, &store)?;
+        let after = crate::nodelock::store_digest(&dir)?;
+        let mut detail = format!(
+            "version {} keys {} signer fp {} removed fp {}",
+            next.version,
+            next.keys.len(),
+            crate::nodelock::fingerprint(&update.signer),
+            fingerprints(&removed)
+        );
+        if !added.is_empty() {
+            detail.push_str(&format!(" added fp {}", fingerprints(&added)));
+        }
+        record(
+            &mut inner,
+            actor,
+            action,
+            "node-lock",
+            before,
+            after,
+            &detail,
+        )?;
+        Ok(lock_value(action.as_str(), &store, &next))
+    }
+
+    /// Return the node lock view (W23-1). The view holds public keys only.
+    pub fn lock_show(&self) -> Result<serde_json::Value, CoordError> {
+        let inner = self.lock()?;
+        let store = crate::nodelock::read_store(&inner.state_dir)?;
+        if !store.enabled() {
+            return Ok(serde_json::json!({"op": "lock", "enabled": false}));
+        }
+        let state = store.current()?;
+        Ok(lock_value("lock", &store, &state))
+    }
+
     /// Return the config chain text.
     ///
     /// The text is empty when the file does not exist.
@@ -940,6 +1097,38 @@ fn record_policy(
     }
 }
 
+fn fingerprints(keys: &[String]) -> String {
+    let prints: Vec<String> = keys
+        .iter()
+        .map(|key| crate::nodelock::fingerprint(key))
+        .collect();
+    if prints.is_empty() {
+        "none".to_string()
+    } else {
+        prints.join(",")
+    }
+}
+
+fn lock_value(
+    op: &str,
+    store: &crate::nodelock::LockStore,
+    state: &crate::nodelock::LockState,
+) -> serde_json::Value {
+    let signed: Vec<serde_json::Value> = store
+        .sigs
+        .iter()
+        .map(|(name, sig)| serde_json::json!({"name": name, "key_id": sig.key_id}))
+        .collect();
+    serde_json::json!({
+        "op": op,
+        "enabled": true,
+        "version": state.version,
+        "head": state.head,
+        "keys": state.keys,
+        "signed": signed,
+    })
+}
+
 /// Append one record when the chain is open.
 fn record(
     inner: &mut Inner,
@@ -1174,6 +1363,7 @@ fn node_visible(node: &StoredNode) -> bool {
 }
 
 fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
+    let lock_store = crate::nodelock::read_store(&inner.state_dir)?;
     let nodes = inner.store.nodes();
     let self_node = nodes
         .iter()
@@ -1199,6 +1389,7 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
                 routes: published_routes(&inner.policy, &node.svid, &node.routes),
                 exit_node: published_exit(&inner.policy, &node.svid, node.exit_node),
                 owner: String::new(),
+                lock_sig: lock_store.sigs.get(&node.name).cloned(),
             });
         }
     }
@@ -1210,6 +1401,7 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
             owner: String::new(),
         },
         peers,
+        lock: lock_store.updates.clone(),
     };
     let signed_netmap = inner.netmap_key.sign_netmap(&payload)?;
     let receiver = SpiffeId::node(&self_node.name)?;
@@ -1429,7 +1621,11 @@ fn write_view(
     grants: &SignedGrants,
     endpoints: &[SignedEndpoint],
 ) -> Result<(), CoordError> {
-    let netmap_text = serde_json::to_string(&netmap.netmap)
+    let mut local = netmap.netmap.clone();
+    if let Some(report) = crate::nodelock::apply_node_lock(dir, &mut local)? {
+        crate::nodelock::print_report(&report);
+    }
+    let netmap_text = serde_json::to_string(&local)
         .map_err(|_| CoordError::Protocol("The netmap is not valid.".to_string()))?;
     orblx_datapath::Netmap::from_slice(netmap_text.as_bytes())
         .map_err(|_| CoordError::Protocol("The netmap is not valid.".to_string()))?;

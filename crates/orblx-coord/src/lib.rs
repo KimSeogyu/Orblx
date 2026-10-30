@@ -23,6 +23,7 @@ mod ippool;
 #[cfg(test)]
 mod issuer_test;
 mod netmap;
+pub mod nodelock;
 mod proto;
 #[cfg(test)]
 mod renew_test;
