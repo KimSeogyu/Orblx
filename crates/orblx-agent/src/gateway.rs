@@ -4,11 +4,14 @@
 //! HTTP/1.x request per connection. The request must carry a use proof in the
 //! `Orblx-Agent-Proof` header and a 16-byte nonce in the `Orblx-Agent-Nonce`
 //! header. The proof is the W19 style proof from [`crate::seal_use`]. Its
-//! `extra` field binds the method, the request target, the nonce, and the
-//! SHA-256 of the body. The gateway refuses a second use of the same nonce
-//! with the same ticket, and a path outside the grant path prefix.
-//! The gateway removes the proof headers before it forwards the request.
-//! It does not log a header value or the query text.
+//! `extra` field binds the method, the request target, the HTTP version, the
+//! nonce, the SHA-256 of each request header except the proof header, and
+//! the SHA-256 of the body (label `orblx-gateway-v2`). A changed, added, or
+//! removed header fails the proof check. The gateway refuses a second use of
+//! the same nonce with the same ticket, and a path outside the grant path
+//! prefix. It keeps the used nonces in a nonce file apart from the audit
+//! chain. The gateway removes the proof headers before it forwards the
+//! request. It does not log a header value or the query text.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -30,7 +33,7 @@ use crate::AgentError;
 pub const PROOF_HEADER: &str = "orblx-agent-proof";
 /// The header that holds the request nonce in hex.
 pub const NONCE_HEADER: &str = "orblx-agent-nonce";
-const EXTRA_LABEL: &[u8] = b"orblx-gateway-v1\n";
+const EXTRA_LABEL: &[u8] = b"orblx-gateway-v2\n";
 const MAX_HEAD: usize = 48 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
 const MAX_TARGET: usize = 2048;
@@ -75,18 +78,79 @@ fn path_of(target: &str) -> &str {
     target.split(['?', '#']).next().unwrap_or("")
 }
 
-/// Return the bytes that the proof binds for one request.
+/// Return the header block that the proof binds.
+///
+/// The block has one `name:value\n` line for each header in order, except
+/// the proof header. Names are lowercase and values have no outer spaces,
+/// the same as in [`RequestHead::headers`].
 #[must_use]
-pub fn http_extra(method: &str, target: &str, nonce: &[u8; 16], body: &[u8]) -> Vec<u8> {
+pub fn header_block(headers: &[(String, String)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, value) in headers {
+        if name == PROOF_HEADER {
+            continue;
+        }
+        out.extend_from_slice(name.as_bytes());
+        out.push(b':');
+        out.extend_from_slice(value.as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Return the bytes that the proof binds for one request.
+///
+/// The bytes are `orblx-gateway-v2`, the method, the target, the HTTP
+/// version, the nonce in hex, the SHA-256 of [`header_block`] in hex, and the
+/// SHA-256 of the body in hex, each on its own line.
+#[must_use]
+pub fn http_extra(
+    method: &str,
+    target: &str,
+    version: &str,
+    nonce: &[u8; 16],
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Vec<u8> {
     let mut out = EXTRA_LABEL.to_vec();
-    out.extend_from_slice(method.as_bytes());
-    out.push(b'\n');
-    out.extend_from_slice(target.as_bytes());
-    out.push(b'\n');
-    out.extend_from_slice(encode_hex(nonce).as_bytes());
+    for part in [method, target, version, &encode_hex(nonce)] {
+        out.extend_from_slice(part.as_bytes());
+        out.push(b'\n');
+    }
+    out.extend_from_slice(encode_hex(&sha256_digest(&header_block(headers))).as_bytes());
     out.push(b'\n');
     out.extend_from_slice(encode_hex(&sha256_digest(body)).as_bytes());
     out
+}
+
+/// Headers that the caller cannot set. The gateway client sets them.
+const OWN_HEADERS: [&str; 6] = [
+    PROOF_HEADER,
+    NONCE_HEADER,
+    "host",
+    "connection",
+    "content-length",
+    "transfer-encoding",
+];
+
+/// Check and normalize one caller header: lowercase name, value without
+/// outer spaces. The error text does not hold the value.
+pub fn request_header(name: &str, value: &str) -> Result<(String, String), AgentError> {
+    let name = name.trim().to_ascii_lowercase();
+    let value = value.trim();
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        || OWN_HEADERS.contains(&name.as_str())
+        || name.starts_with("x-orblx-")
+        || value.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+    {
+        return Err(AgentError::Io(format!(
+            "The request header {name} is not valid."
+        )));
+    }
+    Ok((name, value.to_string()))
 }
 
 /// Return true when `path` is inside `prefix`.
@@ -120,6 +184,7 @@ pub fn seal_http_request(
     service: &str,
     method: &str,
     target: &str,
+    headers: &[(String, String)],
     body: &[u8],
     nonce: [u8; 16],
     now: SystemTime,
@@ -133,7 +198,16 @@ pub fn seal_http_request(
         service,
         port: to.port(),
     };
-    let extra = http_extra(method, target, &nonce, body);
+    let mut all = vec![
+        ("host".to_string(), to.to_string()),
+        ("connection".to_string(), "close".to_string()),
+        ("content-length".to_string(), body.len().to_string()),
+    ];
+    for (name, value) in headers {
+        all.push(request_header(name, value)?);
+    }
+    all.push((NONCE_HEADER.to_string(), encode_hex(&nonce)));
+    let extra = http_extra(method, target, "HTTP/1.1", &nonce, &all, body);
     let proof = seal_use(
         &files.key_pem,
         &files.cert_pem,
@@ -143,12 +217,12 @@ pub fn seal_http_request(
         &extra,
         now,
     )?;
-    let mut out = format!(
-        "{method} {target} HTTP/1.1\r\nHost: {to}\r\nConnection: close\r\nContent-Length: {}\r\n{PROOF_HEADER}: {proof}\r\n{NONCE_HEADER}: {}\r\n\r\n",
-        body.len(),
-        encode_hex(&nonce)
-    )
-    .into_bytes();
+    let mut out = format!("{method} {target} HTTP/1.1\r\n");
+    for (name, value) in &all {
+        out.push_str(&format!("{name}: {value}\r\n"));
+    }
+    out.push_str(&format!("{PROOF_HEADER}: {proof}\r\n\r\n"));
+    let mut out = out.into_bytes();
     out.extend_from_slice(body);
     Ok(out)
 }
@@ -206,16 +280,22 @@ pub fn send_http(to: SocketAddr, bytes: &[u8], timeout: Duration) -> std::io::Re
 
 /// Run the HTTP gateway until the process stops.
 pub fn run_gateway(config: GuardConfig, fetch: DenyFetch) -> Result<(), AgentError> {
+    let mut config = config;
+    let nonce_path = config
+        .nonce_path
+        .get_or_insert_with(|| crate::default_nonce_path(&config.audit_path))
+        .clone();
     let core = Arc::new(GuardCore::new(&config)?);
     let listener =
         TcpListener::bind(config.listen).map_err(|err| AgentError::Io(err.to_string()))?;
     spawn_poll(Arc::clone(&core), fetch, config.poll);
     println!(
-        "agent gateway service {} listen {} target {} nonces_loaded {}",
+        "agent gateway service {} listen {} target {} nonces_loaded {} nonce_file {}",
         config.service,
         config.listen,
         config.target,
-        core.seen_count()
+        core.seen_count(),
+        nonce_path.display()
     );
     let service = Arc::new(config.service.clone());
     let port = config.listen.port();
@@ -280,7 +360,9 @@ pub fn check_request(
     let extra = http_extra(
         &head.method,
         &head.target,
+        &head.version,
         &nonce.unwrap_or([0u8; 16]),
+        &head.headers,
         body,
     );
     let path = head.path().to_string();
@@ -495,7 +577,9 @@ fn read_body<R: Read>(reader: &mut BufReader<R>, head: &RequestHead) -> Result<V
 
 #[cfg(test)]
 mod tests {
-    use super::{forward_bytes, path_in_scope, read_head};
+    use super::{
+        forward_bytes, header_block, http_extra, path_in_scope, read_head, request_header,
+    };
     use std::io::BufReader;
 
     #[test]
@@ -528,6 +612,61 @@ mod tests {
             b"GET /x HTTP/1.1\r\n",
         ] {
             assert!(read_head(&mut BufReader::new(bad)).is_err());
+        }
+    }
+
+    #[test]
+    fn extra_binds_each_header_but_not_the_proof() {
+        let headers = |value: &str| {
+            vec![
+                ("host".to_string(), "100.64.0.2:8080".to_string()),
+                ("x-kind".to_string(), value.to_string()),
+                ("orblx-agent-proof".to_string(), "p".to_string()),
+            ]
+        };
+        let base = http_extra("GET", "/a", "HTTP/1.1", &[1; 16], &headers("read"), b"");
+        assert!(base.starts_with(b"orblx-gateway-v2\n"));
+        assert_ne!(
+            base,
+            http_extra("GET", "/a", "HTTP/1.1", &[1; 16], &headers("write"), b"")
+        );
+        assert_ne!(
+            base,
+            http_extra("GET", "/a", "HTTP/1.0", &[1; 16], &headers("read"), b"")
+        );
+        let mut added = headers("read");
+        added.push(("x-new".to_string(), "1".to_string()));
+        assert_ne!(
+            base,
+            http_extra("GET", "/a", "HTTP/1.1", &[1; 16], &added, b"")
+        );
+        let mut other_proof = headers("read");
+        other_proof[2].1 = "q".to_string();
+        assert_eq!(
+            base,
+            http_extra("GET", "/a", "HTTP/1.1", &[1; 16], &other_proof, b"")
+        );
+        assert_eq!(
+            header_block(&headers("read")),
+            b"host:100.64.0.2:8080\nx-kind:read\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn caller_headers_are_checked() {
+        assert_eq!(
+            request_header("X-Kind", " read ").expect("ok"),
+            ("x-kind".to_string(), "read".to_string())
+        );
+        for (name, value) in [
+            ("Host", "h"),
+            ("Content-Length", "1"),
+            ("Orblx-Agent-Nonce", "00"),
+            ("X-Orblx-Agent", "spoof"),
+            ("bad name", "v"),
+            ("x-kind", "a\r\nx-evil: 1"),
+        ] {
+            assert!(request_header(name, value).is_err());
         }
     }
 

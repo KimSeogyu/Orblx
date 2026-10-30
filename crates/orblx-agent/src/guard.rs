@@ -20,6 +20,7 @@ use orblx_identity::{DenySet, SpiffeId, TicketVerifier, TrustBundle};
 
 use crate::grant::AgentGrant;
 use crate::hex::encode_hex;
+use crate::nonce_store::{NonceStore, SeenSet};
 use crate::proof::{
     open_use, unix_millis, Admitted, Refused, UseTarget, UseTrust, PROOF_WINDOW_SECS,
 };
@@ -50,6 +51,12 @@ pub struct GuardConfig {
     pub netmap_public: [u8; 32],
     /// Grant audit chain file.
     pub audit_path: PathBuf,
+    /// Request nonce file, apart from the audit chain file.
+    ///
+    /// The HTTP gateway uses it. `None` for the TCP guard, which has no
+    /// request nonce. [`crate::run_gateway`] uses
+    /// [`crate::default_nonce_path`] when it is `None`.
+    pub nonce_path: Option<PathBuf>,
     /// Deny poll interval.
     pub poll: Duration,
     /// The guard refuses all uses when the last good deny fetch is older.
@@ -84,9 +91,6 @@ struct Known {
     revoked: bool,
 }
 
-/// Seen request nonces: (ticket hash, nonce) to a time in Unix seconds.
-type SeenSet = BTreeMap<([u8; 16], [u8; 16]), u64>;
-
 struct CoreState {
     deny: DenySet,
     deny_ok_at: Option<SystemTime>,
@@ -94,6 +98,8 @@ struct CoreState {
     known: BTreeMap<String, Known>,
     /// Seen request nonces: (ticket hash, nonce) to the proof stamp.
     seen: SeenSet,
+    /// The nonce file. Each new entry goes to it before the request is admitted.
+    nonces: Option<NonceStore>,
 }
 
 /// Extra checks for one request after the proof check.
@@ -133,7 +139,23 @@ impl GuardCore {
         // `open` checks the chain. A broken chain stops the start (fail closed).
         let audit = ConfigLog::open(&config.audit_path)
             .map_err(|err| AgentError::Audit(err.to_string()))?;
-        let seen = load_seen(&config.audit_path, SystemTime::now())?;
+        let now = SystemTime::now();
+        let mut seen = load_seen(&config.audit_path, now)?;
+        let nonces = match &config.nonce_path {
+            Some(path) => {
+                let now_secs = now
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_err(|_| AgentError::Time)?
+                    .as_secs();
+                let keep_after = now_secs.saturating_sub(2 * PROOF_WINDOW_SECS);
+                let (store, stored) = NonceStore::open(path, keep_after)?;
+                for (key, stamp) in stored {
+                    seen.entry(key).or_insert(stamp);
+                }
+                Some(store)
+            }
+            None => None,
+        };
         Ok(Self {
             node: config.node.clone(),
             addr,
@@ -147,6 +169,7 @@ impl GuardCore {
                 audit,
                 known: BTreeMap::new(),
                 seen,
+                nonces,
             }),
         })
     }
@@ -392,6 +415,14 @@ impl GuardCore {
             return Err("replay");
         }
         state.seen.insert(key, admitted.stamp);
+        // The entry goes to the nonce file before the request goes on.
+        // A failed write refuses the request (fail closed).
+        if let Some(store) = state.nonces.as_mut() {
+            if let Err(err) = store.append(&key, admitted.stamp) {
+                eprintln!("agent gateway nonce write failed. {err}");
+                return Err("store");
+            }
+        }
         (check.scope)(&admitted.grant)
     }
 
