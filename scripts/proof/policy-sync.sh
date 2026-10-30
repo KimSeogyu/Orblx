@@ -26,7 +26,9 @@ cd "$ROOT"
 FILE="scripts/proof/compose.policy-sync.yml"
 export PROOF_PROJECT="${PROOF_PROJECT:-orblx-w256-sync-proof}"
 export ORBLX_SYNC_IMAGE="${ORBLX_SYNC_IMAGE:-orblx-w256-sync:local}"
-PROFILE="${ORBLX_SYNC_PROFILE:-debug}"
+# Gate 3 measures CPU. A debug build is not the build that ships: its TLS handshake and
+# Ed25519 signing are slow. Thus the default is release.
+PROFILE="${ORBLX_SYNC_PROFILE:-release}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 WORK="$(mktemp -d)"
 export SYNC_WORK="$WORK"
