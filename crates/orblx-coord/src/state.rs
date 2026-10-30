@@ -1563,6 +1563,8 @@ fn filtered_grants(
             receiver: receiver.as_uri().to_string(),
             grants: Vec::new(),
             reach: Vec::new(),
+            filter: inner.policy.acl_set(),
+            subnets: Vec::new(),
         };
     }
     let nodes = inner.store.nodes();
@@ -1593,6 +1595,7 @@ fn filtered_grants(
         }
     }
     grants.grants.retain(|grant| !hidden.contains(&grant.src));
+    grants.subnets.retain(|grant| !hidden.contains(&grant.src));
     grants.reach.retain(|dst| !hidden.contains(dst));
     grants
 }
