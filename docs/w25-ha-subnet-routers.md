@@ -84,7 +84,30 @@ The routers masquerade. Thus the target sees the LAN address of the router, and 
 The proof kills a router with `docker kill` (SIGKILL, no clean stop).
 The proof uses a release build. With a debug build on a loaded host, the overlay queued the replies (ping RTT avg 21 ms, bursts of up to 3.8 s) before and after the kill. With the release build, the RTT avg was 0.63 ms.
 
-@@RESULTS@@
+### Results [C]
+
+Branch head c33d30a (main c32d46f), release build, 5 runs.
+Log: `/workspace/orblx-w18-proof/w25ha-routers-full4.log` (03:09:21 to 03:14:42 KST, 31 Oct 2026). Other orblx proof containers: 0 at the start, 0 at the end.
+
+| Gate | Result [C] |
+|---|---|
+| 1. Both routes need approval | Only router-a approved: router-b got 0 FORWARD bytes, and the target got 0 datagrams while router-a was down. After both approvals, the client netmap has both routers for `10.88.125.0/24`. |
+| 2. Failover (limit 5000 ms, target 2000 ms) | 1015, 1028, 1012, 1000, 992 ms. 5/5 at or below 2000 ms. |
+| 2. Max gap of the UDP stream (10 ms interval) | 982, 1001, 987, 976, 964 ms |
+| 2. Ping loss (`ping -i 0.05`, 9 s) | 17/171, 17/169, 17/168, 17/171, 17/171 |
+| 2. Audit | +1 `route-failover` record for each kill. Example: `{"actor":"spiffe://orblx.local/node/client","target":"10.88.125.0/24","action":"route-failover","detail":"from router-a to router-b old_silent_ms 1001"}`. The chain verifies. |
+| 3. Failback | router-a came back. 0 route changes and 0 records in 60 s. All 5892 datagrams came through router-b. |
+| 4. Port ACL on router-b | TCP 8080 allowed. TCP 8081 and UDP 9001 (no rule): 0 FORWARD bytes, 3 packet-deny records. Guest TCP 8080: timeout. |
+| 4. UDP 53 on router-b | With the rule: 1 answer (`10.88.24.20`), 57 bytes. Without the rule: no answer, 0 bytes, 0 queries at the nameserver, 1 deny record. |
+| 5. TCP flow | The flow does not survive. It reconnected 1107 ms after the kill (the read timed out at 1105 ms). |
+| 6. Secrets | 0 lines in all container logs with a token value, a key line, or `PRIVATE KEY` (19 patterns, 403 log lines). |
+| Leak | 0 packets from the client and the guest to `10.88.125.0/24` on the underlay interface. |
+| Ping before the kills | max 2.117 ms. Baseline 0/95 lost, RTT avg 1.098 ms. |
+
+The failover time is about `HA_DEAD_AFTER` (1000 ms): the client moves the route at the first packet after 1000 ms with no frame from the active router.
+
+An earlier run on head f2887a7 (before the merge of #92) had the same result: failover 989 to 1074 ms, TCP reconnect 1125 ms (log `w25ha-routers-full3.log`).
+
 
 ## Limits
 
