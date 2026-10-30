@@ -269,6 +269,46 @@ pub fn audit(coord: &Coordinator, since: Option<u64>) -> Result<Value, CoordErro
     Ok(json!({"op": "audit", "verify": verify, "lines": kept}))
 }
 
+/// Return the policy file text and its SHA-256 (W25-3, scope `policy:read`).
+pub fn policy_show(coord: &Coordinator) -> Result<Value, CoordError> {
+    let path = coord.policy_file()?;
+    if !path.exists() {
+        return Ok(json!({"op": "policy", "present": false}));
+    }
+    let text = read_text(&path)?;
+    if text.len() > POLICY_REPLY_LIMIT {
+        return Err(CoordError::Protocol(
+            "The policy file is too large for one reply.".to_string(),
+        ));
+    }
+    Ok(json!({
+        "op": "policy",
+        "present": true,
+        "sha256": crate::netmap::encode_hex(&sha256_digest(text.as_bytes())),
+        "text": text
+    }))
+}
+
+/// Replace the policy file (W25-3, scope `policy:write`).
+///
+/// The coordinator checks the text first. A bad text does not change the file.
+/// The coordinator then loads the file and writes one `policy-replace` record.
+pub fn policy_set(coord: &Coordinator, text: &str) -> Result<Value, CoordError> {
+    if orblx_identity::Policy::from_hujson(text.as_bytes()).is_err() {
+        return Err(CoordError::Protocol("The policy is not valid.".to_string()));
+    }
+    let path = coord.policy_file()?;
+    write_text(&path, text, 0o644)?;
+    coord.set_policy_file(&path)?;
+    Ok(json!({
+        "op": "policy-set",
+        "sha256": crate::netmap::encode_hex(&sha256_digest(text.as_bytes()))
+    }))
+}
+
+/// The largest policy text in one admin reply.
+const POLICY_REPLY_LIMIT: usize = 160 * 1024;
+
 /// The largest record text in one admin reply.
 const AUDIT_REPLY_LIMIT: usize = 160 * 1024;
 

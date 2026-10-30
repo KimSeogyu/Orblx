@@ -1,12 +1,14 @@
 # serve and funnel proof (W21-4).
 # Three Linux nodes on one [C] bridge. node-b also sits on a second [C] bridge, the outside network.
 # The outside container stands in for a host outside the overlay. It has no orblx node.
-# The proof script builds the image orblx-serve:local and sets the SERVE_* paths.
+# The proof script builds the image and sets the SERVE_* values.
+# SERVE_IMAGE is the image tag. SERVE_OVL and SERVE_OUT are the first three octets of the
+# overlay and outside networks (default 172.30.41 and 172.30.42).
 
 name: orblx-serve-proof
 
 x-node: &node
-  image: orblx-serve:local
+  image: ${SERVE_IMAGE:-orblx-serve:local}
   cap_add:
     - NET_ADMIN
   devices:
@@ -26,7 +28,7 @@ services:
     command: [up, --netmap, /etc/orblx/netmap.json, --state-dir, /var/lib/orblx, --listen, "0.0.0.0:443"]
     networks:
       overlay:
-        ipv4_address: 172.30.41.11
+        ipv4_address: ${SERVE_OVL:-172.30.41}.11
 
   node-b:
     <<: *node
@@ -34,12 +36,12 @@ services:
       - ${SERVE_STATE_B}:/var/lib/orblx
       - ${SERVE_NETMAP_B}:/etc/orblx/netmap.json:ro
       - ${SERVE_TOOLS}:/opt/orblx-proof:ro
-    command: [up, --netmap, /etc/orblx/netmap.json, --state-dir, /var/lib/orblx, --listen, "172.30.41.12:443"]
+    command: [up, --netmap, /etc/orblx/netmap.json, --state-dir, /var/lib/orblx, --listen, "${SERVE_OVL:-172.30.41}.12:443"]
     networks:
       overlay:
-        ipv4_address: 172.30.41.12
+        ipv4_address: ${SERVE_OVL:-172.30.41}.12
       outside:
-        ipv4_address: 172.30.42.12
+        ipv4_address: ${SERVE_OUT:-172.30.42}.12
 
   node-c:
     <<: *node
@@ -50,10 +52,10 @@ services:
     command: [up, --netmap, /etc/orblx/netmap.json, --state-dir, /var/lib/orblx, --listen, "0.0.0.0:443"]
     networks:
       overlay:
-        ipv4_address: 172.30.41.13
+        ipv4_address: ${SERVE_OVL:-172.30.41}.13
 
   outside:
-    image: orblx-serve:local
+    image: ${SERVE_IMAGE:-orblx-serve:local}
     cap_add:
       - NET_ADMIN
     entrypoint: ["/bin/sh", "-c", "exec sleep infinity"]
@@ -62,16 +64,16 @@ services:
       - ${SERVE_TOOLS}:/opt/orblx-proof:ro
     networks:
       outside:
-        ipv4_address: 172.30.42.20
+        ipv4_address: ${SERVE_OUT:-172.30.42}.20
 
 networks:
   overlay:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.30.41.0/24
+        - subnet: ${SERVE_OVL:-172.30.41}.0/24
   outside:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.30.42.0/24
+        - subnet: ${SERVE_OUT:-172.30.42}.0/24

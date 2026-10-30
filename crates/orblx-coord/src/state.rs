@@ -886,6 +886,12 @@ impl Coordinator {
         Ok(inner.policy.is_owner(id))
     }
 
+    /// Return the policy file path.
+    pub fn policy_file(&self) -> Result<PathBuf, CoordError> {
+        let inner = self.lock()?;
+        Ok(inner.policy_path.clone())
+    }
+
     /// Return the state directory.
     pub fn state_dir(&self) -> Result<PathBuf, CoordError> {
         let inner = self.lock()?;

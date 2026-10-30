@@ -13,6 +13,8 @@
 # above the direct ping RTT avg, when a relay ping is lost, or when an idle orblx
 # process uses more than IDLE_CPU_PCT percent CPU.
 # W23: RELAY_SLACK_MS is 1. The relay gate also prints the median and the slowest pings.
+# W24: the direct RTT check prints them too (direct_ping). ORBLX_NATR_PREFIX, ORBLX_NATR_PROJECT,
+# ORBLX_NATR_IMAGE, ORBLX_NATR_PUB and ORBLX_NATR_LAN change the names and the subnets.
 # The script measures TCP bulk throughput on the plain, direct and relay paths.
 # The script prints proof_ok.
 set -euo pipefail
@@ -20,15 +22,22 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 FILE="scripts/proof/compose.nat-realism.yml"
-IMAGE="orblx-natr:w20"
-COORD="172.29.20.10:443"
-STUN="172.29.20.20:3478"
-STUN_ALT="172.29.20.20:3479"
-RELAY="172.29.20.20:443"
-WAN_A="172.29.20.11"
-WAN_B="172.29.20.12"
-WAN_C="172.29.20.13"
-WAN_D="172.29.20.14"
+# The names and the subnets can change, so that two proof stacks can run on one host.
+# The defaults are the W20 names and subnets.
+NATR_PREFIX="${ORBLX_NATR_PREFIX:-orblx-natr-}"
+PROJECT="${ORBLX_NATR_PROJECT:-orblx-natr-proof}"
+IMAGE="${ORBLX_NATR_IMAGE:-orblx-natr:w20}"
+PUB="${ORBLX_NATR_PUB:-172.29.20}"
+LAN="${ORBLX_NATR_LAN:-10.19}"
+export ORBLX_NATR_IMAGE="$IMAGE" ORBLX_NATR_PUB="$PUB" ORBLX_NATR_LAN="$LAN"
+COORD="${PUB}.10:443"
+STUN="${PUB}.20:3478"
+STUN_ALT="${PUB}.20:3479"
+RELAY="${PUB}.20:443"
+WAN_A="${PUB}.11"
+WAN_B="${PUB}.12"
+WAN_C="${PUB}.13"
+WAN_D="${PUB}.14"
 PINGS=50
 MAX_LOSS=1
 MAX_GAP_MS=1000
@@ -52,7 +61,7 @@ DIRECT_AVG=""
 RENEW_TTL=60
 
 dc() {
-  docker compose --progress quiet -f "$FILE" "$@"
+  docker compose --progress quiet -p "$PROJECT" -f "$FILE" "$@"
 }
 
 as_root() {
@@ -121,15 +130,15 @@ wait_bundle() {
 
 gateway_of() {
   case "$1" in
-    node-a) echo 10.19.21.2 ;;
-    node-b) echo 10.19.22.2 ;;
-    node-c) echo 10.19.23.2 ;;
-    node-d) echo 10.19.24.2 ;;
+    node-a) echo ${LAN}.21.2 ;;
+    node-b) echo ${LAN}.22.2 ;;
+    node-c) echo ${LAN}.23.2 ;;
+    node-d) echo ${LAN}.24.2 ;;
   esac
 }
 
 container_of() {
-  echo "orblx-natr-${1#node-}"
+  echo "${NATR_PREFIX}${1#node-}"
 }
 
 enroll_node() {
@@ -228,7 +237,7 @@ now_s() {
   date +%s.%N
 }
 
-NAT_CONTAINERS="orblx-natr-a orblx-natr-b orblx-natr-c orblx-natr-d"
+NAT_CONTAINERS="${NATR_PREFIX}a ${NATR_PREFIX}b ${NATR_PREFIX}c ${NATR_PREFIX}d"
 
 cleanup() {
   local name
@@ -338,6 +347,26 @@ rtt_avg() {
   awk -F'/' '/^rtt / {print $5; exit}'
 }
 
+# Print the median and the 3 slowest pings of one ping -D run (read on stdin).
+# Arguments: line kind (relay_ping or direct_ping), label.
+ping_detail() {
+  python3 -c '
+import re, sys
+kind, label = sys.argv[1], sys.argv[2]
+rows = []
+for text in sys.stdin:
+    m = re.match(r"\[([0-9.]+)\].*icmp_seq=([0-9]+).*time=([0-9.]+) ms", text)
+    if m:
+        rows.append((float(m.group(3)), int(m.group(2)), m.group(1)))
+if rows:
+    times = sorted(r[0] for r in rows)
+    n = len(times)
+    mid = times[n // 2] if n % 2 else (times[n // 2 - 1] + times[n // 2]) / 2
+    slow = " ".join("seq%d:%.3f@%s" % (r[1], r[0], r[2]) for r in sorted(rows, reverse=True)[:3])
+    print("%s %s median_ms %.3f slowest %s" % (kind, label, mid, slow))
+' "$1" "$2"
+}
+
 # Compare the plain container RTT with the direct overlay RTT.
 # The plain ping goes node-a -> router-a (NAT) -> router-b WAN address. It does not use orblx.
 # The overlay ping goes node-a -> orblx TUN -> router-a -> router-b -> node-b -> orblx TUN.
@@ -345,16 +374,20 @@ measure_rtt() {
   local container="$1"
   local wan="$2"
   local ip="$3"
-  local plain overlay odd out
+  local plain overlay odd out full
   out="$(docker exec "$container" ping -n -c "$PINGS" -i 0.2 -W 1 "$wan" | tail -2)"
   printf 'plain %s\n' "$out"
   plain="$(printf '%s\n' "$out" | rtt_avg)"
-  out="$(docker exec "$container" ping -n -c "$PINGS" -i 0.2 -W 1 "$ip" | tail -2)"
+  full="$(docker exec "$container" ping -D -n -c "$PINGS" -i 0.2 -W 1 "$ip")"
+  out="$(printf '%s\n' "$full" | tail -2)"
   printf 'overlay %s\n' "$out"
+  printf '%s\n' "$full" | ping_detail direct_ping prc_prc
   overlay="$(printf '%s\n' "$out" | rtt_avg)"
   # A second interval that is not a multiple of 50 ms shows a timer phase effect.
-  out="$(docker exec "$container" ping -n -c "$PINGS" -i 0.23 -W 1 "$ip" | tail -2)"
+  full="$(docker exec "$container" ping -D -n -c "$PINGS" -i 0.23 -W 1 "$ip")"
+  out="$(printf '%s\n' "$full" | tail -2)"
   printf 'overlay_i0.23 %s\n' "$out"
+  printf '%s\n' "$full" | ping_detail direct_ping prc_prc_i0.23
   odd="$(printf '%s\n' "$out" | rtt_avg)"
   echo "rtt plain_avg_ms ${plain} direct_avg_ms ${overlay} direct_i0.23_avg_ms ${odd}"
   if ! python3 -c 'import sys; p, a, b, lim = map(float, sys.argv[1:5]); sys.exit(0 if max(a, b) - p <= lim else 1)' \
@@ -379,21 +412,7 @@ relay_gate() {
   out="$(printf '%s\n' "$full" | tail -2)"
   printf '%s relay %s\n' "$label" "$out"
   # Print the median and the 3 slowest pings with their seq and time stamp.
-  printf '%s\n' "$full" | python3 -c '
-import re, sys
-label = sys.argv[1]
-rows = []
-for text in sys.stdin:
-    m = re.match(r"\[([0-9.]+)\].*icmp_seq=([0-9]+).*time=([0-9.]+) ms", text)
-    if m:
-        rows.append((float(m.group(3)), int(m.group(2)), m.group(1)))
-if rows:
-    times = sorted(r[0] for r in rows)
-    n = len(times)
-    mid = times[n // 2] if n % 2 else (times[n // 2 - 1] + times[n // 2]) / 2
-    slow = " ".join("seq%d:%.3f@%s" % (r[1], r[0], r[2]) for r in sorted(rows, reverse=True)[:3])
-    print("relay_ping %s median_ms %.3f slowest %s" % (label, mid, slow))
-' "$label"
+  printf '%s\n' "$full" | ping_detail relay_ping "$label"
   avg="$(printf '%s\n' "$out" | rtt_avg)"
   received="$(printf '%s\n' "$out" | awk '/packets transmitted/ {print $4}')"
   lost=$((PINGS - ${received:-0}))
@@ -636,7 +655,7 @@ t = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 while True:
     data, addr = s.recvfrom(64)
     o.sendto(b"other_port", addr)
-    t.sendto(("%s:%d" % addr).encode(), ("172.29.20.20", 5013))
+    t.sendto(("%s:%d" % addr).encode(), ("'"${PUB}"'.20", 5013))
     time.sleep(0.5)
     s.sendto(b"same_endpoint", addr)
 '
@@ -656,7 +675,7 @@ import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(("0.0.0.0", 40001))
 s.settimeout(0.3)
-s.sendto(b"probe", ("172.29.20.10", 5011))
+s.sendto(b"probe", ("'"${PUB}"'.10", 5011))
 got = []
 end = time.time() + 2.5
 while time.time() < end:
@@ -671,7 +690,7 @@ print("filter received", " ".join(got) if got else "nothing")
 mapping_ports() {
   local service="$1"
   dc --profile nodes run --rm --no-deps --entrypoint /bin/sh "$service" -c \
-    "ip route replace default via $(gateway_of "$service") && python3 -c '${PROBE_PY}' 172.29.20.10:5001 172.29.20.20:5001" \
+    "ip route replace default via $(gateway_of "$service") && python3 -c '${PROBE_PY}' ${PUB}.10:5001 ${PUB}.20:5001" \
     | sed "s/^/${service}: /"
 }
 
@@ -719,8 +738,8 @@ sleep 1
 for node in node-a node-b node-c node-d; do
   map="$(mapping_ports "$node")"
   printf '%s\n' "$map"
-  one="$(port_of_mapping "$map" 172.29.20.10:5001)"
-  two="$(port_of_mapping "$map" 172.29.20.20:5001)"
+  one="$(port_of_mapping "$map" ${PUB}.10:5001)"
+  two="$(port_of_mapping "$map" ${PUB}.20:5001)"
   if [[ -z "$one" || -z "$two" ]]; then
     echo "The ${node} mapping probe did not get two answers." >&2
     exit 1
@@ -748,7 +767,7 @@ for node in node-a node-b; do
   filter="$(dc --profile nodes run --rm --no-deps --entrypoint /bin/sh "$node" -c \
     "ip route replace default via $(gateway_of "$node") && python3 -c '${FILTER_PROBE_PY}'")"
   echo "${node}: ${filter}"
-  if [[ "$filter" != "filter received same_endpoint@172.29.20.10:5011" ]]; then
+  if [[ "$filter" != "filter received same_endpoint@${PUB}.10:5011" ]]; then
     echo "${node} did not filter by IP and port." >&2
     exit 1
   fi
@@ -781,7 +800,7 @@ echo "overlay node-d ${IP_D}"
 
 echo "=== [C] no LAN shortcut ==="
 LAN_REACH="$(dc --profile nodes run --rm --no-deps --entrypoint /bin/sh node-a -c \
-  "ip route replace default via 10.19.21.2; for ip in 10.19.22.10 10.19.23.10 10.19.24.10 10.19.22.2 10.19.23.2; do if ping -c 1 -W 1 \$ip >/dev/null 2>&1; then echo lan_reach \$ip yes; else echo lan_reach \$ip no; fi; done")"
+  "ip route replace default via ${LAN}.21.2; for ip in ${LAN}.22.10 ${LAN}.23.10 ${LAN}.24.10 ${LAN}.22.2 ${LAN}.23.2; do if ping -c 1 -W 1 \$ip >/dev/null 2>&1; then echo lan_reach \$ip yes; else echo lan_reach \$ip no; fi; done")"
 printf '%s\n' "$LAN_REACH"
 if printf '%s\n' "$LAN_REACH" | grep -q ' yes$'; then
   echo "node-a can reach another LAN without NAT." >&2
@@ -797,55 +816,55 @@ open_ac() { udp_rules -D router-a "$WAN_A" router-c "$WAN_C"; }
 echo "=== [C] case prc_prc node-a to node-b ==="
 start_nat node-a node-b
 start_nat node-b node-a
-wait_path orblx-natr-a direct node-b >/dev/null
-wait_path orblx-natr-b direct node-a >/dev/null
-PP_A="$(wait_svid orblx-natr-a)"
-PP_B="$(wait_svid orblx-natr-b)"
+wait_path ${NATR_PREFIX}a direct node-b >/dev/null
+wait_path ${NATR_PREFIX}b direct node-a >/dev/null
+PP_A="$(wait_svid ${NATR_PREFIX}a)"
+PP_B="$(wait_svid ${NATR_PREFIX}b)"
 printf '%s\n' "$PP_A"
 printf '%s\n' "$PP_B"
 check_svid "prc_prc node-a" "$PP_A"
 check_svid "prc_prc node-b" "$PP_B"
 PP_PATH="$(path_of "$PP_A") $(path_of "$PP_B")"
 echo "prc_prc path ${PP_PATH}"
-punch_log orblx-natr-a
-punch_log orblx-natr-b
-steady_pings prc_prc orblx-natr-a "$IP_B"
+punch_log ${NATR_PREFIX}a
+punch_log ${NATR_PREFIX}b
+steady_pings prc_prc ${NATR_PREFIX}a "$IP_B"
 
 echo "=== [C] RTT on the prc_prc topology ==="
-measure_rtt orblx-natr-a "$WAN_B" "$IP_B"
+measure_rtt ${NATR_PREFIX}a "$WAN_B" "$IP_B"
 
 echo "=== [C] throughput plain and direct, idle CPU on direct ==="
 # plain: node-a -> router-a (NAT) -> router-b. The server runs on router-b. No orblx.
-bulk plain orblx-natr-a "$(dc ps -q router-b)" "$WAN_B"
-bulk prc_prc_direct orblx-natr-a orblx-natr-b "$IP_B"
-idle_cpu prc_prc_direct orblx-natr-a orblx-natr-b
+bulk plain ${NATR_PREFIX}a "$(dc ps -q router-b)" "$WAN_B"
+bulk prc_prc_direct ${NATR_PREFIX}a ${NATR_PREFIX}b "$IP_B"
+idle_cpu prc_prc_direct ${NATR_PREFIX}a ${NATR_PREFIX}b
 
 echo "=== [C] switch prc_prc direct to relay (block UDP between router-a and router-b) ==="
-measure_switch "switch prc_prc direct_to_relay" orblx-natr-a node-b "$IP_B" relay block_ab
+measure_switch "switch prc_prc direct_to_relay" ${NATR_PREFIX}a node-b "$IP_B" relay block_ab
 echo "=== [C] relay gate, throughput and idle CPU on the prc_prc relay path ==="
 sleep 2
-relay_gate prc_prc orblx-natr-a "$IP_B"
-bulk prc_prc_relay orblx-natr-a orblx-natr-b "$IP_B"
-idle_cpu prc_prc_relay orblx-natr-a orblx-natr-b
+relay_gate prc_prc ${NATR_PREFIX}a "$IP_B"
+bulk prc_prc_relay ${NATR_PREFIX}a ${NATR_PREFIX}b "$IP_B"
+idle_cpu prc_prc_relay ${NATR_PREFIX}a ${NATR_PREFIX}b
 echo "=== [C] switch prc_prc relay to direct (restore UDP) ==="
-measure_switch "switch prc_prc relay_to_direct" orblx-natr-a node-b "$IP_B" direct open_ab
-docker logs orblx-natr-a 2>&1 | grep -E '^The (path to|node sent|relay also)' | sed 's/^/orblx-natr-a: /'
-stop_node orblx-natr-a
-stop_node orblx-natr-b
+measure_switch "switch prc_prc relay_to_direct" ${NATR_PREFIX}a node-b "$IP_B" direct open_ab
+docker logs ${NATR_PREFIX}a 2>&1 | grep -E '^The (path to|node sent|relay also)' | sed "s/^/${NATR_PREFIX}a: /"
+stop_node ${NATR_PREFIX}a
+stop_node ${NATR_PREFIX}b
 
 echo "=== [C] case prc_sym node-a to node-c ==="
 start_nat node-a node-c
 start_nat node-c node-a
-PS_A="$(wait_path orblx-natr-a any node-c)"
+PS_A="$(wait_path ${NATR_PREFIX}a any node-c)"
 # The birthday attempt has a window of 15 seconds.
 for _ in $(seq 1 20); do
-  if [[ "$(path_of "$(status_text orblx-natr-a)")" == "direct" && "$(path_of "$(status_text orblx-natr-c)")" == "direct" ]]; then
+  if [[ "$(path_of "$(status_text ${NATR_PREFIX}a)")" == "direct" && "$(path_of "$(status_text ${NATR_PREFIX}c)")" == "direct" ]]; then
     break
   fi
   sleep 1
 done
-PS_A="$(wait_svid orblx-natr-a)"
-PS_C="$(wait_svid orblx-natr-c)"
+PS_A="$(wait_svid ${NATR_PREFIX}a)"
+PS_C="$(wait_svid ${NATR_PREFIX}c)"
 printf '%s\n' "$PS_A"
 printf '%s\n' "$PS_C"
 check_svid "prc_sym node-a" "$PS_A"
@@ -853,57 +872,57 @@ check_svid "prc_sym node-c" "$PS_C"
 PS_PATH_A="$(path_of "$PS_A")"
 PS_PATH_C="$(path_of "$PS_C")"
 echo "prc_sym path ${PS_PATH_A} ${PS_PATH_C}"
-punch_log orblx-natr-a
-punch_log orblx-natr-c
-check_probe_bound orblx-natr-a
-check_probe_bound orblx-natr-c
+punch_log ${NATR_PREFIX}a
+punch_log ${NATR_PREFIX}c
+check_probe_bound ${NATR_PREFIX}a
+check_probe_bound ${NATR_PREFIX}c
 if [[ "$PS_PATH_A" == "direct" ]]; then
-  REACHED="$(docker logs orblx-natr-a 2>&1 | awk '/^The hole punch reached / {sub(/\.$/, "", $5); print $5; exit}')"
+  REACHED="$(docker logs ${NATR_PREFIX}a 2>&1 | awk '/^The hole punch reached / {sub(/\.$/, "", $5); print $5; exit}')"
   echo "prc_sym node-a punch_peer ${REACHED}"
   if [[ "${REACHED%%:*}" != "$WAN_C" ]]; then
     echo "The prc_sym direct path did not go through the router-c WAN address." >&2
     exit 1
   fi
 fi
-steady_pings prc_sym orblx-natr-a "$IP_C"
+steady_pings prc_sym ${NATR_PREFIX}a "$IP_C"
 if [[ "$PS_PATH_A" == "direct" ]]; then
   echo "=== [C] switch prc_sym direct to relay (block UDP between router-a and router-c) ==="
-  measure_switch "switch prc_sym direct_to_relay" orblx-natr-a node-c "$IP_C" relay block_ac
+  measure_switch "switch prc_sym direct_to_relay" ${NATR_PREFIX}a node-c "$IP_C" relay block_ac
   echo "=== [C] switch prc_sym relay to direct (restore UDP) ==="
-  measure_switch "switch prc_sym relay_to_direct" orblx-natr-a node-c "$IP_C" direct open_ac
+  measure_switch "switch prc_sym relay_to_direct" ${NATR_PREFIX}a node-c "$IP_C" direct open_ac
 fi
-stop_node orblx-natr-a
-stop_node orblx-natr-c
+stop_node ${NATR_PREFIX}a
+stop_node ${NATR_PREFIX}c
 
 echo "=== [C] case sym_sym node-c to node-d ==="
 start_nat node-c node-d
 start_nat node-d node-c
-wait_path orblx-natr-c relay node-d >/dev/null
+wait_path ${NATR_PREFIX}c relay node-d >/dev/null
 sleep 5
-SS_C="$(wait_svid orblx-natr-c)"
-SS_D="$(wait_svid orblx-natr-d)"
+SS_C="$(wait_svid ${NATR_PREFIX}c)"
+SS_D="$(wait_svid ${NATR_PREFIX}d)"
 printf '%s\n' "$SS_C"
 printf '%s\n' "$SS_D"
 check_svid "sym_sym node-c" "$SS_C"
 check_svid "sym_sym node-d" "$SS_D"
 SS_PATH="$(path_of "$SS_C") $(path_of "$SS_D")"
 echo "sym_sym path ${SS_PATH}"
-punch_log orblx-natr-c
-punch_log orblx-natr-d
+punch_log ${NATR_PREFIX}c
+punch_log ${NATR_PREFIX}d
 if [[ "$SS_PATH" != "relay relay" ]]; then
   echo "The sym_sym case did not use the relay." >&2
   exit 1
 fi
-if docker logs orblx-natr-c 2>&1 | grep -q '^The hole punch reached'; then
+if docker logs ${NATR_PREFIX}c 2>&1 | grep -q '^The hole punch reached'; then
   echo "The sym_sym case reported a hole punch." >&2
   exit 1
 fi
-steady_pings sym_sym orblx-natr-c "$IP_D"
-relay_gate sym_sym orblx-natr-c "$IP_D"
-bulk sym_sym_relay orblx-natr-c orblx-natr-d "$IP_D"
-idle_cpu sym_sym_relay orblx-natr-c orblx-natr-d
-stop_node orblx-natr-c
-stop_node orblx-natr-d
+steady_pings sym_sym ${NATR_PREFIX}c "$IP_D"
+relay_gate sym_sym ${NATR_PREFIX}c "$IP_D"
+bulk sym_sym_relay ${NATR_PREFIX}c ${NATR_PREFIX}d "$IP_D"
+idle_cpu sym_sym_relay ${NATR_PREFIX}c ${NATR_PREFIX}d
+stop_node ${NATR_PREFIX}c
+stop_node ${NATR_PREFIX}d
 
 echo "=== [C] renewal case: restart the coordinator with a node leaf life of ${RENEW_TTL} s ==="
 ORBLX_NATR_SVID_TTL="$RENEW_TTL" dc up -d coord
@@ -934,22 +953,22 @@ start_nat node-a node-f
 start_nat node-b node-e
 start_nat node-c node-h
 start_nat node-d node-g
-wait_path orblx-natr-a direct node-f >/dev/null
-wait_path orblx-natr-c relay node-h >/dev/null
+wait_path ${NATR_PREFIX}a direct node-f >/dev/null
+wait_path ${NATR_PREFIX}c relay node-h >/dev/null
 # Read each peer expiry before the first renewal (at two thirds of the leaf life).
-BEFORE_A="$(peer_expiry_of "$(wait_svid orblx-natr-a)")"
-BEFORE_B="$(peer_expiry_of "$(wait_svid orblx-natr-b)")"
-BEFORE_C="$(peer_expiry_of "$(wait_svid orblx-natr-c)")"
-BEFORE_D="$(peer_expiry_of "$(wait_svid orblx-natr-d)")"
+BEFORE_A="$(peer_expiry_of "$(wait_svid ${NATR_PREFIX}a)")"
+BEFORE_B="$(peer_expiry_of "$(wait_svid ${NATR_PREFIX}b)")"
+BEFORE_C="$(peer_expiry_of "$(wait_svid ${NATR_PREFIX}c)")"
+BEFORE_D="$(peer_expiry_of "$(wait_svid ${NATR_PREFIX}d)")"
 for name in $NAT_CONTAINERS; do
   status_text "$name"
 done
-check_renewal "direct node-e sees node-f" orblx-natr-a orblx-natr-b direct "$BEFORE_A"
-check_renewal "direct node-f sees node-e" orblx-natr-b orblx-natr-a direct "$BEFORE_B"
-check_renewal "relay node-g sees node-h" orblx-natr-c orblx-natr-d relay "$BEFORE_C"
-check_renewal "relay node-h sees node-g" orblx-natr-d orblx-natr-c relay "$BEFORE_D"
-steady_pings renew_direct orblx-natr-a "$(self_overlay orblx-natr-b)"
-steady_pings renew_relay orblx-natr-c "$(self_overlay orblx-natr-d)"
+check_renewal "direct node-e sees node-f" ${NATR_PREFIX}a ${NATR_PREFIX}b direct "$BEFORE_A"
+check_renewal "direct node-f sees node-e" ${NATR_PREFIX}b ${NATR_PREFIX}a direct "$BEFORE_B"
+check_renewal "relay node-g sees node-h" ${NATR_PREFIX}c ${NATR_PREFIX}d relay "$BEFORE_C"
+check_renewal "relay node-h sees node-g" ${NATR_PREFIX}d ${NATR_PREFIX}c relay "$BEFORE_D"
+steady_pings renew_direct ${NATR_PREFIX}a "$(self_overlay ${NATR_PREFIX}b)"
+steady_pings renew_relay ${NATR_PREFIX}c "$(self_overlay ${NATR_PREFIX}d)"
 for name in $NAT_CONTAINERS; do
   if docker logs "$name" 2>&1 | grep -q "PRIVATE KEY"; then
     echo "The ${name} log contains a private key." >&2
