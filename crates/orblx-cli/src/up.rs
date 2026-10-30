@@ -1083,7 +1083,7 @@ pub(crate) fn load_grants(
     );
     let filter = live.filter.clone();
     if let Some(filter) = &filter {
-        print_filter_state(filter.active());
+        print_filter_state(filter);
         let watcher = Arc::clone(&live);
         let spawned = std::thread::Builder::new()
             .name("orblx-grants".to_string())
@@ -1098,9 +1098,13 @@ pub(crate) fn load_grants(
     Ok((live, filter))
 }
 
-fn print_filter_state(active: bool) {
-    if active {
+fn print_filter_state(filter: &PacketFilter) {
+    if filter.strict() {
         println!("The packet filter is on. The node drops packets that no grant allows.");
+    } else if filter.active() {
+        println!(
+            "The packet filter is on for shared peers. The node drops their packets that no grant allows."
+        );
     } else {
         println!("The packet filter is off. The policy has no ACL list.");
     }
@@ -1177,10 +1181,10 @@ impl LiveGrants {
             return;
         }
         if let Some(filter) = &self.filter {
-            let was = filter.active();
+            let was = (filter.active(), filter.strict());
             filter.replace(&signed.grants);
-            if was != filter.active() {
-                print_filter_state(filter.active());
+            if was != (filter.active(), filter.strict()) {
+                print_filter_state(filter);
             }
         }
         let count = signed.grants.reach.len();
@@ -1731,6 +1735,7 @@ mod tests {
             reach,
             filter: false,
             subnets: Vec::new(),
+            guarded: Vec::new(),
         };
         let signed = key.sign_grants(&grants).unwrap();
         let text = serde_json::to_string(&signed).unwrap();
