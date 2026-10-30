@@ -86,8 +86,14 @@ These are measurements, not gates. Each message goes node a -> overlay -> node b
 
 | Binary | Median ms | Max ms | Largest message (bytes) |
 | --- | --- | --- | --- |
-| debug (runs 3 to 6) | 15.729, 16.413, 18.401, 16.792 | 1091.565, 996.407, 1260.032, 1033.499 | 70000 |
-| release | 0.202 | 56.961 | 70000 |
+| debug, branch (runs 3 to 6) | 15.729, 16.413, 18.401, 16.792 | 1091.565, 996.407, 1260.032, 1033.499 | 70000 |
+| debug, main 130fe357 | 15.974 | 1149.397 | 70000 |
+| release, branch (before the merge) | 0.202 | 56.961 | 70000 |
+| release, main 130fe357 | 0.256 | 77.254 | 70000 |
+
+Logs on main: `/workspace/orblx-w18-proof/w25-d-serve-websocket-main-130fe357.log` (debug) and
+`/workspace/orblx-w18-proof/w25-d-serve-websocket-release-main-130fe357.log` (release, `SERVE_BIN` set to
+`target/release/orblx`). The release run on main also printed `proof_ok`, with 100 sent, 100 received, and 0 lost.
 
 The max is for a message of 65536 or 70000 bytes.
 The debug build is slow for the datapath crypto. The release build shows this. Set `SERVE_BIN` to a release
