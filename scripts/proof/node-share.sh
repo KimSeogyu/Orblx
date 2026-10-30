@@ -46,6 +46,10 @@ POLICY_SRC="${ORBLX_SHARE_POLICY:-$ROOT/scripts/proof/node-share.hujson}"
 . "$PROOF_LIB_DIR/proof-lock.sh"
 trap proof_lock_end EXIT
 proof_lock_take "node-share"
+# W25-14b: start from a clean compose state (all profiles, all volumes).
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
+proof_compose_clean "orblx-w25a-node-share" || exit 1
 mkdir -p "$POLICY_DIR"
 : >"$IDP_CA_FILE"
 
