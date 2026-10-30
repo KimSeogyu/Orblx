@@ -71,7 +71,9 @@ Code: `crates/orblx-serve/src/ingress.rs`, `admit` in `crates/orblx-serve/src/se
 - Time limits: 10 s for the request head, 60 s for the body (`408` after that).
 - The proxy removes hop-by-hop headers in both directions. It sets `X-Forwarded-For` (the client IP)
   and `X-Forwarded-Proto: https`. It removes the client values of `Forwarded`, `X-Forwarded-For`, and `X-Forwarded-Proto`.
-- A request with `Upgrade` gets `501`. WebSocket is not in this change.
+- In W24-C, a request with `Upgrade` got `501`.
+  Since W25-4 (#81, 130fe357), a WebSocket upgrade (HTTP/1.1 `Upgrade: websocket`) goes to the app.
+  Other upgrades, for example `h2c`, still get `501`. See [`docs/w25-serve-websocket.md`](w25-serve-websocket.md).
 - An HTTP/1.0 client gets an HTTP/1.0 response. The W21-4 proof client uses HTTP/1.0.
 
 Code: `crates/orblx-serve/src/http.rs`.
@@ -167,5 +169,7 @@ After the merge, both scripts run again on `main`. Logs: `w24-c-serve-hardening-
   A peer that sends a packet with the source address of a different peer is a datapath ACL topic. It is not in this change.
   The reply to such a packet goes through TUN to the real peer, so the sender cannot finish the TCP handshake.
 - The proxy keeps each request body in memory up to the limit. The limit applies to each request.
-- WebSocket and other `Upgrade` requests get `501`. In W21-4, serve was a TCP stream proxy, so they passed.
+- In W24-C, WebSocket and other `Upgrade` requests got `501`. In W21-4, serve was a TCP stream proxy, so they passed.
+  Since W25-4 (#81, 130fe357), WebSocket upgrades go to the app again. Other upgrades, for example `h2c`, still get `501`.
+  See [`docs/w25-serve-websocket.md`](w25-serve-websocket.md).
 - HTTP/2 is not in this change. The TLS ALPN value stays `http/1.1`.
