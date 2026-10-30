@@ -392,28 +392,41 @@ mod tests {
         );
         enroll("sync-b").await;
         let joined_at = std::time::Instant::now();
-        let joined = waiter.await.unwrap().unwrap();
-        assert!(joined_at.elapsed() < Duration::from_secs(1));
-        assert_ne!(joined.etag, first.etag);
-        assert!(joined
+        // An enroll writes more than one state file. A reply can show a part of the
+        // enroll (for example the endpoints first). The next request gets the rest.
+        let mut joined = waiter.await.unwrap().unwrap();
+        while !joined
             .view
             .signed_netmap
             .netmap
             .peers
             .iter()
-            .any(|peer| peer.name == "sync-b"));
+            .any(|peer| peer.name == "sync-b")
+        {
+            assert!(joined_at.elapsed() < Duration::from_secs(1));
+            joined = wait(Some(joined.etag.clone())).await.unwrap().unwrap();
+        }
+        assert!(
+            joined_at.elapsed() < Duration::from_secs(1),
+            "the peer came {:?} after the enroll",
+            joined_at.elapsed()
+        );
+        assert_ne!(joined.etag, first.etag);
         let waiter = wait(Some(joined.etag.clone()));
         tokio::time::sleep(Duration::from_millis(300)).await;
         let owner = orblx_identity::SpiffeId::node("owner").unwrap();
         super::revoke_all(&coord, "sync-b", owner.as_uri(), SystemTime::now()).unwrap();
         let revoked_at = std::time::Instant::now();
-        let revoked = waiter.await.unwrap().unwrap();
+        let mut revoked = waiter.await.unwrap().unwrap();
+        while !revoked.deny.contains("spiffe://orblx.local/node/sync-b") {
+            assert!(revoked_at.elapsed() < Duration::from_secs(1));
+            revoked = wait(Some(revoked.etag.clone())).await.unwrap().unwrap();
+        }
         assert!(
             revoked_at.elapsed() < Duration::from_secs(1),
-            "the reply came {:?} after the revoke",
+            "the deny list came {:?} after the revoke",
             revoked_at.elapsed()
         );
-        assert!(revoked.deny.contains("spiffe://orblx.local/node/sync-b"));
         assert_ne!(revoked.etag, joined.etag);
         handle.abort();
     }
