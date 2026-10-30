@@ -1091,6 +1091,7 @@ fn a_ping_increments_the_overlay_counters() {
                     visibility: Arc::new(AllowPeers),
                     on_ready: None,
                     metrics: Some(metrics),
+                    filter: None,
                 },
                 MemoryDevice {
                     from_tun: from_rx,

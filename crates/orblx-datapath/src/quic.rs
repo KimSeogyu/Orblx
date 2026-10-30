@@ -201,6 +201,13 @@ impl HelloEndpoint {
         *slot = deny;
     }
 
+    /// True when the deny list of the endpoint revokes the peer SVID (W24).
+    #[must_use]
+    pub fn denies(&self, peer: &SpiffeId) -> bool {
+        let slot = self.auth.deny.lock().unwrap_or_else(|err| err.into_inner());
+        slot.reject_uri(peer).is_err()
+    }
+
     /// Replace the peer allow list for new sessions (W23-1 node lock).
     ///
     /// None allows every peer with a trusted leaf. With a set, the endpoint closes

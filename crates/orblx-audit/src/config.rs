@@ -92,11 +92,15 @@ pub enum ConfigAction {
     Share,
     /// The policy removed one share (W25-1). One record for each share.
     Unshare,
+    /// The node packet filter dropped packets that no grant allows (W24).
+    ///
+    /// The node writes a sample of the drops. The detail counts the drops it did not write.
+    PacketDeny,
 }
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -128,6 +132,7 @@ impl ConfigAction {
         Self::TokenRevoke,
         Self::Share,
         Self::Unshare,
+        Self::PacketDeny,
     ];
 
     /// Return the stable action token.
@@ -165,6 +170,7 @@ impl ConfigAction {
             Self::TokenRevoke => "token-revoke",
             Self::Share => "share",
             Self::Unshare => "unshare",
+            Self::PacketDeny => "packet-deny",
         }
     }
 
@@ -209,6 +215,7 @@ impl ConfigAction {
             Self::TokenRevoke => 29,
             Self::Share => 30,
             Self::Unshare => 31,
+            Self::PacketDeny => 32,
         }
     }
 
