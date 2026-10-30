@@ -403,15 +403,17 @@ echo "overlay router-a ${OVERLAY[router-a]} router-b ${OVERLAY[router-b]} client
 echo "=== [C] node material from the coordinator enroll ==="
 for name in router-a router-b client guest; do
   as_root cp -a "$WORK/enroll-${name}/." "$WORK/state-${name}/"
+  # The proof user writes in the state directory later (grants.next).
+  as_root chown -R "$(id -u):$(id -g)" "$WORK/state-${name}"
   for file in cert.pem key.pem bundle.pem ticket.bin ticket.bin.mac ticket-verifier.pem ticket-mac.key svid-ca.pub; do
     as_root test -s "$WORK/state-${name}/${file}" || fail "The enroll of ${name} did not write ${file}."
   done
   echo "${name}: SVID, key, and ticket from the coordinator enroll"
 done
-# The routers use the signed grants, so the port ACL covers the subnet route (W24-A).
+# The routers use the signed grants from the enroll, so the port ACL covers the subnet route (W24-A).
 for name in router-a router-b; do
-  as_root cat "$WORK/enroll-${name}/netmap.pub" > "$WORK/state-${name}/netmap.pub"
-  as_root cat "$WORK/enroll-${name}/grants.signed.json" > "$WORK/state-${name}/grants.signed.json"
+  test -s "$WORK/state-${name}/netmap.pub" || fail "The enroll of ${name} did not write netmap.pub."
+  test -s "$WORK/state-${name}/grants.signed.json" || fail "The enroll of ${name} did not write grants.signed.json."
 done
 
 echo "=== [C] start target, nameserver, routers, client, guest ==="
