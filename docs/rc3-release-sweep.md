@@ -23,8 +23,11 @@ lock waits. The plan exits 1 when a row has no proof or a script is missing.
 
 The run:
 
-1. It resolves `COMMIT` (after `git fetch origin`) and makes a detached worktree
-   (`/workspace/orblx-rc3-sweep-<sha>`).
+1. It resolves `COMMIT` (after `git fetch origin`). Then it checks the free disk space on the
+   file system of the worktree and of `ORBLX_SWEEP_OUT`. With less than 30 GB free
+   (`ORBLX_SWEEP_MIN_FREE_GB`), it stops with exit 2 and the message `disk FAIL: only N GB free
+   at DIR; ...`, and no proof runs. A run that failed from a full disk never counts. Then it makes
+   a detached worktree (`/workspace/orblx-rc3-sweep-<sha>`).
 2. It builds the release binary there with the `~/.cargo/bin` toolchain (the build log has the
    `rustc --version` line), and the debug binaries that the older proofs use, so no proof
    compiles while it holds the lock.
@@ -102,6 +105,23 @@ earlier rows. The proof of each row comes from the evidence doc that the row nam
 constants in `clock.rs` and their unit tests), so every sweep fails on row 28 until a proof for
 it is in the manifest. The sweep does not hide this row.
 
+## Release checklist (rc.3)
+
+1. The rc.3 sweep runs on a commit that has the W25-14, W25-14b and W25-6b merges, with at least
+   30 GB free disk. It exits 0. A run that failed from a full disk never counts.
+2. Row 54 (Linux client) counts for rc.3 on the commit build proof (`up`, `down`, `status` and
+   systemd), not on a published artifact. Coverage today: the sweep proof `w18-linux-daemon`
+   runs `orblx up` in [C] containers and checks `orblx status`. No sweep proof runs
+   `orblx down` or starts the systemd unit. `scripts/proof/release.sh` (not in the manifest)
+   builds the release tarball at the commit, installs it in a clean [C] container with `--service`, and checks
+   that the installer writes `/etc/systemd/system/orblxd.service`. The `down` and systemd start
+   parts are open items for the PO.
+3. After the rc.3 artifact is published, run `scripts/proof/release-real.sh` again on the
+   published rc.3 artifact. Nobody announces rc.3 before that run passes.
+4. The real sweep records the run times of the proofs that have no measure in the plan today:
+   `coord-enroll`, `exit-node`, `datapath-acl`, `policy-gitops`, `svid-renew`, `docker-image` and
+   `sym-throughput`.
+
 ## Results and logs
 
 | Result | Rule |
@@ -158,6 +178,7 @@ SIGPIPE (exit 141) under `set -o pipefail`.
 | `ORBLX_SWEEP_FETCH` | 1 | 0 does not run `git fetch`. |
 | `ORBLX_SWEEP_PROGRESS` | none | A file. The script adds one line for each step. |
 | `ORBLX_SWEEP_LOCK_MODE` | `proof` | `proof`: take the lock for each proof. `sweep`: take the lock once and hold it for all the proofs. |
+| `ORBLX_SWEEP_MIN_FREE_GB` | 30 | Free GB that the run needs before it starts. |
 | `ORBLX_SWEEP_TEST_ROOT` | none | Test only (`tests/test_release_sweep.py`). |
 
 The script runs git as the caller. It runs the build and the proofs with `sudo -n` when the
@@ -192,6 +213,7 @@ caller is not root, so it never asks for a password.
   the step logs, whole;
 - the lock is taken (lock mode `proof` and `sweep`);
 - `--plan` lists every row and proof and prints the estimate;
+- less free disk than `ORBLX_SWEEP_MIN_FREE_GB` stops the run with exit 2 before any proof;
 - a `steady_warn` rate over 1% prints the root-cause line and does not fail the sweep;
 - the real manifest has every shipped row, and each proof it names is defined.
 
