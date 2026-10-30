@@ -102,6 +102,40 @@ class SerialTableTest(unittest.TestCase):
         self.assertIn("all runs: 3 values, median 1000.00 Mbit/s, BELOW the W22 floor 1113", out)
         self.assertIn("alone runs: 2 values, median 1100.00 Mbit/s, BELOW the W22 floor 1113", out)
 
+    def test_last_row_prints_the_row_of_the_last_run(self):
+        self.write(1, log("1.500", 0) + "throughput sym_sym_relay bytes 1 seconds 5.0 mbit_s 1200.00\n")
+        self.write(2, log("2.500", 0) + "throughput sym_sym_relay bytes 1 seconds 5.0 mbit_s 1100.00\n")
+        out = self.run_table("--upto", "2", "--last-row").stdout.splitlines()
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0].startswith("| 2 | ok | 2.500 ("), out[0])
+
+    def sym_run(self, i, mbit, secs="30.004", other=0):
+        self.write(i, log("1.500", other) + "throughput sym_sym_relay bytes 1 seconds %s mbit_s %s\n" % (secs, mbit))
+
+    def test_sym_gate_uses_the_median_of_long_alone_runs(self):
+        for i, mbit in enumerate(["1100.00", "1200.00", "1150.00", "1300.00", "1120.00"], 1):
+            self.sym_run(i, mbit)
+        self.sym_run(6, "200.00", other=8)  # contended: not counted
+        self.sym_run(7, "300.00", secs="5.003")  # short sample: not counted
+        res = self.run_table("--sym-gate")
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("sym_gate ok: 5 alone runs of at least 29 s, median 1150.00", res.stdout)
+
+    def test_sym_gate_fails_below_the_floor(self):
+        for i, mbit in enumerate(["1000.00", "1050.00", "1100.00", "1200.00", "1250.00"], 1):
+            self.sym_run(i, mbit)
+        res = self.run_table("--sym-gate")
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("sym_gate failed: 5 alone runs", res.stdout)
+
+    def test_sym_gate_needs_enough_long_runs(self):
+        for i in range(1, 5):
+            self.sym_run(i, "1300.00")
+        self.sym_run(5, "1300.00", secs="5.001")
+        res = self.run_table("--sym-gate")
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("4 alone runs with a sym bulk of at least 29 s, need 5", res.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
