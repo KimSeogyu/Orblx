@@ -30,6 +30,57 @@ pub struct Netmap {
     /// An empty list stays out of the JSON text.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lock: Vec<LockUpdate>,
+    /// Split DNS zones from the policy (W24-F).
+    ///
+    /// The overlay DNS responder sends a query for a name in a zone to the zone nameserver.
+    /// An empty list stays out of the JSON text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub split_dns: Vec<SplitDns>,
+}
+
+/// The maximum number of split DNS zones in one netmap (W24-F).
+pub const MAX_SPLIT_DNS_ZONES: usize = 32;
+
+/// The maximum number of nameservers for one split DNS zone (W24-F).
+pub const MAX_SPLIT_DNS_SERVERS: usize = 4;
+
+/// One split DNS zone (W24-F).
+///
+/// The policy field `splitDns` maps a DNS domain to nameserver IPv4 addresses.
+/// A nameserver is usually behind a subnet router.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SplitDns {
+    /// The DNS domain in lowercase, for example `corp.lan`.
+    pub domain: String,
+    /// The nameserver IPv4 addresses for the domain.
+    pub nameservers: Vec<String>,
+}
+
+/// Check one split DNS domain (W24-F).
+///
+/// The domain is lowercase DNS labels. The `orblx` zone is not valid.
+/// The root zone is not valid.
+#[must_use]
+pub fn valid_split_domain(domain: &str) -> bool {
+    valid_owner_name(domain)
+        && domain == domain.to_ascii_lowercase()
+        && domain != "orblx"
+        && !domain.ends_with(".orblx")
+}
+
+/// Check one split DNS nameserver (W24-F).
+///
+/// The nameserver is a unicast IPv4 address outside the overlay range 100.64.0.0/10
+/// and outside 127.0.0.0/8.
+#[must_use]
+pub fn valid_split_nameserver(text: &str) -> bool {
+    let Ok(ip) = parse_ipv4(text) else {
+        return false;
+    };
+    let octets = ip.octets();
+    let overlay = octets[0] == 100 && (octets[1] & 0xc0) == 64;
+    ip.to_string() == text && !ip.is_loopback() && !overlay
 }
 
 /// The node lock file name in a node state directory.
@@ -265,8 +316,45 @@ impl Netmap {
                 });
             }
         }
-        Ok(())
+        check_split_dns(&self.split_dns)
     }
+}
+
+fn check_split_dns(zones: &[SplitDns]) -> Result<(), NetmapError> {
+    if zones.len() > MAX_SPLIT_DNS_ZONES {
+        return Err(NetmapError::Json {
+            detail: "The netmap has too many split DNS zones.".to_string(),
+        });
+    }
+    let mut seen = HashSet::new();
+    for zone in zones {
+        if !valid_split_domain(&zone.domain) {
+            return Err(NetmapError::Owner {
+                owner: zone.domain.clone(),
+            });
+        }
+        if !seen.insert(zone.domain.clone()) {
+            return Err(NetmapError::Duplicate {
+                value: zone.domain.clone(),
+            });
+        }
+        if zone.nameservers.is_empty() || zone.nameservers.len() > MAX_SPLIT_DNS_SERVERS {
+            return Err(NetmapError::Json {
+                detail: format!(
+                    "The split DNS zone {} needs 1 to {MAX_SPLIT_DNS_SERVERS} nameservers.",
+                    zone.domain
+                ),
+            });
+        }
+        for server in &zone.nameservers {
+            if !valid_split_nameserver(server) {
+                return Err(NetmapError::Address {
+                    address: server.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_ipv4(text: &str) -> Result<Ipv4Addr, NetmapError> {
@@ -496,5 +584,50 @@ mod tests {
         let text = sample().replace("\"version\": 1", "\"version\": 1, \"extra\": true");
         let err = Netmap::from_slice(text.as_bytes()).unwrap_err();
         assert!(matches!(err, NetmapError::Json { .. }));
+    }
+
+    fn with_split(zone: &str) -> String {
+        sample().replace(
+            "\"version\": 1,",
+            &format!("\"version\": 1, \"split_dns\": [{zone}],"),
+        )
+    }
+
+    #[test]
+    fn a_split_dns_zone_round_trips() {
+        let text = with_split(r#"{"domain": "corp.lan", "nameservers": ["10.88.0.53"]}"#);
+        let map = Netmap::from_slice(text.as_bytes()).unwrap();
+        assert_eq!(map.split_dns.len(), 1);
+        assert_eq!(map.split_dns[0].domain, "corp.lan");
+        let again = serde_json::to_string(&map).unwrap();
+        assert!(again.contains("\"split_dns\""));
+        assert_eq!(Netmap::from_slice(again.as_bytes()).unwrap(), map);
+    }
+
+    #[test]
+    fn no_split_dns_stays_out_of_the_json() {
+        let map = Netmap::from_slice(sample().as_bytes()).unwrap();
+        let text = serde_json::to_string(&map).unwrap();
+        assert!(!text.contains("split_dns"));
+    }
+
+    #[test]
+    fn a_bad_split_dns_zone_is_rejected() {
+        for zone in [
+            r#"{"domain": "lab.orblx", "nameservers": ["10.88.0.53"]}"#,
+            r#"{"domain": "orblx", "nameservers": ["10.88.0.53"]}"#,
+            r#"{"domain": "Corp.lan", "nameservers": ["10.88.0.53"]}"#,
+            r#"{"domain": "corp lan", "nameservers": ["10.88.0.53"]}"#,
+            r#"{"domain": "corp.lan", "nameservers": []}"#,
+            r#"{"domain": "corp.lan", "nameservers": ["100.64.0.9"]}"#,
+            r#"{"domain": "corp.lan", "nameservers": ["127.0.0.1"]}"#,
+            r#"{"domain": "corp.lan", "nameservers": ["10.88.0.053"]}"#,
+            r#"{"domain": "corp.lan", "nameservers": ["10.88.0.53"]}, {"domain": "corp.lan", "nameservers": ["10.88.0.54"]}"#,
+        ] {
+            assert!(
+                Netmap::from_slice(with_split(zone).as_bytes()).is_err(),
+                "{zone}"
+            );
+        }
     }
 }

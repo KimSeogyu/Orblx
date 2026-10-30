@@ -57,7 +57,7 @@ pub use google::{
 pub use issuer::{token_kid, OidcIdClaims, OidcIssuer, OidcJwks, OidcReject, DISCOVERY_PATH};
 pub use oidc::{AgentSvid, IssueGate, MockOidc, MOCK_OIDC_ISSUER, OIDC_AUDIENCE};
 pub use policy::{
-    Policy, PolicyAssertion, PolicyError, ReceiverGrant, ReceiverGrants, SshAssertion,
+    Policy, PolicyAssertion, PolicyError, ReceiverGrant, ReceiverGrants, SplitDnsZone, SshAssertion,
 };
 
 /// Return the Ed25519 seed from a PKCS#8 private key PEM.
