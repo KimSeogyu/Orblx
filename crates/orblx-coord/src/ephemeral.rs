@@ -13,6 +13,10 @@
 //! - The file `ephemeral.json` keeps the offline time of each ephemeral node and the
 //!   time of the last save. After a restart the coordinator keeps the offline time that
 //!   the node had at the last save. The time that the coordinator was down does not count.
+//! - A node that had an open request at the last save was online when the coordinator
+//!   stopped. Its request to a stopped coordinator can take up to `DENY_WAIT_HOLD` + 10 s
+//!   to fail before the node connects again. Thus after a start that node gets
+//!   [`RECONNECT_GRACE`] before its offline time starts. The removal can be late, never early.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -31,6 +35,12 @@ pub const DEFAULT_OFFLINE: Duration = Duration::from_secs(600);
 pub const MIN_OFFLINE: Duration = Duration::from_secs(2);
 /// The largest offline limit.
 pub const MAX_OFFLINE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The time that a node that was online at the last save gets after a coordinator start
+/// before its offline time starts. It is the request limit of the node client
+/// (`DENY_WAIT_HOLD` + 10 s).
+pub const RECONNECT_GRACE: Duration =
+    Duration::from_secs(crate::client::DENY_WAIT_HOLD.as_secs() + 10);
 
 const PRESENCE_FILE: &str = "ephemeral.json";
 const PRESENCE_VERSION: u32 = 1;
@@ -92,6 +102,9 @@ struct PresenceFile {
     saved_ms: u64,
     /// Unix milliseconds when each ephemeral node was last online.
     last_seen_ms: BTreeMap<String, u64>,
+    /// The ephemeral nodes with an open request at the save.
+    #[serde(default)]
+    online: Vec<String>,
 }
 
 impl Presence {
@@ -140,11 +153,15 @@ impl Presence {
             return Err(CoordError::State);
         }
         let mut state = self.state.lock().map_err(|_| CoordError::State)?;
+        let grace = u64::try_from(RECONNECT_GRACE.as_millis()).unwrap_or(u64::MAX);
         for (name, seen) in &file.last_seen_ms {
-            let offline_before = file.saved_ms.saturating_sub(*seen);
-            state
-                .last_seen_ms
-                .insert(name.clone(), now.saturating_sub(offline_before));
+            let restored = if file.online.contains(name) {
+                // The node was online at the stop. Its offline time starts after the grace.
+                now.saturating_add(grace)
+            } else {
+                now.saturating_sub(file.saved_ms.saturating_sub(*seen))
+            };
+            state.last_seen_ms.insert(name.clone(), restored);
         }
         Ok(file.last_seen_ms.len())
     }
@@ -205,15 +222,20 @@ impl Presence {
             }
             state.last_save_ms = now;
             let mut last_seen_ms = BTreeMap::new();
+            let mut online = Vec::new();
             for name in ephemeral {
                 if let Some(seen) = state.last_seen_ms.get(name) {
                     last_seen_ms.insert(name.clone(), *seen);
+                }
+                if state.open.contains_key(name) {
+                    online.push(name.clone());
                 }
             }
             PresenceFile {
                 version: PRESENCE_VERSION,
                 saved_ms: now,
                 last_seen_ms,
+                online,
             }
         };
         let path = dir.join(PRESENCE_FILE);
@@ -389,6 +411,51 @@ mod tests {
             second.due(&names(&["eph1"]), 111_001),
             vec![("eph1".to_string(), 10_001)]
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_node_online_at_the_stop_gets_the_reconnect_grace() {
+        let dir = scratch("grace");
+        let first = Presence::default();
+        first.set_offline(Duration::from_secs(10)).unwrap();
+        let guard = first.begin("eph1");
+        assert!(first.due(&names(&["eph1", "eph2"]), 1_000).is_empty());
+        // eph1 has an open request at the save. eph2 is offline for 6 s.
+        first
+            .save(&dir, &names(&["eph1", "eph2"]), 7_000, true)
+            .unwrap();
+        drop(guard);
+        let second = Presence::default();
+        second.set_offline(Duration::from_secs(10)).unwrap();
+        assert_eq!(second.load(&dir, 107_000).unwrap(), 2);
+        let grace = u64::try_from(RECONNECT_GRACE.as_millis()).unwrap();
+        let limit = 107_000 + grace + 10_000;
+        // eph2 keeps its offline time. eph1 starts its offline time after the grace.
+        assert_eq!(
+            second.due(&names(&["eph1", "eph2"]), 111_001),
+            vec![("eph2".to_string(), 10_001)]
+        );
+        assert!(second.due(&names(&["eph1"]), limit).is_empty());
+        assert_eq!(
+            second.due(&names(&["eph1"]), limit + 1),
+            vec![("eph1".to_string(), 10_001)]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_without_the_online_list_reads() {
+        let dir = scratch("old-file");
+        std::fs::write(
+            dir.join(PRESENCE_FILE),
+            r#"{"version":1,"saved_ms":7000,"last_seen_ms":{"eph1":1000}}"#,
+        )
+        .unwrap();
+        let presence = Presence::default();
+        presence.set_offline(Duration::from_secs(10)).unwrap();
+        assert_eq!(presence.load(&dir, 107_000).unwrap(), 1);
+        assert_eq!(presence.due(&names(&["eph1"]), 111_001).len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
