@@ -120,3 +120,7 @@ The agent ticket worked once and the replay was denied.
 After the deny file revoked the alice SVID, the next session failed in 0 seconds.
 The node `b` chain has start 3, end 3, and deny 4.
 The node `c` chain has deny 1.
+
+## Session recording (W22-3)
+
+A policy `ssh` rule can require a session recording. See `docs/w22-ssh-recording.md`.

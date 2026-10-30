@@ -3,6 +3,8 @@
 //! The listener uses the overlay address.
 //! Each new session reads the deny file.
 //! An open session reads the deny file again after the check period.
+//! A rule can require a session recording. Then the server fails closed
+//! when the recording does not open or does not write.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -11,6 +13,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,6 +30,7 @@ use tokio::net::TcpListener;
 
 use crate::auth::{command_ok, open_login, overlay_listen_addr, RefusedLogin};
 use crate::hostkey::host_key_from_seed;
+use crate::record::Recorder;
 
 struct Shared {
     overlay: Ipv4Addr,
@@ -47,6 +51,7 @@ struct Admitted {
     check_period: u64,
     ticket_hash: [u8; 16],
     frame: u32,
+    recording: bool,
 }
 
 #[derive(Clone)]
@@ -157,12 +162,15 @@ impl SshHandler {
                     }
                 }
                 let frame = self.shared.frames.fetch_add(1, Ordering::Relaxed);
+                let recording =
+                    policy.ssh_recording_required(&admitted.src, &self.shared.node_id, user);
                 self.admitted = Some(Admitted {
                     src: admitted.src,
                     user: user.to_string(),
                     check_period: admitted.check_period,
                     ticket_hash: admitted.ticket_hash,
                     frame,
+                    recording,
                 });
                 Auth::Accept
             }
@@ -187,13 +195,47 @@ impl SshHandler {
             self.audit_refuse(&refused);
             return None;
         }
+        let mut recorder = None;
+        if admitted.recording {
+            let opened = Recorder::create(&self.shared.state_dir, admitted.frame, &admitted.user)
+                .and_then(|mut opened| {
+                    opened.event(Duration::ZERO, "i", command.as_bytes())?;
+                    Ok(opened)
+                });
+            match opened {
+                Ok(opened) => recorder = Some(opened),
+                Err(_) => {
+                    eprintln!("The SSH session recording did not open. The session is refused.");
+                    self.audit_refuse(&self.recording_refused(&admitted));
+                    return None;
+                }
+            }
+        }
         self.audit_event(SessionEvent::Start {
             ids: session_ids(&admitted),
             at_unix: unix_now(),
         });
-        let output = run_command(command, &admitted, &self.shared);
+        let output = run_command(command, &admitted, &self.shared, recorder.as_mut());
         match output {
             Ok((code, stdout)) => {
+                if let Some(opened) = recorder {
+                    let Ok((file, sha256)) = opened.finish() else {
+                        eprintln!(
+                            "The SSH session recording did not close. The session is refused."
+                        );
+                        self.audit_refuse(&self.recording_refused(&admitted));
+                        return None;
+                    };
+                    let recorded = self.audit_event(SessionEvent::Record {
+                        ids: session_ids(&admitted),
+                        at_unix: unix_now(),
+                        file,
+                        sha256,
+                    });
+                    if !recorded {
+                        return None;
+                    }
+                }
                 self.audit_event(SessionEvent::End {
                     ids: session_ids(&admitted),
                     at_unix: unix_now(),
@@ -211,6 +253,14 @@ impl SshHandler {
         }
     }
 
+    fn recording_refused(&self, admitted: &Admitted) -> RefusedLogin {
+        RefusedLogin {
+            peer: admitted.src.clone(),
+            reason: orblx_audit::DenyReason::Recording,
+            ticket_hash: admitted.ticket_hash,
+        }
+    }
+
     fn audit_refuse(&self, refused: &RefusedLogin) {
         self.audit_event(SessionEvent::Deny {
             ids: SessionIds::receiver_acl(refused.peer.clone(), 0, refused.ticket_hash),
@@ -219,7 +269,7 @@ impl SshHandler {
         });
     }
 
-    fn audit_event(&self, event: SessionEvent) {
+    fn audit_event(&self, event: SessionEvent) -> bool {
         let mut log = self
             .shared
             .audit
@@ -227,12 +277,14 @@ impl SshHandler {
             .unwrap_or_else(|err| err.into_inner());
         if log.append(event).is_err() {
             eprintln!("The audit chain did not record the SSH session.");
-            return;
+            return false;
         }
         let path = self.shared.state_dir.join("ssh-audit.jsonl");
         if log.write_jsonl(&path).is_err() {
             eprintln!("The audit chain did not record the SSH session.");
+            return false;
         }
+        true
     }
 }
 
@@ -274,6 +326,7 @@ fn run_command(
     command: &str,
     admitted: &Admitted,
     shared: &Shared,
+    mut recorder: Option<&mut Recorder>,
 ) -> Result<(u32, Vec<u8>), orblx_audit::DenyReason> {
     let mut child = Command::new("sh")
         .arg("-c")
@@ -286,38 +339,79 @@ fn run_command(
         .spawn()
         .map_err(|_| orblx_audit::DenyReason::Destination)?;
     let started = Instant::now();
+    let (chunks, output) = mpsc::channel::<(Duration, Vec<u8>)>();
+    let reader = child.stdout.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(len) => {
+                        if chunks
+                            .send((started.elapsed(), buf[..len].to_vec()))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    });
+    let mut stdout = Vec::new();
     let mut checked = false;
+    let fail = |child: &mut std::process::Child, reason| {
+        let _ = child.kill();
+        let _ = child.wait();
+        Err(reason)
+    };
     loop {
+        if take_output(&output, &mut stdout, recorder.as_deref_mut()).is_err() {
+            return fail(&mut child, orblx_audit::DenyReason::Recording);
+        }
         if !checked && started.elapsed() >= Duration::from_secs(admitted.check_period.max(1)) {
             checked = true;
             if recheck(shared, admitted).is_err() {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(orblx_audit::DenyReason::Revoked);
+                return fail(&mut child, orblx_audit::DenyReason::Revoked);
             }
         }
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                if let Some(mut pipe) = child.stdout.take() {
-                    let _ = pipe.read_to_end(&mut stdout);
+                if let Some(handle) = reader {
+                    let _ = handle.join();
                 }
-                if stdout.len() > 4096 {
-                    stdout.truncate(4096);
+                if take_output(&output, &mut stdout, recorder.as_deref_mut()).is_err() {
+                    return Err(orblx_audit::DenyReason::Recording);
                 }
                 let code = status.code().unwrap_or(1);
                 let code = u32::try_from(code).unwrap_or(1);
                 return Ok((code, stdout));
             }
             Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(_) => return Err(orblx_audit::DenyReason::Destination),
+            Err(_) => return fail(&mut child, orblx_audit::DenyReason::Destination),
         }
         if started.elapsed() > Duration::from_secs(30) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(orblx_audit::DenyReason::Expired);
+            return fail(&mut child, orblx_audit::DenyReason::Expired);
         }
     }
+}
+
+/// Move the read output into the reply and into the recording.
+///
+/// The reply keeps the first 4096 bytes. The recording keeps all bytes.
+fn take_output(
+    output: &mpsc::Receiver<(Duration, Vec<u8>)>,
+    stdout: &mut Vec<u8>,
+    mut recorder: Option<&mut Recorder>,
+) -> std::io::Result<()> {
+    while let Ok((at, chunk)) = output.try_recv() {
+        if let Some(recorder) = recorder.as_deref_mut() {
+            recorder.event(at, "o", &chunk)?;
+        }
+        let room = 4096usize.saturating_sub(stdout.len());
+        stdout.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+    Ok(())
 }
 
 /// Start the SSH server on the overlay address.
@@ -744,6 +838,115 @@ mod tests {
         assert!(checked.metrics.start >= 1);
         assert!(checked.metrics.end >= 1);
         assert!(checked.metrics.deny >= 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_rule_with_recording_writes_the_file_and_fails_closed() {
+        let dir = std::env::temp_dir().join(format!("orblx-ssh-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        let ca = MiniCa::generate(now).unwrap();
+        let node = SpiffeId::node("box").unwrap();
+        let alice = SpiffeId::user("alice").unwrap();
+        let issued_node = ca
+            .issue(&node, now, MAX_USER_TTL, &DenySet::empty())
+            .unwrap();
+        let issued_alice = ca
+            .issue(&alice, now, MAX_USER_TTL, &DenySet::empty())
+            .unwrap();
+        std::fs::write(dir.join("cert.pem"), &issued_node.certificate_pem).unwrap();
+        std::fs::write(dir.join("key.pem"), &issued_node.private_key_pem).unwrap();
+        std::fs::write(dir.join("bundle.pem"), ca.certificate_pem()).unwrap();
+        std::fs::write(dir.join("peer.pem"), &issued_node.certificate_pem).unwrap();
+        std::fs::write(
+            dir.join("policy.hujson"),
+            r#"{
+                "ssh": [
+                    {
+                        "src": ["spiffe://orblx.local/user/alice"],
+                        "dst": ["spiffe://orblx.local/node/box"],
+                        "users": ["alice"],
+                        "checkPeriod": "30s"
+                    },
+                    {
+                        "src": ["spiffe://orblx.local/user/alice"],
+                        "dst": ["spiffe://orblx.local/node/box"],
+                        "users": ["rec"],
+                        "checkPeriod": "30s",
+                        "recording": "required"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let alice_dir = dir.join("alice");
+        std::fs::create_dir_all(&alice_dir).unwrap();
+        std::fs::write(alice_dir.join("bundle.pem"), ca.certificate_pem()).unwrap();
+        std::fs::write(alice_dir.join("cert.pem"), &issued_alice.certificate_pem).unwrap();
+        std::fs::write(alice_dir.join("key.pem"), &issued_alice.private_key_pem).unwrap();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shared = std::sync::Arc::new(Shared::load(&dir, Ipv4Addr::LOCALHOST).unwrap());
+        tokio::spawn(super::accept_loop(listener, shared));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let request = |user: &str| SessionRequest {
+            user: user.to_string(),
+            addr,
+            dst: node.clone(),
+            identity_dir: alice_dir.clone(),
+            peer_cert: dir.join("peer.pem"),
+            command: "printf '%s\\n' \"recorded-$ORBLX_SSH_USER\"".to_string(),
+        };
+
+        let recorded = session_within(request("rec")).await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&recorded.stdout).trim(),
+            "recorded-rec"
+        );
+        let records: Vec<_> = std::fs::read_dir(dir.join(crate::record::RECORD_DIR))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(records.len(), 1);
+        let cast = std::fs::read_to_string(&records[0]).unwrap();
+        assert!(cast.contains("recorded-rec"));
+        assert!(!cast.contains("PRIVATE KEY"));
+        let checked = verify_file(&dir.join("ssh-audit.jsonl")).unwrap();
+        assert_eq!(checked.metrics.record, 1);
+
+        let plain = session_within(request("alice")).await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&plain.stdout).trim(),
+            "recorded-alice"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.join(crate::record::RECORD_DIR))
+                .unwrap()
+                .count(),
+            1
+        );
+
+        let original = std::fs::read(&records[0]).unwrap();
+        let mut changed = original.clone();
+        changed[0] ^= 0x01;
+        std::fs::write(&records[0], &changed).unwrap();
+        assert!(verify_file(&dir.join("ssh-audit.jsonl")).is_err());
+        std::fs::write(&records[0], &original).unwrap();
+
+        std::fs::rename(
+            dir.join(crate::record::RECORD_DIR),
+            dir.join("recordings-moved"),
+        )
+        .unwrap();
+        std::fs::write(dir.join(crate::record::RECORD_DIR), b"not a directory").unwrap();
+        assert!(session_within(request("rec")).await.is_err());
+        let chain = std::fs::read_to_string(dir.join("ssh-audit.jsonl")).unwrap();
+        assert!(chain.contains("\"reason\":\"recording\""));
+        let plain = session_within(request("alice")).await.unwrap();
+        assert_eq!(plain.exit_status, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

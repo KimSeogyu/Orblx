@@ -1,6 +1,7 @@
 //! Session audit hash chain.
 //!
-//! The chain records session start, session end, and session deny.
+//! The chain records session start, session end, session deny, and session recording.
+//! A record event stores the SHA-256 of one SSH session recording file.
 //! Each record stores the previous SHA-256 hash.
 //! The hash covers the previous hash and the canonical event bytes.
 //! An auditor can check an export file without the data path.
@@ -21,8 +22,8 @@ mod hexutil;
 mod metrics;
 
 pub use chain::{
-    canonical_bytes, event_hash, verify_file, verify_jsonl, AuditLog, ChainRecord, VerifiedChain,
-    EVENT_VERSION, GENESIS_HASH,
+    canonical_bytes, event_hash, recording_path_ok, verify_file, verify_jsonl, AuditLog,
+    ChainRecord, VerifiedChain, EVENT_VERSION, GENESIS_HASH,
 };
 pub use config::{
     config_canonical_bytes, config_hash, digest_hex, parse_utc_text, sha256_digest, utc_text,

@@ -43,6 +43,7 @@ fn escape_demo_links_one_deny_and_one_session() {
             start: 1,
             end: 1,
             deny: 1,
+            record: 0,
         }
     );
 }
@@ -158,6 +159,7 @@ fn custom_ids_use_relay_session_and_spiffe() {
             start: 1,
             end: 1,
             deny: 1,
+            record: 0,
         }
     );
     assert_eq!(checked.records, 3);

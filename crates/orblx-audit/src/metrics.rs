@@ -1,6 +1,6 @@
 use crate::EventKind;
 
-/// Counters for session start, session end, and session deny.
+/// Counters for session start, session end, session deny, and session recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[must_use]
 pub struct SessionMetrics {
@@ -10,6 +10,8 @@ pub struct SessionMetrics {
     pub end: u64,
     /// Session deny events.
     pub deny: u64,
+    /// Session recording events.
+    pub record: u64,
 }
 
 impl SessionMetrics {
@@ -18,6 +20,7 @@ impl SessionMetrics {
             EventKind::Start => self.start = self.start.saturating_add(1),
             EventKind::End => self.end = self.end.saturating_add(1),
             EventKind::Deny => self.deny = self.deny.saturating_add(1),
+            EventKind::Record => self.record = self.record.saturating_add(1),
         }
     }
 }

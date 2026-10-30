@@ -148,6 +148,7 @@ impl AuditLog {
 ///
 /// The layout is version, kind, time, Relay session id, frame session id,
 /// peer length, peer bytes, ticket hash, reason length, and reason bytes.
+/// A record event then adds the file length, the file bytes, and the 32-byte SHA-256.
 /// Lengths and the time are big-endian.
 pub fn canonical_bytes(event: &SessionEvent) -> Result<Vec<u8>, AuditError> {
     let ids = event.ids();
@@ -167,6 +168,12 @@ pub fn canonical_bytes(event: &SessionEvent) -> Result<Vec<u8>, AuditError> {
     out.extend_from_slice(&ids.ticket_hash);
     out.extend_from_slice(&reason_len.to_be_bytes());
     out.extend_from_slice(reason_bytes);
+    if let Some((file, sha256)) = event.recording() {
+        let file_len = u16::try_from(file.len()).map_err(|_| AuditError::BadText)?;
+        out.extend_from_slice(&file_len.to_be_bytes());
+        out.extend_from_slice(file.as_bytes());
+        out.extend_from_slice(sha256);
+    }
     Ok(out)
 }
 
@@ -240,10 +247,54 @@ pub fn verify_jsonl(text: &str) -> Result<VerifiedChain, AuditError> {
 }
 
 /// Read a JSONL file and check the chain.
+///
+/// The function also reads each recording that a record event names.
+/// The path is relative to the chain file directory.
+/// The SHA-256 of the file must match the SHA-256 in the chain.
 pub fn verify_file(path: &Path) -> Result<VerifiedChain, AuditError> {
     let text = std::fs::read_to_string(path)
         .map_err(|err| AuditError::Io(format!("{}: {err}", path.display())))?;
-    verify_jsonl(&text)
+    let checked = verify_jsonl(&text)?;
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    for raw in text.lines() {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let exported: ExportRecord = serde_json::from_str(raw).map_err(|_| AuditError::Export)?;
+        let event = event_from_export(&exported)?;
+        if let Some((file, sha256)) = event.recording() {
+            verify_recording(base, exported.index, file, sha256)?;
+        }
+    }
+    Ok(checked)
+}
+
+/// Return true when `file` is a plain relative path with no `..` part.
+#[must_use]
+pub fn recording_path_ok(file: &str) -> bool {
+    let path = Path::new(file);
+    !file.is_empty()
+        && path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+}
+
+fn verify_recording(
+    base: &Path,
+    index: u64,
+    file: &str,
+    sha256: &[u8; 32],
+) -> Result<(), AuditError> {
+    if !recording_path_ok(file) {
+        return Err(AuditError::BadRecordingPath { index });
+    }
+    let bytes = std::fs::read(base.join(file)).map_err(|_| AuditError::BadRecording { index })?;
+    let digest = Sha256::digest(&bytes);
+    if digest.as_slice() != sha256.as_slice() {
+        return Err(AuditError::BadRecording { index });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -259,6 +310,10 @@ struct ExportRecord {
     peer: String,
     ticket_hash: String,
     reason: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    recording: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    recording_sha256: String,
 }
 
 fn export_record(record: &ChainRecord) -> ExportRecord {
@@ -269,6 +324,10 @@ fn export_record(record: &ChainRecord) -> ExportRecord {
         .map(DenyReason::as_str)
         .unwrap_or("")
         .to_string();
+    let (recording, recording_sha256) = match record.event.recording() {
+        Some((file, sha256)) => (file.to_string(), encode_hex(sha256)),
+        None => (String::new(), String::new()),
+    };
     ExportRecord {
         index: record.index,
         prev_hash: encode_hex(&record.prev_hash),
@@ -280,6 +339,8 @@ fn export_record(record: &ChainRecord) -> ExportRecord {
         peer: ids.peer.as_uri().to_string(),
         ticket_hash: encode_hex(&ids.ticket_hash),
         reason,
+        recording,
+        recording_sha256,
     }
 }
 
@@ -293,7 +354,11 @@ fn event_from_export(row: &ExportRecord) -> Result<SessionEvent, AuditError> {
         ticket_hash: decode_hex_array::<16>(&row.ticket_hash)?,
     };
     let at_unix = row.at_unix;
-    match EventKind::from_str(&row.kind)? {
+    let kind = EventKind::from_str(&row.kind)?;
+    if kind != EventKind::Record && !(row.recording.is_empty() && row.recording_sha256.is_empty()) {
+        return Err(AuditError::BadText);
+    }
+    match kind {
         EventKind::Start => {
             require_empty_reason(&row.reason)?;
             Ok(SessionEvent::Start { ids, at_unix })
@@ -307,6 +372,16 @@ fn event_from_export(row: &ExportRecord) -> Result<SessionEvent, AuditError> {
             at_unix,
             reason: DenyReason::parse(&row.reason)?,
         }),
+        EventKind::Record => {
+            require_empty_reason(&row.reason)?;
+            Ok(SessionEvent::Record {
+                ids,
+                at_unix,
+                file: row.recording.clone(),
+                sha256: decode_hex_array::<32>(&row.recording_sha256)
+                    .map_err(|_| AuditError::BadText)?,
+            })
+        }
     }
 }
 

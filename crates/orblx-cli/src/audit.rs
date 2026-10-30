@@ -53,6 +53,7 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             println!("start {}", checked.metrics.start);
             println!("end {}", checked.metrics.end);
             println!("deny {}", checked.metrics.deny);
+            println!("record {}", checked.metrics.record);
             println!("records {}", checked.records);
             Ok(())
         }

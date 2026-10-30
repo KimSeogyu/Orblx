@@ -37,7 +37,7 @@ impl SessionIds {
     }
 }
 
-/// The three session event classes.
+/// The session event classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
     /// A session opened.
@@ -46,6 +46,8 @@ pub enum EventKind {
     End,
     /// A session was refused.
     Deny,
+    /// A session recording closed.
+    Record,
 }
 
 impl EventKind {
@@ -56,6 +58,7 @@ impl EventKind {
             Self::Start => "start",
             Self::End => "end",
             Self::Deny => "deny",
+            Self::Record => "record",
         }
     }
 
@@ -64,6 +67,7 @@ impl EventKind {
             "start" => Ok(Self::Start),
             "end" => Ok(Self::End),
             "deny" => Ok(Self::Deny),
+            "record" => Ok(Self::Record),
             _ => Err(AuditError::BadKind),
         }
     }
@@ -73,6 +77,7 @@ impl EventKind {
             Self::Start => 1,
             Self::End => 2,
             Self::Deny => 3,
+            Self::Record => 4,
         }
     }
 }
@@ -92,6 +97,8 @@ pub enum DenyReason {
     Expired,
     /// The ticket is absent.
     Missing,
+    /// The rule needs a session recording and the recording failed.
+    Recording,
 }
 
 impl DenyReason {
@@ -104,6 +111,7 @@ impl DenyReason {
             Self::Ticket => "ticket",
             Self::Expired => "expired",
             Self::Missing => "missing",
+            Self::Recording => "recording",
         }
     }
 
@@ -114,6 +122,7 @@ impl DenyReason {
             "ticket" => Ok(Self::Ticket),
             "expired" => Ok(Self::Expired),
             "missing" => Ok(Self::Missing),
+            "recording" => Ok(Self::Recording),
             _ => Err(AuditError::BadReason),
         }
     }
@@ -145,6 +154,20 @@ pub enum SessionEvent {
         /// Deny cause.
         reason: DenyReason,
     },
+    /// The session recording closed.
+    ///
+    /// `file` is the recording path relative to the chain file directory.
+    /// `sha256` is the SHA-256 of the full recording file.
+    Record {
+        /// Session names.
+        ids: SessionIds,
+        /// Unix time in seconds.
+        at_unix: u64,
+        /// Recording path relative to the chain file directory.
+        file: String,
+        /// SHA-256 of the recording file.
+        sha256: [u8; 32],
+    },
 }
 
 impl SessionEvent {
@@ -155,6 +178,7 @@ impl SessionEvent {
             Self::Start { .. } => EventKind::Start,
             Self::End { .. } => EventKind::End,
             Self::Deny { .. } => EventKind::Deny,
+            Self::Record { .. } => EventKind::Record,
         }
     }
 
@@ -162,7 +186,10 @@ impl SessionEvent {
     #[must_use]
     pub fn ids(&self) -> &SessionIds {
         match self {
-            Self::Start { ids, .. } | Self::End { ids, .. } | Self::Deny { ids, .. } => ids,
+            Self::Start { ids, .. }
+            | Self::End { ids, .. }
+            | Self::Deny { ids, .. }
+            | Self::Record { ids, .. } => ids,
         }
     }
 
@@ -172,18 +199,30 @@ impl SessionEvent {
         match self {
             Self::Start { at_unix, .. }
             | Self::End { at_unix, .. }
-            | Self::Deny { at_unix, .. } => *at_unix,
+            | Self::Deny { at_unix, .. }
+            | Self::Record { at_unix, .. } => *at_unix,
         }
     }
 
     /// Return the deny cause.
     ///
-    /// Start and end have no cause.
+    /// Start, end, and record have no cause.
     #[must_use]
     pub fn reason(&self) -> Option<DenyReason> {
         match self {
-            Self::Start { .. } | Self::End { .. } => None,
+            Self::Start { .. } | Self::End { .. } | Self::Record { .. } => None,
             Self::Deny { reason, .. } => Some(*reason),
+        }
+    }
+
+    /// Return the recording path and the recording SHA-256.
+    ///
+    /// Only a record event has a recording.
+    #[must_use]
+    pub fn recording(&self) -> Option<(&str, &[u8; 32])> {
+        match self {
+            Self::Record { file, sha256, .. } => Some((file.as_str(), sha256)),
+            _ => None,
         }
     }
 }
