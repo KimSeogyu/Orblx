@@ -886,6 +886,13 @@ impl Coordinator {
         Ok(inner.policy.is_owner(id))
     }
 
+    /// Return the owner SPIFFE IDs of the loaded policy (W25-3b).
+    pub fn policy_owners(&self) -> Result<Vec<SpiffeId>, CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        Ok(inner.policy.owners().to_vec())
+    }
+
     /// Return the policy file path.
     pub fn policy_file(&self) -> Result<PathBuf, CoordError> {
         let inner = self.lock()?;
