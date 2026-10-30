@@ -367,8 +367,8 @@ if [[ "$CASE2_PATH" != "direct" && "$CASE2_PATH" != "relay" ]]; then
   exit 1
 fi
 echo "=== [C] case 2 direct path evidence ==="
-docker logs orblx-nat-x 2>&1 | grep -E '^The (reflexive endpoint|candidate for|hole punch reached)' | sort -u | sed 's/^/node-x: /'
-docker logs orblx-nat-y 2>&1 | grep -E '^The (reflexive endpoint|candidate for|hole punch reached)' | sort -u | sed 's/^/node-y: /'
+docker logs orblx-nat-x 2>&1 | show_matching -E '^The (reflexive endpoint|candidate for|hole punch reached)' | sort -u | sed 's/^/node-x: /'
+docker logs orblx-nat-y 2>&1 | show_matching -E '^The (reflexive endpoint|candidate for|hole punch reached)' | sort -u | sed 's/^/node-y: /'
 CASE2_X_REACHED="$(docker logs orblx-nat-x 2>&1 | read_all awk '/^The hole punch reached / {sub(/\.$/, "", $5); print $5; exit}')"
 CASE2_Y_REACHED="$(docker logs orblx-nat-y 2>&1 | read_all awk '/^The hole punch reached / {sub(/\.$/, "", $5); print $5; exit}')"
 echo "case2 node-x punch_peer ${CASE2_X_REACHED:-none}"
@@ -487,8 +487,8 @@ printf '%s\n' "$CASE5_W"
 CASE5_PATH="$(path_of "$CASE5_Y")"
 CASE5_PATH_W="$(path_of "$CASE5_W")"
 ping_ok orblx-nat-y "$IP_W"
-docker logs orblx-nat-y 2>&1 | grep -E '^The (reflexive endpoint|candidate for|hole punch|direct attempt|relay transport)' | sort -u | sed 's/^/node-y: /'
-docker logs orblx-nat-w 2>&1 | grep -E '^The (reflexive endpoint|candidate for|hole punch|direct attempt|relay transport)' | sort -u | sed 's/^/node-w: /'
+docker logs orblx-nat-y 2>&1 | show_matching -E '^The (reflexive endpoint|candidate for|hole punch|direct attempt|relay transport)' | sort -u | sed 's/^/node-y: /'
+docker logs orblx-nat-w 2>&1 | show_matching -E '^The (reflexive endpoint|candidate for|hole punch|direct attempt|relay transport)' | sort -u | sed 's/^/node-w: /'
 echo "case5 path ${CASE5_PATH} ${CASE5_PATH_W}"
 if [[ "$CASE5_PATH" != "relay" || "$CASE5_PATH_W" != "relay" ]]; then
   echo "Case 5 did not use the relay." >&2

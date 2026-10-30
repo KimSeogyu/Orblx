@@ -20,6 +20,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::share::{compile_guests, compile_shares, Share, ShareFile};
+use crate::sink::{compile_audit_sinks, AuditSink, AuditSinkFile};
 use crate::spiffe::{SpiffeId, WorkloadKind};
 
 const MAX_POLICY_BYTES: usize = 256 * 1024;
@@ -352,6 +353,7 @@ pub struct Policy {
     shares: Vec<Share>,
     split_dns: Vec<SplitDnsZone>,
     audit_webhooks: Vec<String>,
+    audit_sinks: Vec<AuditSink>,
     /// True when the policy file has an `acls` list.
     acl_set: bool,
 }
@@ -388,6 +390,7 @@ impl std::fmt::Debug for Policy {
             .field("shares", &self.shares.len())
             .field("split_dns", &self.split_dns.len())
             .field("audit_webhooks", &self.audit_webhooks.len())
+            .field("audit_sinks", &self.audit_sinks.len())
             .finish()
     }
 }
@@ -412,6 +415,7 @@ impl Policy {
             shares: Vec::new(),
             split_dns: Vec::new(),
             audit_webhooks: Vec::new(),
+            audit_sinks: Vec::new(),
             acl_set: false,
         }
     }
@@ -422,6 +426,12 @@ impl Policy {
     #[must_use]
     pub fn audit_webhooks(&self) -> &[String] {
         &self.audit_webhooks
+    }
+
+    /// Return the SIEM sinks from `auditSinks` (W25-13).
+    #[must_use]
+    pub fn audit_sinks(&self) -> &[AuditSink] {
+        &self.audit_sinks
     }
 
     /// Return the node shares (W25-1).
@@ -767,6 +777,8 @@ struct PolicyFile {
     split_dns: BTreeMap<String, Vec<String>>,
     #[serde(default, rename = "auditWebhooks")]
     audit_webhooks: Vec<String>,
+    #[serde(default, rename = "auditSinks")]
+    audit_sinks: Vec<AuditSinkFile>,
 }
 
 #[derive(Deserialize)]
@@ -956,6 +968,7 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
     let shares = compile_shares(&guests, &file.shares)?;
     let split_dns = compile_split_dns(&file.split_dns)?;
     let audit_webhooks = compile_audit_webhooks(&file.audit_webhooks)?;
+    let audit_sinks = compile_audit_sinks(&file.audit_sinks)?;
     Ok(Policy {
         grants,
         subnet_grants,
@@ -970,6 +983,7 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
         shares,
         split_dns,
         audit_webhooks,
+        audit_sinks,
         acl_set: file.acls.is_some(),
     })
 }

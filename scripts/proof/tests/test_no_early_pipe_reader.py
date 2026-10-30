@@ -343,3 +343,52 @@ class SteadyPingGateTest(unittest.TestCase):
         self.assertIn('steady_ping_gate "$label" "$PINGS" "$MAX_LOSS" "$STEADY_MAX_MS" || exit 1', body)
         # proof_ok comes after the last steady ping run.
         self.assertGreater(text.rindex("proof_ok"), text.rindex("\nsteady_pings "))
+
+
+class FullOutputAndSecretScanTest(unittest.TestCase):
+    """W25-14 item 7: a proof step keeps its full output in the log, and the policy-sync leak scan fails."""
+
+    def lib(self, script, *args, stdin=""):
+        return subprocess.run(["bash", "-c", '. "$0"; set -euo pipefail; ' + script, PIPE_LIB, *args],
+                              input=stdin, capture_output=True, text=True)
+
+    def test_no_script_pipes_cargo_output_into_a_filter(self):
+        bad = []
+        for path in shell_files():
+            with open(path, errors="replace") as f:
+                for n, line in enumerate(f, 1):
+                    if not line.lstrip().startswith("#") and re.search(r"\bcargo (test|build|run|clippy)\b[^#]*\|", line):
+                        bad.append("%s:%d: %s" % (os.path.relpath(path, REPO), n, line.strip()))
+        self.assertEqual(bad, [])
+
+    def test_show_matching_prints_the_full_input_when_nothing_matches(self):
+        res = self.lib("printf 'error: the cause\\ntest result: FAILED\\n' | show_matching -E '^test ok'")
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("error: the cause", res.stderr)
+        res = self.lib("printf 'a\\ntest ok 1\\n' | show_matching -E '^test ok'")
+        self.assertEqual((res.returncode, res.stdout), (0, "test ok 1\n"))
+
+    def scan(self, text):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write(text)
+        return self.lib('secret_scan "$1"', f.name)
+
+    def test_secret_scan_fails_on_a_key_a_token_or_an_empty_log(self):
+        noise = "".join("router | line %d\n" % i for i in range(200000))
+        res = self.scan(noise + "a | -----BEGIN PRIVATE KEY-----\n")
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("secret_grep 'PRIVATE KEY' 1", res.stdout)
+        self.assertEqual(self.scan("b | token ge1.fake\n" + noise).returncode, 1)
+        self.assertEqual(self.scan("").returncode, 1)
+        self.assertEqual(self.lib('secret_scan /nonexistent/all-logs.out').returncode, 1)
+        res = self.scan(noise)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("secret_grep 'PRIVATE KEY' 0", res.stdout)
+
+    def test_policy_sync_uses_the_secret_scan_and_fails_on_a_log_error(self):
+        with open(os.path.join(REPO, "scripts", "proof", "policy-sync.sh")) as f:
+            text = f.read()
+        self.assertIn('secret_scan "$WORK/all-logs.out" || fail', text)
+        self.assertIn('logs >"$WORK/all-logs.out" 2>&1 || fail', text)
+        self.assertNotIn("grep -cF 'PRIVATE KEY'", text)
