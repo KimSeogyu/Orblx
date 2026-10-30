@@ -139,6 +139,17 @@ wait_removed() {
   fail "The coordinator did not remove ${name} in ${limit_s} s."
 }
 
+# Wait until SERVICE printed NEEDLE COUNT times (a restart keeps the old log lines).
+wait_log_count() {
+  local service="$1" needle="$2" count="$3" limit_s="${4:-60}" got
+  for _ in $(seq 1 "$limit_s"); do
+    got="$(dc logs --no-color "$service" 2>&1 | grep -cF -- "$needle" || true)"
+    [[ "$got" -ge "$count" ]] && return 0
+    sleep 1
+  done
+  fail "The service ${service} did not print ${count} times: ${needle}"
+}
+
 wait_log() {
   local service="$1" needle="$2" limit_s="${3:-60}"
   for _ in $(seq 1 "$limit_s"); do
@@ -364,9 +375,11 @@ jq -c . <<<"$saved"
 [[ "$off_before" =~ ^[0-9]+$ ]] && (( off_before < T_MS )) || fail "e3 was not offline less than T at the kill."
 sleep $((EPH_T * 2))
 dc start coord >/dev/null
-wait_log coord "ephemeral offline_secs ${EPH_T} loaded" 30
+wait_log_count coord "ephemeral offline_secs ${EPH_T} loaded" 2 30
+dc logs --no-color coord 2>&1 | grep -F "ephemeral offline_secs ${EPH_T} loaded"
 start_ms="$(coord_line_ms "ephemeral offline_secs ${EPH_T} loaded")"
 echo "coord down_ms $((start_ms - kill_ms))"
+(( start_ms > kill_ms )) || fail "The start time of the coordinator is not after the kill."
 wait_removed e3 $((EPH_T + 10))
 removed3_ms="$(coord_line_ms 'ephemeral removed e3 ')" || fail "The coordinator did not log the removal of e3."
 dc logs --no-color coord 2>&1 | grep -F 'ephemeral removed e3 '
@@ -427,8 +440,9 @@ done
 echo "load_left_in_store ${left}"
 [[ "$left" -eq 0 ]] || fail "The coordinator did not remove all load clients."
 dc logs -t --no-color coord 2>&1 | grep -F 'ephemeral removed load' >"$WORK/load-removed.txt" || true
-first_rm="$(head -n 1 "$WORK/load-removed.txt" | awk '{print $1}')"
-last_rm="$(tail -n 1 "$WORK/load-removed.txt" | awk '{print $1}')"
+# A line of `docker compose logs -t` is: coord-1 | TIME text.
+first_rm="$(awk 'NR == 1 {print $3}' "$WORK/load-removed.txt")"
+last_rm="$(awk 'END {print $3}' "$WORK/load-removed.txt")"
 first_rm_ms="$(date -d "$first_rm" +%s%3N)"; last_rm_ms="$(date -d "$last_rm" +%s%3N)"
 echo "load_removed $(awk 'END {print NR}' "$WORK/load-removed.txt") stop_to_first_ms $((first_rm_ms - load_stop_ms)) stop_to_last_ms $((last_rm_ms - load_stop_ms)) spread_ms $((last_rm_ms - first_rm_ms))"
 for i in $(seq 1 "$LOAD_NODES"); do
