@@ -291,31 +291,63 @@ pub(crate) fn fetch(
     Ok(Fetched::Issued(Box::new((material, signed))))
 }
 
-/// List grants. The call records each new expiry in the config chain.
-pub(crate) fn list(coord: &Coordinator, now: SystemTime) -> Result<Value, CoordError> {
-    let now_unix = unix_now(now)?;
+/// Record each new grant expiry in the config chain.
+///
+/// The coordinator tick calls this each 500 ms. `list` also calls it.
+/// The detail holds the end time and the time of the record in Unix ms.
+pub(crate) fn expire_due(coord: &Coordinator, now: SystemTime) -> Result<usize, CoordError> {
     let _guard = GRANT_LOCK.lock().map_err(|_| CoordError::State)?;
     let mut file = load(coord)?;
-    let mut changed = false;
-    let actor = coord.coord_actor()?;
+    let count = expire_locked(coord, &mut file, now)?;
+    if count > 0 {
+        save(coord, &file)?;
+    }
+    Ok(count)
+}
+
+fn expire_locked(
+    coord: &Coordinator,
+    file: &mut GrantFile,
+    now: SystemTime,
+) -> Result<usize, CoordError> {
+    let now_unix = unix_now(now)?;
+    let now_ms = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| CoordError::State)?
+        .as_millis();
+    let mut count = 0;
     for record in &mut file.grants {
         let ended = record.state == ISSUED
             && record.expires.is_some_and(|expires| now_unix >= expires)
             && !record.expire_logged;
         if ended {
+            let actor = coord.coord_actor()?;
             record.expire_logged = true;
-            changed = true;
+            count += 1;
+            let expires = record.expires.unwrap_or(0);
             coord.record_change(
                 &actor,
                 ConfigAction::AgentExpire,
                 &record.id,
                 EMPTY_DIGEST,
                 EMPTY_DIGEST,
-                &format!("expires {}", record.expires.unwrap_or(0)),
+                &format!("expires {expires} seen_ms {now_ms}"),
             )?;
+            println!(
+                "coord agent grant {} expired expires {expires} seen_ms {now_ms}",
+                record.id
+            );
         }
     }
-    if changed {
+    Ok(count)
+}
+
+/// List grants. The call also records each new expiry in the config chain.
+pub(crate) fn list(coord: &Coordinator, now: SystemTime) -> Result<Value, CoordError> {
+    let now_unix = unix_now(now)?;
+    let _guard = GRANT_LOCK.lock().map_err(|_| CoordError::State)?;
+    let mut file = load(coord)?;
+    if expire_locked(coord, &mut file, now)? > 0 {
         save(coord, &file)?;
     }
     let grants: Vec<Value> = file
@@ -420,7 +452,7 @@ mod tests {
     use orblx_identity::SpiffeId;
     use serde_json::Value;
 
-    use super::{approve, fetch, list, request, revoke, Fetched};
+    use super::{approve, expire_due, fetch, list, request, revoke, Fetched};
     use crate::proto::GrantAsk;
     use crate::{Coordinator, OidcConfig};
 
@@ -491,6 +523,14 @@ mod tests {
         let store = fs::read_to_string(dir.0.join("agent-grants.json")).unwrap();
         assert!(!store.contains("PRIVATE KEY"));
         let later = now + Duration::from_secs(31);
+        // Before the end the tick records nothing.
+        assert_eq!(
+            expire_due(&coord, now + Duration::from_secs(29)).unwrap(),
+            0
+        );
+        // The tick records the expiry without a list call, one time only.
+        assert_eq!(expire_due(&coord, later).unwrap(), 1);
+        assert_eq!(expire_due(&coord, later).unwrap(), 0);
         let listed = list(&coord, later).unwrap();
         assert_eq!(listed["grants"][0]["state"], "expired");
         let revoked = revoke(&coord, &id, owner.as_uri(), now).unwrap();
@@ -513,5 +553,11 @@ mod tests {
         ] {
             assert!(actions.iter().any(|item| item == action), "no {action}");
         }
+        // The list call after the tick does not add a second expire record.
+        let expires = actions
+            .iter()
+            .filter(|item| *item == "agent-expire")
+            .count();
+        assert_eq!(expires, 1);
     }
 }

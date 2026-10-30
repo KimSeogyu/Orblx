@@ -43,11 +43,37 @@ pub async fn spawn(
     let material = coord.tls_material()?;
     let endpoint = tlsutil::server_endpoint(&material, listen)?;
     let addr = endpoint.local_addr().map_err(CoordError::io)?;
+    let tick_coord = coord.clone();
+    tokio::spawn(async move {
+        expire_tick(tick_coord).await;
+    });
     let coord = coord.clone();
     let handle = tokio::spawn(async move {
         let _ = accept_loop(endpoint, coord).await;
     });
     Ok((addr, handle))
+}
+
+/// The time between two agent grant expiry checks.
+const EXPIRE_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Record agent grant expiry in the config chain without an admin call.
+async fn expire_tick(coord: Coordinator) {
+    let mut failed = false;
+    loop {
+        tokio::time::sleep(EXPIRE_TICK).await;
+        let step = coord.clone();
+        let result =
+            tokio::task::spawn_blocking(move || agent::expire_due(&step, SystemTime::now())).await;
+        match result {
+            Ok(Ok(_)) => failed = false,
+            Ok(Err(err)) if !failed => {
+                failed = true;
+                println!("coord agent expire tick failed: {}", err.public_text());
+            }
+            _ => {}
+        }
+    }
 }
 
 async fn warm_jwks(coord: &Coordinator) {

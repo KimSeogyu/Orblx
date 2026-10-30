@@ -343,6 +343,41 @@ wait_file_line b "$STATE/guard-web.log" "agent grant ${grant1} expired"
 guard_ttl_ms="$(dc exec -T b awk '/^agent deny reason expired /{print $NF; exit}' "$STATE/guard-web.log")"
 echo "guard_expired_deny_ms ${guard_ttl_ms} guard_deny_after_end_ms $(( guard_ttl_ms - expires1_ms ))"
 
+echo "=== [C] coordinator records the expiry without a list call ==="
+# The script does not call "admin grants" after the end until this check is done.
+coord_line=""
+for i in $(seq 1 100); do
+  coord_line="$(dc logs coord 2>&1 | grep -m1 "coord agent grant ${grant1} expired " || true)"
+  if [[ -n "$coord_line" ]]; then
+    break
+  fi
+  sleep 0.1
+done
+seen_by_script_ms="$(date +%s%3N)"
+printf '%s
+' "$coord_line"
+if [[ -z "$coord_line" ]]; then
+  echo "The coordinator did not record the expiry of grant ${grant1}." >&2
+  exit 1
+fi
+coord_seen_ms="$(awk '{for (i = 1; i < NF; i++) if ($i == "seen_ms") print $(i + 1)}' <<<"$coord_line")"
+coord_expire_delta=$(( coord_seen_ms - expires1_ms ))
+echo "coord_expire_seen_ms ${coord_seen_ms} coord_expire_after_end_ms ${coord_expire_delta}"
+echo "script_saw_expire_ms ${seen_by_script_ms} script_saw_after_end_ms $(( seen_by_script_ms - expires1_ms ))"
+if (( coord_expire_delta < 0 || coord_expire_delta > 3000 )); then
+  echo "The coordinator expire record is not within 3000 ms after the end." >&2
+  exit 1
+fi
+early_audit="$(owner audit)"
+printf '%s
+' "$early_audit" | grep " agent-expire " || true
+printf '%s
+' "$early_audit" | grep -q " agent-expire .*${grant1}"
+printf '%s
+' "$early_audit" | grep -q '^verify ok '
+printf '%s
+' "$early_audit" | grep '^verify '
+
 echo "=== [C] owner lists grants after the end ==="
 owner grants
 
@@ -379,6 +414,20 @@ fi
 wait_file_line b "$STATE/guard-web.log" "agent grant ${grant2} revoked"
 guard_rv_ms="$(dc exec -T b awk '/^agent deny reason revoked /{print $NF; exit}' "$STATE/guard-web.log")"
 echo "guard_revoked_deny_ms ${guard_rv_ms} guard_deny_after_revoke_done_ms $(( guard_rv_ms - revoke_done ))"
+
+echo "=== [C] a later grant for the same agent name is refused after the revoke ==="
+reply="$(grant_request 8080 300)"
+printf '%s\n' "$reply"
+grant3="$(printf '%s\n' "$reply" | field grant_id)"
+owner grant-approve "$grant3"
+# The agent SPIFFE ID is in the deny set. The coordinator does not issue grant 3.
+if grant_fetch "$grant3" "$STATE/agent-g3" >"$WORK/g3.txt" 2>&1; then
+  cat "$WORK/g3.txt"
+  echo "The coordinator issued a grant for a revoked agent name." >&2
+  exit 1
+fi
+cat "$WORK/g3.txt"
+echo "later_grant_same_agent fetch refused"
 
 echo "=== [C] guard logs ==="
 dc exec -T b cat "$STATE/guard-web.log"
@@ -442,5 +491,5 @@ for needle in 'PRIVATE KEY' 'T0JMWEFHVDE' 'ge1.'; do
 done
 echo "log_bytes $(wc -c <"$WORK/all-logs.out")"
 
-echo "summary ttl_deny_after_end_ms ${ttl_delta} guard_ttl_after_end_ms $(( guard_ttl_ms - expires1_ms )) revoke_deny_after_done_ms ${rv_delta} revoke_deny_after_start_ms ${rv_delta_start} guard_revoke_after_done_ms $(( guard_rv_ms - revoke_done )) limit_ms ${LIMIT_MS}"
+echo "summary coord_expire_after_end_ms ${coord_expire_delta} ttl_deny_after_end_ms ${ttl_delta} guard_ttl_after_end_ms $(( guard_ttl_ms - expires1_ms )) revoke_deny_after_done_ms ${rv_delta} revoke_deny_after_start_ms ${rv_delta_start} guard_revoke_after_done_ms $(( guard_rv_ms - revoke_done )) limit_ms ${LIMIT_MS}"
 echo "proof_ok"
