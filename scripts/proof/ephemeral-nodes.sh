@@ -429,14 +429,16 @@ echo "[C] gate5 ok"
 echo "=== Gate 6 [C]: ${LOAD_NODES} ephemeral clients stop at once, a pings b ==="
 dc exec -T coord sh -c "for i in \$(seq 1 ${LOAD_NODES}); do orblx coord token create --state /var/lib/orblx --out /var/lib/orblx/tokens/load\$i --ttl 3600 --ephemeral >/dev/null || exit 1; done"
 dc --profile load up -d load
-dc --profile load exec -T load sh -c "mkdir -p /tmp/load; for i in \$(seq 1 ${LOAD_NODES}); do orblx coord enroll --name load\$i --coord ${COORD} --bundle /coord-state/trust-bundle.pem --token-file /coord-state/tokens/load\$i --state /tmp/load/\$i --endpoint 172.30.218.9:\$((20000 + i)) >/dev/null || exit 1; done"
-dc --profile load exec -d load sh -c "for i in \$(seq 1 ${LOAD_NODES}); do orblx coord netmap --coord ${COORD} --bundle /tmp/load/\$i/bundle.pem --state /tmp/load/\$i --watch >/tmp/load/\$i.log 2>&1 & done; wait"
+# Each client starts its watch right after its own enroll. With a short T, a client that waits
+# for the other enrolls would be offline for longer than T and the coordinator would remove it.
+dc --profile load exec -d load sh -c "mkdir -p /tmp/load; for i in \$(seq 1 ${LOAD_NODES}); do orblx coord enroll --name load\$i --coord ${COORD} --bundle /coord-state/trust-bundle.pem --token-file /coord-state/tokens/load\$i --state /tmp/load/\$i --endpoint 172.30.218.9:\$((20000 + i)) >/tmp/load/\$i.enroll 2>&1 || { echo enroll_failed >/tmp/load/\$i.enroll; continue; }; orblx coord netmap --coord ${COORD} --bundle /tmp/load/\$i/bundle.pem --state /tmp/load/\$i --watch >/tmp/load/\$i.log 2>&1 & done; wait"
 for _ in $(seq 1 60); do
   ups="$(dc --profile load exec -T load sh -c 'cat /tmp/load/*.log 2>/dev/null' | grep -c '^policy_update ' || true)"
   [[ "$ups" -ge "$LOAD_NODES" ]] && break
   sleep 1
 done
 echo "load_first_updates ${ups}"
+echo "load_enroll_failed $(dc --profile load exec -T load sh -c 'cat /tmp/load/*.enroll 2>/dev/null' | grep -c '^enroll_failed' || true)"
 [[ "$ups" -ge "$LOAD_NODES" ]] || fail "Not all load clients got the first policy."
 load_eph="$(store_nodes | awk '$1 ~ /^load/ && $2 == "true"' | awk 'END {print NR}')"
 echo "load_ephemeral_in_store ${load_eph}"
