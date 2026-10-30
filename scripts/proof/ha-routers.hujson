@@ -1,19 +1,12 @@
 {
-  // W25 HA subnet routers proof.
-  // router-a and router-b may both publish 10.88.125.0/24.
-  // The client may reach the target 10.88.125.5 on UDP 9000 and TCP 8080 only.
+  // W25-10 HA subnet routers proof.
+  // router-a and router-b may both publish 10.88.125.0/24 (routeApprovals).
+  // Gate 1 starts with a copy of this file that approves only router-a.
+  // The client may reach the target 10.88.125.5 on UDP 9000, TCP 8080, TCP 8090, and ICMP,
+  // and the nameserver 10.88.125.53 on UDP 53. Gate 4 removes the UDP 53 rule.
   // The guest has no rule. Each router drops the guest packets and the other client ports.
   "groups": {
     "group:humans": ["spiffe://orblx.local/node/client"],
-  },
-  "tags": {
-    "tag:router": [
-      "spiffe://orblx.local/node/router-a",
-      "spiffe://orblx.local/node/router-b",
-    ],
-  },
-  "tagOwners": {
-    "tag:router": ["group:humans"],
   },
   "acls": [
     {
@@ -26,14 +19,30 @@
       "action": "accept",
       "src": ["group:humans"],
       "proto": "tcp",
-      "dst": ["10.88.125.5/32:8080"],
+      "dst": ["10.88.125.5/32:8080", "10.88.125.5/32:8090"],
+    },
+    {
+      "action": "accept",
+      "src": ["group:humans"],
+      "proto": "icmp",
+      "dst": ["10.88.125.5/32:*"],
+    },
+    {
+      "action": "accept",
+      "src": ["group:humans"],
+      "proto": "udp",
+      "dst": ["10.88.125.53/32:53"],
     },
   ],
-  "autoApprovers": {
-    "routes": {
-      "10.88.125.0/24": ["tag:router"],
+  "routeApprovals": [
+    {
+      "src": [
+        "spiffe://orblx.local/node/router-a",
+        "spiffe://orblx.local/node/router-b",
+      ],
+      "routes": ["10.88.125.0/24"],
     },
-  },
+  ],
   "tests": [
     {
       "src": "spiffe://orblx.local/node/client",

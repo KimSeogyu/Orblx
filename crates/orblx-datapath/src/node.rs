@@ -25,7 +25,7 @@ use crate::dns::{
     refresh_resolver, serve_dns, DnsTable, ExitNodeForwarder, LinkResolverGuard, PeerVisibility,
     QueryForwarder, ResolvConfForwarder, DNS_PORT,
 };
-use crate::ha::{RouteSelector, HA_DEAD_AFTER};
+use crate::ha::{RouteAudit, RouteSelector, HA_DEAD_AFTER, ROUTE_AUDIT_FILE};
 use crate::ipv4::ipv4_destination;
 use crate::ipv4::{inbound_action, InboundAction};
 #[cfg(target_os = "macos")]
@@ -497,13 +497,21 @@ async fn run_mesh_inner(
     let tun_counters = Arc::clone(&counters);
     let tun_peers = Arc::clone(&peers);
     let accept_routes = request.accept_routes;
-    if accept_routes {
-        for (cidr, routers) in router.ha_routes() {
-            println!(
-                "The HA route {cidr} has the routers {}.",
-                routers.join(", ")
-            );
-        }
+    let ha_routes = if accept_routes {
+        router.ha_routes()
+    } else {
+        Vec::new()
+    };
+    let tun_audit = if ha_routes.is_empty() {
+        RouteAudit::off()
+    } else {
+        RouteAudit::spawn(state_dir.join(ROUTE_AUDIT_FILE), node.svid.clone())
+    };
+    for (cidr, routers) in ha_routes {
+        println!(
+            "The HA route {cidr} has the routers {}.",
+            routers.join(", ")
+        );
     }
     let exit_node = request.exit_node.clone();
     let relay = request.relay;
@@ -515,6 +523,7 @@ async fn run_mesh_inner(
                 links: tun_links,
                 peers: tun_peers,
                 selector: RouteSelector::new(),
+                audit: tun_audit,
                 accept_routes,
                 exit_node,
             },
@@ -809,6 +818,7 @@ struct TunRoutes {
     links: Arc<Mutex<HashMap<String, LiveLink>>>,
     peers: Arc<Mutex<Vec<PeerView>>>,
     selector: RouteSelector,
+    audit: RouteAudit,
     accept_routes: bool,
     exit_node: Option<String>,
 }
@@ -838,15 +848,28 @@ impl TunRoutes {
             .selector
             .pick(&cidr, found.peers, |name| self.healthy(name, now));
         if let Some(change) = change {
-            match change.from {
-                Some(from) => println!(
-                    "The HA route {} uses {}. The router before was {from}.",
-                    change.cidr, change.to
-                ),
+            match &change.from {
+                Some(from) => {
+                    let silent = self.silent_ms(from, now);
+                    println!(
+                        "The HA route {} uses {}. The router before was {from}.",
+                        change.cidr, change.to
+                    );
+                    self.audit.record(&change, silent);
+                }
                 None => println!("The HA route {} uses {}.", change.cidr, change.to),
             }
         }
         peer
+    }
+
+    /// The time since the last frame from `name`. `None` when it has no session.
+    fn silent_ms(&self, name: &str, now: Instant) -> Option<u128> {
+        lock(&self.peers)
+            .iter()
+            .find(|peer| peer.name == name && peer.session)
+            .and_then(|peer| peer.last_rx)
+            .map(|then| now.saturating_duration_since(then).as_millis())
     }
 
     /// A router is healthy when it has a live link and sent a frame in the last

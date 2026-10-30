@@ -98,11 +98,13 @@ pub enum ConfigAction {
     PacketDeny,
     /// An owner removed the SVID deny entry of one principal (W25-2 revoke undo).
     Unrevoke,
+    /// A client moved an HA subnet route to another router (W25-10).
+    RouteFailover,
 }
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -136,6 +138,7 @@ impl ConfigAction {
         Self::Unshare,
         Self::PacketDeny,
         Self::Unrevoke,
+        Self::RouteFailover,
     ];
 
     /// Return the stable action token.
@@ -175,6 +178,7 @@ impl ConfigAction {
             Self::Unshare => "unshare",
             Self::PacketDeny => "packet-deny",
             Self::Unrevoke => "unrevoke",
+            Self::RouteFailover => "route-failover",
         }
     }
 
@@ -221,6 +225,7 @@ impl ConfigAction {
             Self::Unshare => 31,
             Self::PacketDeny => 32,
             Self::Unrevoke => 33,
+            Self::RouteFailover => 34,
         }
     }
 

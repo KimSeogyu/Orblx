@@ -9,6 +9,10 @@ spray IP FIRST LAST       send one UDP datagram to each port from FIRST to LAST.
 listen-stamp IP PORT LOG  log the receive time (Unix ms) of each datagram. No reply.
 stream IP PORT SECS MS [TAG]  send one UDP datagram each MS ms for SECS s. Print the count.
                           TAG starts each payload (W25 HA proof).
+listen-echo IP PORT       echo each line on each TCP connection (W25-10).
+tcp-hold IP PORT SECS     keep one TCP connection, send a line each 100 ms, wait 1 s
+                          for the echo, and connect again after a loss. Print the
+                          events with the Unix ms time (W25-10).
 """
 import socket
 import sys
@@ -125,6 +129,78 @@ def stream(ip, port, secs, every_ms, tag=""):
     print("stream %s:%d sent %d" % (ip, port, sent))
 
 
+def listen_echo(ip, port):
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((ip, port))
+    server.listen(16)
+
+    def serve(conn):
+        try:
+            while True:
+                data = conn.recv(4096)
+                if not data:
+                    return
+                conn.sendall(data)
+        except OSError:
+            return
+        finally:
+            conn.close()
+
+    while True:
+        conn, _ = server.accept()
+        threading.Thread(target=serve, args=(conn,), daemon=True).start()
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def tcp_hold(ip, port, secs):
+    end = time.time() + secs
+    conn = None
+    number = 0
+    seq = 0
+    lost_at = None
+    while time.time() < end:
+        if conn is None:
+            try:
+                conn = socket.create_connection((ip, port), 1.0)
+                conn.settimeout(1.0)
+                number += 1
+                print("event connect %d at_ms %d" % (number, now_ms()), flush=True)
+                if lost_at is not None:
+                    print("event reconnect %d at_ms %d" % (number, now_ms()), flush=True)
+            except OSError as err:
+                print("event connect_fail %s at_ms %d" % (type(err).__name__, now_ms()), flush=True)
+                time.sleep(0.1)
+                continue
+        line = b"hold %d\n" % seq
+        seq += 1
+        try:
+            conn.sendall(line)
+            got = b""
+            while not got.endswith(b"\n"):
+                part = conn.recv(64)
+                if not part:
+                    raise ConnectionResetError()
+                got += part
+            if got != line:
+                raise ValueError()
+        except (OSError, ValueError) as err:
+            if lost_at is None:
+                lost_at = now_ms()
+            print("event lost %d %s at_ms %d" % (number, type(err).__name__, now_ms()), flush=True)
+            try:
+                conn.close()
+            except OSError:
+                pass
+            conn = None
+            continue
+        time.sleep(0.1)
+    print("event end connections %d lines %d at_ms %d" % (number, seq, now_ms()), flush=True)
+
+
 def main():
     cmd = sys.argv[1]
     ip = sys.argv[2]
@@ -143,6 +219,10 @@ def main():
     elif cmd == "stream":
         tag = sys.argv[6] if len(sys.argv) > 6 else ""
         stream(ip, int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5]), tag)
+    elif cmd == "listen-echo":
+        listen_echo(ip, int(sys.argv[3]))
+    elif cmd == "tcp-hold":
+        tcp_hold(ip, int(sys.argv[3]), float(sys.argv[4]))
     else:
         raise SystemExit("unknown command")
 

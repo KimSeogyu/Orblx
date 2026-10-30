@@ -10,8 +10,18 @@
 //! The selection uses only local data. It adds no frame and no netmap field.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use orblx_audit::{ConfigAction, ConfigEvent, ConfigLog, EMPTY_DIGEST};
+
+/// The route failover audit chain in the node state directory (W25-10).
+pub const ROUTE_AUDIT_FILE: &str = "route-audit.jsonl";
+
+const AUDIT_QUEUE: usize = 64;
 
 /// A router with no received frame for this long is not healthy.
 ///
@@ -97,12 +107,90 @@ impl RouteSelector {
     }
 }
 
+/// Writes one `route-failover` record for each failover (W25-10).
+///
+/// The file is a config chain. `orblx audit verify-config --file FILE` checks it.
+/// The records hold node names, the route, and times. They hold no keys.
+pub struct RouteAudit {
+    actor: String,
+    tx: Option<SyncSender<ConfigEvent>>,
+}
+
+impl RouteAudit {
+    /// Start the writer thread for `path`. `actor` is the SPIFFE ID of this node.
+    #[must_use]
+    pub fn spawn(path: PathBuf, actor: String) -> Self {
+        let (tx, rx) = mpsc::sync_channel(AUDIT_QUEUE);
+        let spawned = thread::Builder::new()
+            .name("orblx-route-audit".to_string())
+            .spawn(move || audit_loop(&path, &rx));
+        let tx = match spawned {
+            Ok(_) => Some(tx),
+            Err(err) => {
+                eprintln!("The route audit thread did not start. {err}");
+                None
+            }
+        };
+        Self { actor, tx }
+    }
+
+    /// Make a writer that writes nothing.
+    #[must_use]
+    pub fn off() -> Self {
+        Self {
+            actor: String::new(),
+            tx: None,
+        }
+    }
+
+    /// Queue one record. The first selection of a route is not a failover.
+    ///
+    /// `silent_ms` is the time since the last frame from the old router.
+    /// `None` means the old router had no session.
+    pub fn record(&self, change: &RouteChange, silent_ms: Option<u128>) {
+        let (Some(tx), Some(from)) = (&self.tx, &change.from) else {
+            return;
+        };
+        let silent = silent_ms.map_or_else(|| "no-session".to_string(), |ms| format!("{ms}"));
+        let event = ConfigEvent {
+            actor: self.actor.clone(),
+            at_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0),
+            action: ConfigAction::RouteFailover,
+            target: change.cidr.clone(),
+            before: EMPTY_DIGEST,
+            after: EMPTY_DIGEST,
+            detail: format!("from {from} to {} old_silent_ms {silent}", change.to),
+        };
+        if tx.try_send(event).is_err() {
+            eprintln!("The route audit queue is full. The node did not queue a record.");
+        }
+    }
+}
+
+fn audit_loop(path: &Path, rx: &Receiver<ConfigEvent>) {
+    let mut log = match ConfigLog::open(path) {
+        Ok(log) => log,
+        Err(err) => {
+            eprintln!("The route audit chain did not open. {err}");
+            return;
+        }
+    };
+    while let Ok(event) = rx.recv() {
+        if let Err(err) = log.append(event) {
+            eprintln!("The route audit record was not written. {err}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::collections::HashSet;
 
-    use super::RouteSelector;
+    use super::{RouteAudit, RouteChange, RouteSelector};
 
     const CIDR: &str = "10.88.0.0/24";
 
@@ -199,5 +287,50 @@ mod tests {
             seen.insert(peer.unwrap());
         }
         assert_eq!(seen.len(), 1);
+    }
+
+    #[test]
+    fn a_failover_writes_one_verified_record_and_a_first_selection_writes_none() {
+        let dir = std::env::temp_dir().join(format!("orblx-route-audit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(super::ROUTE_AUDIT_FILE);
+        {
+            let audit =
+                RouteAudit::spawn(path.clone(), "spiffe://orblx.local/node/client".to_string());
+            audit.record(
+                &RouteChange {
+                    cidr: CIDR.to_string(),
+                    from: None,
+                    to: "router-a".to_string(),
+                },
+                None,
+            );
+            audit.record(
+                &RouteChange {
+                    cidr: CIDR.to_string(),
+                    from: Some("router-a".to_string()),
+                    to: "router-b".to_string(),
+                },
+                Some(1003),
+            );
+        }
+        let mut verified = None;
+        for _ in 0..100 {
+            if let Ok(chain) = orblx_audit::verify_config_file(&path) {
+                if !chain.records.is_empty() {
+                    verified = Some(chain);
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let chain = verified.unwrap();
+        assert_eq!(chain.records.len(), 1);
+        let event = &chain.records[0].event;
+        assert_eq!(event.action.as_str(), "route-failover");
+        assert_eq!(event.target, CIDR);
+        assert_eq!(event.detail, "from router-a to router-b old_silent_ms 1003");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

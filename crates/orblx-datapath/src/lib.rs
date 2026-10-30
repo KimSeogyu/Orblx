@@ -37,7 +37,7 @@ pub use exit_route::{plan_exit_routes, underlay_addresses, ExitRoutePlan};
 pub use filter::{FilterStats, PacketFilter, PACKET_AUDIT_FILE};
 pub use framing::{decode_length_prefixed, encode_length_prefixed, MAX_FRAME_LEN};
 pub use gate::PeerGate;
-pub use ha::{RouteChange, RouteSelector, HA_DEAD_AFTER};
+pub use ha::{RouteAudit, RouteChange, RouteSelector, HA_DEAD_AFTER, ROUTE_AUDIT_FILE};
 pub use ipv4::{ipv4_destination, ipv4_packet, is_icmp_echo_reply, is_ipv4_packet};
 pub use netmap::{
     valid_split_domain, valid_split_nameserver, LockUpdate, Netmap, NetmapError, NetmapPeer,

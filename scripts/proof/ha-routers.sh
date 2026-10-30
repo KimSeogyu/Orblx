@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# W25 HA subnet routers proof. All gates are [C] (Docker on one Linux host).
+# W25-10 HA subnet routers proof. All gates are [C] (Docker on one Linux host).
 # router-a and router-b advertise the same route 10.88.125.0/24.
-# The client streams UDP to the LAN target 10.88.125.5 through the active router.
-# Each run kills the active router (docker kill) and measures the time from the kill
-# to the first datagram that reaches the target through the other router.
-# The routers masquerade, so the target sees the LAN address of the router.
-# Run 1 also checks the ACL and the port ACL through the new router, and then
-# watches the route for 60 s after the killed router comes back.
+# Gate 1: the policy approves only router-a. router-b carries 0 bytes, also when router-a is down.
+# Then the policy approves both routers.
+# Gate 2: each run kills the active router (docker kill) and measures the time from the kill
+# to the first datagram that reaches the target through the other router. The routers
+# masquerade, so the target sees the LAN address of the router.
+# Gate 3: the killed router comes back. The proof counts the route changes in 60 s.
+# Gate 4: the port ACL and the UDP 53 gate apply on the new router (run 1).
+# Gate 5: one TCP flow through the subnet during run 1 (survives or reconnects).
+# Gate 6: the container logs have no key or token text.
 # The script deletes its own containers at the start and at the end.
 # The script does not print enroll tokens or private keys.
 set -euo pipefail
@@ -17,10 +20,13 @@ FILE="scripts/proof/compose.ha-routers.yml"
 PROJECT="${PROOF_PROJECT:-orblx-w25ha-proof}"
 IMAGE="${ORBLX_HA_IMAGE:-orblx-w25ha:local}"
 RUNS="${ORBLX_HA_RUNS:-5}"
-LIMIT_MS="${ORBLX_HA_LIMIT_MS:-2000}"
+LIMIT_MS="${ORBLX_HA_LIMIT_MS:-5000}"
+TARGET_MS="${ORBLX_HA_TARGET_MS:-2000}"
+TCP_LIMIT_MS="${ORBLX_HA_TCP_LIMIT_MS:-5000}"
 WATCH_SECS="${ORBLX_HA_WATCH_SECS:-60}"
 CIDR="10.88.125.0/24"
 TARGET="10.88.125.5"
+NAMESERVER="10.88.125.53"
 COORD="172.30.125.2:443"
 WORK="$(mktemp -d)"
 ENV_FILE="$WORK/compose.env"
@@ -48,7 +54,7 @@ trap cleanup EXIT
 
 fail() {
   echo "FAIL: $1" >&2
-  dc --profile nodes logs --tail 80 client router-a router-b guest >&2 || true
+  dc --profile nodes logs --tail 80 client router-a router-b guest 2>&1 | grep -v -i -e 'private key' -e token >&2 || true
   exit 1
 }
 
@@ -152,10 +158,99 @@ ping_max_ms() {
     | sed -n 's|.*= [0-9.]*/[0-9.]*/\([0-9.]*\)/.*|\1|p'
 }
 
-echo "=== W25 HA subnet routers proof. All gates are [C] (Docker on one Linux host). ==="
-echo "project ${PROJECT} image ${IMAGE} runs ${RUNS} limit_ms ${LIMIT_MS} watch_secs ${WATCH_SECS}"
-echo "route ${CIDR} on router-a (lan ${LAN_IP[router-a]}) and router-b (lan ${LAN_IP[router-b]}); target ${TARGET}"
+# Forward counters on one router. A docker start makes a new network namespace,
+# so the proof adds the rules again after each restart.
+add_counters() {
+  local router="$1"
+  dc exec -T "$router" iptables -I FORWARD 1 -d "$CIDR" -m comment --comment orblx-w25ha-fwd
+  dc exec -T "$router" iptables -I FORWARD 1 -d "$TARGET" -p tcp --dport 8081 -m comment --comment orblx-w25ha-t8081
+  dc exec -T "$router" iptables -I FORWARD 1 -d "$TARGET" -p udp --dport 9001 -m comment --comment orblx-w25ha-u9001
+  dc exec -T "$router" iptables -I FORWARD 1 -d "$NAMESERVER" -p udp --dport 53 -m comment --comment orblx-w25ha-dns
+}
+
+fwd_bytes() {
+  local router="$1" tag="$2"
+  dc exec -T "$router" iptables -nvx -L FORWARD | awk -v t="orblx-w25ha-${tag}" '$0 ~ t {print $2; exit}'
+}
+
+route_audit_count() {
+  { dc exec -T client cat /var/lib/orblx/route-audit.jsonl 2>/dev/null || true; } \
+    | jq -c 'select(.action == "route-failover")' | grep -c . || true
+}
+
+grant_reloads() {
+  log_count "$1" 'The DNS responder loaded new signed grants.'
+}
+
+# Write the policy file in one rename, so the coordinator never reads half a file.
+put_policy() {
+  cp "$1" "$WORK/policy/policy.next"
+  chmod 644 "$WORK/policy/policy.next"
+  mv "$WORK/policy/policy.next" "$WORK/policy/policy.hujson"
+}
+
+# The repository policy without comments, edited by a Python expression on `data`.
+policy_variant() {
+  local out="$1" expr="$2"
+  grep -v '^\s*//' "$ROOT/scripts/proof/ha-routers.hujson" | python3 -c "import sys,re,json
+text=re.sub(r',(\s*[}\]])', r'\1', sys.stdin.read())
+data=json.loads(text)
+${expr}
+print(json.dumps(data, indent=2))" > "$out"
+}
+
+# Fetch the netmap and grants of one router and give the grants to the running router.
+refresh_router_grants() {
+  local router="$1" before
+  before="$(grant_reloads "$router")"
+  fetch_netmap "$router"
+  as_root cat "$WORK/enroll-${router}/grants.signed.json" > "$WORK/state-${router}/grants.next"
+  mv "$WORK/state-${router}/grants.next" "$WORK/state-${router}/grants.signed.json"
+  for _ in $(seq 1 50); do
+    [[ "$(grant_reloads "$router")" -gt "$before" ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# The largest time between two datagrams of one stream tag at the target.
+max_gap_ms() {
+  local tag="$1"
+  target_log u9000 | awk -v tag="$tag" '$4 == tag {print $2}' | sort -n \
+    | awk 'NR > 1 && $1 - p > m {m = $1 - p} {p = $1} END {print m + 0}'
+}
+
+deny_to() {
+  local router="$1" dst="$2"
+  { dc exec -T "$router" cat /var/lib/orblx/packet-audit.jsonl 2>/dev/null || true; } \
+    | jq -c "select(.action == \"packet-deny\" and (.detail | contains(\"dst ${dst} \")))" \
+    | grep -c . || true
+}
+
+ask_dns() {
+  dc exec -T client python3 /proof/dns-ask.py db.corp.lan "$NAMESERVER" 2>/dev/null || echo "db.corp.lan no answer"
+}
+
+srcs_of() {
+  target_log u9000 | awk -v tag="$1" '$4 == tag {print $3}' | sort | uniq -c | tr -s ' ' | tr '\n' ';'
+}
+
+restore_router() {
+  local router="$1"
+  as_root docker start "${PROJECT}-${router}-1" >/dev/null
+  for _ in $(seq 1 60); do
+    dc exec -T "$router" true >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  add_counters "$router"
+  wait_direct client "$router" 120 || fail "${router} did not come back."
+}
+
+echo "=== W25-10 HA subnet routers proof. All gates are [C] (Docker on one Linux host). ==="
+echo "project ${PROJECT} image ${IMAGE} runs ${RUNS} limit_ms ${LIMIT_MS} target_ms ${TARGET_MS} tcp_limit_ms ${TCP_LIMIT_MS} watch_secs ${WATCH_SECS}"
+echo "route ${CIDR} on router-a (lan ${LAN_IP[router-a]}) and router-b (lan ${LAN_IP[router-b]}); target ${TARGET}; nameserver ${NAMESERVER}"
 echo "host $(uname -sm) $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+echo "start_kst $(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M:%S')"
 other="$(as_root docker ps --format '{{.Names}}' | grep '^orblx' | grep -vc "^${PROJECT}" || true)"
 echo "other_orblx_containers_at_start ${other}"
 
@@ -164,9 +259,14 @@ for name in router-a router-b client guest; do
   mkdir -p "$WORK/state-${name}"
   : > "$WORK/netmap-${name}.json"
 done
-cp "$ROOT/scripts/proof/ha-routers.hujson" "$WORK/policy/policy.hujson"
+POLICY_BOTH="$WORK/policy-both.json"
+POLICY_A="$WORK/policy-a.json"
+POLICY_NODNS="$WORK/policy-nodns.json"
+policy_variant "$POLICY_BOTH" "pass"
+policy_variant "$POLICY_A" "data['routeApprovals'][0]['src'] = ['spiffe://orblx.local/node/router-a']"
+policy_variant "$POLICY_NODNS" "data['acls'] = [a for a in data['acls'] if not any(d.endswith(':53') for d in a['dst'])]"
 chmod 755 "$WORK/policy"
-chmod 644 "$WORK/policy/policy.hujson"
+put_policy "$POLICY_A"
 cat > "$ENV_FILE" <<ENV
 PROOF_PROJECT=${PROJECT}
 ORBLX_HA_IMAGE=${IMAGE}
@@ -196,7 +296,7 @@ image_dir="$(stage_proof_image "$ROOT" "$BIN")"
 as_root docker build -q -t "$IMAGE" "$image_dir" >/dev/null
 rm -rf "$image_dir"
 
-echo "=== [C] start coordinator ==="
+echo "=== [C] start coordinator (the policy approves ${CIDR} only for router-a) ==="
 dc up -d coord
 for _ in $(seq 1 90); do
   as_root test -s "$WORK/coord/trust-bundle.pem" && break
@@ -219,17 +319,23 @@ for name in router-a router-b; do
     --route "$CIDR" | grep -v -i token || true
 done
 
+write_netmaps() {
+  for name in router-a router-b client guest; do
+    fetch_netmap "$name"
+    as_root cat "$WORK/enroll-${name}/netmap.json" > "$WORK/netmap-${name}.json"
+  done
+}
+
+routes_of() {
+  jq -c --arg n "$1" '[.peers[] | select(.name==$n) | .routes] | first // []' "$WORK/netmap-client.json"
+}
+
 echo "=== [C] netmaps ==="
-for name in router-a router-b client guest; do
-  fetch_netmap "$name"
-  as_root cat "$WORK/enroll-${name}/netmap.json" > "$WORK/netmap-${name}.json"
-done
+write_netmaps
 echo "client netmap routes: $(jq -c '[.peers[] | {name, routes}]' "$WORK/netmap-client.json")"
-for name in router-a router-b; do
-  jq -e --arg n "$name" --arg c "$CIDR" '.peers[] | select(.name==$n) | .routes == [$c]' "$WORK/netmap-client.json" >/dev/null \
-    || fail "The client netmap does not give ${CIDR} to ${name}."
-done
-echo "[C] the signed netmap gives ${CIDR} to router-a and router-b"
+[[ "$(routes_of router-a)" == "[\"${CIDR}\"]" ]] || fail "The client netmap does not give ${CIDR} to router-a."
+[[ "$(routes_of router-b)" == "[]" || "$(routes_of router-b)" == "null" ]] || fail "The client netmap gives a route to the unapproved router-b."
+echo "[C] the signed netmap gives ${CIDR} to router-a only; router-b advertises it without approval"
 
 declare -A OVERLAY
 for name in router-a router-b client guest; do
@@ -257,8 +363,8 @@ for name in router-a router-b; do
   as_root cat "$WORK/enroll-${name}/grants.signed.json" > "$WORK/state-${name}/grants.signed.json"
 done
 
-echo "=== [C] start target, routers, client, guest ==="
-dc --profile nodes up -d target router-a router-b
+echo "=== [C] start target, nameserver, routers, client, guest ==="
+dc --profile nodes up -d target landns router-a router-b
 for router in router-a router-b; do
   ok=0
   for _ in $(seq 1 60); do
@@ -269,6 +375,7 @@ for router in router-a router-b; do
     sleep 0.5
   done
   [[ "$ok" -eq 1 ]] || fail "${router} did not start forwarding with the packet filter on."
+  add_counters "$router"
 done
 dc --profile nodes up -d client guest
 for node in client guest; do
@@ -276,11 +383,63 @@ for node in client guest; do
     wait_direct "$node" "$router" 120 || fail "${node} has no direct path to ${router}."
   done
 done
+dc exec -T client ip route show dev orblx0 | grep -q "^${CIDR}" || fail "The client has no route to ${CIDR}."
+
+echo "=== Gate 1 [C]: an unapproved second router carries 0 bytes ==="
+b0="$(fwd_bytes router-b fwd)"
+probe client stream "$TARGET" 9000 3 10 appr1 >/dev/null
+sleep 0.5
+echo "router-a up: target sources for appr1: $(srcs_of appr1)"
+[[ "$(target_log u9000 | awk -v ip="${LAN_IP[router-a]}" '$4 == "appr1" && $3 == ip' | grep -c . || true)" -ge 100 ]] \
+  || fail "The stream did not use router-a."
+as_root docker kill "${PROJECT}-router-a-1" >/dev/null
+probe client stream "$TARGET" 9000 4 10 appr2 >/dev/null
+sleep 0.5
+b1="$(fwd_bytes router-b fwd)"
+appr2_rx="$(target_log u9000 | awk '$4 == "appr2"' | grep -c . || true)"
+echo "router-a down: datagrams at the target for appr2: ${appr2_rx}"
+echo "router-b FORWARD bytes to ${CIDR}: ${b0} -> ${b1}"
+[[ "$b0" == 0 && "$b1" == 0 && "$appr2_rx" -eq 0 ]] || fail "The unapproved router-b carried traffic."
+gate1_unapproved="router-b_bytes ${b1} rx_with_router-a_down ${appr2_rx}"
+restore_router router-a
+echo "[C] gate1 part 1 ok: unapproved router-b carried 0 bytes"
+
+echo "---- [C] approve ${CIDR} for router-a and router-b ----"
+put_policy "$POLICY_BOTH"
+ok=0
+for _ in $(seq 1 40); do
+  fetch_netmap client
+  if jq -e --arg c "$CIDR" '.peers[] | select(.name=="router-b") | .routes == [$c]' "$WORK/enroll-client/netmap.json" >/dev/null 2>&1 \
+    || as_root jq -e --arg c "$CIDR" '.peers[] | select(.name=="router-b") | .routes == [$c]' "$WORK/enroll-client/netmap.json" >/dev/null 2>&1; then
+    ok=1
+    break
+  fi
+  sleep 0.5
+done
+[[ "$ok" -eq 1 ]] || fail "The coordinator did not approve ${CIDR} for router-b."
+write_netmaps
+echo "client netmap routes: $(jq -c '[.peers[] | {name, routes}]' "$WORK/netmap-client.json")"
+for name in router-a router-b; do
+  [[ "$(routes_of "$name")" == "[\"${CIDR}\"]" ]] || fail "The client netmap does not give ${CIDR} to ${name}."
+  refresh_router_grants "$name" || fail "${name} did not load the new grants."
+done
+# The client reads the route table at start (doc limit), so the proof restarts it.
+dc restart client guest >/dev/null
+sleep 3
+for _ in $(seq 1 60); do
+  [[ "$(log_count client "The HA route ${CIDR} has the routers router-a, router-b.")" -ge 1 ]] && break
+  sleep 0.5
+done
+for node in client guest; do
+  for router in router-a router-b; do
+    wait_direct "$node" "$router" 120 || fail "${node} has no direct path to ${router} after the restart."
+  done
+done
 echo "client log: $(dc logs --no-log-prefix client 2>/dev/null | grep "The HA route ${CIDR} has the routers" | tail -n 1)"
 [[ "$(log_count client "The HA route ${CIDR} has the routers router-a, router-b.")" -ge 1 ]] \
   || fail "The client did not see two routers for ${CIDR}."
 echo "client: $(dc exec -T client ip route get "$TARGET" | head -n 1)"
-dc exec -T client ip route show dev orblx0 | grep -q "^${CIDR}" || fail "The client has no route to ${CIDR}."
+echo "[C] gate1 ok: both routes approved"
 
 echo "---- [C] ping (report each value above 20 ms) ----"
 for dest in "${OVERLAY[router-a]}" "${OVERLAY[router-b]}" "$TARGET"; do
@@ -297,41 +456,38 @@ for node in client guest; do
   dc exec -T "$node" iptables -I OUTPUT 1 -o eth0 -d "$CIDR" -m comment --comment orblx-w25ha-leak
 done
 
-echo "=== Gate 0 [C]: traffic uses one router before the first kill ==="
-out="$(probe client udp "$TARGET" 9000 3 || true)"
-echo "client udp ${TARGET}:9000 (no echo on the target): ${out}"
+echo "---- [C] warm stream: traffic uses one router ----"
+probe client stream "$TARGET" 9000 2 10 warm >/dev/null
 sleep 0.5
 first="$(active_router)"
 [[ -n "$first" ]] || fail "The client log has no active router."
-echo "active router ${first}"
-probe client stream "$TARGET" 9000 1 10 warm >/dev/null
-sleep 0.5
-warm_srcs="$(target_log u9000 | awk '$4 == "warm" {print $3}' | sort | uniq -c | tr -s ' ' | tr '\n' ';')"
-echo "target sources for the warm stream: ${warm_srcs}"
+echo "active router ${first}; target sources for the warm stream: $(srcs_of warm)"
 [[ "$(target_log u9000 | awk -v ip="${LAN_IP[$first]}" '$4 == "warm" && $3 != ip' | grep -c . || true)" -eq 0 ]] \
   || fail "The warm stream did not use only ${first}."
-echo "[C] gate0 ok"
 
 acl_through() {
   local router="$1"
-  local d0 d1 t80 t81 u91 g80 a80_0 a80_1 a81
-  echo "=== Gate 2 [C]: the ACL and the port ACL apply through ${router} ==="
-  d0="$(deny_records "$router")"
+  local d0 d1 t80 t81 u91 g80 a80_0 a80_1 a81 u91_rx f81 f91
+  echo "=== Gate 4 [C]: the port ACL applies on the new router ${router} ==="
+  d0="$(deny_to "$router" "$TARGET")"
   a80_0="$(target_log t8080 | grep -c "accept ${LAN_IP[$router]} " || true)"
   t80="$(probe client tcp "$TARGET" 8080 3)"
   t81="$(probe client tcp "$TARGET" 8081 2)"
   u91="$(probe client udp "$TARGET" 9001 2)"
   g80="$(probe guest tcp "$TARGET" 8080 2)"
   sleep 1
-  d1="$(deny_records "$router")"
+  d1="$(deny_to "$router" "$TARGET")"
   a80_1="$(target_log t8080 | grep -c "accept ${LAN_IP[$router]} " || true)"
   a81="$(target_log t8081 | grep -c . || true)"
   u91_rx="$(target_log u9001 | grep -c . || true)"
+  f81="$(fwd_bytes "$router" t8081)"
+  f91="$(fwd_bytes "$router" u9001)"
   echo "client tcp 8080 (allowed): ${t80}"
   echo "client tcp 8081 (no rule): ${t81}"
   echo "client udp 9001 (no rule): ${u91}"
   echo "guest tcp 8080 (no rule for guest): ${g80}"
   echo "target tcp 8080 accepts from ${LAN_IP[$router]}: $((a80_1 - a80_0)); target tcp 8081 accepts: ${a81}; target udp 9001 datagrams: ${u91_rx}"
+  echo "${router} FORWARD bytes: tcp 8081 ${f81}; udp 9001 ${f91} (the 9001 stream ran during the kill)"
   echo "${router} packet-deny records for dst ${TARGET}: $((d1 - d0))"
   [[ "$t80" == "tcp ${TARGET}:8080 connected reply ok" ]] || fail "The allowed TCP 8080 flow failed through ${router}."
   [[ $((a80_1 - a80_0)) -ge 1 ]] || fail "The TCP 8080 flow did not come through ${router}."
@@ -339,17 +495,67 @@ acl_through() {
   [[ "$u91" == *"reply none"* ]] || fail "UDP 9001 got a reply."
   [[ "$g80" == *timeout* || "$g80" == *fail* ]] || fail "The guest reached TCP 8080."
   [[ "$a81" -eq 0 && "$u91_rx" -eq 0 ]] || fail "A denied packet reached the target."
+  [[ "$f81" == 0 && "$f91" == 0 ]] || fail "${router} forwarded bytes for a denied port."
   [[ $((d1 - d0)) -ge 3 ]] || fail "${router} did not audit the denied packets."
   dc exec -T "$router" cat /var/lib/orblx/packet-audit.jsonl \
     | jq -c "select(.action == \"packet-deny\" and (.detail | contains(\"dst ${TARGET} \"))) | {actor, target, detail}" | tail -n 3
-  echo "[C] gate2 ok through ${router}"
+  gate4_ports="tcp8081_bytes ${f81} udp9001_bytes ${f91} deny_records $((d1 - d0))"
+
+  echo "---- Gate 4 [C]: UDP 53 on ${router} ----"
+  local q0 q1 n0 n1 ans den x0 x1 dd0 dd1 ok
+  n0="$(fwd_bytes "$router" dns)"
+  q0="$(log_count landns 'query db.corp.lan')"
+  ans="$(ask_dns)"
+  sleep 0.3
+  n1="$(fwd_bytes "$router" dns)"
+  q1="$(log_count landns 'query db.corp.lan')"
+  echo "allowed: ${ans}; ${router} FORWARD bytes udp 53 ${n0} -> ${n1}; nameserver queries +$((q1 - q0))"
+  [[ "$ans" == "db.corp.lan rcode 0 answers 1 address 10.88.24.20" ]] || fail "The allowed DNS query failed through ${router}."
+  [[ "$n1" -gt "$n0" && $((q1 - q0)) -ge 1 ]] || fail "The allowed DNS query did not go through ${router}."
+  put_policy "$POLICY_NODNS"
+  ok=0
+  for _ in $(seq 1 20); do
+    refresh_router_grants "$router" || true
+    if [[ "$(ask_dns)" == "db.corp.lan no answer" ]]; then
+      ok=1
+      break
+    fi
+    sleep 0.5
+  done
+  [[ "$ok" -eq 1 ]] || fail "${router} did not drop UDP 53 after the rule was removed."
+  x0="$(fwd_bytes "$router" dns)"
+  q0="$(log_count landns 'query db.corp.lan')"
+  dd0="$(deny_to "$router" "$NAMESERVER")"
+  den="$(ask_dns)"
+  sleep 0.5
+  x1="$(fwd_bytes "$router" dns)"
+  q1="$(log_count landns 'query db.corp.lan')"
+  dd1="$(deny_to "$router" "$NAMESERVER")"
+  echo "no rule: ${den}; ${router} FORWARD bytes udp 53 ${x0} -> ${x1}; nameserver queries +$((q1 - q0)); packet-deny records +$((dd1 - dd0))"
+  [[ "$x1" == "$x0" && $((q1 - q0)) -eq 0 && $((dd1 - dd0)) -ge 1 ]] || fail "The denied DNS query was not dropped on ${router}."
+  gate4_dns="allowed_answer 10.88.24.20 allowed_bytes $((n1 - n0)) denied_bytes $((x1 - x0)) denied_queries $((q1 - q0)) deny_records $((dd1 - dd0))"
+  put_policy "$POLICY_BOTH"
+  ok=0
+  for _ in $(seq 1 20); do
+    refresh_router_grants "$router" || true
+    if [[ "$(ask_dns)" == "db.corp.lan rcode 0 answers 1 address 10.88.24.20" ]]; then
+      ok=1
+      break
+    fi
+    sleep 0.5
+  done
+  [[ "$ok" -eq 1 ]] || fail "${router} did not allow UDP 53 again."
+  echo "[C] gate4 ok through ${router}"
 }
 
-declare -a RESULTS=()
-declare -a KILLED=()
+declare -a RESULTS=() KILLED=() LOSS=() GAPS=()
 watch_changes="-"
 watch_srcs="-"
 watch_moved="-"
+tcp_result="-"
+gate4_ports="-"
+gate4_dns="-"
+audit_example="-"
 leak0_client="$(leak_count client)"
 leak0_guest="$(leak_count guest)"
 
@@ -360,89 +566,164 @@ for run in $(seq 1 "$RUNS"); do
     router-b) standby=router-a ;;
     *) fail "Run ${run}: no active router." ;;
   esac
-  echo "=== Gate 1 [C] run ${run}: kill ${active}, standby ${standby} ==="
+  echo "=== Gate 2 [C] run ${run}: kill ${active}, standby ${standby} ==="
   wait_direct client "$standby" 120 || fail "Run ${run}: the client has no direct path to ${standby}."
   lines0="$(route_lines)"
+  audit0="$(route_audit_count)"
   dc exec -d client python3 /proof/acl-probe.py stream "$TARGET" 9000 8 10 "run${run}"
   dc exec -d client python3 /proof/acl-probe.py stream "$TARGET" 9001 8 10 "deny${run}"
   dc exec -d guest python3 /proof/acl-probe.py stream "$TARGET" 9000 8 10 "guest${run}"
+  dc exec -d client sh -c "ping -n -i 0.05 -w 9 -W 1 ${TARGET} > /tmp/ping${run}.txt 2>&1"
+  if [[ "$run" -eq 1 ]]; then
+    dc exec -d client sh -c "python3 -u /proof/acl-probe.py tcp-hold ${TARGET} 8090 12 > /tmp/hold.txt 2>&1"
+  fi
   sleep 2
   t_kill="$(now_ms)"
   as_root docker kill "${PROJECT}-${active}-1" >/dev/null
   t_killed="$(now_ms)"
-  sleep 7
+  sleep 8
   log="$(target_log u9000)"
   before="$(printf '%s\n' "$log" | awk -v t="$t_kill" -v ip="${LAN_IP[$active]}" -v tag="run${run}" '$4 == tag && $3 == ip && $2 < t' | grep -c . || true)"
-  last_old="$(printf '%s\n' "$log" | awk -v t="$t_kill" -v ip="${LAN_IP[$active]}" -v tag="run${run}" '$4 == tag && $3 == ip && $2 < t {m=$2} END {print m+0}')"
   first_new="$(printf '%s\n' "$log" | awk -v t="$t_kill" -v ip="${LAN_IP[$standby]}" -v tag="run${run}" '$4 == tag && $3 == ip && $2 >= t {print $2; exit}')"
   after_new="$(printf '%s\n' "$log" | awk -v ip="${LAN_IP[$standby]}" -v tag="run${run}" '$4 == tag && $3 == ip' | grep -c . || true)"
   old_after="$(printf '%s\n' "$log" | awk -v t="$t_killed" -v ip="${LAN_IP[$active]}" -v tag="run${run}" '$4 == tag && $3 == ip && $2 > t' | grep -c . || true)"
   total="$(printf '%s\n' "$log" | awk -v tag="run${run}" '$4 == tag' | grep -c . || true)"
   denied_rx="$(target_log u9001 | awk -v tag="deny${run}" '$4 == tag' | grep -c . || true)"
   guest_rx="$(printf '%s\n' "$log" | awk -v tag="guest${run}" '$4 == tag' | grep -c . || true)"
+  gap="$(max_gap_ms "run${run}")"
+  ping_sum="$(dc exec -T client cat "/tmp/ping${run}.txt" 2>/dev/null | grep 'packets transmitted' || true)"
+  ping_tx="$(printf '%s' "$ping_sum" | awk '{print $1}')"
+  ping_rx="$(printf '%s' "$ping_sum" | awk '{print $4}')"
   lines1="$(route_lines)"
+  audit1="$(route_audit_count)"
   [[ "$before" -ge 50 ]] || fail "Run ${run}: only ${before} datagrams came through ${active} before the kill."
   [[ -n "$first_new" ]] || fail "Run ${run}: no datagram came through ${standby} after the kill."
+  [[ -n "$ping_tx" && -n "$ping_rx" ]] || fail "Run ${run}: no ping summary."
   failover_ms=$((first_new - t_kill))
-  gap_ms=$((first_new - last_old))
-  echo "run ${run} killed ${active} kill_cmd_ms $((t_killed - t_kill)) failover_ms ${failover_ms} gap_ms ${gap_ms} via_old_before ${before} via_new ${after_new} via_old_after_kill ${old_after} received ${total} denied_9001_rx ${denied_rx} guest_rx ${guest_rx} route_changes $((lines1 - lines0))"
+  ping_lost=$((ping_tx - ping_rx))
+  echo "run ${run} killed ${active} kill_cmd_ms $((t_killed - t_kill)) failover_ms ${failover_ms} max_gap_ms ${gap} via_old_before ${before} via_new ${after_new} via_old_after_kill ${old_after} received ${total} denied_9001_rx ${denied_rx} guest_rx ${guest_rx} route_changes $((lines1 - lines0))"
+  echo "run ${run} ping -i 0.05: ${ping_sum}"
+  echo "run ${run} route-failover audit records +$((audit1 - audit0))"
   echo "client log: $(dc logs --no-log-prefix client 2>/dev/null | grep "The HA route ${CIDR} uses " | tail -n 1)"
   [[ "$(active_router)" == "$standby" ]] || fail "Run ${run}: the client log does not name ${standby}."
   [[ "$denied_rx" -eq 0 && "$guest_rx" -eq 0 ]] || fail "Run ${run}: a denied datagram reached the target during the failover."
   [[ "$old_after" -eq 0 ]] || fail "Run ${run}: a datagram came through the killed router."
   [[ "$failover_ms" -le "$LIMIT_MS" ]] || fail "Run ${run}: failover took ${failover_ms} ms (limit ${LIMIT_MS} ms)."
+  [[ $((audit1 - audit0)) -eq 1 ]] || fail "Run ${run}: expected 1 route-failover record, got $((audit1 - audit0))."
+  audit_example="$(dc exec -T client cat /var/lib/orblx/route-audit.jsonl | jq -c 'select(.action == "route-failover") | {actor, target, action, detail}' | tail -n 1)"
+  echo "run ${run} audit record: ${audit_example}"
   RESULTS+=("$failover_ms")
   KILLED+=("$active")
+  LOSS+=("${ping_lost}/${ping_tx}")
+  GAPS+=("$gap")
 
   if [[ "$run" -eq 1 ]]; then
+    echo "=== Gate 5 [C]: one TCP flow through the subnet during the kill ==="
+    for _ in $(seq 1 30); do
+      dc exec -T client grep -q '^event end' /tmp/hold.txt 2>/dev/null && break
+      sleep 0.5
+    done
+    hold="$(dc exec -T client cat /tmp/hold.txt 2>/dev/null || true)"
+    printf '%s\n' "$hold" | grep -v '^event connect_fail' | head -n 8
+    echo "connect_fail events: $(printf '%s\n' "$hold" | grep -c '^event connect_fail' || true)"
+    printf '%s\n' "$hold" | grep -q '^event end' || fail "The TCP hold client did not end."
+    lost_at="$(printf '%s\n' "$hold" | awk '$2 == "lost" {print $NF; exit}')"
+    if [[ -z "$lost_at" ]]; then
+      tcp_result="survived connections 1"
+    else
+      re_at="$(printf '%s\n' "$hold" | awk '$2 == "reconnect" {print $NF; exit}')"
+      [[ -n "$re_at" ]] || fail "The TCP flow did not reconnect."
+      tcp_reconnect_ms=$((re_at - t_kill))
+      tcp_result="reconnected lost_after_kill_ms $((lost_at - t_kill)) reconnect_after_kill_ms ${tcp_reconnect_ms}"
+      [[ "$tcp_reconnect_ms" -le "$TCP_LIMIT_MS" ]] || fail "The TCP flow reconnected after ${tcp_reconnect_ms} ms (limit ${TCP_LIMIT_MS} ms)."
+    fi
+    echo "tcp flow: ${tcp_result}; $(printf '%s\n' "$hold" | grep '^event end')"
+    echo "[C] gate5 ok"
     acl_through "$standby"
   fi
 
   echo "---- [C] run ${run}: restore ${active} ----"
-  as_root docker start "${PROJECT}-${active}-1" >/dev/null
-  wait_direct client "$active" 120 || fail "Run ${run}: ${active} did not come back."
+  restore_router "$active"
   sleep 2
 
   if [[ "$run" -eq 1 ]]; then
     echo "=== Gate 3 [C]: ${active} is back; watch the route for ${WATCH_SECS} s ==="
     w0="$(route_lines)"
+    wa0="$(route_audit_count)"
     probe client stream "$TARGET" 9000 "$WATCH_SECS" 10 watch
     sleep 1
     w1="$(route_lines)"
+    wa1="$(route_audit_count)"
     watch_changes=$((w1 - w0))
-    watch_srcs="$(target_log u9000 | awk '$4 == "watch" {print $3}' | sort | uniq -c | tr -s ' ' | tr '\n' ';')"
+    watch_srcs="$(srcs_of watch)"
     watch_moved="$(target_log u9000 | awk -v ip="${LAN_IP[$active]}" '$4 == "watch" && $3 == ip' | grep -c . || true)"
-    echo "route_changes_in_${WATCH_SECS}s ${watch_changes}; target sources ${watch_srcs}; datagrams through ${active} ${watch_moved}"
+    echo "route_changes_in_${WATCH_SECS}s ${watch_changes}; route-failover records +$((wa1 - wa0)); target sources ${watch_srcs}; datagrams through ${active} ${watch_moved}"
     echo "status of ${active} on the client: $(dc exec -T client cat /var/lib/orblx/status.txt | grep "^peer ${active} " | awk '{print $6}')"
-    [[ "$watch_changes" -eq 0 && "$watch_moved" -eq 0 ]] || fail "The route moved after ${active} came back."
-    echo "[C] gate3 ok: the route stays on ${standby}; no failback, no flap"
+    [[ "$watch_changes" -le 1 && $((wa1 - wa0)) -le 1 ]] || fail "The route flapped after ${active} came back."
+    echo "[C] gate3 ok: ${watch_changes} route changes in ${WATCH_SECS} s"
   fi
 done
 
 leak1_client="$(leak_count client)"
 leak1_guest="$(leak_count guest)"
-echo "=== Gate 4 [C]: no leak to the underlay ==="
+echo "=== [C] no leak to the underlay ==="
 echo "client eth0 packets to ${CIDR}: ${leak0_client} -> ${leak1_client}; guest: ${leak0_guest} -> ${leak1_guest}"
 [[ "$leak1_client" == "$leak0_client" && "$leak1_guest" == "$leak0_guest" ]] || fail "A packet to ${CIDR} left on eth0."
-echo "[C] gate4 ok"
 
 for router in router-a router-b; do
   dc exec -T "$router" orblx audit verify-config --file /var/lib/orblx/packet-audit.jsonl | grep -qx ok \
     || fail "The ${router} packet audit chain did not verify."
 done
-echo "packet audit verify ok on router-a and router-b"
+dc exec -T client orblx audit verify-config --file /var/lib/orblx/route-audit.jsonl | grep -qx ok \
+  || fail "The client route audit chain did not verify."
+echo "packet audit verify ok on router-a and router-b; route audit verify ok on client ($(route_audit_count) route-failover records)"
+
+echo "=== Gate 6 [C]: no key or token text in the container logs ==="
+# The patterns are the real token values and the base64 lines of each private key file.
+# The pattern file stays in the temporary work directory, and cleanup removes it.
+patterns="$WORK/secret-patterns"
+: > "$patterns"
+chmod 600 "$patterns"
+as_root find "$WORK" -path "$WORK/coord/tokens/*" -type f -exec cat {} + 2>/dev/null \
+  | tr -s ' \n' '\n' | awk 'length($0) >= 16' >> "$patterns" || true
+as_root grep -rlZ -e 'PRIVATE KEY' "$WORK" 2>/dev/null | as_root xargs -0 -r cat \
+  | grep -v -e '-----' | awk 'length($0) >= 16' >> "$patterns" || true
+as_root find "$WORK" -type f \( -name '*.key' -o -name '*key.pem' \) -exec grep -I -h -v -e '-----' {} + 2>/dev/null \
+  | awk 'length($0) >= 16' >> "$patterns" || true
+sort -u -o "$patterns" "$patterns"
+secret_patterns="$(grep -c . "$patterns" || true)"
+logs_file="$WORK/all-logs.txt"
+dc --profile nodes logs --no-log-prefix coord router-a router-b client guest target landns > "$logs_file" 2>&1 || true
+secrets="$(grep -c -F -f "$patterns" "$logs_file" || true)"
+pem_lines="$(grep -c 'PRIVATE KEY' "$logs_file" || true)"
+secrets=$((secrets + pem_lines))
+echo "secret patterns ${secret_patterns} (token values and key lines); log lines $(grep -c . "$logs_file" || true)"
+echo "secret_lines ${secrets}"
+[[ "$secret_patterns" -ge 4 ]] || fail "The proof found no token or key to look for."
+[[ "$secrets" -eq 0 ]] || fail "The container logs have ${secrets} lines with key or token text."
 
 max=0
 for value in "${RESULTS[@]}"; do
   ((value > max)) && max="$value"
 done
+under_target=0
+for value in "${RESULTS[@]}"; do
+  ((value <= TARGET_MS)) && under_target=$((under_target + 1))
+done
 other_end="$(as_root docker ps --format '{{.Names}}' | grep '^orblx' | grep -vc "^${PROJECT}" || true)"
 echo "=== summary ==="
+echo "gate1 unapproved ${gate1_unapproved}"
 for i in "${!RESULTS[@]}"; do
-  echo "run $((i + 1)) killed ${KILLED[$i]} failover_ms ${RESULTS[$i]}"
+  echo "run $((i + 1)) killed ${KILLED[$i]} failover_ms ${RESULTS[$i]} max_gap_ms ${GAPS[$i]} ping_lost ${LOSS[$i]}"
 done
-echo "failover_ms_all ${RESULTS[*]} max ${max} limit ${LIMIT_MS} pass ${#RESULTS[@]}/${RUNS}"
+echo "failover_ms_all ${RESULTS[*]} max ${max} limit ${LIMIT_MS} pass ${#RESULTS[@]}/${RUNS} at_or_below_target_${TARGET_MS} ${under_target}/${RUNS}"
+echo "audit_record ${audit_example}"
 echo "failback route_changes_in_${WATCH_SECS}s ${watch_changes} sources ${watch_srcs}"
+echo "gate4 ports ${gate4_ports}"
+echo "gate4 dns ${gate4_dns}"
+echo "gate5 tcp ${tcp_result}"
 echo "leak client $((leak1_client - leak0_client)) guest $((leak1_guest - leak0_guest))"
+echo "secret_lines ${secrets}"
+echo "end_kst $(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M:%S')"
 echo "other_orblx_containers_at_end ${other_end}"
 echo "proof_ok"

@@ -1,4 +1,4 @@
-# W25 HA subnet routers proof.
+# W25-10 HA subnet routers proof.
 # router-a and router-b advertise the same route 10.88.125.0/24.
 # The coordinator, both routers, the client, and the guest share the proof network.
 # Both routers and the target share the lan network. The target has no overlay.
@@ -135,12 +135,24 @@ services:
         python3 -u /proof/acl-probe.py listen-stamp 10.88.125.5 9001 /tmp/u9001.log &
         python3 -u /proof/acl-probe.py listen-tcp 10.88.125.5 8080 /tmp/t8080.log &
         python3 -u /proof/acl-probe.py listen-tcp 10.88.125.5 8081 /tmp/t8081.log &
+        python3 -u /proof/acl-probe.py listen-echo 10.88.125.5 8090 &
         wait
     volumes:
       - ./:/proof:ro
     networks:
       lan:
         ipv4_address: 10.88.125.5
+
+  # The LAN nameserver for the UDP 53 gate.
+  landns:
+    image: ${ORBLX_HA_IMAGE:-orblx-w25ha:local}
+    profiles: ["nodes"]
+    entrypoint: ["python3", "-u", "/proof/split-dns-server.py", "lan", "10.88.125.53"]
+    volumes:
+      - ./:/proof:ro
+    networks:
+      lan:
+        ipv4_address: 10.88.125.53
 
 networks:
   proof:
