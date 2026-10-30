@@ -6,7 +6,8 @@
 //! agent grants. The requesting node then fetches the material one time.
 //! The fetch issues the agent SVID and the agent JIT ticket. The life starts
 //! at the fetch. The coordinator does not store the agent key.
-//! Revoke adds the agent SVID and the ticket nonce to the deny file.
+//! Revoke adds the ticket nonce of that one grant to the deny file.
+//! Other grants for the same agent name stay valid.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -401,7 +402,9 @@ pub(crate) fn approve(
 
 /// Revoke one grant.
 ///
-/// An issued grant puts the agent SVID and the ticket nonce in the deny file.
+/// An issued grant puts its ticket nonce in the deny file. The agent SVID
+/// does not go in the deny file, so other grants for the same agent name
+/// stay valid. Each grant has its own random ticket nonce.
 pub(crate) fn revoke(
     coord: &Coordinator,
     id: &str,
@@ -430,13 +433,17 @@ pub(crate) fn revoke(
     let before = deny_digest(coord)?;
     let version = if issued {
         let nonces: Vec<String> = nonce.into_iter().collect();
-        Some(push_deny(coord, std::slice::from_ref(&uri), &nonces, now)?)
+        if nonces.is_empty() {
+            // An issued grant always has a ticket nonce.
+            return Err(CoordError::State);
+        }
+        Some(push_deny(coord, &[], &nonces, now)?)
     } else {
         None
     };
     let after = deny_digest(coord)?;
     let detail = match version {
-        Some(version) => format!("agent {uri} deny_version {version}"),
+        Some(version) => format!("agent {uri} scope grant deny_version {version}"),
         None => format!("agent {uri} not issued"),
     };
     coord.record_change(actor, ConfigAction::AgentRevoke, id, before, after, &detail)?;
@@ -536,7 +543,9 @@ mod tests {
         let revoked = revoke(&coord, &id, owner.as_uri(), now).unwrap();
         assert!(revoked["deny_version"].as_u64().unwrap() >= 1);
         let text = crate::deny_json(&coord, now).unwrap();
-        assert!(text.contains("spiffe://orblx.local/agent/bot"));
+        // A revoke denies the ticket nonce of this grant, not the agent name.
+        assert!(!text.contains("spiffe://orblx.local/agent/bot"));
+        assert!(text.contains(&hex_of(&material.ticket.nonce)));
         let audit = crate::audit(&coord, None).unwrap();
         assert_eq!(audit["verify"]["ok"], Value::Bool(true));
         let lines = audit["lines"].as_array().unwrap();
@@ -559,5 +568,50 @@ mod tests {
             .filter(|item| *item == "agent-expire")
             .count();
         assert_eq!(expires, 1);
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn issue(coord: &Coordinator, owner: &SpiffeId, now: SystemTime) -> (String, String) {
+        let reply = request(coord, "a", &ask(8080, 120), now).unwrap();
+        let id = reply["id"].as_str().unwrap().to_string();
+        approve(coord, &id, owner.as_uri(), now).unwrap();
+        let Fetched::Issued(issued) = fetch(coord, "a", &id, now).unwrap() else {
+            panic!("the grant was not issued");
+        };
+        (id, hex_of(&issued.0.ticket.nonce))
+    }
+
+    #[test]
+    fn a_revoke_stops_one_grant_only() {
+        let dir = scratch();
+        let now = SystemTime::now();
+        let coord = Coordinator::open(&dir.0, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        for name in ["a", "b"] {
+            let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+            coord
+                .enroll_token(name, &token.secret, &[format!("{name}:443")], &[], now)
+                .unwrap();
+        }
+        let owner = SpiffeId::node("owner").unwrap();
+        let (first, first_nonce) = issue(&coord, &owner, now);
+        let (_second, second_nonce) = issue(&coord, &owner, now);
+        assert_ne!(first_nonce, second_nonce);
+        revoke(&coord, &first, owner.as_uri(), now).unwrap();
+        let text = crate::deny_json(&coord, now).unwrap();
+        assert!(text.contains(&first_nonce));
+        assert!(!text.contains(&second_nonce));
+        assert!(!text.contains("spiffe://orblx.local/agent/bot"));
+        // The coordinator still issues a new grant for the same agent name.
+        let (_third, third_nonce) = issue(&coord, &owner, now);
+        assert!(!crate::deny_json(&coord, now)
+            .unwrap()
+            .contains(&third_nonce));
+        assert!(revoke(&coord, &first, owner.as_uri(), now).is_err());
+        let audit = crate::audit(&coord, None).unwrap();
+        assert_eq!(audit["verify"]["ok"], Value::Bool(true));
     }
 }

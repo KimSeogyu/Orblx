@@ -22,14 +22,14 @@ Marks: **[C]** = shown in the container proof. **REAL** = shown on real hosts. T
 - The coordinator prints `coord agent grant ID expired expires SECS seen_ms MS`.
 - `orblx admin grants` uses the same function. A grant gets one expire record only.
 
-## (b) Revoke scope
+## (b) Revoke scope (W22-1 state)
 
 A revoke puts the agent SPIFFE ID and the ticket nonce in the deny set. Thus:
 
 - all grants for that agent name stop,
 - the coordinator does not issue a later grant for the same agent name. The fetch fails.
 
-Use a new agent name after a revoke. W22-2 adds a revoke for one grant.
+Use a new agent name after a revoke. W22-2 changes this: a revoke now stops one grant only. See [W22 grant revoke](w22-grant-revoke.md).
 
 ## (d) Gateway restart replay
 

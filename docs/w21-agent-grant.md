@@ -41,9 +41,8 @@ A later change can add an auto-approval rule. That change must have its own revi
    - the deny list from the coordinator, polled each 200 ms.
    If the last good poll is older than 2 s, the guard refuses with `stale` (fail closed).
 6. The owner runs `orblx admin grant-revoke ID`.
-   The coordinator adds the agent URI and the ticket nonce to `deny.json`. The chain gets an `agent-revoke` record.
-   A revoke stops all grants for that agent name, not only grant ID.
-   The coordinator does not issue a later grant for the same agent name (W22-1 [C]).
+   The coordinator adds the ticket nonce of grant ID to `deny.json`. The chain gets an `agent-revoke` record.
+   Since W22-2 a revoke stops grant ID only. Other grants for the same agent name stay valid ([W22 grant revoke](w22-grant-revoke.md)).
 
 The guard writes `agent-grant`, `agent-use`, `agent-deny`, `agent-expire`, and `agent-revoke` records to its own chain file.
 The coordinator writes `agent-expire` at the end time. A tick each 500 ms finds the ended grants. No admin call is necessary (W22-1).
@@ -108,5 +107,5 @@ The limit is 1000 ms. All measured times are below the limit.
 - The chain holds a hash of the ticket (a fingerprint), not the ticket.
 - The coordinator tick can write `agent-expire` up to 500 ms after the end, plus the time of one chain write.
 - `up --coord` does not refresh the netmap. The proof runs `coord netmap` before `up`.
-- A revoke denies the agent URI. Thus it stops all grants for that agent name, and the coordinator does not issue a later grant for that name. A revoke for one grant only is not available in W22-1.
+- Since W22-2 a revoke denies the ticket nonce of one grant. To stop all grants for an agent, revoke each grant ID.
 - Each guard process writes its own chain file.
