@@ -621,7 +621,7 @@ check_renewal() {
         echo "${label} path is ${kind}, not ${want}." >&2
         exit 1
       fi
-      docker logs "$other" 2>&1 | grep -E '^The node renewed the SVID' | sed "s/^/${other}: /"
+      docker logs "$other" 2>&1 | show_matching -E '^The node renewed the SVID' | sed "s/^/${other}: /"
       SUMMARY+=("renew ${label} path ${kind} peer_svid_expiry ${before} to ${after}")
       return 0
     fi
@@ -739,7 +739,8 @@ port_of_mapping() {
 }
 
 echo "=== REAL cargo test signed hello and birthday bounds ==="
-cargo test -p orblx-edge --lib -- nat_path:: birthday:: 2>&1 | grep -E '^test |test result'
+# W25-14: the log keeps the full cargo output, so a failure shows its cause.
+cargo test -p orblx-edge --lib -- nat_path:: birthday:: 2>&1
 
 echo "=== [C] remove old proof stack ==="
 cleanup
@@ -896,7 +897,7 @@ bulk prc_prc_relay ${NATR_PREFIX}a ${NATR_PREFIX}b "$IP_B"
 idle_cpu prc_prc_relay ${NATR_PREFIX}a ${NATR_PREFIX}b
 echo "=== [C] switch prc_prc relay to direct (restore UDP) ==="
 measure_switch "switch prc_prc relay_to_direct" ${NATR_PREFIX}a node-b "$IP_B" direct open_ab
-docker logs ${NATR_PREFIX}a 2>&1 | grep -E '^The (path to|node sent|relay also)' | sed "s/^/${NATR_PREFIX}a: /"
+docker logs ${NATR_PREFIX}a 2>&1 | show_matching -E '^The (path to|node sent|relay also)' | sed "s/^/${NATR_PREFIX}a: /"
 stop_node ${NATR_PREFIX}a
 stop_node ${NATR_PREFIX}b
 

@@ -340,3 +340,136 @@ class SteadyPingGateTest(unittest.TestCase):
         self.assertIn('steady_ping_gate "$label" "$PINGS" "$MAX_LOSS" "$STEADY_MAX_MS" || exit 1', body)
         # proof_ok comes after the last steady ping run.
         self.assertGreater(text.rindex("proof_ok"), text.rindex("\nsteady_pings "))
+
+
+class FullOutputAndSecretScanTest(unittest.TestCase):
+    """W25-14 item 7: a proof step keeps its full output in the log, and the policy-sync leak scan fails."""
+
+    def lib(self, script, *args, stdin=""):
+        return subprocess.run(["bash", "-c", '. "$0"; set -euo pipefail; ' + script, PIPE_LIB, *args],
+                              input=stdin, capture_output=True, text=True)
+
+    def test_no_script_pipes_cargo_output_into_a_filter(self):
+        bad = []
+        for path in shell_files():
+            with open(path, errors="replace") as f:
+                for n, line in enumerate(f, 1):
+                    if not line.lstrip().startswith("#") and re.search(r"\bcargo (test|build|run|clippy)\b[^#]*\|", line):
+                        bad.append("%s:%d: %s" % (os.path.relpath(path, REPO), n, line.strip()))
+        self.assertEqual(bad, [])
+
+    def test_show_matching_prints_the_full_input_when_nothing_matches(self):
+        res = self.lib("printf 'error: the cause\\ntest result: FAILED\\n' | show_matching -E '^test ok'")
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("error: the cause", res.stderr)
+        res = self.lib("printf 'a\\ntest ok 1\\n' | show_matching -E '^test ok'")
+        self.assertEqual((res.returncode, res.stdout), (0, "test ok 1\n"))
+
+    def scan(self, text):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write(text)
+        return self.lib('secret_scan "$1"', f.name)
+
+    def test_secret_scan_fails_on_a_key_a_token_or_an_empty_log(self):
+        noise = "".join("router | line %d\n" % i for i in range(200000))
+        res = self.scan(noise + "a | -----BEGIN PRIVATE KEY-----\n")
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("secret_grep 'PRIVATE KEY' 1", res.stdout)
+        self.assertEqual(self.scan("b | token ge1.fake\n" + noise).returncode, 1)
+        self.assertEqual(self.scan("").returncode, 1)
+        self.assertEqual(self.lib('secret_scan /nonexistent/all-logs.out').returncode, 1)
+        res = self.scan(noise)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("secret_grep 'PRIVATE KEY' 0", res.stdout)
+
+    def test_policy_sync_uses_the_secret_scan_and_fails_on_a_log_error(self):
+        with open(os.path.join(REPO, "scripts", "proof", "policy-sync.sh")) as f:
+            text = f.read()
+        self.assertIn('secret_scan "$WORK/all-logs.out" || fail', text)
+        self.assertIn('logs >"$WORK/all-logs.out" 2>&1 || fail', text)
+        self.assertNotIn("grep -cF 'PRIVATE KEY'", text)
+
+
+SIEM = os.path.join(REPO, "scripts", "proof", "siem-streaming.sh")
+
+
+class SiemStreamingTest(unittest.TestCase):
+    """W25-14 items 8 and 9: the siem-streaming leak checks fail closed, and gate 1 uses one clock."""
+
+    def script(self):
+        with open(SIEM) as f:
+            return f.read()
+
+    def arrivals(self, tmp, rows, start, limit=10000, lo=0, hi=3):
+        import json
+        src = self.script()
+        a = src.index("cat > \"$WORK/arrivals.py\" <<'PY'\n")
+        a = src.index("\n", a) + 1
+        b = src.index("\nPY\n", a)
+        prog = os.path.join(tmp, "arrivals.py")
+        with open(prog, "w") as f:
+            f.write(src[a:b] + "\n")
+        os.makedirs(os.path.join(tmp, "recv", "s"), exist_ok=True)
+        with open(os.path.join(tmp, "recv", "s", "arrivals.jsonl"), "w") as f:
+            for seq, ms in rows:
+                f.write(json.dumps({"seq": seq, "recv_ms": ms}) + "\n")
+        with open(os.path.join(tmp, "chain.jsonl"), "w") as f:
+            f.write("")
+        res = subprocess.run(["python3", prog, os.path.join(tmp, "chain.jsonl"), os.path.join(tmp, "recv"),
+                              str(start), str(lo), str(hi), str(limit), "s"], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return res.stdout
+
+    def test_gate1_has_no_second_clock(self):
+        src = self.script()
+        self.assertNotIn("coord-ts.log\" \"$g", src)
+        self.assertNotIn("latency_ms min", src)
+        for g in ("g1", "g3", "g4"):
+            self.assertIn('%s_start_ms="$(now_ms)"' % g, src)
+
+    def test_gate1_passes_inside_the_limit(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.arrivals(tmp, [(0, 1010.0), (1, 1020.0), (2, 1030.5)], 1000)
+        self.assertIn("start_to_last_arrival_ms 30.5", out)
+        self.assertTrue(out.endswith("arrivals ok\n"), out)
+
+    def test_gate1_fails_over_the_limit(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.arrivals(tmp, [(0, 1010.0), (1, 1020.0), (2, 11000.1)], 1000)
+        self.assertTrue(out.endswith("arrivals fail\n"), out)
+
+    def test_gate1_fails_when_a_record_arrives_before_the_start(self):
+        # The old reader printed a negative latency (min -13.9 ms) and passed.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.arrivals(tmp, [(0, 986.1), (1, 1020.0), (2, 1030.0)], 1000)
+        self.assertIn("start_to_first_arrival_ms -13.9", out)
+        self.assertTrue(out.endswith("arrivals fail\n"), out)
+
+    def test_gate1_fails_on_a_gap_duplicate_or_no_records(self):
+        import tempfile
+        for rows in ([(0, 1010.0), (2, 1030.0)], [(0, 1010.0), (1, 1020.0), (1, 1021.0), (2, 1030.0)], []):
+            with tempfile.TemporaryDirectory() as tmp:
+                out = self.arrivals(tmp, rows, 1000)
+            self.assertTrue(out.endswith("arrivals fail\n"), (rows, out))
+
+    def test_leak_checks_fail_closed(self):
+        src = self.script()
+        self.assertIn('. "$ROOT/scripts/proof/pipe-lib.sh"', src)
+        self.assertIn('> "$WORK/logs.txt" 2>&1 || fail', src)
+        self.assertIn('secret_scan "$WORK/logs.txt" || fail', src)
+        self.assertNotIn("/var/lib/orblx | wc -l", src)
+        self.assertNotIn("/recv | wc -l", src)
+        self.assertRegex(src, r'hits_state=.*\|\| fail')
+        self.assertRegex(src, r'hits_recv=.*\|\| fail')
+        self.assertIn('[[ "$recv_files" -gt 0 ]] || fail', src)
+
+    def test_container_scan_fails_when_grep_fails(self):
+        # The old form "grep -rlF ... DIR | wc -l" printed 0 when DIR was missing.
+        old = subprocess.run(["sh", "-c", "grep -rlF x /no/such/dir 2>/dev/null | wc -l"], capture_output=True, text=True)
+        self.assertEqual((old.returncode, old.stdout.strip()), (0, "0"))
+        new = subprocess.run(["sh", "-c", "set -e; test -d /no/such/dir; wc -l < /dev/null"], capture_output=True, text=True)
+        self.assertNotEqual(new.returncode, 0)
