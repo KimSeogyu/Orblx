@@ -69,7 +69,7 @@ The node lock allow list is still set again each 10 s.
 The policy is `scripts/proof/datapath-acl.hujson`: a may reach b on TCP 8080, UDP 9000 and 9500, and ICMP.
 c may reach b on TCP 8080 only. No rule lets b open a flow to a or c.
 
-Log: `/workspace/orblx-w18-proof/w24acl-branch-51b943e8-datapath-acl-run1.log` (branch head 51b943e8 on main 5b5bb3e). The run printed `proof_ok`.
+Log: `/workspace/orblx-w18-proof/w24acl-fin2-1a79a966-datapath-acl-run1.log` (branch head 1a79a966 on main 38b1638). The run printed `proof_ok`.
 
 | Gate | Check | Result [C] |
 |---|---|---|
@@ -77,7 +77,7 @@ Log: `/workspace/orblx-w18-proof/w24acl-branch-51b943e8-datapath-acl-run1.log` (
 | 2. Allowed ports work. Denied TCP and UDP ports get 0 bytes. | a and c to b TCP 8080 `connected reply ok`. a to b UDP 9000 `reply yes`. a and c to b TCP 8081 `timeout`. a to b UDP 9001 `reply none`. Listener on b: `tcp8081 0 udp9001 0`. | `denied_app_bytes 0` |
 | 3. Each deny is audited with a rate limit. | a sends UDP to 200 denied ports (9100-9299). | `spray_denied 200 spray_records 11`. `unwritten_before` accounts for the other drops. `audit_verify ok`. |
 | 4. Without an ACL list, the old behavior stays. | The proof removes the `acls` key. TCP 8081, UDP 9001, b to a TCP, and all pings pass. | `audit_records_no_acl 15 15` (no new record). The ACL list then comes back and TCP 8081 is dropped again. |
-| 5. The datapath drops the revoked principal 1 s or less after revoke-all. | a sends UDP to b port 9500 each 20 ms. That port has no check of its own. c runs `orblx admin revoke-all a`. | `revoke_drop_ms 56` (limit 1000). `stamp_rx_after_revoke_done 3`. |
+| 5. The datapath drops the revoked principal 1 s or less after revoke-all. | a sends UDP to b port 9500 each 20 ms. That port has no check of its own. c runs `orblx admin revoke-all a`. | `revoke_drop_ms 364` (limit 1000). Other runs: 10, 438, 56. |
 
 `revoke_drop_ms` is the receive time of the last datagram from a at b minus `revoke_done_ms`.
 
@@ -87,7 +87,7 @@ Log: `/workspace/orblx-w18-proof/w24acl-branch-51b943e8-datapath-acl-run1.log` (
 The router has the signed grants. The policy `scripts/proof/split-dns.hujson` lets `group:humans` use UDP to `10.88.24.53/32:53` and TCP to `10.88.24.20/32:80`.
 The proof counts the forwarded bytes with an iptables FORWARD rule on the router (`-d 10.88.24.53 -p udp --dport 53`) and the queries in the nameserver log.
 
-Log: `/workspace/orblx-w18-proof/w24acl-reb-1755055b-split-dns-run1.log`. The run printed `proof_ok`.
+Log: `/workspace/orblx-w18-proof/w24acl-fin-0b50c16b-split-dns-run2.log`. The run printed `proof_ok`.
 
 | Case | Result [C] |
 |---|---|
