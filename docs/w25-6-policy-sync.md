@@ -117,7 +117,37 @@ Other checks on the branch:
   The same host check with 50 release clients showed 82 ticks in 60 s (1.37%).
   Fix: the proof uses the release build by default (`ORBLX_SYNC_PROFILE`). The gate limit did not change.
 
-## 4. Limits
+## 4. First dial to a late peer (W25-6b)
+
+A peer can enroll, and so be in the netmap of node `a`, before its UDP listener is up.
+Node `a` dials the new peer at once. Before this change, one QUIC attempt had a 3 s limit,
+and QUIC sends the Initial packet of an attempt again only after about 1 s and then 2 s more.
+When the peer started to listen more than about 1 s after the dial, the attempt timed out,
+the node waited 1 s, and then it started a new attempt. The peer was not reachable for about 4 s
+or more. The unit test `a_peer_that_enrolls_later_is_reachable_in_two_seconds` measured
+2852 ms in CI and 5560 ms in a soak.
+
+The fix is in the dial path of the node:
+
+- For 10 s after a dial task starts, and after a session ends (`FAST_DIAL_WINDOW`), one dial
+  attempt starts a new QUIC attempt each 250 ms (`FAST_DIAL_PROBE`), with at most 12 attempts.
+  The earlier attempts stay open, so a slow handshake on a long path can still finish.
+  The first session or the first error ends the dial attempt.
+- In this window, the node waits 250 ms after a failed dial attempt. After the window, the node
+  uses one QUIC attempt at a time and waits 1 s, as before.
+- The 3 s limit of one dial attempt and the 2 s limit of the test did not change.
+
+Measurements (REAL: `cargo test` on the Linux host, debug build, 127.0.0.1, rustc 1.99.1):
+
+| Check | Label | Result |
+|---|---|---|
+| One QUIC attempt, the peer listens 1.2 s after the dial starts | REAL | ends at 3028 ms, 1826 ms after the peer listens |
+| Probed dial, same order (`a_dial_to_a_peer_that_listens_late_ends_soon_after_it_listens`) | REAL | ends at 1282 ms, 79 ms after the peer listens |
+| `a_peer_that_enrolls_later_is_reachable_in_two_seconds`, 20 runs in a loop | REAL | 20 of 20 pass, 290 ms to 818 ms |
+
+The one-attempt row is a temporary test that the change does not keep.
+
+## 5. Limits
 
 - A changed endpoint list of a peer that the node already dials does not restart that dial task.
   The dial task uses the endpoints from the netmap at the time it started.

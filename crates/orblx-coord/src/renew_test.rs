@@ -7,8 +7,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_crypto::{mac_input, ticket_mac, TicketKey, TicketRing};
 use orblx_datapath::{
-    ipv4_packet, run_memory_node, AllowPeers, MemoryDevice, Netmap, NodeRequest, RenewedLeaf,
-    SvidRenewer, NODE_STATUS_FILE,
+    ipv4_packet, run_memory_node, AllowPeers, HelloEndpoint, MemoryDevice, Netmap, NodeRequest,
+    RenewedLeaf, SvidRenewer, NODE_STATUS_FILE,
 };
 use orblx_identity::{
     decode_certificate_pem, leaf_validity, sign_ticket, SpiffeId, TicketClaims, TicketFlags,
@@ -440,6 +440,90 @@ async fn a_peer_that_enrolls_later_is_reachable_in_two_seconds() {
         reached <= Duration::from_secs(2),
         "the late peer took {} ms",
         reached.as_millis()
+    );
+}
+
+/// W25-6b: a dial to a peer that starts to listen late ends soon after the peer listens.
+///
+/// A peer can enroll, and so be in the netmap of a node, before its UDP listener is up.
+/// QUIC sends the Initial packet of one attempt again only after about 1 s and then 2 s more.
+/// The probed connect starts one more attempt each 250 ms, so the dial does not wait for that backoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dial_to_a_peer_that_listens_late_ends_soon_after_it_listens() {
+    let scratch = Scratch::new("probe");
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    let (addr, handle) = server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+    let trust = TrustBundle::from_pem(&bundle).unwrap();
+    let signer = TicketSigner::generate();
+    let mac_key = [0x46; 32];
+    let now = SystemTime::now();
+    let ticket_key = TicketKey::new(
+        signer.verifier(),
+        mac_key,
+        now - Duration::from_secs(60),
+        now + Duration::from_secs(3_600),
+    )
+    .unwrap();
+    let ring = TicketRing::single(ticket_key, &[9; 32]).unwrap();
+    let mut configs = Vec::new();
+    for name in ["a", "b"] {
+        let token = coord.create_token(Duration::from_secs(600)).unwrap();
+        let port = free_port();
+        let enrolled = client::enroll_with_token(
+            addr,
+            "coord",
+            &bundle,
+            name,
+            &token.secret,
+            &[format!("127.0.0.1:{port}")],
+            &[],
+        )
+        .await
+        .unwrap();
+        configs.push(leaf_config(
+            &enrolled, &trust, &signer, &mac_key, &ring, now,
+        ));
+    }
+    let config_b = configs.pop().unwrap();
+    let config_a = configs.pop().unwrap();
+    let dialer = Arc::new(
+        HelloEndpoint::bind_node(config_a, SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap(),
+    );
+    let late = Duration::from_millis(1_200);
+    let port_b = free_port();
+    let target = SocketAddr::from((Ipv4Addr::LOCALHOST, port_b));
+    let listener = tokio::spawn(async move {
+        tokio::time::sleep(late).await;
+        let endpoint = HelloEndpoint::bind_node(config_b, target).unwrap();
+        let listening = Instant::now();
+        let session = endpoint.accept_one().await.unwrap();
+        (listening, session, endpoint)
+    });
+    let started = Instant::now();
+    let session = tokio::time::timeout(
+        Duration::from_secs(3),
+        dialer.connect_probed(target, Duration::from_millis(250)),
+    )
+    .await
+    .expect("the probed dial did not end in 3 s")
+    .unwrap();
+    let dialed = Instant::now();
+    let (listening, _accepted, _endpoint) = listener.await.unwrap();
+    handle.abort();
+    let after_listen = dialed.saturating_duration_since(listening);
+    println!(
+        "probed_dial_ms {} after_listen_ms {}",
+        dialed.duration_since(started).as_millis(),
+        after_listen.as_millis()
+    );
+    assert_eq!(session.peer_id().as_uri(), "spiffe://orblx.local/node/b");
+    assert!(
+        after_listen <= Duration::from_millis(800),
+        "the dial ended {} ms after the peer listened",
+        after_listen.as_millis()
     );
 }
 
