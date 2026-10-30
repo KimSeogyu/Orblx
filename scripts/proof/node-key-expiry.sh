@@ -55,6 +55,11 @@ cleanup() {
 trap 'cleanup; proof_lock_end' EXIT
 proof_lock_take "node-key-expiry" "$NKE_PROJECT"
 
+# W25-14b: start from a clean compose state (all profiles, all volumes).
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
+proof_compose_clean "${NKE_PROJECT}" || exit 1
+
 fail() {
   echo "FAIL: $*" >&2
   exit 1
