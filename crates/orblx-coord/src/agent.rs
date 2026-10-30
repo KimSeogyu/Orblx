@@ -495,7 +495,7 @@ pub(crate) fn revoke_principal(
     }
     let deny_version = push_deny(coord, &[principal.as_uri().to_string()], &nonces, now)?;
     for record in file.grants.iter_mut() {
-        if ids.iter().any(|id| *id == record.id) {
+        if ids.contains(&record.id) {
             record.state = REVOKED.to_string();
         }
     }

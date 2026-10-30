@@ -40,7 +40,9 @@ as_root() {
 }
 
 dc() {
-  as_root docker compose --progress quiet --profile nodes -f "$FILE" "$@"
+  # sudo drops the environment, so pass the Compose variables with env.
+  as_root env POLICY_FILE="$POLICY_FILE" COORD_ADDR="$COORD_ADDR" \
+    docker compose --progress quiet --profile nodes -f "$FILE" "$@"
 }
 
 cleanup() {
@@ -306,6 +308,9 @@ dc exec -T b cat "$STATE/cert.pem" >"$WORK/b-cert.pem"
 for name in a c; do
   dc exec -T "$name" sh -c "cat > /tmp/b-cert.pem" <"$WORK/b-cert.pem"
   dc exec -T "$name" sh -c "rm -rf /tmp/svid && mkdir -p /tmp/svid && cp -a $STATE/. /tmp/svid/"
+  # The node state holds a node ticket.bin. An SSH login with a node SVID has no ticket,
+  # so the SSH identity directory holds only the SVID and the bundle.
+  dc exec -T "$name" sh -c "rm -rf /tmp/sshid && mkdir -p /tmp/sshid && cp $STATE/cert.pem $STATE/key.pem $STATE/bundle.pem /tmp/sshid/"
   dc exec -T "$name" sh -c "cat > /tmp/probe.py" <"$ROOT/scripts/proof/revoke-probe.py"
 done
 
@@ -316,7 +321,7 @@ for name in a c; do
   dc exec -T "$name" orblx coord netmap --coord "${coord_ip}:443" \
     --bundle /tmp/svid/bundle.pem --state /tmp/svid >/dev/null
   echo "svid ${name} coordinator netmap ok"
-  dc exec -T "$name" orblx ssh root@b --identity "$STATE" --netmap "$STATE/netmap.json" \
+  dc exec -T "$name" orblx ssh root@b --identity /tmp/sshid --netmap "$STATE/netmap.json" \
     --peer-cert /tmp/b-cert.pem --command 'echo ssh_ok'
   dc exec -T "$name" sh -c "head -c 4096 /dev/urandom >/tmp/probe.bin"
   dc exec -T "$name" orblx file send /tmp/probe.bin --to b --name "before-${name}.bin" \
@@ -353,7 +358,7 @@ surface_cmds() {
   probe "$name" "$mode" "${name}-svid" "$secs" "$every" \
     orblx coord netmap --coord "${coord_ip}:443" --bundle /tmp/svid/bundle.pem --state /tmp/svid
   probe "$name" "$mode" "${name}-ssh" "$secs" "$every" \
-    orblx ssh root@b --identity "$STATE" --netmap "$STATE/netmap.json" \
+    orblx ssh root@b --identity /tmp/sshid --netmap "$STATE/netmap.json" \
     --peer-cert /tmp/b-cert.pem --command true
   probe "$name" "$mode" "${name}-file" "$secs" "$every" \
     orblx file send /tmp/probe.bin --to b --name "${mode}-${name}-{n}.bin" --state "$STATE"
@@ -416,7 +421,7 @@ grep -q "^grant ${grant_c1} issued " "$WORK/grants-after.txt"
 c_after="$(dc exec -T c orblx agent connect --grant "$STATE/agent-c1" --send "$GET")"
 printf '%s\n' "$c_after" | grep -q '^reply HTTP/1.0 200'
 echo "c grant c1 after revoke 200"
-dc exec -T c orblx ssh root@b --identity "$STATE" --netmap "$STATE/netmap.json" \
+dc exec -T c orblx ssh root@b --identity /tmp/sshid --netmap "$STATE/netmap.json" \
   --peer-cert /tmp/b-cert.pem --command 'echo ssh_ok'
 dc exec -T c orblx file send /tmp/probe.bin --to b --name after-c.bin --state "$STATE" \
   | grep '^file_sent '
@@ -457,7 +462,7 @@ ssh_revoked="$(jq -s '[.[] | select(.kind == "deny" and .reason == "revoked")] |
 echo "ssh_chain deny revoked ${ssh_revoked}"
 [[ "$ssh_revoked" -ge 1 ]]
 dc exec -T b cat "$STATE/file-audit.jsonl" >"$WORK/file-audit.jsonl"
-file_identity="$(jq -s '[.[] | select(.action == "file-deny" and .actor == "spiffe://orblx.local/node/a" and (.detail | startswith("reason identity")))] | length' "$WORK/file-audit.jsonl")"
+file_identity="$(jq -s '[.[] | select(.action == "file-deny" and (.actor | startswith("spiffe://orblx.local/node/a")) and (.detail | startswith("reason identity")))] | length' "$WORK/file-audit.jsonl")"
 file_c_after="$(jq -s '[.[] | select(.action == "file-receive" and .actor == "spiffe://orblx.local/node/c")] | length' "$WORK/file-audit.jsonl")"
 echo "file_chain deny_identity_a ${file_identity} receive_c ${file_c_after}"
 [[ "$file_identity" -ge 1 ]]
