@@ -1,0 +1,77 @@
+# serve and funnel proof (W21-4).
+# Three Linux nodes on one [C] bridge. node-b also sits on a second [C] bridge, the outside network.
+# The outside container stands in for a host outside the overlay. It has no orblx node.
+# The proof script builds the image orblx-serve:local and sets the SERVE_* paths.
+
+name: orblx-serve-proof
+
+x-node: &node
+  image: orblx-serve:local
+  cap_add:
+    - NET_ADMIN
+  devices:
+    - /dev/net/tun:/dev/net/tun
+  sysctls:
+    net.ipv4.conf.all.rp_filter: "0"
+    net.ipv4.conf.default.rp_filter: "0"
+  stop_grace_period: 10s
+
+services:
+  node-a:
+    <<: *node
+    volumes:
+      - ${SERVE_STATE_A}:/var/lib/orblx
+      - ${SERVE_NETMAP_A}:/etc/orblx/netmap.json:ro
+      - ${SERVE_TOOLS}:/opt/orblx-proof:ro
+    command: [up, --netmap, /etc/orblx/netmap.json, --state-dir, /var/lib/orblx, --listen, "0.0.0.0:443"]
+    networks:
+      overlay:
+        ipv4_address: 172.30.41.11
+
+  node-b:
+    <<: *node
+    volumes:
+      - ${SERVE_STATE_B}:/var/lib/orblx
+      - ${SERVE_NETMAP_B}:/etc/orblx/netmap.json:ro
+      - ${SERVE_TOOLS}:/opt/orblx-proof:ro
+    command: [up, --netmap, /etc/orblx/netmap.json, --state-dir, /var/lib/orblx, --listen, "172.30.41.12:443"]
+    networks:
+      overlay:
+        ipv4_address: 172.30.41.12
+      outside:
+        ipv4_address: 172.30.42.12
+
+  node-c:
+    <<: *node
+    volumes:
+      - ${SERVE_STATE_C}:/var/lib/orblx
+      - ${SERVE_NETMAP_C}:/etc/orblx/netmap.json:ro
+      - ${SERVE_TOOLS}:/opt/orblx-proof:ro
+    command: [up, --netmap, /etc/orblx/netmap.json, --state-dir, /var/lib/orblx, --listen, "0.0.0.0:443"]
+    networks:
+      overlay:
+        ipv4_address: 172.30.41.13
+
+  outside:
+    image: orblx-serve:local
+    cap_add:
+      - NET_ADMIN
+    entrypoint: ["/bin/sh", "-c", "exec sleep infinity"]
+    volumes:
+      - ${SERVE_BUNDLE}:/etc/orblx-outside/bundle.pem:ro
+      - ${SERVE_TOOLS}:/opt/orblx-proof:ro
+    networks:
+      outside:
+        ipv4_address: 172.30.42.20
+
+networks:
+  overlay:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.41.0/24
+  outside:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.42.0/24

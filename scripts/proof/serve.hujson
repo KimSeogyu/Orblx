@@ -1,0 +1,24 @@
+{
+  // node a may open the serve HTTPS port 443 on node b.
+  // node c has no rule. The default is deny.
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a"],
+      "proto": "tcp",
+      "dst": ["spiffe://orblx.local/node/b:443"],
+    },
+  ],
+  "tests": [
+    {
+      "src": "spiffe://orblx.local/node/a",
+      "proto": "tcp",
+      "accept": ["spiffe://orblx.local/node/b:443"],
+    },
+    {
+      "src": "spiffe://orblx.local/node/c",
+      "proto": "tcp",
+      "deny": ["spiffe://orblx.local/node/b:443"],
+    },
+  ],
+}

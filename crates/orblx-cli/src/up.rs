@@ -398,6 +398,7 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
     let config = load_config(&options.state_dir)?;
     let visibility = load_visibility(&options.state_dir, &netmap.self_node.name)?;
     let ssh_state = options.state_dir.clone();
+    let serve_netmap = netmap_path.clone();
     spawn_deny_refresh(&options);
     let underlay = underlay_for(&netmap, options.coord, options.relay);
     let renew = load_renewer(&options.state_dir, options.coord, options.coord_name)?;
@@ -421,6 +422,7 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
             if let Err(err) = orblx_ssh::spawn_overlay_server(&ssh_state, overlay) {
                 eprintln!("The SSH server did not start. {err}");
             }
+            orblx_serve::spawn_serve(&ssh_state, &serve_netmap, overlay);
         })),
         metrics: options.metrics,
     })
