@@ -5,6 +5,7 @@ mod connector;
 mod dns;
 mod error;
 mod exit_route;
+mod filter;
 mod framing;
 mod gate;
 mod ipv4;
@@ -32,6 +33,7 @@ pub use dns::{
 
 pub use error::HelloError;
 pub use exit_route::{plan_exit_routes, underlay_addresses, ExitRoutePlan};
+pub use filter::{FilterStats, PacketFilter, PACKET_AUDIT_FILE};
 pub use framing::{decode_length_prefixed, encode_length_prefixed, MAX_FRAME_LEN};
 pub use gate::PeerGate;
 pub use ipv4::{ipv4_destination, ipv4_packet, is_icmp_echo_reply, is_ipv4_packet};

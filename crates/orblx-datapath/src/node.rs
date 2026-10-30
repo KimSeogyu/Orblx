@@ -157,6 +157,10 @@ pub struct NodeRequest {
     /// `None` does not open the metrics port.
     /// The default command uses `127.0.0.1:9464`.
     pub metrics: Option<SocketAddr>,
+    /// The receiver packet filter (W24).
+    ///
+    /// `None` keeps the old datapath. The node does not check the packet port.
+    pub filter: Option<Arc<crate::PacketFilter>>,
 }
 
 /// One peer line in `orblx status`.
@@ -248,6 +252,7 @@ struct Mesh {
     shutdown: watch::Receiver<bool>,
     rekey_tx: watch::Sender<u64>,
     rekey_rx: watch::Receiver<u64>,
+    filter: Option<Arc<crate::PacketFilter>>,
 }
 
 /// Format `orblx status` text.
@@ -516,6 +521,7 @@ async fn run_mesh_inner(
         shutdown: shutdown_rx,
         rekey_tx,
         rekey_rx,
+        filter: request.filter.clone(),
     };
     if let Some(addr) = request.metrics {
         let metrics_peers = Arc::clone(&peers);
@@ -1209,6 +1215,7 @@ async fn run_link(
     }
     set_session(&mesh.peers, &name, true, Some(expiry));
     publish(&mesh.state_dir, &mesh.node, &mesh.peers, "up");
+    let peer_svid = session.peer_id().as_uri().to_string();
     let (sender, receiver) = session.split();
     let peers = Arc::clone(&mesh.peers);
     let state_dir = Arc::clone(&mesh.state_dir);
@@ -1225,6 +1232,8 @@ async fn run_link(
             ask_rekey: ask_rx,
             remote_rekey,
             counters: Arc::clone(&mesh.counters),
+            filter: mesh.filter.clone(),
+            peer_svid,
         },
         move || note_rx(&peers, &state_dir, &node, &peer_name),
     )
@@ -1254,6 +1263,8 @@ struct SessionIo {
     ask_rekey: watch::Receiver<u64>,
     remote_rekey: watch::Sender<u64>,
     counters: Arc<NodeCounters>,
+    filter: Option<Arc<crate::PacketFilter>>,
+    peer_svid: String,
 }
 
 async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
@@ -1267,6 +1278,8 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
         mut ask_rekey,
         remote_rekey,
         counters,
+        filter,
+        peer_svid,
     } = io;
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     loop {
@@ -1293,6 +1306,9 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                 let Some(packet) = packet else {
                     return;
                 };
+                if let Some(filter) = &filter {
+                    filter.note_outbound(&packet);
+                }
                 if sender.send_ipv4(&packet).await.is_err() {
                     return;
                 }
@@ -1303,6 +1319,11 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     Ok(SessionEvent::Packet(packet)) => {
                         on_rx();
                         counters.rx.fetch_add(1, Ordering::Relaxed);
+                        if let Some(filter) = &filter {
+                            if !filter.allow_inbound(&peer_svid, &packet) {
+                                continue;
+                            }
+                        }
                         match inbound_action(&packet, overlay) {
                             InboundAction::Reply(reply) => {
                                 if sender.send_ipv4(&reply).await.is_err() {

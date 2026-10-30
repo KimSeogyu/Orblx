@@ -1563,6 +1563,7 @@ fn filtered_grants(
             receiver: receiver.as_uri().to_string(),
             grants: Vec::new(),
             reach: Vec::new(),
+            filter: inner.policy.acl_set(),
         };
     }
     let nodes = inner.store.nodes();
