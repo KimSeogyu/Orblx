@@ -71,7 +71,7 @@ done | has_line "^${NET}\.0/24 "; then
 fi
 
 echo "=== REAL build the release binary ==="
-cargo build --release -p orblx-cli --bin orblx || exit 1
+if ! cargo build --release -p orblx-cli --bin orblx; then exit 1; fi
 # shellcheck source=scripts/proof/stage-image.sh
 source "$ROOT/scripts/proof/stage-image.sh"
 image_dir="$(stage_proof_image "$ROOT" "$BIN")"
