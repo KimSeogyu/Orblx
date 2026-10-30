@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""W25-22: the summary and the gate of the join-time proof.
+"""The summary and the gate of the join-time proof.
 
 Usage: join-time-summary.py JOINS_FILE N LIMIT_MS
 

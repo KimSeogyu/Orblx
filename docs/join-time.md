@@ -1,4 +1,4 @@
-# W25-22: join-time proof
+# Join-time proof
 
 Status: the script, the gate, and the negative tests are in this change. A full N=20 box run
 needs W25-14b (#114, `scripts/proof/compose-clean.sh`) on main first. The script sources
@@ -11,7 +11,7 @@ run, under the box proof lock. The host is REAL. The coordinator, node a, and no
 containers on one Linux host.
 
 Each join starts from a clean state:
-- its own compose project, `JOIN_PROJECT_BASE-jI` (default `orblx-w2522-join-jI`),
+- its own compose project, `JOIN_PROJECT_BASE-jI` (default `orblx-join-time-jI`),
 - new state directories for the coordinator, a, and b,
 - a new coordinator,
 - `proof_compose_clean` (W25-14b) before the first `up` of the join and after the join.
@@ -45,7 +45,7 @@ It drops no join. It prints n, median, p95, and max of both values. The median o
 is the mean of the two middle values. The p95 is the nearest rank (rank ceil(0.95 n)).
 The proof prints `proof_ok` only after `join_gate ok`.
 
-The sweep runs the proof as the gate `W25-22` (`scripts/proof/sweep-manifest.txt`).
+The sweep runs the proof as the gate `join-time` (`scripts/proof/sweep-manifest.txt`).
 
 ## 3. Negative tests
 

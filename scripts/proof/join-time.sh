@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# W25-22 join-time proof.
+# Join-time proof.
 # The host is REAL. The coordinator, node a, and node b are [C] containers on one Linux host.
 # The script runs N late-peer joins (JOIN_N, default 20) one after the other in one run.
 # Each join starts from a clean state: its own compose project (JOIN_PROJECT_BASE-jI), its
@@ -26,8 +26,8 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 . "$ROOT/scripts/proof/pipe-lib.sh"
 cd "$ROOT"
 FILE="scripts/proof/compose.join-time.yml"
-BASE="${JOIN_PROJECT_BASE:-orblx-w2522-join}"
-export ORBLX_JOIN_IMAGE="${ORBLX_JOIN_IMAGE:-orblx-w2522-join:local}"
+BASE="${JOIN_PROJECT_BASE:-orblx-join-time}"
+export ORBLX_JOIN_IMAGE="${ORBLX_JOIN_IMAGE:-orblx-join-time:local}"
 PROFILE="${ORBLX_JOIN_PROFILE:-release}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 N="${JOIN_N:-20}"

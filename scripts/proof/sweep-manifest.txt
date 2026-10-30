@@ -41,7 +41,7 @@ row|58|Docker image|docker-image
 row|61|CLI UX (login/up/down/set)|w18-linux-daemon coord-enroll exit-node
 row|62|Admin CLI / console|admin
 gate|W23-4|sym relay throughput: sym_sym median of 5 runs of 30 s >= 1113 Mbit/s (W25-12)|sym-throughput
-gate|W25-22|join time: 20 late-peer joins from a clean state, each 2000 ms or less from the listener start to the first packet (enroll to first packet is report only)|join-time
+gate|join-time|join time: 20 late-peer joins from a clean state, each 2000 ms or less from the listener start to the first packet (enroll to first packet is report only)|join-time
 
 proof|w18-linux-daemon|scripts/proof/w18-linux-daemon.sh|-|orblx-w18:local
 proof|coord-enroll|scripts/proof/coord-enroll.sh|-|orblx-coord:w18

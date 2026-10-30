@@ -1,4 +1,4 @@
-"""W25-22: the join-time proof gate (scripts/proof/join-time-summary.py) and its wiring.
+"""The join-time proof gate (scripts/proof/join-time-summary.py) and its wiring.
 
 The summary takes every join that the proof started. The negative tests check that a join
 that fails (a timeout or an error), a missing join, or a join that is slow from the
@@ -83,7 +83,7 @@ class JoinTimeWiringTest(unittest.TestCase):
     def test_the_sweep_manifest_runs_the_proof_as_a_gate(self):
         with open(MANIFEST) as f:
             lines = [l.rstrip("\n") for l in f if l.strip() and not l.startswith("#")]
-        self.assertTrue(any(l.startswith("gate|W25-22|") and l.endswith("|join-time") for l in lines))
+        self.assertTrue(any(l.startswith("gate|join-time|") and l.endswith("|join-time") for l in lines))
         self.assertTrue(any(l.startswith("proof|join-time|scripts/proof/join-time.sh|") for l in lines))
 
     def test_each_join_has_its_own_project_and_a_clean_start(self):

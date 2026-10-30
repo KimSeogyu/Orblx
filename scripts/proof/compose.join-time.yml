@@ -1,9 +1,9 @@
-# W25-22 join-time proof stack. One stack for each join, with its own project name and its
+# Join-time proof stack. One stack for each join, with its own project name and its
 # own state directories. `docker compose up` starts only the coordinator and the tool.
 name: ${JOIN_PROJECT:?set JOIN_PROJECT}
 
 x-node: &node
-  image: ${ORBLX_JOIN_IMAGE:-orblx-w2522-join:local}
+  image: ${ORBLX_JOIN_IMAGE:-orblx-join-time:local}
   profiles: ["nodes"]
   entrypoint: ["orblx"]
   cap_add:
@@ -15,7 +15,7 @@ x-node: &node
 
 services:
   coord:
-    image: ${ORBLX_JOIN_IMAGE:-orblx-w2522-join:local}
+    image: ${ORBLX_JOIN_IMAGE:-orblx-join-time:local}
     command:
       - coord
       - serve
@@ -39,7 +39,7 @@ services:
   # The tool runs the enroll calls with `docker compose exec`, so a container start is not
   # part of the enroll time.
   tool:
-    image: ${ORBLX_JOIN_IMAGE:-orblx-w2522-join:local}
+    image: ${ORBLX_JOIN_IMAGE:-orblx-join-time:local}
     entrypoint: ["sleep", "infinity"]
     volumes:
       - ${JOIN_WORK:?set JOIN_WORK}:/work

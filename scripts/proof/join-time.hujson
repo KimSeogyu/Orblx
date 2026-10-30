@@ -1,5 +1,5 @@
 {
-  // W25-22 join-time proof.
+  // Join-time proof.
   // Node a runs first. Node b enrolls later. Node a may ping b.
   "acls": [
     {
