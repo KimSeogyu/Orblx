@@ -125,6 +125,19 @@ class PerfSummaryTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("sym_sym_relay: throughput None", summary["runs"][0]["ci_failures"][0])
 
+    def test_a_throughput_below_300_mbit_fails(self):
+        text = synthetic().replace("throughput prc_prc_direct bytes 883294208 seconds 5.003 mbit_s 1412.29",
+                                   "throughput prc_prc_direct bytes 175500000 seconds 5.000 mbit_s 280.83")
+        code, summary, _ = run_summary([(text, 0)])
+        self.assertEqual(code, 1)
+        self.assertIn("prc_prc_direct: throughput 280.83 Mbit/s is below the floor 300.0 Mbit/s",
+                      summary["runs"][0]["ci_failures"])
+
+    def test_a_throughput_of_300_mbit_passes(self):
+        text = synthetic().replace("mbit_s 1412.29", "mbit_s 300.00")
+        code, summary, _ = run_summary([(text, 0)])
+        self.assertEqual(code, 0)
+
     def test_a_log_without_ping_rtts_fails(self):
         code, summary, _ = run_summary([(RUN1, 0)])
         self.assertEqual(code, 1)
