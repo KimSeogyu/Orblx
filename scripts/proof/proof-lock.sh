@@ -161,7 +161,7 @@ proof_lock_queue_position() {
   printf '%s\n' "$n"
 }
 
-# Write the ticket. Call it before the first proof_context line.
+# proof_lock_queue_join LOCK_FILE: write this proof's ticket into the queue.
 proof_lock_queue_join() {
   local file="$1" dir
   dir="${file}.queue"
@@ -289,6 +289,9 @@ proof_lock_plain_parent() {
 proof_lock_queue_wait() {
   local file="$1" note="$2" from="$3" dir first next_note have_fifo=0 next_keeper=0 now
   dir="${file}.queue"
+  if [[ -z "${PROOF_LOCK_TICKET:-}" ]]; then
+    proof_lock_queue_join "$file"
+  fi
   next_note=0
   while :; do
     if [[ "$have_fifo" == "0" ]]; then
