@@ -42,7 +42,50 @@ existing netmap key. The node verifies each reply with the pinned netmap key, as
 
 ## 3. Results
 
-The proof results follow after the proof run.
+Proof: `scripts/proof/policy-sync.sh`. The script takes the box proof lock (`proof-lock.sh`, W25-5).
+The build is release. Branch run: commit `d8c7d3ae`, 2026-10-31 01:44 to 01:48 KST,
+log `w256-br2-d8c7d3ae-policy-sync-run3.log` in the proof log directory. Result: `proof_ok`.
+The lock sampler saw other orblx containers in all 86 samples (max 7, load1 max 2.84).
+
+| Gate | Label | Limit | Measured |
+|---|---|---|---|
+| 1. Policy change to the new DNS answer on node `a` (remove `corp.lan`) | [C] | 2000 ms | 272 ms |
+| 1. Policy change to the new DNS answer on node `a` (add `corp.lan` again) | [C] | 2000 ms | 234 ms |
+| 1. Node `a` applied a new policy (stage, remove / add) | [C] | - | +120 ms / +202 ms |
+| 1. The DNS table follows the new netmap (stage, remove / add) | [C] | - | +265 ms / +233 ms |
+| 4. Late peer `b`: first ICMP reply on `a`, from `docker compose up b` | [C] | 2000 ms | 1066 ms |
+| 4. Late peer `b`: first ICMP reply on `a`, from the container start | [C] | - | 855 ms |
+| 4. Late peer `b`: first ICMP reply on `a`, from the start of the enroll | [C] | - | 1731 ms |
+| 4. Restarts of `a` and the router | [C] | 0 | 0 |
+| 3. Coordinator CPU, 50 `policy-wait` clients, no change, 60.3 s | [C] | < 5% of one core | 1.38% |
+| 3. Coordinator CPU, 50 clients, one change each 10 s, 60.4 s | [C] | < 5% of one core | 4.35% |
+| 3. Policy updates that the 50 clients got in the change window | [C] | >= 300 | 300 |
+| 3. CPU of one client (no change / change) | [C] | - | 0.037% / 0.070% |
+| 2. Last datagram from `a` at the router after `revoke_done_ms` | [C] | 1000 ms | 230 ms |
+| Logs with `PRIVATE KEY` | [C] | 0 | 0 |
+
+No node restarted, and the script did not run a manual netmap fetch on a node.
+The late peer gate is a Docker measurement. The unit test `a_peer_that_enrolls_later` is extra.
+
+Other checks on the branch:
+
+- REAL: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  and `cargo test --workspace` pass (rustc 1.99.1).
+- [C] W23-4 NAT realism (`nat-realism.sh`, release, `nat-realism-acl.hujson`) on `431e1fef`:
+  `proof_ok` (log `w256-br2-431e1fef-natr-run1.log`). The commits after `431e1fef` change only
+  the policy sync proof files.
+
+### Failed runs and causes
+
+- Run 1 (`431e1fef`): gate 3 stopped at the enroll of the load identities.
+  Cause: the coordinator needs one endpoint at enroll, and the script gave none.
+  Fix: the load container has the fixed address 172.30.126.9, and each identity gives its own port.
+- Run 2 (`7d1bebfa`, debug build): gate 3 failed. Coordinator CPU 99.60% with no change.
+  Cause: the debug build. Each client asks again after the 20 s hold, with a new QUIC and TLS
+  handshake, and the coordinator signs the netmap for each reply. In a debug build these steps are slow.
+  A host check with 10 debug clients showed a burst of 127 CPU ticks (1.27 s) for each 20 s cycle.
+  The same host check with 50 release clients showed 82 ticks in 60 s (1.37%).
+  Fix: the proof uses the release build by default (`ORBLX_SYNC_PROFILE`). The gate limit did not change.
 
 ## 4. Limits
 
