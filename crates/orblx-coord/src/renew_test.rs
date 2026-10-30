@@ -111,6 +111,7 @@ async fn renew_replaces_the_leaf_and_keeps_the_address() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_stays_up_for_three_svid_lifetimes() {
     const LIFE_SECS: u64 = 60;
+    const PROBE_MS: u64 = 20;
     let scratch = Scratch::new("life");
     let node_a = Scratch::new("life-a");
     let node_b = Scratch::new("life-b");
@@ -213,7 +214,9 @@ async fn session_stays_up_for_three_svid_lifetimes() {
     let mut saw_direct = false;
     let mut expiries = HashSet::new();
     let limit = Duration::from_secs(LIFE_SECS * 3 + 8);
+    let mut round = 0u64;
     while issued_at.elapsed() < limit {
+        // One probe each way every 20 ms, so a 200 ms gap shows as about 10 lost probes.
         let _ = a_in_tx
             .send(
                 ipv4_packet(
@@ -234,36 +237,47 @@ async fn session_stays_up_for_three_svid_lifetimes() {
                 .unwrap(),
             )
             .await;
-        let slice_end = Instant::now() + Duration::from_millis(200);
-        while Instant::now() < slice_end {
-            if let Ok(Some(_)) =
-                tokio::time::timeout(Duration::from_millis(20), b_out_rx.recv()).await
-            {
-                note_gap(&mut last_ab, &mut max_gap);
-                got_ab += 1;
-            }
-            if let Ok(Some(_)) =
-                tokio::time::timeout(Duration::from_millis(20), a_out_rx.recv()).await
-            {
-                note_gap(&mut last_ba, &mut max_gap);
-                got_ba += 1;
+        let tick = tokio::time::Instant::now() + Duration::from_millis(PROBE_MS);
+        loop {
+            tokio::select! {
+                got = b_out_rx.recv() => {
+                    if got.is_some() {
+                        note_gap("ab", &mut last_ab, &mut max_gap);
+                        got_ab += 1;
+                    }
+                }
+                got = a_out_rx.recv() => {
+                    if got.is_some() {
+                        note_gap("ba", &mut last_ba, &mut max_gap);
+                        got_ba += 1;
+                    }
+                }
+                () = tokio::time::sleep_until(tick) => break,
             }
         }
-        if let Ok(text) = fs::read_to_string(node_a.0.join(NODE_STATUS_FILE)) {
-            if text.contains("path direct ") {
-                saw_direct = true;
-            }
-            if let Some(value) = text
-                .lines()
-                .find_map(|line| line.strip_prefix("svid_expiry "))
-            {
-                expiries.insert(value.to_string());
+        round += 1;
+        if round.is_multiple_of(10) {
+            if let Ok(text) = fs::read_to_string(node_a.0.join(NODE_STATUS_FILE)) {
+                if text.contains("path direct ") {
+                    saw_direct = true;
+                }
+                if let Some(value) = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("svid_expiry "))
+                {
+                    expiries.insert(value.to_string());
+                }
             }
         }
         if last_ab.is_some() && last_ba.is_some() && max_gap > Duration::from_secs(2) {
             break;
         }
     }
+    println!(
+        "renew_gap_summary probe_ms {PROBE_MS} ab {got_ab} ba {got_ba} max_gap_ms {} expiries {}",
+        max_gap.as_millis(),
+        expiries.len()
+    );
 
     let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(3), task_a).await;
@@ -286,10 +300,17 @@ async fn session_stays_up_for_three_svid_lifetimes() {
     );
 }
 
-fn note_gap(last: &mut Option<Instant>, max_gap: &mut Duration) {
+fn note_gap(dir: &str, last: &mut Option<Instant>, max_gap: &mut Duration) {
     let now = Instant::now();
     if let Some(prev) = *last {
         let gap = now.saturating_duration_since(prev);
+        if gap > Duration::from_millis(100) {
+            let ms = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            eprintln!("trace {ms} test gap dir={dir} ms={}", gap.as_millis());
+        }
         if gap > *max_gap {
             *max_gap = gap;
         }

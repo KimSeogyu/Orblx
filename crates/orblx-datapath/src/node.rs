@@ -34,6 +34,15 @@ use crate::router::{route_packet, RouterTable};
 use crate::tun_dev::{open_tun, TunConfig};
 use crate::{HelloConfig, HelloError, HelloSender, HelloSession, FLAG_REKEY_REQ};
 
+macro_rules! tr {
+    ($($a:tt)*) => {
+        if std::env::var_os("ORBLX_TRACE_RENEW").is_some() {
+            let ms = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+            eprintln!("trace {ms} {}", format!($($a)*));
+        }
+    };
+}
+
 /// The node record file in the state directory.
 pub const NODE_RECORD_FILE: &str = "node.json";
 
@@ -890,6 +899,7 @@ async fn accept_loop(mut mesh: Mesh) {
             accepted = mesh.endpoint.accept_one() => {
                 match accepted {
                     Ok(session) => {
+                        tr!("{} accepted {}", mesh.node.name, session.peer_id().as_uri());
                         let netmap = fresh_netmap(&mesh);
                         let peer_name = netmap.peers.iter().find(|peer| peer.svid == session.peer_id().as_uri()).map(|peer| peer.name.clone());
                         let Some(peer_name) = peer_name else {
@@ -945,12 +955,14 @@ async fn dial_peer(mut mesh: Mesh, peer: NetmapPeer) {
                     if changed.is_err() || stopped(&mesh) {
                         return;
                     }
+                    tr!("{} reconnect cause=local_renew peer={}", mesh.node.name, peer.name);
                     reconnect(&mut mesh, &peer, &remote_tx, &mut task).await;
                 }
                 changed = remote_rx.changed() => {
                     if changed.is_err() || stopped(&mesh) {
                         return;
                     }
+                    tr!("{} reconnect cause=peer_rekey_req peer={}", mesh.node.name, peer.name);
                     reconnect(&mut mesh, &peer, &remote_tx, &mut task).await;
                 }
             }
@@ -977,9 +989,22 @@ async fn reconnect(
     remote_tx: &watch::Sender<u64>,
     task: &mut JoinHandle<()>,
 ) {
+    let t0 = Instant::now();
     let Some((session, relay_face)) = dial_once(mesh, peer).await else {
+        tr!(
+            "{} dial_failed peer={} ms={}",
+            mesh.node.name,
+            peer.name,
+            t0.elapsed().as_millis()
+        );
         return;
     };
+    tr!(
+        "{} dial_done peer={} ms={}",
+        mesh.node.name,
+        peer.name,
+        t0.elapsed().as_millis()
+    );
     let next = spawn_link(
         mesh,
         session,
@@ -1205,6 +1230,12 @@ async fn run_link(
             println!("The node ended the session with {name}. The deny list revokes the peer.");
             return;
         }
+        tr!(
+            "{} link_up peer={} gen={}",
+            mesh.node.name,
+            name,
+            generation
+        );
         if let Some(old) = map.insert(
             name.clone(),
             LiveLink {
@@ -1214,6 +1245,12 @@ async fn run_link(
                 ask_rekey: ask_tx,
             },
         ) {
+            tr!(
+                "{} link_cancel_old peer={} old_gen={}",
+                mesh.node.name,
+                name,
+                old.generation
+            );
             let _ = old.cancel.send(true);
         }
     }
@@ -1238,6 +1275,7 @@ async fn run_link(
             counters: Arc::clone(&mesh.counters),
             filter: mesh.filter.clone(),
             peer_svid,
+            label: format!("{} peer={} gen={}", mesh.node.name, name, generation),
         },
         move || note_rx(&peers, &state_dir, &node, &peer_name),
     )
@@ -1269,6 +1307,7 @@ struct SessionIo {
     counters: Arc<NodeCounters>,
     filter: Option<Arc<crate::PacketFilter>>,
     peer_svid: String,
+    label: String,
 }
 
 async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
@@ -1284,12 +1323,16 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
         counters,
         filter,
         peer_svid,
+        label,
     } = io;
+    let mut first_rx = true;
+    let mut first_tx = true;
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     loop {
         tokio::select! {
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
+                    tr!("{label} session_end reason=cancel");
                     return;
                 }
             }
@@ -1297,7 +1340,9 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                 if changed.is_err() {
                     return;
                 }
+                tr!("{label} send_rekey_req");
                 if sender.send_ctrl(FLAG_REKEY_REQ).await.is_err() {
+                    tr!("{label} session_end reason=send_rekey_err");
                     return;
                 }
             }
@@ -1313,7 +1358,12 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                 if let Some(filter) = &filter {
                     filter.note_outbound(&packet);
                 }
+                if first_tx {
+                    tr!("{label} first_tx");
+                    first_tx = false;
+                }
                 if sender.send_ipv4(&packet).await.is_err() {
+                    tr!("{label} session_end reason=send_err");
                     return;
                 }
                 counters.tx.fetch_add(1, Ordering::Relaxed);
@@ -1321,6 +1371,10 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
             incoming = receiver.recv_event() => {
                 match incoming {
                     Ok(SessionEvent::Packet(packet)) => {
+                        if first_rx {
+                            tr!("{label} first_rx");
+                            first_rx = false;
+                        }
                         on_rx();
                         counters.rx.fetch_add(1, Ordering::Relaxed);
                         if let Some(filter) = &filter {
@@ -1344,11 +1398,15 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     }
                     Ok(SessionEvent::Keepalive) => on_rx(),
                     Ok(SessionEvent::Rekey) => {
+                        tr!("{label} got_rekey_req");
                         on_rx();
                         let next = remote_rekey.borrow().saturating_add(1);
                         let _ = remote_rekey.send(next);
                     }
-                    Err(_) => return,
+                    Err(err) => {
+                        tr!("{label} session_end reason=recv_err {err}");
+                        return;
+                    }
                 }
             }
         }
@@ -1463,6 +1521,7 @@ async fn renew_loop(mut mesh: Mesh, renewer: SvidRenewer) {
             if stopped(&mesh) {
                 return;
             }
+            tr!("{} renew_start", mesh.node.name);
             let renewer = renewer.clone();
             let fetched = tokio::task::spawn_blocking(move || renewer.renew()).await;
             let leaf = match fetched {
@@ -1489,6 +1548,7 @@ async fn renew_loop(mut mesh: Mesh, renewer: SvidRenewer) {
             };
             match apply_leaf(&mesh, &leaf) {
                 Ok(expiry) => {
+                    tr!("{} renew_applied signal_rekey", mesh.node.name);
                     signal_rekey(&mesh);
                     publish(&mesh.state_dir, &mesh.node, &mesh.peers, "up");
                     println!("The node renewed the SVID. The new expiry is {expiry}.");
