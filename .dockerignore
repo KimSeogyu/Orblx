@@ -1,2 +1,8 @@
-target
-.git
+# The image build needs only the Rust workspace and the docker directory.
+# This list keeps target/, state files, and tokens out of the build context.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+!docker/entrypoint.sh
+crates/**/target/
