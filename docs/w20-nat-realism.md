@@ -180,5 +180,5 @@ proof_ok
 - The birthday attempt is probabilistic. With 256 sockets and up to 2048 probes over 64512 ports, the expected number of hits is about 8, so the chance of no hit is about 0.03 percent. When it fails, the node uses the relay. The node makes one birthday attempt for each process start.
 - Two symmetric NATs always use the relay. The code does not try a punch in that case.
 - The hello carries the SVID at the start of the session. The NAT runtime does not send a new hello after an SVID renewal, so the peer line shows the expiry of the SVID from the hello.
-- The overlay RTT in the lab is about 50 ms on a direct path. This comes from the read loop of the TUN device and not from the network. It was 100 ms in W19. This change does not try to fix it.
+- The overlay RTT in the lab is about 50 ms on a direct path. It was 100 ms in W19. The bridge RTT is below 1 ms, so the delay is in the node. A poll timer in the node is a possible cause. This change did not measure or fix it.
 - One host runs all containers. The bridge has no packet loss and no delay. The switch numbers do not include real WAN loss.
