@@ -79,9 +79,36 @@ Log: `/workspace/orblx-w18-proof/w24acl-branch-51b943e8-datapath-acl-run1.log` (
 
 `revoke_drop_ms` is the receive time of the last datagram from a at b minus `revoke_done_ms`.
 
-SUBNET_RESULTS
+### Subnet route [C]
 
-PERF_RESULTS
+`scripts/proof/split-dns.sh` Gate 5 (W24-F stack: a router with the route 10.88.24.0/24, the corp.lan nameserver 10.88.24.53 behind it, node a accepts routes).
+The router has the signed grants. The policy `scripts/proof/split-dns.hujson` lets `group:humans` use UDP to `10.88.24.53/32:53` and TCP to `10.88.24.20/32:80`.
+The proof counts the forwarded bytes with an iptables FORWARD rule on the router (`-d 10.88.24.53 -p udp --dport 53`) and the queries in the nameserver log.
+
+Log: `/workspace/orblx-w18-proof/w24acl-reb-1755055b-split-dns-run1.log`. The run printed `proof_ok`.
+
+| Case | Result [C] |
+|---|---|
+| The policy allows UDP 53. a asks 10.88.24.53 for db.corp.lan. | `rcode 0 answers 1 address 10.88.24.20`. `allowed_fwd_bytes 57`, `allowed_landns_queries 1`. |
+| The proof removes the UDP 53 rule. The router reads the new signed grants (no restart, no automatic fetch). a asks again. | `TimeoutError: timed out`. `denied_fwd_bytes 0`, `denied_landns_queries 0`, `audit_packet_deny_udp53 1`: `{"action":"packet-deny","actor":"spiffe://orblx.local/node/a","target":"udp/53","detail":"src 100.64.0.2 dst 10.88.24.53 proto udp port 53 unwritten_before 0"}`. `audit verify-config` ok. |
+| TCP 80 to 10.88.24.20 still has a rule. | `db-ok`. |
+
+Gates 1 to 4 of the W24-F proof also pass with the router filter on.
+
+### W23-4 gates [C]
+
+`scripts/proof/nat-realism.sh` with `ORBLX_NATR_POLICY=scripts/proof/nat-realism-acl.hujson` (the filter is on), release build, 3 runs on branch head 1755055b (main 130fe35).
+
+| Run | prc direct Mbit/s | prc relay Mbit/s | sym relay Mbit/s | prc relay / direct RTT avg ms | sym relay / direct RTT avg ms | lost |
+|---|---|---|---|---|---|---|
+| run2 | 1112.65 | 1277.52 | 930.65 | 0.926 / 0.574 | 0.425 / 0.574 | 0/50, 0/50 |
+| run3 | 1378.90 | 1269.68 | 1136.20 | 0.910 / 0.368 | 0.827 / 0.368 | 0/50, 0/50 |
+| run4 | 1096.84 | 1071.13 | 535.71 | 0.927 / 0.384 | 0.434 / 0.384 | 0/50, 0/50 |
+| median | 1112.65 (W22 1094) | 1269.68 (W22 1128) | 1136.20 (W22 1113) | all within direct + 1 ms | | |
+
+Logs: `/workspace/orblx-w18-proof/w24acl-reb-1755055b-natr-branch-run{2,3,4}.log`.
+The box had other workers (load 4 to 6). One ping in run2 had a max of 100.809 ms (avg 2.593 ms, 0/50 lost) during an SVID renewal.
+An earlier set of 3 runs (branch d4c9b9e0 against main 76c90ac, same hour) had relay medians below W22 on both the branch (prc 860, sym 1018) and main (prc 914, sym 978). Logs: `w24acl-d4c-*-natr-*.log`.
 
 ## Changes to other proofs
 
