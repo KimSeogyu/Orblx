@@ -109,6 +109,17 @@ The failover time is about `HA_DEAD_AFTER` (1000 ms): the client moves the route
 An earlier run on head f2887a7 (before the merge of #92) had the same result: failover 989 to 1074 ms, TCP reconnect 1125 ms (log `w25ha-routers-full3.log`).
 
 
+### W23-4 gates [C]
+
+`scripts/proof/nat-realism.sh` with `ORBLX_NATR_POLICY=scripts/proof/nat-realism-acl.hujson` (the filter is on), release build, branch head b145e54, 1 run.
+Log: `/workspace/orblx-w18-proof/w25ha-b145e542-natr-branch-run1.log` (lock 03:55:48 to 04:01:38 KST). Other orblx proof containers: 0.
+
+| prc direct Mbit/s | prc relay Mbit/s | sym relay Mbit/s | prc relay / direct RTT avg ms | sym relay / direct RTT avg ms | lost |
+|---|---|---|---|---|---|
+| 1405.71 (W24 median 1112.65) | 1341.03 (1269.68) | 1386.52 (1136.20) | 1.035 / 0.551 | 0.954 / 0.551 | 0/50, 0/50 |
+
+The relay RTT is within direct + 1 ms. The steady ping max was 1.525 ms or less (limit 100 ms).
+
 ## Limits
 
 - Since W25-6 (#92), the node applies a new netmap with no restart, and it prints the new HA routes. The proof still restarts the client after it approves router-b. Thus the proof does not show the HA change with no restart.
