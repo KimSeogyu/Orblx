@@ -108,7 +108,7 @@ Log: `/workspace/orblx-w18-proof/w25-h-docker-image-ecb00bfa.log` (branch commit
 
 | Gate | Label | Result |
 | --- | --- | --- |
-| 1. Multi-stage build, slim runtime, at most 60 MB | REAL | `size_bytes 40259589` (40.3 MB), 1 layer. The stripped release binary is 14964872 bytes (15.0 MB). |
+| 1. Multi-stage build, slim runtime, at most 60 MB | REAL | `size_bytes 40259589` (40.3 MB), 1 layer. PR CI (BuildKit, run 41055756663) reports `size_bytes 27703428` (27.7 MB) for the same Dockerfile. The two engines measure the size differently. Both are below the limit. The stripped release binary is 14964872 bytes (15.0 MB). |
 | 2. Only a token, `NET_ADMIN`, and `/dev/net/tun`: enroll, SVID, overlay ping | [C] | `b` used a token file. `a` used a token env var (`--env-file`). `privileged false cap_add [CAP_NET_ADMIN] devices 1` for both. Overlay `a 100.64.0.2`, `b 100.64.0.1`. `ping a->b`: 20/20, 0% loss, avg 1.736 ms, max 6.010 ms. The `orblx up` process has 0 `ORBLX_ENROLL_TOKEN*` variables. 0 temp token files. `resolvectl` missing: 1 line, the node continues. |
 | 3. Restart with the state volume: same overlay IP, no new enroll | [C] | `a overlay before 100.64.0.2 after 100.64.0.2 enrolled_lines 1 no_enroll_lines 1`. `ping a->b after restart`: 20/20, 0% loss, avg 0.620 ms. |
 | 4. SVID renew in the container, short life | [C] | `ORBLX_SVID_TTL=60`. `The node renewed the SVID. The new expiry is 1793363346.` `svid_expiry before 1793363306 after 1793363346` (+40 s). Ping after renew: 20/20, 0% loss, avg 1.075 ms. |
