@@ -419,8 +419,8 @@ echo "revoke_drop_ms ${drop_ms} (last datagram from a at b minus revoke_done_ms,
 [[ "$drop_ms" -le 1000 ]]
 # The stream ran for 6 s or more after the revoke. Thus most datagrams must be dropped.
 [[ $(( sent - rx_total )) -gt 200 ]]
-wait_log b 'The node ended the session with a. The deny list revokes the peer.' 1
-dc logs --no-log-prefix b 2>&1 | grep 'The node ended the session with a.' | head -1
+wait_log b 'The peer a is in the deny list. The node closes the session.' 1
+dc logs --no-log-prefix b 2>&1 | grep -e 'The peer a is in the deny list.' -e 'The node ended the session with a.' | head -1
 expect_probe a "tcp ${ips[b]}:8080 timeout" tcp "${ips[b]}" 8080 "$TIMEOUT"
 expect_probe c "tcp ${ips[b]}:8080 connected reply ok" tcp "${ips[b]}" 8080 "$TIMEOUT"
 

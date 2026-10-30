@@ -436,7 +436,7 @@ deny_ms grant-a2 "$WORK/probe-a-grant-a2.out" 'connect denied reason revoked' ov
 deny_ms svid "$WORK/probe-a-svid.out" 'deny_output'
 deny_ms ssh "$WORK/probe-a-ssh.out" 'The SSH session was refused' overlay
 deny_ms file "$WORK/probe-a-file.out" 'reply deny identity' overlay
-dc logs --no-log-prefix b 2>&1 | grep -m1 'The node ended the session with a.' || true
+dc logs --no-log-prefix b 2>&1 | grep -m1 -e 'The peer a is in the deny list.' -e 'The node ended the session with a.' || true
 
 echo "=== [C] probes of c during and after the revoke ==="
 for label in c-grant-c1 c-svid c-ssh c-file; do
