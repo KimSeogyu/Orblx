@@ -408,7 +408,8 @@ async fn late_peer_case(
 
     let enrolled_at = Instant::now();
     let token_b = coord.create_token(Duration::from_secs(600)).unwrap();
-    let enrolled_b = client::enroll_with_token(
+    let token_done = Instant::now();
+    let (enrolled_b, close_waits) = with_close_waits(client::enroll_with_token(
         addr,
         "coord",
         &bundle,
@@ -416,9 +417,9 @@ async fn late_peer_case(
         &token_b.secret,
         &[format!("127.0.0.1:{port_b}")],
         &[],
-    )
-    .await
-    .unwrap();
+    ))
+    .await;
+    let enrolled_b = enrolled_b.unwrap();
     let enroll_done = Instant::now();
     enrolled_b.write_state(&node_b.0).unwrap();
     let state_done = Instant::now();
@@ -455,7 +456,9 @@ async fn late_peer_case(
     ));
     let marks = StartMarks {
         enroll_start: enrolled_at,
+        token_done,
         enroll_done,
+        close_waits,
         state_done,
         netmap_done,
         config_done,
@@ -522,7 +525,10 @@ async fn late_peer_case(
 /// The harness times of one node start, from the enroll call to the spawn of the node (W25-21).
 struct StartMarks {
     enroll_start: Instant,
+    token_done: Instant,
     enroll_done: Instant,
+    /// The close-wait times of the enroll call (client::CLOSE_WAITS).
+    close_waits: Vec<Duration>,
     state_done: Instant,
     netmap_done: Instant,
     config_done: Instant,
@@ -535,7 +541,12 @@ struct StartMarks {
 /// listener start event.
 #[derive(Clone, Copy, Debug)]
 struct StartupPhases {
-    enroll_rpc: Duration,
+    /// The coordinator makes the enroll token (the harness, not the node).
+    token: Duration,
+    /// The enroll call up to the reply: connect, handshake, request and reply.
+    enroll_call: Duration,
+    /// The enroll call after the reply: the close and the endpoint wait (up to 2 s).
+    close_wait: Duration,
     write_state: Duration,
     netmap_read: Duration,
     leaf_config: Duration,
@@ -548,21 +559,32 @@ struct StartupPhases {
     total: Duration,
 }
 
+/// The phases of [`StartupPhases`] in time order, with their names.
+const PHASES: [(&str, PhaseField); 12] = [
+    ("token", |p| p.token),
+    ("enroll_call", |p| p.enroll_call),
+    ("close_wait", |p| p.close_wait),
+    ("write_state", |p| p.write_state),
+    ("netmap_read", |p| p.netmap_read),
+    ("leaf_config", |p| p.leaf_config),
+    ("harness_wait", |p| p.harness_wait),
+    ("spawn_to_node", |p| p.spawn_to_node),
+    ("prepare", |p| p.prepare),
+    ("to_bind", |p| p.to_bind),
+    ("bind", |p| p.bind),
+    ("total", |p| p.total),
+];
+
 impl StartupPhases {
     fn line(&self) -> String {
-        format!(
-            "startup_ms enroll_rpc {} write_state {} netmap_read {} leaf_config {} harness_wait {} spawn_to_node {} prepare {} to_bind {} bind {} total {}",
-            self.enroll_rpc.as_millis(),
-            self.write_state.as_millis(),
-            self.netmap_read.as_millis(),
-            self.leaf_config.as_millis(),
-            self.harness_wait.as_millis(),
-            self.spawn_to_node.as_millis(),
-            self.prepare.as_millis(),
-            self.to_bind.as_millis(),
-            self.bind.as_millis(),
-            self.total.as_millis()
-        )
+        let mut text = "startup_ms".to_string();
+        for (name, field) in PHASES {
+            text.push_str(&format!(
+                " {name} {:.1}",
+                field(self).as_secs_f64() * 1000.0
+            ));
+        }
+        text
     }
 }
 
@@ -571,8 +593,12 @@ type PhaseField = fn(&StartupPhases) -> Duration;
 
 fn startup_phases(marks: &StartMarks, event: &ListenEvent) -> StartupPhases {
     let span = |from: Instant, to: Instant| to.saturating_duration_since(from);
+    let call = span(marks.token_done, marks.enroll_done);
+    let close_wait = marks.close_waits.iter().sum::<Duration>().min(call);
     StartupPhases {
-        enroll_rpc: span(marks.enroll_start, marks.enroll_done),
+        token: span(marks.enroll_start, marks.token_done),
+        enroll_call: call - close_wait,
+        close_wait,
         write_state: span(marks.enroll_done, marks.state_done),
         netmap_read: span(marks.state_done, marks.netmap_done),
         leaf_config: span(marks.netmap_done, marks.config_done),
@@ -583,6 +609,17 @@ fn startup_phases(marks: &StartMarks, event: &ListenEvent) -> StartupPhases {
         bind: span(event.bind_at, event.at),
         total: span(marks.enroll_start, event.at),
     }
+}
+
+/// Runs a coordinator call and returns its result and the close-wait times of its calls.
+async fn with_close_waits<T>(call: impl std::future::Future<Output = T>) -> (T, Vec<Duration>) {
+    client::CLOSE_WAITS
+        .scope(std::cell::RefCell::new(Vec::new()), async {
+            let out = call.await;
+            let waits = client::CLOSE_WAITS.with(|waits| waits.borrow().clone());
+            (out, waits)
+        })
+        .await
 }
 
 /// W25-21 measurement: `ORBLX_STARTUP_RUNS` node starts (default 10), each from the enroll
@@ -622,24 +659,12 @@ async fn startup_cost_runs() {
             (values[n / 2 - 1] + values[n / 2]) / 2
         }
     };
-    let fields: [(&str, PhaseField); 10] = [
-        ("enroll_rpc", |p| p.enroll_rpc),
-        ("write_state", |p| p.write_state),
-        ("netmap_read", |p| p.netmap_read),
-        ("leaf_config", |p| p.leaf_config),
-        ("harness_wait", |p| p.harness_wait),
-        ("spawn_to_node", |p| p.spawn_to_node),
-        ("prepare", |p| p.prepare),
-        ("to_bind", |p| p.to_bind),
-        ("bind", |p| p.bind),
-        ("total", |p| p.total),
-    ];
-    for (name, field) in fields {
+    for (name, field) in PHASES {
         println!(
-            "startup_cost phase {name} median_ms {} p95_ms {} max_ms {}",
-            median(field).as_millis(),
-            pick(field, 0.95).as_millis(),
-            pick(field, 1.0).as_millis()
+            "startup_cost phase {name} median_ms {:.1} p95_ms {:.1} max_ms {:.1}",
+            median(field).as_secs_f64() * 1000.0,
+            pick(field, 0.95).as_secs_f64() * 1000.0,
+            pick(field, 1.0).as_secs_f64() * 1000.0
         );
     }
     let total = median(|p| p.total);
@@ -690,9 +715,10 @@ async fn startup_cost_once() -> StartupPhases {
     .unwrap();
     let ring = TicketRing::single(ticket_key, &[7; 32]).unwrap();
     let port = free_port();
-    let token = coord.create_token(Duration::from_secs(600)).unwrap();
     let enroll_start = Instant::now();
-    let enrolled = client::enroll_with_token(
+    let token = coord.create_token(Duration::from_secs(600)).unwrap();
+    let token_done = Instant::now();
+    let (enrolled, close_waits) = with_close_waits(client::enroll_with_token(
         addr,
         "coord",
         &bundle,
@@ -700,9 +726,9 @@ async fn startup_cost_once() -> StartupPhases {
         &token.secret,
         &[format!("127.0.0.1:{port}")],
         &[],
-    )
-    .await
-    .unwrap();
+    ))
+    .await;
+    let enrolled = enrolled.unwrap();
     let enroll_done = Instant::now();
     enrolled.write_state(&node_dir.0).unwrap();
     let state_done = Instant::now();
@@ -742,7 +768,9 @@ async fn startup_cost_once() -> StartupPhases {
     handle.abort();
     let marks = StartMarks {
         enroll_start,
+        token_done,
         enroll_done,
+        close_waits,
         state_done,
         netmap_done,
         config_done,

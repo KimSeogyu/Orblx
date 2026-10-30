@@ -800,6 +800,13 @@ pub fn fetch_netmap_blocking(
     block_on(fetch_netmap(coord, coord_name, bundle_pem, state_dir))
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// W25-21, tests only: a future that runs in `CLOSE_WAITS.scope` gets the close-wait time
+    /// of each coordinator call that it makes.
+    pub(crate) static CLOSE_WAITS: std::cell::RefCell<Vec<std::time::Duration>>;
+}
+
 /// Closes a coordinator call and waits up to 2 s for the endpoint to become idle, so that the
 /// coordinator gets the close. W25-21: with ORBLX_TRACE_COORD=1 it prints the time of this
 /// wait. The line has no request or response data.
@@ -807,6 +814,8 @@ async fn close_and_wait(connection: &quinn::Connection, endpoint: &quinn::Endpoi
     let started = std::time::Instant::now();
     connection.close(quinn::VarInt::from_u32(0), b"done");
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.wait_idle()).await;
+    #[cfg(test)]
+    let _ = CLOSE_WAITS.try_with(|waits| waits.borrow_mut().push(started.elapsed()));
     if std::env::var("ORBLX_TRACE_COORD").as_deref() == Ok("1") {
         eprintln!(
             "orblx coord_call close_wait_ms {:.1} rtt_ms {:.1}",
