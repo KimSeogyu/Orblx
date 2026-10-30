@@ -163,7 +163,54 @@ Measurements (REAL: `cargo test` on the Linux host, debug build, 127.0.0.1, rust
 test that the change does not keep. A first version of the fix without the accept loop change
 had 3 of 50 soak failures (2755 ms to 2959 ms late, up to 2728 ms). The accept loop change removed them.
 
-## 5. Limits
+## 5. Start of the late peer gate (W25-6c)
+
+### 5.1 Problem
+
+The gate of `a_peer_that_enrolls_later_is_reachable_in_two_seconds` started when the test
+called the enroll of b. The time to the first packet then included the start-up of b
+before its UDP listener started. That time is not a dial or datapath time.
+
+REAL: renew-soak run 41120080246, job 124284271149 (`ubuntu-latest`, #91 head a3e5cd6), 2026-10-31 KST:
+
+| Time (KST) | Event |
+|---|---|
+| 05:02:56.501 | The coordinator enrolled b. |
+| 05:02:56.926 | Node a added b from the new netmap. |
+| 05:02:58.959 | Node b started (2.46 s after the enroll). |
+| 05:02:59.196 | Node b accepted a (0.24 s after the start of b). |
+| 05:02:59.222 | The first packet came to b: 3298 ms after the enroll. The gate failed. |
+
+### 5.2 Change
+
+- `NodeRequest::on_listen` (optional hook). The node takes the time at once after the bind of its
+  UDP socket. The node logs the time: `The node <name> listener started at unix_ms <ms>.`
+  Then the node calls the hook with the same time (`ListenEvent`), before it accepts or dials.
+  The node daemon (`orblx up`) sets `None`.
+- The gate starts at the listener start event of b. The limit is 2 s. There are no retries,
+  no sleeps and no tolerance.
+- The test prints two report-only lines, `enroll_to_listener_ms` and `enroll_to_first_packet_ms`,
+  and the gate line `listener_to_first_packet_ms ... limit_ms 2000`.
+- Negative tests. The delays are only in the test code.
+  - `the_late_peer_gate_fails_when_the_peer_stops_after_its_listener_starts`: the hook of b
+    stops for 2.5 s after the listener start. The gate must fail.
+  - `the_late_peer_gate_passes_when_the_listener_of_the_peer_starts_late`: the test waits 2.5 s
+    after the enroll, before b starts. The gate must pass, and `enroll_to_listener_ms` must be 2.5 s or more.
+
+### 5.3 Results
+
+REAL: `cargo test -p orblx-coord --lib renew_test -- --nocapture` on the Linux box, debug build,
+2026-10-31 KST. Log: `/workspace/orblx-w18-proof/w256c-local-renew_test-run1.log`.
+
+| Test | enroll to listener | enroll to first packet | listener to first packet (gate) | Result |
+|---|---|---|---|---|
+| gate | 208 ms | 574 ms | 365 ms | pass |
+| stop 2.5 s after the listener start | 198 ms | 2772 ms | 2574 ms | gate fails, as required |
+| delay 2.5 s before the listener start | 2736 ms | 2798 ms | 62 ms | gate passes, as required |
+
+The start-up time from the enroll to the listener start is task W25-21.
+
+## 6. Limits
 
 - A changed endpoint list of a peer that the node already dials does not restart that dial task.
   The dial task uses the endpoints from the netmap at the time it started.

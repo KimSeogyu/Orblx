@@ -152,6 +152,12 @@ pub struct NodeRequest {
     /// The node daemon starts SSH from this hook.
     /// `None` starts no extra listener.
     pub on_ready: Option<Box<dyn FnOnce(Ipv4Addr) + Send>>,
+    /// Runs once, at once after the node binds its UDP listener and before the node
+    /// accepts or dials a peer (W25-6c).
+    ///
+    /// The event has the same time that the node logs in its listener start line.
+    /// `None` runs nothing. The node daemon uses `None`.
+    pub on_listen: Option<Box<dyn FnOnce(ListenEvent) + Send>>,
     /// Loopback Prometheus address.
     ///
     /// `None` does not open the metrics port.
@@ -452,8 +458,21 @@ fn announce_renew(request: &NodeRequest) {
     }
 }
 
+/// The UDP listener start of a node (W25-6c).
+///
+/// The node takes the time at once after the bind of its UDP socket.
+#[derive(Clone, Copy, Debug)]
+pub struct ListenEvent {
+    /// The bound UDP address.
+    pub addr: SocketAddr,
+    /// The monotonic time of the listener start.
+    pub at: Instant,
+    /// The same time as milliseconds since the Unix epoch. The node logs this value.
+    pub unix_ms: u128,
+}
+
 async fn run_mesh_inner(
-    request: NodeRequest,
+    mut request: NodeRequest,
     view: NodeView,
     router: RouterTable,
     from_tun: mpsc::Receiver<Vec<u8>>,
@@ -465,8 +484,24 @@ async fn run_mesh_inner(
     let netmap_path = request.netmap_path.clone();
     let visibility = Arc::clone(&request.visibility);
     let endpoint = Arc::new(HelloEndpoint::bind_node(request.config, request.listen)?);
+    let listened_at = Instant::now();
+    let listened_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0);
     let bound = endpoint.local_addr()?;
     println!("The node {} listens on UDP {bound}.", view.name);
+    println!(
+        "The node {} listener started at unix_ms {listened_unix_ms}.",
+        view.name
+    );
+    if let Some(on_listen) = request.on_listen.take() {
+        on_listen(ListenEvent {
+            addr: bound,
+            at: listened_at,
+            unix_ms: listened_unix_ms,
+        });
+    }
     let state_dir = Arc::new(request.state_dir);
     let node = Arc::new(view);
     let peers = Arc::new(Mutex::new(initial_peers(&request.netmap)));
