@@ -43,6 +43,7 @@ The script sends no proof output through a pipe. The output goes to the log file
 | `ORBLX_SWEEP_KEEP` | 0 | 1 keeps the worktree, the target and the images. |
 | `ORBLX_SWEEP_FETCH` | 1 | 0 does not run `git fetch`. |
 | `ORBLX_SWEEP_PROGRESS` | none | A file. The script adds one line for each step. |
+| `ORBLX_SWEEP_LOCK_MODE` | `proof` | `proof`: take the lock for each proof, so other proofs can run between two sweep proofs. `sweep`: take the lock once and hold it for all the proofs. |
 | `ORBLX_SWEEP_LIST`, `ORBLX_SWEEP_TEST_ROOT` | none | Test only (`tests/test_release_sweep.py`). |
 
 The script runs git as the caller. It runs the build and the proofs with `sudo -n` when the caller is not root, so it never asks for a password.
@@ -101,6 +102,7 @@ The dry run on main is running. This section gets the table before the merge.
 
 ## Limits
 
+- `flock` does not serve waiters in order. In the dry run (lock mode `proof`), other workers ran `nat-realism.sh` in loops, and the sweep waited up to about 17 minutes for one proof. For the real sweep, use `ORBLX_SWEEP_LOCK_MODE=sweep` when the box is busy: the sweep then waits once and blocks other lock users until it ends.
 - The lock only orders the proofs that take it. A proof that does not take the lock (from another branch or another agent) can run at the same time. Proofs with fixed container names or subnets (for example `subnet.sh`, `exit-node.sh`) can then collide with the same proof of another worktree.
 - The `proof_context` and `proof_contention` lines count every other running orblx container. For the proofs with fixed names, this count includes the containers of the proof itself.
 - The proofs with no binary setting use a debug binary, not the release binary.

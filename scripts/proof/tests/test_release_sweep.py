@@ -47,7 +47,7 @@ class ReleaseSweepTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp)
 
-    def run_sweep(self, only=None):
+    def run_sweep(self, only=None, mode=None):
         env = dict(os.environ)
         env.update({
             "ORBLX_SWEEP_TEST_ROOT": self.root,
@@ -58,6 +58,8 @@ class ReleaseSweepTest(unittest.TestCase):
         })
         if only is not None:
             env["ORBLX_SWEEP_ONLY"] = only
+        if mode is not None:
+            env["ORBLX_SWEEP_LOCK_MODE"] = mode
         return subprocess.run(["bash", SWEEP, "testsha"], env=env, capture_output=True, text=True)
 
     def rows(self):
@@ -90,6 +92,17 @@ class ReleaseSweepTest(unittest.TestCase):
             self.assertIn("proof_lock rc3-sweep:lock released", log)
             self.assertNotIn("held=none", log)
         self.assertEqual(list(self.rows()), ["lock"])
+
+    def test_sweep_lock_mode_holds_one_lock_for_all_proofs(self):
+        out = self.run_sweep(only="lock ok", mode="sweep")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        with open(os.path.join(self.out, "rc3-sweep-testsha-lock.log")) as f:
+            log = f.read()
+        if shutil.which("flock"):
+            self.assertIn("proof_lock rc3-sweep:testsha acquired", out.stdout)
+            self.assertIn("proof_lock rc3-sweep:lock held by the parent proof", log)
+            self.assertNotIn("held=none", log)
+        self.assertEqual(sorted(self.rows()), ["lock", "ok"])
 
     def test_unknown_proof_name_is_refused(self):
         out = self.run_sweep(only="nope")

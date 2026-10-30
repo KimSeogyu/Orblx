@@ -35,6 +35,10 @@
 #   ORBLX_SWEEP_KEEP      1 keeps the worktree, the target and the images.
 #   ORBLX_SWEEP_FETCH     0 does not run git fetch before COMMIT is resolved.
 #   ORBLX_SWEEP_PROGRESS  A file. The script adds one line for each step.
+#   ORBLX_SWEEP_LOCK_MODE proof (default): take the lock for each proof, so other proofs can
+#                         run between two sweep proofs. sweep: take the lock once for all the
+#                         proofs. flock is not first-come-first-served, so on a busy box the
+#                         proof mode can wait long for each proof.
 #   ORBLX_SWEEP_LIST      Test only: the proof list (the format of PROOFS below).
 #   ORBLX_SWEEP_TEST_ROOT Test only: use this directory as the checkout. No git, no build,
 #                         no sudo, no image removal.
@@ -115,6 +119,9 @@ tool_env() {
   local pass=()
   if [[ -n "${ORBLX_PROOF_LOCK:-}" ]]; then
     pass+=("ORBLX_PROOF_LOCK=$ORBLX_PROOF_LOCK")
+  fi
+  if [[ -n "${ORBLX_PROOF_LOCK_HELD:-}" ]]; then
+    pass+=("ORBLX_PROOF_LOCK_HELD=$ORBLX_PROOF_LOCK_HELD")
   fi
   as_root env ${pass[@]+"${pass[@]}"} PATH="$TOOL_PATH" CARGO_HOME="$TOOL_CARGO_HOME" RUSTUP_HOME="$TOOL_RUSTUP_HOME" "$@"
 }
@@ -229,7 +236,25 @@ if [[ -n "$ONLY" ]]; then
 fi
 
 ROWS_FILE="$(mktemp)"
-trap 'rm -f "$ROWS_FILE"' EXIT
+LOCK_MODE="${ORBLX_SWEEP_LOCK_MODE:-proof}"
+case "$LOCK_MODE" in
+  proof)
+    trap 'rm -f "$ROWS_FILE"' EXIT
+    ;;
+  sweep)
+    # One hold for all the proofs. The wrapper of each proof sees ORBLX_PROOF_LOCK_HELD.
+    # shellcheck source=proof-lock.sh
+    . "$LOCK_LIB"
+    trap 'proof_lock_end; rm -f "$ROWS_FILE"' EXIT
+    note "lock mode sweep: wait for the lock"
+    proof_lock_take "rc3-sweep:$SHORT" orblx-rc3sw-
+    note "lock mode sweep: lock taken $(now)"
+    ;;
+  *)
+    echo "release_sweep: ORBLX_SWEEP_LOCK_MODE must be proof or sweep" >&2
+    exit 2
+    ;;
+esac
 failed=0
 ran=0
 for line in "${specs[@]}"; do
