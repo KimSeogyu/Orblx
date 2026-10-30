@@ -114,7 +114,7 @@ fetch_netmap() {
 
 log_count() {
   local service="$1" pattern="$2"
-  { dc logs --no-log-prefix "$service" 2>/dev/null || true; } | grep -c -- "$pattern" || true
+  dc logs --no-log-prefix "$service" 2>/dev/null | grep -F -- "$pattern" | count_lines
 }
 
 # The router that the client uses now, from the last route line of the client log.
@@ -141,8 +141,22 @@ wait_direct() {
   return 1
 }
 
+# W25-14: the reads fail closed. A failed docker exec fails the pipe, and set -e stops
+# the proof. Only a missing file inside the container counts as empty.
 target_log() {
-  dc exec -T target cat "/tmp/$1.log" 2>/dev/null || true
+  dc exec -T target cat "/tmp/$1.log"
+}
+
+# Count the non-empty lines of stdin. Print 0 when there is no line. Do not hide a failed writer.
+count_lines() {
+  local n
+  n="$(grep -c .)" || [[ $? -eq 1 ]]
+  echo "${n:-0}"
+}
+
+# Print a file in a container. A missing file prints nothing. A failed docker exec fails.
+cat_in() {
+  dc exec -T "$1" sh -c 'cat "$1" 2>/dev/null; exit 0' sh "$2"
 }
 
 leak_count() {
@@ -152,9 +166,9 @@ leak_count() {
 
 deny_records() {
   local router="$1"
-  { dc exec -T "$router" cat /var/lib/orblx/packet-audit.jsonl 2>/dev/null || true; } \
+  cat_in "$router" /var/lib/orblx/packet-audit.jsonl \
     | jq -c "select(.action == \"packet-deny\" and (.detail | contains(\"dst ${TARGET} \")))" \
-    | grep -c . || true
+    | count_lines
 }
 
 probe() {
@@ -185,8 +199,8 @@ fwd_bytes() {
 }
 
 route_audit_count() {
-  { dc exec -T client cat /var/lib/orblx/route-audit.jsonl 2>/dev/null || true; } \
-    | jq -c 'select(.action == "route-failover")' | grep -c . || true
+  cat_in client /var/lib/orblx/route-audit.jsonl \
+    | jq -c 'select(.action == "route-failover")' | count_lines
 }
 
 grant_reloads() {
@@ -238,9 +252,9 @@ max_gap_ms() {
 
 deny_to() {
   local router="$1" dst="$2"
-  { dc exec -T "$router" cat /var/lib/orblx/packet-audit.jsonl 2>/dev/null || true; } \
+  cat_in "$router" /var/lib/orblx/packet-audit.jsonl \
     | jq -c "select(.action == \"packet-deny\" and (.detail | contains(\"dst ${dst} \")))" \
-    | grep -c . || true
+    | count_lines
 }
 
 ask_dns() {
@@ -407,13 +421,13 @@ b0="$(fwd_bytes router-b fwd)"
 probe client stream "$TARGET" 9000 3 10 appr1 >/dev/null
 sleep 0.5
 echo "router-a up: target sources for appr1: $(srcs_of appr1)"
-[[ "$(target_log u9000 | awk -v ip="${LAN_IP[router-a]}" '$4 == "appr1" && $3 == ip' | grep -c . || true)" -ge 100 ]] \
+[[ "$(target_log u9000 | awk -v ip="${LAN_IP[router-a]}" '$4 == "appr1" && $3 == ip' | count_lines)" -ge 100 ]] \
   || fail "The stream did not use router-a."
 as_root docker kill "${PROJECT}-router-a-1" >/dev/null
 probe client stream "$TARGET" 9000 4 10 appr2 >/dev/null
 sleep 0.5
 b1="$(fwd_bytes router-b fwd)"
-appr2_rx="$(target_log u9000 | awk '$4 == "appr2"' | grep -c . || true)"
+appr2_rx="$(target_log u9000 | awk '$4 == "appr2"' | count_lines)"
 echo "router-a down: datagrams at the target for appr2: ${appr2_rx}"
 echo "router-b FORWARD bytes to ${CIDR}: ${b0} -> ${b1}"
 [[ "$b0" == 0 && "$b1" == 0 && "$appr2_rx" -eq 0 ]] || fail "The unapproved router-b carried traffic."
@@ -480,7 +494,8 @@ sleep 0.5
 first="$(active_router)"
 [[ -n "$first" ]] || fail "The client log has no active router."
 echo "active router ${first}; target sources for the warm stream: $(srcs_of warm)"
-[[ "$(target_log u9000 | awk -v ip="${LAN_IP[$first]}" '$4 == "warm" && $3 != ip' | grep -c . || true)" -eq 0 ]] \
+warm_other="$(target_log u9000 | awk -v ip="${LAN_IP[$first]}" '$4 == "warm" && $3 != ip' | count_lines)"
+[[ "$warm_other" -eq 0 ]] \
   || fail "The warm stream did not use only ${first}."
 
 acl_through() {
@@ -488,16 +503,16 @@ acl_through() {
   local d0 d1 t80 t81 u91 g80 a80_0 a80_1 a81 u91_rx f81 f91
   echo "=== Gate 4 [C]: the port ACL applies on the new router ${router} ==="
   d0="$(deny_to "$router" "$TARGET")"
-  a80_0="$(target_log t8080 | grep -c "accept ${LAN_IP[$router]} " || true)"
+  a80_0="$(target_log t8080 | grep "accept ${LAN_IP[$router]} " | count_lines)"
   t80="$(probe client tcp "$TARGET" 8080 3)"
   t81="$(probe client tcp "$TARGET" 8081 2)"
   u91="$(probe client udp "$TARGET" 9001 2)"
   g80="$(probe guest tcp "$TARGET" 8080 2)"
   sleep 1
   d1="$(deny_to "$router" "$TARGET")"
-  a80_1="$(target_log t8080 | grep -c "accept ${LAN_IP[$router]} " || true)"
-  a81="$(target_log t8081 | grep -c . || true)"
-  u91_rx="$(target_log u9001 | grep -c . || true)"
+  a80_1="$(target_log t8080 | grep "accept ${LAN_IP[$router]} " | count_lines)"
+  a81="$(target_log t8081 | count_lines)"
+  u91_rx="$(target_log u9001 | count_lines)"
   f81="$(fwd_bytes "$router" t8081)"
   f91="$(fwd_bytes "$router" u9001)"
   echo "client tcp 8080 (allowed): ${t80}"
@@ -609,13 +624,13 @@ for run in $(seq 1 "$RUNS"); do
   t_killed="$(now_ms)"
   sleep 8
   log="$(target_log u9000)"
-  before="$(printf '%s\n' "$log" | awk -v t="$t_kill" -v ip="${LAN_IP[$active]}" -v tag="run${run}" '$4 == tag && $3 == ip && $2 < t' | grep -c . || true)"
+  before="$(printf '%s\n' "$log" | awk -v t="$t_kill" -v ip="${LAN_IP[$active]}" -v tag="run${run}" '$4 == tag && $3 == ip && $2 < t' | count_lines)"
   first_new="$(printf '%s\n' "$log" | read_all awk -v t="$t_kill" -v ip="${LAN_IP[$standby]}" -v tag="run${run}" '$4 == tag && $3 == ip && $2 >= t {print $2; exit}')"
-  after_new="$(printf '%s\n' "$log" | awk -v ip="${LAN_IP[$standby]}" -v tag="run${run}" '$4 == tag && $3 == ip' | grep -c . || true)"
-  old_after="$(printf '%s\n' "$log" | awk -v t="$t_killed" -v ip="${LAN_IP[$active]}" -v tag="run${run}" '$4 == tag && $3 == ip && $2 > t' | grep -c . || true)"
-  total="$(printf '%s\n' "$log" | awk -v tag="run${run}" '$4 == tag' | grep -c . || true)"
-  denied_rx="$(target_log u9001 | awk -v tag="deny${run}" '$4 == tag' | grep -c . || true)"
-  guest_rx="$(printf '%s\n' "$log" | awk -v tag="guest${run}" '$4 == tag' | grep -c . || true)"
+  after_new="$(printf '%s\n' "$log" | awk -v ip="${LAN_IP[$standby]}" -v tag="run${run}" '$4 == tag && $3 == ip' | count_lines)"
+  old_after="$(printf '%s\n' "$log" | awk -v t="$t_killed" -v ip="${LAN_IP[$active]}" -v tag="run${run}" '$4 == tag && $3 == ip && $2 > t' | count_lines)"
+  total="$(printf '%s\n' "$log" | awk -v tag="run${run}" '$4 == tag' | count_lines)"
+  denied_rx="$(target_log u9001 | awk -v tag="deny${run}" '$4 == tag' | count_lines)"
+  guest_rx="$(printf '%s\n' "$log" | awk -v tag="guest${run}" '$4 == tag' | count_lines)"
   gap="$(max_gap_ms "run${run}")"
   ping_sum="$(dc exec -T client cat "/tmp/ping${run}.txt" 2>/dev/null | grep 'packets transmitted' || true)"
   ping_tx="$(printf '%s' "$ping_sum" | awk '{print $1}')"
@@ -682,7 +697,7 @@ for run in $(seq 1 "$RUNS"); do
     wa1="$(route_audit_count)"
     watch_changes=$((w1 - w0))
     watch_srcs="$(srcs_of watch)"
-    watch_moved="$(target_log u9000 | awk -v ip="${LAN_IP[$active]}" '$4 == "watch" && $3 == ip' | grep -c . || true)"
+    watch_moved="$(target_log u9000 | awk -v ip="${LAN_IP[$active]}" '$4 == "watch" && $3 == ip' | count_lines)"
     echo "route_changes_in_${WATCH_SECS}s ${watch_changes}; route-failover records +$((wa1 - wa0)); target sources ${watch_srcs}; datagrams through ${active} ${watch_moved}"
     echo "status of ${active} on the client: $(dc exec -T client cat /var/lib/orblx/status.txt | grep "^peer ${active} " | awk '{print $6}')"
     [[ "$watch_changes" -le 1 && $((wa1 - wa0)) -le 1 ]] || fail "The route flapped after ${active} came back."
@@ -719,10 +734,11 @@ as_root find "$WORK" -type f \( -name '*.key' -o -name '*key.pem' \) -exec grep 
 sort -u -o "$patterns" "$patterns"
 secret_patterns="$(grep -c . "$patterns" || true)"
 logs_file="$WORK/all-logs.txt"
-dc --profile nodes logs --no-log-prefix coord router-a router-b client guest target landns > "$logs_file" 2>&1 || true
-secrets="$(grep -c -F -f "$patterns" "$logs_file" || true)"
-pem_lines="$(grep -c 'PRIVATE KEY' "$logs_file" || true)"
-secrets=$((secrets + pem_lines))
+# W25-14: the scan fails closed. A failed log read or an empty log stops the proof.
+dc --profile nodes logs --no-log-prefix coord router-a router-b client guest target landns > "$logs_file" 2>&1 \
+  || fail "The proof could not read the container logs."
+secret_scan "$logs_file" || fail "The container logs have key or token text, or the log is empty."
+secrets="$(grep -c -F -f "$patterns" "$logs_file")" || [[ $? -eq 1 ]] || fail "The secret scan of the logs failed."
 echo "secret patterns ${secret_patterns} (token values and key lines); log lines $(grep -c . "$logs_file" || true)"
 echo "secret_lines ${secrets}"
 [[ "$secret_patterns" -ge 4 ]] || fail "The proof found no token or key to look for."
