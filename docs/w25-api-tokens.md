@@ -110,27 +110,39 @@ Script: `scripts/proof/api-tokens.sh` (compose `scripts/proof/compose.api-tokens
 The `client` host [C] has no SVID. It has only the trust bundle and the token files.
 The script never prints a token. It prints `proof_ok`.
 
-Branch log: `/workspace/orblx-w18-proof/w25-c-api-tokens-branch.log` (project `orblx-w25c-tokens`).
+Branch log: `/workspace/orblx-w18-proof/w25-c-api-tokens-branch-644d7fd.log` (project `orblx-w25c-tokens`).
 
 | Gate | Label | Result (branch) |
 | --- | --- | --- |
 | 1. `nodes:read` token on all 20 admin operations | [C] | `200` for `nodes`, `users`, `routes`. `403` for the other 17 (`approve`, `revoke`, `revoke-all`, `expire`, `grants`, `grant-approve`, `grant-revoke`, `audit`, `lock`, `lock-init`, `lock-sign`, `lock-update`, `policy`, `policy-set`, `token-create`, `token-list`, `token-revoke`). After the calls, node `a` is still enrolled and the policy owners did not change. |
 | 1b. `policy:write` token | [C] | `policy-set` `200`, `nodes` `403`, `grant-approve` `403`. |
-| 2. Expired token (TTL 3 s) | [C] | 22 calls `200`. Last `200` at expiry −1 ms. First `401` (`The API token is expired.`) at expiry +112 ms. Limit 1000 ms. |
-| 3. Revoked token | [C] | 19 calls `200` before the revoke. First `401` (`The API token is revoked.`) at revoke +108 ms. Limit 1000 ms. A later call also gets `401`. |
-| 4. Audit | [C] | Each of the 4 tokens: exactly 1 `token-create` and 1 `token-revoke`. `token-use` and `token-deny` counts are equal to the calls (read 3/17, policy 1/2, expire 22/1, revoke 19/2). `verify ok records 79`. `audit verify-config` ok. |
-| 5. No token text | [C] | 0 hits in the coordinator state files, 0 in 169 container log lines, 0 in the audit records, 0 in the proof log. Control: the same check finds 4 of 4 token files. `api-tokens.json` mode 600. |
+| 2. Expired token (TTL 3 s) | [C] | 21 calls `200`. First `401` (`The API token is expired.`) at expiry +185 ms. Limit 1000 ms. |
+| 3. Revoked token | [C] | 19 calls `200` before the revoke. First `401` (`The API token is revoked.`) at revoke +114 ms. Limit 1000 ms. A later call also gets `401`. |
+| 4. Audit | [C] | Each of the 4 tokens: exactly 1 `token-create` and 1 `token-revoke`. The `token-use` and `token-deny` counts are equal to the calls (read 3/17, policy 1/2, expire 21/1, revoke 19/2). `verify ok records 78`. `audit verify-config` ok. |
+| 5. No token text | [C] | 0 hits in the coordinator state files, 0 in 167 container log lines, 0 in the audit records, 0 in the proof log. Control: the same check finds 4 of 4 token files. `api-tokens.json` mode 600. |
 | 6. Owner SVID (mTLS) | [C] | `admin nodes` and `admin policy` work. Node `a` (not an owner) gets `The caller is not an owner.` |
 
 The delta for gates 2 and 3 is the client time at the end of the first refused call minus the coordinator
 expiry time or revoke time. All containers use the clock of the same host. One call takes about 110 ms in [C],
 so the delta includes the time of one call.
 
-W25_MAIN_PROOF
+After the merge, the proof runs again on `main`. The log is `/workspace/orblx-w18-proof/w25-c-api-tokens-main-SHA.log`.
 
 ## 8. W23-4 gates
 
-W25_NATR
+The change does not touch the datapath. `scripts/proof/nat-realism.sh` (`ORBLX_NATR_PROFILE=release`) ran with
+private names and subnets (`orblx-w25c-natr-`, `172.29.125.0/24`, `10.125.2x.0/24`), so it did not touch other proof stacks.
+Log: `/workspace/orblx-w18-proof/w25-c-nat-realism-branch-644d7fd.log`. Result: `proof_ok` [C].
+
+| Gate | Result (branch) |
+| --- | --- |
+| Direct RTT: direct avg at most plain avg + 5 ms | plain 0.038 ms, direct 0.228 ms. `rtt limit_ms 5 ok`. |
+| prc relay: relay avg at most direct avg + 1 ms, 0 lost | 0.709 ms. 0/50 lost. `relay_gate ok`. |
+| sym relay: relay avg at most direct avg + 1 ms, 0 lost | 0.822 ms. 0/50 lost. `relay_gate ok`. |
+
+TCP bulk throughput (5 s, measured, not a gate): plain 35642.67, prc direct 972.93, prc relay 788.73,
+sym relay 1101.61 Mbit/s. Other workers used the same host during the run. A run of `main` 8972192 by another track
+on the same day gave 1413.70, 960.55 and 1050.48 Mbit/s (`w24f-base-8972192-run1-release-nat-realism.log`).
 
 ## 9. Shared files
 
