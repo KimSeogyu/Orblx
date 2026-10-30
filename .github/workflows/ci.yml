@@ -31,10 +31,11 @@ jobs:
       - name: Check the shell syntax of the release and proof scripts
         run: |
           sh -n scripts/install.sh
-          bash -n scripts/release/package.sh scripts/proof/release.sh scripts/proof/release-real.sh
-          bash -n scripts/proof/agent-grant.sh scripts/proof/agent-gateway.sh scripts/proof/agent-python-sdk.sh
-          bash -n scripts/proof/nat-realism.sh scripts/proof/perf-watch.sh
-          bash -n scripts/proof/api-tokens.sh scripts/proof/token-no-escalation.sh scripts/proof/audit-webhooks.sh
+          # bash -n reads only its first file, so check each script alone.
+          for script in scripts/release/*.sh scripts/proof/*.sh scripts/*.sh; do
+            bash -n "$script"
+          done
+          sh -n docker/entrypoint.sh
 
       - name: Run the perf watch summary tests
         run: python3 -m unittest discover -s scripts/proof/tests -v
@@ -48,6 +49,45 @@ jobs:
           ORBLX_GOOGLE_CLIENT_ID: 949089074205-hpspmac5i7uld6q5p3f019tvmojhoipi.apps.googleusercontent.com
           ORBLX_GOOGLE_CLIENT_SECRET: not-a-real-google-secret
         run: ./scripts/demo.sh
+
+  docker-image:
+    name: Docker image build, size, and secrets scan
+    runs-on: ubuntu-latest
+    # CI builds the image only. CI does not push the image to a registry.
+    steps:
+      - name: Get the repository
+        uses: actions/checkout@v7
+
+      - name: Build the image
+        run: docker build -f docker/Dockerfile -t orblx-ci:local .
+
+      - name: Check the image size (at most 60000000 bytes)
+        run: |
+          size="$(docker image inspect orblx-ci:local --format '{{.Size}}')"
+          echo "size_bytes ${size}"
+          test "$size" -le 60000000
+
+      - name: Check the image history for secrets
+        run: |
+          history="$(docker history --no-trunc --format '{{.CreatedBy}}' orblx-ci:local)"
+          if grep -qE 'BEGIN|ORBLX_ENROLL_TOKEN=' <<<"$history"; then
+            echo "docker history has a secret pattern." >&2
+            exit 1
+          fi
+
+      - name: Scan the saved image for secrets
+        run: docker save orblx-ci:local | python3 scripts/proof/image-secrets-scan.py
+
+      - name: Check that the scan finds a planted fake PEM block (control)
+        run: |
+          work="$(mktemp -d)"
+          python3 -c 'import base64, os; print("-----BEGIN " + "PRIVATE KEY-----\n" + base64.encodebytes(os.urandom(96)).decode() + "-----END " + "PRIVATE KEY-----")' >"$work/planted.pem"
+          printf 'FROM orblx-ci:local\nCOPY planted.pem /etc/planted.pem\n' >"$work/Dockerfile"
+          docker build -q -t orblx-ci-control:local "$work"
+          docker save orblx-ci-control:local | python3 scripts/proof/image-secrets-scan.py --expect-hit
+
+      - name: Check that the image runs the orblx binary
+        run: docker run --rm orblx-ci:local --version
 
   rust-macos:
     name: macOS format, clippy, and test

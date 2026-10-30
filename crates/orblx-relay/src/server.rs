@@ -21,8 +21,8 @@ const READ_SLICE: Duration = Duration::from_millis(50);
 /// A peer that sends nothing for this long loses the session slot.
 ///
 /// A restarted node can attach again.
-/// A live peer sends a probe before this time.
-const PEER_IDLE: Duration = Duration::from_secs(1);
+/// A live peer sends a probe or a keepalive before this time.
+pub const PEER_IDLE: Duration = Duration::from_secs(1);
 
 /// Bind addresses and the lab audit needle.
 pub struct ServerConfig {
