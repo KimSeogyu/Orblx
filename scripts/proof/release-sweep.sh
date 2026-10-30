@@ -41,6 +41,8 @@
 #   ORBLX_SWEEP_PROGRESS  A file. The script adds one line for each step.
 #   ORBLX_SWEEP_LOCK_MODE proof (default): take the lock for each proof. sweep: take it once
 #                         for all the proofs.
+#   ORBLX_SWEEP_MIN_FREE_GB Free disk space (GB) that the run needs before it starts (default
+#                         30), on the file system of the worktree and of ORBLX_SWEEP_OUT.
 #   ORBLX_SWEEP_TEST_ROOT Test only: use this directory as the checkout. No git, no build,
 #                         no sudo, no image removal.
 # The script prints no token and no key.
@@ -369,6 +371,24 @@ if [[ "$PLAN" == 1 ]]; then
   cat "$PLAN_FILE"
   exit "$bad"
 fi
+
+# Free disk space. A proof that fails from a full disk is a box failure, and such a run never
+# counts. So the run does not start with less than ORBLX_SWEEP_MIN_FREE_GB free.
+MIN_FREE_GB="${ORBLX_SWEEP_MIN_FREE_GB:-30}"
+[[ "$MIN_FREE_GB" =~ ^[0-9]+$ ]] || die "ORBLX_SWEEP_MIN_FREE_GB must be a whole number of GB"
+free_gb_of() {
+  local dir="$1" text
+  while [[ ! -d "$dir" ]]; do dir="$(dirname "$dir")"; done
+  text="$(df -Pk "$dir")" || return 1
+  awk 'NR == 2 {kb = $4} END {if (kb == "") exit 1; printf "%d\n", kb / 1048576}' <<<"$text"
+}
+for disk_dir in "$ROOT" "$OUT"; do
+  free_gb="$(free_gb_of "$disk_dir")" || die "cannot read the free disk space of $disk_dir"
+  note "disk: $free_gb GB free at $disk_dir, the run needs $MIN_FREE_GB GB"
+  if [[ "$free_gb" -lt "$MIN_FREE_GB" ]]; then
+    die "disk FAIL: only $free_gb GB free at $disk_dir; the sweep needs at least $MIN_FREE_GB GB free before it starts. A run that fails from a full disk never counts. Nothing ran."
+  fi
+done
 
 # 4. The worktree and the build.
 if [[ -z "$TEST_ROOT" ]]; then
