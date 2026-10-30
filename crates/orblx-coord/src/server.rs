@@ -156,9 +156,10 @@ async fn policy_wait(
     let deadline = tokio::time::Instant::now() + crate::DENY_WAIT_HOLD;
     loop {
         stamp.borrow_and_update();
-        let view = coord.netmap_for(name)?;
+        // W25-16: the view comes from the cache when its inputs did not change.
+        let cached = coord.netmap_cached(name)?;
         let deny = admin::deny_json_for(coord, name, SystemTime::now())?;
-        let etag = policy_etag(&view, &deny)?;
+        let etag = policy_etag(&cached.digest, &deny);
         let changed = known != Some(etag.as_str());
         if changed
             || !matches!(
@@ -166,7 +167,7 @@ async fn policy_wait(
                 Ok(Ok(()))
             )
         {
-            let mut response = netmap_response(&view);
+            let mut response = netmap_response(&cached.view);
             response.detail = Some(deny);
             response.policy_etag = Some(etag);
             return Ok(response);
@@ -174,26 +175,17 @@ async fn policy_wait(
     }
 }
 
-/// The SHA-256 of the signed netmap, the signed grants, the endpoints, the routes, and the
-/// deny list ETag, in hex (W25-6).
+/// The SHA-256 of the view digest and the deny list ETag, in hex (W25-6, W25-16).
 ///
+/// The view digest covers the signed netmap, the signed grants, the endpoints, and the routes.
 /// Ed25519 signatures are deterministic, so the same view gives the same ETag.
-fn policy_etag(view: &crate::state::NetmapView, deny: &str) -> Result<String, CoordError> {
+fn policy_etag(view_digest: &[u8; 32], deny: &str) -> String {
     use sha2::{Digest, Sha256};
-    let invalid = || CoordError::Protocol("The netmap is not valid.".to_string());
     let mut hasher = Sha256::new();
-    hasher.update(serde_json::to_vec(&view.signed_netmap).map_err(|_| invalid())?);
+    hasher.update(view_digest);
     hasher.update(b"\0");
-    hasher.update(serde_json::to_vec(&view.signed_grants).map_err(|_| invalid())?);
-    hasher.update(b"\0");
-    hasher.update(serde_json::to_vec(&view.endpoints).map_err(|_| invalid())?);
-    hasher.update(b"\0");
-    hasher.update(view.approved_routes.join(",").as_bytes());
-    hasher.update(b"\0");
-    hasher.update(view.advertised_routes.join(",").as_bytes());
-    hasher.update([u8::from(view.exit_approved), 0]);
     hasher.update(admin::deny_etag(deny).as_bytes());
-    Ok(encode_hex(&hasher.finalize()))
+    encode_hex(&hasher.finalize())
 }
 
 async fn warm_jwks(coord: &Coordinator) {
@@ -268,17 +260,50 @@ async fn accept_loop(
     Ok(())
 }
 
+/// Serve the requests of one connection (W25-16).
+///
+/// A connection can carry many requests. Each request uses its own bidirectional stream.
+/// The coordinator authenticates the peer leaf again for each request, at the time of that
+/// request and with the deny list of that time. The connection ends when the client closes it
+/// or after the idle timeout.
 async fn handle_connection(
     coord: &Coordinator,
     connection: quinn::Connection,
     stamp: watch::Receiver<u64>,
 ) -> Result<(), CoordError> {
-    let (mut send, mut recv) = connection.accept_bi().await.map_err(|_| {
-        println!("coord rejected: the stream did not open");
-        CoordError::Protocol("The request is not valid.".to_string())
-    })?;
+    let mut first = true;
+    loop {
+        let (send, recv) = match connection.accept_bi().await {
+            Ok(stream) => stream,
+            Err(_) if !first => return Ok(()),
+            Err(_) => {
+                println!("coord rejected: the stream did not open");
+                return Err(CoordError::Protocol(
+                    "The request is not valid.".to_string(),
+                ));
+            }
+        };
+        first = false;
+        let coord = coord.clone();
+        let connection = connection.clone();
+        let stamp = stamp.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_stream(&coord, &connection, send, recv, stamp).await {
+                println!("coord request failed: {}", err.public_text());
+            }
+        });
+    }
+}
+
+async fn handle_stream(
+    coord: &Coordinator,
+    connection: &quinn::Connection,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    stamp: watch::Receiver<u64>,
+) -> Result<(), CoordError> {
     let request = proto::read_json::<Request>(&mut recv).await?;
-    let response = match dispatch(coord, &connection, request, stamp).await {
+    let response = match dispatch(coord, connection, request, stamp).await {
         Ok(response) => response,
         Err(err) => {
             println!("coord rejected: {}", err.public_text());
@@ -291,9 +316,6 @@ async fn handle_connection(
     };
     proto::write_json(&mut send, &response).await?;
     let _ = send.finish();
-    drop(send);
-    drop(recv);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), connection.closed()).await;
     Ok(())
 }
 

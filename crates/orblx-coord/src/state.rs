@@ -1,6 +1,8 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use orblx_audit::{ConfigAction, ConfigEvent, ConfigLog, ConfigRecord, EMPTY_DIGEST};
 use orblx_datapath::{Netmap, NetmapPeer, NetmapSelf, SplitDns};
@@ -150,6 +152,81 @@ struct Inner {
     audit: Option<ConfigLog>,
     /// The digest of the last refused policy file.
     fail_hash: Option<[u8; 32]>,
+    /// The count of policy changes. The view cache uses it as a key (W25-16).
+    policy_gen: u64,
+    /// The node store file that `inner.store` holds, when no change came after the read (W25-16).
+    nodes_loaded: Option<LoadedFile>,
+    /// The lock store file and its contents (W25-16).
+    lock_loaded: Option<(LoadedFile, crate::nodelock::LockStore)>,
+    /// Signed views for the current inputs (W25-16).
+    views: ViewCache,
+    /// Endpoint signatures by node name and endpoint (W25-16).
+    ///
+    /// Ed25519 signatures are deterministic. The same key and the same endpoint give the same
+    /// signature, so the coordinator signs each endpoint one time.
+    endpoint_sigs: RefCell<HashMap<(String, String), SignedEndpoint>>,
+}
+
+/// The time after which the coordinator reads a state file again, also when its metadata
+/// did not change (W25-16).
+const RELOAD_MAX_AGE: Duration = Duration::from_secs(1);
+
+/// The identity of a state file at one time: device, inode, size, mtime, and ctime.
+///
+/// A writer writes a temp file and renames it, so each write gives a new inode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp([i64; 7]);
+
+impl FileStamp {
+    fn of(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self([
+            meta.dev() as i64,
+            meta.ino() as i64,
+            meta.size() as i64,
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec(),
+        ]))
+    }
+}
+
+/// A state file that the coordinator read, and the digest of its bytes.
+#[derive(Debug, Clone)]
+struct LoadedFile {
+    stamp: Option<FileStamp>,
+    at: Instant,
+    digest: [u8; 32],
+}
+
+impl LoadedFile {
+    fn fresh(&self, path: &Path) -> bool {
+        self.at.elapsed() < RELOAD_MAX_AGE && FileStamp::of(path) == self.stamp
+    }
+}
+
+/// The inputs of a signed view: the node store, the policy, and the lock store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ViewKey {
+    nodes: [u8; 32],
+    policy_gen: u64,
+    lock: [u8; 32],
+}
+
+#[derive(Default)]
+struct ViewCache {
+    key: Option<ViewKey>,
+    views: HashMap<String, Arc<CachedView>>,
+}
+
+/// A signed view and the digest of its contents (W25-16).
+#[derive(Debug)]
+pub struct CachedView {
+    pub view: NetmapView,
+    /// The SHA-256 of the signed netmap, the signed grants, the endpoints, and the routes.
+    pub digest: [u8; 32],
 }
 
 /// The coordinator state.
@@ -309,6 +386,11 @@ impl Coordinator {
                 saw_file: false,
                 audit: None,
                 fail_hash: None,
+                policy_gen: 0,
+                nodes_loaded: None,
+                lock_loaded: None,
+                views: ViewCache::default(),
+                endpoint_sigs: RefCell::new(HashMap::new()),
             })),
         };
         {
@@ -419,7 +501,8 @@ impl Coordinator {
     /// The count grows with each record, so the deny list version stays monotonic.
     pub fn share_deny_for(&self, name: &str) -> Result<(Vec<String>, u64), CoordError> {
         let mut inner = self.lock()?;
-        reload(&mut inner)?;
+        // A read path: the store is read again only when the file changed (W25-16).
+        reload_read(&mut inner)?;
         let nodes = inner.store.nodes();
         let viewer = nodes
             .iter()
@@ -431,9 +514,41 @@ impl Coordinator {
     }
 
     pub fn netmap_for(&self, name: &str) -> Result<NetmapView, CoordError> {
+        Ok(self.netmap_cached(name)?.view.clone())
+    }
+
+    /// Return the signed view of a node, from the cache when its inputs did not change (W25-16).
+    ///
+    /// The coordinator signs a new view when the node store, the policy, or the lock store
+    /// changes. Each new view gets a new netmap signature and a new grant signature.
+    pub fn netmap_cached(&self, name: &str) -> Result<Arc<CachedView>, CoordError> {
         let mut inner = self.lock()?;
-        reload(&mut inner)?;
-        sign_view(&inner, name)
+        reload_read(&mut inner)?;
+        let lock_digest = load_lock_store(&mut inner)?;
+        let Some(nodes) = inner.nodes_loaded.as_ref().map(|file| file.digest) else {
+            return Err(CoordError::State);
+        };
+        let key = ViewKey {
+            nodes,
+            policy_gen: inner.policy_gen,
+            lock: lock_digest,
+        };
+        if inner.views.key != Some(key) {
+            inner.views.key = Some(key);
+            inner.views.views.clear();
+            prune_endpoint_sigs(&inner);
+        }
+        if let Some(view) = inner.views.views.get(name) {
+            return Ok(Arc::clone(view));
+        }
+        let view = sign_view(&inner, name)?;
+        let digest = view_digest(&view)?;
+        let cached = Arc::new(CachedView { view, digest });
+        inner
+            .views
+            .views
+            .insert(name.to_string(), Arc::clone(&cached));
+        Ok(cached)
     }
 
     /// Store advertised subnet routes and return a fresh signed netmap.
@@ -1011,9 +1126,121 @@ impl Coordinator {
 }
 
 fn reload(inner: &mut Inner) -> Result<(), CoordError> {
+    // The caller can change `inner.store` after this read, so the next read path reads the
+    // file again (W25-16).
+    inner.nodes_loaded = None;
     inner.store = NodeStore::open(&inner.state_dir.join(STORE_FILE))?;
     refresh_policy(inner);
     Ok(())
+}
+
+/// Read the node store and the policy for a read-only request (W25-16).
+///
+/// The coordinator reads `nodes.json` again when its metadata changed, when a change path ran
+/// after the last read, or when the last read is older than [`RELOAD_MAX_AGE`].
+fn reload_read(inner: &mut Inner) -> Result<(), CoordError> {
+    let path = inner.state_dir.join(STORE_FILE);
+    let fresh = inner
+        .nodes_loaded
+        .as_ref()
+        .is_some_and(|file| file.fresh(&path));
+    if !fresh {
+        let stamp = FileStamp::of(&path);
+        let at = Instant::now();
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(CoordError::io(err)),
+        };
+        let digest = sha256(&bytes);
+        let same = inner
+            .nodes_loaded
+            .as_ref()
+            .is_some_and(|file| file.digest == digest);
+        if !same {
+            inner.nodes_loaded = None;
+            inner.store = NodeStore::open(&path)?;
+        }
+        inner.nodes_loaded = Some(LoadedFile { stamp, at, digest });
+    }
+    refresh_policy(inner);
+    Ok(())
+}
+
+/// Read the lock store when its file changed, and return the digest of the file (W25-16).
+fn load_lock_store(inner: &mut Inner) -> Result<[u8; 32], CoordError> {
+    let path = inner.state_dir.join(crate::nodelock::COORD_LOCK_FILE);
+    if let Some((file, _)) = &inner.lock_loaded {
+        if file.fresh(&path) {
+            return Ok(file.digest);
+        }
+    }
+    let stamp = FileStamp::of(&path);
+    let at = Instant::now();
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(CoordError::io(err)),
+    };
+    let digest = sha256(&bytes);
+    let store = crate::nodelock::read_store(&inner.state_dir)?;
+    // The digest is of the bytes before the parse. A write between the two reads gives a new
+    // stamp, so the next request reads the file again.
+    inner.lock_loaded = Some((LoadedFile { stamp, at, digest }, store));
+    Ok(digest)
+}
+
+/// Remove endpoint signatures of endpoints that no node has now.
+fn prune_endpoint_sigs(inner: &Inner) {
+    let mut sigs = inner.endpoint_sigs.borrow_mut();
+    if sigs.is_empty() {
+        return;
+    }
+    let live: std::collections::HashSet<(String, String)> = inner
+        .store
+        .nodes()
+        .iter()
+        .flat_map(|node| {
+            node.endpoints
+                .iter()
+                .map(|endpoint| (node.name.clone(), endpoint.clone()))
+        })
+        .collect();
+    sigs.retain(|key, _| live.contains(key));
+}
+
+/// Return the signature of one endpoint, from the cache or from a new signature.
+///
+/// The coordinator verifies a new signature one time, before it goes in the cache.
+fn signed_endpoint(
+    inner: &Inner,
+    name: &str,
+    endpoint: &str,
+) -> Result<SignedEndpoint, CoordError> {
+    let key = (name.to_string(), endpoint.to_string());
+    if let Some(signed) = inner.endpoint_sigs.borrow().get(&key) {
+        return Ok(signed.clone());
+    }
+    let signed = inner.netmap_key.sign_endpoint(name, endpoint)?;
+    verify_signed_endpoint(&signed, &inner.netmap_key.public())?;
+    inner.endpoint_sigs.borrow_mut().insert(key, signed.clone());
+    Ok(signed)
+}
+
+/// Return the SHA-256 of the parts of a view that a node applies (W25-16).
+fn view_digest(view: &NetmapView) -> Result<[u8; 32], CoordError> {
+    let mut hasher = Sha256::new();
+    let netmap = serde_json::to_vec(&view.signed_netmap).map_err(|_| CoordError::State)?;
+    let grants = serde_json::to_vec(&view.signed_grants).map_err(|_| CoordError::State)?;
+    let endpoints = serde_json::to_vec(&view.endpoints).map_err(|_| CoordError::State)?;
+    let approved = view.approved_routes.join(",").into_bytes();
+    let advertised = view.advertised_routes.join(",").into_bytes();
+    let exit = vec![u8::from(view.exit_approved)];
+    for part in [&netmap, &grants, &endpoints, &approved, &advertised, &exit] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    Ok(hasher.finalize().into())
 }
 
 fn refresh_policy(inner: &mut Inner) {
@@ -1055,6 +1282,7 @@ fn refresh_policy(inner: &mut Inner) {
             let rules = rules_digest(&bytes);
             let rules_changed = inner.rules_hash != Some(rules);
             inner.policy = policy;
+            inner.policy_gen += 1;
             inner.policy_hash = Some(hash);
             inner.rules_hash = Some(rules);
             inner.has_good = true;
@@ -1101,6 +1329,7 @@ fn adopt_saved_policy(inner: &mut Inner) {
     };
     if let Ok(policy) = Policy::from_hujson(&bytes) {
         inner.policy = policy;
+        inner.policy_gen += 1;
         inner.has_good = true;
         inner.policy_hash = Some(sha256(&bytes));
         inner.rules_hash = Some(rules_digest(&bytes));
@@ -1475,7 +1704,7 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
             node_visible(node) && crate::share::sees(&inner.policy, &self_node, node)
         }) {
             for endpoint in &node.endpoints {
-                endpoints.push(inner.netmap_key.sign_endpoint(&node.name, endpoint)?);
+                endpoints.push(signed_endpoint(inner, &node.name, endpoint)?);
             }
             if node.name == self_node.name {
                 continue;
@@ -1516,9 +1745,6 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
     let netmap_public = inner.netmap_key.public();
     verify_signed_netmap(&signed_netmap, &netmap_public)?;
     verify_signed_grants(&signed_grants, &netmap_public)?;
-    for endpoint in &endpoints {
-        verify_signed_endpoint(endpoint, &netmap_public)?;
-    }
     let approved_routes = published_routes(&inner.policy, &self_node.svid, &self_node.routes);
     let exit_approved = published_exit(&inner.policy, &self_node.svid, self_node.exit_node);
     Ok(NetmapView {

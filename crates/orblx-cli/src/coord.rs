@@ -10,8 +10,8 @@ use orblx_identity::{OidcMode, GOOGLE_CLIENT_ID_ENV, MAX_USER_TTL};
 use super::{parse_socket, take_value};
 use orblx_coord::{
     advertise_routes_blocking, enroll_with_oidc_blocking, enroll_with_token_blocking,
-    fetch_netmap_blocking, fetch_policy_wait_blocking, oidc_config, serve_blocking, CoordConfig,
-    Coordinator, OidcConfig, OidcEnroll,
+    fetch_netmap_blocking, oidc_config, serve_blocking, CoordConfig, Coordinator, OidcConfig,
+    OidcEnroll,
 };
 
 const DEFAULT_PORT: u16 = 443;
@@ -296,8 +296,11 @@ fn watch_netmap(
     state: &std::path::Path,
 ) -> Result<(), String> {
     let mut etag: Option<String> = None;
+    // W25-16: one waiter keeps one QUIC connection for all waits.
+    let mut waiter =
+        orblx_coord::PolicyWaiter::new(coord, coord_name).map_err(|err| err.public_text())?;
     loop {
-        match fetch_policy_wait_blocking(coord, coord_name, bundle_pem, state, etag.as_deref()) {
+        match waiter.wait(bundle_pem, state, etag.as_deref()) {
             Ok(sync) => {
                 if etag.as_deref() != Some(sync.etag.as_str()) {
                     sync.view
