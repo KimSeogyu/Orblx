@@ -32,6 +32,7 @@ mod server;
 mod share;
 #[cfg(test)]
 mod share_test;
+mod sink;
 mod state;
 mod store;
 mod ticket;

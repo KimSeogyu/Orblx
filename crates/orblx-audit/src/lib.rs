@@ -20,6 +20,7 @@ mod event;
 mod expose;
 mod hexutil;
 mod metrics;
+mod siem;
 mod webhook;
 
 pub use chain::{
@@ -40,6 +41,10 @@ pub use error::AuditError;
 pub use event::{DenyReason, EventKind, SessionEvent, SessionIds};
 pub use expose::{default_metrics_addr, sample_line, spawn_metrics_server, DEFAULT_METRICS_PORT};
 pub use metrics::SessionMetrics;
+pub use siem::{
+    datadog_batch, ndjson_batch, splunk_hec_batch, syslog_frame, syslog_host, SIEM_SOURCE,
+    SIEM_SOURCETYPE, SYSLOG_APP_NAME, SYSLOG_MSG_ID, SYSLOG_PRI, SYSLOG_SD_ID,
+};
 pub use webhook::{
     webhook_body, webhook_secret, webhook_signature, webhook_signature_ok, WebhookBody,
     MAX_WEBHOOK_SECRET, MIN_WEBHOOK_SECRET, WEBHOOK_BODY_TYPE, WEBHOOK_BODY_VERSION,
