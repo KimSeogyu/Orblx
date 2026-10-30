@@ -10,8 +10,7 @@ The exit code is 1 when a run did not print proof_ok or when a CI gate did not p
 CI gates (W24-E2). A run fails when one of these is true:
 - the relay ping median is more than the direct ping median + ORBLX_PERF_MEDIAN_SLACK_MS (1 ms),
 - a ping on a path is lost,
-- the TCP throughput of a path is missing or not more than ORBLX_PERF_MIN_MBIT (0 Mbit/s,
-  the floor of nat-realism.sh: the transfer must finish with a result),
+- the TCP throughput of a path is missing or below ORBLX_PERF_MIN_MBIT (300 Mbit/s, W24-E3),
 - more than ORBLX_PERF_MAX_SPIKES (3) pings of a path are more than ORBLX_PERF_SPIKE_MS (10 ms).
 Report only: the median, p99 and max ping and the spike count of each path, and the box
 avg gate (relay avg <= direct avg + 1 ms). The box merge gate in nat-realism.sh does not change.
@@ -41,7 +40,7 @@ DIRECT_PATH = "prc_prc_direct"
 MEDIAN_SLACK_MS = float(os.environ.get("ORBLX_PERF_MEDIAN_SLACK_MS", "1"))
 SPIKE_MS = float(os.environ.get("ORBLX_PERF_SPIKE_MS", "10"))
 MAX_SPIKES = int(os.environ.get("ORBLX_PERF_MAX_SPIKES", "3"))
-MIN_MBIT = float(os.environ.get("ORBLX_PERF_MIN_MBIT", "0"))
+MIN_MBIT = float(os.environ.get("ORBLX_PERF_MIN_MBIT", "300"))
 # The box avg gate of nat-realism.sh. The CI reports it and does not gate on it.
 BOX_SLACK_MS = 1.0
 
@@ -165,8 +164,8 @@ def ci_failures(run):
             fails.append("%s: relay_rtt lost %s" % (path, lost))
     for path in PATHS:
         tput = run["throughput"].get(path)
-        if tput is None or tput <= MIN_MBIT:
-            fails.append("%s: throughput %s Mbit/s, floor > %s" % (path, tput, MIN_MBIT))
+        if tput is None or tput < MIN_MBIT:
+            fails.append("%s: throughput %s Mbit/s is below the floor %s Mbit/s" % (path, tput, MIN_MBIT))
     return fails
 
 
@@ -282,7 +281,7 @@ def markdown(summary):
         len(summary["runs"]), summary["proof_ok"], summary["ci_gate_ok"]))
     lines.append("")
     lines.append(
-        "CI gate: relay ping median <= direct ping median + %s ms, 0 lost, TCP > %s Mbit/s, "
+        "CI gate: relay ping median <= direct ping median + %s ms, 0 lost, TCP >= %s Mbit/s on each path, "
         "at most %d pings above %s ms on each path."
         % (g["median_slack_ms"], g["min_mbit"], g["max_spikes"], g["spike_ms"]))
     lines.append(
