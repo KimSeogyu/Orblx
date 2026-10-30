@@ -19,6 +19,7 @@
 //! The process does not restart.
 //! The NAT feed records one JSON object per path event.
 
+mod birthday;
 mod candidate;
 mod direct;
 mod error;
@@ -35,6 +36,7 @@ mod signed;
 mod stick;
 mod stun;
 
+pub use birthday::{MappingKind, Strategy};
 pub use candidate::{
     decode_candidate, encode_candidate, endpoint_sign_payload, CandidateSink, EndpointCandidate,
     MemoryCandidateSink, UnsignedCandidateSet,
@@ -51,7 +53,7 @@ pub use nat_feed::{
     KIND_PATH_DOWN, KIND_PATH_RELAY, KIND_PATH_SWITCH, KIND_PATH_UP, KIND_RELAY_HOP,
     LAB_OVERLAY_IP, NAT_EVENT_VERSION, NAT_FEED_SOURCE,
 };
-pub use nat_path::{select_path, session_id, OverlayPath, PathSelect};
+pub use nat_path::{select_path, session_id, HelloAuth, OverlayPath, PathSelect, SendPlan};
 pub use nat_run::{prepare_nat_gateway, run_nat_node, NatConfig};
 pub use nat_smash::{run_nat_smash, NatSmash, NatSmashReport};
 pub use path::{

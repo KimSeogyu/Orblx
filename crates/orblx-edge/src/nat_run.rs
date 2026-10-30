@@ -4,11 +4,14 @@
 //! The coordinator signs that address.
 //! The peer verifies the signature and then punches.
 //! The overlay session stays up when the path moves between direct and relay.
+//! A path move is make-before-break.
+//! The node keeps the old path until the new path carries probes both ways.
 
 use std::collections::VecDeque;
 use std::fs;
 use std::io::ErrorKind;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,18 +25,26 @@ use orblx_datapath::{
 };
 use orblx_relay::{RelayPipe, RelaySessionId};
 
+use crate::birthday::{
+    local_kind, peer_kind, strategy, MappingKind, RateGate, Spray, Strategy, BIRTHDAY_SOCKETS,
+    BIRTHDAY_WINDOW, PROBE_BURST, PROBE_RATE, SOCKET_REFRESH,
+};
 use crate::nat_path::{
-    encode_hello, relay_allowed, select_path, session_id, session_punch_token, KeyGate, Opened,
-    OverlayPath, PathSelect, KIND_DATA, KIND_PROBE, STALE_MS,
+    relay_allowed, select_path, session_id, session_punch_token, HelloAuth, KeyGate, Opened,
+    OverlayPath, PathSelect, SendPlan, KIND_DATA, KIND_PROBE, PROBE_GAP_MS, PROBE_HEARS, RESEND_MS,
+    STALE_MS,
 };
 use crate::punch::{decode_punch, encode_punch, exchange_same_ip, PunchKind, PunchToken};
 use crate::signed::{encode_hex, verify_signed_candidate, SignedCandidate};
 use crate::{EdgeError, StunClient, DIRECT_ATTEMPT_BUDGET, DIRECT_QUIC_PORT};
 
 const HOLD_LIMIT: usize = 64;
-const PROBE_GAP: Duration = Duration::from_millis(150);
+const RECENT_LIMIT: usize = 128;
+const PROBE_GAP: Duration = Duration::from_millis(PROBE_GAP_MS);
 const HELLO_GAP: Duration = Duration::from_millis(50);
 const PUNCH_GAP: Duration = Duration::from_millis(200);
+const RELAY_ONLY_PUNCH_GAP: Duration = Duration::from_secs(2);
+const DIRECT_READ: Duration = Duration::from_millis(5);
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -52,6 +63,9 @@ fn install_signals() {
         libc::signal(libc::SIGTERM, on_stop as *const () as libc::sighandler_t);
     }
 }
+
+/// Publish reflexive endpoints and return the signed candidate list.
+pub type PublishFn = Box<dyn FnMut(Vec<String>) -> Result<Vec<SignedCandidate>, String> + Send>;
 
 /// Inputs for one NAT node.
 pub struct NatConfig {
@@ -75,6 +89,10 @@ pub struct NatConfig {
     pub peer_svid: String,
     /// The STUN server.
     pub stun: SocketAddr,
+    /// A second STUN server on another address or port.
+    ///
+    /// Two answers show the NAT mapping kind.
+    pub stun_alt: Option<SocketAddr>,
     /// The Relay UDP socket.
     pub relay_udp: SocketAddr,
     /// The Relay TCP socket.
@@ -83,11 +101,13 @@ pub struct NatConfig {
     pub gateway: Option<Ipv4Addr>,
     /// The coordinator netmap public key.
     pub netmap_public: [u8; 32],
-    /// Publish this reflexive endpoint and return the signed candidate list.
+    /// The SVID material for the signed hello.
+    pub hello: HelloAuth,
+    /// Publish these reflexive endpoints and return the signed candidate list.
     ///
     /// The closure talks to the coordinator.
     /// The closure must not log a private key.
-    pub publish: Box<dyn FnMut(String) -> Result<Vec<SignedCandidate>, String> + Send>,
+    pub publish: PublishFn,
 }
 
 /// Run one NAT node until SIGINT or SIGTERM.
@@ -96,11 +116,16 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
     if let Some(gateway) = config.gateway {
         set_default_route(gateway)?;
     }
-    let (socket, reflexive) = gather_reflexive(config.stun)?;
+    let (socket, reflexive, alt) = gather_reflexive(config.stun, config.stun_alt)?;
     println!("The reflexive endpoint is {reflexive}.");
+    if let Some(alt) = alt {
+        println!("The second reflexive endpoint is {alt}.");
+    }
+    let nat_kind = local_kind(reflexive, alt);
+    println!("The local NAT mapping is {}.", nat_kind.as_str());
     let session = session_id(&config.name, &config.peer_name)?;
     println!("session {}", encode_hex(&session));
-    let gate = KeyGate::generate(session, &config.name, &config.peer_name)?;
+    let gate = KeyGate::generate(session, &config.name, &config.peer_name, config.hello)?;
     write_record(&config.state_dir, &config.name, config.overlay)?;
     let _pid = PidGuard::create(&config.state_dir)?;
     let bridge = open_tun(&TunConfig {
@@ -153,6 +178,7 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         relay_udp: config.relay_udp,
         relay_tcp: config.relay_tcp,
         netmap_public: config.netmap_public,
+        nat_kind,
         session,
         token: session_punch_token(&session),
         relay_id: RelaySessionId::from_bytes(session),
@@ -160,11 +186,13 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         keys: Mutex::new(gate),
         select: Mutex::new(PathSelect::default()),
         queues: Mutex::new(Queues::default()),
-        peer_reflexive: Mutex::new(None),
+        peer_endpoints: Mutex::new(Vec::new()),
         candidate_at: Mutex::new(None),
-        active: AtomicU64::new(0),
+        plan: AtomicU64::new(0),
         direct_rx: AtomicU64::new(0),
         relay_rx: AtomicU64::new(0),
+        direct_heard: AtomicU64::new(0),
+        relay_heard: AtomicU64::new(0),
         saw_direct: AtomicBool::new(false),
         peer_confirmed: AtomicBool::new(false),
         to_tun: Mutex::new(to_tx),
@@ -172,7 +200,10 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
     hub.write_status(None);
 
     let publish_hub = Arc::clone(&hub);
-    let reflexive_text = reflexive.to_string();
+    let mut reflexive_text = vec![reflexive.to_string()];
+    if let Some(alt) = alt {
+        reflexive_text.push(alt.to_string());
+    }
     let mut publish = config.publish;
     thread::Builder::new()
         .name("orblx-nat-publish".to_string())
@@ -249,7 +280,9 @@ fn set_default_route(gateway: Ipv4Addr) -> Result<(), EdgeError> {
     Ok(())
 }
 
-fn gather_reflexive(stun: SocketAddr) -> Result<(UdpSocket, SocketAddr), EdgeError> {
+type Reflexive = (UdpSocket, SocketAddr, Option<SocketAddr>);
+
+fn gather_reflexive(stun: SocketAddr, alt: Option<SocketAddr>) -> Result<Reflexive, EdgeError> {
     let mut last = EdgeError::Timeout;
     for _ in 0..5 {
         if stopped() {
@@ -257,7 +290,15 @@ fn gather_reflexive(stun: SocketAddr) -> Result<(UdpSocket, SocketAddr), EdgeErr
         }
         let client = StunClient::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, DIRECT_QUIC_PORT)))?;
         match client.gather(stun, Duration::from_secs(2)) {
-            Ok(addr) => return Ok((client.into_socket(), addr)),
+            Ok(addr) => {
+                // The second answer uses the same local socket.
+                // A different port means an endpoint-dependent mapping.
+                let second = match alt {
+                    Some(server) => gather_alt(&client, server),
+                    None => None,
+                };
+                return Ok((client.into_socket(), addr, second));
+            }
             Err(EdgeError::Timeout) => {
                 last = EdgeError::Timeout;
                 thread::sleep(Duration::from_millis(200));
@@ -266,6 +307,18 @@ fn gather_reflexive(stun: SocketAddr) -> Result<(UdpSocket, SocketAddr), EdgeErr
         }
     }
     Err(last)
+}
+
+fn gather_alt(client: &StunClient, server: SocketAddr) -> Option<SocketAddr> {
+    for _ in 0..3 {
+        match client.gather(server, Duration::from_secs(1)) {
+            Ok(addr) => return Some(addr),
+            Err(EdgeError::Timeout) => continue,
+            Err(_) => return None,
+        }
+    }
+    eprintln!("The second STUN server did not answer. The NAT mapping kind is unknown.");
+    None
 }
 
 struct Hub {
@@ -280,6 +333,7 @@ struct Hub {
     relay_udp: SocketAddr,
     relay_tcp: SocketAddr,
     netmap_public: [u8; 32],
+    nat_kind: MappingKind,
     session: [u8; 16],
     token: PunchToken,
     relay_id: RelaySessionId,
@@ -287,21 +341,28 @@ struct Hub {
     keys: Mutex<KeyGate>,
     select: Mutex<PathSelect>,
     queues: Mutex<Queues>,
-    peer_reflexive: Mutex<Option<SocketAddr>>,
+    peer_endpoints: Mutex<Vec<SocketAddr>>,
     candidate_at: Mutex<Option<Instant>>,
-    active: AtomicU64,
+    plan: AtomicU64,
     direct_rx: AtomicU64,
     relay_rx: AtomicU64,
+    direct_heard: AtomicU64,
+    relay_heard: AtomicU64,
     saw_direct: AtomicBool,
     peer_confirmed: AtomicBool,
     to_tun: Mutex<std::sync::mpsc::Sender<Vec<u8>>>,
 }
 
+/// Sealed frames for each path, and plain packets that wait for a path.
 #[derive(Default)]
 struct Queues {
     direct: VecDeque<Vec<u8>>,
     relay: VecDeque<Vec<u8>>,
     hold: VecDeque<Vec<u8>>,
+    /// Frames sent on direct, with the send time in ms.
+    ///
+    /// A move to relay sends these frames again.
+    recent: VecDeque<(u64, Vec<u8>)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -315,54 +376,98 @@ impl Hub {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
+    /// The first signed endpoint of the peer.
     fn peer_addr(&self) -> Option<SocketAddr> {
-        *lock(&self.peer_reflexive)
+        lock(&self.peer_endpoints).first().copied()
+    }
+
+    /// The ports in the signed endpoints of the peer.
+    fn peer_ports(&self) -> Vec<u16> {
+        lock(&self.peer_endpoints)
+            .iter()
+            .map(SocketAddr::port)
+            .collect()
+    }
+
+    fn peer_kind(&self) -> MappingKind {
+        peer_kind(&lock(&self.peer_endpoints))
     }
 
     fn mark_rx(&self, slot: Slot) {
-        let now = self.now_ms();
+        let now = self.now_ms().max(1);
         match slot {
             Slot::Direct => self.direct_rx.store(now, Ordering::Relaxed),
             Slot::Relay => self.relay_rx.store(now, Ordering::Relaxed),
         }
     }
 
+    fn mark_heard(&self, slot: Slot, hears: bool) {
+        let value = if hears { self.now_ms().max(1) } else { 0 };
+        match slot {
+            Slot::Direct => self.direct_heard.store(value, Ordering::Relaxed),
+            Slot::Relay => self.relay_heard.store(value, Ordering::Relaxed),
+        }
+    }
+
+    /// Return true when a frame arrived on this path in the stale time.
     fn fresh(&self, slot: Slot, now: u64) -> bool {
         let rx = match slot {
             Slot::Direct => self.direct_rx.load(Ordering::Relaxed),
             Slot::Relay => self.relay_rx.load(Ordering::Relaxed),
         };
-        rx != 0 && now.saturating_sub(rx) <= STALE_MS
+        recent_ms(rx, now)
     }
 
-    fn accept(&self, frame: &[u8], slot: Slot) -> Option<Vec<u8>> {
+    /// Return true when probes went both ways on this path in the stale time.
+    fn both_ways(&self, slot: Slot, now: u64) -> bool {
+        let heard = match slot {
+            Slot::Direct => self.direct_heard.load(Ordering::Relaxed),
+            Slot::Relay => self.relay_heard.load(Ordering::Relaxed),
+        };
+        self.fresh(slot, now) && recent_ms(heard, now)
+    }
+
+    /// Open one frame.
+    ///
+    /// The second value is true when the frame was a fresh probe or data frame.
+    fn accept(&self, frame: &[u8], slot: Slot) -> (Option<Vec<u8>>, bool) {
         let opened = {
             let mut gate = lock(&self.keys);
             match gate.open_frame(frame) {
                 Ok(opened) => opened,
-                Err(_) => return None,
+                Err(EdgeError::Identity(text)) => {
+                    eprintln!("{text}");
+                    return (None, false);
+                }
+                Err(_) => return (None, false),
             }
         };
         match opened {
-            Some(Opened::Hello) | None => None,
-            Some(Opened::Probe) => {
+            Some(Opened::Hello) | None => (None, false),
+            Some(Opened::Probe(flags)) => {
                 self.peer_confirmed.store(true, Ordering::Relaxed);
                 self.mark_rx(slot);
-                None
+                self.mark_heard(slot, flags & PROBE_HEARS != 0);
+                (None, true)
             }
             Some(Opened::Data(packet)) => {
                 self.peer_confirmed.store(true, Ordering::Relaxed);
                 self.mark_rx(slot);
                 if is_ipv4_packet(&packet) {
-                    Some(packet)
+                    (Some(packet), true)
                 } else {
-                    None
+                    (None, true)
                 }
             }
         }
     }
 
-    fn send_control(&self, last_hello: &mut Instant, last_probe: &mut Instant) -> Vec<Vec<u8>> {
+    fn send_control(
+        &self,
+        slot: Slot,
+        last_hello: &mut Instant,
+        last_probe: &mut Instant,
+    ) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let ready = lock(&self.keys).ready();
         let confirmed = self.peer_confirmed.load(Ordering::Relaxed);
@@ -371,12 +476,17 @@ impl Hub {
         // The punch loop drops frames that are not punch datagrams.
         // The peer may miss the first hello.
         if !confirmed && now.duration_since(*last_hello) >= HELLO_GAP {
-            let public = lock(&self.keys).public_key();
-            out.push(encode_hello(&self.session, &public));
+            out.push(lock(&self.keys).hello_frame());
             *last_hello = now;
         }
         if ready && now.duration_since(*last_probe) >= PROBE_GAP {
-            if let Some(frame) = self.seal(KIND_PROBE, &[1]) {
+            // The flag tells the peer that this node receives on this path.
+            let hears = if self.fresh(slot, self.now_ms()) {
+                PROBE_HEARS
+            } else {
+                0
+            };
+            if let Some(frame) = self.seal(KIND_PROBE, &[hears]) {
                 out.push(frame);
                 *last_probe = now;
             }
@@ -392,17 +502,61 @@ impl Hub {
         gate.seal(kind, plain).ok()
     }
 
+    fn current_plan(&self) -> SendPlan {
+        plan_of(self.plan.load(Ordering::Relaxed))
+    }
+
     fn enqueue(&self, packet: Vec<u8>) {
         if !is_ipv4_packet(&packet) {
             return;
         }
+        let plan = self.current_plan();
+        if plan == SendPlan::Hold {
+            push_bound(&mut lock(&self.queues).hold, packet);
+            return;
+        }
+        // One seal for each packet.
+        // The same frame can go on two paths. The receiver drops the second copy.
+        match self.seal(KIND_DATA, &packet) {
+            Some(frame) => self.route(frame, plan),
+            None => push_bound(&mut lock(&self.queues).hold, packet),
+        }
+    }
+
+    fn route(&self, frame: Vec<u8>, plan: SendPlan) {
+        let now = self.now_ms();
         let mut queues = lock(&self.queues);
-        let queue = match active_path(self.active.load(Ordering::Relaxed)) {
-            Some(OverlayPath::Direct) => &mut queues.direct,
-            Some(OverlayPath::Relay) => &mut queues.relay,
-            None => &mut queues.hold,
-        };
-        push_bound(queue, packet);
+        if plan.uses_direct() {
+            push_bound(&mut queues.direct, frame.clone());
+            queues.recent.push_back((now, frame.clone()));
+            while queues.recent.len() > RECENT_LIMIT
+                || queues
+                    .recent
+                    .front()
+                    .is_some_and(|(at, _)| now.saturating_sub(*at) > 2 * RESEND_MS)
+            {
+                queues.recent.pop_front();
+            }
+        }
+        if plan.uses_relay() {
+            push_bound(&mut queues.relay, frame);
+        }
+    }
+
+    /// Send again on the relay the direct frames sent at or after `since_ms`.
+    fn resend_on_relay(&self, since_ms: u64) -> usize {
+        let mut queues = lock(&self.queues);
+        let frames: Vec<Vec<u8>> = queues
+            .recent
+            .drain(..)
+            .filter(|(at, _)| *at >= since_ms)
+            .map(|(_, frame)| frame)
+            .collect();
+        let count = frames.len();
+        for frame in frames {
+            push_bound(&mut queues.relay, frame);
+        }
+        count
     }
 
     fn pop(&self, path: OverlayPath) -> Option<Vec<u8>> {
@@ -413,27 +567,31 @@ impl Hub {
         }
     }
 
-    fn push_front(&self, path: OverlayPath, packet: Vec<u8>) {
+    fn push_front(&self, path: OverlayPath, frame: Vec<u8>) {
         let mut queues = lock(&self.queues);
         let queue = match path {
             OverlayPath::Direct => &mut queues.direct,
             OverlayPath::Relay => &mut queues.relay,
         };
-        queue.push_front(packet);
+        queue.push_front(frame);
     }
 
-    fn flush_hold(&self, path: OverlayPath) {
-        let mut queues = lock(&self.queues);
-        if queues.hold.is_empty() {
+    fn flush_hold(&self, plan: SendPlan) {
+        if plan == SendPlan::Hold {
             return;
         }
-        let pending: Vec<Vec<u8>> = queues.hold.drain(..).collect();
-        let queue = match path {
-            OverlayPath::Direct => &mut queues.direct,
-            OverlayPath::Relay => &mut queues.relay,
+        let pending: Vec<Vec<u8>> = {
+            let mut queues = lock(&self.queues);
+            if queues.hold.is_empty() {
+                return;
+            }
+            queues.hold.drain(..).collect()
         };
         for packet in pending {
-            push_bound(queue, packet);
+            match self.seal(KIND_DATA, &packet) {
+                Some(frame) => self.route(frame, plan),
+                None => push_bound(&mut lock(&self.queues).hold, packet),
+            }
         }
     }
 
@@ -447,6 +605,7 @@ impl Hub {
             Some(path) => path.as_str(),
             None => "down",
         };
+        let peer_expiry = lock(&self.keys).peer_not_after();
         let status = NodeStatus {
             state: "up".to_string(),
             name: self.name.clone(),
@@ -459,7 +618,8 @@ impl Hub {
                 overlay_ip: self.peer_overlay.to_string(),
                 path: path_text.to_string(),
                 svid: self.peer_svid.clone(),
-                svid_expiry: None,
+                // The value comes from the peer SVID in the signed hello.
+                svid_expiry: peer_expiry,
             }],
         };
         let text = format_node_status(&status);
@@ -471,19 +631,25 @@ impl Hub {
     }
 }
 
-fn active_path(value: u64) -> Option<OverlayPath> {
+fn recent_ms(at: u64, now: u64) -> bool {
+    at != 0 && now.saturating_sub(at) <= STALE_MS
+}
+
+fn plan_of(value: u64) -> SendPlan {
     match value {
-        1 => Some(OverlayPath::Direct),
-        2 => Some(OverlayPath::Relay),
-        _ => None,
+        1 => SendPlan::Direct,
+        2 => SendPlan::Relay,
+        3 => SendPlan::Both,
+        _ => SendPlan::Hold,
     }
 }
 
-fn path_code(path: Option<OverlayPath>) -> u64 {
-    match path {
-        Some(OverlayPath::Direct) => 1,
-        Some(OverlayPath::Relay) => 2,
-        None => 0,
+fn plan_code(plan: SendPlan) -> u64 {
+    match plan {
+        SendPlan::Hold => 0,
+        SendPlan::Direct => 1,
+        SendPlan::Relay => 2,
+        SendPlan::Both => 3,
     }
 }
 
@@ -500,8 +666,8 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 fn publish_loop(
     hub: Arc<Hub>,
-    reflexive: String,
-    publish: &mut dyn FnMut(String) -> Result<Vec<SignedCandidate>, String>,
+    reflexive: Vec<String>,
+    publish: &mut dyn FnMut(Vec<String>) -> Result<Vec<SignedCandidate>, String>,
 ) {
     while !stopped() {
         match publish(reflexive.clone()) {
@@ -520,6 +686,7 @@ fn publish_loop(
 }
 
 fn store_peer(hub: &Hub, list: &[SignedCandidate]) {
+    let mut verified = Vec::new();
     for item in list {
         if item.name != hub.peer_name {
             continue;
@@ -530,16 +697,22 @@ fn store_peer(hub: &Hub, list: &[SignedCandidate]) {
         let Some(addr) = usable_endpoint(&item.endpoint) else {
             continue;
         };
-        let mut slot = lock(&hub.peer_reflexive);
-        if *slot != Some(addr) {
-            println!("The candidate for {} is {}.", item.name, item.endpoint);
-            *slot = Some(addr);
+        verified.push(addr);
+    }
+    if verified.is_empty() {
+        return;
+    }
+    let mut slot = lock(&hub.peer_endpoints);
+    if *slot != verified {
+        for addr in &verified {
+            println!("The candidate for {} is {}.", hub.peer_name, addr);
         }
-        drop(slot);
-        let mut started = lock(&hub.candidate_at);
-        if started.is_none() {
-            *started = Some(Instant::now());
-        }
+        *slot = verified;
+    }
+    drop(slot);
+    let mut started = lock(&hub.candidate_at);
+    if started.is_none() {
+        *started = Some(Instant::now());
     }
 }
 
@@ -555,36 +728,226 @@ fn usable_endpoint(text: &str) -> Option<SocketAddr> {
     }
 }
 
+/// The extra sockets of the hard side for one birthday attempt.
+struct Fleet {
+    sockets: Vec<UdpSocket>,
+    sent_at: Vec<Option<Instant>>,
+    next: usize,
+    started: Instant,
+    gate: RateGate,
+    sent: u64,
+}
+
+impl Fleet {
+    fn open(count: usize, now: Instant) -> Result<Self, EdgeError> {
+        let mut sockets = Vec::with_capacity(count);
+        for _ in 0..count {
+            let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+                .map_err(|err| EdgeError::Io(err.to_string()))?;
+            socket
+                .set_nonblocking(true)
+                .map_err(|err| EdgeError::Io(err.to_string()))?;
+            sockets.push(socket);
+        }
+        Ok(Self {
+            sent_at: vec![None; sockets.len()],
+            sockets,
+            next: 0,
+            started: now,
+            gate: RateGate::new(PROBE_RATE, PROBE_BURST, now),
+            sent: 0,
+        })
+    }
+
+    fn done(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started) >= BIRTHDAY_WINDOW
+    }
+
+    /// Send the punch on the sockets that are due, in the rate limit.
+    fn send_due(&mut self, peer: SocketAddr, packet: &[u8], now: Instant) {
+        let count = self.sockets.len();
+        for _ in 0..count {
+            let index = self.next;
+            let due = self.sent_at[index]
+                .map(|at| now.saturating_duration_since(at) >= SOCKET_REFRESH)
+                .unwrap_or(true);
+            if !due {
+                self.next = (index + 1) % count;
+                continue;
+            }
+            if self.gate.take(now, 1) == 0 {
+                return;
+            }
+            let _ = self.sockets[index].send_to(packet, peer);
+            self.sent_at[index] = Some(now);
+            self.sent += 1;
+            self.next = (index + 1) % count;
+        }
+    }
+
+    /// Return the socket index and source of the first punch from `ip`.
+    fn poll(&self, token: PunchToken, ip: IpAddr) -> Option<(usize, SocketAddr, PunchKind)> {
+        let mut fds: Vec<libc::pollfd> = self
+            .sockets
+            .iter()
+            .map(|socket| libc::pollfd {
+                fd: socket.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        // SAFETY: `fds` is a valid array of pollfd values with the given length.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0) };
+        if ready <= 0 {
+            return None;
+        }
+        let mut buf = [0u8; 2048];
+        for (index, fd) in fds.iter().enumerate() {
+            if fd.revents & libc::POLLIN == 0 {
+                continue;
+            }
+            while let Ok((size, from)) = self.sockets[index].recv_from(&mut buf) {
+                if from.ip() != ip {
+                    continue;
+                }
+                if let Some(kind) = decode_punch(&buf[..size], token) {
+                    return Some((index, from, kind));
+                }
+            }
+        }
+        None
+    }
+
+    fn take(mut self, index: usize) -> UdpSocket {
+        self.sockets.swap_remove(index)
+    }
+}
+
 fn direct_loop(hub: Arc<Hub>, socket: UdpSocket) {
-    let mut direct_peer = coordinated_punch(&hub, &socket);
-    let _ = socket.set_read_timeout(Some(Duration::from_millis(20)));
+    let mut socket = socket;
+    let (mut direct_peer, plan) = coordinated_punch(&hub, &socket);
+    let _ = socket.set_read_timeout(Some(DIRECT_READ));
+    let mut spray: Option<Spray> = None;
+    let mut fleet: Option<Fleet> = None;
+    if direct_peer.is_none() {
+        let now = Instant::now();
+        match plan {
+            Strategy::Spray => {
+                if let Some(peer) = hub.peer_addr() {
+                    spray = Some(Spray::new(peer.ip(), &hub.peer_ports(), now));
+                }
+            }
+            Strategy::Sockets => match Fleet::open(BIRTHDAY_SOCKETS, now) {
+                Ok(opened) => fleet = Some(opened),
+                Err(err) => eprintln!("The birthday sockets did not open. {err}"),
+            },
+            Strategy::Plain | Strategy::RelayOnly => {}
+        }
+    }
+    let check = encode_punch(PunchKind::Check, hub.token);
+    let ack = encode_punch(PunchKind::Ack, hub.token);
+    let punch_gap = if plan == Strategy::RelayOnly {
+        RELAY_ONLY_PUNCH_GAP
+    } else {
+        PUNCH_GAP
+    };
     let mut last_hello = Instant::now() - HELLO_GAP;
     let mut last_probe = Instant::now() - PROBE_GAP;
-    let mut last_punch = Instant::now() - PUNCH_GAP;
+    let mut last_punch = Instant::now() - punch_gap;
     let mut buf = [0u8; 65_535];
     while !stopped() {
+        let now = Instant::now();
         let fresh = hub.fresh(Slot::Direct, hub.now_ms());
-        if (direct_peer.is_none() || !fresh) && last_punch.elapsed() >= PUNCH_GAP {
-            if let Some(peer) = hub.peer_addr() {
-                let packet = encode_punch(PunchKind::Check, hub.token);
-                let _ = socket.send_to(&packet, peer);
+        if (direct_peer.is_none() || !fresh) && last_punch.elapsed() >= punch_gap {
+            let signed = hub.peer_addr();
+            if let Some(peer) = signed {
+                let _ = socket.send_to(&check, peer);
             }
-            last_punch = Instant::now();
+            // The last working address can differ from the signed address.
+            // A symmetric NAT maps a new port for this flow.
+            if let Some(known) = direct_peer.filter(|known| Some(*known) != signed) {
+                let _ = socket.send_to(&check, known);
+            }
+            last_punch = now;
+        }
+        if direct_peer.is_none() {
+            if let Some(active) = spray.as_mut() {
+                match active.due(now) {
+                    Ok(targets) => {
+                        for target in targets {
+                            let _ = socket.send_to(&check, target);
+                        }
+                    }
+                    Err(err) => eprintln!("The port spray stopped. {err}"),
+                }
+                if active.done(now) {
+                    println!(
+                        "The port spray ended after {} probes. The node uses the relay.",
+                        active.sent()
+                    );
+                    spray = None;
+                }
+            }
+            if let (Some(active), Some(peer)) = (fleet.as_mut(), hub.peer_addr()) {
+                active.send_due(peer, &check, now);
+                if let Some((index, from, kind)) = active.poll(hub.token, peer.ip()) {
+                    let sent = active.sent;
+                    if let Some(winner) = fleet.take() {
+                        socket = winner.take(index);
+                        let _ = socket.set_nonblocking(false);
+                        let _ = socket.set_read_timeout(Some(DIRECT_READ));
+                        if kind == PunchKind::Check {
+                            let _ = socket.send_to(&ack, from);
+                        }
+                        println!(
+                            "The birthday punch reached {from} with socket {index} after {sent} probes."
+                        );
+                        println!("The hole punch reached {from}.");
+                        direct_peer = Some(from);
+                    }
+                } else if active.done(now) {
+                    println!(
+                        "The birthday attempt ended after {} probes. The node uses the relay.",
+                        active.sent
+                    );
+                    fleet = None;
+                }
+            }
         }
         match socket.recv_from(&mut buf) {
             Ok((size, from)) => {
                 if let Some(kind) = decode_punch(&buf[..size], hub.token) {
                     if let Some(signed) = hub.peer_addr() {
                         if from.ip() == signed.ip() {
+                            if direct_peer.is_none() {
+                                if let Some(active) = spray.take() {
+                                    println!(
+                                        "The port spray reached {from} after {} probes.",
+                                        active.sent()
+                                    );
+                                }
+                                println!("The hole punch reached {from}.");
+                            }
                             direct_peer = Some(from);
                             if kind == PunchKind::Check {
-                                let ack = encode_punch(PunchKind::Ack, hub.token);
                                 let _ = socket.send_to(&ack, from);
                             }
                         }
                     }
-                } else if let Some(packet) = hub.accept(&buf[..size], Slot::Direct) {
-                    hub.deliver(packet);
+                } else {
+                    let (packet, fresh_frame) = hub.accept(&buf[..size], Slot::Direct);
+                    // A fresh sealed frame shows the current address of the peer.
+                    if fresh_frame
+                        && direct_peer.is_some_and(|known| known != from)
+                        && hub
+                            .peer_addr()
+                            .is_some_and(|signed| signed.ip() == from.ip())
+                    {
+                        direct_peer = Some(from);
+                    }
+                    if let Some(packet) = packet {
+                        hub.deliver(packet);
+                    }
                 }
             }
             Err(err) if is_idle(&err) => {}
@@ -594,7 +957,7 @@ fn direct_loop(hub: Arc<Hub>, socket: UdpSocket) {
             }
         }
         if let Some(peer) = direct_peer {
-            for frame in hub.send_control(&mut last_hello, &mut last_probe) {
+            for frame in hub.send_control(Slot::Direct, &mut last_hello, &mut last_probe) {
                 let _ = socket.send_to(&frame, peer);
             }
             drain_direct(&hub, &socket, peer);
@@ -602,24 +965,39 @@ fn direct_loop(hub: Arc<Hub>, socket: UdpSocket) {
     }
 }
 
-fn coordinated_punch(hub: &Hub, socket: &UdpSocket) -> Option<SocketAddr> {
+fn coordinated_punch(hub: &Hub, socket: &UdpSocket) -> (Option<SocketAddr>, Strategy) {
     let mut started: Option<Instant> = None;
+    let mut plan: Option<Strategy> = None;
     while !stopped() {
         let Some(peer) = hub.peer_addr() else {
             thread::sleep(Duration::from_millis(50));
             continue;
         };
+        let chosen = *plan.get_or_insert_with(|| {
+            let peer_nat = hub.peer_kind();
+            let chosen = strategy(hub.nat_kind, peer_nat);
+            println!(
+                "The punch plan is {}. The local mapping is {}. The peer mapping is {}.",
+                chosen.as_str(),
+                hub.nat_kind.as_str(),
+                peer_nat.as_str()
+            );
+            chosen
+        });
+        if chosen != Strategy::Plain {
+            return (None, chosen);
+        }
         let start = *started.get_or_insert_with(Instant::now);
         if start.elapsed() >= DIRECT_ATTEMPT_BUDGET {
             println!("The direct attempt ended. The node can use the relay.");
-            return None;
+            return (None, chosen);
         }
         let round = Instant::now() + Duration::from_millis(500);
         let deadline = round.min(start + DIRECT_ATTEMPT_BUDGET);
         match exchange_same_ip(socket, &[peer], peer, hub.token, deadline) {
             Ok(outcome) => {
                 println!("The hole punch reached {}.", outcome.peer);
-                return Some(outcome.peer);
+                return (Some(outcome.peer), chosen);
             }
             Err(failure) => {
                 if !matches!(failure.error, EdgeError::DirectBudget) {
@@ -628,20 +1006,16 @@ fn coordinated_punch(hub: &Hub, socket: &UdpSocket) -> Option<SocketAddr> {
             }
         }
     }
-    None
+    (None, plan.unwrap_or(Strategy::Plain))
 }
 
 fn drain_direct(hub: &Hub, socket: &UdpSocket, peer: SocketAddr) {
     while !stopped() {
-        let Some(packet) = hub.pop(OverlayPath::Direct) else {
-            return;
-        };
-        let Some(frame) = hub.seal(KIND_DATA, &packet) else {
-            hub.push_front(OverlayPath::Direct, packet);
+        let Some(frame) = hub.pop(OverlayPath::Direct) else {
             return;
         };
         if socket.send_to(&frame, peer).is_err() {
-            hub.push_front(OverlayPath::Direct, packet);
+            hub.push_front(OverlayPath::Direct, frame);
             return;
         }
     }
@@ -668,21 +1042,29 @@ fn relay_loop(hub: Arc<Hub>) {
         let Some(current) = pipe.as_mut() else {
             continue;
         };
-        match current.recv_opaque() {
-            Ok(Some(frame)) => {
-                if let Some(packet) = hub.accept(&frame, Slot::Relay) {
-                    hub.deliver(packet);
+        let mut broken = false;
+        // Read all frames that wait on the relay socket.
+        loop {
+            match current.recv_opaque() {
+                Ok(Some(frame)) => {
+                    if let (Some(packet), _) = hub.accept(&frame, Slot::Relay) {
+                        hub.deliver(packet);
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    broken = true;
+                    break;
                 }
             }
-            Ok(None) => {}
-            Err(_) => {
-                eprintln!("The relay path stopped. The node will attach again.");
-                pipe = None;
-                thread::sleep(Duration::from_millis(200));
-                continue;
-            }
         }
-        let frames = hub.send_control(&mut last_hello, &mut last_probe);
+        if broken {
+            eprintln!("The relay path stopped. The node will attach again.");
+            pipe = None;
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        let frames = hub.send_control(Slot::Relay, &mut last_hello, &mut last_probe);
         let mut failed = false;
         if let Some(current) = pipe.as_mut() {
             for frame in frames {
@@ -699,7 +1081,7 @@ fn relay_loop(hub: Arc<Hub>) {
         if !drain_relay(&hub, pipe.as_mut()) {
             pipe = None;
         }
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -715,15 +1097,11 @@ fn drain_relay(hub: &Hub, pipe: Option<&mut RelayPipe>) -> bool {
         return true;
     };
     while !stopped() {
-        let Some(packet) = hub.pop(OverlayPath::Relay) else {
-            return true;
-        };
-        let Some(frame) = hub.seal(KIND_DATA, &packet) else {
-            hub.push_front(OverlayPath::Relay, packet);
+        let Some(frame) = hub.pop(OverlayPath::Relay) else {
             return true;
         };
         if pipe.send_opaque(&frame).is_err() {
-            hub.push_front(OverlayPath::Relay, packet);
+            hub.push_front(OverlayPath::Relay, frame);
             return false;
         }
     }
@@ -734,15 +1112,17 @@ fn router_loop(hub: Arc<Hub>, packets: std::sync::mpsc::Receiver<Vec<u8>>) {
     let mut reported: Option<OverlayPath> = None;
     let mut known = false;
     let mut last_status = Instant::now() - Duration::from_secs(1);
+    // The time of the last move off direct, for the resend window.
+    let mut left_direct: Option<u64> = None;
     while !stopped() {
-        match packets.recv_timeout(Duration::from_millis(50)) {
+        match packets.recv_timeout(Duration::from_millis(10)) {
             Ok(packet) => hub.enqueue(packet),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
         let now = hub.now_ms();
-        let direct_ok = hub.fresh(Slot::Direct, now);
-        let relay_ok = hub.fresh(Slot::Relay, now);
+        let direct_ok = hub.both_ways(Slot::Direct, now);
+        let relay_ok = hub.both_ways(Slot::Relay, now);
         let budget_done = lock(&hub.candidate_at)
             .map(|start| start.elapsed() >= DIRECT_ATTEMPT_BUDGET)
             .unwrap_or(false);
@@ -751,17 +1131,29 @@ fn router_loop(hub: Arc<Hub>, packets: std::sync::mpsc::Receiver<Vec<u8>>) {
             direct_ok,
             budget_done,
         );
-        let next = {
+        let (before, next, plan) = {
             let mut select = lock(&hub.select);
-            select_path(&mut select, direct_ok, relay_ok, allowed, now)
+            let before = select.current;
+            let next = select_path(&mut select, direct_ok, relay_ok, allowed, now);
+            (before, next, select.plan(now))
         };
         if next == Some(OverlayPath::Direct) {
             hub.saw_direct.store(true, Ordering::Relaxed);
+            left_direct = None;
         }
-        hub.active.store(path_code(next), Ordering::Relaxed);
-        if let Some(path) = next {
-            hub.flush_hold(path);
+        if before == Some(OverlayPath::Direct) && next != Some(OverlayPath::Direct) {
+            left_direct = Some(now);
         }
+        hub.plan.store(plan_code(plan), Ordering::Relaxed);
+        if next == Some(OverlayPath::Relay) {
+            if let Some(left) = left_direct.take() {
+                // Make before break failed for this move: direct went silent first.
+                // Frames from the last stale window may be lost. Send them again on the relay.
+                let count = hub.resend_on_relay(left.saturating_sub(RESEND_MS));
+                println!("The node sent {count} recent frames again on the relay.");
+            }
+        }
+        hub.flush_hold(plan);
         if !known || next != reported {
             if let Some(path) = next {
                 println!("The path to {} is {}.", hub.peer_name, path.as_str());
@@ -770,6 +1162,9 @@ fn router_loop(hub: Arc<Hub>, packets: std::sync::mpsc::Receiver<Vec<u8>>) {
                     encode_hex(&hub.session),
                     path.as_str()
                 );
+            }
+            if before == Some(OverlayPath::Relay) && next == Some(OverlayPath::Direct) {
+                println!("The relay also carries frames during the overlap.");
             }
             reported = next;
             known = true;
