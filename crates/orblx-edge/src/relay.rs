@@ -24,6 +24,8 @@ use crate::{
 /// A hit means the bytes were visible on the Relay.
 pub const RELAY_PROOF_PAYLOAD: &[u8] = b"orblx-w6-relay-probe";
 
+/// The longest time that a bridge blocks before it checks the stop flag.
+const BRIDGE_WAIT: Duration = Duration::from_millis(50);
 const LAB_DIRECT_BUDGET: Duration = Duration::from_millis(200);
 const LAB_QUIC_BUDGET: Duration = Duration::from_secs(8);
 const LAB_UDP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -471,7 +473,10 @@ fn spawn_bridge(mut pipe: RelayPipe, face: UdpSocket, stop: Arc<AtomicBool>) -> 
                 }
             }
             if idle {
-                thread::sleep(Duration::from_millis(2));
+                // Block until the face or the Relay has data. The limit sets the stop check.
+                if pipe.wait_readable_or(&face, BRIDGE_WAIT).is_err() {
+                    break;
+                }
             }
         }
         pipe.detach();

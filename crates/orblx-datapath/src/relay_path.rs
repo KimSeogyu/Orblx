@@ -18,6 +18,8 @@ use sha2::{Digest, Sha256};
 use crate::quic::{HelloConfig, HelloEndpoint, HelloSocketRole};
 use crate::HelloError;
 
+/// The longest time that a bridge blocks before it checks the stop flag.
+const BRIDGE_WAIT: Duration = Duration::from_millis(50);
 const UDP_TIMEOUT: Duration = Duration::from_millis(400);
 const TCP_TIMEOUT: Duration = Duration::from_secs(4);
 
@@ -137,7 +139,10 @@ fn spawn_bridge(mut pipe: RelayPipe, face: UdpSocket, stop: Arc<AtomicBool>) -> 
                 }
             }
             if idle {
-                thread::sleep(Duration::from_millis(2));
+                // Block until the face or the Relay has data. The limit sets the stop check.
+                if pipe.wait_readable_or(&face, BRIDGE_WAIT).is_err() {
+                    break;
+                }
             }
         }
         pipe.detach();

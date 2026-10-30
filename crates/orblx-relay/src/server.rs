@@ -284,9 +284,15 @@ fn tcp_conn(mut stream: TcpStream, shared: Arc<Shared>) {
     let _ = stream.set_read_timeout(Some(READ_SLICE));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(32);
+    // A writer thread sends each record when it arrives.
+    // The reader loop does not wait for a read timeout before it can send.
+    let Ok(writer) = stream.try_clone() else {
+        return;
+    };
+    let writer_thread = thread::spawn(move || tcp_writer(writer, rx));
     let mut buf = Vec::new();
     let mut peer: Option<(RelaySessionId, u64)> = None;
-    while !shared.stop.load(Ordering::Relaxed) {
+    'conn: while !shared.stop.load(Ordering::Relaxed) {
         match read_some(&mut stream, &mut buf) {
             Ok(()) => {}
             Err(RelayError::Timeout) => {}
@@ -300,7 +306,7 @@ fn tcp_conn(mut stream: TcpStream, shared: Arc<Shared>) {
             match datagram.kind {
                 RelayKind::Attach => {
                     if !datagram.payload.is_empty() {
-                        return;
+                        break 'conn;
                     }
                     match register_tcp(&shared, datagram.session_id, tx.clone()) {
                         Ok(id) => {
@@ -308,16 +314,16 @@ fn tcp_conn(mut stream: TcpStream, shared: Arc<Shared>) {
                             let Ok(ack) =
                                 encode_datagram(RelayKind::Attach, datagram.session_id, &[])
                             else {
-                                return;
+                                break 'conn;
                             };
                             let Ok(record) = encode_tcp_record(&ack) else {
-                                return;
+                                break 'conn;
                             };
-                            if stream.write_all(&record).is_err() {
-                                return;
+                            if tx.send(record).is_err() {
+                                break 'conn;
                             }
                         }
-                        Err(_) => return,
+                        Err(_) => break 'conn,
                     }
                 }
                 RelayKind::Data => {
@@ -337,21 +343,27 @@ fn tcp_conn(mut stream: TcpStream, shared: Arc<Shared>) {
                             remove_peer(&shared, session_id, id);
                         }
                     }
-                    return;
+                    break 'conn;
                 }
-            }
-        }
-        while let Ok(record) = rx.try_recv() {
-            if stream.write_all(&record).is_err() {
-                if let Some((session_id, id)) = peer.take() {
-                    remove_peer(&shared, session_id, id);
-                }
-                return;
             }
         }
     }
     if let Some((session_id, id)) = peer {
         remove_peer(&shared, session_id, id);
+    }
+    drop(tx);
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    let _ = writer_thread.join();
+}
+
+/// Write each queued record to the TCP stream until all senders close.
+fn tcp_writer(mut stream: TcpStream, rx: mpsc::Receiver<Vec<u8>>) {
+    for record in rx {
+        if stream.write_all(&record).is_err() {
+            // The reader loop sees the closed stream and removes the peer.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        }
     }
 }
 
@@ -650,6 +662,32 @@ mod tests {
         assert_eq!(recv_some(&mut right), payload);
         assert_eq!(server.stats().plaintext_hits, 0);
         assert!(server.stats().forwards >= 1);
+    }
+
+    #[test]
+    fn tcp_sender_keeps_order_and_wait_readable_wakes() {
+        let server = server_both();
+        let tcp = server.tcp_addr().unwrap();
+        let session = RelaySessionId::generate().unwrap();
+        let left = RelayPipe::connect_tcp(tcp, session, Duration::from_secs(2)).unwrap();
+        let mut right = RelayPipe::connect_tcp(tcp, session, Duration::from_secs(2)).unwrap();
+        assert!(!right.wait_readable(Duration::from_millis(50)).unwrap());
+        let mut sender = left.sender().unwrap();
+        for index in 0u8..20 {
+            sender.send_opaque(&[index, 7, 7]).unwrap();
+        }
+        let mut got = Vec::new();
+        let started = std::time::Instant::now();
+        while got.len() < 20 && started.elapsed() < Duration::from_secs(5) {
+            if !right.wait_readable(Duration::from_secs(1)).unwrap() {
+                continue;
+            }
+            while let Some(bytes) = right.recv_opaque().unwrap() {
+                got.push(bytes);
+            }
+        }
+        let want: Vec<Vec<u8>> = (0u8..20).map(|index| vec![index, 7, 7]).collect();
+        assert_eq!(got, want);
     }
 
     #[test]
