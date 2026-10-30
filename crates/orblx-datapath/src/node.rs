@@ -152,6 +152,12 @@ pub struct NodeRequest {
     /// The node daemon starts SSH from this hook.
     /// `None` starts no extra listener.
     pub on_ready: Option<Box<dyn FnOnce(Ipv4Addr) + Send>>,
+    /// Runs once, at once after the node binds its UDP listener and before the node
+    /// accepts or dials a peer (W25-6c).
+    ///
+    /// The event has the same time that the node logs in its listener start line.
+    /// `None` runs nothing. The node daemon uses `None`.
+    pub on_listen: Option<Box<dyn FnOnce(ListenEvent) + Send>>,
     /// Loopback Prometheus address.
     ///
     /// `None` does not open the metrics port.
@@ -318,7 +324,8 @@ pub fn running_pid(state_dir: &Path) -> Option<u32> {
 
 /// Run the node until the process receives SIGINT or SIGTERM.
 pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
-    let mut prepared = prepare_node(request)?;
+    let entered_at = Instant::now();
+    let mut prepared = prepare_node(request, entered_at)?;
     let install = prepared
         .router
         .install_cidrs(prepared.request.accept_routes);
@@ -388,7 +395,8 @@ pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
 /// Call this function inside a Tokio runtime.
 /// The function does not open a TUN device.
 pub async fn run_memory_node(request: NodeRequest, device: MemoryDevice) -> Result<(), HelloError> {
-    let mut prepared = prepare_node(request)?;
+    let entered_at = Instant::now();
+    let mut prepared = prepare_node(request, entered_at)?;
     println!("The overlay IP is {}.", prepared.record.overlay_ip);
     println!(
         "The state directory is {}.",
@@ -410,9 +418,19 @@ struct PreparedNode {
     record: NodeRecord,
     router: RouterTable,
     _pid_guard: PidGuard,
+    phases: StartPhases,
 }
 
-fn prepare_node(request: NodeRequest) -> Result<PreparedNode, HelloError> {
+/// The start-up times of a node before its listener starts (W25-21).
+#[derive(Clone, Copy, Debug)]
+pub struct StartPhases {
+    /// The node function started (`run_node` or `run_memory_node`).
+    pub entered_at: Instant,
+    /// The state, the netmap check, and the pid file are ready.
+    pub prepared_at: Instant,
+}
+
+fn prepare_node(request: NodeRequest, entered_at: Instant) -> Result<PreparedNode, HelloError> {
     request
         .netmap
         .check()
@@ -439,6 +457,10 @@ fn prepare_node(request: NodeRequest) -> Result<PreparedNode, HelloError> {
         record,
         router,
         _pid_guard: pid_guard,
+        phases: StartPhases {
+            entered_at,
+            prepared_at: Instant::now(),
+        },
     })
 }
 
@@ -452,21 +474,70 @@ fn announce_renew(request: &NodeRequest) {
     }
 }
 
+/// The UDP listener start of a node (W25-6c).
+///
+/// The node takes the time at once after the bind of its UDP socket.
+#[derive(Clone, Copy, Debug)]
+pub struct ListenEvent {
+    /// The bound UDP address.
+    pub addr: SocketAddr,
+    /// The monotonic time of the listener start.
+    pub at: Instant,
+    /// The same time as milliseconds since the Unix epoch. The node logs this value.
+    pub unix_ms: u128,
+    /// The start-up times before the bind (W25-21).
+    pub phases: StartPhases,
+    /// The start of the UDP bind.
+    pub bind_at: Instant,
+}
+
 async fn run_mesh_inner(
-    request: NodeRequest,
-    view: NodeView,
-    router: RouterTable,
+    prepared: PreparedNode,
     from_tun: mpsc::Receiver<Vec<u8>>,
     to_tun: mpsc::Sender<Vec<u8>>,
     interface: Option<String>,
-    _pid_guard: PidGuard,
 ) -> Result<(), HelloError> {
+    let PreparedNode {
+        mut request,
+        view,
+        router,
+        _pid_guard,
+        phases,
+        ..
+    } = prepared;
     let identity = Arc::new(Mutex::new(request.config.clone()));
     let netmap_path = request.netmap_path.clone();
     let visibility = Arc::clone(&request.visibility);
+    let bind_at = Instant::now();
     let endpoint = Arc::new(HelloEndpoint::bind_node(request.config, request.listen)?);
+    let listened_at = Instant::now();
+    let listened_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0);
     let bound = endpoint.local_addr()?;
     println!("The node {} listens on UDP {bound}.", view.name);
+    println!(
+        "The node {} listener started at unix_ms {listened_unix_ms}.",
+        view.name
+    );
+    let ms = |from: Instant, to: Instant| to.saturating_duration_since(from).as_millis();
+    println!(
+        "The node {} start-up took prepare_ms {} to_bind_ms {} bind_ms {}.",
+        view.name,
+        ms(phases.entered_at, phases.prepared_at),
+        ms(phases.prepared_at, bind_at),
+        ms(bind_at, listened_at)
+    );
+    if let Some(on_listen) = request.on_listen.take() {
+        on_listen(ListenEvent {
+            addr: bound,
+            at: listened_at,
+            unix_ms: listened_unix_ms,
+            phases,
+            bind_at,
+        });
+    }
     let state_dir = Arc::new(request.state_dir);
     let node = Arc::new(view);
     let peers = Arc::new(Mutex::new(initial_peers(&request.netmap)));
@@ -685,17 +756,7 @@ async fn run_mesh(
     to_tun: mpsc::Sender<Vec<u8>>,
     interface: Option<String>,
 ) -> Result<(), HelloError> {
-    let PreparedNode {
-        request,
-        view,
-        router,
-        _pid_guard,
-        ..
-    } = prepared;
-    run_mesh_inner(
-        request, view, router, from_tun, to_tun, interface, _pid_guard,
-    )
-    .await
+    run_mesh_inner(prepared, from_tun, to_tun, interface).await
 }
 
 fn local_view(request: &NodeRequest) -> Result<NodeView, HelloError> {
