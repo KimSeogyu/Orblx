@@ -33,6 +33,8 @@ BIN="$ROOT/target/release/orblx"
 work=""
 env_file=""
 
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$ROOT/scripts/proof/pipe-lib.sh"
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$ROOT/scripts/proof/proof-lock.sh"
 
@@ -57,18 +59,16 @@ finish() {
 }
 trap finish EXIT
 
-if [[ "$(id -u)" -ne 0 ]]; then
-  echo "The renewal gap proof needs root for docker." >&2
-  exit 1
-fi
+require_root "$@"
+proof_lock_take "renew-gap:${PROJECT}" "${PROJECT}-"
+
+# The subnet check runs under the lock, so a proof that runs now cannot hold the subnet.
 if docker network ls --format '{{.Name}}' | while read -r name; do
   docker network inspect "$name" -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null
-done | grep -q "^${NET}\.0/24 "; then
+done | has_line "^${NET}\.0/24 "; then
   echo "The subnet ${NET}.0/24 is in use. Set ORBLX_RG_NET." >&2
   exit 1
 fi
-
-proof_lock_take "renew-gap:${PROJECT}" "${PROJECT}-"
 
 echo "=== REAL build the release binary ==="
 cargo build --release -p orblx-cli --bin orblx || exit 1
@@ -102,7 +102,7 @@ EOF
 wait_direct() {
   local node="$1" peer="$2"
   for _ in $(seq 1 40); do
-    if dc exec -T "$node" orblx status 2>/dev/null | grep -q "peer ${peer} overlay_ip .* path direct "; then
+    if dc exec -T "$node" orblx status 2>/dev/null | has_line "peer ${peer} overlay_ip .* path direct "; then
       return 0
     fi
     sleep 1
@@ -170,7 +170,7 @@ EOF
     dc logs --timestamps --no-log-prefix "$name" 2>/dev/null \
       | awk -v n="$name" '/The node renewed the SVID/ {print "svid_renewal " n " " $1}' >>"$OUT/run${i}.renewals"
     dc logs --no-log-prefix "$name" 2>/dev/null | grep '^trace ' >>"$OUT/run${i}.trace" || true
-    if dc logs "$name" 2>&1 | grep -q "PRIVATE KEY"; then
+    if dc logs "$name" 2>&1 | has_line "PRIVATE KEY"; then
       echo "The ${name} log contains a private key." >&2
       return 1
     fi
