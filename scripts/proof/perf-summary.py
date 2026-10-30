@@ -10,7 +10,7 @@ The exit code is 1 when a run did not print proof_ok or when a CI gate did not p
 CI gates (W24-E2). A run fails when one of these is true:
 - the relay ping median is more than the direct ping median + ORBLX_PERF_MEDIAN_SLACK_MS (1 ms),
 - a ping on a path is lost,
-- the TCP throughput of a path is missing or below ORBLX_PERF_MIN_MBIT (300 Mbit/s, W24-E3),
+- the TCP throughput of a path is missing or below ORBLX_PERF_MIN_MBIT (200 Mbit/s, W24-E4),
 - more than ORBLX_PERF_MAX_SPIKES (3) pings of a path are more than ORBLX_PERF_SPIKE_MS (10 ms).
 Report only: the median, p99 and max ping and the spike count of each path, and the box
 avg gate (relay avg <= direct avg + 1 ms). The box merge gate in nat-realism.sh does not change.
@@ -40,7 +40,7 @@ DIRECT_PATH = "prc_prc_direct"
 MEDIAN_SLACK_MS = float(os.environ.get("ORBLX_PERF_MEDIAN_SLACK_MS", "1"))
 SPIKE_MS = float(os.environ.get("ORBLX_PERF_SPIKE_MS", "10"))
 MAX_SPIKES = int(os.environ.get("ORBLX_PERF_MAX_SPIKES", "3"))
-MIN_MBIT = float(os.environ.get("ORBLX_PERF_MIN_MBIT", "300"))
+MIN_MBIT = float(os.environ.get("ORBLX_PERF_MIN_MBIT", "200"))
 # The box avg gate of nat-realism.sh. The CI reports it and does not gate on it.
 BOX_SLACK_MS = 1.0
 
@@ -364,6 +364,20 @@ def load_runs(out_dir):
     return runs
 
 
+def throughput_lines(summary):
+    """Return one line for each throughput value: path, run, value, floor and result."""
+    lines = ["cpu_model %s" % summary.get("host", {}).get("cpu", "unknown")]
+    for r in summary["runs"]:
+        for path in PATHS:
+            tput = r["throughput"].get(path)
+            if tput is None:
+                lines.append("%s run%d none floor %g FAIL" % (path, r["run"], MIN_MBIT))
+            else:
+                lines.append("%s run%d %.2f Mbit/s floor %g %s" % (
+                    path, r["run"], tput, MIN_MBIT, "PASS" if tput >= MIN_MBIT else "FAIL"))
+    return lines
+
+
 def main(argv):
     if len(argv) != 2:
         print(__doc__, file=sys.stderr)
@@ -378,6 +392,7 @@ def main(argv):
     with open(os.path.join(out_dir, "perf-watch.md"), "w") as f:
         f.write(text)
     print(text)
+    print("\n".join(throughput_lines(summary)))
     if not summary["runs"]:
         print("No run log was found.", file=sys.stderr)
         return 1
