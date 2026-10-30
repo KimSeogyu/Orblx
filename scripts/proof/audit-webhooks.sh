@@ -47,6 +47,10 @@ ENV_FILE="$WORK/env"
 . "$PROOF_LIB_DIR/proof-lock.sh"
 trap proof_lock_end EXIT
 proof_lock_take "audit-webhooks" "$HOOKS_PROJECT"
+# W25-14b: start from a clean compose state (all profiles, all volumes).
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
+proof_compose_clean "$HOOKS_PROJECT" || exit 1
 printf 'HOOKS_IMAGE=%s\n' "$HOOKS_IMAGE" > "$ENV_FILE"
 
 as_root() {
