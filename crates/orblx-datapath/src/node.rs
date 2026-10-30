@@ -1842,9 +1842,19 @@ fn tun_device_name() -> Option<String> {
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), HelloError> {
+    let started = Instant::now();
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, bytes).map_err(|err| HelloError::Node(err.to_string()))?;
-    fs::rename(&tmp, path).map_err(|err| HelloError::Node(err.to_string()))
+    let done = fs::rename(&tmp, path).map_err(|err| HelloError::Node(err.to_string()));
+    let ms = started.elapsed().as_millis();
+    if ms >= 20 {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("-");
+        tr!("slow_io op=write_atomic file={name} ms={ms}");
+    }
+    done
 }
 
 #[cfg(target_os = "linux")]

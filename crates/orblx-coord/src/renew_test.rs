@@ -283,7 +283,17 @@ async fn session_stays_up_for_three_svid_lifetimes() {
         }
         round += 1;
         if round.is_multiple_of(10) {
-            if let Ok(text) = fs::read_to_string(node_a.0.join(NODE_STATUS_FILE)) {
+            let read_started = Instant::now();
+            let read = fs::read_to_string(node_a.0.join(NODE_STATUS_FILE));
+            let read_ms = read_started.elapsed().as_millis();
+            if read_ms >= 20 {
+                let ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis();
+                eprintln!("trace {ms} test slow_io op=status_read ms={read_ms}");
+            }
+            if let Ok(text) = read {
                 if text.contains("path direct ") {
                     saw_direct = true;
                 }
