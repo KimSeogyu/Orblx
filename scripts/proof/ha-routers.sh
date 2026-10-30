@@ -303,8 +303,8 @@ dc --profile nodes --profile tool down -v --remove-orphans >/dev/null 2>&1 || tr
 open_legacy_forward
 
 echo "=== [C] build image ==="
-BIN="$ROOT/target/debug/orblx"
-cargo build -q -p orblx-cli --bin orblx
+BIN="$ROOT/target/release/orblx"
+cargo build -q --release -p orblx-cli --bin orblx
 # shellcheck source=stage-image.sh
 source "$ROOT/scripts/proof/stage-image.sh"
 image_dir="$(stage_proof_image "$ROOT" "$BIN")"
@@ -528,6 +528,7 @@ acl_through() {
   echo "allowed: ${ans}; ${router} FORWARD bytes udp 53 ${n0} -> ${n1}; nameserver queries +$((q1 - q0))"
   [[ "$ans" == "db.corp.lan rcode 0 answers 1 address 10.88.24.20" ]] || fail "The allowed DNS query failed through ${router}."
   [[ "$n1" -gt "$n0" && $((q1 - q0)) -ge 1 ]] || fail "The allowed DNS query did not go through ${router}."
+  dd0="$(deny_to "$router" "$NAMESERVER")"
   put_policy "$POLICY_NODNS"
   ok=0
   for _ in $(seq 1 20); do
@@ -541,13 +542,12 @@ acl_through() {
   [[ "$ok" -eq 1 ]] || fail "${router} did not drop UDP 53 after the rule was removed."
   x0="$(fwd_bytes "$router" dns)"
   q0="$(log_count landns 'query db.corp.lan')"
-  dd0="$(deny_to "$router" "$NAMESERVER")"
   den="$(ask_dns)"
   sleep 0.5
   x1="$(fwd_bytes "$router" dns)"
   q1="$(log_count landns 'query db.corp.lan')"
   dd1="$(deny_to "$router" "$NAMESERVER")"
-  echo "no rule: ${den}; ${router} FORWARD bytes udp 53 ${x0} -> ${x1}; nameserver queries +$((q1 - q0)); packet-deny records +$((dd1 - dd0))"
+  echo "no rule: ${den}; ${router} FORWARD bytes udp 53 ${x0} -> ${x1}; nameserver queries +$((q1 - q0)); packet-deny records since the rule change +$((dd1 - dd0)) (at most 1 record for each source and port in 10 s)"
   [[ "$x1" == "$x0" && $((q1 - q0)) -eq 0 && $((dd1 - dd0)) -ge 1 ]] || fail "The denied DNS query was not dropped on ${router}."
   gate4_dns="allowed_answer 10.88.24.20 allowed_bytes $((n1 - n0)) denied_bytes $((x1 - x0)) denied_queries $((q1 - q0)) deny_records $((dd1 - dd0))"
   put_policy "$POLICY_BOTH"
@@ -563,6 +563,14 @@ acl_through() {
   [[ "$ok" -eq 1 ]] || fail "${router} did not allow UDP 53 again."
   echo "[C] gate4 ok through ${router}"
 }
+
+echo "---- [C] baseline before the first kill: ping and TCP hold through ${first} ----"
+dc exec -d client sh -c "python3 -u /proof/acl-probe.py tcp-hold ${TARGET} 8090 5 > /tmp/hold0.txt 2>&1"
+base_ping="$({ dc exec -T client ping -n -i 0.05 -w 5 -W 1 "$TARGET" 2>/dev/null || true; } | grep -E 'packets transmitted|rtt' | tr '\n' ' ')"
+sleep 1
+base_hold="$(dc exec -T client cat /tmp/hold0.txt 2>/dev/null | grep -v connect_fail | tr '\n' ';' || true)"
+echo "baseline ping: ${base_ping}"
+echo "baseline tcp hold: ${base_hold}"
 
 declare -a RESULTS=() KILLED=() LOSS=() GAPS=()
 watch_changes="-"
@@ -589,7 +597,7 @@ for run in $(seq 1 "$RUNS"); do
   dc exec -d client python3 /proof/acl-probe.py stream "$TARGET" 9000 8 10 "run${run}"
   dc exec -d client python3 /proof/acl-probe.py stream "$TARGET" 9001 8 10 "deny${run}"
   dc exec -d guest python3 /proof/acl-probe.py stream "$TARGET" 9000 8 10 "guest${run}"
-  dc exec -d client sh -c "ping -n -i 0.05 -w 9 -W 1 ${TARGET} > /tmp/ping${run}.txt 2>&1"
+  dc exec -d client sh -c "ping -D -n -i 0.05 -w 9 -W 1 ${TARGET} > /tmp/ping${run}.txt 2>&1"
   if [[ "$run" -eq 1 ]]; then
     dc exec -d client sh -c "python3 -u /proof/acl-probe.py tcp-hold ${TARGET} 8090 12 > /tmp/hold.txt 2>&1"
   fi
