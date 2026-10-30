@@ -142,6 +142,60 @@ async fn deny_wait(
     }
 }
 
+/// Reply with the signed netmap, the signed grants, and the deny list of one node (W25-6).
+///
+/// The reply comes at once when the ETag of the three is not `known`.
+/// Otherwise the request waits like `deny-wait`: until an input file changes and the ETag
+/// changes, or until [`crate::DENY_WAIT_HOLD`] ends.
+async fn policy_wait(
+    coord: &Coordinator,
+    name: &str,
+    known: Option<&str>,
+    mut stamp: watch::Receiver<u64>,
+) -> Result<Response, CoordError> {
+    let deadline = tokio::time::Instant::now() + crate::DENY_WAIT_HOLD;
+    loop {
+        stamp.borrow_and_update();
+        let view = coord.netmap_for(name)?;
+        let deny = admin::deny_json_for(coord, name, SystemTime::now())?;
+        let etag = policy_etag(&view, &deny)?;
+        let changed = known != Some(etag.as_str());
+        if changed
+            || !matches!(
+                tokio::time::timeout_at(deadline, stamp.changed()).await,
+                Ok(Ok(()))
+            )
+        {
+            let mut response = netmap_response(&view);
+            response.detail = Some(deny);
+            response.policy_etag = Some(etag);
+            return Ok(response);
+        }
+    }
+}
+
+/// The SHA-256 of the signed netmap, the signed grants, the endpoints, the routes, and the
+/// deny list ETag, in hex (W25-6).
+///
+/// Ed25519 signatures are deterministic, so the same view gives the same ETag.
+fn policy_etag(view: &crate::state::NetmapView, deny: &str) -> Result<String, CoordError> {
+    use sha2::{Digest, Sha256};
+    let invalid = || CoordError::Protocol("The netmap is not valid.".to_string());
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(&view.signed_netmap).map_err(|_| invalid())?);
+    hasher.update(b"\0");
+    hasher.update(serde_json::to_vec(&view.signed_grants).map_err(|_| invalid())?);
+    hasher.update(b"\0");
+    hasher.update(serde_json::to_vec(&view.endpoints).map_err(|_| invalid())?);
+    hasher.update(b"\0");
+    hasher.update(view.approved_routes.join(",").as_bytes());
+    hasher.update(b"\0");
+    hasher.update(view.advertised_routes.join(",").as_bytes());
+    hasher.update([u8::from(view.exit_approved), 0]);
+    hasher.update(admin::deny_etag(deny).as_bytes());
+    Ok(encode_hex(&hasher.finalize()))
+}
+
 async fn warm_jwks(coord: &Coordinator) {
     let Some(client_id) = coord.google_client_id_for_fetch().ok().flatten() else {
         return;
@@ -352,6 +406,13 @@ async fn dispatch(
                 detail: Some(detail),
                 ..Response::default()
             })
+        }
+        "policy-wait" => {
+            let peer = peer_node(coord, connection)?;
+            if peer != request.name {
+                return Err(CoordError::Peer);
+            }
+            policy_wait(coord, &request.name, request.deny_etag.as_deref(), stamp).await
         }
         "agent-grant" => {
             let peer = peer_node(coord, connection)?;
