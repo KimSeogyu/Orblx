@@ -467,8 +467,7 @@ pub fn admin_token_expect_blocking(
         proto::write_json(&mut send, &request).await?;
         let _ = send.finish();
         let response: Response = proto::read_json(&mut recv).await?;
-        connection.close(quinn::VarInt::from_u32(0), b"done");
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.wait_idle()).await;
+        close_and_wait(&connection, &endpoint).await;
         let status = response
             .status
             .unwrap_or(if response.ok { 200 } else { 400 });
@@ -684,8 +683,7 @@ async fn authed_response(
     proto::write_json(&mut send, &request).await?;
     let _ = send.finish();
     let response: Response = proto::read_json(&mut recv).await?;
-    connection.close(quinn::VarInt::from_u32(0), b"done");
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.wait_idle()).await;
+    close_and_wait(&connection, &endpoint).await;
     if !response.ok {
         let text = response
             .error
@@ -802,6 +800,22 @@ pub fn fetch_netmap_blocking(
     block_on(fetch_netmap(coord, coord_name, bundle_pem, state_dir))
 }
 
+/// Closes a coordinator call and waits up to 2 s for the endpoint to become idle, so that the
+/// coordinator gets the close. W25-21: with ORBLX_TRACE_COORD=1 it prints the time of this
+/// wait. The line has no request or response data.
+async fn close_and_wait(connection: &quinn::Connection, endpoint: &quinn::Endpoint) {
+    let started = std::time::Instant::now();
+    connection.close(quinn::VarInt::from_u32(0), b"done");
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.wait_idle()).await;
+    if std::env::var("ORBLX_TRACE_COORD").as_deref() == Ok("1") {
+        eprintln!(
+            "orblx coord_call close_wait_ms {:.1} rtt_ms {:.1}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            connection.rtt().as_secs_f64() * 1000.0
+        );
+    }
+}
+
 async fn round_trip(
     coord: SocketAddr,
     coord_name: &str,
@@ -833,8 +847,7 @@ async fn round_trip(
     proto::write_json(&mut send, &request).await?;
     let _ = send.finish();
     let response: Response = proto::read_json(&mut recv).await?;
-    connection.close(quinn::VarInt::from_u32(0), b"done");
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.wait_idle()).await;
+    close_and_wait(&connection, &endpoint).await;
     enroll_from_response(response, bundle_pem, pinned_public, require_leaf)
 }
 
