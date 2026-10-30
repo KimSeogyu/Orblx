@@ -378,21 +378,36 @@ pub fn policy_keeps_webhooks(
 /// The coordinator checks the text first. A bad text does not change the file.
 /// The coordinator then loads the file and writes one `policy-replace` record.
 /// The caller holds the policy write lock.
+///
+/// W25-9: when `expect` is given, the call writes only when the live policy sha256
+/// is `expect` (`none`: no policy file). Otherwise it returns `CoordError::Conflict`.
+/// When the text is the same as the live policy, the call does not write and
+/// returns `"changed": false`. Then no new policy record is written.
 pub fn policy_set(
     coord: &Coordinator,
     _lock: &PolicyWrite,
     text: &str,
+    expect: Option<&str>,
 ) -> Result<Value, CoordError> {
     if orblx_identity::Policy::from_hujson(text.as_bytes()).is_err() {
         return Err(CoordError::Protocol("The policy is not valid.".to_string()));
     }
     let path = coord.policy_file()?;
+    let live = if path.exists() {
+        crate::netmap::encode_hex(&sha256_digest(read_text(&path)?.as_bytes()))
+    } else {
+        "none".to_string()
+    };
+    let sha = crate::netmap::encode_hex(&sha256_digest(text.as_bytes()));
+    if expect.is_some_and(|want| want != live) {
+        return Err(CoordError::Conflict);
+    }
+    if live == sha {
+        return Ok(json!({"op": "policy-set", "sha256": sha, "changed": false}));
+    }
     write_text(&path, text, 0o644)?;
     coord.set_policy_file(&path)?;
-    Ok(json!({
-        "op": "policy-set",
-        "sha256": crate::netmap::encode_hex(&sha256_digest(text.as_bytes()))
-    }))
+    Ok(json!({"op": "policy-set", "sha256": sha, "changed": true}))
 }
 
 /// The largest policy text in one admin reply.

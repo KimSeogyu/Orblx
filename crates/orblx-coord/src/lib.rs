@@ -46,10 +46,11 @@ pub use apitoken::{
     API_TOKEN_FILE, API_TOKEN_PREFIX, MAX_API_TOKEN_TTL_SECS, OWNER_ONLY_OPS,
 };
 pub use client::{
-    admin_blocking, admin_token_blocking, advertise_exit_blocking, advertise_routes_blocking,
-    agent_grant_fetch_blocking, agent_grant_request_blocking, enroll_with_oidc_blocking,
-    enroll_with_token_blocking, fetch_deny_blocking, fetch_netmap_blocking, netmap_json,
-    publish_candidates_blocking, renew_svid_blocking, AdminReply, GrantFetch, OidcEnroll,
+    admin_blocking, admin_token_blocking, admin_token_expect_blocking, advertise_exit_blocking,
+    advertise_routes_blocking, agent_grant_fetch_blocking, agent_grant_request_blocking,
+    enroll_with_oidc_blocking, enroll_with_token_blocking, fetch_deny_blocking,
+    fetch_netmap_blocking, netmap_json, publish_candidates_blocking, renew_svid_blocking,
+    AdminReply, GrantFetch, OidcEnroll,
 };
 pub use config::{CoordConfig, OidcSection};
 pub use error::CoordError;
