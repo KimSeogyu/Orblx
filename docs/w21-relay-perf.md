@@ -64,13 +64,15 @@ The image has no iperf3. The proof uses the Python TCP bulk tool. Python 3 is in
 | debug | before (`30d613b`) | 2.077 ms | 6.569 ms | (stopped) | 0/50 | `w21-1-baseline-30d613b-gate-fails.log` |
 | release | before (`30d613b`) | 1.232 ms | 6.032 ms | 6.143 ms | 0/50 | `w21-1-baseline-30d613b-release-nat-realism.log` |
 | debug | after | 1.803 ms | 2.008 ms | 3.080 ms | 0/50 | `w21-1-dev2-nat-realism.log` |
+| release | after | 1.738 ms | 1.276 ms | 1.327 ms | 0/50 | `w21-1-dev3-release-nat-realism.log` |
 | release | after | 1.277 ms | 1.381 ms | 2.163 ms | 0/50 | `w21-1-dev4-release-nat-realism.log` |
 
 The second "before" run used the default slack of 2 ms.
 The script stopped with `prc_prc relay RTT avg 6.569 ms is more than 2 ms above the direct avg 2.077 ms.` and exit 1.
 This shows that `nat-realism.sh` fails when the relay gate fails.
 
-The relay path adds two hops through the relay container. In the release build, the relay RTT is 0.1 ms to 0.9 ms above direct.
+The relay path adds two hops through the relay container. In the two release "after" runs, the relay RTT is 0.5 ms below to 0.9 ms above direct.
+The direct RTT itself changed from 1.277 ms to 1.738 ms between these two runs. The host was shared.
 The `sym_sym` debug run had one ping at 59.5 ms (max). The other worker used the host CPU at the same time.
 The average with that ping was 3.080 ms. The gate limit was 3.803 ms.
 
@@ -98,9 +100,14 @@ All gaps are 1 s or less. The script fails a switch above 1 s.
 | debug | before | 34063.10 Mbit/s | 33.32 Mbit/s | 18.15 Mbit/s | 18.57 Mbit/s |
 | release | before | 32278.48 Mbit/s | 803.52 Mbit/s | 106.52 Mbit/s | 97.10 Mbit/s |
 | debug | after | 34074.89 Mbit/s | 31.51 Mbit/s | 33.81 Mbit/s | 31.53 Mbit/s |
-| release | after | 33041.36 Mbit/s | 863.04 Mbit/s | 875.09 Mbit/s | 921.90 Mbit/s |
+| release | after (`w21-1-dev3`) | 34459.81 Mbit/s | 785.26 Mbit/s | 743.96 Mbit/s | 650.97 Mbit/s |
+| release | after (`w21-1-dev4`) | 33041.36 Mbit/s | 863.04 Mbit/s | 875.09 Mbit/s | 921.90 Mbit/s |
+| release | after, range of all release runs | 33041.36 to 34459.81 Mbit/s | 785.26 to 863.04 Mbit/s | 743.96 to 875.09 Mbit/s | 650.97 to 921.90 Mbit/s |
 
-Each cell is one run. The runs on a shared host can change by about 10 %. Do not read a small difference as a result.
+Each row is one run, except the range row. There are two release "after" runs.
+Across all release "after" runs, the overlay paths gave 650.97 Mbit/s to 921.90 Mbit/s.
+The runs on a shared host can change by about 30 %. Do not read a small difference as a result.
+`docs/w22-throughput.md` has a later rerun of this code with three runs.
 
 ### CPU during the release bulk transfer (3 s sample, percent of one core)
 
@@ -124,7 +131,7 @@ The relay path did not use the CPU. It waited. The relay loop moved frames only 
 and the RTT on the relay path was about 6 ms. A single TCP stream cannot go faster than its window divided by the RTT,
 and the wait in the queue was part of each RTT. This limited the throughput to about one eighth of the direct path.
 
-**After, relay and direct (release 863 Mbit/s to 922 Mbit/s).** The sender router thread used 80 % to 94 % of one core.
+**After, relay and direct (release 651 Mbit/s to 922 Mbit/s across all release runs).** The sender router thread used 80 % to 94 % of one core.
 For each packet, this one thread reads the packet from the TUN reader, seals it with ChaCha20-Poly1305, and sends one UDP datagram.
 The thread handles one packet of up to 1500 bytes in each system call. There is no batch send and no GSO.
 This single thread is the limit for one TCP stream, on the direct path and on the relay path.

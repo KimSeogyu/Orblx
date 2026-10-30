@@ -8,11 +8,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::batch::{recv_batch, send_batch, BatchPeer, RecvBatch, UDP_BATCH};
 use crate::error::io_error;
 use crate::session::encode_hex;
 use crate::{
     contains_needle, encode_datagram, encode_tcp_record, take_tcp_record, RelayError, RelayKind,
-    RelaySessionId, MAX_DATAGRAM_LEN,
+    RelaySessionId, MAX_DATAGRAM_LEN, RELAY_HEADER_LEN,
 };
 
 const READ_SLICE: Duration = Duration::from_millis(50);
@@ -214,54 +215,215 @@ impl Drop for RelayServer {
     }
 }
 
+/// Receive buffers that move between the receive thread and the send thread.
+const UDP_POOL: usize = 4;
+
 fn udp_loop(socket: Arc<UdpSocket>, shared: Arc<Shared>) {
-    let mut buf = [0u8; MAX_DATAGRAM_LEN];
-    while !shared.stop.load(Ordering::Relaxed) {
-        let (size, from) = match socket.recv_from(&mut buf) {
-            Ok(packet) => packet,
-            Err(err) if is_timeout(&err) => continue,
-            Err(_) => break,
+    // The receive thread reads and routes. The send thread writes.
+    // The kernel work of the two calls runs on two cores.
+    // One recvmmsg call takes all datagrams that wait, up to the batch size.
+    // One sendmmsg call sends all UDP forwards of the batch.
+    let (full_tx, full_rx) = mpsc::sync_channel::<(RecvBatch, Vec<UdpForward>)>(UDP_POOL);
+    let (free_tx, free_rx) = mpsc::sync_channel::<(RecvBatch, Vec<UdpForward>)>(UDP_POOL);
+    for _ in 0..UDP_POOL {
+        let _ = free_tx.send((
+            RecvBatch::new(UDP_BATCH, MAX_DATAGRAM_LEN),
+            Vec::with_capacity(UDP_BATCH),
+        ));
+    }
+    let send_socket = Arc::clone(&socket);
+    let send_shared = Arc::clone(&shared);
+    let sender = thread::Builder::new()
+        .name("orblx-relay-send".to_string())
+        .spawn(move || {
+            while let Ok((batch, out)) = full_rx.recv() {
+                send_forwards(&send_shared, &send_socket, &batch, &out);
+                if free_tx.send((batch, out)).is_err() {
+                    break;
+                }
+            }
+        });
+    let Ok(sender) = sender else {
+        return;
+    };
+    'run: while !shared.stop.load(Ordering::Relaxed) {
+        let Ok((mut batch, mut out)) = free_rx.recv() else {
+            break;
         };
-        if shared.udp_discard {
-            continue;
+        loop {
+            if shared.stop.load(Ordering::Relaxed) {
+                break 'run;
+            }
+            match recv_batch(&socket, &mut batch) {
+                Ok(_) => break,
+                Err(err) if is_timeout(&err) => continue,
+                Err(_) => break 'run,
+            }
         }
-        if let Err(error) = handle_udp(&shared, &socket, from, &buf[..size]) {
-            let _ = error;
-            bump_drop(&shared);
+        out.clear();
+        if !shared.udp_discard {
+            for index in 0..batch.len() {
+                let Some((bytes, Some(from))) = batch.get(index) else {
+                    bump_drop(&shared);
+                    continue;
+                };
+                match handle_udp(&shared, &socket, from, bytes) {
+                    Ok(Some((session_id, addr, hit))) => out.push(UdpForward {
+                        index,
+                        session_id,
+                        addr,
+                        len: bytes.len() - RELAY_HEADER_LEN,
+                        hit,
+                    }),
+                    Ok(None) => {}
+                    Err(_) => bump_drop(&shared),
+                }
+            }
         }
+        if full_tx.send((batch, out)).is_err() {
+            break;
+        }
+    }
+    drop(full_tx);
+    let _ = sender.join();
+}
+
+/// One UDP forward that waits for the batch send.
+struct UdpForward {
+    index: usize,
+    session_id: RelaySessionId,
+    addr: SocketAddr,
+    len: usize,
+    hit: bool,
+}
+
+/// Send the UDP forwards of one batch. The bytes are the received datagrams without a change.
+fn send_forwards(shared: &Shared, socket: &UdpSocket, batch: &RecvBatch, out: &[UdpForward]) {
+    if out.is_empty() {
+        return;
+    }
+    let frames: Vec<&[u8]> = out
+        .iter()
+        .filter_map(|item| batch.get(item.index).map(|(bytes, _)| bytes))
+        .collect();
+    let addrs: Vec<SocketAddr> = out.iter().map(|item| item.addr).collect();
+    if frames.len() != out.len() {
+        lock_mutex(&shared.stats).drops += out.len() as u64;
+        return;
+    }
+    // A failed datagram is a drop. The send goes on with the next datagram.
+    let mut ok = vec![false; out.len()];
+    let mut next = 0;
+    while next < out.len() {
+        let sent = send_batch(
+            socket,
+            &[],
+            &frames[next..],
+            BatchPeer::Each(&addrs[next..]),
+        )
+        .unwrap_or(0);
+        for flag in &mut ok[next..next + sent] {
+            *flag = true;
+        }
+        next += sent + 1;
+    }
+    {
+        let mut stats = lock_mutex(&shared.stats);
+        for (item, sent) in out.iter().zip(&ok) {
+            if !sent {
+                stats.drops += 1;
+                continue;
+            }
+            stats.forwards += 1;
+            stats.forward_bytes += item.len as u64;
+            if item.hit {
+                stats.plaintext_hits += 1;
+            }
+        }
+    }
+    for (item, _) in out.iter().zip(&ok).filter(|(_, sent)| **sent) {
+        write_audit(shared, item.session_id, item.len, item.hit);
     }
 }
 
+/// Handle one UDP datagram.
+///
+/// A DATA datagram for a UDP peer returns the session, the address, and the needle flag.
+/// The caller sends the original bytes. A DATA datagram has the same bytes on both sides of the Relay.
 fn handle_udp(
     shared: &Shared,
     socket: &UdpSocket,
     from: SocketAddr,
     bytes: &[u8],
-) -> Result<(), RelayError> {
-    let datagram = crate::decode_datagram(bytes)?;
-    match datagram.kind {
+) -> Result<Option<(RelaySessionId, SocketAddr, bool)>, RelayError> {
+    let (kind, session_id, payload) = crate::wire::split_datagram(bytes)?;
+    match kind {
         RelayKind::Attach => {
-            if !datagram.payload.is_empty() {
+            if !payload.is_empty() {
                 return Err(RelayError::BadDatagram);
             }
-            register_udp(shared, datagram.session_id, from)?;
-            let ack = encode_datagram(RelayKind::Attach, datagram.session_id, &[])?;
+            register_udp(shared, session_id, from)?;
+            let ack = encode_datagram(RelayKind::Attach, session_id, &[])?;
             socket.send_to(&ack, from).map_err(io_error)?;
-            Ok(())
+            Ok(None)
         }
         RelayKind::Data => {
-            let id = udp_peer_id(shared, datagram.session_id, from)?;
-            touch_slot(shared, datagram.session_id, id);
-            forward(shared, datagram.session_id, id, &datagram.payload);
-            Ok(())
+            let dest = udp_route(shared, session_id, from)?;
+            let hit = shared
+                .audit_absent
+                .as_ref()
+                .is_some_and(|needle| contains_needle(payload, needle));
+            match dest {
+                Dest::Udp(addr) => Ok(Some((session_id, addr, hit))),
+                Dest::Tcp(tx) => {
+                    if !send_tcp(session_id, payload, &tx) {
+                        return Err(RelayError::NotAttached);
+                    }
+                    {
+                        let mut stats = lock_mutex(&shared.stats);
+                        stats.forwards += 1;
+                        stats.forward_bytes += payload.len() as u64;
+                        if hit {
+                            stats.plaintext_hits += 1;
+                        }
+                    }
+                    write_audit(shared, session_id, payload.len(), hit);
+                    Ok(None)
+                }
+            }
         }
         RelayKind::Detach => {
-            if let Ok(id) = udp_peer_id(shared, datagram.session_id, from) {
-                remove_peer(shared, datagram.session_id, id);
+            if let Ok(id) = udp_peer_id(shared, session_id, from) {
+                remove_peer(shared, session_id, id);
             }
-            Ok(())
+            Ok(None)
         }
     }
+}
+
+/// Find the sender slot, mark it as seen, and return the other peer. One lock.
+fn udp_route(
+    shared: &Shared,
+    session_id: RelaySessionId,
+    from: SocketAddr,
+) -> Result<Dest, RelayError> {
+    let mut sessions = lock_mutex(&shared.sessions);
+    let session = sessions
+        .get_mut(&session_id)
+        .ok_or(RelayError::NotAttached)?;
+    let slot = session
+        .slots
+        .iter_mut()
+        .find(|slot| matches!(slot.dest, Dest::Udp(existing) if existing == from))
+        .ok_or(RelayError::NotAttached)?;
+    slot.last_seen = Instant::now();
+    let id = slot.id;
+    session
+        .slots
+        .iter()
+        .find(|slot| slot.id != id)
+        .map(|slot| slot.dest.clone())
+        .ok_or(RelayError::NotAttached)
 }
 
 fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
