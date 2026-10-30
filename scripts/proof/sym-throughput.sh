@@ -13,7 +13,13 @@ export ORBLX_SERIAL_RUNS="${ORBLX_SERIAL_RUNS:-5}"
 export ORBLX_BULK_SECS="${ORBLX_BULK_SECS:-30}"
 export ORBLX_SERIAL_OUT="${ORBLX_SERIAL_OUT:-$ROOT/target/sym-throughput}"
 
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$ROOT/scripts/proof/proof-lock.sh"
+trap proof_lock_end EXIT
+proof_lock_take "sym-throughput:${ORBLX_NATR_PROJECT:-orblx-natr-proof}" "${ORBLX_NATR_PREFIX:-orblx-natr-}" "${ORBLX_NATR_PROJECT:-orblx-natr-proof}-"
+
 "$ROOT/scripts/proof/serial-rtt.sh"
 status=$?
 python3 "$ROOT/scripts/proof/serial-rtt-table.py" "$ORBLX_SERIAL_OUT" --sym-gate || status=1
+proof_lock_end
 exit "$status"
