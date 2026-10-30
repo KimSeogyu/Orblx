@@ -1,0 +1,53 @@
+# W25-21: the node start-up cost from the enroll call to the listener start on a busy runner.
+# Report only: the job prints the phase times and does not apply the idle-box gate
+# (ORBLX_STARTUP_REPORT_ONLY=1). The idle-box gate is scripts/proof/startup-cost.sh.
+# The other orblx-coord tests run in parallel with the measurement, as in ci.yml, so the runner
+# has the same load as the CI test step. There are no reruns.
+name: startup-cost
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - crates/orblx-datapath/src/node.rs
+      - crates/orblx-coord/src/client.rs
+      - crates/orblx-coord/src/renew_test.rs
+      - .github/workflows/startup-cost.yml
+
+jobs:
+  startup-cost:
+    name: startup-cost ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Get the repository
+        uses: actions/checkout@v7
+
+      - name: Install the stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the test
+        run: cargo test -p orblx-coord --no-run
+
+      - name: Measure the start-up cost 20 times while the orblx-coord tests run
+        env:
+          ORBLX_STARTUP_RUNS: "20"
+          ORBLX_STARTUP_REPORT_ONLY: "1"
+          ORBLX_TRACE_COORD: "1"
+        run: |
+          set +e  # GitHub runs this step with bash -e; the step checks each exit code itself.
+          set -uo pipefail
+          echo "=== startup_cost ${{ matrix.os }} start $(date -u +%FT%TZ) ==="
+          cargo test -p orblx-coord >load.log 2>&1 &
+          load=$!
+          cargo test -p orblx-coord --lib startup_cost_runs -- --ignored --nocapture >measure.log 2>&1
+          code=$?
+          wait "$load"
+          load_code=$?
+          cat measure.log
+          echo "=== startup_cost ${{ matrix.os }} end $(date -u +%FT%TZ) measure_exit ${code} load_exit ${load_code} ==="
+          exit "$code"
