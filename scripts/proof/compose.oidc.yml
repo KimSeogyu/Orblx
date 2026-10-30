@@ -1,0 +1,97 @@
+# Custom OIDC proof stack.
+# The idp service is the orblx-test-idp HTTPS test issuer.
+# The coordinator reads the [oidc] section from CONFIG_FILE.
+name: orblx-oidc-proof
+
+services:
+  idp:
+    image: orblx-oidc:w20
+    entrypoint: ["orblx-test-idp"]
+    command:
+      - serve
+      - --dir
+      - /idp
+      - --issuer
+      - https://idp:8443
+      - --listen
+      - 0.0.0.0:8443
+    volumes:
+      - orblx-oidc-idp:/idp
+      - orblx-oidc-tokens:/tokens
+    networks:
+      - proof
+
+  coord:
+    image: orblx-oidc:w20
+    # The coordinator does not need systemd-resolved.
+    # systemd-resolved does not send the one-label name idp to the Docker DNS.
+    entrypoint: ["orblx"]
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /var/lib/orblx/policy.hujson
+      - --config
+      - /etc/orblx/coord.toml
+    volumes:
+      - orblx-oidc-store:/var/lib/orblx
+      - ${POLICY_FILE:?set POLICY_FILE}:/var/lib/orblx/policy.hujson:ro
+      - ${CONFIG_FILE:?set CONFIG_FILE}:/etc/orblx/coord.toml:ro
+      - ${IDP_CA_FILE:?set IDP_CA_FILE}:/etc/orblx/idp-ca.pem:ro
+    networks:
+      - proof
+
+  laptop:
+    image: orblx-oidc:w20
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    volumes:
+      - orblx-oidc-tokens:/tokens:ro
+      - orblx-oidc-laptop:/var/lib/orblx
+    networks:
+      - proof
+
+  srv:
+    image: orblx-oidc:w20
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-oidc-store:/coord-state:ro
+      - orblx-oidc-srv:/var/lib/orblx
+    networks:
+      - proof
+
+volumes:
+  orblx-oidc-idp:
+  orblx-oidc-tokens:
+  orblx-oidc-store:
+  orblx-oidc-laptop:
+  orblx-oidc-srv:
+
+networks:
+  proof:
