@@ -214,7 +214,7 @@ W25-14 added the ticket queue. Two faults stayed:
 
 | Item | Change | Mark |
 |---|---|---|
-| Ticket time | `proof_lock_take` makes the ticket before the first `proof_context` line. PR #108 makes the same change on main; this PR adds the `proto=fifo-keeper` line to the ticket. | REAL (unit test) |
+| Ticket time | `proof_lock_take` makes the ticket before the first `proof_context` line. PR #108 (merged as f3bee5b) made this change on main; this PR adds the `proto=fifo-keeper` line to the ticket. | REAL (unit test) |
 | Keeper | A keeper process holds the lock file (the `flock` that old checkouts use) while a FIFO proof runs, and while the oldest live ticket is from a FIFO waiter. A plain `flock` from an old checkout then waits until no FIFO proof runs or waits first. Only one keeper runs (`${lock}.keeper.lock`). It runs in its own session, so a `timeout` of the proof does not stop it. | REAL (unit test, host test) |
 | FIFO lock | The FIFO proofs take turns on `${lock}.fifo`. The oldest live ticket takes it. The proof starts only when the keeper holds the lock file. | REAL (unit test) |
 | Keeper stop | The keeper stops when `${lock}.fifo` is free and the oldest live ticket is not from a FIFO waiter (or no ticket is left). It checks this under `${lock}.fifo`, so no FIFO proof can start while it stops. `proof_lock_end` stops the keeper before it frees `${lock}.fifo` when no FIFO waiter is next. The lock file is then free when `proof_lock_end` returns. | REAL (unit test) |
