@@ -31,6 +31,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$ROOT/scripts/proof/pipe-lib.sh"
 FILE="scripts/proof/compose.siem-streaming.yml"
 SIEM_PROJECT="${SIEM_PROJECT:-orblx-w25m-siem}"
 SIEM_IMAGE="${SIEM_IMAGE:-orblx-w25m-siem:local}"
@@ -84,8 +86,16 @@ fail() {
   echo "proof_fail: $*" >&2
   local logs
   logs="$(dc logs --no-log-prefix coord 2>&1 || true)"
+  # W25-14: keep the full coord log. The short view below hides the config audit lines only.
+  if [[ -n "${PROOF_LOG:-}" ]]; then
+    printf '%s\n' "$logs" > "${PROOF_LOG}.coord.log" || true
+    echo "---- full coord log: ${PROOF_LOG}.coord.log ----" >&2
+  else
+    echo "---- full coord log ----" >&2
+    printf '%s\n' "$logs" >&2
+  fi
   echo "---- coord log (last 40 lines, no config audit lines) ----" >&2
-  grep -v '^config audit ' <<< "$logs" | tail -n 40 >&2 || true
+  awk '!/^config audit /' <<< "$logs" | tail -n 40 >&2 || true
   exit 1
 }
 
@@ -199,26 +209,18 @@ make_events() {
   echo "events_made $(( now - before )) want ${want}"
 }
 
+# W25-14: one clock. START_MS is the host time (date) just before the client makes the events.
+# The receiver writes recv_ms with time.time() in a container on the same host kernel clock.
+# Before, the write time came from "docker logs -t" (the time the daemon read the log line), so a
+# record could arrive "before" it was written (min -13.9 ms). Each record latency is at most
+# start_to_last_arrival_ms, so the gate on it is not weaker than the old per-record gate.
 cat > "$WORK/arrivals.py" <<'PY'
-import datetime
 import json
-import re
 import sys
 
-chain_file, recv_dir, log_file, lo, hi, limit = sys.argv[1:7]
+chain_file, recv_dir, start_ms, lo, hi, limit = sys.argv[1:7]
 sinks = sys.argv[7:]
-lo, hi, limit = int(lo), int(hi), float(limit)
-chain = [json.loads(line) for line in open(chain_file) if line.strip()]
-written = {}
-pat = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z config audit (\d+) ")
-for line in open(log_file, errors="replace"):
-    match = pat.match(line)
-    if not match:
-        continue
-    base = datetime.datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S")
-    base = base.replace(tzinfo=datetime.timezone.utc)
-    frac = (match.group(2) or "0")[:6].ljust(6, "0")
-    written.setdefault(int(match.group(3)), base.timestamp() * 1000.0 + int(frac) / 1000.0)
+start_ms, lo, hi, limit = float(start_ms), int(lo), int(hi), float(limit)
 all_ok = True
 for sink in sinks:
     rows = [json.loads(line) for line in open("%s/%s/arrivals.jsonl" % (recv_dir, sink)) if line.strip()]
@@ -231,21 +233,19 @@ for sink in sinks:
     want = range(lo, hi)
     got = [seq for seq in want if seq in first]
     gaps = len(want) - len(got)
-    lat = sorted(first[seq] - written.get(seq, float("nan")) for seq in got)
-    known = [ms for ms in lat if ms == ms]
-    span = (max(first[seq] for seq in got) - min(written.get(seq, float("inf")) for seq in got)) if got else 0
-    # Gate 1 also needs the whole window (first write to last arrival) in the limit.
-    span_ok = limit >= 999999999 or span <= limit
-    ok = gaps == 0 and dups == 0 and order_ok and len(known) == len(got) and all(ms <= limit for ms in known) and span_ok
-    all_ok = all_ok and ok
-    if known:
-        print("sink %s window %d..%d delivered %d of %d gaps %d duplicates %d order %s latency_ms min %.1f p50 %.1f p99 %.1f max %.1f first_write_to_last_arrival_ms %.1f %s"
+    if got:
+        early = min(first[seq] for seq in got) - start_ms
+        span = max(first[seq] for seq in got) - start_ms
+        # A record that arrives before the start means the clock or the window is wrong.
+        clock_ok = early >= 0
+        ok = gaps == 0 and dups == 0 and order_ok and clock_ok and span <= limit
+        print("sink %s window %d..%d delivered %d of %d gaps %d duplicates %d order %s start_to_first_arrival_ms %.1f start_to_last_arrival_ms %.1f limit_ms %s %s"
               % (sink, lo, hi - 1, len(got), len(want), gaps, dups, "ok" if order_ok else "fail",
-                 known[0], known[len(known) // 2], known[min(len(known) - 1, int(len(known) * 0.99))], known[-1], span,
-                 "ok" if ok else "fail"))
+                 early, span, "none" if limit >= 999999999 else "%.0f" % limit, "ok" if ok else "fail"))
     else:
-        print("sink %s window %d..%d delivered %d of %d gaps %d duplicates %d order %s no latency %s"
-              % (sink, lo, hi - 1, len(got), len(want), gaps, dups, "ok" if order_ok else "fail", "ok" if ok else "fail"))
+        ok = False
+        print("sink %s window %d..%d delivered 0 of %d fail" % (sink, lo, hi - 1, len(want)))
+    all_ok = all_ok and ok
 print("arrivals %s" % ("ok" if all_ok else "fail"))
 PY
 
@@ -417,12 +417,13 @@ wait_all 20 || fail "the sinks did not get the start of the chain"
 
 echo "=== [C] gate 1: ${EVENTS} events reach each sink in ${LIMIT_MS} ms or less ==="
 g1_lo="$(chain_len)"
+g1_start_ms="$(now_ms)"
 EVENT_JOBS=32 make_events "$EVENTS"
 g1_hi=$(( g1_lo + EVENTS ))
 [[ "$(chain_len)" -ge "$g1_hi" ]] || fail "gate 1: the client did not make ${EVENTS} events"
 wait_all 30 || fail "gate 1: a sink did not get every event"
 snapshot
-g1_out="$(python3 "$WORK/arrivals.py" "$WORK/chain.jsonl" "$WORK/recv" "$WORK/coord-ts.log" "$g1_lo" "$g1_hi" "$LIMIT_MS" "${SINKS[@]}")"
+g1_out="$(python3 "$WORK/arrivals.py" "$WORK/chain.jsonl" "$WORK/recv" "$g1_start_ms" "$g1_lo" "$g1_hi" "$LIMIT_MS" "${SINKS[@]}")"
 printf '%s\n' "$g1_out"
 has_line '^arrivals ok' "$g1_out" || fail "gate 1"
 for sink in "${SINKS[@]}"; do
@@ -469,6 +470,7 @@ down_at="$(now_ms)"
 bench > "$WORK/bench-dead.txt"
 dead_sum="$(summary "$WORK/bench-dead.txt" | tr '\n' ' ')"
 echo "mode dead (siemhttp and syslog stopped) n ${BENCH_N} ${dead_sum}"
+g3_start_ms="$(now_ms)"
 make_events 200
 owner_policy "$(policy_json "$ALL_SINKS" udp)"
 echo "owner policy-set with dead sinks ok"
@@ -485,7 +487,7 @@ dc start siemhttp syslog >/dev/null
 wait_all 60 || fail "gate 3: records were lost"
 g3_hi="$(chain_len)"
 snapshot
-g3_out="$(python3 "$WORK/arrivals.py" "$WORK/chain.jsonl" "$WORK/recv" "$WORK/coord-ts.log" "$g3_lo" "$g3_hi" 999999999 "${SINKS[@]}")"
+g3_out="$(python3 "$WORK/arrivals.py" "$WORK/chain.jsonl" "$WORK/recv" "$g3_start_ms" "$g3_lo" "$g3_hi" 999999999 "${SINKS[@]}")"
 printf '%s\n' "$g3_out"
 has_line '^arrivals ok' "$g3_out" || fail "gate 3: order, gaps, or duplicates"
 for sink in "${SINKS[@]}"; do
@@ -503,6 +505,7 @@ has_line ' ok$' "$gate3" || fail "gate 3: the admin p50 moved more than 10 ms"
 echo "=== [C] gate 4: coordinator kill while records wait ==="
 g4_lo="$(chain_len)"
 dc stop -t 1 siemhttp syslog >/dev/null
+g4_start_ms="$(now_ms)"
 make_events 100
 g4_mid="$(chain_len)"
 echo "events_waiting $((g4_mid - g4_lo))"
@@ -527,7 +530,7 @@ dc start siemhttp syslog >/dev/null
 wait_all 60 || fail "gate 4: records were lost"
 g4_hi="$(chain_len)"
 snapshot
-g4_out="$(python3 "$WORK/arrivals.py" "$WORK/chain.jsonl" "$WORK/recv" "$WORK/coord-ts.log" "$g4_lo" "$g4_hi" 999999999 "${SINKS[@]}")"
+g4_out="$(python3 "$WORK/arrivals.py" "$WORK/chain.jsonl" "$WORK/recv" "$g4_start_ms" "$g4_lo" "$g4_hi" 999999999 "${SINKS[@]}")"
 printf '%s\n' "$g4_out"
 has_line '^arrivals ok' "$g4_out" || fail "gate 4"
 for sink in "${SINKS[@]}"; do
@@ -584,10 +587,13 @@ control_cred="$(dc exec -T coord sh -c 'cat > /tmp/needles; grep -lF -f /tmp/nee
 control_tokens="$(dc exec -T client sh -c 'cat > /tmp/needles; grep -lF -f /tmp/needles /tokens/pol /tokens/bench | wc -l; rm -f /tmp/needles' < "$WORK/needles")"
 echo "credential_check control_credential_files ${control_cred} want 3 control_token_files ${control_tokens} want 2"
 [[ "$control_cred" == 3 && "$control_tokens" == 2 ]] || fail "the credential check does not find the control files"
-hits_state="$(dc exec -T coord sh -c 'cat > /tmp/needles; grep -rlF -f /tmp/needles /var/lib/orblx | wc -l; rm -f /tmp/needles' < "$WORK/needles")"
-hits_recv="$(recv_sh 'cat > /tmp/needles; grep -rlF -f /tmp/needles /recv | wc -l; rm -f /tmp/needles' < "$WORK/needles")"
-recv_files="$(recv_sh 'find /recv -type f | wc -l')"
-dc logs --no-log-prefix > "$WORK/logs.txt" 2>&1 || true
+hits_state="$(dc exec -T coord sh -c 'cat > /tmp/needles; set -e; test -d /var/lib/orblx; rc=0; grep -rlF -f /tmp/needles /var/lib/orblx > /tmp/hits || rc=$?; rm -f /tmp/needles; [ "$rc" -le 1 ]; wc -l < /tmp/hits; rm -f /tmp/hits' < "$WORK/needles")" || fail "the coord state check failed"
+hits_recv="$(recv_sh 'cat > /tmp/needles; set -e; test -d /recv; rc=0; grep -rlF -f /tmp/needles /recv > /tmp/hits || rc=$?; rm -f /tmp/needles; [ "$rc" -le 1 ]; wc -l < /tmp/hits; rm -f /tmp/hits' < "$WORK/needles")" || fail "the sink output check failed"
+recv_files="$(recv_sh 'find /recv -type f | wc -l')" || fail "the sink output list failed"
+[[ "$recv_files" -gt 0 ]] || fail "the sink output check found no files"
+# W25-14: a failed or empty log read fails the check. Before, "|| true" gave 0 hits.
+dc logs --no-log-prefix > "$WORK/logs.txt" 2>&1 || fail "docker compose logs failed"
+secret_scan "$WORK/logs.txt" || fail "a container log has PEM key text or an enroll token, or it is empty"
 hits_logs="$(grep -cF -f "$WORK/needles" "$WORK/logs.txt" || true)"
 hits_chain="$(grep -cF -f "$WORK/needles" "$WORK/chain.jsonl" || true)"
 hits_policy="$(grep -cF -f "$WORK/needles" <<< "$policy_now" || true)"
