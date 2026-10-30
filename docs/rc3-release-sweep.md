@@ -101,7 +101,34 @@ The sweep has 22 proofs. The proof list is the `PROOFS` variable in the script. 
 
 ## Dry run on main
 
-The dry run on main is running. This section gets the table before the merge.
+This dry run is for early detection only. **It does not count for rc.3.** The real sweep runs later on a commit that has the W25-14 merge.
+
+Commit: `cd6c8eea` (main on 2026-10-31 00:40 KST, before W25-6, W25-14 and the FIFO lock). Started 00:29:53 KST, lock mode `proof`. The build took about 1 min. The other proofs of the box ran at the same time, so most of each proof time below is the wait for the lock. The live table is `/workspace/orblx-w18-proof/rc3-sweep-cd6c8eea.md`. `policy-sync` is not in this commit.
+
+State at the merge of this PR (16 of 21 proofs done; `ssh`, `file-send`, `config-audit`, `audit-webhooks` and `docker-image` still ran):
+
+| proof | gap row | result |
+|---|---|---|
+| w18-linux-daemon | 1, 54, 61 | `proof_ok` |
+| coord-enroll | 33, 61 | FAIL (exit 1): The TUN device did not open. The TUN device needs CAP_NET_ADMIN on Linux. ... No such file or directory (os error 2) |
+| subnet | 9, 10 | `proof_ok` |
+| exit-node | 11, 61 | FAIL (exit 1): mkdir ... No space left on device (box disk full) |
+| w18-names | 16 | FAIL (exit 1): proof-lock.sh: line 165: echo: write error: No space left on device (box disk full) |
+| policy | 19, 21 | FAIL (exit 1): same (box disk full) |
+| datapath-acl | 19 | FAIL (exit 1): Error response from daemon: write /orblx: no space left on device (box disk full) |
+| policy-gitops | 24 | FAIL (exit 100): apt: Error writing to file ... No space left on device (box disk full) |
+| svid-renew | 29 | FAIL (exit 1): cp: error copying ... No space left on device (box disk full) |
+| nat-realism | 29 | FAIL (exit 1): no error line; last line `=== REAL cargo test signed hello and birthday bounds ===` (the proof filters the cargo test output; it ran while the disk was full) |
+| admin | 30, 31, 53, 62 | `proof_ok` |
+| revoke-all | 30 | `proof_ok` |
+| revoke-followup | 30 | `proof_ok` |
+| api-tokens | 35 | `proof_ok` |
+| token-no-escalation | 35 | `proof_ok` |
+| node-share | 38 | `proof_ok` |
+
+- The box disk reached 100% at about 01:32 KST (the targets and images of other workers). The seven `No space left on device` failures are of the box, not of the product. They need a run again.
+- `coord-enroll` is the one product failure so far: `orblx up` does not open the TUN device in its container.
+- The `proof_ok` logs show no skipped check. Some setup steps (for example `=== [C] start coordinator ===`) print nothing, because the proof sends their output to `/dev/null`.
 
 ## Limits
 
