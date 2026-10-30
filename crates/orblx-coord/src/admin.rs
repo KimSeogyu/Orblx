@@ -4,12 +4,14 @@
 //! Approve puts a node into netmaps and grants.
 //! Revoke adds the node SVID to the deny set.
 //! Expire removes the node from netmaps until the next approve.
+//! Revoke-all stops all access of one principal with one deny change and one
+//! audit record: the SVID, the agent grants, SSH, and file send.
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use orblx_audit::{sha256_digest, verify_config_jsonl, ConfigAction, EMPTY_DIGEST};
-use orblx_identity::{DenySet, SpiffeId};
+use orblx_identity::{DenySet, SpiffeId, WorkloadKind};
 use serde_json::{json, Value};
 
 use crate::error::CoordError;
@@ -104,6 +106,78 @@ pub fn revoke(
         "svid": node.svid,
         "deny_version": version
     }))
+}
+
+/// Revoke all access of one principal (W24-D).
+///
+/// `principal` is a node name or a SPIFFE URI of a node, a user, or an agent.
+/// The call adds the principal URI and the ticket nonce of each issued grant of
+/// the principal to the deny file in one deny version. It marks the grants of
+/// the principal revoked. It writes one `revoke` audit record with `scope all`.
+/// SSH servers and file receivers check the sender SVID against the deny file,
+/// so the URI entry stops SSH and file send. The coordinator refuses the SVID.
+pub fn revoke_all(
+    coord: &Coordinator,
+    principal: &str,
+    actor: &str,
+    now: SystemTime,
+) -> Result<Value, CoordError> {
+    let id = principal_id(coord, principal)?;
+    if id.as_uri() == actor {
+        return Err(CoordError::Protocol(
+            "The caller cannot revoke its own SVID.".to_string(),
+        ));
+    }
+    let before = deny_digest(coord)?;
+    let done = crate::agent::revoke_principal(coord, &id, now)?;
+    let after = deny_digest(coord)?;
+    let detail = format!(
+        "principal {} scope all svid denied grants {} nonces {} deny_version {}",
+        id.as_uri(),
+        done.grants.len(),
+        done.nonces,
+        done.deny_version
+    );
+    coord.record_change(
+        actor,
+        ConfigAction::Revoke,
+        id.as_uri(),
+        before,
+        after,
+        &detail,
+    )?;
+    Ok(json!({
+        "op": "revoke-all",
+        "principal": id.as_uri(),
+        "scope": "all",
+        "svid_denied": true,
+        "grants": done.grants,
+        "nonces": done.nonces,
+        "deny_version": done.deny_version
+    }))
+}
+
+/// Read a node name or a SPIFFE URI. A node must be enrolled.
+fn principal_id(coord: &Coordinator, principal: &str) -> Result<SpiffeId, CoordError> {
+    let bad = || CoordError::Protocol("The principal is not valid.".to_string());
+    let id = if principal.starts_with("spiffe://") {
+        SpiffeId::parse(principal).map_err(|_| bad())?
+    } else {
+        SpiffeId::node(principal).map_err(|_| bad())?
+    };
+    match id.kind() {
+        WorkloadKind::Node => {
+            let nodes = coord.node_list()?;
+            if !nodes.iter().any(|node| node.name == id.name()) {
+                return Err(CoordError::Protocol(
+                    "The node is not enrolled.".to_string(),
+                ));
+            }
+        }
+        WorkloadKind::User | WorkloadKind::Agent => {}
+        WorkloadKind::Coord => return Err(bad()),
+    }
+    Ok(id)
 }
 
 pub fn nodes(coord: &Coordinator) -> Result<Value, CoordError> {

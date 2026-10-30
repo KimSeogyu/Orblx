@@ -304,6 +304,7 @@ async fn dispatch(
         | "admin-users"
         | "admin-approve"
         | "admin-revoke"
+        | "admin-revoke-all"
         | "admin-expire"
         | "admin-routes"
         | "admin-audit"
@@ -337,6 +338,7 @@ fn dispatch_admin(
         "admin-users" => admin::users(coord)?,
         "admin-approve" => admin::approve(coord, &request.name, caller.as_uri())?,
         "admin-revoke" => admin::revoke(coord, &request.name, caller.as_uri(), now)?,
+        "admin-revoke-all" => admin::revoke_all(coord, &request.name, caller.as_uri(), now)?,
         "admin-expire" => admin::expire(coord, &request.name, caller.as_uri())?,
         "admin-routes" => admin::routes(coord)?,
         "admin-audit" => admin::audit(coord, parse_since(&request.name)?)?,

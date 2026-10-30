@@ -40,6 +40,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         "users" => "admin-users",
         "approve" => "admin-approve",
         "revoke" => "admin-revoke",
+        "revoke-all" => "admin-revoke-all",
         "expire" => "admin-expire",
         "routes" => "admin-routes",
         "audit" => "admin-audit",
@@ -60,12 +61,15 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         op,
         "admin-approve"
             | "admin-revoke"
+            | "admin-revoke-all"
             | "admin-expire"
             | "admin-grant-approve"
             | "admin-grant-revoke"
     ) {
         let what = if op.starts_with("admin-grant") {
             "a grant id"
+        } else if op == "admin-revoke-all" {
+            "a principal"
         } else {
             "a node name"
         };
@@ -141,7 +145,7 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
                 return print_audit(&value, call.json, call.verify_only);
             }
             print_admin(&call.op, &value)?;
-            if call.op == "admin-grant-revoke" {
+            if matches!(call.op.as_str(), "admin-grant-revoke" | "admin-revoke-all") {
                 println!("revoke_start_ms {started_ms}");
                 println!("revoke_done_ms {}", now_millis());
             }
@@ -191,6 +195,30 @@ fn print_admin(op: &str, value: &Value) -> Result<(), String> {
                 .get("deny_version")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| "The coordinator response is not valid.".to_string())?;
+            println!("deny_version {version}");
+        }
+        "admin-revoke-all" => {
+            let bad = || "The coordinator response is not valid.".to_string();
+            println!("revoked_all {}", text_field(value, "principal")?);
+            println!("revoke_scope all");
+            println!("svid_denied yes");
+            let grants = value
+                .get("grants")
+                .and_then(Value::as_array)
+                .ok_or_else(bad)?;
+            for grant in grants {
+                println!("revoked_grant {}", grant.as_str().ok_or_else(bad)?);
+            }
+            println!("grants_revoked {}", grants.len());
+            let nonces = value
+                .get("nonces")
+                .and_then(Value::as_u64)
+                .ok_or_else(bad)?;
+            println!("grant_nonces_denied {nonces}");
+            let version = value
+                .get("deny_version")
+                .and_then(Value::as_u64)
+                .ok_or_else(bad)?;
             println!("deny_version {version}");
         }
         "admin-expire" => {
@@ -395,6 +423,7 @@ orblx admin nodes --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin users --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin approve NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin revoke NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin revoke-all PRINCIPAL --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin expire NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin routes --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin grants --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
@@ -406,12 +435,15 @@ The command uses the node SVID in the state directory.
 The coordinator accepts the call when that SVID is an owner.
 approve puts the node into netmaps and grants.
 revoke adds the node to the deny set.
+revoke-all stops all access of one principal with one deny change and one audit record:
+the SVID, all agent grants of the principal, SSH, and file send.
+PRINCIPAL is a node name or a SPIFFE URI of a node, a user, or an agent.
 expire removes the node from netmaps until approve.
 grants lists the agent JIT grants.
 grant-approve lets the agent fetch the grant. Only an owner approves an agent grant.
 grant-revoke ends grant ID only. The ticket nonce of the grant goes into the deny set.
 Other grants for the same agent name stay valid. The coordinator can issue new grants for that name.
-To stop all grants for an agent, revoke each grant ID.
+To stop all grants for an agent, use revoke-all with the agent URI.
 audit prints the control-plane audit chain and the chain check.
 TIME is Unix seconds, YYYY-MM-DDTHH:MM:SSZ, or an age such as 30m, 2h, or 7d.
 --json prints one JSON record on each line.
@@ -445,6 +477,31 @@ mod tests {
             }
             Command::Help => panic!("the parser did not select approve"),
         }
+    }
+
+    #[test]
+    fn revoke_all_parses_the_principal() {
+        let command = parse(&[
+            "revoke-all".to_string(),
+            "spiffe://orblx.local/node/a".to_string(),
+            "--coord".to_string(),
+            "127.0.0.1:443".to_string(),
+        ])
+        .unwrap();
+        match command {
+            Command::Call(call) => {
+                assert_eq!(call.op, "admin-revoke-all");
+                assert_eq!(call.target, "spiffe://orblx.local/node/a");
+            }
+            Command::Help => panic!("the parser did not select revoke-all"),
+        }
+        let err = parse(&[
+            "revoke-all".to_string(),
+            "--coord".to_string(),
+            "127.0.0.1:443".to_string(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("a principal"));
     }
 
     #[test]

@@ -18,7 +18,7 @@ use orblx_agent::{
     MAX_GRANT_SECS,
 };
 use orblx_audit::{sha256_digest, ConfigAction, EMPTY_DIGEST};
-use orblx_identity::{Ipv4Destination, SpiffeId};
+use orblx_identity::{Ipv4Destination, SpiffeId, WorkloadKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -450,6 +450,65 @@ pub(crate) fn revoke(
     Ok(json!({"op": "grant-revoke", "grant": view, "deny_version": version}))
 }
 
+/// The result of one revoke-all call for the grants.
+pub(crate) struct PrincipalRevoke {
+    /// The grant IDs that changed to revoked.
+    pub(crate) grants: Vec<String>,
+    /// The number of ticket nonces that went into the deny file.
+    pub(crate) nonces: usize,
+    /// The deny file version after the call.
+    pub(crate) deny_version: u64,
+}
+
+/// Revoke all grants of one principal and deny the principal SPIFFE ID.
+///
+/// A node principal owns the grants that it requested. An agent principal owns
+/// the grants for its agent name. A user principal owns no grants.
+/// The function writes the deny file one time: the principal URI and the
+/// ticket nonce of each issued grant. Then it marks the grants revoked.
+/// The deny file changes first, so a failure after that leaves the access denied.
+/// The function writes no audit record. The caller writes one record.
+pub(crate) fn revoke_principal(
+    coord: &Coordinator,
+    principal: &SpiffeId,
+    now: SystemTime,
+) -> Result<PrincipalRevoke, CoordError> {
+    let _guard = GRANT_LOCK.lock().map_err(|_| CoordError::State)?;
+    let mut file = load(coord)?;
+    let owned = |record: &GrantRecord| match principal.kind() {
+        WorkloadKind::Node => record.requester == principal.name(),
+        WorkloadKind::Agent => record.agent == principal.name(),
+        WorkloadKind::User | WorkloadKind::Coord => false,
+    };
+    let mut ids = Vec::new();
+    let mut nonces = Vec::new();
+    for record in file.grants.iter().filter(|record| owned(record)) {
+        if record.state == REVOKED {
+            continue;
+        }
+        if record.state == ISSUED {
+            // An issued grant always has a ticket nonce.
+            let nonce = record.nonce.clone().ok_or(CoordError::State)?;
+            nonces.push(nonce);
+        }
+        ids.push(record.id.clone());
+    }
+    let deny_version = push_deny(coord, &[principal.as_uri().to_string()], &nonces, now)?;
+    for record in file.grants.iter_mut() {
+        if ids.contains(&record.id) {
+            record.state = REVOKED.to_string();
+        }
+    }
+    if !ids.is_empty() {
+        save(coord, &file)?;
+    }
+    Ok(PrincipalRevoke {
+        grants: ids,
+        nonces: nonces.len(),
+        deny_version,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -582,6 +641,146 @@ mod tests {
             panic!("the grant was not issued");
         };
         (id, hex_of(&issued.0.ticket.nonce))
+    }
+
+    fn issue_for(
+        coord: &Coordinator,
+        requester: &str,
+        owner: &SpiffeId,
+        now: SystemTime,
+    ) -> (String, String) {
+        let reply = request(coord, requester, &ask(8080, 120), now).unwrap();
+        let id = reply["id"].as_str().unwrap().to_string();
+        approve(coord, &id, owner.as_uri(), now).unwrap();
+        let Fetched::Issued(issued) = fetch(coord, requester, &id, now).unwrap() else {
+            panic!("the grant was not issued");
+        };
+        (id, hex_of(&issued.0.ticket.nonce))
+    }
+
+    fn audit_actions(coord: &Coordinator) -> Vec<Value> {
+        let audit = crate::audit(coord, None).unwrap();
+        assert_eq!(audit["verify"]["ok"], Value::Bool(true));
+        audit["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line.as_str()?).ok())
+            .collect()
+    }
+
+    #[test]
+    fn revoke_all_stops_one_principal_with_one_record() {
+        let dir = scratch();
+        let now = SystemTime::now();
+        let coord = Coordinator::open(&dir.0, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        for name in ["a", "b", "c"] {
+            let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+            coord
+                .enroll_token(name, &token.secret, &[format!("{name}:443")], &[], now)
+                .unwrap();
+        }
+        let owner = SpiffeId::node("owner").unwrap();
+        let (a1, a1_nonce) = issue_for(&coord, "a", &owner, now);
+        let (a2, a2_nonce) = issue_for(&coord, "a", &owner, now);
+        let pending = request(&coord, "a", &ask(8080, 60), now).unwrap();
+        let pending = pending["id"].as_str().unwrap().to_string();
+        let (c1, c1_nonce) = issue_for(&coord, "c", &owner, now);
+        let records_before = audit_actions(&coord).len();
+
+        let reply = crate::revoke_all(&coord, "a", owner.as_uri(), now).unwrap();
+        assert_eq!(reply["principal"], "spiffe://orblx.local/node/a");
+        assert_eq!(reply["scope"], "all");
+        assert_eq!(reply["nonces"], 2);
+        let mut revoked: Vec<String> = reply["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.as_str().unwrap().to_string())
+            .collect();
+        revoked.sort();
+        let mut want = vec![a1.clone(), a2.clone(), pending.clone()];
+        want.sort();
+        assert_eq!(revoked, want);
+
+        // One deny change holds the SVID and both issued nonces of a.
+        let deny = crate::deny_set(&coord, now).unwrap();
+        assert!(deny.reject_uri(&SpiffeId::node("a").unwrap()).is_err());
+        assert!(deny.reject_uri(&SpiffeId::node("c").unwrap()).is_ok());
+        let text = crate::deny_json(&coord, now).unwrap();
+        assert!(text.contains(&a1_nonce));
+        assert!(text.contains(&a2_nonce));
+        assert!(!text.contains(&c1_nonce));
+        assert!(!text.contains("spiffe://orblx.local/agent/bot"));
+        assert_eq!(reply["deny_version"], 1);
+
+        // The grants of a are revoked. The grant of c stays issued.
+        let listed = list(&coord, now).unwrap();
+        for grant in listed["grants"].as_array().unwrap() {
+            let id = grant["id"].as_str().unwrap();
+            if id == c1 {
+                assert_eq!(grant["state"], "issued");
+            } else {
+                assert_eq!(grant["state"], "revoked", "grant {id}");
+            }
+        }
+        assert!(fetch(&coord, "a", &pending, now).is_err());
+
+        // Exactly one audit record for the call.
+        let records = audit_actions(&coord);
+        assert_eq!(records.len(), records_before + 1);
+        let last = records.last().unwrap();
+        assert_eq!(last["action"], "revoke");
+        assert_eq!(last["target"], "spiffe://orblx.local/node/a");
+        let detail = last["detail"].as_str().unwrap();
+        assert!(detail.contains("scope all"), "{detail}");
+        assert!(detail.contains("grants 3 nonces 2"), "{detail}");
+
+        // A second call adds no grant and keeps one URI entry.
+        let again =
+            crate::revoke_all(&coord, "spiffe://orblx.local/node/a", owner.as_uri(), now).unwrap();
+        assert_eq!(again["grants"].as_array().unwrap().len(), 0);
+        let text = crate::deny_json(&coord, now).unwrap();
+        assert_eq!(text.matches("spiffe://orblx.local/node/a").count(), 1);
+    }
+
+    #[test]
+    fn revoke_all_refuses_bad_principals() {
+        let dir = scratch();
+        let now = SystemTime::now();
+        let coord = Coordinator::open(&dir.0, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        let owner = SpiffeId::node("owner").unwrap();
+        // The node is not enrolled.
+        assert!(crate::revoke_all(&coord, "ghost", owner.as_uri(), now).is_err());
+        assert!(crate::revoke_all(
+            &coord,
+            "spiffe://orblx.local/coord/coord",
+            owner.as_uri(),
+            now
+        )
+        .is_err());
+        assert!(crate::revoke_all(&coord, "spiffe://other/node/a", owner.as_uri(), now).is_err());
+        assert!(crate::revoke_all(&coord, owner.as_uri(), owner.as_uri(), now).is_err());
+        assert!(!dir.0.join("deny.json").exists());
+        // A user and an agent need no enroll. An agent owns the grants for its name.
+        let user = crate::revoke_all(
+            &coord,
+            "spiffe://orblx.local/user/alice",
+            owner.as_uri(),
+            now,
+        )
+        .unwrap();
+        assert_eq!(user["grants"].as_array().unwrap().len(), 0);
+        let agent = crate::revoke_all(
+            &coord,
+            "spiffe://orblx.local/agent/bot",
+            owner.as_uri(),
+            now,
+        )
+        .unwrap();
+        assert_eq!(agent["deny_version"], 2);
     }
 
     #[test]
