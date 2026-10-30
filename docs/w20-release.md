@@ -46,8 +46,11 @@ The workflow also stops when the tag is not `v` plus the workspace version.
 
 ```bash
 curl -fsSL https://github.com/KimSeogyu/Orblx/releases/latest/download/install.sh | sh
-curl -fsSL https://github.com/KimSeogyu/Orblx/releases/latest/download/install.sh | sh -s -- --version v0.1.0 --service
+curl -fsSL https://github.com/KimSeogyu/Orblx/releases/download/v0.1.0-rc.1/install.sh | sh -s -- --version v0.1.0-rc.1 --service
 ```
+
+A tag with a `-` suffix (for example `v0.1.0-rc.1`) is a GitHub pre-release.
+The GitHub `latest` URL does not use a pre-release, so give `--version TAG` for a pre-release.
 
 | Option | Variable | Content |
 | --- | --- | --- |
@@ -86,6 +89,7 @@ The code changes for the new russh API are:
 
 russh 0.65.0 needs Rust 1.89, so the workspace `rust-version` is now 1.89.
 `.github/dependabot.yml` does not change.
+After the merge, GitHub closed the russh alerts. On 2026-10-30 at 10:30 KST, `gh api repos/KimSeogyu/Orblx/dependabot/alerts?state=open` gives 0 open alerts. 36 russh alerts have the state `fixed`.
 
 [C] `scripts/proof/ssh.sh` with russh 0.65.0. The SSH command from alice to node b prints `alice`. This extract does not show the audit counter lines:
 
@@ -209,9 +213,105 @@ private_key_in_www none
 proof_ok
 ```
 
+## First real release: v0.1.0-rc.1
+
+The first real run of the release workflow is the pre-release `v0.1.0-rc.1`.
+
+| Item | Value |
+| --- | --- |
+| Release | https://github.com/KimSeogyu/Orblx/releases/tag/v0.1.0-rc.1 (pre-release) |
+| Tag | `v0.1.0-rc.1`, annotated tag object `4b44d9b8c78d10c1d3cd88848e1ac2afad0fd6af` |
+| Commit | `f3a4d2dd60a00021242fe5595153253d6eed86aa` (main) |
+| Workflow run | https://github.com/KimSeogyu/Orblx/actions/runs/40984619756, result success, attempt 1 |
+| Published | 2026-10-30 10:17 KST |
+
+The assets are these:
+
+| Asset | SHA-256 |
+| --- | --- |
+| `orblx-x86_64-unknown-linux-gnu.tar.gz` | `6f149805e35830669293213168cd1d2568c0407e63bca95f6f4f7cd918f03e3e` |
+| `orblx-aarch64-unknown-linux-gnu.tar.gz` | `4bc3ea77cd2cce2ac24c8e5cf1e2eb519d93e8b9d4254956e8817175e0253d3f` |
+| `orblx-x86_64-apple-darwin.tar.gz` | `04ca701b7226cecc6cea01fa8b249bd80e2f997daea765df9652cb2de2f7e620` |
+| `orblx-aarch64-apple-darwin.tar.gz` | `b577cb1f19aa2884ee47bfafa8e0613feb6081b8257d7b1d8c8f959a5a7e8209` |
+| `SHA256SUMS` | `42a5f752bf8e343d9833997008d795ca6816b94fc8898c3141e2188de689dff8` |
+| `SHA256SUMS.sigstore.json` | `832f9fbefec783bccadd7aaf2b597812456060da6430e9fd3ff58cc947d86228` |
+| `install.sh` | `38f30084d84a5d94f13a0346039ca5f1dba81326787371095698401ddd5e251a` |
+
+## Real release proof
+
+`scripts/proof/release-real.sh` checks the real release assets.
+Run it on a Linux x86_64 host with Docker:
+
+```bash
+RELEASE_TAG=v0.1.0-rc.1 COSIGN_BIN=/path/to/cosign-linux-amd64 ./scripts/proof/release-real.sh
+```
+
+The script does these steps:
+
+1. A clean [C] Ubuntu 24.04 container with cosign v3.1.4 (and no orblx) runs `curl -fsSL .../install.sh | sh -s -- --version v0.1.0-rc.1`. All files come from the real GitHub release URLs.
+2. The container checks the keyless signature again with the exact identity `https://github.com/KimSeogyu/Orblx/.github/workflows/release.yml@refs/tags/v0.1.0-rc.1` and the issuer `https://token.actions.githubusercontent.com`. It prints the Fulcio certificate fields.
+3. The REAL host downloads the real assets and changes one byte in the middle of the x86_64 Linux tarball.
+4. A [C] mirror container serves the changed copy with the real `SHA256SUMS` and the real bundle. A clean [C] container runs the real `install.sh` with `--base-url` set to the mirror. The install must stop, and `/usr/local/bin/orblx` must not exist.
+
+The containers use the default Docker bridge. cosign gets the Sigstore TUF root from the internet.
+
+Real output (`rc1-f3a4d2dd-release-real.log`, 2026-10-30 KST):
+
+```text
+=== [C] install from the real release with curl | sh ===
+orblx install: target x86_64-unknown-linux-gnu version v0.1.0-rc.1 source https://github.com/KimSeogyu/Orblx/releases/download/v0.1.0-rc.1
+orblx install: check the signature of SHA256SUMS
+orblx install: signature ok
+orblx install: check the SHA-256 of orblx-x86_64-unknown-linux-gnu.tar.gz
+orblx install: checksum ok 6f149805e35830669293213168cd1d2568c0407e63bca95f6f4f7cd918f03e3e
+orblx install: installed /usr/local/bin/orblx
+orblx 0.1.0-rc.1
+orblx install: done
+-rwxr-xr-x /usr/local/bin/orblx
+--- orblx --version
+orblx 0.1.0-rc.1
+--- cosign verify-blob with the exact identity
+Verified OK
+verified_identity https://github.com/KimSeogyu/Orblx/.github/workflows/release.yml@refs/tags/v0.1.0-rc.1
+verified_issuer https://token.actions.githubusercontent.com
+orblx-x86_64-unknown-linux-gnu.tar.gz: OK
+--- the Fulcio certificate in the bundle
+bundle_media_type application/vnd.dev.sigstore.bundle.v0.3+json
+tlog_entries 1
+issuer=O = sigstore.dev, CN = sigstore-intermediate
+URI:https://github.com/KimSeogyu/Orblx/.github/workflows/release.yml@refs/tags/v0.1.0-rc.1
+1.3.6.1.4.1.57264.1.1: 
+https://token.actions.githubusercontent.com
+1.3.6.1.4.1.57264.1.8: 
+.+https://token.actions.githubusercontent.com
+1.3.6.1.4.1.57264.1.9: 
+.Vhttps://github.com/KimSeogyu/Orblx/.github/workflows/release.yml@refs/tags/v0.1.0-rc.1
+1.3.6.1.4.1.57264.1.12: 
+."https://github.com/KimSeogyu/Orblx
+1.3.6.1.4.1.57264.1.14: 
+..refs/tags/v0.1.0-rc.1
+=== [REAL] get the real assets and change one byte in the tarball ===
+orblx-x86_64-unknown-linux-gnu.tar.gz: OK
+changed byte 2960451 of orblx-x86_64-unknown-linux-gnu.tar.gz
+ba701abe4f37b3d8d2a224d0178e0a522f18f51d1b5e0d4157e5a55951f7c841  orblx-x86_64-unknown-linux-gnu.tar.gz
+=== [C] start the mirror container with the changed tarball ===
+mirror http://172.17.0.2:8000 (orblx-release-mirror)
+=== [C] install from the changed mirror must fail ===
+orblx install: warning: http://172.17.0.2:8000 is not HTTPS. The signature and the checksum still protect the files.
+orblx install: target x86_64-unknown-linux-gnu version v0.1.0-rc.1 source http://172.17.0.2:8000
+orblx install: check the signature of SHA256SUMS
+orblx install: signature ok
+orblx install: check the SHA-256 of orblx-x86_64-unknown-linux-gnu.tar.gz
+orblx install: error: The checksum of orblx-x86_64-unknown-linux-gnu.tar.gz is not correct. The script installed nothing.
+orblx_absent
+install_exit 1
+proof_ok
+```
+
 ## Limits
 
-- The proof checks the key path of the installer. The keyless path needs a real tag run in GitHub Actions.
-- No release tag exists yet. The first `v0.1.0` tag is the first real run of the workflow.
 - The macOS binaries are not signed or notarized by Apple. Gatekeeper can block a binary from a browser download. `curl` downloads do not get the quarantine flag.
-- The installer needs cosign on the host.
+- The installer needs cosign on the host. It has no option to skip the signature check.
+- The Linux binaries need glibc 2.35 or later, because the builds use Ubuntu 22.04.
+- The real release proof covers the x86_64 Linux asset only. The other assets have the same signature and checksum path, but no proof installs them.
+- A pre-release is not the GitHub `latest` release. Give `--version TAG` to install a pre-release.

@@ -3,7 +3,7 @@
 This change has two parts:
 
 1. After an SVID renewal, `orblx nat run` sends a new signed hello on the direct path and on the relay path. The peer line in `orblx status` then shows the new `svid_expiry`.
-2. The direct-path ping RTT moves from about 50 ms to about 1.6 ms. The cause was a timer in the TUN thread.
+2. The direct-path ping RTT moves from about 50 ms to about 1.5 ms. The cause was a timer in the TUN thread.
 
 `scripts/proof/nat-realism.sh` proves both parts. It prints `proof_ok`.
 All extra hosts are [C] containers on the same host. The topology is the W20 topology (see [w20-nat-realism.md](w20-nat-realism.md)).
@@ -31,38 +31,59 @@ The coordinator does not allow a second enrollment of a name, so four new names 
 The script reads each peer expiry before the first renewal.
 It then waits until the peer line shows a later expiry that is equal to the `svid_expiry` on the self line of the peer.
 
-Real output (dev run on this branch):
+Real output (the run at the PR head 035f2179, `pr50-035f2179-nat-realism.log`):
 
 ```text
 coord node svid ttl 60
-direct node-e sees node-f before peer_svid_expiry 1793320675
+direct node-e sees node-f before peer_svid_expiry 1793321587
 state up
 name node-e
 overlay_ip 100.64.0.5
 svid spiffe://orblx.local/node/node-e
-svid_expiry 1793320714
-peer node-f overlay_ip 100.64.0.6 path direct svid spiffe://orblx.local/node/node-f svid_expiry 1793320715
-direct node-e sees node-f after peer_svid_expiry 1793320715 peer_self_svid_expiry 1793320715 path direct
-orblx-natr-b: The node renewed the SVID. The new expiry is 1793320715.
-direct node-f sees node-e before peer_svid_expiry 1793320674
-direct node-f sees node-e after peer_svid_expiry 1793320714 peer_self_svid_expiry 1793320714 path direct
-orblx-natr-a: The node renewed the SVID. The new expiry is 1793320714.
-relay node-g sees node-h before peer_svid_expiry 1793320677
+svid_expiry 1793321627
+peer node-f overlay_ip 100.64.0.6 path direct svid spiffe://orblx.local/node/node-f svid_expiry 1793321627
+direct node-e sees node-f after peer_svid_expiry 1793321627 peer_self_svid_expiry 1793321627 path direct
+orblx-natr-b: The node renewed the SVID. The new expiry is 1793321627.
+direct node-f sees node-e before peer_svid_expiry 1793321587
+state up
+name node-f
+overlay_ip 100.64.0.6
+svid spiffe://orblx.local/node/node-f
+svid_expiry 1793321627
+peer node-e overlay_ip 100.64.0.5 path direct svid spiffe://orblx.local/node/node-e svid_expiry 1793321627
+direct node-f sees node-e after peer_svid_expiry 1793321627 peer_self_svid_expiry 1793321627 path direct
+orblx-natr-a: The node renewed the SVID. The new expiry is 1793321627.
+relay node-g sees node-h before peer_svid_expiry 1793321589
 state up
 name node-g
 overlay_ip 100.64.0.7
 svid spiffe://orblx.local/node/node-g
-svid_expiry 1793320716
-peer node-h overlay_ip 100.64.0.8 path relay svid spiffe://orblx.local/node/node-h svid_expiry 1793320717
-relay node-g sees node-h after peer_svid_expiry 1793320717 peer_self_svid_expiry 1793320717 path relay
-orblx-natr-d: The node renewed the SVID. The new expiry is 1793320717.
-relay node-h sees node-g before peer_svid_expiry 1793320676
-relay node-h sees node-g after peer_svid_expiry 1793320716 peer_self_svid_expiry 1793320716 path relay
-orblx-natr-c: The node renewed the SVID. The new expiry is 1793320716.
+svid_expiry 1793321628
+peer node-h overlay_ip 100.64.0.8 path relay svid spiffe://orblx.local/node/node-h svid_expiry 1793321629
+relay node-g sees node-h after peer_svid_expiry 1793321629 peer_self_svid_expiry 1793321629 path relay
+orblx-natr-d: The node renewed the SVID. The new expiry is 1793321629.
+relay node-h sees node-g before peer_svid_expiry 1793321588
+state up
+name node-h
+overlay_ip 100.64.0.8
+svid spiffe://orblx.local/node/node-h
+svid_expiry 1793321629
+peer node-g overlay_ip 100.64.0.7 path relay svid spiffe://orblx.local/node/node-g svid_expiry 1793321628
+relay node-h sees node-g after peer_svid_expiry 1793321628 peer_self_svid_expiry 1793321628 path relay
+orblx-natr-c: The node renewed the SVID. The new expiry is 1793321628.
+50 packets transmitted, 50 received, 0% packet loss, time 9833ms
+rtt min/avg/max/mdev = 0.928/1.561/2.293/0.339 ms
 renew_direct steady lost 0/50
+50 packets transmitted, 50 received, 0% packet loss, time 9838ms
+rtt min/avg/max/mdev = 4.761/6.581/9.457/1.206 ms
 renew_relay steady lost 0/50
+renew direct node-e sees node-f path direct peer_svid_expiry 1793321587 to 1793321627
+renew direct node-f sees node-e path direct peer_svid_expiry 1793321587 to 1793321627
+renew relay node-g sees node-h path relay peer_svid_expiry 1793321589 to 1793321629
+renew relay node-h sees node-g path relay peer_svid_expiry 1793321588 to 1793321628
 ```
 
+The last four lines come from the summary at the end of the log.
 Each peer expiry moves forward by 40 s: one renewal at 2/3 of a 60 s life.
 
 ## Part 2: direct-path RTT
@@ -86,13 +107,16 @@ overlay_i0.23 rtt min/avg/max/mdev = 50.154/64.323/100.594/22.498 ms
 rtt plain_avg_ms 0.033 direct_avg_ms 57.277 direct_i0.23_avg_ms 64.323
 ```
 
-After (this branch):
+After (the run at the PR head 035f2179):
 
 ```text
-plain   rtt min/avg/max/mdev = 0.019/0.041/0.140/0.018 ms
-overlay rtt min/avg/max/mdev = 0.746/1.591/2.318/0.426 ms
-overlay_i0.23 rtt min/avg/max/mdev = 0.793/1.956/2.593/0.409 ms
-rtt plain_avg_ms 0.041 direct_avg_ms 1.591 direct_i0.23_avg_ms 1.956
+plain 50 packets transmitted, 50 received, 0% packet loss, time 10065ms
+rtt min/avg/max/mdev = 0.024/0.037/0.060/0.004 ms
+overlay 50 packets transmitted, 50 received, 0% packet loss, time 9839ms
+rtt min/avg/max/mdev = 0.834/1.541/2.540/0.425 ms
+overlay_i0.23 50 packets transmitted, 50 received, 0% packet loss, time 11325ms
+rtt min/avg/max/mdev = 0.896/1.893/2.687/0.455 ms
+rtt plain_avg_ms 0.037 direct_avg_ms 1.541 direct_i0.23_avg_ms 1.893
 rtt limit_ms 5 ok
 ```
 
@@ -113,10 +137,10 @@ The macOS utun thread (`tun_macos.rs`) had the same read-then-write loop.
 
 ### The remaining 1.5 ms
 
-The direct RTT is 1.55 ms above the plain RTT. The proof uses a debug build.
+The direct RTT (1.541 ms average) is 1.50 ms above the plain RTT (0.037 ms average). The proof uses a debug build.
 
 - Crypto: one seal and one open of an 84-byte ping take 125 us in the debug build (6 us in a release build). Measured with a loop of 1000 frames in a unit test. One RTT has two seals and two opens, so about 0.25 ms.
-- Thread handoffs: each direction has four handoffs. On the sender: TUN read thread to bridge thread, bridge thread to router thread. On the receiver: direct thread to bridge thread, bridge thread to TUN write thread. The rest, about 1.3 ms for 8 handoffs in one RTT, is the wake-up time of these threads in the containers. This part is an estimate. It was not measured one by one.
+- Thread handoffs: each direction has four handoffs. On the sender: TUN read thread to bridge thread, bridge thread to router thread. On the receiver: direct thread to bridge thread, bridge thread to TUN write thread. The rest, about 1.25 ms for 8 handoffs in one RTT, is the wake-up time of these threads in the containers. This part is an estimate. It was not measured one by one.
 
 ## Caveats
 
