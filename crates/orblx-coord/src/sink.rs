@@ -255,4 +255,210 @@ mod tests {
         );
         assert_eq!(roots_of(b"no pem").err(), Some(Failure::step("ca")));
     }
+
+    /// A lab CA and a server certificate for `localhost`.
+    struct Lab {
+        ca_pem: String,
+        server: Arc<rustls::ServerConfig>,
+    }
+
+    fn lab(ca_name: &str) -> Lab {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, ca_name);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .signed_by(&leaf_key, &issuer)
+            .unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::try_from(leaf_key.serialize_der()).unwrap();
+        let server = rustls::ServerConfig::builder_with_provider(crate::tlsutil::crypto_provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![leaf.der().clone()], key)
+            .unwrap();
+        Lab {
+            ca_pem: ca_cert.pem(),
+            server: Arc::new(server),
+        }
+    }
+
+    fn bodies(dir: &Path) -> Vec<WebhookBody> {
+        let mut log = orblx_audit::ConfigLog::open(&dir.join("chain.jsonl")).unwrap();
+        (0..3)
+            .map(|at| {
+                let record = log
+                    .append(orblx_audit::ConfigEvent {
+                        actor: "spiffe://orblx.local/node/owner".into(),
+                        at_unix: 1_700_000_000 + at,
+                        action: orblx_audit::ConfigAction::TokenUse,
+                        target: "t1".into(),
+                        before: [0; 32],
+                        after: [1; 32],
+                        detail: "op nodes scope nodes:read".into(),
+                    })
+                    .unwrap();
+                orblx_audit::webhook_body(&record.to_json_line().unwrap()).unwrap()
+            })
+            .collect()
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("orblx-sink-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// One syslog TLS server connection. `ack` false closes TCP without close_notify.
+    async fn syslog_server(
+        listener: tokio::net::TcpListener,
+        config: Arc<rustls::ServerConfig>,
+        ack: bool,
+    ) -> Vec<u8> {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let Ok(mut tls) = tokio_rustls::TlsAcceptor::from(config).accept(tcp).await else {
+            return Vec::new();
+        };
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match tls.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => got.extend_from_slice(&buf[..read]),
+            }
+        }
+        if ack {
+            let _ = tls.shutdown().await;
+        } else {
+            let (tcp, _) = tls.into_inner();
+            drop(tcp);
+        }
+        got
+    }
+
+    fn syslog_sender(dir: &Path, port: u16) -> SinkSender {
+        SinkSender::new(
+            AuditSink {
+                name: "sys".into(),
+                target: SinkTarget::SyslogTls {
+                    host: "localhost".into(),
+                    port,
+                },
+                credential_file: None,
+                ca_file: Some("ca.pem".into()),
+            },
+            Some(dir.to_path_buf()),
+            "coord".into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn syslog_tls_needs_the_server_close_notify_and_a_good_certificate() {
+        let dir = scratch("syslog");
+        let good = lab("orblx lab ca");
+        std::fs::write(dir.join("ca.pem"), &good.ca_pem).unwrap();
+        let bodies = bodies(&dir);
+        let want: String = bodies
+            .iter()
+            .map(|body| orblx_audit::syslog_frame(body, "coord"))
+            .collect();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(syslog_server(listener, Arc::clone(&good.server), true));
+        let mut sender = syslog_sender(&dir, port);
+        assert_eq!(sender.send(&bodies).await, Ok(()));
+        assert_eq!(server.await.unwrap(), want.as_bytes());
+
+        // A TCP close without close_notify is not an ack.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(syslog_server(listener, Arc::clone(&good.server), false));
+        let mut sender = syslog_sender(&dir, port);
+        assert_eq!(sender.send(&bodies).await, Err(Failure::step("ack")));
+        let _ = server.await;
+
+        // A certificate from a different CA: the TLS step fails and the server gets 0 bytes.
+        let other = lab("orblx other ca");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(syslog_server(listener, other.server, true));
+        let mut sender = syslog_sender(&dir, port);
+        assert_eq!(sender.send(&bodies).await, Err(Failure::step("tls")));
+        assert!(server.await.unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn https_hec_sends_one_batch_with_the_credential_header() {
+        let dir = scratch("hec");
+        let good = lab("orblx lab ca");
+        std::fs::write(dir.join("ca.pem"), &good.ca_pem).unwrap();
+        std::fs::write(dir.join("hec.token"), "lab-token-1\n").unwrap();
+        let bodies = bodies(&dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = Arc::clone(&good.server);
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = tokio_rustls::TlsAcceptor::from(config)
+                .accept(tcp)
+                .await
+                .unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let read = tls.read(&mut buf).await.unwrap();
+                raw.extend_from_slice(&buf[..read]);
+                let text = String::from_utf8_lossy(&raw).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length: usize = text
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Content-Length: "))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    if raw.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = tls.shutdown().await;
+            String::from_utf8(raw).unwrap()
+        });
+        let mut sender = SinkSender::new(
+            AuditSink {
+                name: "hec".into(),
+                target: SinkTarget::Https {
+                    url: format!("https://localhost:{port}/services/collector/event"),
+                    format: SinkFormat::SplunkHec,
+                },
+                credential_file: Some("hec.token".into()),
+                ca_file: Some("ca.pem".into()),
+            },
+            Some(dir.clone()),
+            "coord".into(),
+        );
+        assert_eq!(sender.send(&bodies).await, Ok(()));
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /services/collector/event HTTP/1.1\r\n"));
+        assert!(request.contains("\r\nAuthorization: Splunk lab-token-1\r\n"));
+        assert!(request.contains("\r\nX-Orblx-First-Seq: 0\r\nX-Orblx-Count: 3\r\n"));
+        let body = &request[request.find("\r\n\r\n").unwrap() + 4..];
+        assert_eq!(
+            body,
+            orblx_audit::splunk_hec_batch(&bodies, "coord").unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
