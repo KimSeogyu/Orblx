@@ -9,6 +9,8 @@
 # when a switch gap is more than 1 second, or when svid_expiry is unknown.
 # The script also fails when the direct ping RTT is more than RTT_LIMIT_MS above
 # the plain container RTT, or when a renewed SVID does not reach the peer line.
+# W25-14: the script also fails when the max RTT of a steady ping run is more than
+# STEADY_MAX_MS (ORBLX_NATR_STEADY_MAX_MS, default 100 ms).
 # W21: the script also fails when the relay ping RTT avg is more than RELAY_SLACK_MS
 # above the direct ping RTT avg, when a relay ping is lost, or when an idle orblx
 # process uses more than IDLE_CPU_PCT percent CPU.
@@ -50,6 +52,8 @@ WAN_D="${PUB}.14"
 PINGS=50
 MAX_LOSS=1
 MAX_GAP_MS=1000
+# W25-14: the most max RTT of a steady ping run on a stable path.
+STEADY_MAX_MS="${ORBLX_NATR_STEADY_MAX_MS:-100}"
 SPRAY_MAX=2048
 # The direct overlay RTT may be at most this much above the plain container RTT.
 RTT_LIMIT_MS="${ORBLX_RTT_LIMIT_MS:-5}"
@@ -360,15 +364,10 @@ steady_pings() {
   local label="$1"
   local container="$2"
   local ip="$3"
-  local out received
+  local out
   out="$(docker exec "$container" ping -n -i 0.2 -c "$PINGS" -W 1 "$ip" | tail -2)"
   printf '%s\n' "$out"
-  received="$(printf '%s\n' "$out" | awk '/packets transmitted/ {print $4}')"
-  echo "${label} steady lost $((PINGS - received))/${PINGS}"
-  if (( PINGS - received > MAX_LOSS )); then
-    echo "${label} lost too many pings on a stable path." >&2
-    exit 1
-  fi
+  printf '%s\n' "$out" | steady_ping_gate "$label" "$PINGS" "$MAX_LOSS" "$STEADY_MAX_MS" || exit 1
 }
 
 # Print the avg value of one ping run.

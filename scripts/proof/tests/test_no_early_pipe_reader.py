@@ -265,3 +265,78 @@ class ProofHardeningTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(subprocess.run(["sh", "-c", "command -v flock"], capture_output=True).returncode != 0,
+                 "no flock on this host")
+class ProofLockQueueTest(unittest.TestCase):
+    """W25-14: two or more proofs that start at the same time run one after the other, in arrival order."""
+
+    def test_waiters_take_the_lock_in_arrival_order_and_print_the_wait(self):
+        import tempfile
+        work = tempfile.mkdtemp()
+        lock = os.path.join(work, "lock")
+        order = os.path.join(work, "order")
+        script = (
+            '. "$0"; trap proof_lock_end EXIT; proof_lock_take "$1"; '
+            'echo "start $1 $(date +%s%N)" >>"$2"; sleep "$3"; echo "end $1 $(date +%s%N)" >>"$2"'
+        )
+        lib = os.path.join(REPO, "scripts", "proof", "proof-lock.sh")
+        env = dict(os.environ, ORBLX_PROOF_LOCK=lock, ORBLX_PROOF_LOCK_NOTE_SECS="1", ORBLX_PROOF_SAMPLE_SECS="1")
+        procs = []
+        for label, hold in [("holder", "3"), ("first", "1"), ("second", "1"), ("third", "1")]:
+            procs.append(subprocess.Popen(["bash", "-c", script, lib, label, order, hold], env=env,
+                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
+            time.sleep(0.4)
+        outs = [p.communicate(timeout=60)[0] for p in procs]
+        self.assertEqual([p.returncode for p in procs], [0, 0, 0, 0], outs)
+        with open(order) as f:
+            events = [l.split() for l in f.read().split("\n") if l]
+        self.assertEqual([e[1] for e in events if e[0] == "start"], ["holder", "first", "second", "third"])
+        # One proof at a time: each start comes after the end of the one before.
+        self.assertEqual([e[0] for e in events], ["start", "end"] * 4)
+        self.assertRegex(outs[3], r"proof_lock third waiting for lock, \d+ s, position \d+, .*holder: label=")
+        self.assertGreaterEqual(len(re.findall(r"waiting for lock", outs[3])), 3)
+
+
+class SteadyPingGateTest(unittest.TestCase):
+    """W25-14: nat-realism.sh must fail a steady ping run with a high max RTT or with loss.
+
+    The bad sample is from the W25-1b run2 log (w25a1b-branch-80a507f-run2-release-nat-realism.log,
+    prc_sym steady): max 121.701 ms, and the old script printed proof_ok.
+    """
+
+    BAD = ("50 packets transmitted, 50 received, 0% packet loss, time 10087ms\n"
+           "rtt min/avg/max/mdev = 0.214/2.979/121.701/16.961 ms\n")
+    GOOD = ("50 packets transmitted, 50 received, 0% packet loss, time 10045ms\n"
+            "rtt min/avg/max/mdev = 0.202/0.525/1.029/0.223 ms\n")
+    LOSS = ("50 packets transmitted, 48 received, 4% packet loss, time 10045ms\n"
+            "rtt min/avg/max/mdev = 0.202/0.525/1.029/0.223 ms\n")
+
+    def gate(self, text, limit="100"):
+        return subprocess.run(["bash", "-c", '. "$0"; set -euo pipefail; steady_ping_gate prc_sym 50 1 "$1"',
+                               PIPE_LIB, limit], input=text, capture_output=True, text=True)
+
+    def test_a_high_max_rtt_fails(self):
+        res = self.gate(self.BAD)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("prc_sym steady lost 0/50 max_ms 121.701 limit_ms 100", res.stdout)
+        self.assertIn("max ping RTT 121.701 ms is more than 100 ms", res.stderr)
+
+    def test_a_normal_run_passes(self):
+        res = self.gate(self.GOOD)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_loss_and_a_missing_summary_fail(self):
+        self.assertEqual(self.gate(self.LOSS).returncode, 1)
+        self.assertEqual(self.gate("").returncode, 1)
+        self.assertEqual(self.gate("ping: unknown host\n").returncode, 1)
+
+    def test_nat_realism_uses_the_gate_for_each_steady_run(self):
+        with open(os.path.join(REPO, "scripts", "proof", "nat-realism.sh")) as f:
+            text = f.read()
+        body = text[text.index("steady_pings() {"):]
+        body = body[: body.index("\n}\n")]
+        self.assertIn('steady_ping_gate "$label" "$PINGS" "$MAX_LOSS" "$STEADY_MAX_MS" || exit 1', body)
+        # proof_ok comes after the last steady ping run.
+        self.assertGreater(text.rindex("proof_ok"), text.rindex("\nsteady_pings "))
