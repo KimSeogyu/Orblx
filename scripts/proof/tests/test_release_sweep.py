@@ -27,6 +27,8 @@ PROOFS = {
     "steps.sh": "mkdir -p target/st\nprintf 'step a line\\nproof_ok\\n' >target/st/run1.log\n"
                 "printf 'step b line\\n' >target/st/run2.log\necho 'gate_x ok: 2 runs'\n",
     "gatefail.sh": "echo proof_ok\necho 'gate_x failed: median low'\n",
+    "natr.sh": "echo 'steady_warn prc_prc sample 140 ms over 100 ms'\necho proof_ok\n",
+    "natrq.sh": "echo 'prc_prc steady lost 0/20 max_ms 40 limit_ms 1000'\necho proof_ok\n",
     "loud.sh": "seq 1 100000\necho 'to stderr' >&2\nprintf 'no newline at end'\necho\necho proof_ok\n",
 }
 
@@ -57,6 +59,13 @@ row|1|Mesh|ok
 row|3|Lock|lock ok
 proof|ok|scripts/proof/ok.sh|-|-
 proof|lock|scripts/proof/lock.sh|-|-
+"""
+
+NATR = """
+row|29|SVID|nat-realism
+gate|G1|A gate|steps
+proof|nat-realism|scripts/proof/natr.sh|-|-
+proof|steps|scripts/proof/steps.sh|-|-|^gate_x ok: |target/st/run*.log
 """
 
 SWEEP_LINE = re.compile(r"^(proof_(lock|context|contention) |release_sweep: )")
@@ -201,6 +210,17 @@ class ReleaseSweepTest(unittest.TestCase):
         self.assertRegex(out.stdout, r"Estimate: \d+ s \(\d+ min\) for the \d+ proofs with a measure")
         if shutil.which("flock"):
             self.assertRegex(out.stdout, r"\| ok \| 1, 3 \| \d+ \| .*rc3-sweep-testsha-ok\.log \|")
+
+    def test_a_steady_warn_rate_over_one_percent_is_reported_and_does_not_fail(self):
+        out = self.run_sweep(NATR)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("steady_warn: 1 of 3 nat-realism runs have a steady_warn line (33.3%). Report only.", out.stdout)
+        self.assertIn("steady_warn_rate over 1%: root-cause item (1 of 3 nat-realism runs, 33.3%)", out.stdout)
+        self.assertIn("Failed rows: none.", self.table())
+        out = self.run_sweep(NATR.replace("natr.sh", "natrq.sh"))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("steady_warn: 0 of 3 nat-realism runs have a steady_warn line (0.0%).", out.stdout)
+        self.assertNotIn("steady_warn_rate over 1%", out.stdout)
 
     def test_the_real_manifest_maps_every_shipped_row(self):
         with open(REAL_MANIFEST) as f:

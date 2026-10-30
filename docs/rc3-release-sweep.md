@@ -5,7 +5,7 @@ the Tailscale gap matrix on one commit. The proofs run one at a time under the W
 lock. The exit code is not 0 when a proof fails or when a shipped row has no proof. This is rc.3
 condition 4, and later the nightly run on main (the nightly schedule is not in this change).
 
-The rc.3 sweep counts only on a commit that has the W25-14 and the W25-6b merges.
+The rc.3 sweep counts only on a commit that has the W25-14, the W25-14b (coord-enroll fix) and the W25-6b merges.
 
 ## Commands
 
@@ -126,6 +126,23 @@ output to files of its own (`sym-throughput`: `target/sym-throughput/runN.log` o
 (`=== release_sweep: step log ... (full) ===`). The sweep does not change the proof scripts
 (W25-14 owns them); since W25-14d (#101) no proof pipes `cargo` output into a filter.
 
+### steady_warn rate (report only)
+
+`nat-realism.sh` prints a `steady_warn` line when a steady ping sample is over 100 ms. It is
+report only. The sweep counts the nat-realism runs that have at least one `steady_warn` line: the
+log of the `nat-realism` proof is one run, and each step log of a proof with step logs is one
+run (the five or more release `nat-realism.sh` runs of `sym-throughput`). The summary always has
+the line `steady_warn: W of N nat-realism runs have a steady_warn line (P%). Report only.` When
+more than 1% of the runs have one, it adds:
+
+```
+steady_warn_rate over 1%: root-cause item (W of N nat-realism runs, P%). This does not fail the sweep.
+```
+
+This line does not change the exit code. Note: with about six nat-realism runs in one sweep, one
+run with a `steady_warn` line is over 1%. On main (4bcc3b0) `nat-realism.sh` does not print
+`steady_warn` yet, so the count is 0 until the proof prints it.
+
 The script sends no proof output through a pipe. The checks read the whole file (the
 `has_line` helper of #94, and awk with no early exit), so no reader can end early and cause
 SIGPIPE (exit 141) under `set -o pipefail`.
@@ -175,6 +192,7 @@ caller is not root, so it never asks for a password.
   the step logs, whole;
 - the lock is taken (lock mode `proof` and `sweep`);
 - `--plan` lists every row and proof and prints the estimate;
+- a `steady_warn` rate over 1% prints the root-cause line and does not fail the sweep;
 - the real manifest has every shipped row, and each proof it names is defined.
 
 `scripts/proof/tests/test_no_early_pipe_reader.py` checks the script for early pipe readers.
@@ -217,11 +235,11 @@ Estimate: 1428 s (23 min) for the 16 proofs with a measure (the run time under t
 Plan FAIL: rows 28.
 
 The plan fails on row 28 (no proof). The real rc.3 sweep runs later, on a commit with the
-W25-14 and W25-6b merges, when the PO says so.
+W25-14, W25-14b (coord-enroll fix) and W25-6b merges, when the PO says so.
 
 ## Proof dry run on main (pass 1)
 
-This run used the first version of the script (one line for each proof, no manifest). It is for early detection only. **It does not count for rc.3.** The real sweep runs later on a commit that has the W25-14 and W25-6b merges.
+This run used the first version of the script (one line for each proof, no manifest). It is for early detection only. **It does not count for rc.3.** The real sweep runs later on a commit that has the W25-14, W25-14b (coord-enroll fix) and W25-6b merges.
 
 Commit: `cd6c8eea` (main at the start of the dry run, before W25-6, W25-14 and the FIFO lock). Started 00:29:53 KST, lock mode `proof`. The build took about 1 min. The other proofs of the box ran at the same time, so most of each proof time below is the wait for the lock. The live table is `/workspace/orblx-w18-proof/rc3-sweep-cd6c8eea.md`. `policy-sync` and `sym-throughput` are not in this commit.
 

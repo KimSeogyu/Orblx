@@ -240,6 +240,24 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 done <"$MANIFEST_TMP"
 [[ "${#R_ID[@]}" -gt 0 && "${#P_NAME[@]}" -gt 0 ]] || die "manifest: no rows or no proofs"
 
+# Report only (PO, W25-17): nat-realism prints a steady_warn line for a steady ping sample over
+# 100 ms. A run is the nat-realism proof log, or one step log section of a proof with step logs
+# (the nat-realism runs of sym-throughput). Print "RUNS WARNED" for one proof log.
+STEADY_RE='(^|[^[:alnum:]_])steady_warn([^[:alnum:]_]|$)'
+steady_warn_runs() {
+  local log="$1" name="$2" steps="$3"
+  [[ "$name" == nat-realism || -n "$steps" ]] || { echo "0 0"; return 0; }
+  awk -v re="$STEADY_RE" -v sections="${steps:+1}" '
+    index($0, "=== release_sweep: step log ") == 1 { runs++; cur = runs; next }
+    index($0, "release_sweep: ") == 1 { next }
+    $0 ~ re { if (sections == "") hit[0] = 1; else if (cur) hit[cur] = 1 }
+    END {
+      if (sections == "") { print 1, (0 in hit) ? 1 : 0; exit }
+      n = 0; for (k in hit) n++
+      print runs + 0, n
+    }' "$log"
+}
+
 proof_index() {
   local i
   for i in "${!P_NAME[@]}"; do
@@ -453,6 +471,8 @@ case "$LOCK_MODE" in
 esac
 
 FAILED_ROWS=""
+STEADY_RUNS=0
+STEADY_WARNED=0
 failed=0
 ran=0
 not_run=0
@@ -531,6 +551,9 @@ for i in "${!P_NAME[@]}"; do
   P_LOG[$i]="$log"
   P_TIME[$i]="${secs} s (run ${run:-?} s, lock wait ${wait:-?} s)"
   P_CONT[$i]="$(contention_of "$log" "$name")"
+  read -r s_runs s_warned <<<"$(steady_warn_runs "$log" "$name" "${P_STEPS[$i]}")" || true
+  STEADY_RUNS=$((STEADY_RUNS + ${s_runs:-0}))
+  STEADY_WARNED=$((STEADY_WARNED + ${s_warned:-0}))
   note "proof $name rows $(rows_of "$name") end $(now) secs $secs result $result"
   if [[ -z "$TEST_ROOT" && "$KEEP" != 1 && "${P_IMAGES[$i]}" != "-" ]]; then
     for image in ${P_IMAGES[$i]}; do
@@ -548,6 +571,15 @@ total=$(( $(date +%s) - SWEEP_START ))
   echo "Proofs run: $ran. Failed proofs: $failed. Not run: $not_run. Total time: ${total} s ($((total / 60)) min $((total % 60)) s). Ended $(date '+%Y-%m-%d %H:%M:%S %Z')."
   if [[ "$not_run" -gt 0 ]]; then
     echo "Partial run (ORBLX_SWEEP_ONLY): it does not count."
+  fi
+  if [[ "$STEADY_RUNS" -gt 0 ]]; then
+    STEADY_PCT="$(awk -v w="$STEADY_WARNED" -v n="$STEADY_RUNS" 'BEGIN {printf "%.1f", 100 * w / n}')"
+    echo "steady_warn: $STEADY_WARNED of $STEADY_RUNS nat-realism runs have a steady_warn line (${STEADY_PCT}%). Report only."
+    if [[ $((STEADY_WARNED * 100)) -gt "$STEADY_RUNS" ]]; then
+      echo "steady_warn_rate over 1%: root-cause item ($STEADY_WARNED of $STEADY_RUNS nat-realism runs, ${STEADY_PCT}%). This does not fail the sweep."
+    fi
+  else
+    echo "steady_warn: no nat-realism run in this sweep."
   fi
 } >>"$TABLE"
 note "end $(now) proofs $ran failed $failed not_run $not_run failed_rows ${FAILED_ROWS:-none} total_secs $total table $TABLE"
