@@ -41,6 +41,7 @@ jobs:
           ORBLX_TRACE_RENEW: "1"
           REPORT_ONLY: ${{ matrix.os == 'macos-latest' && '1' || '0' }}
         run: |
+          set +e  # GitHub runs this step with bash -e; the loop checks each exit code itself.
           set -uo pipefail
           for i in 1 2 3 4; do
             echo "=== renew_soak ${{ matrix.os }} shard ${{ matrix.shard }} run ${i} start $(date -u +%FT%TZ) ==="
