@@ -833,7 +833,12 @@ async fn startup_cost_once() -> StartupPhases {
         map,
         port,
         node_dir.0.clone(),
-        renewer(addr, bundle.clone(), node_dir.0.clone()),
+        renewer(
+            addr,
+            bundle.clone(),
+            node_dir.0.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+        ),
         stop,
     );
     request.on_listen = Some(Box::new(move |event| {
