@@ -307,6 +307,38 @@ impl HelloEndpoint {
         bind_session(connection, &self.auth, StreamRole::Client).await
     }
 
+    /// Connect to `peer`. Start one more attempt each `probe_every` until one attempt ends.
+    ///
+    /// QUIC sends the Initial packet of an attempt again only after a backoff (about 1 s, then 2 s).
+    /// When the peer starts to listen after the first Initial, a single attempt can wait for seconds.
+    /// The earlier attempts stay open, so a slow handshake on a long path can still finish.
+    /// The function starts at most [`MAX_CONNECT_PROBES`] attempts.
+    /// The first session or the first error ends the call and drops the other attempts.
+    /// The caller sets the time limit.
+    pub async fn connect_probed(
+        self: &Arc<Self>,
+        peer: SocketAddr,
+        probe_every: Duration,
+    ) -> Result<HelloSession, HelloError> {
+        let mut attempts = tokio::task::JoinSet::new();
+        let mut next = tokio::time::Instant::now();
+        loop {
+            if attempts.len() < MAX_CONNECT_PROBES && tokio::time::Instant::now() >= next {
+                let endpoint = Arc::clone(self);
+                attempts.spawn(async move { endpoint.connect_one(peer).await });
+                next += probe_every;
+            }
+            let more = attempts.len() < MAX_CONNECT_PROBES;
+            tokio::select! {
+                Some(done) = attempts.join_next() => match done {
+                    Ok(result) => return result,
+                    Err(err) => return Err(HelloError::Quic(err.to_string())),
+                },
+                () = tokio::time::sleep_until(next), if more => {}
+            }
+        }
+    }
+
     async fn wait_idle(&self) {
         self.endpoint.wait_idle().await;
     }
@@ -808,6 +840,9 @@ fn random_session_id() -> u32 {
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     u32::from_ne_bytes(bytes)
 }
+
+/// The most attempts that [`HelloEndpoint::connect_probed`] starts.
+pub const MAX_CONNECT_PROBES: usize = 12;
 
 fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
