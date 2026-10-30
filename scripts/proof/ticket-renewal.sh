@@ -63,6 +63,11 @@ cleanup() {
 trap 'cleanup; proof_lock_end' EXIT
 proof_lock_take "ticket-renewal" "$TR_PROJECT"
 
+# W25-14b: start from a clean compose state (all profiles, all volumes).
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
+proof_compose_clean "${TR_PROJECT}" || exit 1
+
 fail() {
   echo "FAIL: $*" >&2
   exit 1
@@ -144,7 +149,7 @@ check_refusals() {
   local hits first
   hits="$(dc logs -t "${NODES[@]}" 2>&1 | read_all grep -cE -- "$REFUSAL" || true)"
   if [[ "${hits:-0}" -ne 0 ]]; then
-    first="$(dc logs -t "${NODES[@]}" 2>&1 | read_all grep -E -- "$REFUSAL" | sort -k3,3 | head -1)"
+    first="$(dc logs -t "${NODES[@]}" 2>&1 | read_all grep -E -- "$REFUSAL" | sort -k3,3 | sed -n 1p)"
     echo "refusals ${hits}"
     echo "first_refusal ${first}"
     report_first_refusal "$first"
@@ -224,7 +229,7 @@ for name in "${NODES[@]}"; do
   [[ -n "${OVERLAY[$name]}" ]] || fail "No overlay IP for ${name}."
   START0[$name]="$(started_of "$name")"
   PID0[$name]="$(pid_of "$name")"
-  E0[$name]="$(status_of "$name" | read_all awk '$1 == "svid_expiry" {print $2; exit}')"
+  E0[$name]="$(status_of "$name" | read_all awk '$1 == "svid_expiry" && !f {print $2; f = 1}')"
   [[ -n "${E0[$name]}" ]] || fail "No svid_expiry for ${name}."
   echo "node ${name} overlay ${OVERLAY[$name]} pid ${PID0[$name]} svid_expiry ${E0[$name]}"
 done
@@ -258,7 +263,7 @@ tick=0
 while (( $(date +%s) < RUN_END )); do
   for name in "${NODES[@]}"; do
     st="$(status_of "$name")"
-    e="$(printf '%s\n' "$st" | awk '$1 == "svid_expiry" {print $2; exit}')"
+    e="$(printf '%s\n' "$st" | awk '$1 == "svid_expiry" && !f {print $2; f = 1}')"
     [[ -z "$e" ]] || EXPIRIES[$name]="$(printf '%s\n%s\n' "${EXPIRIES[$name]:-}" "$e" | awk 'NF' | sort -u | tr '\n' ' ')"
     n="$(printf '%s\n' "$st" | awk '$1 == "peer" && $6 == "direct" {n++} END {print n + 0}')"
     samples=$((samples + 1))
