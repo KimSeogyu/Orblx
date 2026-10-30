@@ -524,3 +524,12 @@ class ComposeCleanupTest(unittest.TestCase):
         self.assertIn("dc --profile nodes down -v --remove-orphans", src)
         self.assertNotRegex(src, r"(?m)^dc down -v")
         self.assertIn("orblx-coord-proof_orblx-node-a", src)
+        # PO gate 2c: a stale ticket.bin with no netmap must make up fail.
+        self.assertIn("orblx up did not stop on a stale ticket.bin with no netmap", src)
+        self.assertIn("orblx up reported ready with a stale ticket.bin and no netmap.", src)
+        # PO: wait_bundle has a hard deadline and a timeout on each read.
+        body = src[src.index("wait_bundle() {"):src.index("echo \"=== [C] remove old proof volumes")]
+        self.assertIn("WAIT_BUNDLE_SECS=90", src)
+        self.assertIn("SECONDS < deadline", body)
+        self.assertIn("timeout 10 ", body)
+        self.assertIn("return 1", body)

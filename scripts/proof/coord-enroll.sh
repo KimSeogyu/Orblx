@@ -63,15 +63,18 @@ build_image() {
   rm -rf "$image_dir"
 }
 
+# W25-14b: wait_bundle has a hard deadline of WAIT_BUNDLE_SECS (90 s). Each read also has a
+# 10 s timeout, so a hung "docker compose exec" cannot make the wait go on forever.
+WAIT_BUNDLE_SECS=90
 wait_bundle() {
-  local i
-  for i in $(seq 1 90); do
-    if dc exec -T coord cat /var/lib/orblx/trust-bundle.pem >/dev/null 2>&1; then
+  local deadline=$((SECONDS + WAIT_BUNDLE_SECS))
+  while ((SECONDS < deadline)); do
+    if timeout 10 docker compose --progress quiet -f "$FILE" exec -T coord cat /var/lib/orblx/trust-bundle.pem >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
   done
-  echo "The coordinator did not write the trust bundle." >&2
+  echo "The coordinator did not write the trust bundle in ${WAIT_BUNDLE_SECS} s." >&2
   dc logs coord >&2 || true
   return 1
 }
@@ -251,6 +254,25 @@ if printf '%s\n' "$bad_out" | read_all grep -q '^The TUN device is '; then
   exit 1
 fi
 echo "bad_netmap rejected exit ${bad_code}"
+
+echo "=== [C] negative: stale ticket.bin with no valid netmap ==="
+# W25-14b: an old ticket.bin with no netmap.json must not let up start. This is the stale
+# state that the old node volumes left.
+set +e
+stale_out="$(timeout 120 docker compose --progress quiet -f "$FILE" --profile nodes run --rm --entrypoint sh node-a-tun -c \
+  'rm -rf /tmp/stale && mkdir -p /tmp/stale && cp -a /var/lib/orblx/ticket.bin /var/lib/orblx/ticket.bin.mac /tmp/stale/ && exec orblx up --state-dir /tmp/stale' 2>&1)"
+stale_code=$?
+set -e
+printf '%s\n' "$stale_out"
+if [[ "$stale_code" -eq 0 || "$stale_code" -eq 124 ]]; then
+  echo "orblx up did not stop on a stale ticket.bin with no netmap (exit ${stale_code})." >&2
+  exit 1
+fi
+if printf '%s\n' "$stale_out" | read_all grep -Eq '^The (TUN device is |overlay IP is )'; then
+  echo "orblx up reported ready with a stale ticket.bin and no netmap." >&2
+  exit 1
+fi
+echo "stale_ticket rejected exit ${stale_code}"
 
 echo "=== [C] orblx up reads netmap.json (TUN device, same state, no new enroll token) ==="
 dc --profile nodes run -d --name "$UP_NAME" node-a-tun up --state-dir /var/lib/orblx >/dev/null
