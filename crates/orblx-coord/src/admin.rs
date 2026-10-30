@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use orblx_audit::{sha256_digest, verify_config_jsonl, ConfigAction, EMPTY_DIGEST};
 use orblx_identity::{DenySet, SpiffeId};
 use serde_json::{json, Value};
 
@@ -54,9 +55,9 @@ pub fn deny_set(coord: &Coordinator, now: SystemTime) -> Result<DenySet, CoordEr
     Ok(deny)
 }
 
-pub fn approve(coord: &Coordinator, name: &str) -> Result<Value, CoordError> {
+pub fn approve(coord: &Coordinator, name: &str, actor: &str) -> Result<Value, CoordError> {
     let _ = SpiffeId::node(name)?;
-    coord.approve_node(name)?;
+    coord.approve_node_by(name, actor)?;
     Ok(json!({
         "op": "approve",
         "name": name,
@@ -64,9 +65,9 @@ pub fn approve(coord: &Coordinator, name: &str) -> Result<Value, CoordError> {
     }))
 }
 
-pub fn expire(coord: &Coordinator, name: &str) -> Result<Value, CoordError> {
+pub fn expire(coord: &Coordinator, name: &str, actor: &str) -> Result<Value, CoordError> {
     let _ = SpiffeId::node(name)?;
-    coord.expire_node(name)?;
+    coord.expire_node_by(name, actor)?;
     Ok(json!({
         "op": "expire",
         "name": name,
@@ -74,14 +75,29 @@ pub fn expire(coord: &Coordinator, name: &str) -> Result<Value, CoordError> {
     }))
 }
 
-pub fn revoke(coord: &Coordinator, name: &str, now: SystemTime) -> Result<Value, CoordError> {
+pub fn revoke(
+    coord: &Coordinator,
+    name: &str,
+    actor: &str,
+    now: SystemTime,
+) -> Result<Value, CoordError> {
     let _ = SpiffeId::node(name)?;
     let nodes = coord.node_list()?;
     let node = nodes
         .iter()
         .find(|node| node.name == name)
         .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+    let before = deny_digest(coord)?;
     let version = push_revoke(coord, &node.svid, now)?;
+    let after = deny_digest(coord)?;
+    coord.record_change(
+        actor,
+        ConfigAction::Revoke,
+        name,
+        before,
+        after,
+        &format!("svid {} deny_version {version}", node.svid),
+    )?;
     Ok(json!({
         "op": "revoke",
         "name": name,
@@ -133,6 +149,62 @@ pub fn users(coord: &Coordinator) -> Result<Value, CoordError> {
 
 pub fn routes(coord: &Coordinator) -> Result<Value, CoordError> {
     Ok(json!({"op": "routes", "nodes": coord.route_report()?}))
+}
+
+/// Return config chain records and the chain check result.
+///
+/// `since` is Unix seconds. The list holds records at or after that time.
+/// The check always covers the full chain.
+pub fn audit(coord: &Coordinator, since: Option<u64>) -> Result<Value, CoordError> {
+    let text = coord.config_audit_text()?;
+    let verify = match verify_config_jsonl(&text) {
+        Ok(checked) => json!({
+            "ok": true,
+            "records": checked.records.len(),
+            "tip": checked.tip_hex()
+        }),
+        Err(err) => json!({"ok": false, "error": err.to_string()}),
+    };
+    let mut lines = Vec::new();
+    for raw in text.split('\n') {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let keep = match (since, serde_json::from_str::<Value>(raw)) {
+            (None, _) => true,
+            (Some(limit), Ok(value)) => value
+                .get("at_unix")
+                .and_then(Value::as_u64)
+                .is_none_or(|at| at >= limit),
+            (Some(_), Err(_)) => true,
+        };
+        if keep {
+            lines.push(raw.to_string());
+        }
+    }
+    let mut total = 0usize;
+    let mut kept = Vec::new();
+    for line in lines.into_iter().rev() {
+        total = total.saturating_add(line.len() + 1);
+        if total > AUDIT_REPLY_LIMIT {
+            break;
+        }
+        kept.push(line);
+    }
+    kept.reverse();
+    Ok(json!({"op": "audit", "verify": verify, "lines": kept}))
+}
+
+/// The largest record text in one admin reply.
+const AUDIT_REPLY_LIMIT: usize = 160 * 1024;
+
+fn deny_digest(coord: &Coordinator) -> Result<[u8; 32], CoordError> {
+    let path = coord.state_dir()?.join(DENY_FILE);
+    if !path.exists() {
+        return Ok(EMPTY_DIGEST);
+    }
+    let text = read_text(&path)?;
+    Ok(sha256_digest(text.as_bytes()))
 }
 
 fn push_revoke(coord: &Coordinator, svid: &str, now: SystemTime) -> Result<u64, CoordError> {

@@ -1,0 +1,32 @@
+{
+  // Config audit proof policy, second version.
+  // This version adds TCP 22 from a to b.
+  "nodeApproval": true,
+  "owners": ["spiffe://orblx.local/node/owner"],
+  "tags": {
+    "tag:edge": ["spiffe://orblx.local/node/b"],
+  },
+  "tagOwners": {
+    "tag:edge": ["spiffe://orblx.local/node/owner"],
+  },
+  "autoApprovers": {
+    "routes": {
+      "10.77.0.0/24": ["tag:edge"],
+    },
+    "exitNode": ["tag:edge"],
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a"],
+      "proto": "udp",
+      "dst": ["spiffe://orblx.local/node/b:*"],
+    },
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a"],
+      "proto": "tcp",
+      "dst": ["spiffe://orblx.local/node/b:22"],
+    },
+  ],
+}

@@ -8,8 +8,11 @@
 //! The frame session id is the datapath frame `session_id`.
 //! The peer is a SPIFFE ID from `orblx-identity`.
 //! The ticket hash is `orblx_identity::ticket_hash`.
+//!
+//! A second chain records control-plane changes. See [`ConfigLog`].
 
 mod chain;
+mod config;
 mod demo;
 mod error;
 mod event;
@@ -20,6 +23,11 @@ mod metrics;
 pub use chain::{
     canonical_bytes, event_hash, verify_file, verify_jsonl, AuditLog, ChainRecord, VerifiedChain,
     EVENT_VERSION, GENESIS_HASH,
+};
+pub use config::{
+    config_canonical_bytes, config_hash, digest_hex, parse_utc_text, sha256_digest, utc_text,
+    verify_config_file, verify_config_jsonl, ConfigAction, ConfigEvent, ConfigLog, ConfigRecord,
+    VerifiedConfig, CONFIG_EVENT_VERSION, EMPTY_DIGEST, MAX_CONFIG_TEXT,
 };
 pub use demo::{
     escape_demo, DEMO_DENY_FRAME, DEMO_DENY_PEER, DEMO_DENY_RELAY, DEMO_DENY_TICKET,

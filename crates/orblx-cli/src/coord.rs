@@ -52,6 +52,7 @@ pub(crate) enum Command {
         bundle: PathBuf,
         state: PathBuf,
         routes: Vec<String>,
+        exit_node: Option<bool>,
     },
 }
 
@@ -155,20 +156,42 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             bundle,
             state,
             routes,
+            exit_node,
         } => {
             let bundle_pem = fs::read_to_string(&bundle)
                 .map_err(|err| format!("The file {} did not open. {err}", bundle.display()))?;
-            let view = advertise_routes_blocking(coord, &coord_name, &bundle_pem, &state, &routes)
-                .map_err(|err| err.to_string())?;
-            for route in &view.approved_routes {
-                println!("approved route {route}");
-            }
-            for route in &view.advertised_routes {
-                if !view.approved_routes.iter().any(|item| item == route) {
-                    println!("held route {route}");
+            if !routes.is_empty() {
+                let view =
+                    advertise_routes_blocking(coord, &coord_name, &bundle_pem, &state, &routes)
+                        .map_err(|err| err.to_string())?;
+                for route in &view.approved_routes {
+                    println!("approved route {route}");
                 }
+                for route in &view.advertised_routes {
+                    if !view.approved_routes.iter().any(|item| item == route) {
+                        println!("held route {route}");
+                    }
+                }
+                println!("advertised {}", view.advertised_routes.len());
             }
-            println!("advertised {}", view.advertised_routes.len());
+            if let Some(enabled) = exit_node {
+                let view = orblx_coord::advertise_exit_blocking(
+                    coord,
+                    &coord_name,
+                    &bundle_pem,
+                    &state,
+                    enabled,
+                )
+                .map_err(|err| err.to_string())?;
+                let state = if view.exit_approved {
+                    "approved"
+                } else if enabled {
+                    "held"
+                } else {
+                    "off"
+                };
+                println!("exit_node {state}");
+            }
             Ok(())
         }
         Command::Netmap {
@@ -382,6 +405,7 @@ fn parse_advertise(args: &[String]) -> Result<Command, String> {
     let mut bundle = None;
     let mut state = None;
     let mut routes = Vec::new();
+    let mut exit_node = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -393,11 +417,21 @@ fn parse_advertise(args: &[String]) -> Result<Command, String> {
             "--bundle" => bundle = Some(PathBuf::from(value)),
             "--state" => state = Some(PathBuf::from(value)),
             "--route" => routes.push(value),
+            "--exit-node" => {
+                exit_node = Some(match value.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err("The --exit-node value must be on or off.".to_string()),
+                })
+            }
             other => return Err(format!("The flag {other} is not valid.\n{}", help())),
         }
     }
-    if routes.is_empty() {
-        return Err(format!("The command needs --route.\n{}", help()));
+    if routes.is_empty() && exit_node.is_none() {
+        return Err(format!(
+            "The command needs --route or --exit-node.\n{}",
+            help()
+        ));
     }
     Ok(Command::Advertise {
         coord: coord.ok_or_else(|| "The command needs --coord.".to_string())?,
@@ -405,6 +439,7 @@ fn parse_advertise(args: &[String]) -> Result<Command, String> {
         bundle: bundle.ok_or_else(|| "The command needs --bundle.".to_string())?,
         state: state.ok_or_else(|| "The command needs --state.".to_string())?,
         routes,
+        exit_node,
     })
 }
 
@@ -439,7 +474,7 @@ fn help() -> String {
 orblx coord serve --state DIR [--listen ADDR] [--name NAME] [--policy FILE]
 orblx coord token create --state DIR --out FILE [--ttl SECS]
 orblx coord enroll --name NAME --coord ADDR --bundle FILE --token-file FILE --state DIR [--coord-name NAME] [--endpoint HOST:PORT] [--route CIDR]
-orblx coord advertise --coord ADDR --bundle FILE --state DIR --route CIDR [--route CIDR] [--coord-name NAME]
+orblx coord advertise --coord ADDR --bundle FILE --state DIR [--route CIDR]... [--exit-node on|off] [--coord-name NAME]
 orblx coord netmap --coord ADDR --bundle FILE --state DIR [--coord-name NAME]
 
 The coordinator listens with QUIC.
@@ -460,6 +495,8 @@ orblx coord advertise stores subnet CIDRs for an enrolled node.
 The signed netmap includes a route after the policy approves it.
 A route that the policy does not approve stays out of the signed netmap.
 The route 0.0.0.0/0 is an exit route.
+--exit-node on offers this node as an exit node. --exit-node off clears the offer.
+The coordinator writes each route change and exit-node change to config-audit.jsonl.
 "
     .to_string()
 }

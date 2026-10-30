@@ -9,6 +9,7 @@ version.workspace = true
 [dependencies]
 base64 = "0.22"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+orblx-audit = { path = "../orblx-audit" }
 orblx-crypto = { path = "../orblx-crypto" }
 orblx-datapath = { path = "../orblx-datapath" }
 orblx-edge = { path = "../orblx-edge" }
