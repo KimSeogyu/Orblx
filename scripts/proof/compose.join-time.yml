@@ -1,0 +1,77 @@
+# W25-22 join-time proof stack. One stack for each join, with its own project name and its
+# own state directories. `docker compose up` starts only the coordinator and the tool.
+name: ${JOIN_PROJECT:?set JOIN_PROJECT}
+
+x-node: &node
+  image: ${ORBLX_JOIN_IMAGE:-orblx-w2522-join:local}
+  profiles: ["nodes"]
+  entrypoint: ["orblx"]
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+  devices:
+    - /dev/net/tun:/dev/net/tun
+  stop_grace_period: 10s
+
+services:
+  coord:
+    image: ${ORBLX_JOIN_IMAGE:-orblx-w2522-join:local}
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /etc/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+    volumes:
+      - ${JOIN_COORD_STATE:?set JOIN_COORD_STATE}:/var/lib/orblx
+      - ./join-time.hujson:/etc/orblx/policy.hujson:ro
+    networks:
+      proof:
+        ipv4_address: 172.30.127.2
+
+  # The tool runs the enroll calls with `docker compose exec`, so a container start is not
+  # part of the enroll time.
+  tool:
+    image: ${ORBLX_JOIN_IMAGE:-orblx-w2522-join:local}
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - ${JOIN_WORK:?set JOIN_WORK}:/work
+      - ${JOIN_COORD_STATE:?set JOIN_COORD_STATE}:/coord-state:ro
+    networks:
+      proof:
+        ipv4_address: 172.30.127.9
+
+  a:
+    <<: *node
+    volumes:
+      - ${JOIN_A_STATE:?set JOIN_A_STATE}:/var/lib/orblx
+    command: [up, --state-dir, /var/lib/orblx, --listen, "0.0.0.0:443", --coord, "172.30.127.2:443", --bundle, /var/lib/orblx/bundle.pem]
+    networks:
+      proof:
+        ipv4_address: 172.30.127.4
+
+  # The late peer. It enrolls and starts after a runs.
+  b:
+    <<: *node
+    volumes:
+      - ${JOIN_B_STATE:?set JOIN_B_STATE}:/var/lib/orblx
+    command: [up, --state-dir, /var/lib/orblx, --listen, "0.0.0.0:443", --coord, "172.30.127.2:443", --bundle, /var/lib/orblx/bundle.pem]
+    networks:
+      proof:
+        ipv4_address: 172.30.127.5
+
+networks:
+  proof:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.127.0/24
+          gateway: 172.30.127.1
+          ip_range: 172.30.127.128/25
