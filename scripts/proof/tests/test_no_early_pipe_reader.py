@@ -517,3 +517,7 @@ class ComposeCleanupTest(unittest.TestCase):
             self.assertIn(text, src)
         self.assertNotIn("sleep", src[src.index("orblx up reads netmap.json"):])
         self.assertLess(src.index("trap 'cleanup; proof_lock_end' EXIT"), src.index('proof_lock_take "coord-enroll"'))
+        # Without "--profile nodes", "down -v" keeps the node volumes (and an old ticket.bin).
+        self.assertIn("dc --profile nodes down -v --remove-orphans", src)
+        self.assertNotRegex(src, r"(?m)^dc down -v")
+        self.assertIn("orblx-coord-proof_orblx-node-a", src)

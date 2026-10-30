@@ -77,7 +77,15 @@ wait_bundle() {
 }
 
 echo "=== [C] remove old proof volumes ==="
-dc down -v --remove-orphans || true
+# W25-14b: "--profile nodes" is needed. Without it, "down -v" keeps the node-a and node-b
+# volumes, so an old ticket.bin from an earlier run stays in the node state.
+cleanup
+for vol in orblx-coord-proof_orblx-coord-store orblx-coord-proof_orblx-node-a orblx-coord-proof_orblx-node-b; do
+  if docker volume inspect "$vol" >/dev/null 2>&1; then
+    echo "The old proof volume ${vol} is still there." >&2
+    exit 1
+  fi
+done
 open_legacy_forward
 
 echo "=== [C] build coordinator image ==="
