@@ -21,6 +21,7 @@ PROOFS = {
     "pipe.sh": "set -o pipefail\nseq 1 200000 | cat >/dev/null\necho 'proof_ok extra 1'\n",
     "lock.sh": "echo held=${ORBLX_PROOF_LOCK_HELD:-none}\necho proof_ok\n",
     "quiet.sh": "echo 'nothing to see'\nexit 5\n",
+    "loud.sh": "seq 1 100000\necho 'to stderr' >&2\nprintf 'no newline at end'\necho\necho proof_ok\n",
 }
 
 LIST = "\n".join([
@@ -31,6 +32,7 @@ LIST = "\n".join([
     "pipe|scripts/proof/pipe.sh|6|-|-",
     "lock|scripts/proof/lock.sh|7|-|-",
     "quiet|scripts/proof/quiet.sh|8|-|-",
+    "loud|scripts/proof/loud.sh|9|-|-",
 ])
 
 
@@ -71,7 +73,7 @@ class ReleaseSweepTest(unittest.TestCase):
         out = self.run_sweep()
         self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
         rows = self.rows()
-        self.assertEqual(sorted(rows), sorted(["ok", "fail", "skip", "missing", "pipe", "lock", "quiet"]))
+        self.assertEqual(sorted(rows), sorted(["ok", "fail", "skip", "missing", "pipe", "lock", "quiet", "loud"]))
         self.assertTrue(rows["ok"].endswith("| proof_ok |"))
         self.assertIn("| 1, 2 |", rows["ok"])
         self.assertIn(os.path.join(self.out, "rc3-sweep-testsha-ok.log"), rows["ok"])
@@ -80,7 +82,7 @@ class ReleaseSweepTest(unittest.TestCase):
         self.assertIn("FAIL (exit 127): release_sweep: No such file scripts/proof/missing.sh", rows["missing"])
         self.assertTrue(rows["pipe"].endswith("| proof_ok |"))
         self.assertIn("FAIL (exit 5): (no error line; last line) nothing to see", rows["quiet"])
-        self.assertIn("Proofs: 7. Failed: 4.", out.stdout)
+        self.assertIn("Proofs: 8. Failed: 4.", out.stdout)
 
     def test_the_proof_runs_under_the_lock(self):
         out = self.run_sweep(only="lock")
@@ -103,6 +105,15 @@ class ReleaseSweepTest(unittest.TestCase):
             self.assertIn("proof_lock rc3-sweep:lock held by the parent proof", log)
             self.assertNotIn("held=none", log)
         self.assertEqual(sorted(self.rows()), ["lock", "ok"])
+
+    def test_the_log_keeps_the_full_unfiltered_proof_output(self):
+        out = self.run_sweep(only="loud")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        with open(os.path.join(self.out, "rc3-sweep-testsha-loud.log")) as f:
+            lines = f.read().splitlines()
+        body = [l for l in lines if not l.startswith(("proof_lock ", "proof_context ", "proof_contention "))]
+        self.assertEqual(body[:100000], [str(i) for i in range(1, 100001)])
+        self.assertEqual(body[100000:], ["to stderr", "no newline at end", "proof_ok"])
 
     def test_unknown_proof_name_is_refused(self):
         out = self.run_sweep(only="nope")

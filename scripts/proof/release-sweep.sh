@@ -25,6 +25,8 @@
 # This script does not use head, grep -q, grep -m or awk with exit at all: under
 # set -o pipefail, a reader that ends early gives the writer SIGPIPE (exit 141).
 # Proof output goes to a file. The checks read the file.
+# The log of a proof is its full stdout and stderr, not filtered and not cut: the sweep adds
+# only its own lock lines (proof_lock, proof_context, proof_contention) around it.
 #
 # Env:
 #   ORBLX_SWEEP_OUT       Log and table directory (default /workspace/orblx-w18-proof).
@@ -94,7 +96,8 @@ ssh|scripts/proof/ssh.sh|40, 41|-|orblx-ssh:local
 file-send|scripts/proof/file-send.sh|45|-|orblx-w23a-file:w23
 config-audit|scripts/proof/config-audit.sh|49|-|orblx-audit:w20
 audit-webhooks|scripts/proof/audit-webhooks.sh|52|HOOKS_BIN=@BIN@ HOOKS_PROJECT=orblx-rc3sw-webhooks HOOKS_IMAGE=orblx-rc3sw-webhooks:local|orblx-rc3sw-webhooks:local
-docker-image|scripts/proof/docker-image.sh|58|ORBLX_DIMG_PREFIX=orblx-rc3sw-dimg ORBLX_DIMG_IMAGE=orblx-rc3sw-image:local|orblx-rc3sw-image:local'
+docker-image|scripts/proof/docker-image.sh|58|ORBLX_DIMG_PREFIX=orblx-rc3sw-dimg ORBLX_DIMG_IMAGE=orblx-rc3sw-image:local|orblx-rc3sw-image:local
+policy-sync|scripts/proof/policy-sync.sh|17|ORBLX_SYNC_PROFILE=release PROOF_PROJECT=orblx-rc3sw-sync ORBLX_SYNC_IMAGE=orblx-rc3sw-sync:local|orblx-rc3sw-sync:local'
 PROOFS="${ORBLX_SWEEP_LIST:-$PROOFS}"
 
 now() { date '+%Y-%m-%dT%H:%M:%S%z'; }

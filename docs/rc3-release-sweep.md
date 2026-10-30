@@ -17,9 +17,10 @@ scripts/proof/release-sweep.sh COMMIT
 
 1. The script resolves `COMMIT` (after `git fetch origin`) and makes a detached worktree of it (`/workspace/orblx-rc3-sweep-<sha>`).
 2. It builds the release binary there with the `~/.cargo/bin` toolchain (the build log has the `rustc --version` line). It also builds the debug binaries that the older proofs use, so that no proof compiles while it holds the lock.
-3. It runs each proof of the list below, one at a time, from that worktree. A wrapper takes the W25-5 box proof lock (`proof-lock.sh`) before the proof starts and releases it after the proof ends. A proof that takes the lock itself (`nat-realism.sh`) sees that its parent holds it.
+3. It runs each proof of the list below, one at a time, from that worktree. A wrapper takes the W25-5 box proof lock (`proof-lock.sh`) before the proof starts and releases it after the proof ends. Since W25-14 every proof takes the lock itself; it sees that its parent (the wrapper) holds it and does not wait again.
 4. The log of each proof is `/workspace/orblx-w18-proof/rc3-sweep-<sha>-<proof>.log`. The table is `/workspace/orblx-w18-proof/rc3-sweep-<sha>.md`. The table has 4 columns: proof, gap row, log path, result.
-5. After each proof, the script removes the images that the proof built (without `-f`, so an image that a running container uses stays). At the end, it removes the worktree and its target.
+5. The log of a proof is the full stdout and stderr of the proof, with no filter and no cut. The sweep adds only the lock lines (`proof_lock`, `proof_context`, `proof_contention`). A step that the proof script filters itself is filtered in the log too (for example `nat-realism.sh` sends its `cargo test` output through `grep -E '^test |test result'`). The sweep does not change the proof scripts.
+6. After each proof, the script removes the images that the proof built (without `-f`, so an image that a running container uses stays). At the end, it removes the worktree and its target.
 
 Result rules:
 
@@ -50,7 +51,7 @@ The script runs git as the caller. It runs the build and the proofs with `sudo -
 
 ## Shipped rows and their proofs
 
-Source: the Page "Orblx vs Tailscale 기능 격차 매트릭스 + Wave 계획" (the gap matrix is not in this repository). It has 25 shipped rows. The proof of each row comes from the `docs/wNN-*.md` file that the row names as its evidence.
+Source: the Page "Orblx vs Tailscale 기능 격차 매트릭스 + Wave 계획" (the gap matrix is not in this repository). It has 26 shipped rows (row 17 shipped with W25-6). The proof of each row comes from the `docs/wNN-*.md` file that the row names as its evidence.
 
 | Row | Feature | Evidence doc | Proof in the sweep |
 |---|---|---|---|
@@ -59,6 +60,7 @@ Source: the Page "Orblx vs Tailscale 기능 격차 매트릭스 + Wave 계획" (
 | 10 | Split tunneling / accept-routes | `w18-subnet.md` | `subnet` |
 | 11 | Exit nodes | `w19-exit-node.md` | `exit-node` |
 | 16 | MagicDNS | `w18-names.md` | `w18-names` |
+| 17 | Split DNS (Linux only) | `w25-6-policy-sync.md` | `policy-sync` |
 | 19 | ACL policy file | `w18-policy.md`, `w24-port-acl.md` | `policy`, `datapath-acl` |
 | 21 | ACL tests | `w18-policy.md` | `policy` |
 | 24 | GitOps for ACLs | `w25-policy-gitops.md` | `policy-gitops` (`examples/policy-gitops/proof/proof.sh`) |
@@ -85,13 +87,14 @@ Gaps (a shipped row, or part of one, with no proof script that the sweep can run
 - Row 28: the evidence is the TTL constants in `clock.rs` (unit tests only). No proof script.
 - Row 54, rc.2 install part: `scripts/proof/release-real.sh` checks a published release tag from github.com. It does not test a commit, so it is not in the sweep. Run it after the rc.3 tag.
 
-The sweep has 21 proofs. The proof list is the `PROOFS` variable in the script. When a shipped row changes, change the list and this table together.
+The sweep has 22 proofs. The proof list is the `PROOFS` variable in the script. When a shipped row changes, change the list and this table together.
 
 ## Proof settings
 
 - `nat-realism`: `ORBLX_NATR_PROFILE=release`, own names `orblx-rc3sw-natr`.
 - `revoke-followup`: `ORBLX_PROOF_PROFILE=release` (its default).
 - `api-tokens`, `token-no-escalation`, `audit-webhooks`, `policy-gitops`: the release binary (`TOKENS_BIN`, `ESC_BIN`, `HOOKS_BIN`, `GITOPS_BIN`) and own `orblx-rc3sw-*` project and image names.
+- `policy-sync`: `ORBLX_SYNC_PROFILE=release` (its default) and own names `orblx-rc3sw-sync`. Linux only (gap matrix row 17).
 - `docker-image`: own `orblx-rc3sw-*` names. It builds `docker/Dockerfile` (release build in the image).
 - The other proofs have no binary setting. They use the debug binary of the same commit (the sweep builds it before the first proof) and their fixed names.
 - Each proof gets `PROOF_LOG` set to its log, so the secret checks also read the log.
@@ -102,7 +105,7 @@ The dry run on main is running. This section gets the table before the merge.
 
 ## Limits
 
-- `flock` does not serve waiters in order. In the dry run (lock mode `proof`), other workers ran `nat-realism.sh` in loops, and the sweep waited up to about 17 minutes for one proof. For the real sweep, use `ORBLX_SWEEP_LOCK_MODE=sweep` when the box is busy: the sweep then waits once and blocks other lock users until it ends.
+- The dry run started before W25-14c (#99). Then `flock` did not serve waiters in order: other workers ran `nat-realism.sh` in loops, and the sweep waited up to about 24 minutes for one proof. #99 makes the lock first come, first served, so a sweep proof now waits at most for the queue in front of it. `ORBLX_SWEEP_LOCK_MODE=sweep` still makes the sweep wait once and then hold the lock until it ends.
 - The lock only orders the proofs that take it. A proof that does not take the lock (from another branch or another agent) can run at the same time. Proofs with fixed container names or subnets (for example `subnet.sh`, `exit-node.sh`) can then collide with the same proof of another worktree.
 - The `proof_context` and `proof_contention` lines count every other running orblx container. For the proofs with fixed names, this count includes the containers of the proof itself.
 - The proofs with no binary setting use a debug binary, not the release binary.
