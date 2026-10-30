@@ -239,6 +239,15 @@ struct LiveLink {
     ask_rekey: watch::Sender<u64>,
 }
 
+/// A link that a newer session for the same peer replaced (W25-11).
+///
+/// The link gets no new packets. It sends the packets in its queue, ends its send
+/// stream, and reads until the peer ends its send stream. `cancel` stops it at once.
+struct RetiredLink {
+    peer: String,
+    cancel: watch::Sender<bool>,
+}
+
 struct NodeCounters {
     tx: AtomicU64,
     rx: AtomicU64,
@@ -252,6 +261,8 @@ struct Mesh {
     netmap_path: PathBuf,
     node: Arc<NodeView>,
     links: Arc<Mutex<HashMap<String, LiveLink>>>,
+    /// Replaced links that still drain, by generation (W25-11).
+    retired: Arc<Mutex<HashMap<u64, RetiredLink>>>,
     peers: Arc<Mutex<Vec<PeerView>>>,
     counters: Arc<NodeCounters>,
     to_tun: mpsc::Sender<Vec<u8>>,
@@ -521,6 +532,7 @@ async fn run_mesh_inner(
         netmap_path: netmap_path.clone(),
         node: Arc::clone(&node),
         links: Arc::clone(&links),
+        retired: Arc::new(Mutex::new(HashMap::new())),
         peers: Arc::clone(&peers),
         counters: Arc::clone(&counters),
         to_tun: to_tun.clone(),
@@ -878,6 +890,18 @@ fn close_denied_links(mesh: &Mesh, deny: &DenySet) {
             let _ = link.cancel.send(true);
         }
     }
+    drop(links);
+    for retired in lock(&mesh.retired).values() {
+        let Some(svid) = svids.get(retired.peer.as_str()) else {
+            continue;
+        };
+        let Ok(id) = SpiffeId::parse(svid) else {
+            continue;
+        };
+        if deny.reject_uri(&id).is_err() {
+            let _ = retired.cancel.send(true);
+        }
+    }
 }
 
 fn parse_deny(bytes: &[u8]) -> Option<DenySet> {
@@ -956,14 +980,14 @@ async fn dial_peer(mut mesh: Mesh, peer: NetmapPeer) {
                         return;
                     }
                     tr!("{} reconnect cause=local_renew peer={}", mesh.node.name, peer.name);
-                    reconnect(&mut mesh, &peer, &remote_tx, &mut task).await;
+                    reconnect(&mut mesh, &peer, &remote_tx, &mut remote_rx, &mut task).await;
                 }
                 changed = remote_rx.changed() => {
                     if changed.is_err() || stopped(&mesh) {
                         return;
                     }
                     tr!("{} reconnect cause=peer_rekey_req peer={}", mesh.node.name, peer.name);
-                    reconnect(&mut mesh, &peer, &remote_tx, &mut task).await;
+                    reconnect(&mut mesh, &peer, &remote_tx, &mut remote_rx, &mut task).await;
                 }
             }
         }
@@ -987,8 +1011,13 @@ async fn reconnect(
     mesh: &mut Mesh,
     peer: &NetmapPeer,
     remote_tx: &watch::Sender<u64>,
+    remote_rx: &mut watch::Receiver<u64>,
     task: &mut JoinHandle<()>,
 ) {
+    // The new handshake uses the identity of both nodes as of now. Earlier renew signals
+    // of either node need no second session (W25-11).
+    mesh.rekey_rx.borrow_and_update();
+    remote_rx.borrow_and_update();
     let t0 = Instant::now();
     let Some((session, relay_face)) = dial_once(mesh, peer).await else {
         tr!(
@@ -1012,13 +1041,8 @@ async fn reconnect(
         remote_tx.clone(),
         relay_face,
     );
-    let mut old = std::mem::replace(task, next);
-    if tokio::time::timeout(Duration::from_secs(2), &mut old)
-        .await
-        .is_err()
-    {
-        old.abort();
-    }
+    // The old link drains and then stops (see `drive_session`). Do not wait for it here.
+    drop(std::mem::replace(task, next));
 }
 
 async fn dial_ready(
@@ -1245,13 +1269,21 @@ async fn run_link(
                 ask_rekey: ask_tx,
             },
         ) {
+            // Make before break (W25-11): the new session carries new packets now.
+            // The old link drains. Its queue closes when `old.tx` drops here.
             tr!(
-                "{} link_cancel_old peer={} old_gen={}",
+                "{} link_retire_old peer={} old_gen={}",
                 mesh.node.name,
                 name,
                 old.generation
             );
-            let _ = old.cancel.send(true);
+            lock(&mesh.retired).insert(
+                old.generation,
+                RetiredLink {
+                    peer: name.clone(),
+                    cancel: old.cancel,
+                },
+            );
         }
     }
     set_session(&mesh.peers, &name, true, Some(expiry));
@@ -1275,11 +1307,14 @@ async fn run_link(
             counters: Arc::clone(&mesh.counters),
             filter: mesh.filter.clone(),
             peer_svid,
+            links: Arc::clone(&mesh.links),
+            peer: name.clone(),
             label: format!("{} peer={} gen={}", mesh.node.name, name, generation),
         },
         move || note_rx(&peers, &state_dir, &node, &peer_name),
     )
     .await;
+    lock(&mesh.retired).remove(&generation);
     let removed = {
         let mut map = lock(&mesh.links);
         if map.get(&name).map(|link| link.generation) == Some(generation) {
@@ -1307,13 +1342,43 @@ struct SessionIo {
     counters: Arc<NodeCounters>,
     filter: Option<Arc<crate::PacketFilter>>,
     peer_svid: String,
+    /// The live links. A draining link sends its replies on the current link.
+    links: Arc<Mutex<HashMap<String, LiveLink>>>,
+    peer: String,
     label: String,
+}
+
+type NextEvent = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = (crate::HelloReceiver, Result<SessionEvent, HelloError>)>
+            + Send,
+    >,
+>;
+
+/// Read one frame to the end.
+///
+/// The future owns the receiver, so `select!` can poll it again after another branch
+/// wins. A dropped read would lose the bytes it already took from the stream (W25-11).
+fn next_event(mut receiver: crate::HelloReceiver) -> NextEvent {
+    Box::pin(async move {
+        let event = receiver.recv_event().await;
+        (receiver, event)
+    })
+}
+
+async fn poll_slot<T>(
+    slot: &mut Option<std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>>,
+) -> T {
+    match slot {
+        Some(future) => future.await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
     let SessionIo {
         mut sender,
-        mut receiver,
+        receiver,
         mut packets,
         mut cancel,
         to_tun,
@@ -1323,12 +1388,24 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
         counters,
         filter,
         peer_svid,
+        links,
+        peer,
         label,
     } = io;
     let mut first_rx = true;
     let mut first_tx = true;
+    // The queue is open while this link is the live link for the peer.
+    let mut tx_open = true;
+    let mut tx_end: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> = None;
+    let mut tx_done = false;
+    let mut ask_open = true;
+    let mut rx_next: Option<NextEvent> = Some(next_event(receiver));
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     loop {
+        if tx_done && rx_next.is_none() {
+            tr!("{label} session_end reason=drained");
+            return;
+        }
         tokio::select! {
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
@@ -1336,9 +1413,11 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     return;
                 }
             }
-            changed = ask_rekey.changed() => {
+            changed = ask_rekey.changed(), if tx_open && ask_open => {
                 if changed.is_err() {
-                    return;
+                    // The link was replaced. The new link sends the rekey requests.
+                    ask_open = false;
+                    continue;
                 }
                 tr!("{label} send_rekey_req");
                 if sender.send_ctrl(FLAG_REKEY_REQ).await.is_err() {
@@ -1346,14 +1425,18 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     return;
                 }
             }
-            _ = keepalive.tick() => {
+            _ = keepalive.tick(), if tx_open => {
                 if sender.send_ctrl(0).await.is_err() {
                     return;
                 }
             }
-            packet = packets.recv() => {
+            packet = packets.recv(), if tx_open => {
                 let Some(packet) = packet else {
-                    return;
+                    // A newer link replaced this one, and the queue is empty.
+                    tx_open = false;
+                    tr!("{label} tx_end");
+                    tx_end = Some(Box::pin(sender.finish()));
+                    continue;
                 };
                 if let Some(filter) = &filter {
                     filter.note_outbound(&packet);
@@ -1368,40 +1451,63 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                 }
                 counters.tx.fetch_add(1, Ordering::Relaxed);
             }
-            incoming = receiver.recv_event() => {
+            () = poll_slot(&mut tx_end), if tx_end.is_some() => {
+                tx_end = None;
+                tx_done = true;
+            }
+            (receiver, incoming) = poll_slot(&mut rx_next), if rx_next.is_some() => {
+                rx_next = None;
                 match incoming {
-                    Ok(SessionEvent::Packet(packet)) => {
-                        if first_rx {
-                            tr!("{label} first_rx");
-                            first_rx = false;
-                        }
-                        on_rx();
-                        counters.rx.fetch_add(1, Ordering::Relaxed);
-                        if let Some(filter) = &filter {
-                            if !filter.allow_inbound(&peer_svid, &packet) {
-                                continue;
-                            }
-                        }
-                        match inbound_action(&packet, overlay) {
-                            InboundAction::Reply(reply) => {
-                                if sender.send_ipv4(&reply).await.is_err() {
-                                    return;
+                    Ok(event) => {
+                        rx_next = Some(next_event(receiver));
+                        match event {
+                            SessionEvent::Packet(packet) => {
+                                if first_rx {
+                                    tr!("{label} first_rx");
+                                    first_rx = false;
                                 }
-                                counters.tx.fetch_add(1, Ordering::Relaxed);
-                            }
-                            InboundAction::Forward => {
-                                if to_tun.send(packet).await.is_err() {
-                                    return;
+                                on_rx();
+                                counters.rx.fetch_add(1, Ordering::Relaxed);
+                                if let Some(filter) = &filter {
+                                    if !filter.allow_inbound(&peer_svid, &packet) {
+                                        continue;
+                                    }
                                 }
+                                match inbound_action(&packet, overlay) {
+                                    InboundAction::Reply(reply) if tx_open => {
+                                        if sender.send_ipv4(&reply).await.is_err() {
+                                            return;
+                                        }
+                                        counters.tx.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    InboundAction::Reply(reply) => {
+                                        // This send stream ended. The live link carries the reply.
+                                        let live = lock(&links).get(&peer).map(|link| link.tx.clone());
+                                        if let Some(live) = live {
+                                            if live.try_send(reply).is_ok() {
+                                                counters.tx.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                    }
+                                    InboundAction::Forward => {
+                                        if to_tun.send(packet).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            SessionEvent::Keepalive => on_rx(),
+                            SessionEvent::Rekey => {
+                                tr!("{label} got_rekey_req");
+                                on_rx();
+                                let next = remote_rekey.borrow().saturating_add(1);
+                                let _ = remote_rekey.send(next);
                             }
                         }
                     }
-                    Ok(SessionEvent::Keepalive) => on_rx(),
-                    Ok(SessionEvent::Rekey) => {
-                        tr!("{label} got_rekey_req");
-                        on_rx();
-                        let next = remote_rekey.borrow().saturating_add(1);
-                        let _ = remote_rekey.send(next);
+                    Err(HelloError::StreamClosed) => {
+                        // The peer replaced this session and sent all its frames on it.
+                        tr!("{label} rx_end");
                     }
                     Err(err) => {
                         tr!("{label} session_end reason=recv_err {err}");

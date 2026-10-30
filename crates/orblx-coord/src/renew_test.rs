@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_crypto::{mac_input, ticket_mac, TicketKey, TicketRing};
@@ -112,6 +112,7 @@ async fn renew_replaces_the_leaf_and_keeps_the_address() {
 async fn session_stays_up_for_three_svid_lifetimes() {
     const LIFE_SECS: u64 = 60;
     const PROBE_MS: u64 = 20;
+    const RENEW_GAP_LIMIT: Duration = Duration::from_millis(200);
     let scratch = Scratch::new("life");
     let node_a = Scratch::new("life-a");
     let node_b = Scratch::new("life-b");
@@ -170,6 +171,7 @@ async fn session_stays_up_for_three_svid_lifetimes() {
     let map_a = netmap("a", "100.64.0.1", "b", "100.64.0.2", port_b);
     let map_b = netmap("b", "100.64.0.2", "a", "100.64.0.1", port_a);
 
+    let renewals = Arc::new(Mutex::new(Vec::new()));
     let (stop_tx, stop_a) = watch::channel(false);
     let stop_b = stop_a.clone();
     let (a_in_tx, a_in_rx) = mpsc::channel(64);
@@ -183,7 +185,12 @@ async fn session_stays_up_for_three_svid_lifetimes() {
             map_a,
             port_a,
             node_a.0.clone(),
-            renewer(addr, bundle.clone(), node_a.0.clone()),
+            renewer(
+                addr,
+                bundle.clone(),
+                node_a.0.clone(),
+                Arc::clone(&renewals),
+            ),
             stop_a,
         ),
         MemoryDevice {
@@ -197,7 +204,12 @@ async fn session_stays_up_for_three_svid_lifetimes() {
             map_b,
             port_b,
             node_b.0.clone(),
-            renewer(addr, bundle.clone(), node_b.0.clone()),
+            renewer(
+                addr,
+                bundle.clone(),
+                node_b.0.clone(),
+                Arc::clone(&renewals),
+            ),
             stop_b,
         ),
         MemoryDevice {
@@ -209,6 +221,7 @@ async fn session_stays_up_for_three_svid_lifetimes() {
     let mut last_ab: Option<Instant> = None;
     let mut last_ba: Option<Instant> = None;
     let mut max_gap = Duration::ZERO;
+    let mut gaps = Vec::new();
     let mut got_ab = 0u64;
     let mut got_ba = 0u64;
     let mut saw_direct = false;
@@ -242,13 +255,13 @@ async fn session_stays_up_for_three_svid_lifetimes() {
             tokio::select! {
                 got = b_out_rx.recv() => {
                     if got.is_some() {
-                        note_gap("ab", &mut last_ab, &mut max_gap);
+                        note_gap("ab", &mut last_ab, &mut max_gap, &mut gaps);
                         got_ab += 1;
                     }
                 }
                 got = a_out_rx.recv() => {
                     if got.is_some() {
-                        note_gap("ba", &mut last_ba, &mut max_gap);
+                        note_gap("ba", &mut last_ba, &mut max_gap, &mut gaps);
                         got_ba += 1;
                     }
                 }
@@ -273,9 +286,13 @@ async fn session_stays_up_for_three_svid_lifetimes() {
             break;
         }
     }
+    let renewals = renewals.lock().unwrap().clone();
+    let renew_gap = renewal_max_gap(&gaps, &renewals);
     println!(
-        "renew_gap_summary probe_ms {PROBE_MS} ab {got_ab} ba {got_ba} max_gap_ms {} expiries {}",
+        "renew_gap_summary probe_ms {PROBE_MS} ab {got_ab} ba {got_ba} max_gap_ms {} renewals {} renewal_max_gap_ms {} expiries {}",
         max_gap.as_millis(),
+        renewals.len(),
+        renew_gap.as_millis(),
         expiries.len()
     );
 
@@ -293,6 +310,16 @@ async fn session_stays_up_for_three_svid_lifetimes() {
         "packet gap {} ms",
         max_gap.as_millis()
     );
+    assert!(
+        renewals.len() >= 4,
+        "renew calls {} over three lifetimes",
+        renewals.len()
+    );
+    assert!(
+        renew_gap <= RENEW_GAP_LIMIT,
+        "packet gap {} ms at an SVID renewal",
+        renew_gap.as_millis()
+    );
     assert!(saw_direct, "status did not report path direct");
     assert!(
         expiries.len() >= 3,
@@ -300,13 +327,40 @@ async fn session_stays_up_for_three_svid_lifetimes() {
     );
 }
 
-fn note_gap(dir: &str, last: &mut Option<Instant>, max_gap: &mut Duration) {
+/// The renewal window: from 1 s before a renew call to 3 s after it (W25-11).
+const RENEW_WINDOW_BEFORE: Duration = Duration::from_secs(1);
+const RENEW_WINDOW_AFTER: Duration = Duration::from_secs(3);
+
+/// Return the largest gap that overlaps one renewal window.
+fn renewal_max_gap(gaps: &[(Instant, Instant)], renewals: &[Instant]) -> Duration {
+    gaps.iter()
+        .filter(|(prev, now)| {
+            renewals.iter().any(|start| {
+                let from = start.checked_sub(RENEW_WINDOW_BEFORE).unwrap_or(*start);
+                let to = *start + RENEW_WINDOW_AFTER;
+                *prev < to && *now > from
+            })
+        })
+        .map(|(prev, now)| now.saturating_duration_since(*prev))
+        .max()
+        .unwrap_or(Duration::ZERO)
+}
+
+fn note_gap(
+    dir: &str,
+    last: &mut Option<Instant>,
+    max_gap: &mut Duration,
+    gaps: &mut Vec<(Instant, Instant)>,
+) {
     let now = Instant::now();
     if let Some(prev) = *last {
         let gap = now.saturating_duration_since(prev);
+        if gap > Duration::from_millis(40) {
+            gaps.push((prev, now));
+        }
         if gap > Duration::from_millis(100) {
             let ms = SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+                .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis();
             eprintln!("trace {ms} test gap dir={dir} ms={}", gap.as_millis());
@@ -318,8 +372,15 @@ fn note_gap(dir: &str, last: &mut Option<Instant>, max_gap: &mut Duration) {
     *last = Some(now);
 }
 
-fn renewer(addr: SocketAddr, bundle: String, state: PathBuf) -> SvidRenewer {
+/// A renewer that also notes the time of each renew call.
+fn renewer(
+    addr: SocketAddr,
+    bundle: String,
+    state: PathBuf,
+    calls: Arc<Mutex<Vec<Instant>>>,
+) -> SvidRenewer {
     SvidRenewer::new(move || {
+        calls.lock().unwrap().push(Instant::now());
         let result = client::renew_svid_blocking(addr, "coord", &bundle, &state)
             .map_err(|err| err.to_string())?;
         Ok(RenewedLeaf {
