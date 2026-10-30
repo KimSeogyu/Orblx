@@ -32,7 +32,7 @@ Result rules:
 
 A failed proof does not stop the sweep. The exit code is 1 when a proof failed, 2 when the setup or the build failed, and 0 when every proof gave `proof_ok`.
 
-The script sends no proof output through a pipe. The output goes to the log file, and the checks read the file. So no reader can end early and cause SIGPIPE (exit 141) under `set -o pipefail`. `scripts/proof/tests/test_no_early_pipe_reader.py` also checks `release-sweep.sh` now.
+The script sends no proof output through a pipe. The output goes to the log file, and the checks read the whole file (the `has_line` helper of #94, and awk with no early exit). So no reader can end early and cause SIGPIPE (exit 141) under `set -o pipefail`. `scripts/proof/tests/test_no_early_pipe_reader.py` also checks `release-sweep.sh` now.
 
 | Env | Default | Meaning |
 |---|---|---|

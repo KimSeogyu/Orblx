@@ -22,7 +22,7 @@
 # and the proofs with sudo -n (no password prompt) unless the caller is root.
 # The toolchain is $CARGO_HOME/bin (default ~/.cargo/bin), not the system rustc.
 #
-# This script does not use head, grep -q, grep -m or awk with exit on a pipe: under
+# This script does not use head, grep -q, grep -m or awk with exit at all: under
 # set -o pipefail, a reader that ends early gives the writer SIGPIPE (exit 141).
 # Proof output goes to a file. The checks read the file.
 #
@@ -119,11 +119,17 @@ tool_env() {
   as_root env ${pass[@]+"${pass[@]}"} PATH="$TOOL_PATH" CARGO_HOME="$TOOL_CARGO_HOME" RUSTUP_HOME="$TOOL_RUSTUP_HOME" "$@"
 }
 
+# Exit 0 when a line of stdin matches the ERE $1. It reads all of stdin (the #94 helper),
+# so it is safe on a pipe under set -o pipefail. The sweep gives it files with <.
+has_line() {
+  awk -v re="$1" '$0 ~ re {found = 1} END {exit !found}'
+}
+
 # The first error line of a log, else its last line. Not the lock lines of the sweep.
-# awk reads a file here, not a pipe, so its exit cannot cause SIGPIPE.
+# awk reads the whole file and has no early exit.
 first_error() {
   local log="$1" line
-  line="$(awk -v re="$ERR_RE" -v skip="$LOCK_LINE_RE" '$0 ~ re && $0 !~ skip {print; exit}' "$log")"
+  line="$(awk -v re="$ERR_RE" -v skip="$LOCK_LINE_RE" '!done && $0 ~ re && $0 !~ skip {print; done = 1}' "$log")"
   if [[ -z "$line" ]]; then
     line="$(awk -v skip="$LOCK_LINE_RE" 'NF && $0 !~ skip {l = $0} END {print l}' "$log")"
     if [[ -n "$line" ]]; then
@@ -197,7 +203,7 @@ if [[ -z "$TEST_ROOT" ]]; then
     cleanup_worktree
     exit 2
   fi
-  note "build ok: $(awk '/^rustc /{print; exit}' "$build_log")"
+  note "build ok: $(awk '!done && /^rustc / {print; done = 1}' "$build_log")"
 fi
 
 # 3. Run the proofs.
@@ -260,7 +266,7 @@ for line in "${specs[@]}"; do
       >>"$log" 2>&1 </dev/null || rc=$?
   fi
   secs=$(( $(date +%s) - started ))
-  if [[ "$rc" -eq 0 ]] && grep -Eq "$OK_RE" "$log"; then
+  if [[ "$rc" -eq 0 ]] && has_line "$OK_RE" <"$log"; then
     result="proof_ok"
   else
     failed=$((failed + 1))
