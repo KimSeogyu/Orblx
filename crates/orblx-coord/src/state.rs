@@ -913,6 +913,14 @@ impl Coordinator {
         Ok(inner.policy.owners().to_vec())
     }
 
+    /// Return the audit webhook URLs of the loaded policy (W25-7).
+    ///
+    /// The call does not read the policy file.
+    pub fn audit_webhook_urls(&self) -> Result<Vec<String>, CoordError> {
+        let inner = self.lock()?;
+        Ok(inner.policy.audit_webhooks().to_vec())
+    }
+
     /// Return the policy file path.
     pub fn policy_file(&self) -> Result<PathBuf, CoordError> {
         let inner = self.lock()?;

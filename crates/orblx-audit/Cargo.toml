@@ -10,6 +10,7 @@ version.workspace = true
 # This crate does not use the data path.
 
 [dependencies]
+hmac = "0.12"
 orblx-identity = { path = "../orblx-identity" }
 orblx-relay = { path = "../orblx-relay" }
 serde = { version = "1", features = ["derive"] }

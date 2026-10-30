@@ -1,0 +1,98 @@
+# W25-7 audit webhook proof stack.
+# coord: the coordinator. It posts each config audit record to the receiver.
+# receiver: a small HTTP receiver. It checks the HMAC-SHA256 signature and keeps each body.
+# owner: the owner SVID. a and b: nodes that are not owners.
+# client: a host with no SVID. It has only the trust bundle and token files.
+name: orblx-w25g-webhooks
+
+services:
+  coord:
+    image: ${HOOKS_IMAGE:?set HOOKS_IMAGE}
+    # No systemd-resolved: it does not resolve the one-label name "receiver".
+    entrypoint: ["orblx"]
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /var/lib/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+      ORBLX_AUDIT_WEBHOOK_SECRET_FILE: /secret/webhook.key
+    volumes:
+      - store:/var/lib/orblx
+      - secret:/secret:ro
+    networks:
+      - proof
+
+  receiver:
+    image: ${HOOKS_IMAGE:?set HOOKS_IMAGE}
+    entrypoint: ["python3", "/proof/audit-webhook-receiver.py", "serve"]
+    environment:
+      RECV_SECRET_FILE: /secret/webhook.key
+      RECV_DIR: /recv
+      RECV_PORT: "9000"
+    volumes:
+      - secret:/secret
+      - recv:/recv
+      - ./audit-webhook-receiver.py:/proof/audit-webhook-receiver.py:ro
+    networks:
+      - proof
+
+  owner:
+    image: ${HOOKS_IMAGE:?set HOOKS_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    volumes:
+      - store:/coord-state:ro
+      - owner:/var/lib/orblx
+      - tokens:/tokens
+    networks:
+      - proof
+
+  a:
+    image: ${HOOKS_IMAGE:?set HOOKS_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    volumes:
+      - store:/coord-state:ro
+      - node-a:/var/lib/orblx
+    networks:
+      - proof
+
+  b:
+    image: ${HOOKS_IMAGE:?set HOOKS_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    volumes:
+      - store:/coord-state:ro
+      - node-b:/var/lib/orblx
+    networks:
+      - proof
+
+  client:
+    image: ${HOOKS_IMAGE:?set HOOKS_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - store:/coord-state:ro
+      - tokens:/tokens:ro
+    networks:
+      - proof
+
+volumes:
+  store:
+  secret:
+  recv:
+  owner:
+  node-a:
+  node-b:
+  tokens:
+
+networks:
+  proof:
