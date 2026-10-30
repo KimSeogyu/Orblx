@@ -42,9 +42,9 @@ pub use netmap::{
     NetmapSelf, NodeLockSig, SplitDns, MAX_SPLIT_DNS_SERVERS, MAX_SPLIT_DNS_ZONES, NODE_LOCK_FILE,
 };
 pub use node::{
-    format_node_status, read_status_text, run_memory_node, run_node, running_pid, MemoryDevice,
-    NodeRequest, NodeStatus, RenewedLeaf, StatusPeer, SvidRenewer, NODE_PID_FILE, NODE_RECORD_FILE,
-    NODE_STATUS_FILE,
+    format_node_status, read_status_text, run_memory_node, run_node, running_pid, ListenEvent,
+    MemoryDevice, NodeRequest, NodeStatus, RenewedLeaf, StatusPeer, SvidRenewer, NODE_PID_FILE,
+    NODE_RECORD_FILE, NODE_STATUS_FILE,
 };
 pub use quic::{
     measure_hello_rtt, prove_hello_socket, HelloConfig, HelloEndpoint, HelloReceiver, HelloSender,
