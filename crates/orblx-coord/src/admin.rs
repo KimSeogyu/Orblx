@@ -413,6 +413,25 @@ pub fn policy_keeps_owners(
     Ok(now == want)
 }
 
+/// Return true when the policy text has the same audit webhook URLs as the loaded policy (W25-7).
+///
+/// The order of the list does not matter.
+/// A text that is not a valid policy returns true. `policy_set` refuses it later.
+pub fn policy_keeps_webhooks(
+    coord: &Coordinator,
+    _lock: &PolicyWrite,
+    text: &str,
+) -> Result<bool, CoordError> {
+    let Ok(next) = orblx_identity::Policy::from_hujson(text.as_bytes()) else {
+        return Ok(true);
+    };
+    let mut now = coord.audit_webhook_urls()?;
+    let mut want = next.audit_webhooks().to_vec();
+    now.sort();
+    want.sort();
+    Ok(now == want)
+}
+
 /// Replace the policy file (W25-3, scope `policy:write`).
 ///
 /// The coordinator checks the text first. A bad text does not change the file.
