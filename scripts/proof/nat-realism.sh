@@ -13,7 +13,7 @@
 # above the direct ping RTT avg, when a relay ping is lost, or when an idle orblx
 # process uses more than IDLE_CPU_PCT percent CPU.
 # W23: RELAY_SLACK_MS is 1. The relay gate also prints the median and the slowest pings.
-# W24: the direct RTT check prints them too (direct_ping). ORBLX_NATR_PREFIX, ORBLX_NATR_PROJECT,
+# W24: the direct RTT check prints them too (direct_ping). W24-A: ORBLX_NATR_POLICY sets an ACL policy. ORBLX_NATR_PREFIX, ORBLX_NATR_PROJECT,
 # ORBLX_NATR_IMAGE, ORBLX_NATR_PUB and ORBLX_NATR_LAN change the names and the subnets.
 # The script measures TCP bulk throughput on the plain, direct and relay paths.
 # The script prints proof_ok.
@@ -722,6 +722,11 @@ echo "=== [C] start public network, routers, coordinator, and relay ==="
 dc up -d coord relay router-a router-b router-c router-d
 open_legacy_forward
 wait_bundle
+# W24-A: ORBLX_NATR_POLICY sets an ACL policy file. Then the datapath packet filter is on.
+if [[ -n "${ORBLX_NATR_POLICY:-}" ]]; then
+  docker cp "$ORBLX_NATR_POLICY" "$(dc ps -q coord)":/var/lib/orblx/policy.hujson
+  echo "natr_policy $(basename "$ORBLX_NATR_POLICY") $(sha256sum "$ORBLX_NATR_POLICY" | cut -c1-16)"
+fi
 sleep 1
 for router in router-a router-b router-c router-d; do
   echo "=== [C] ${router} rules ==="
@@ -837,6 +842,9 @@ PP_PATH="$(path_of "$PP_A") $(path_of "$PP_B")"
 echo "prc_prc path ${PP_PATH}"
 punch_log ${NATR_PREFIX}a
 punch_log ${NATR_PREFIX}b
+for name in ${NATR_PREFIX}a ${NATR_PREFIX}b; do
+  echo "natr_filter ${name} on $(docker logs "$name" 2>&1 | grep -c 'The packet filter is on.' || true) off $(docker logs "$name" 2>&1 | grep -c 'The packet filter is off.' || true)"
+done
 steady_pings prc_prc ${NATR_PREFIX}a "$IP_B"
 
 echo "=== [C] RTT on the prc_prc topology ==="
