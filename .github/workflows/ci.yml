@@ -28,6 +28,11 @@ jobs:
       - name: Run the tests
         run: cargo test --workspace
 
+      - name: Check the shell syntax of the release scripts
+        run: |
+          sh -n scripts/install.sh
+          bash -n scripts/release/package.sh scripts/proof/release.sh
+
       - name: Run the harness demo
         env:
           # Public Web client id. The secret is a stand-in. It is not a Google secret.
