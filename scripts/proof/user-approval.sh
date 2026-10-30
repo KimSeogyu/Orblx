@@ -54,6 +54,11 @@ dc() {
     docker compose --progress quiet --profile nodes -f "$FILE" "$@"
 }
 
+# W25-14b: start from a clean compose state (all profiles, all volumes).
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
+proof_compose_clean "orblx-w25o-users" || exit 1
+
 cleanup() {
   local status=$?
   if [[ "$status" -ne 0 ]]; then
