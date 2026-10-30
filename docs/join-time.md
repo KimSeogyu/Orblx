@@ -1,8 +1,7 @@
 # Join-time proof
 
-Status: the script, the gate, and the negative tests are in this change. A full N=20 box run
-needs W25-14b (#114, `scripts/proof/compose-clean.sh`) on main first. The script sources
-that helper, and it fails if the helper is not there.
+Status: the script, the gate, the negative tests, and one box run (section 4). The script
+sources `scripts/proof/compose-clean.sh` (W25-14b, #114).
 
 ## 1. What the proof measures
 
@@ -55,20 +54,43 @@ The sweep runs the proof as the gate `join-time` (`scripts/proof/sweep-manifest.
 - Live: `ORBLX_JOIN_BREAK_AT=K` (test only) removes the trust bundle of b in join K. Node b
   cannot start, node a gets no reply, and the proof must fail with `join K fail`.
 
-## 4. How to run
+## 4. Results
+
+Box run on 2026-10-31, 08:12 to 08:21 KST, branch head 948ab50 (main 690558d with #114
+merged in), release build, under the FIFO proof lock, `sudo -n`. [C] Linux lab, one host.
+Log: `/workspace/orblx-w18-proof/w25j-join-time-948ab50-n20-run1.log`.
+
+| Value | n | median | p95 | max | Gate |
+|---|---|---|---|---|---|
+| enroll_to_first_packet_ms | 20 | 715 | 796 | 804 | report only |
+| listener_to_first_packet_ms | 20 | 215 | 336 | 339 | 2000 for each join: pass |
+
+All 20 joins reached the first packet. `proof_compose_clean` printed "clean" 60 times
+(the start of the run, and before and after each join). The proof printed `proof_ok`.
+The contention sampler saw 0 other orblx containers in 164 samples (max load1 5.60).
+
+Join 20 had 471 ms and 33 ms. The proof keeps it in the numbers. This proof does not
+explain why that join was faster.
+
+Negative live run: `JOIN_N=2 ORBLX_JOIN_BREAK_AT=2`, 08:21 to 08:22 KST. Join 1 passed
+(691 and 241 ms). Join 2 failed with "node a got no reply from b in 30 s (timeout)", the
+gate printed `join_gate FAIL`, and there was no `proof_ok`.
+Log: `/workspace/orblx-w18-proof/w25j-join-time-948ab50-break2-run1.log`.
+
+## 5. How to run
 
 ```
 ./scripts/proof/join-time.sh                       # N=20, release build
 JOIN_N=2 ORBLX_JOIN_BREAK_AT=2 ./scripts/proof/join-time.sh   # must fail
 ```
 
-## 5. Release note rule
+## 6. Release note rule
 
 The only join-time number for a release note is enroll to first packet (median and p95) from
 this proof in the real rc.3 sweep, labeled "[C] Linux lab, one host", with n. Do not make a
 join-time claim from enroll to listener. Do not compare with Tailscale.
 
-## 6. Limits
+## 7. Limits
 
 - One host, containers on one Docker bridge. There is no NAT and no relay in the path.
 - The coordinator has 2 nodes. It does not show the join time with many nodes.
