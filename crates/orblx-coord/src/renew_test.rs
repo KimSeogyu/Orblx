@@ -241,6 +241,7 @@ async fn session_stays_up_for_three_svid_lifetimes() {
     let mut expiries = HashSet::new();
     let limit = Duration::from_secs(LIFE_SECS * 3 + 8);
     let mut round = 0u64;
+    let mut status_read: Option<tokio::task::JoinHandle<(std::io::Result<String>, u128)>> = None;
     while issued_at.elapsed() < limit {
         // One probe each way every 20 ms, so a 200 ms gap shows as about 10 lost probes.
         let _ = a_in_tx
@@ -282,10 +283,10 @@ async fn session_stays_up_for_three_svid_lifetimes() {
             }
         }
         round += 1;
-        if round.is_multiple_of(10) {
-            let read_started = Instant::now();
-            let read = fs::read_to_string(node_a.0.join(NODE_STATUS_FILE));
-            let read_ms = read_started.elapsed().as_millis();
+        // W25-11: the status file read runs on a blocking thread. A slow disk read must not
+        // stop this loop, because then the loop sends no probes and sees a false gap.
+        if status_read.as_ref().is_some_and(|read| read.is_finished()) {
+            let (read, read_ms) = status_read.take().unwrap().await.unwrap();
             if read_ms >= 20 {
                 let ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -304,6 +305,14 @@ async fn session_stays_up_for_three_svid_lifetimes() {
                     expiries.insert(value.to_string());
                 }
             }
+        }
+        if status_read.is_none() && round.is_multiple_of(10) {
+            let path = node_a.0.join(NODE_STATUS_FILE);
+            status_read = Some(tokio::task::spawn_blocking(move || {
+                let read_started = Instant::now();
+                let read = fs::read_to_string(path);
+                (read, read_started.elapsed().as_millis())
+            }));
         }
         if last_ab.is_some() && last_ba.is_some() && max_gap > Duration::from_secs(2) {
             break;

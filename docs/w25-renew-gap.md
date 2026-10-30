@@ -87,6 +87,32 @@ The claim of this change is: the renewal gap is 200 ms or less on Linux.
 | 41075302928 | 7cceaaa | 20/20 | 93 ms |
 | 41081409325 | c3af70f (main merged) | 20/20 | 69 ms |
 | 41086516186 | dd5eec0 | 20/20 | 106 ms |
+| 41094354119 | ee56381 (main #97, #98 merged) | 20/20 | 70 ms |
+| 41099476815 | e356060 (main #92, #99 merged) | 18 pass, 1 fail, 1 not run (see 4.1.1) | 295 ms |
+
+#### 4.1.1 The failed Linux run is a gap in the test loop
+
+REAL, job 124213770543, shard 2, run 3 (`w25-k-soak-e356-ubuntu-s2-124213770543.log`), KST 2026-10-31:
+
+| Time (KST) | Event |
+| --- | --- |
+| 02:40:25.012 | b `renew_start` (the renew call runs on a blocking thread) |
+| 02:40:25.220 | a `renew_start` |
+| about 02:40:25.374 to 02:40:25.647 | the test loop reads `status.txt` of node a: `slow_io op=status_read ms=273` |
+| 02:40:25.658 | `gap dir=ba ms=294` ends |
+| 02:40:25.659 | `gap dir=ab ms=295` ends |
+| 02:40:25.662 | b `renew_applied`, then the new links come up (make-before-break) |
+
+- The test loop sends the probes and also read `status.txt` on the same task with a blocking read.
+  During the 273 ms read, the loop sent no probes. The gap of 294 ms and 295 ms is in both directions at the same time.
+- The probes after the read arrived after about 11 ms in both directions, on the old link, before `renew_applied`.
+  Thus the datapath did not stop.
+- The runtime stall probe and the OS-thread probe saw no stall (0 ms), because other threads ran.
+- The blocking read was in the test since #39. Slow reads also occur in earlier soaks (up to 837 ms),
+  but they failed a run only when they occurred in a renewal window.
+- Fix: the test reads `status.txt` on a blocking thread (`spawn_blocking`) and takes the result when the read is
+  complete. The loop never waits for the read. The limit (200 ms), the probe interval (20 ms) and the window do not
+  change. The fix adds no retry and no sleep.
 
 ### 4.2 Box proof ([C], 10 serial runs under the proof lock)
 
