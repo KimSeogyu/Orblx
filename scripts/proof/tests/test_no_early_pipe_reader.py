@@ -323,6 +323,37 @@ class SteadyPingGateTest(unittest.TestCase):
         self.assertIn("prc_sym steady lost 0/50 max_ms 121.701 limit_ms 100", res.stdout)
         self.assertIn("max ping RTT 121.701 ms is more than 100 ms", res.stderr)
 
+    @staticmethod
+    def sample(ms):
+        return ("64 bytes from 100.64.0.2: icmp_seq=1 ttl=64 time=0.412 ms\n"
+                "64 bytes from 100.64.0.2: icmp_seq=2 ttl=64 time=%s ms\n"
+                "64 bytes from 100.64.0.2: icmp_seq=3 ttl=64 time=0.398 ms\n"
+                "50 packets transmitted, 50 received, 0%% packet loss, time 10087ms\n"
+                "rtt min/avg/max/mdev = 0.214/4.100/%s/1.000 ms\n" % (ms, ms))
+
+    def nat_gate(self, text):
+        return subprocess.run(["bash", "-c", '. "$0"; set -euo pipefail; steady_ping_gate prc_sym 50 1 200 100',
+                               PIPE_LIB], input=text, capture_output=True, text=True)
+
+    def test_a_201_ms_sample_fails_the_stall_limit(self):
+        res = self.nat_gate(self.sample("201"))
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("max ping RTT 201 ms is more than 200 ms", res.stderr)
+        self.assertIn("steady_warn prc_sym icmp_seq 2 ms 201 warn_ms 100 limit_ms 200 time ", res.stdout)
+
+    def test_a_150_ms_sample_passes_with_a_steady_warn_line(self):
+        res = self.nat_gate(self.sample("150"))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        warn = [line for line in res.stdout.splitlines() if line.startswith("steady_warn ")]
+        self.assertEqual(len(warn), 1, res.stdout)
+        self.assertRegex(warn[0], r"^steady_warn prc_sym icmp_seq 2 ms 150 warn_ms 100 limit_ms 200 "
+                                  r"time \d{4}-\d\d-\d\dT\S+ proof_context ")
+
+    def test_no_steady_warn_line_at_or_below_100_ms(self):
+        res = self.nat_gate(self.sample("100"))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("steady_warn", res.stdout)
+
     def test_a_normal_run_passes(self):
         res = self.gate(self.GOOD)
         self.assertEqual(res.returncode, 0, res.stderr)
@@ -337,7 +368,9 @@ class SteadyPingGateTest(unittest.TestCase):
             text = f.read()
         body = text[text.index("steady_pings() {"):]
         body = body[: body.index("\n}\n")]
-        self.assertIn('steady_ping_gate "$label" "$PINGS" "$MAX_LOSS" "$STEADY_MAX_MS" || exit 1', body)
+        self.assertIn('steady_ping_gate "$label" "$PINGS" "$MAX_LOSS" "$STEADY_MAX_MS" "$STEADY_WARN_MS" || exit 1', body)
+        self.assertIn('STEADY_MAX_MS="${ORBLX_NATR_STEADY_MAX_MS:-200}"', text)
+        self.assertIn("STEADY_WARN_MS=100", text)
         # proof_ok comes after the last steady ping run.
         self.assertGreater(text.rindex("proof_ok"), text.rindex("\nsteady_pings "))
 
