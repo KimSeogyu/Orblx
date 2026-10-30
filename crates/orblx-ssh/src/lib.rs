@@ -14,11 +14,15 @@
 mod auth;
 mod client;
 mod hostkey;
+mod pty;
 mod record;
 mod server;
 
 pub use auth::{overlay_listen_addr, SSH_PORT};
-pub use client::{run_session, SessionOutput, SessionRequest};
+pub use client::{
+    local_terminal_size, run_session, run_shell, RawMode, SessionOutput, SessionRequest,
+    ShellTerminal,
+};
 pub use server::spawn_overlay_server;
 
 /// This function returns the name of this crate.

@@ -2,8 +2,12 @@
 //!
 //! The format is asciicast version 2.
 //! Line 1 is the header.
-//! Each later line is `[seconds, "i", text]` or `[seconds, "o", text]`.
-//! `i` is the command of this session. `o` is the output of this session.
+//! Each later line is `[seconds, code, text]`.
+//! For an exec session, `i` is the command and `o` is the output.
+//! For a PTY shell session, `i` is the input of the session user, `o` is the
+//! terminal output, `r` is a terminal size change, and `m` marks input that the
+//! recorder hides because the terminal echo is off (for example a password prompt).
+//! The events are in time order.
 //! One file holds one session. The file does not hold other sessions.
 //! The recorder does not write the SVID proof, the ticket, or the environment.
 
@@ -35,6 +39,20 @@ impl Recorder {
     ///
     /// The function fails when the directory is read-only or the disk fails.
     pub(crate) fn create(state_dir: &Path, frame: u32, user: &str) -> io::Result<Self> {
+        Self::create_sized(state_dir, frame, user, 80, 24, None)
+    }
+
+    /// Create a new recording file for a terminal of one size.
+    ///
+    /// `term` is the terminal type of a PTY session. An exec session has none.
+    pub(crate) fn create_sized(
+        state_dir: &Path,
+        frame: u32,
+        user: &str,
+        width: u16,
+        height: u16,
+        term: Option<&str>,
+    ) -> io::Result<Self> {
         let dir = state_dir.join(RECORD_DIR);
         fs::create_dir_all(&dir)?;
         let now = SystemTime::now()
@@ -56,12 +74,17 @@ impl Recorder {
             relative: format!("{RECORD_DIR}/{name}"),
             written: 0,
         };
+        let mut env = serde_json::Map::new();
+        env.insert("ORBLX_SSH_USER".to_string(), user.into());
+        if let Some(term) = term {
+            env.insert("TERM".to_string(), term.into());
+        }
         let header = serde_json::json!({
             "version": 2,
-            "width": 80,
-            "height": 24,
+            "width": width,
+            "height": height,
             "timestamp": now.as_secs(),
-            "env": { "ORBLX_SSH_USER": user },
+            "env": env,
         });
         recorder.line(&header.to_string())?;
         Ok(recorder)
@@ -74,6 +97,16 @@ impl Recorder {
     pub(crate) fn event(&mut self, at: Duration, code: &str, data: &[u8]) -> io::Result<()> {
         let text = String::from_utf8_lossy(data);
         let row = serde_json::json!([at.as_secs_f64(), code, text]);
+        self.line(&row.to_string())
+    }
+
+    /// Write one event with text that is already UTF-8.
+    /// The time is in seconds with microsecond steps, so it prints short.
+    pub(crate) fn event_text(&mut self, at: Duration, code: &str, text: &str) -> io::Result<()> {
+        let micros = u64::try_from(at.as_micros()).unwrap_or(u64::MAX);
+        #[allow(clippy::cast_precision_loss)]
+        let seconds = micros as f64 / 1_000_000.0;
+        let row = serde_json::json!([seconds, code, text]);
         self.line(&row.to_string())
     }
 
@@ -103,13 +136,70 @@ impl Recorder {
     }
 }
 
+/// Joins UTF-8 text that a read cut in two.
+///
+/// A PTY read can end in the middle of a character.
+/// The carry keeps up to 3 bytes of an incomplete character for the next read.
+#[derive(Default)]
+pub(crate) struct Utf8Carry {
+    tail: Vec<u8>,
+}
+
+impl Utf8Carry {
+    /// Return the complete text and keep an incomplete last character.
+    ///
+    /// Bytes that are not UTF-8 become U+FFFD.
+    pub(crate) fn take(&mut self, data: &[u8]) -> String {
+        let mut bytes = std::mem::take(&mut self.tail);
+        bytes.extend_from_slice(data);
+        let mut text = String::new();
+        let mut rest = bytes.as_slice();
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    break;
+                }
+                Err(err) => {
+                    let (valid, after) = rest.split_at(err.valid_up_to());
+                    text.push_str(std::str::from_utf8(valid).unwrap_or_default());
+                    match err.error_len() {
+                        Some(bad) => {
+                            text.push('\u{FFFD}');
+                            rest = &after[bad..];
+                        }
+                        None => {
+                            self.tail = after.to_vec();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        text
+    }
+}
+
+#[cfg(test)]
+impl Recorder {
+    /// Wrap a file that fails on write, for the fail-closed tests.
+    pub(crate) fn from_file_for_test(file: File, path: PathBuf) -> Self {
+        Self {
+            file,
+            path,
+            relative: format!("{RECORD_DIR}/test.cast"),
+            written: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use sha2::{Digest, Sha256};
 
-    use super::{Recorder, RECORD_DIR};
+    use super::{Recorder, Utf8Carry, RECORD_DIR};
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("orblx-rec-{tag}-{}", std::process::id()));
@@ -144,6 +234,28 @@ mod tests {
         let dir = temp_dir("bad");
         std::fs::write(dir.join(RECORD_DIR), b"not a directory").unwrap();
         assert!(Recorder::create(&dir, 1, "rec").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_carry_joins_a_character_that_a_read_cut_in_two() {
+        let mut carry = Utf8Carry::default();
+        let text = "a\u{d55c}b".as_bytes();
+        assert_eq!(carry.take(&text[..2]), "a");
+        assert_eq!(carry.take(&text[2..]), "\u{d55c}b");
+        assert_eq!(carry.take(&[0xff, b'x']), "\u{FFFD}x");
+    }
+
+    #[test]
+    fn a_pty_header_holds_the_size_and_the_terminal_type() {
+        let dir = temp_dir("pty");
+        let recorder = Recorder::create_sized(&dir, 3, "rec", 120, 40, Some("xterm")).unwrap();
+        let (relative, _) = recorder.finish().unwrap();
+        let text = std::fs::read_to_string(dir.join(relative)).unwrap();
+        let header: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(header["width"], 120);
+        assert_eq!(header["height"], 40);
+        assert_eq!(header["env"]["TERM"], "xterm");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

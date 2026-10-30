@@ -3,13 +3,15 @@
 //! The client signs in with an SVID.
 //! The client does not read or write an SSH key file.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 use orblx_datapath::Netmap;
 use orblx_identity::SpiffeId;
-use orblx_ssh::{run_session, SessionRequest, SSH_PORT};
+use orblx_ssh::{
+    local_terminal_size, run_session, run_shell, RawMode, SessionRequest, ShellTerminal, SSH_PORT,
+};
 
 use super::take_value;
 
@@ -30,6 +32,7 @@ pub(crate) struct SessionOptions {
     netmap: PathBuf,
     peer_cert: PathBuf,
     command: String,
+    shell: bool,
 }
 
 pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
@@ -41,10 +44,14 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
     let mut netmap = None;
     let mut peer_cert = None;
     let mut command = None;
+    let mut shell = false;
     let mut index = 0;
     while index < args.len() {
         let item = args[index].as_str();
-        if item.starts_with('-') {
+        if item == "--shell" {
+            shell = true;
+            index += 1;
+        } else if item.starts_with('-') {
             index += 1;
             let value = take_value(args, &mut index)?;
             match item {
@@ -68,6 +75,12 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
     let netmap = netmap.ok_or_else(|| format!("The command needs --netmap.\n{}", help()))?;
     let peer_cert =
         peer_cert.ok_or_else(|| format!("The command needs --peer-cert.\n{}", help()))?;
+    if shell && command.is_some() {
+        return Err(format!(
+            "The flags --shell and --command do not go together.\n{}",
+            help()
+        ));
+    }
     Ok(Command::Session(SessionOptions {
         user,
         node,
@@ -75,6 +88,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         netmap,
         peer_cert,
         command: command.unwrap_or_else(|| DEFAULT_COMMAND.to_string()),
+        shell,
     }))
 }
 
@@ -82,6 +96,13 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
     match command {
         Command::Help => {
             println!("{}", help());
+            Ok(())
+        }
+        Command::Session(options) if options.shell => {
+            let code = run_shell_blocking(options)?;
+            if code != 0 {
+                return Err(format!("The SSH shell exited with status {code}."));
+            }
             Ok(())
         }
         Command::Session(options) => {
@@ -121,6 +142,52 @@ fn run_blocking(options: SessionOptions) -> Result<orblx_ssh::SessionOutput, Str
     })
 }
 
+fn run_shell_blocking(options: SessionOptions) -> Result<u32, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "The SSH client did not start.".to_string())?;
+    let netmap = Netmap::from_path(&options.netmap).map_err(|err| err.to_string())?;
+    let (addr, dst) = locate(&netmap, &options.node)?;
+    let (cols, rows) = local_terminal_size();
+    let term = std::env::var("TERM").unwrap_or_else(|_| "xterm".to_string());
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        let mut stdin = io::stdin();
+        let mut buf = [0u8; 1024];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(len) => {
+                    if sender.blocking_send(buf[..len].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let raw = RawMode::enable();
+    let result = runtime.block_on(run_shell(
+        SessionRequest {
+            user: options.user,
+            addr,
+            dst,
+            identity_dir: options.identity,
+            peer_cert: options.peer_cert,
+            command: String::new(),
+        },
+        ShellTerminal { term, cols, rows },
+        receiver,
+        |bytes| {
+            let mut stdout = io::stdout();
+            let _ = stdout.write_all(bytes);
+            let _ = stdout.flush();
+        },
+    ));
+    drop(raw);
+    result
+}
+
 fn locate(netmap: &Netmap, node: &str) -> Result<(SocketAddr, SpiffeId), String> {
     let peer = netmap
         .peers
@@ -148,7 +215,7 @@ fn split_target(text: &str) -> Result<(String, String), String> {
 
 fn help() -> String {
     "\
-orblx ssh USER@NODE --identity DIR --netmap FILE --peer-cert FILE [--command TEXT]
+orblx ssh USER@NODE --identity DIR --netmap FILE --peer-cert FILE [--command TEXT | --shell]
 
 The client connects to the node overlay address on port 22.
 The client checks the SSH host key against the node SVID in --peer-cert.
@@ -158,6 +225,8 @@ The ticket is one shot for one host.
 The command does not read authorized_keys.
 The command does not write an SSH key file.
 The default command prints ORBLX_SSH_USER.
+--shell asks for a PTY and an interactive shell.
+The client sends standard input to the shell and prints the shell output.
 "
     .to_string()
 }
@@ -186,5 +255,28 @@ mod tests {
             }
             Command::Help => panic!("the parser did not select a session"),
         }
+    }
+
+    #[test]
+    fn the_shell_flag_takes_no_value_and_refuses_a_command() {
+        let base = [
+            "alice@box",
+            "--shell",
+            "--identity",
+            "id",
+            "--netmap",
+            "netmap.json",
+            "--peer-cert",
+            "peer.pem",
+        ];
+        let args: Vec<String> = base.iter().map(|item| item.to_string()).collect();
+        match parse(&args).unwrap() {
+            Command::Session(options) => assert!(options.shell),
+            Command::Help => panic!("the parser did not select a session"),
+        }
+        let mut both = args.clone();
+        both.push("--command".to_string());
+        both.push("id".to_string());
+        assert!(parse(&both).is_err());
     }
 }

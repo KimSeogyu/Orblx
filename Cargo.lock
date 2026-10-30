@@ -1811,6 +1811,7 @@ version = "0.1.0-rc.1"
 dependencies = [
  "base64",
  "ed25519-dalek 2.2.0",
+ "libc",
  "orblx-audit",
  "orblx-identity",
  "russh",
