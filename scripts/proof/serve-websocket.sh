@@ -16,6 +16,10 @@ source "$ROOT/scripts/proof/serve-lib.sh"
 . "$PROOF_LIB_DIR/proof-lock.sh"
 trap 'serve_cleanup; proof_lock_end' EXIT
 proof_lock_take "serve-websocket" "${SERVE_PROJECT:-orblx-serve-proof}"
+# W25-14b: start from a clean compose state (all profiles, all volumes).
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
+proof_compose_clean "${SERVE_PROJECT:-orblx-serve-proof}" || exit 1
 
 WS_PORT=8090
 COUNT="${ORBLX_WS_COUNT:-100}"

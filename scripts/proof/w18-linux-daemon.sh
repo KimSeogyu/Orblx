@@ -86,6 +86,10 @@ cleanup() {
 . "$PROOF_LIB_DIR/proof-lock.sh"
 trap 'cleanup; proof_lock_end' EXIT
 proof_lock_take "w18-linux-daemon"
+# W25-14b: start from a clean compose state (all profiles, all volumes).
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
+proof_compose_clean "orblx-w18" || exit 1
 
 require_toolchain
 
