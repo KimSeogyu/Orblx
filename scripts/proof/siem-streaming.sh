@@ -185,7 +185,7 @@ snapshot() {
   dc logs -t --no-log-prefix coord > "$WORK/coord-ts.log" 2>&1 || true
 }
 
-# make_events N: N token calls from the client (each writes one token-use record).
+# make_events N: N token calls from the client (each writes one token-use record). EVENT_JOBS calls run at once (default 8).
 make_events() {
   local want="$1" before now left
   before="$(chain_len)"
@@ -193,7 +193,7 @@ make_events() {
     now="$(chain_len)"
     left=$(( want - (now - before) ))
     [[ "$left" -le 0 ]] && break
-    dc exec -T client sh -c "seq 1 $left | xargs -P 8 -I{} orblx admin call admin-nodes --token-file /tokens/bench --coord $COORD --bundle /coord-state/trust-bundle.pem >/dev/null 2>&1" || true
+    dc exec -T client sh -c "seq 1 $left | xargs -P ${EVENT_JOBS:-8} -I{} orblx admin call admin-nodes --token-file /tokens/bench --coord $COORD --bundle /coord-state/trust-bundle.pem >/dev/null 2>&1" || true
   done
   now="$(chain_len)"
   echo "events_made $(( now - before )) want ${want}"
@@ -234,7 +234,9 @@ for sink in sinks:
     lat = sorted(first[seq] - written.get(seq, float("nan")) for seq in got)
     known = [ms for ms in lat if ms == ms]
     span = (max(first[seq] for seq in got) - min(written.get(seq, float("inf")) for seq in got)) if got else 0
-    ok = gaps == 0 and dups == 0 and order_ok and len(known) == len(got) and all(ms <= limit for ms in known)
+    # Gate 1 also needs the whole window (first write to last arrival) in the limit.
+    span_ok = limit >= 999999999 or span <= limit
+    ok = gaps == 0 and dups == 0 and order_ok and len(known) == len(got) and all(ms <= limit for ms in known) and span_ok
     all_ok = all_ok and ok
     if known:
         print("sink %s window %d..%d delivered %d of %d gaps %d duplicates %d order %s latency_ms min %.1f p50 %.1f p99 %.1f max %.1f first_write_to_last_arrival_ms %.1f %s"
@@ -415,7 +417,7 @@ wait_all 20 || fail "the sinks did not get the start of the chain"
 
 echo "=== [C] gate 1: ${EVENTS} events reach each sink in ${LIMIT_MS} ms or less ==="
 g1_lo="$(chain_len)"
-make_events "$EVENTS"
+EVENT_JOBS=32 make_events "$EVENTS"
 g1_hi=$(( g1_lo + EVENTS ))
 [[ "$(chain_len)" -ge "$g1_hi" ]] || fail "gate 1: the client did not make ${EVENTS} events"
 wait_all 30 || fail "gate 1: a sink did not get every event"
