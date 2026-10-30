@@ -1,0 +1,49 @@
+{
+  // W25-6 policy sync proof.
+  // The router publishes 10.88.26.0/24. corp.lan names go to 10.88.26.53 behind the router.
+  // Node a may send UDP 9500 and ICMP to the router. The router is the owner, so it can revoke a.
+  "owners": ["spiffe://orblx.local/node/router"],
+  "tags": {
+    "tag:router": ["spiffe://orblx.local/node/router"],
+  },
+  "tagOwners": {
+    "tag:router": ["spiffe://orblx.local/node/router"],
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a"],
+      "proto": "udp",
+      "dst": ["10.88.26.53/32:53", "spiffe://orblx.local/node/router:9500"],
+    },
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a"],
+      "proto": "icmp",
+      "dst": ["spiffe://orblx.local/node/router:*"],
+    },
+    {
+      // Gate 4: b enrolls after a starts. Node a may ping b.
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a"],
+      "proto": "icmp",
+      "dst": ["spiffe://orblx.local/node/b:*"],
+    },
+  ],
+  "autoApprovers": {
+    "routes": {
+      "10.88.26.0/24": ["tag:router"],
+    },
+  },
+  "splitDns": {
+    "corp.lan": ["10.88.26.53"],
+  },
+  "tests": [
+    {
+      "src": "spiffe://orblx.local/node/a",
+      "proto": "udp",
+      "accept": ["spiffe://orblx.local/node/router:9500"],
+      "deny": ["spiffe://orblx.local/node/router:9501"],
+    },
+  ],
+}
