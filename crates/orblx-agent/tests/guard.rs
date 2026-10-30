@@ -258,6 +258,7 @@ fn core(fixture: &Fixture, audit: PathBuf) -> GuardCore {
         verifier: fixture.signer.verifier(),
         netmap_public: fixture.netmap.verifying_key().to_bytes(),
         audit_path: audit,
+        nonce_path: None,
         poll: Duration::from_millis(200),
         stale_after: Duration::from_secs(2),
     };

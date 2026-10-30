@@ -1,11 +1,12 @@
 # Agent JIT grant proof stack.
 # `docker compose up` starts only the coordinator.
 # The node services use the nodes profile.
+# PROOF_PROJECT and ORBLX_AGENT_IMAGE set other names for a parallel run.
 name: orblx-agent-proof
 
 services:
   coord:
-    image: orblx-agent:w21
+    image: ${ORBLX_AGENT_IMAGE:-orblx-agent:w21}
     command:
       - coord
       - serve
@@ -26,7 +27,7 @@ services:
       - proof
 
   owner:
-    image: orblx-agent:w21
+    image: ${ORBLX_AGENT_IMAGE:-orblx-agent:w21}
     profiles: ["nodes"]
     entrypoint: ["orblx"]
     depends_on:
@@ -38,7 +39,7 @@ services:
       - proof
 
   a:
-    image: orblx-agent:w21
+    image: ${ORBLX_AGENT_IMAGE:-orblx-agent:w21}
     profiles: ["nodes"]
     cap_add:
       - NET_ADMIN
@@ -69,7 +70,7 @@ services:
       - proof
 
   b:
-    image: orblx-agent:w21
+    image: ${ORBLX_AGENT_IMAGE:-orblx-agent:w21}
     profiles: ["nodes"]
     cap_add:
       - NET_ADMIN
