@@ -9,11 +9,24 @@ use orblx_identity::{OidcMode, GOOGLE_CLIENT_ID_ENV, MAX_USER_TTL};
 
 use super::{parse_socket, take_value};
 use orblx_coord::{
-    advertise_routes_blocking, enroll_with_token_blocking, fetch_netmap_blocking, oidc_config,
-    serve_blocking, Coordinator, OidcConfig,
+    advertise_routes_blocking, enroll_with_oidc_blocking, enroll_with_token_blocking,
+    fetch_netmap_blocking, oidc_config, serve_blocking, CoordConfig, Coordinator, OidcConfig,
+    OidcEnroll,
 };
 
 const DEFAULT_PORT: u16 = 443;
+
+/// How `orblx coord enroll` proves the right to enroll.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EnrollSecret {
+    /// An enroll token file.
+    Token(PathBuf),
+    /// An OIDC ID token file and an optional nonce.
+    IdToken {
+        file: PathBuf,
+        nonce: Option<String>,
+    },
+}
 
 /// A coordinator command.
 #[derive(Debug)]
@@ -24,6 +37,7 @@ pub(crate) enum Command {
         listen: SocketAddr,
         name: String,
         policy: Option<PathBuf>,
+        config: Option<PathBuf>,
     },
     TokenCreate {
         state: PathBuf,
@@ -35,7 +49,7 @@ pub(crate) enum Command {
         coord: SocketAddr,
         coord_name: String,
         bundle: PathBuf,
-        token_file: PathBuf,
+        secret: EnrollSecret,
         state: PathBuf,
         endpoints: Vec<String>,
         routes: Vec<String>,
@@ -81,15 +95,38 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             listen,
             name,
             policy,
+            config,
         } => {
-            let mode = OidcMode::from_env().map_err(|err| err.to_string())?;
-            let client_id = std::env::var(GOOGLE_CLIENT_ID_ENV).ok();
-            if matches!(mode, OidcMode::Mock) {
-                println!(
-                    "Mock mode does not enable laptop login on the coordinator. Token enrollment is ready."
-                );
-            }
-            let oidc = oidc_config(mode, client_id).map_err(|err| err.to_string())?;
+            let from_file = match &config {
+                Some(path) => CoordConfig::from_file(path)
+                    .and_then(|parsed| parsed.oidc_config())
+                    .map_err(|err| err.to_string())?,
+                None => None,
+            };
+            let oidc = match from_file {
+                Some(oidc) => {
+                    if let OidcConfig::Issuer { issuer, .. } = &oidc {
+                        println!(
+                            "oidc issuer {} client_id {} allowed_domains {} allowed_emails {}",
+                            issuer.issuer(),
+                            issuer.client_id(),
+                            issuer.allowed_domains().len(),
+                            issuer.allowed_emails().len()
+                        );
+                    }
+                    oidc
+                }
+                None => {
+                    let mode = OidcMode::from_env().map_err(|err| err.to_string())?;
+                    let client_id = std::env::var(GOOGLE_CLIENT_ID_ENV).ok();
+                    if matches!(mode, OidcMode::Mock) {
+                        println!(
+                            "Mock mode does not enable laptop login on the coordinator. Token enrollment is ready."
+                        );
+                    }
+                    oidc_config(mode, client_id).map_err(|err| err.to_string())?
+                }
+            };
             let coord = Coordinator::open(&state, &name, oidc).map_err(|err| err.to_string())?;
             if let Some(ttl) = node_svid_ttl_from_env()? {
                 coord
@@ -122,28 +159,50 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             coord,
             coord_name,
             bundle,
-            token_file,
+            secret,
             state,
             endpoints,
             routes,
         } => {
             let bundle_pem = fs::read_to_string(&bundle)
                 .map_err(|err| format!("The file {} did not open. {err}", bundle.display()))?;
-            let token = fs::read_to_string(&token_file)
-                .map_err(|err| format!("The enroll token file did not open. {err}"))?;
-            let token = token.trim();
-            if token.is_empty() {
-                return Err("The enroll token file is empty.".to_string());
+            let result = match &secret {
+                EnrollSecret::Token(token_file) => {
+                    let token = fs::read_to_string(token_file)
+                        .map_err(|err| format!("The enroll token file did not open. {err}"))?;
+                    let token = token.trim();
+                    if token.is_empty() {
+                        return Err("The enroll token file is empty.".to_string());
+                    }
+                    enroll_with_token_blocking(
+                        coord,
+                        &coord_name,
+                        &bundle_pem,
+                        &name,
+                        token,
+                        &endpoints,
+                        &routes,
+                    )
+                }
+                EnrollSecret::IdToken { file, nonce } => {
+                    let id_token = fs::read_to_string(file)
+                        .map_err(|err| format!("The ID token file did not open. {err}"))?;
+                    let id_token = id_token.trim();
+                    if id_token.is_empty() {
+                        return Err("The ID token file is empty.".to_string());
+                    }
+                    enroll_with_oidc_blocking(OidcEnroll {
+                        coord,
+                        coord_name: &coord_name,
+                        bundle_pem: &bundle_pem,
+                        name: &name,
+                        id_token,
+                        nonce: nonce.as_deref(),
+                        endpoints: &endpoints,
+                        routes: &routes,
+                    })
+                }
             }
-            let result = enroll_with_token_blocking(
-                coord,
-                &coord_name,
-                &bundle_pem,
-                &name,
-                token,
-                &endpoints,
-                &routes,
-            )
             .map_err(|err| err.to_string())?;
             result.write_state(&state).map_err(|err| err.to_string())?;
             remember_coord(&state, coord, &coord_name)?;
@@ -309,6 +368,7 @@ fn parse_serve(args: &[String]) -> Result<Command, String> {
     let mut listen = None;
     let mut name = None;
     let mut policy = None;
+    let mut config = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -319,6 +379,7 @@ fn parse_serve(args: &[String]) -> Result<Command, String> {
             "--listen" => listen = Some(parse_socket(&value, DEFAULT_PORT)?),
             "--name" => name = Some(value),
             "--policy" => policy = Some(PathBuf::from(value)),
+            "--config" => config = Some(PathBuf::from(value)),
             other => return Err(format!("The flag {other} is not valid.\n{}", help())),
         }
     }
@@ -327,6 +388,7 @@ fn parse_serve(args: &[String]) -> Result<Command, String> {
         listen: listen.unwrap_or_else(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_PORT))),
         name: name.unwrap_or_else(|| "coord".to_string()),
         policy,
+        config,
     })
 }
 
@@ -367,6 +429,8 @@ fn parse_enroll(args: &[String]) -> Result<Command, String> {
     let mut coord_name = None;
     let mut bundle = None;
     let mut token_file = None;
+    let mut id_token_file = None;
+    let mut nonce = None;
     let mut state = None;
     let mut endpoints = Vec::new();
     let mut routes = Vec::new();
@@ -381,6 +445,8 @@ fn parse_enroll(args: &[String]) -> Result<Command, String> {
             "--coord-name" => coord_name = Some(value),
             "--bundle" => bundle = Some(PathBuf::from(value)),
             "--token-file" => token_file = Some(PathBuf::from(value)),
+            "--id-token-file" => id_token_file = Some(PathBuf::from(value)),
+            "--nonce" => nonce = Some(value),
             "--state" => state = Some(PathBuf::from(value)),
             "--endpoint" => endpoints.push(value),
             "--route" => routes.push(value),
@@ -392,7 +458,19 @@ fn parse_enroll(args: &[String]) -> Result<Command, String> {
         coord: coord.ok_or_else(|| "The command needs --coord.".to_string())?,
         coord_name: coord_name.unwrap_or_else(|| "coord".to_string()),
         bundle: bundle.ok_or_else(|| "The command needs --bundle.".to_string())?,
-        token_file: token_file.ok_or_else(|| "The command needs --token-file.".to_string())?,
+        secret: match (token_file, id_token_file, nonce) {
+            (Some(file), None, None) => EnrollSecret::Token(file),
+            (None, Some(file), nonce) => EnrollSecret::IdToken { file, nonce },
+            (Some(_), Some(_), _) => {
+                return Err("Use --token-file or --id-token-file, not both.".to_string())
+            }
+            (Some(_), None, Some(_)) => {
+                return Err("The --nonce flag needs --id-token-file.".to_string())
+            }
+            (None, None, _) => {
+                return Err("The command needs --token-file or --id-token-file.".to_string())
+            }
+        },
         state: state.ok_or_else(|| "The command needs --state.".to_string())?,
         endpoints,
         routes,
@@ -471,9 +549,9 @@ fn parse_netmap(args: &[String]) -> Result<Command, String> {
 
 fn help() -> String {
     "\
-orblx coord serve --state DIR [--listen ADDR] [--name NAME] [--policy FILE]
+orblx coord serve --state DIR [--listen ADDR] [--name NAME] [--policy FILE] [--config FILE]
 orblx coord token create --state DIR --out FILE [--ttl SECS]
-orblx coord enroll --name NAME --coord ADDR --bundle FILE --token-file FILE --state DIR [--coord-name NAME] [--endpoint HOST:PORT] [--route CIDR]
+orblx coord enroll --name NAME --coord ADDR --bundle FILE (--token-file FILE | --id-token-file FILE [--nonce HEX]) --state DIR [--coord-name NAME] [--endpoint HOST:PORT] [--route CIDR]
 orblx coord advertise --coord ADDR --bundle FILE --state DIR [--route CIDR]... [--exit-node on|off] [--coord-name NAME]
 orblx coord netmap --coord ADDR --bundle FILE --state DIR [--coord-name NAME]
 
@@ -497,6 +575,10 @@ A route that the policy does not approve stays out of the signed netmap.
 The route 0.0.0.0/0 is an exit route.
 --exit-node on offers this node as an exit node. --exit-node off clears the offer.
 The coordinator writes each route change and exit-node change to config-audit.jsonl.
+--config FILE reads the [oidc] section: issuer, client_id, allowed_domains, allowed_emails, ca_file.
+preset = \"google\" selects Google as the issuer.
+--id-token-file enrolls with an OIDC ID token from the configured issuer.
+The command does not print the ID token.
 "
     .to_string()
 }

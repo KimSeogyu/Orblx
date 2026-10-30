@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime};
 use orblx_audit::{ConfigAction, ConfigEvent, ConfigLog, ConfigRecord, EMPTY_DIGEST};
 use orblx_datapath::{Netmap, NetmapPeer, NetmapSelf};
 use orblx_identity::{
-    google_client_id_ok, DenySet, GoogleJwks, IssueGate, IssuedSvid, MiniCa, Policy, SpiffeId,
-    MAX_USER_TTL,
+    google_client_id_ok, DenySet, GoogleJwks, IssueGate, IssuedSvid, MiniCa, OidcIssuer, OidcJwks,
+    Policy, SpiffeId, MAX_USER_TTL,
 };
 use sha2::{Digest, Sha256};
 
@@ -48,6 +48,40 @@ pub enum OidcConfig {
     /// Tests use this variant.
     /// `orblx coord serve` does not select it.
     Mock(Box<IssueGate>),
+    /// A generic OIDC issuer from the `[oidc]` config section.
+    ///
+    /// The coordinator reads discovery and the JWKS on the first OIDC enrollment.
+    Issuer {
+        /// The issuer, the client id, and the allowed lists.
+        issuer: Box<OidcIssuer>,
+        /// Extra TLS roots for the issuer HTTPS server, as PEM text.
+        extra_roots_pem: Option<String>,
+    },
+}
+
+/// The life of a cached issuer JWKS.
+pub const ISSUER_JWKS_TTL_SECS: u64 = 300;
+
+/// The shortest time between two JWKS fetches for an unknown `kid`.
+pub const ISSUER_REFETCH_SECS: u64 = 10;
+
+/// One planned discovery and JWKS fetch for a generic issuer.
+#[derive(Debug, Clone)]
+pub struct IssuerFetch {
+    /// The issuer.
+    pub issuer: OidcIssuer,
+    /// Extra TLS roots as PEM text.
+    pub extra_roots_pem: Option<String>,
+    /// The reason for the fetch: `first`, `stale`, or `unknown-kid`.
+    pub reason: &'static str,
+}
+
+struct IssuerCache {
+    issuer: OidcIssuer,
+    extra_roots_pem: Option<String>,
+    jwks: Option<OidcJwks>,
+    fetched_at: u64,
+    attempted_at: Option<u64>,
 }
 
 /// Build the OIDC mode for `orblx coord serve`.
@@ -91,6 +125,7 @@ enum OidcState {
         jwks: Option<GoogleJwks>,
     },
     Mock(Box<IssueGate>),
+    Issuer(Box<IssuerCache>),
 }
 
 struct Inner {
@@ -222,6 +257,16 @@ impl Coordinator {
                 OidcState::Google { client_id, jwks }
             }
             OidcConfig::Mock(gate) => OidcState::Mock(gate),
+            OidcConfig::Issuer {
+                issuer,
+                extra_roots_pem,
+            } => OidcState::Issuer(Box::new(IssuerCache {
+                issuer: *issuer,
+                extra_roots_pem,
+                jwks: None,
+                fetched_at: 0,
+                attempted_at: None,
+            })),
         };
         let coord = Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -459,8 +504,59 @@ impl Coordinator {
                 client_id,
                 jwks: None,
             } => Some(client_id.clone()),
-            OidcState::Google { .. } | OidcState::TokenOnly | OidcState::Mock(_) => None,
+            OidcState::Google { .. }
+            | OidcState::TokenOnly
+            | OidcState::Mock(_)
+            | OidcState::Issuer(_) => None,
         })
+    }
+
+    /// Plan a discovery and JWKS fetch for the generic issuer.
+    ///
+    /// The function returns a plan when the cache is empty, when the cache is
+    /// older than [`ISSUER_JWKS_TTL_SECS`], or when the cache does not have `kid`.
+    /// A fetch for an unknown `kid` happens at most once in [`ISSUER_REFETCH_SECS`].
+    pub fn issuer_fetch_plan(
+        &self,
+        kid: Option<&str>,
+        now: SystemTime,
+    ) -> Result<Option<IssuerFetch>, CoordError> {
+        let now = unix_secs(now);
+        let mut inner = self.lock()?;
+        let OidcState::Issuer(cache) = &mut inner.oidc else {
+            return Ok(None);
+        };
+        let recent = cache
+            .attempted_at
+            .is_some_and(|at| now < at.saturating_add(ISSUER_REFETCH_SECS));
+        let reason = match &cache.jwks {
+            None if recent => return Ok(None),
+            None => "first",
+            Some(_) if now >= cache.fetched_at.saturating_add(ISSUER_JWKS_TTL_SECS) => "stale",
+            Some(jwks) => match kid {
+                Some(kid) if !jwks.has_kid(kid) && !recent => "unknown-kid",
+                _ => return Ok(None),
+            },
+        };
+        cache.attempted_at = Some(now);
+        Ok(Some(IssuerFetch {
+            issuer: cache.issuer.clone(),
+            extra_roots_pem: cache.extra_roots_pem.clone(),
+            reason,
+        }))
+    }
+
+    /// Replace the cached generic issuer JWKS.
+    pub fn install_issuer_jwks(&self, jwks: OidcJwks, now: SystemTime) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        match &mut inner.oidc {
+            OidcState::Issuer(cache) => {
+                cache.jwks = Some(jwks);
+                cache.fetched_at = unix_secs(now);
+                Ok(())
+            }
+            _ => Err(CoordError::Oidc),
+        }
     }
 
     /// Approve a node and clear key expiry.
@@ -646,7 +742,9 @@ impl Coordinator {
                 *slot = Some(jwks);
                 Ok(())
             }
-            OidcState::TokenOnly | OidcState::Mock(_) => Err(CoordError::Oidc),
+            OidcState::TokenOnly | OidcState::Mock(_) | OidcState::Issuer(_) => {
+                Err(CoordError::Oidc)
+            }
         }
     }
 
@@ -1142,7 +1240,29 @@ fn owner_from_oidc(
                 .map(|claims| claims.subject)
                 .map_err(|_| CoordError::Oidc)
         }
+        OidcState::Issuer(cache) => {
+            let Some(jwks) = cache.jwks.as_ref() else {
+                println!("oidc reject jwks-missing");
+                return Err(CoordError::Oidc);
+            };
+            match jwks.verify(id_token, &cache.issuer, nonce, now) {
+                Ok(claims) => {
+                    println!("oidc accept sub {}", claims.subject);
+                    Ok(claims.subject)
+                }
+                Err(reason) => {
+                    println!("oidc reject {reason}");
+                    Err(CoordError::Oidc)
+                }
+            }
+        }
     }
+}
+
+fn unix_secs(now: SystemTime) -> u64 {
+    now.duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or_default()
 }
 
 fn load_ca(dir: &Path, now: SystemTime) -> Result<MiniCa, CoordError> {

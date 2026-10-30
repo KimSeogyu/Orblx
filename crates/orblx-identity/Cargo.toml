@@ -1,6 +1,6 @@
 [package]
 name = "orblx-identity"
-description = "Mini CA, Google OIDC SVID issue, capability tickets, and deny list."
+description = "Mini CA, Google and generic OIDC, capability tickets, and deny list."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
@@ -19,6 +19,7 @@ time = { version = "0.3.36", default-features = false }
 x509-parser = "0.18.1"
 
 [dev-dependencies]
+orblx-test-idp = { path = "../orblx-test-idp" }
 base64 = "0.22"
 jsonwebtoken = { version = "=10.3.0", features = ["rust_crypto"] }
 rand = "0.8.5"

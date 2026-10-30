@@ -52,34 +52,96 @@ pub async fn post_google_token(body: &str) -> Result<String, CoordError> {
     String::from_utf8(bytes).map_err(|_| CoordError::Oidc)
 }
 
+/// Send `GET` to one `https://` URL and return the body.
+///
+/// `extra_roots_pem` adds TLS roots to the public web roots.
+/// The function accepts only a `200` reply and at most 64 KiB.
+/// The error names the failed step. It does not contain reply data.
+pub async fn https_get(url: &str, extra_roots_pem: Option<&str>) -> Result<String, &'static str> {
+    let (host, port, path) = split_https_url(url).map_err(|_| "url")?;
+    let host_header = if port == 443 {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
+    );
+    let bytes = exchange_steps(&host, port, &request, extra_roots_pem).await?;
+    String::from_utf8(bytes).map_err(|_| "utf8")
+}
+
+/// Split `https://host[:port][/path]` into its parts.
+pub fn split_https_url(url: &str) -> Result<(String, u16, String), CoordError> {
+    let rest = url.strip_prefix("https://").ok_or(CoordError::Oidc)?;
+    if rest.contains(['?', '#', '@', '\\'])
+        || rest.bytes().any(|byte| !(0x21..=0x7e).contains(&byte))
+    {
+        return Err(CoordError::Oidc);
+    }
+    let (authority, path) = match rest.find('/') {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.contains(']') || host.ends_with(']') => {
+            (host, port.parse::<u16>().map_err(|_| CoordError::Oidc)?)
+        }
+        _ => (authority, 443),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() || port == 0 {
+        return Err(CoordError::Oidc);
+    }
+    Ok((host.to_string(), port, path.to_string()))
+}
+
 async fn https_exchange(host: &str, request: &str) -> Result<Vec<u8>, CoordError> {
+    exchange_steps(host, 443, request, None)
+        .await
+        .map_err(|_| CoordError::Oidc)
+}
+
+async fn exchange_steps(
+    host: &str,
+    port: u16,
+    request: &str,
+    extra_roots_pem: Option<&str>,
+) -> Result<Vec<u8>, &'static str> {
     let provider = crate::tlsutil::crypto_provider();
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(pem) = extra_roots_pem {
+        for cert in rustls_pemfile::certs(&mut pem.as_bytes()) {
+            let cert = cert.map_err(|_| "roots")?;
+            roots.add(cert).map_err(|_| "roots")?;
+        }
+    }
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|err| CoordError::Tls(err.to_string()))?
+        .map_err(|_| "tls-config")?
         .with_root_certificates(roots)
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(config));
-    let tcp = tokio::time::timeout(Duration::from_secs(20), TcpStream::connect((host, 443)))
+    let tcp = tokio::time::timeout(Duration::from_secs(20), TcpStream::connect((host, port)))
         .await
-        .map_err(|_| CoordError::Oidc)?
-        .map_err(|_| CoordError::Oidc)?;
-    let server_name = ServerName::try_from(host.to_string()).map_err(|_| CoordError::Oidc)?;
+        .map_err(|_| "connect-timeout")?
+        .map_err(|_| "connect")?;
+    let server_name = ServerName::try_from(host.to_string()).map_err(|_| "server-name")?;
     let mut tls =
         tokio::time::timeout(Duration::from_secs(20), connector.connect(server_name, tcp))
             .await
-            .map_err(|_| CoordError::Oidc)?
-            .map_err(|_| CoordError::Oidc)?;
+            .map_err(|_| "tls-timeout")?
+            .map_err(|_| "tls")?;
     tls.write_all(request.as_bytes())
         .await
-        .map_err(|_| CoordError::Oidc)?;
+        .map_err(|_| "write")?;
     let mut raw = Vec::new();
-    tls.read_to_end(&mut raw)
+    tokio::time::timeout(Duration::from_secs(20), tls.read_to_end(&mut raw))
         .await
-        .map_err(|_| CoordError::Oidc)?;
-    split_http_body(&raw)
+        .map_err(|_| "read-timeout")?
+        .map_err(|_| "read")?;
+    split_http_body(&raw).map_err(|_| "http")
 }
 
 pub fn split_http_body(raw: &[u8]) -> Result<Vec<u8>, CoordError> {
@@ -177,7 +239,26 @@ fn block_on<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::split_http_body;
+    use super::{split_http_body, split_https_url};
+
+    #[test]
+    fn https_urls_split_into_host_port_and_path() {
+        assert_eq!(
+            split_https_url("https://idp:8443/.well-known/openid-configuration").unwrap(),
+            (
+                "idp".to_string(),
+                8443,
+                "/.well-known/openid-configuration".to_string()
+            )
+        );
+        assert_eq!(
+            split_https_url("https://accounts.google.com").unwrap(),
+            ("accounts.google.com".to_string(), 443, "/".to_string())
+        );
+        assert!(split_https_url("http://idp/jwks").is_err());
+        assert!(split_https_url("https://user@idp/jwks").is_err());
+        assert!(split_https_url("https://idp:0/jwks").is_err());
+    }
 
     #[test]
     fn content_length_body_is_returned() {
