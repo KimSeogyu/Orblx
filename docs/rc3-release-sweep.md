@@ -19,7 +19,7 @@ scripts/proof/release-sweep.sh COMMIT
 2. It builds the release binary there with the `~/.cargo/bin` toolchain (the build log has the `rustc --version` line). It also builds the debug binaries that the older proofs use, so that no proof compiles while it holds the lock.
 3. It runs each proof of the list below, one at a time, from that worktree. A wrapper takes the W25-5 box proof lock (`proof-lock.sh`) before the proof starts and releases it after the proof ends. Since W25-14 every proof takes the lock itself; it sees that its parent (the wrapper) holds it and does not wait again.
 4. The log of each proof is `/workspace/orblx-w18-proof/rc3-sweep-<sha>-<proof>.log`. The table is `/workspace/orblx-w18-proof/rc3-sweep-<sha>.md`. The table has 4 columns: proof, gap row, log path, result.
-5. The log of a proof is the full stdout and stderr of the proof, with no filter and no cut. The sweep adds only the lock lines (`proof_lock`, `proof_context`, `proof_contention`) and its own `release_sweep:` notes. A step that the proof script filters itself is filtered in the log too (for example `nat-realism.sh` sends its `cargo test` output through `grep -E '^test |test result'`). The sweep does not change the proof scripts.
+5. The log of a proof is the full stdout and stderr of the proof, with no filter and no cut. The sweep adds only the lock lines (`proof_lock`, `proof_context`, `proof_contention`) and its own `release_sweep:` notes. A step that a proof script filters itself is filtered in the log too; the sweep does not change the proof scripts. Since W25-14d (#101) no proof pipes `cargo` output into a filter, and the excerpt steps use `show_matching`, which prints the full step output when no line matches. The sweep takes a `show_matching: no line matches` or `secret_scan:` line as an error line.
 6. After each proof, the script removes the images that the proof built (without `-f`, so an image that a running container uses stays). At the end, it removes the worktree and its target.
 
 Result rules:
@@ -27,7 +27,7 @@ Result rules:
 | Result | Rule |
 |---|---|
 | `proof_ok` | The proof exit code is 0 and the log has a line `proof_ok` (`docker-image.sh` adds fields after it; `w18-linux-daemon.sh` prints `W18 proof passed`). |
-| `FAIL (exit N): LINE` | Any other case. `LINE` is the first log line that matches `error`, `FAIL`, `failed`, `panicked`, `: line N:`, `command not found`, `No such file`, `timed out` or `Traceback`. When no line matches, it is the last log line. |
+| `FAIL (exit N): LINE` | Any other case. `LINE` is the first log line that matches `error`, `FAIL`, `failed`, `panicked`, `: line N:`, `command not found`, `No such file`, `timed out`, `Traceback`, `show_matching: no line matches` or `secret_scan:`. When no line matches, it is the last log line. |
 | `FAIL (exit 0, no proof_ok line)` | The proof skipped itself (for example, it was not root). A skip is not a pass. |
 | `FAIL (exit 124, timeout ...)` | The proof ran longer than `ORBLX_SWEEP_TIMEOUT` (default 3600 s, the lock wait does not count). |
 

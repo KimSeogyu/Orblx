@@ -69,7 +69,7 @@ TOOL_PATH="$TOOL_CARGO_HOME/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bi
 # A line equal to proof_ok (docker-image adds fields after it). w18-linux-daemon.sh
 # prints "W18 proof passed" in place of proof_ok.
 OK_RE='^(proof_ok( .*)?|W18 proof passed)$'
-ERR_RE='(error|Error|ERROR|FAIL|panicked|[Ff]ailed|: line [0-9]+:|command not found|No such file|[Tt]imed out|Traceback)'
+ERR_RE='(error|Error|ERROR|FAIL|panicked|[Ff]ailed|: line [0-9]+:|command not found|No such file|[Tt]imed out|Traceback|show_matching: no line matches|secret_scan: )'
 LOCK_LINE_RE='^proof_(lock|context|contention) '
 
 # One proof for each line: name|script|gap rows|env|images.
