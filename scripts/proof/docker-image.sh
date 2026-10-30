@@ -215,7 +215,7 @@ before="$(status_field "${PREFIX}-a" svid_expiry)"
 wait_log "${PREFIX}-a" "The node renewed the SVID" 1 $((TTL * 2)) || die "a did not renew the SVID."
 sleep 2
 after="$(status_field "${PREFIX}-a" svid_expiry)"
-docker logs "${PREFIX}-a" 2>&1 | grep -F "The node renewed the SVID" | tail -1
+docker logs "${PREFIX}-a" 2>&1 | show_matching -F "The node renewed the SVID" | tail -1
 echo "a svid_expiry before ${before} after ${after}"
 [[ "$after" -gt "$before" ]] || die "The SVID expiry did not move."
 ping_peer "${PREFIX}-a" "$ip_b" "ping a->b after renew"

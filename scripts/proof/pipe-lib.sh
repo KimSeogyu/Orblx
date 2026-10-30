@@ -62,3 +62,36 @@ steady_ping_gate() {
     return 1
   fi
 }
+
+# W25-14: show_matching GREP_ARGS... prints the matching lines of stdin, like grep.
+# When no line matches, it prints the full input to stderr, so the log keeps the cause,
+# and returns 1 (as grep does).
+show_matching() {
+  local input
+  input="$(cat; printf x)"
+  input="${input%x}"
+  if printf '%s' "$input" | grep "$@"; then
+    return 0
+  fi
+  echo "show_matching: no line matches: $*. The full output follows." >&2
+  printf '%s' "$input" >&2
+  return 1
+}
+
+# W25-14: secret_scan FILE fails when FILE is missing or empty, or when it holds PEM key
+# text or an enroll token (ge1.). It prints "secret_grep <pattern> <count>" for each pattern.
+secret_scan() {
+  local file="$1" pattern hits bad=0
+  if [[ ! -s "$file" ]]; then
+    echo "secret_scan: ${file} is missing or empty. The scan cannot pass." >&2
+    return 1
+  fi
+  for pattern in 'PRIVATE KEY' 'ge1\.'; do
+    hits="$(awk -v re="$pattern" '$0 ~ re {n++} END {print n + 0}' "$file")" || return 1
+    echo "secret_grep '${pattern}' ${hits}"
+    if [[ "$hits" -ne 0 ]]; then
+      bad=1
+    fi
+  done
+  return "$bad"
+}
