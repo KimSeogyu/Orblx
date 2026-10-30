@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::time::SystemTime;
+use tokio::sync::watch;
 
 use orblx_identity::{GoogleJwks, OidcJwks, TrustBundle, WorkloadKind};
 use rustls::pki_types::CertificateDer;
@@ -48,9 +49,14 @@ pub async fn spawn(
     tokio::spawn(async move {
         expire_tick(tick_coord).await;
     });
+    let (stamp_tx, stamp_rx) = watch::channel(0u64);
+    let stamp_coord = coord.clone();
+    tokio::spawn(async move {
+        stamp_tick(stamp_coord, stamp_tx).await;
+    });
     let coord = coord.clone();
     let handle = tokio::spawn(async move {
-        let _ = accept_loop(endpoint, coord).await;
+        let _ = accept_loop(endpoint, coord, stamp_rx).await;
     });
     Ok((addr, handle))
 }
@@ -73,6 +79,64 @@ async fn expire_tick(coord: Coordinator) {
                 println!("coord agent expire tick failed: {}", err.public_text());
             }
             _ => {}
+        }
+    }
+}
+
+/// The time between two checks of the files that make the deny list (W25-2).
+const STAMP_TICK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Wake the `deny-wait` requests when a file that makes the deny list changes.
+///
+/// The files are the deny file, the config audit chain, the node store, and the policy file.
+/// The tick reads only the file size and change time.
+async fn stamp_tick(coord: Coordinator, stamp: watch::Sender<u64>) {
+    let mut last = None;
+    loop {
+        tokio::time::sleep(STAMP_TICK).await;
+        let (Ok(dir), Ok(policy)) = (coord.state_dir(), coord.policy_file()) else {
+            continue;
+        };
+        let now = [
+            dir.join("deny.json"),
+            dir.join(crate::state::CONFIG_AUDIT_FILE),
+            dir.join("nodes.json"),
+            policy,
+        ]
+        .iter()
+        .map(|path| {
+            std::fs::metadata(path)
+                .ok()
+                .map(|meta| (meta.len(), meta.modified().ok()))
+        })
+        .collect::<Vec<_>>();
+        if last.as_ref() != Some(&now) {
+            last = Some(now);
+            stamp.send_modify(|value| *value = value.wrapping_add(1));
+        }
+    }
+}
+
+/// Reply with the deny list of one node when its ETag is not `known` (W25-2).
+///
+/// Otherwise hold the request until a deny file input changes and the ETag changes,
+/// or until [`crate::DENY_WAIT_HOLD`] ends. Then reply with the same list.
+async fn deny_wait(
+    coord: &Coordinator,
+    name: &str,
+    known: Option<&str>,
+    mut stamp: watch::Receiver<u64>,
+) -> Result<String, CoordError> {
+    let deadline = tokio::time::Instant::now() + crate::DENY_WAIT_HOLD;
+    loop {
+        stamp.borrow_and_update();
+        let text = admin::deny_json_for(coord, name, SystemTime::now())?;
+        if known != Some(admin::deny_etag(&text).as_str()) {
+            return Ok(text);
+        }
+        match tokio::time::timeout_at(deadline, stamp.changed()).await {
+            Ok(Ok(())) => {}
+            _ => return Ok(text),
         }
     }
 }
@@ -124,16 +188,21 @@ async fn refresh_issuer_jwks(coord: &Coordinator, plan: IssuerFetch) {
     }
 }
 
-async fn accept_loop(endpoint: quinn::Endpoint, coord: Coordinator) -> Result<(), CoordError> {
+async fn accept_loop(
+    endpoint: quinn::Endpoint,
+    coord: Coordinator,
+    stamp: watch::Receiver<u64>,
+) -> Result<(), CoordError> {
     loop {
         let Some(incoming) = endpoint.accept().await else {
             break;
         };
         let coord = coord.clone();
+        let stamp = stamp.clone();
         tokio::spawn(async move {
             match incoming.await {
                 Ok(connection) => {
-                    if let Err(err) = handle_connection(&coord, connection).await {
+                    if let Err(err) = handle_connection(&coord, connection, stamp).await {
                         println!("coord request failed: {}", err.public_text());
                     }
                 }
@@ -147,13 +216,14 @@ async fn accept_loop(endpoint: quinn::Endpoint, coord: Coordinator) -> Result<()
 async fn handle_connection(
     coord: &Coordinator,
     connection: quinn::Connection,
+    stamp: watch::Receiver<u64>,
 ) -> Result<(), CoordError> {
     let (mut send, mut recv) = connection.accept_bi().await.map_err(|_| {
         println!("coord rejected: the stream did not open");
         CoordError::Protocol("The request is not valid.".to_string())
     })?;
     let request = proto::read_json::<Request>(&mut recv).await?;
-    let response = match dispatch(coord, &connection, request).await {
+    let response = match dispatch(coord, &connection, request, stamp).await {
         Ok(response) => response,
         Err(err) => {
             println!("coord rejected: {}", err.public_text());
@@ -176,6 +246,7 @@ async fn dispatch(
     coord: &Coordinator,
     connection: &quinn::Connection,
     request: Request,
+    stamp: watch::Receiver<u64>,
 ) -> Result<Response, CoordError> {
     let now = SystemTime::now();
     match request.op.as_str() {
@@ -262,6 +333,19 @@ async fn dispatch(
                 return Err(CoordError::Peer);
             }
             let detail = admin::deny_json_for(coord, &request.name, now)?;
+            Ok(Response {
+                ok: true,
+                detail: Some(detail),
+                ..Response::default()
+            })
+        }
+        "deny-wait" => {
+            let peer = peer_node(coord, connection)?;
+            if peer != request.name {
+                return Err(CoordError::Peer);
+            }
+            let detail =
+                deny_wait(coord, &request.name, request.deny_etag.as_deref(), stamp).await?;
             Ok(Response {
                 ok: true,
                 detail: Some(detail),
@@ -463,6 +547,7 @@ fn run_admin(
         "admin-approve" => admin::approve(coord, &request.name, actor)?,
         "admin-revoke" => admin::revoke(coord, &request.name, actor, now)?,
         "admin-revoke-all" => admin::revoke_all(coord, &request.name, actor, now)?,
+        "admin-revoke-undo" => admin::revoke_undo(coord, &request.name, actor, now)?,
         "admin-expire" => admin::expire(coord, &request.name, actor)?,
         "admin-routes" => admin::routes(coord)?,
         "admin-audit" => admin::audit(coord, parse_since(&request.name)?)?,
@@ -657,6 +742,7 @@ mod tests {
             exit_node: false,
             grant: None,
             api_token: Some(secret.to_string()),
+            deny_etag: None,
         }
     }
 

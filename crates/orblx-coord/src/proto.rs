@@ -26,6 +26,10 @@ pub struct Request {
     /// A scoped admin API token (W25-3). The caller then needs no client certificate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_token: Option<String>,
+    /// The ETag of the deny list that the node has (W25-2 `deny-wait`).
+    /// An old coordinator ignores the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_etag: Option<String>,
 }
 
 /// One agent grant request.

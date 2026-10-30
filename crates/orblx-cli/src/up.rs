@@ -696,19 +696,53 @@ fn spawn_deny_refresh(options: &UpOptions) {
             .unwrap_or_else(|| "coord".to_string()),
     };
     let state = options.state_dir.clone();
-    // The fetch starts each DENY_REFRESH. The time of the fetch is not added to the interval (W25-1).
-    thread::spawn(move || loop {
-        let start = Instant::now();
-        if let Ok(bundle) = fs::read_to_string(state.join(BUNDLE_FILE)) {
+    // W25-2: the node waits for a new deny list (`deny-wait`). The coordinator replies when the
+    // list changes, or after DENY_WAIT_HOLD with the same list.
+    // When the wait fails (for example an old coordinator), the node fetches the list each
+    // DENY_REFRESH, and tries the wait again after DENY_WAIT_RETRY.
+    thread::spawn(move || {
+        let mut etag: Option<String> = None;
+        let mut wait_after = Instant::now();
+        loop {
+            let start = Instant::now();
+            let Ok(bundle) = fs::read_to_string(state.join(BUNDLE_FILE)) else {
+                thread::sleep(DENY_REFRESH);
+                continue;
+            };
+            if start >= wait_after {
+                match orblx_coord::fetch_deny_wait_blocking(
+                    coord,
+                    &name,
+                    &bundle,
+                    &state,
+                    etag.as_deref(),
+                ) {
+                    Ok(text) => {
+                        let _ = store_deny(&state, &text);
+                        etag = Some(orblx_coord::deny_etag(&text));
+                        thread::sleep(DENY_WAIT_GAP.saturating_sub(start.elapsed()));
+                        continue;
+                    }
+                    Err(_) => wait_after = Instant::now() + DENY_WAIT_RETRY,
+                }
+            }
+            // The fetch starts each DENY_REFRESH. The time of the fetch is not added (W25-1).
             if let Ok(text) = orblx_coord::fetch_deny_blocking(coord, &name, &bundle, &state) {
                 let _ = store_deny(&state, &text);
+                etag = Some(orblx_coord::deny_etag(&text));
             }
+            thread::sleep(DENY_REFRESH.saturating_sub(start.elapsed()));
         }
-        thread::sleep(DENY_REFRESH.saturating_sub(start.elapsed()));
     });
 }
 
-/// The time between two deny fetches (W24-D).
+/// The shortest time between two `deny-wait` requests (W25-2).
+const DENY_WAIT_GAP: Duration = Duration::from_millis(100);
+
+/// The time before the node tries `deny-wait` again after it failed (W25-2).
+const DENY_WAIT_RETRY: Duration = Duration::from_secs(30);
+
+/// The time between two deny fetches when `deny-wait` fails (W24-D).
 ///
 /// The SSH server and the file receiver read `deny.json` for each new login or file.
 /// A revoke-all must stop them within 1 s, so the node fetches the deny file each 500 ms.

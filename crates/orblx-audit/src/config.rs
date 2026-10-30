@@ -92,11 +92,13 @@ pub enum ConfigAction {
     Share,
     /// The policy removed one share (W25-1). One record for each share.
     Unshare,
+    /// An owner removed the SVID deny entry of one principal (W25-2 revoke undo).
+    Unrevoke,
 }
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -128,6 +130,7 @@ impl ConfigAction {
         Self::TokenRevoke,
         Self::Share,
         Self::Unshare,
+        Self::Unrevoke,
     ];
 
     /// Return the stable action token.
@@ -165,6 +168,7 @@ impl ConfigAction {
             Self::TokenRevoke => "token-revoke",
             Self::Share => "share",
             Self::Unshare => "unshare",
+            Self::Unrevoke => "unrevoke",
         }
     }
 
@@ -209,6 +213,7 @@ impl ConfigAction {
             Self::TokenRevoke => 29,
             Self::Share => 30,
             Self::Unshare => 31,
+            Self::Unrevoke => 32,
         }
     }
 
