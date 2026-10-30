@@ -28,7 +28,7 @@ Result rules:
 | `proof_ok` | The proof exit code is 0 and the log has a line `proof_ok` (`docker-image.sh` adds fields after it; `w18-linux-daemon.sh` prints `W18 proof passed`). |
 | `FAIL (exit N): LINE` | Any other case. `LINE` is the first log line that matches `error`, `FAIL`, `failed`, `panicked`, `: line N:`, `command not found`, `No such file`, `timed out` or `Traceback`. When no line matches, it is the last log line. |
 | `FAIL (exit 0, no proof_ok line)` | The proof skipped itself (for example, it was not root). A skip is not a pass. |
-| `FAIL (exit 124, timeout ...)` | The proof ran longer than `ORBLX_SWEEP_TIMEOUT` (default 3600 s). |
+| `FAIL (exit 124, timeout ...)` | The proof ran longer than `ORBLX_SWEEP_TIMEOUT` (default 3600 s, the lock wait does not count). |
 
 A failed proof does not stop the sweep. The exit code is 1 when a proof failed, 2 when the setup or the build failed, and 0 when every proof gave `proof_ok`.
 
@@ -39,7 +39,7 @@ The script sends no proof output through a pipe. The output goes to the log file
 | `ORBLX_SWEEP_OUT` | `/workspace/orblx-w18-proof` | Log and table directory. |
 | `ORBLX_SWEEP_WT` | `/workspace/orblx-rc3-sweep-<sha>` | Worktree path. |
 | `ORBLX_SWEEP_ONLY` | every proof | Space list of proof names. |
-| `ORBLX_SWEEP_TIMEOUT` | 3600 | Seconds for each proof. |
+| `ORBLX_SWEEP_TIMEOUT` | 3600 | Seconds for each proof, without the wait for the lock. |
 | `ORBLX_SWEEP_KEEP` | 0 | 1 keeps the worktree, the target and the images. |
 | `ORBLX_SWEEP_FETCH` | 1 | 0 does not run `git fetch`. |
 | `ORBLX_SWEEP_PROGRESS` | none | A file. The script adds one line for each step. |

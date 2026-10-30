@@ -30,7 +30,8 @@
 #   ORBLX_SWEEP_OUT       Log and table directory (default /workspace/orblx-w18-proof).
 #   ORBLX_SWEEP_WT        Worktree path (default /workspace/orblx-rc3-sweep-<sha>).
 #   ORBLX_SWEEP_ONLY      Space list of proof names. Default: every proof.
-#   ORBLX_SWEEP_TIMEOUT   Seconds for each proof (default 3600). Then the proof is FAIL.
+#   ORBLX_SWEEP_TIMEOUT   Seconds for each proof, without the lock wait (default 3600).
+#                         Then the proof is FAIL.
 #   ORBLX_SWEEP_KEEP      1 keeps the worktree, the target and the images.
 #   ORBLX_SWEEP_FETCH     0 does not run git fetch before COMMIT is resolved.
 #   ORBLX_SWEEP_PROGRESS  A file. The script adds one line for each step.
@@ -247,14 +248,15 @@ for line in "${specs[@]}"; do
     # The wrapper takes the lock, runs the proof, and releases the lock in its EXIT trap.
     # ORBLX_PROOF_LOCK_HELD is the wrapper pid, so a proof that takes the lock itself
     # (nat-realism.sh) sees that its parent holds it.
+    # The timeout counts only the proof, not the wait for the lock.
     tool_env PROOF_LOG="$log" ${env_words[@]+"${env_words[@]}"} \
-      timeout -k 60 "$TIMEOUT" bash -c '
+      bash -c '
         . "$1" || exit 98
         trap proof_lock_end EXIT
         proof_lock_take "$2" orblx-rc3sw-
         cd "$3"
-        bash "$4"
-      ' release-sweep-proof "$LOCK_LIB" "rc3-sweep:$name" "$ROOT" "$ROOT/$path" \
+        timeout -k 60 "$5" bash "$4"
+      ' release-sweep-proof "$LOCK_LIB" "rc3-sweep:$name" "$ROOT" "$ROOT/$path" "$TIMEOUT" \
       >>"$log" 2>&1 </dev/null || rc=$?
   fi
   secs=$(( $(date +%s) - started ))
