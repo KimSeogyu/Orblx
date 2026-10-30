@@ -334,6 +334,7 @@ fn node_request(
         visibility: Arc::new(AllowPeers),
         on_ready: None,
         metrics: None,
+        filter: None,
     }
 }
 

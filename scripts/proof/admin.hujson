@@ -7,6 +7,12 @@
       "src": ["spiffe://orblx.local/node/a"],
       "proto": "udp",
       "dst": ["spiffe://orblx.local/node/b:*"]
+    },
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a"],
+      "proto": "icmp",
+      "dst": ["spiffe://orblx.local/node/b:*"]
     }
   ]
 }

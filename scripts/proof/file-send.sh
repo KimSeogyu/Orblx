@@ -5,7 +5,8 @@
 # Check 1: a sends a random file to b. The SHA-256 on b is the same as on a.
 # Check 2: a sends the same name again. The receiver does not replace the file.
 # Check 3: c sends a file to b over the overlay. The signed grants for b do not allow c on
-#          TCP 4243. The receiver refuses the offer before it writes a byte.
+#          TCP 4243. Since W24, the datapath on b drops the packets, so the receiver
+#          does not see the connection. The packet audit on b has a record for c.
 #          The inbox has no new file and no part file.
 # Check 4: b sends a file to its own receiver (not through the datapath). The grants do not
 #          allow b. The receiver refuses it. The inbox has no new file and no part file.
@@ -294,7 +295,17 @@ if dc exec -T c orblx file send /tmp/from-c.bin --to b --state "$STATE" --timeou
   exit 1
 fi
 cat "$WORK/from-c.txt"
-grep -q 'reply deny acl' "$WORK/from-c.txt"
+if grep -q 'reply deny acl' "$WORK/from-c.txt"; then
+  echo "The receiver saw the connection from c. The datapath must drop it." >&2
+  exit 1
+fi
+dc exec -T b cat "$STATE/packet-audit.jsonl" >"$WORK/packet-audit.jsonl"
+jq -e -s '
+  any(.[]; .action == "packet-deny"
+    and .actor == "spiffe://orblx.local/node/c"
+    and .target == "tcp/4243")
+' "$WORK/packet-audit.jsonl" >/dev/null
+echo "packet_audit c tcp/4243 deny"
 expect_inbox "payload.bin "
 no_part_files
 
@@ -317,14 +328,14 @@ dc exec -T b cat /tmp/file-receive.log
 refused_lines="$(dc exec -T b grep -c '^file_refused ' /tmp/file-receive.log || true)"
 received_lines="$(dc exec -T b grep -c '^file_received ' /tmp/file-receive.log || true)"
 echo "receiver_lines received ${received_lines} refused ${refused_lines}"
-[[ "$received_lines" -eq 1 && "$refused_lines" -eq 3 ]]
+[[ "$received_lines" -eq 1 && "$refused_lines" -eq 2 ]]
 
 echo "=== [C] check 5: receiver audit chain ==="
 dc exec -T b cat "$STATE/file-audit.jsonl" >"$WORK/file-audit.jsonl"
 jq -c '{action, actor, target, detail}' "$WORK/file-audit.jsonl"
 records="$(wc -l <"$WORK/file-audit.jsonl" | tr -d ' ')"
 echo "audit_records ${records}"
-[[ "$records" -eq 4 ]]
+[[ "$records" -eq 3 ]]
 jq -e -s --arg sha "$sender_sha" --arg size "$SIZE_BYTES" '
   .[0].action == "file-receive"
   and .[0].actor == "spiffe://orblx.local/node/a"
@@ -334,13 +345,9 @@ jq -e -s --arg sha "$sender_sha" --arg size "$SIZE_BYTES" '
   and .[1].actor == "spiffe://orblx.local/node/a"
   and (.[1].detail | startswith("reason exists size 4096 sha256 "))
   and .[2].action == "file-deny"
-  and .[2].actor == "spiffe://orblx.local/node/c"
-  and .[2].target == "from-c.bin"
+  and .[2].actor == "spiffe://orblx.local/node/b"
+  and .[2].target == "from-b.bin"
   and (.[2].detail | startswith("reason acl size 65536 sha256 "))
-  and .[3].action == "file-deny"
-  and .[3].actor == "spiffe://orblx.local/node/b"
-  and .[3].target == "from-b.bin"
-  and (.[3].detail | startswith("reason acl size 65536 sha256 "))
 ' "$WORK/file-audit.jsonl" >/dev/null
 echo "audit_fields ok"
 verify="$(dc exec -T b orblx audit verify-config --file "$STATE/file-audit.jsonl")"
@@ -365,5 +372,5 @@ hits="$(grep -cF 'PRIVATE KEY' "$WORK/all-logs.out" || true)"
 echo "secret_grep 'PRIVATE KEY' ${hits}"
 [[ "$hits" -eq 0 ]]
 
-echo "summary file_size ${SIZE_BYTES} sha256_match yes resend exists_refused deny_c acl_refused deny_b acl_refused inbox_files 1 inbox_dot_files 0 audit_records ${records} audit_verify ok"
+echo "summary file_size ${SIZE_BYTES} sha256_match yes resend exists_refused deny_c datapath_dropped deny_b acl_refused inbox_files 1 inbox_dot_files 0 audit_records ${records} audit_verify ok"
 echo "proof_ok"
