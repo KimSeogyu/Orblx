@@ -34,7 +34,7 @@ the W22 commit, measured in the same session with at least 5 samples each.
 
 sym_sym relay TCP throughput, 30 s for each sample:
 
-| Commit | Runs | Median Mbit/s | p10 | p90 | Min | Max | Runs alone |
+| Commit | Runs | Median Mbit/s | p10 | p90 | Min | Max | Runs with no other orblx container |
 |---|---|---|---|---|---|---|---|
 | head `cd6c8ee` | 5 | **1263.29** | 1159.46 | 1331.01 | 1151.58 | 1348.05 | 2 |
 | w22 `739c3cb` | 5 | **1010.96** | 652.18 | 1050.64 | 419.56 | 1066.40 | 5 |
@@ -54,8 +54,8 @@ Each run:
 | head a8 | 02:46:19 | 1151.58 | alone | 6.81 | 130.4 / 120.5 / 105.0 |
 | w22 a10 | 03:02:30 | 1001.10 | alone | 5.08 | 150.1 / 172.9 / 99.4 |
 | w22 a11 | 03:17:10 | 1066.40 | alone | 6.01 | 148.0 / 170.0 / 96.9 |
-| w22 a12 | 03:25:24 | 1010.96 | alone | 8.69 | 144.1 / 168.8 / 95.6 |
-| w22 a13 | 03:32:54 | 419.56 | alone | 8.70 | 57.4 / 54.1 / 37.2 |
+| w22 a12 | 03:25:24 | 1010.96 | no other orblx container, but high load (not idle) | 8.69 | 144.1 / 168.8 / 95.6 |
+| w22 a13 | 03:32:54 | 419.56 | no other orblx container, but high load (not idle) | 8.70 | 57.4 / 54.1 / 37.2 |
 | main-89 a1 | 00:17:29 | 1239.07 | alone | 7.64 | 133.7 / 125.3 / 105.5 |
 
 Runs not counted (logs kept): w22 a9 (785.34 Mbit/s; max load1 12.45 with no other orblx
@@ -67,13 +67,27 @@ the lock; no measurement).
 - The limiter is the CPU of the sym nodes and the relay. On w22 the nodes use more CPU
   (node d 161 to 173%) for less throughput than on head (node d 116 to 133%). Head moves more bytes
   for each CPU second. This check does not name the change that did it.
-- w22 a13 (419.56) has low CPU on all three (37 to 57%). The load came from outside the proof (no
-  other orblx container, max load1 8.70). Without a13, the w22 median is 1018.99, and the verdict
-  is the same.
+- w22 a13 (419.56) is not an idle sample. No other orblx container ran, but load1 was 8.69 when it
+  queued and 7.28 at its start (`proof_context` lines), on 8 vCPUs. The sym nodes and the relay got
+  only 37 to 57% CPU during the bulk (other samples: 92 to 173%). Thus another process on the host
+  took the CPU. The proof does not record which process. w22 a12 started with load1 2.04, and load1
+  was 8.69 at its end (03:32:22). Its sym CPU was normal (144.1 / 168.8 / 95.6). The high load thus
+  started near the end of a12 and continued into a13. a12 is marked as not idle because of its max
+  load1.
+- Medians with fewer samples (same data, no new runs):
+
+  | Filter | head | w22 | head vs w22 |
+  |---|---|---|---|
+  | All complete samples | 1263.29 (n=5) | 1010.96 (n=5) | +25.0% |
+  | Without w22 a13 | 1263.29 (n=5) | 1018.99 (n=4) | +24.0% |
+  | No other orblx container | 1249.82 (n=2) | 1010.96 (n=5) | +23.6% |
+  | No other orblx container and max load1 below 8 | 1249.82 (n=2: a6, a8) | 1027.01 (n=3: a7, a10, a11) | +21.7% |
+
+  Every filter gives the same verdict. The strict filter has fewer than 5 samples for each commit.
 - The head runs with contention (a2, a3, a4) are in the same range as the alone runs (a6, a8).
 - The 1113 value of W22 came from 5 s samples on another day. In this session the W22 commit is
   below 1113, and head is above it.
-- The 5 s samples of W25-5 (916.39 to 1306.48, alone) have a larger spread than the 30 s samples
+- The 5 s samples of W25-5 (916.39 to 1306.48, no other orblx container) have a larger spread than the 30 s samples
   of head (1151.58 to 1348.05). One 5 s sample is not sufficient for a gate.
 
 ## Verdict
