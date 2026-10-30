@@ -1201,6 +1201,10 @@ async fn run_link(
     let expiry = session.peer_not_after();
     {
         let mut map = lock(&mesh.links);
+        if mesh.endpoint.denies(session.peer_id()) {
+            println!("The node ended the session with {name}. The deny list revokes the peer.");
+            return;
+        }
         if let Some(old) = map.insert(
             name.clone(),
             LiveLink {

@@ -10,6 +10,9 @@
 # The owner runs one command: `orblx admin revoke-all a`.
 # Checks:
 #   1. Each surface of a denies within LIMIT_MS after revoke_done_ms. The script prints the ms.
+#      W24: the datapath of b ends the session of a. A surface on the overlay can then fail
+#      with a timeout (datapath_drop) before the app check. The script accepts this when the
+#      last good run ended and the failed run started LIMIT_MS or less after revoke_done_ms.
 #   2. The probes of c have no failure during and after the revoke.
 #   3. The coordinator chain has exactly 1 new record, the revoke-all record.
 #   4. The coordinator chain and the chains on b verify ok.
@@ -186,7 +189,37 @@ issue_grant() {
   printf '%s\n' "$id"
 }
 
+# The client errors of a surface when the datapath of b drops the packets (W24).
+# "deny_output connect ok to" with no reply line: the connect passed before the drop, the reply did not.
+DATAPATH_DROP='os error 11|os error 104|os error 110|timed out|timeout|deny_output connect ok to '
+
+# A datapath drop: the last good run of a ended LIMIT_MS or less after revoke_done_ms,
+# and the next run (it starts after the last good run) gets no reply.
+# The script prints both times. The end of the failed run is the client timeout.
+datapath_ms() {
+  local label="$1"
+  local file="$2"
+  local last="$3"
+  local start end
+  start="$(awk '$3 == "ok" {for (i = 1; i < NF; i++) if ($i == "deny_run_start_ms") print $(i + 1)}' "$file")"
+  end="$(awk '$3 == "ok" {for (i = 1; i < NF; i++) if ($i == "first_deny_ms") print $(i + 1)}' "$file")"
+  # A slow run (SSH) can start before the revoke and fail after it.
+  if (( end < revoke_start )); then
+    echo "The surface ${label} failed before the revoke." >&2
+    exit 1
+  fi
+  local last_after=$(( last - revoke_done ))
+  local start_after=$(( start - revoke_done ))
+  echo "surface ${label} datapath_drop last_ok_after_done_ms ${last_after} failed_run_start_after_done_ms ${start_after}"
+  if (( last_after > LIMIT_MS || start_after > LIMIT_MS )); then
+    echo "The datapath did not drop the surface ${label} within ${LIMIT_MS} ms." >&2
+    exit 1
+  fi
+  results+=("${label}=datapath:${start_after}")
+}
+
 # Check the deny reason of one probe and print the deny ms after revoke_done_ms.
+# The fourth argument "overlay" also accepts a datapath drop (W24).
 deny_ms() {
   local label="$1"
   local file="$2"
@@ -199,7 +232,14 @@ deny_ms() {
     echo "The surface ${label} did not deny." >&2
     exit 1
   fi
+  local overlay="${4:-no}"
   if ! grep -q -- "$needle" "$file"; then
+    # W24: the datapath of b ends the session of a revoked peer. Then a surface on the
+    # overlay fails with a timeout before the app check on b sees it.
+    if [[ "$overlay" == overlay ]] && grep -qE "$DATAPATH_DROP" "$file"; then
+      datapath_ms "$label" "$file" "$last"
+      return 0
+    fi
     echo "The surface ${label} failed, but not with: ${needle}" >&2
     exit 1
   fi
@@ -352,8 +392,10 @@ surface_cmds() {
   fi
   local grant
   for grant in "${grants[@]}"; do
+    # A run is good only with an HTTP reply. A connect with no reply (read timeout) fails (W24).
     probe "$name" "$mode" "${name}-grant-${grant}" "$secs" "$every" \
-      orblx agent connect --grant "$STATE/agent-${grant}" --send "$GET"
+      sh -c 'out="$(orblx agent connect --grant "$1" --send "$2" 2>&1)"; code=$?; printf "%s\n" "$out"; [ "$code" -eq 0 ] && printf "%s\n" "$out" | grep -q "^reply HTTP"' \
+      sh "$STATE/agent-${grant}" "$GET"
   done
   probe "$name" "$mode" "${name}-svid" "$secs" "$every" \
     orblx coord netmap --coord "${coord_ip}:443" --bundle /tmp/svid/bundle.pem --state /tmp/svid
@@ -389,11 +431,12 @@ done
 
 echo "=== [C] deny time of each surface of a (limit ${LIMIT_MS} ms after revoke_done_ms) ==="
 results=()
-deny_ms grant-a1 "$WORK/probe-a-grant-a1.out" 'connect denied reason revoked'
-deny_ms grant-a2 "$WORK/probe-a-grant-a2.out" 'connect denied reason revoked'
+deny_ms grant-a1 "$WORK/probe-a-grant-a1.out" 'connect denied reason revoked' overlay
+deny_ms grant-a2 "$WORK/probe-a-grant-a2.out" 'connect denied reason revoked' overlay
 deny_ms svid "$WORK/probe-a-svid.out" 'deny_output'
-deny_ms ssh "$WORK/probe-a-ssh.out" 'deny_output'
-deny_ms file "$WORK/probe-a-file.out" 'reply deny identity'
+deny_ms ssh "$WORK/probe-a-ssh.out" 'The SSH session was refused' overlay
+deny_ms file "$WORK/probe-a-file.out" 'reply deny identity' overlay
+dc logs --no-log-prefix b 2>&1 | grep -m1 'The node ended the session with a.' || true
 
 echo "=== [C] probes of c during and after the revoke ==="
 for label in c-grant-c1 c-svid c-ssh c-file; do
@@ -460,12 +503,17 @@ grep -qx 'ok' "$WORK/ssh-verify.txt"
 dc exec -T b cat "$STATE/ssh-audit.jsonl" >"$WORK/ssh-audit.jsonl"
 ssh_revoked="$(jq -s '[.[] | select(.kind == "deny" and .reason == "revoked")] | length' "$WORK/ssh-audit.jsonl")"
 echo "ssh_chain deny revoked ${ssh_revoked}"
-[[ "$ssh_revoked" -ge 1 ]]
+# W24: when the datapath drops the SSH surface first, the SSH server sees no login of a.
+if [[ " ${results[*]} " != *" ssh=datapath:"* ]]; then
+  [[ "$ssh_revoked" -ge 1 ]]
+fi
 dc exec -T b cat "$STATE/file-audit.jsonl" >"$WORK/file-audit.jsonl"
 file_identity="$(jq -s '[.[] | select(.action == "file-deny" and (.actor | startswith("spiffe://orblx.local/node/a")) and (.detail | startswith("reason identity")))] | length' "$WORK/file-audit.jsonl")"
 file_c_after="$(jq -s '[.[] | select(.action == "file-receive" and .actor == "spiffe://orblx.local/node/c")] | length' "$WORK/file-audit.jsonl")"
 echo "file_chain deny_identity_a ${file_identity} receive_c ${file_c_after}"
-[[ "$file_identity" -ge 1 ]]
+if [[ " ${results[*]} " != *" file=datapath:"* ]]; then
+  [[ "$file_identity" -ge 1 ]]
+fi
 
 echo "=== [C] logs hold no key, ticket, or enroll token ==="
 {

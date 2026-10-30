@@ -6,10 +6,13 @@ listen-udp IP PORT LOG    log each datagram and echo it back.
 tcp IP PORT TIMEOUT       connect, send one line, print the result.
 udp IP PORT TIMEOUT       send one datagram, wait for the echo, print the result.
 spray IP FIRST LAST       send one UDP datagram to each port from FIRST to LAST.
+listen-stamp IP PORT LOG  log the receive time (Unix ms) of each datagram. No reply.
+stream IP PORT SECS MS    send one UDP datagram each MS ms for SECS s. Print the count.
 """
 import socket
 import sys
 import threading
+import time
 
 PROBE = b"orblx-acl-probe\n"
 
@@ -96,6 +99,26 @@ def spray(ip, first, last):
     print("spray %s ports %d-%d sent %d" % (ip, first, last, last - first + 1))
 
 
+def listen_stamp(ip, port, path):
+    open(path, "a", encoding="utf-8").close()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((ip, port))
+    while True:
+        data, peer = sock.recvfrom(65535)
+        log_line(path, "rx_ms %d %s %s" % (int(time.time() * 1000), peer[0], data.decode(errors="replace")))
+
+
+def stream(ip, port, secs, every_ms):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    end = time.time() + secs
+    sent = 0
+    while time.time() < end:
+        sock.sendto(b"seq %d" % sent, (ip, port))
+        sent += 1
+        time.sleep(every_ms / 1000.0)
+    print("stream %s:%d sent %d" % (ip, port, sent))
+
+
 def main():
     cmd = sys.argv[1]
     ip = sys.argv[2]
@@ -109,6 +132,10 @@ def main():
         udp(ip, int(sys.argv[3]), float(sys.argv[4]))
     elif cmd == "spray":
         spray(ip, int(sys.argv[3]), int(sys.argv[4]))
+    elif cmd == "listen-stamp":
+        listen_stamp(ip, int(sys.argv[3]), sys.argv[4])
+    elif cmd == "stream":
+        stream(ip, int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5]))
     else:
         raise SystemExit("unknown command")
 

@@ -1,9 +1,11 @@
 {
   // Datapath ACL proof (W24).
-  // Node a may reach node b on TCP 8080, on UDP 9000, and with ICMP.
+  // Node a may reach node b on TCP 8080, on UDP 9000 and 9500, and with ICMP.
   // Node c may reach node b only on TCP 8080. Node c has no ICMP rule.
   // No rule lets node b open a flow to node a or node c.
   // The receiving node drops each other packet in the datapath.
+  // W24: node c is the owner. Check 7 runs `orblx admin revoke-all a` on node c.
+  "owners": ["spiffe://orblx.local/node/c"],
   "acls": [
     {
       "action": "accept",
@@ -15,7 +17,7 @@
       "action": "accept",
       "src": ["spiffe://orblx.local/node/a"],
       "proto": "udp",
-      "dst": ["spiffe://orblx.local/node/b:9000"],
+      "dst": ["spiffe://orblx.local/node/b:9000", "spiffe://orblx.local/node/b:9500"],
     },
     {
       "action": "accept",
