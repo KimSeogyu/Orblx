@@ -11,7 +11,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-TAG="${RELEASE_TAG:-v0.1.0-rc.1}"
+TAG="${RELEASE_TAG:-v0.1.0-rc.2}"
 REPO="KimSeogyu/Orblx"
 TARGET="x86_64-unknown-linux-gnu"
 TARBALL="orblx-${TARGET}.tar.gz"
