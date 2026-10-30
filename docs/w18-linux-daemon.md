@@ -7,6 +7,14 @@ The CLI commands are `orblx up`, `orblx down`, and `orblx status`.
 The default state directory is `/var/lib/orblx`.
 The flag `--state-dir` selects another directory.
 The file `node.json` in that directory stores the node name and the overlay IP.
+`orblx up` writes `node.json` only after the TUN device opens.
+The write uses a temp file, fsync, and rename, so a crash leaves the old file or the new file.
+A failed `orblx up` (for example, no TUN device) does not change the state directory.
+Before the first good `orblx up`, `orblx status` reads the node name and the overlay IP from `netmap.json`.
+
+Gate 1 ruling (W25): the earlier code wrote `node.json` before the TUN device opened.
+This is a product bug from #34 and #45, not from #41.
+#114 removed the stale compose volumes that hid the bug, and the coord-enroll proof then showed it.
 A later start reads that file.
 A netmap overlay IP that differs from the stored IP is an error.
 The process keeps the stored IP.
