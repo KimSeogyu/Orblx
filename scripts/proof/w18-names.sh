@@ -26,17 +26,18 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap proof_lock_end EXIT
+proof_lock_take "w18-names"
+
 # Docker on this host can leave iptables-legacy FORWARD policy DROP.
 # That policy drops UDP on a user-defined bridge.
 # iptables-nft already accepts the same traffic.
 if command -v iptables-legacy >/dev/null 2>&1; then
   if iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP'; then
     if ! command -v iptables-nft >/dev/null 2>&1 || iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT'; then
-# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
-# shellcheck source=scripts/proof/proof-lock.sh
-. "$PROOF_LIB_DIR/proof-lock.sh"
-trap proof_lock_end EXIT
-proof_lock_take "w18-names"
       echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
       iptables-legacy -P FORWARD ACCEPT
     fi
