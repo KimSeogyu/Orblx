@@ -109,9 +109,17 @@ jobs:
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "${GITHUB_REF_NAME}"
-          --verify-tag
-          --title "${GITHUB_REF_NAME}"
-          --notes "Install: curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/install.sh | sh"
-          dist/orblx-*.tar.gz dist/SHA256SUMS dist/SHA256SUMS.sigstore.json scripts/install.sh
+        shell: bash
+        run: |
+          # A tag with a '-' suffix (for example v0.1.0-rc.1) is a pre-release.
+          # GitHub does not use a pre-release for the "latest" download URL.
+          prerelease=()
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            prerelease=(--prerelease)
+          fi
+          gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            "${prerelease[@]}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "Install: curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/install.sh | sh -s -- --version ${GITHUB_REF_NAME}" \
+            dist/orblx-*.tar.gz dist/SHA256SUMS dist/SHA256SUMS.sigstore.json scripts/install.sh
