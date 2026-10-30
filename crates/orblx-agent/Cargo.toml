@@ -1,0 +1,16 @@
+[package]
+name = "orblx-agent"
+description = "Agent JIT grants for Orblx. An agent proves its short SVID and shows one coordinator ticket for one service and one port. The guard checks each connection and writes the grant audit chain."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+base64 = "0.22"
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+orblx-audit = { path = "../orblx-audit" }
+orblx-identity = { path = "../orblx-identity" }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

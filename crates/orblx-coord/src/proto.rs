@@ -21,6 +21,27 @@ pub struct Request {
     pub routes: Vec<String>,
     #[serde(default)]
     pub exit_node: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<GrantAsk>,
+}
+
+/// One agent grant request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantAsk {
+    /// Agent name. The SVID is `spiffe://orblx.local/agent/{agent}`.
+    pub agent: String,
+    /// Target node name.
+    pub node: String,
+    /// Service name.
+    pub service: String,
+    /// TCP port.
+    pub port: u16,
+    /// Grant life in seconds. The maximum is 300.
+    pub ttl_secs: u64,
+    /// HTTP path prefix. The default is `/`.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
