@@ -67,6 +67,36 @@ The lock sampler saw other orblx containers in all 86 samples (max 7, load1 max 
 No node restarted, and the script did not run a manual netmap fetch on a node.
 The late peer gate is a Docker measurement. The unit test `a_peer_that_enrolls_later` is extra.
 
+### More runs: final branch head and main
+
+Gate 3 measures CPU on a release build (`ORBLX_SYNC_PROFILE` default `release`) in all runs in this section.
+A debug build is not the build that ships (see "Failed runs and causes").
+
+- Branch run 4: commit `2540a869` (the final head of #92). Lock held 01:58:22 to 02:01:39 KST.
+  Log `w256-br2-2540a869-policy-sync-run4.log`. Result: `proof_ok`.
+  The lock sampler saw other orblx containers in 97 of 97 samples (max 6, load1 max 2.85).
+- Main run 1: commit `c32d46f8` (main after the #92 merge). Lock held 02:26:52 to 02:29:49 KST.
+  Log `w256-main-c32d46f8-policy-sync-run1.log`. Result: `proof_ok`.
+  The lock sampler saw no other orblx container (0 of 87 samples, load1 max 2.61).
+
+| Gate | Label | Limit | Branch run 4 | Main run 1 |
+|---|---|---|---|---|
+| 1. Policy change to the new DNS answer (remove / add) | [C] | 2000 ms | 313 / 1083 ms | 248 / 219 ms |
+| 1. Node `a` applied a new policy (stage, remove / add) | [C] | - | +124 / +113 ms | +186 / +181 ms |
+| 1. The DNS table follows the new netmap (stage, remove / add) | [C] | - | +298 / +1079 ms | +228 / +213 ms |
+| 4. Late peer `b`: first ICMP reply on `a`, from `docker compose up b` | [C] | 2000 ms | 947 ms | 835 ms |
+| 4. Late peer `b`: from the container start / from the start of the enroll | [C] | - | 698 / 1604 ms | 595 / 1742 ms |
+| 4. Restarts of `a` and the router | [C] | 0 | 0 | 0 |
+| 3. Coordinator CPU, 50 clients, no change (release build) | [C] | < 5% of one core | 1.34% | 1.34% |
+| 3. Coordinator CPU, 50 clients, one change each 10 s (release build) | [C] | < 5% of one core | 4.17% | 4.20% |
+| 3. Policy updates that the 50 clients got in the change window | [C] | >= 300 | 300 | 300 |
+| 3. CPU of one client (no change / change) | [C] | - | 0.029% / 0.068% | 0.034% / 0.075% |
+| 2. Last datagram from `a` at the router after `revoke_done_ms` | [C] | 1000 ms | 284 ms | 276 ms |
+| Logs with `PRIVATE KEY` | [C] | 0 | 0 | 0 |
+
+The gate 3 value with one change each 10 s is near the limit (4.17% to 4.35% in three runs).
+The host, the Docker engine, and the clock that the script reads are REAL. All the measured values are [C].
+
 Other checks on the branch:
 
 - REAL: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
