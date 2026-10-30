@@ -1,0 +1,44 @@
+{
+  // W25 HA subnet routers proof.
+  // router-a and router-b may both publish 10.88.125.0/24.
+  // The client may reach the target 10.88.125.5 on UDP 9000 and TCP 8080 only.
+  // The guest has no rule. Each router drops the guest packets and the other client ports.
+  "groups": {
+    "group:humans": ["spiffe://orblx.local/node/client"],
+  },
+  "tags": {
+    "tag:router": [
+      "spiffe://orblx.local/node/router-a",
+      "spiffe://orblx.local/node/router-b",
+    ],
+  },
+  "tagOwners": {
+    "tag:router": ["group:humans"],
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["group:humans"],
+      "proto": "udp",
+      "dst": ["10.88.125.5/32:9000"],
+    },
+    {
+      "action": "accept",
+      "src": ["group:humans"],
+      "proto": "tcp",
+      "dst": ["10.88.125.5/32:8080"],
+    },
+  ],
+  "autoApprovers": {
+    "routes": {
+      "10.88.125.0/24": ["tag:router"],
+    },
+  },
+  "tests": [
+    {
+      "src": "spiffe://orblx.local/node/client",
+      "proto": "tcp",
+      "deny": ["spiffe://orblx.local/node/router-a:22", "spiffe://orblx.local/node/router-b:22"],
+    },
+  ],
+}

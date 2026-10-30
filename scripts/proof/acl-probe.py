@@ -7,7 +7,8 @@ tcp IP PORT TIMEOUT       connect, send one line, print the result.
 udp IP PORT TIMEOUT       send one datagram, wait for the echo, print the result.
 spray IP FIRST LAST       send one UDP datagram to each port from FIRST to LAST.
 listen-stamp IP PORT LOG  log the receive time (Unix ms) of each datagram. No reply.
-stream IP PORT SECS MS    send one UDP datagram each MS ms for SECS s. Print the count.
+stream IP PORT SECS MS [TAG]  send one UDP datagram each MS ms for SECS s. Print the count.
+                          TAG starts each payload (W25 HA proof).
 """
 import socket
 import sys
@@ -108,12 +109,17 @@ def listen_stamp(ip, port, path):
         log_line(path, "rx_ms %d %s %s" % (int(time.time() * 1000), peer[0], data.decode(errors="replace")))
 
 
-def stream(ip, port, secs, every_ms):
+def stream(ip, port, secs, every_ms, tag=""):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     end = time.time() + secs
     sent = 0
+    prefix = (tag + " ").encode() if tag else b""
     while time.time() < end:
-        sock.sendto(b"seq %d" % sent, (ip, port))
+        try:
+            sock.sendto(prefix + b"seq %d" % sent, (ip, port))
+        except OSError:
+            # A route change can fail one send. The stream goes on.
+            pass
         sent += 1
         time.sleep(every_ms / 1000.0)
     print("stream %s:%d sent %d" % (ip, port, sent))
@@ -135,7 +141,8 @@ def main():
     elif cmd == "listen-stamp":
         listen_stamp(ip, int(sys.argv[3]), sys.argv[4])
     elif cmd == "stream":
-        stream(ip, int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5]))
+        tag = sys.argv[6] if len(sys.argv) > 6 else ""
+        stream(ip, int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5]), tag)
     else:
         raise SystemExit("unknown command")
 
