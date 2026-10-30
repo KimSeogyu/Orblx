@@ -7,6 +7,10 @@
 # The script deletes the proof containers at the start and at the end.
 # The script does not print enroll tokens or private keys.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
+# W25-14: this proof needs root. It stops at once without root.
+require_root "$@"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -38,7 +42,11 @@ cleanup() {
     sudo -n rm -rf "$WORK" >/dev/null 2>&1 || rm -rf "$WORK" >/dev/null 2>&1 || true
   fi
 }
-trap cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "split-dns" "$PROOF_PROJECT"
 
 dc() {
   docker compose --progress quiet -f "$FILE" "$@"
@@ -61,9 +69,9 @@ fail() {
 # Docker on this host can leave iptables-legacy FORWARD policy DROP.
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -120,7 +128,7 @@ fetch_netmap() {
 
 overlay_of() {
   local name="$1" file="$2"
-  sed -n "s/.*\"name\":\"${name}\",\"overlay_ip\":\"\([^\"]*\)\".*/\1/p" "$file" | head -n 1
+  sed -n "s/.*\"name\":\"${name}\",\"overlay_ip\":\"\([^\"]*\)\".*/\1/p" "$file" | read_all head -n 1
 }
 
 ask() {
@@ -213,7 +221,7 @@ echo "=== [C] wait for the overlay paths ==="
 for node in a c; do
   ready=0
   for _ in $(seq 1 40); do
-    if dc logs "$node" 2>/dev/null | grep -q 'The path to router is direct.'; then
+    if dc logs "$node" 2>/dev/null | read_all grep -q 'The path to router is direct.'; then
       ready=1
       break
     fi
@@ -221,14 +229,14 @@ for node in a c; do
   done
   [[ "$ready" -eq 1 ]] || fail "Node ${node} did not open a path to the router."
 done
-dc logs router 2>/dev/null | grep -q 'The node forwards 10.88.24.0/24' || fail "The router did not enable forwarding."
-dc logs router 2>/dev/null | grep -q 'The packet filter is on.' || fail "The router packet filter is not on."
+dc logs router 2>/dev/null | read_all grep -q 'The node forwards 10.88.24.0/24' || fail "The router did not enable forwarding."
+dc logs router 2>/dev/null | read_all grep -q 'The packet filter is on.' || fail "The router packet filter is not on."
 
 echo "---- [C] routes ----"
-echo "a: $(dc exec -T a ip route get 10.88.24.53 | head -n 1)"
-echo "c: $(dc exec -T c ip route get 10.88.24.53 | head -n 1)"
-dc exec -T a ip route show dev orblx0 | grep -q '10.88.24.0/24' || fail "Node a has no route to 10.88.24.0/24."
-if dc exec -T c ip route show dev orblx0 | grep -q '10.88.24.0/24'; then
+echo "a: $(dc exec -T a ip route get 10.88.24.53 | read_all head -n 1)"
+echo "c: $(dc exec -T c ip route get 10.88.24.53 | read_all head -n 1)"
+dc exec -T a ip route show dev orblx0 | read_all grep -q '10.88.24.0/24' || fail "Node a has no route to 10.88.24.0/24."
+if dc exec -T c ip route show dev orblx0 | read_all grep -q '10.88.24.0/24'; then
   fail "Node c has the route. Node c must not accept routes."
 fi
 
@@ -249,7 +257,7 @@ echo "a direct query to ${a_ip}: ${out}"
 echo "---- [C] a resolvectl query db.corp.lan ----"
 resolved_out="$(dc exec -T a resolvectl query db.corp.lan 2>&1 || true)"
 printf '%s\n' "$resolved_out"
-printf '%s\n' "$resolved_out" | grep -q '10.88.24.20' || fail "systemd-resolved on a did not resolve db.corp.lan."
+printf '%s\n' "$resolved_out" | read_all grep -q '10.88.24.20' || fail "systemd-resolved on a did not resolve db.corp.lan."
 echo "---- [C] a curl http://db.corp.lan/ (name from the OS resolver) ----"
 body="$(dc exec -T a curl -fsS --max-time 10 http://db.corp.lan/)"
 echo "body ${body}"
@@ -273,7 +281,7 @@ for name in db.corp.lan corp.lan x.y.corp.lan; do
 done
 resolved_c="$(dc exec -T c resolvectl query db.corp.lan 2>&1 || true)"
 echo "c resolvectl query db.corp.lan: ${resolved_c}"
-if printf '%s\n' "$resolved_c" | grep -q -e '10.88.24.20' -e '192.0.2.1'; then
+if printf '%s\n' "$resolved_c" | read_all grep -q -e '10.88.24.20' -e '192.0.2.1'; then
   fail "Node c resolved db.corp.lan."
 fi
 sleep 1
@@ -414,7 +422,7 @@ echo "denied_fwd_bytes $((f3 - f2)) denied_landns_queries $((l3 - l2)) audit_pac
 [[ $((d1 - d0)) -ge 1 ]] || fail "The router did not audit the denied query."
 dc exec -T router cat /var/lib/orblx/packet-audit.jsonl \
   | jq -c 'select(.target == "udp/53") | {action, actor, target, detail}' | tail -n 1
-dc exec -T router orblx audit verify-config --file /var/lib/orblx/packet-audit.jsonl | grep -qx ok \
+dc exec -T router orblx audit verify-config --file /var/lib/orblx/packet-audit.jsonl | read_all grep -qx ok \
   || fail "The router packet audit chain did not verify."
 echo "router packet audit verify ok"
 body="$(dc exec -T a curl -fsS --max-time 10 http://10.88.24.20/)"

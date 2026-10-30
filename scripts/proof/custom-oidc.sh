@@ -7,6 +7,8 @@
 # a bad signature, and an unknown kid.
 # The script does not print an ID token, an enroll token, or a private key.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -18,6 +20,11 @@ export IDP_CA_FILE="$WORK/idp-ca.pem"
 export COORD_ADDR="127.0.0.1:443"
 ISSUER="https://idp:8443"
 CLIENT="orblx-proof"
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap proof_lock_end EXIT
+proof_lock_take "custom-oidc"
 : > "$IDP_CA_FILE"
 
 cleanup() {
@@ -29,7 +36,8 @@ cleanup() {
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the cleanup runs first, then the lock is released.
+trap 'cleanup; proof_lock_end' EXIT
 
 dc() {
   docker compose --progress quiet --profile nodes -f "$FILE" "$@"
@@ -45,9 +53,9 @@ as_root() {
 
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -69,7 +77,7 @@ build_image() {
 
 resolve_name() {
   dc run --rm --no-deps --entrypoint getent laptop ahostsv4 "$1" \
-    | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
+    | read_all awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
 }
 
 idp() {
@@ -79,7 +87,7 @@ idp() {
 wait_log() {
   local service="$1" needle="$2" i
   for i in $(seq 1 60); do
-    if dc logs "$service" 2>&1 | grep -q -- "$needle"; then
+    if dc logs "$service" 2>&1 | read_all grep -q -- "$needle"; then
       return 0
     fi
     sleep 1
@@ -139,7 +147,7 @@ expect_reject() {
     echo "The coordinator accepted the ${label} token." >&2
     exit 1
   fi
-  printf '%s\n' "$out" | grep -q 'The OIDC check failed.'
+  printf '%s\n' "$out" | read_all grep -q 'The OIDC check failed.'
   sleep 1
   if [[ "$(reject_count "$reason")" -le "$before" ]]; then
     echo "The coordinator log does not show oidc reject ${reason}." >&2
@@ -227,8 +235,8 @@ ping_ok="$(dc run --rm --no-deps laptop ping srv \
   --bundle /var/lib/orblx/laptop/bundle.pem \
   --timeout 5)"
 printf '%s\n' "$ping_ok"
-printf '%s\n' "$ping_ok" | grep -qx 'path direct'
-printf '%s\n' "$ping_ok" | grep -q '^rtt_ms '
+printf '%s\n' "$ping_ok" | read_all grep -qx 'path direct'
+printf '%s\n' "$ping_ok" | read_all grep -q '^rtt_ms '
 
 echo "=== [C] enroll desk with an ES256 ID token ==="
 mint desk es1 --sub bob --email bob@example.test
@@ -258,7 +266,7 @@ mint rotated es2 --sub dave --email dave@example.test
 enroll_oidc rotated rotated
 wait_log coord "oidc accept sub dave"
 dc logs coord 2>&1 | grep "oidc jwks loaded unknown-kid" | tail -1 | sed 's/^[^|]*| //'
-dc logs coord 2>&1 | grep "oidc jwks loaded unknown-kid" | tail -1 | grep -q "kids es1 es2"
+dc logs coord 2>&1 | grep "oidc jwks loaded unknown-kid" | tail -1 | read_all grep -q "kids es1 es2"
 expect_reject "dropped key rs1" unknown-kid old-key
 
 echo "=== [C] coordinator OIDC log lines ==="
@@ -268,17 +276,17 @@ echo "=== [C] no token text in logs or the node store ==="
 for name in laptop desk rotated wrong-issuer; do
   head_part="$(dc run --rm --no-deps --entrypoint cut idp -d. -f1 "/tokens/${name}")"
   sig_part="$(dc run --rm --no-deps --entrypoint cut idp -d. -f3 "/tokens/${name}")"
-  if dc logs 2>&1 | grep -qF -- "$sig_part"; then
+  if dc logs 2>&1 | read_all grep -qF -- "$sig_part"; then
     echo "A log contains ID token text." >&2
     exit 1
   fi
-  if dc exec -T coord cat /var/lib/orblx/nodes.json | grep -qF -- "$sig_part"; then
+  if dc exec -T coord cat /var/lib/orblx/nodes.json | read_all grep -qF -- "$sig_part"; then
     echo "The node store contains ID token text." >&2
     exit 1
   fi
   : "$head_part"
 done
-if dc logs 2>&1 | grep -q 'PRIVATE KEY'; then
+if dc logs 2>&1 | read_all grep -q 'PRIVATE KEY'; then
   echo "A log contains a private key." >&2
   exit 1
 fi

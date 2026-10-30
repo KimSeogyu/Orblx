@@ -7,6 +7,8 @@
 # The script then changes one byte in each file and checks that the install refuses.
 # The script does not print the throwaway private key.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -33,7 +35,11 @@ cleanup() {
   as_root docker image rm "$IMAGE" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "release"
 
 if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
   echo "The proof needs a Linux x86_64 host." >&2
@@ -149,8 +155,8 @@ expect_refuse() {
     echo "The install did not refuse ${dir}." >&2
     exit 1
   fi
-  printf '%s\n' "$out" | grep -qF -- "$needle"
-  printf '%s\n' "$out" | grep -q '^install_exit [1-9]'
+  printf '%s\n' "$out" | read_all grep -qF -- "$needle"
+  printf '%s\n' "$out" | read_all grep -q '^install_exit [1-9]'
 }
 
 expect_refuse bad-tarball "The checksum of orblx-${TARGET}.tar.gz is not correct."
@@ -167,7 +173,7 @@ if [[ "$status" -eq 0 || "$status" -eq 99 ]]; then
   echo "The install did not refuse without cosign." >&2
   exit 1
 fi
-printf '%s\n' "$out" | grep -q 'cosign is not installed'
+printf '%s\n' "$out" | read_all grep -q 'cosign is not installed'
 
 echo "=== [REAL] no private key text in the served files ==="
 if grep -rq 'PRIVATE KEY' "$WORK/www"; then

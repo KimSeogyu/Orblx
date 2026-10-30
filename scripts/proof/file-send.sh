@@ -14,6 +14,8 @@
 # The script deletes the orblx-w23a-file-send volumes at the start.
 # The script does not print enroll tokens or private keys.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -36,7 +38,11 @@ cleanup() {
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "file-send"
 
 dc() {
   docker compose --progress quiet --profile nodes -f "$FILE" "$@"
@@ -45,7 +51,7 @@ dc() {
 resolve_name() {
   local name="$1"
   dc run --rm --no-deps --entrypoint getent a ahostsv4 "$name" \
-    | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
+    | read_all awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
 }
 
 as_root() {
@@ -58,9 +64,9 @@ as_root() {
 
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -93,7 +99,7 @@ wait_log() {
   local needle="$2"
   local i
   for i in $(seq 1 60); do
-    if dc logs "$service" 2>&1 | grep -q "$needle"; then
+    if dc logs "$service" 2>&1 | read_all grep -q "$needle"; then
       return 0
     fi
     sleep 1
@@ -115,7 +121,7 @@ wait_path() {
   local i
   for i in $(seq 1 60); do
     if dc exec -T "$from" orblx status --state-dir "$STATE" 2>/dev/null \
-      | grep -q "^peer ${to} .* path direct "; then
+      | read_all grep -q "^peer ${to} .* path direct "; then
       echo "path ${from} ${to} direct"
       return 0
     fi
@@ -211,7 +217,7 @@ for name in "${NODES[@]}"; do
     --state "$STATE" \
     --endpoint "${name}:443")"
   printf '%s\n' "$out"
-  ips[$name]="$(printf '%s\n' "$out" | awk '/^overlay_ip /{print $2; exit}')"
+  ips[$name]="$(printf '%s\n' "$out" | read_all awk '/^overlay_ip /{print $2; exit}')"
   if [[ -z "${ips[$name]}" ]]; then
     echo "The node ${name} has no overlay address." >&2
     exit 1
