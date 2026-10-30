@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use orblx_audit::{ConfigAction, ConfigEvent, ConfigLog, ConfigRecord, EMPTY_DIGEST};
 use orblx_datapath::{Netmap, NetmapPeer, NetmapSelf};
 use orblx_identity::{
     google_client_id_ok, DenySet, GoogleJwks, IssueGate, IssuedSvid, MiniCa, Policy, SpiffeId,
@@ -26,6 +27,8 @@ const SEED_FILE: &str = "netmap.seed";
 const STORE_FILE: &str = "nodes.json";
 const POLICY_FILE: &str = "policy.hujson";
 const LOADED_POLICY_FILE: &str = "policy.loaded.hujson";
+/// The control-plane audit chain in the state directory.
+pub const CONFIG_AUDIT_FILE: &str = "config-audit.jsonl";
 
 /// How the coordinator checks a laptop enrollment.
 pub enum OidcConfig {
@@ -106,6 +109,10 @@ struct Inner {
     policy_fail: Option<String>,
     has_good: bool,
     saw_file: bool,
+    /// The config chain. The serve path opens it.
+    audit: Option<ConfigLog>,
+    /// The digest of the last refused policy file.
+    fail_hash: Option<[u8; 32]>,
 }
 
 /// The coordinator state.
@@ -232,6 +239,8 @@ impl Coordinator {
                 policy_fail: None,
                 has_good: false,
                 saw_file: false,
+                audit: None,
+                fail_hash: None,
             })),
         };
         {
@@ -352,7 +361,27 @@ impl Coordinator {
     ) -> Result<NetmapView, CoordError> {
         let mut inner = self.lock()?;
         reload(&mut inner)?;
+        let before = node_digest(&inner, name);
+        let old_routes = node_routes(&inner, name);
         inner.store.set_routes(name, routes)?;
+        let after = node_digest(&inner, name);
+        if before != after {
+            let actor = node_actor(&inner, name);
+            let detail = format!(
+                "from [{}] to [{}]",
+                old_routes.join(","),
+                node_routes(&inner, name).join(",")
+            );
+            record(
+                &mut inner,
+                &actor,
+                ConfigAction::Routes,
+                name,
+                before,
+                after,
+                &detail,
+            )?;
+        }
         let view = sign_view(&inner, name)?;
         println!("advertise {name} approved {}", view.approved_routes.len());
         for route in &view.approved_routes {
@@ -388,7 +417,22 @@ impl Coordinator {
     pub fn advertise_exit(&self, name: &str, enabled: bool) -> Result<NetmapView, CoordError> {
         let mut inner = self.lock()?;
         reload(&mut inner)?;
+        let before = node_digest(&inner, name);
         inner.store.set_exit_node(name, enabled)?;
+        let after = node_digest(&inner, name);
+        if before != after {
+            let actor = node_actor(&inner, name);
+            let detail = if enabled { "offer on" } else { "offer off" };
+            record(
+                &mut inner,
+                &actor,
+                ConfigAction::ExitNode,
+                name,
+                before,
+                after,
+                detail,
+            )?;
+        }
         let view = sign_view(&inner, name)?;
         if view.exit_approved {
             println!("approved exit node {name}");
@@ -420,19 +464,139 @@ impl Coordinator {
     }
 
     /// Approve a node and clear key expiry.
+    ///
+    /// The config chain names the coordinator as the actor.
     pub fn approve_node(&self, name: &str) -> Result<(), CoordError> {
+        let actor = self.coord_actor()?;
+        self.approve_node_by(name, &actor)
+    }
+
+    /// Approve a node for `actor` and write one config record.
+    pub fn approve_node_by(&self, name: &str, actor: &str) -> Result<(), CoordError> {
         let mut inner = self.lock()?;
         reload(&mut inner)?;
-        inner.store.set_approved(name, true)
+        let before = node_digest(&inner, name);
+        inner.store.set_approved(name, true)?;
+        let after = node_digest(&inner, name);
+        record(
+            &mut inner,
+            actor,
+            ConfigAction::Approve,
+            name,
+            before,
+            after,
+            "",
+        )
     }
 
     /// Expire a node key.
     ///
     /// The node leaves every netmap until approve.
     pub fn expire_node(&self, name: &str) -> Result<(), CoordError> {
+        let actor = self.coord_actor()?;
+        self.expire_node_by(name, &actor)
+    }
+
+    /// Expire a node key for `actor` and write one config record.
+    pub fn expire_node_by(&self, name: &str, actor: &str) -> Result<(), CoordError> {
         let mut inner = self.lock()?;
         reload(&mut inner)?;
-        inner.store.set_expired(name)
+        let before = node_digest(&inner, name);
+        inner.store.set_expired(name)?;
+        let after = node_digest(&inner, name);
+        record(
+            &mut inner,
+            actor,
+            ConfigAction::Expire,
+            name,
+            before,
+            after,
+            "",
+        )
+    }
+
+    /// Open the config chain and record the policy state at start.
+    ///
+    /// The serve path calls this function one time.
+    /// A chain that fails the hash check stops the start.
+    pub fn enable_config_audit(&self) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        if inner.audit.is_some() {
+            return Ok(());
+        }
+        let path = inner.state_dir.join(CONFIG_AUDIT_FILE);
+        let log = ConfigLog::open(&path).map_err(|err| {
+            CoordError::Protocol(format!("The config audit chain is not valid. {err}"))
+        })?;
+        let before = log.last_policy_digest().unwrap_or(EMPTY_DIGEST);
+        inner.audit = Some(log);
+        let actor = coord_actor_of(&inner)?;
+        let target = policy_target(&inner);
+        if inner.has_good {
+            let after = inner.policy_hash.unwrap_or(EMPTY_DIGEST);
+            let detail = if inner.saw_file {
+                "start"
+            } else {
+                "start saved"
+            };
+            record(
+                &mut inner,
+                &actor,
+                ConfigAction::PolicyLoad,
+                &target,
+                before,
+                after,
+                detail,
+            )?;
+        }
+        if let Some(sentence) = inner.policy_fail.clone() {
+            let current = inner.policy_hash.unwrap_or(EMPTY_DIGEST);
+            let after = inner.fail_hash.unwrap_or(EMPTY_DIGEST);
+            record(
+                &mut inner,
+                &actor,
+                ConfigAction::PolicyReject,
+                &target,
+                current,
+                after,
+                &sentence,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Write one config record for `actor`.
+    ///
+    /// The function does nothing when the chain is not open.
+    pub fn record_change(
+        &self,
+        actor: &str,
+        action: ConfigAction,
+        target: &str,
+        before: [u8; 32],
+        after: [u8; 32],
+        detail: &str,
+    ) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        record(&mut inner, actor, action, target, before, after, detail)
+    }
+
+    /// Return the config chain text.
+    ///
+    /// The text is empty when the file does not exist.
+    pub fn config_audit_text(&self) -> Result<String, CoordError> {
+        let inner = self.lock()?;
+        let path = inner.state_dir.join(CONFIG_AUDIT_FILE);
+        if !path.exists() {
+            return Ok(String::new());
+        }
+        read_text(&path)
+    }
+
+    /// Return the coordinator SPIFFE ID text.
+    pub fn coord_actor(&self) -> Result<String, CoordError> {
+        let inner = self.lock()?;
+        coord_actor_of(&inner)
     }
 
     /// Return the enrolled nodes.
@@ -530,10 +694,18 @@ fn refresh_policy(inner: &mut Inner) {
     }
     match Policy::from_hujson(&bytes) {
         Ok(policy) => {
+            let before = inner.policy_hash.filter(|_| inner.has_good);
             inner.policy = policy;
             inner.policy_hash = Some(hash);
             inner.has_good = true;
             inner.policy_fail = None;
+            inner.fail_hash = None;
+            let action = if before.is_some() {
+                ConfigAction::PolicyReplace
+            } else {
+                ConfigAction::PolicyLoad
+            };
+            record_policy(inner, action, before.unwrap_or(EMPTY_DIGEST), hash, "file");
             let saved = inner.state_dir.join(LOADED_POLICY_FILE);
             match std::str::from_utf8(&bytes) {
                 Ok(text) => {
@@ -547,7 +719,7 @@ fn refresh_policy(inner: &mut Inner) {
             }
         }
         Err(err) => {
-            note_policy_failure(inner, &err.to_string());
+            note_policy_failure_with(inner, &err.to_string(), Some(hash));
             if !inner.has_good {
                 adopt_saved_policy(inner);
             }
@@ -568,11 +740,170 @@ fn adopt_saved_policy(inner: &mut Inner) {
 }
 
 fn note_policy_failure(inner: &mut Inner, sentence: &str) {
-    if inner.policy_fail.as_deref() == Some(sentence) {
+    note_policy_failure_with(inner, sentence, None);
+}
+
+fn note_policy_failure_with(inner: &mut Inner, sentence: &str, hash: Option<[u8; 32]>) {
+    if inner.policy_fail.as_deref() == Some(sentence) && inner.fail_hash == hash {
         return;
     }
     println!("policy load failed: {sentence}");
     inner.policy_fail = Some(sentence.to_string());
+    inner.fail_hash = hash;
+    let current = inner
+        .policy_hash
+        .filter(|_| inner.has_good)
+        .unwrap_or(EMPTY_DIGEST);
+    record_policy(
+        inner,
+        ConfigAction::PolicyReject,
+        current,
+        hash.unwrap_or(EMPTY_DIGEST),
+        sentence,
+    );
+}
+
+fn record_policy(
+    inner: &mut Inner,
+    action: ConfigAction,
+    before: [u8; 32],
+    after: [u8; 32],
+    detail: &str,
+) {
+    if inner.audit.is_none() {
+        return;
+    }
+    let actor = match coord_actor_of(inner) {
+        Ok(actor) => actor,
+        Err(_) => return,
+    };
+    let target = policy_target(inner);
+    if record(inner, &actor, action, &target, before, after, detail).is_err() {
+        println!("config audit write failed: {}", action.as_str());
+    }
+}
+
+/// Append one record when the chain is open.
+fn record(
+    inner: &mut Inner,
+    actor: &str,
+    action: ConfigAction,
+    target: &str,
+    before: [u8; 32],
+    after: [u8; 32],
+    detail: &str,
+) -> Result<(), CoordError> {
+    let Some(log) = inner.audit.as_mut() else {
+        return Ok(());
+    };
+    let at_unix = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| CoordError::Time)?
+        .as_secs();
+    let detail = clip_detail(detail);
+    let event = ConfigEvent {
+        actor: actor.to_string(),
+        at_unix,
+        action,
+        target: target.to_string(),
+        before,
+        after,
+        detail,
+    };
+    let written: ConfigRecord = log.append(event).map_err(|err| {
+        println!("config audit write failed: {}", action.as_str());
+        CoordError::Protocol(format!("The config audit write failed. {err}"))
+    })?;
+    println!(
+        "config audit {} {} {} {}",
+        written.index,
+        action.as_str(),
+        target,
+        actor
+    );
+    Ok(())
+}
+
+fn clip_detail(detail: &str) -> String {
+    let clean: String = detail
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let mut out = String::new();
+    for ch in clean.chars() {
+        if out.len() + ch.len_utf8() > orblx_audit::MAX_CONFIG_TEXT {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn coord_actor_of(inner: &Inner) -> Result<String, CoordError> {
+    Ok(SpiffeId::coord(&inner.coord_name)?.as_uri().to_string())
+}
+
+fn policy_target(inner: &Inner) -> String {
+    let name = inner
+        .policy_path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| POLICY_FILE.to_string());
+    let clean: String = name
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && !ch.is_control())
+        .collect();
+    if clean.is_empty() {
+        POLICY_FILE.to_string()
+    } else {
+        clean
+    }
+}
+
+fn node_actor(inner: &Inner, name: &str) -> String {
+    inner
+        .store
+        .nodes()
+        .into_iter()
+        .find(|node| node.name == name)
+        .map(|node| node.svid)
+        .unwrap_or_else(|| format!("node:{name}"))
+}
+
+fn node_routes(inner: &Inner, name: &str) -> Vec<String> {
+    inner
+        .store
+        .nodes()
+        .into_iter()
+        .find(|node| node.name == name)
+        .map(|node| node.routes)
+        .unwrap_or_default()
+}
+
+/// SHA-256 over the control-plane fields of one node.
+///
+/// The digest leaves out endpoints because NAT candidates change often.
+/// An absent node uses the zero digest.
+fn node_digest(inner: &Inner, name: &str) -> [u8; 32] {
+    let Some(node) = inner
+        .store
+        .nodes()
+        .into_iter()
+        .find(|node| node.name == name)
+    else {
+        return EMPTY_DIGEST;
+    };
+    let value = serde_json::json!({
+        "name": node.name,
+        "overlay_ip": node.overlay_ip,
+        "svid": node.svid,
+        "owner": node.owner,
+        "routes": node.routes,
+        "exit_node": node.exit_node,
+        "approved": node.approved,
+        "expired": node.expired,
+    });
+    sha256(value.to_string().as_bytes())
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -594,9 +925,26 @@ fn finish_enroll(
     let stored = inner
         .store
         .commit(plan, issued.spiffe_id.as_uri().to_string(), now)?;
-    if !initial_approved(&inner.policy, &stored.name) {
+    let approved = initial_approved(&inner.policy, &stored.name);
+    if !approved {
         inner.store.set_approved(&stored.name, false)?;
     }
+    let after = node_digest(inner, &stored.name);
+    let detail = format!(
+        "svid {} ip {} {}",
+        stored.svid,
+        stored.overlay_ip,
+        if approved { "approved" } else { "pending" }
+    );
+    record(
+        inner,
+        &stored.owner,
+        ConfigAction::Enroll,
+        &stored.name,
+        EMPTY_DIGEST,
+        after,
+        &detail,
+    )?;
     let view = sign_view(inner, &stored.name)?;
     let ticket = issue_ticket(inner, &stored.name, now)?;
     Ok(EnrollResult {
