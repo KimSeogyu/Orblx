@@ -22,7 +22,7 @@ row|17|Split DNS / policy sync (Linux only)|split-dns policy-sync
 row|19|ACL policy file|policy datapath-acl
 row|21|ACL tests|policy
 row|24|GitOps for ACLs|policy-gitops
-row|28|Node key expiry / auth period|-
+row|28|Node key expiry / auth period|node-key-expiry
 row|29|Key / SVID rotation UX|svid-renew nat-realism
 row|30|Revocation / device removal|admin revoke-all revoke-followup
 row|31|Device approval|admin
@@ -55,6 +55,7 @@ proof|policy-gitops|examples/policy-gitops/proof/proof.sh|GITOPS_BIN=@BIN@ GITOP
 proof|svid-renew|scripts/proof/svid-renew.sh|-|orblx-svid:local
 proof|nat-realism|scripts/proof/nat-realism.sh|ORBLX_NATR_PROFILE=release ORBLX_NATR_PREFIX=orblx-rc3sw-natr- ORBLX_NATR_PROJECT=orblx-rc3sw-natr ORBLX_NATR_IMAGE=orblx-rc3sw-natr:local|orblx-rc3sw-natr:local
 proof|admin|scripts/proof/admin.sh|-|orblx-admin:w19
+proof|node-key-expiry|scripts/proof/node-key-expiry.sh|NKE_BIN=@BIN@ NKE_PROJECT=orblx-rc3sw-nke NKE_IMAGE=orblx-rc3sw-nke:local|orblx-rc3sw-nke:local
 proof|revoke-all|scripts/proof/revoke-all.sh|-|orblx-w24d-revoke:w24
 proof|revoke-followup|scripts/proof/revoke-followup.sh|ORBLX_PROOF_PROFILE=release|orblx-w25a-revoke:w25
 proof|api-tokens|scripts/proof/api-tokens.sh|TOKENS_BIN=@BIN@ TOKENS_PROJECT=orblx-rc3sw-tokens TOKENS_IMAGE=orblx-rc3sw-tokens:local|orblx-rc3sw-tokens:local
