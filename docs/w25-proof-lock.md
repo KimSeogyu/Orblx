@@ -202,3 +202,53 @@ The sym relay values are one 5 s sample for each run. The median of the 9 alone 
 - macOS has no `flock`. There, the proof runs without the lock and prints that.
 - A waiter can print an old holder record for a moment (see gate 1). It is marked `(stale record, pid not running)`.
 - The sym throughput is one 5 s sample for each run.
+
+## W25-19: lock fairness
+
+W25-14 added the ticket queue. Two faults stayed:
+
+1. `proof_lock_take` printed the `queued` `proof_context` line before it made the ticket. That line runs `docker ps`, which can take more than 0.4 s on a loaded host. A proof that called `proof_lock_take` first could get a later ticket. This is the cause of the flaky `test_waiters_take_the_lock_in_arrival_order_and_print_the_wait` (CI job 124271496928: order `first, third, holder, second`).
+2. A proof from an old checkout (W25-5 library, or a wrapper such as `flock FILE proof.sh`) takes the lock file with a plain `flock`. When the holder released the lock, the kernel woke the plain `flock` and the FIFO waiter at the same time, and the plain `flock` could win. A FIFO waiter could wait for more than one run (W25-6 natr run1 waited about 3900 s).
+
+### Changes
+
+| Item | Change | Mark |
+|---|---|---|
+| Ticket time | `proof_lock_take` makes the ticket before the first `proof_context` line. PR #108 (merged as f3bee5b) made this change on main; this PR adds the `proto=fifo-keeper` line to the ticket. | REAL (unit test) |
+| Keeper | A keeper process holds the lock file (the `flock` that old checkouts use) while a FIFO proof runs, and while the oldest live ticket is from a FIFO waiter. A plain `flock` from an old checkout then waits until no FIFO proof runs or waits first. Only one keeper runs (`${lock}.keeper.lock`). It runs in its own session, so a `timeout` of the proof does not stop it. | REAL (unit test, host test) |
+| FIFO lock | The FIFO proofs take turns on `${lock}.fifo`. The oldest live ticket takes it. The proof starts only when the keeper holds the lock file. | REAL (unit test) |
+| Keeper stop | The keeper stops when `${lock}.fifo` is free and the oldest live ticket is not from a FIFO waiter (or no ticket is left). It checks this under `${lock}.fifo`, so no FIFO proof can start while it stops. `proof_lock_end` stops the keeper before it frees `${lock}.fifo` when no FIFO waiter is next. The lock file is then free when `proof_lock_end` returns. | REAL (unit test) |
+| W25-14 waiters | A W25-14 ticket has no `proto=fifo-keeper` line. When it is the oldest live ticket, the keeper frees the lock file, so the W25-14 waiter takes it in its turn. | REAL (unit test) |
+| Plain `flock` wrapper | `proof_lock_take` stops at once with exit 1 when this shell or a parent process holds a `flock` on the lock file: `proof_lock LABEL FAIL: process PID COMMAND holds FILE with a plain flock, not with the FIFO queue. Do not wrap a proof in flock. Use proof_lock_take ...`. It reads the `lock:` lines in `/proc/PID/fdinfo`. (`/proc/locks` does not list a lock after the `flock(1)` process that took it ends.) | REAL (unit test) |
+| fdinfo read | The plain-`flock` check and the keeper check read all `fdinfo` files of a process with one `grep`, not one `grep` for each fd. A CI runner is an ancestor with hundreds of fds: one `grep` for each fd took 735 ms with 600 fds (REAL host). Only a waiter did the full check (the lock file exists), so it started late and `test_two_proofs_run_one_after_the_other` saw 1 waiting note, not 2 (CI runs 41122934311, 41123075554, 41125663364). With one `grep`: 26 ms with 600 fds. A unit test runs the check under a parent with 2000 fds: less than 500 ms (old code: 2344 ms, FAIL), and the parent that holds the lock is still found. | REAL (unit test, host test) |
+| Scripts | A unit test checks that no script in `scripts/`, `scripts/proof/` or `examples/*/proof/` calls `flock` itself. Only `proof-lock.sh` calls it. `release-sweep.sh` and the W25-14b scripts do not change. | REAL (unit test) |
+| Tests | `test_proof_lock_fifo.py` (new). The FIFO test starts the next proof when the one before it is in the queue (it reads the output line), not after a fixed 0.4 s. `tests/fixtures/` has copies of `proof-lock.sh` at d0ddf7f (W25-5) and 9d53d3c (W25-14) for the old-checkout tests. | REAL (CI) |
+
+No file under `crates/` changed. The lock file path, the holder record, `ORBLX_PROOF_LOCK_HELD` and the log lines do not change. macOS has no `flock`; there the proof runs without the lock, as before.
+
+### Gates (REAL host, stand-in proofs)
+
+The stand-in proof takes the lock, writes its start and end times, and holds the lock for a set time. Each test uses its own lock file (`ORBLX_PROOF_LOCK` in a temp directory), so the tests do not touch the box lock or other proofs.
+
+| Gate | Check | Result | Log |
+|---|---|---|---|
+| 1. The ticket time is before `proof_context` | A `docker` stand-in counts the tickets when `proof_context` calls it. Branch: 1 ticket at the first call. W25-14 library (9d53d3c): 0 tickets. | **PASS** | unit test `test_the_ticket_is_made_before_the_first_proof_context_line` |
+| 2. `test_waiters_take_the_lock_in_arrival_order_and_print_the_wait` | 50 runs in a loop, 05:13 to 05:18 KST. | **PASS**, 50 of 50 | `/workspace/orblx-w18-proof/w25s-fifo-50.log` |
+| 3. A wrapper that takes the lock without the FIFO path fails | `flock FILE bash proof` stops at once with exit 1 and the `FAIL: ... plain flock` message. The proof body does not run. No script calls `flock` itself. | **PASS** | unit tests `test_a_proof_under_a_plain_flock_stops_at_once_with_a_message`, `test_no_proof_script_calls_flock_itself` |
+| 4. An old-checkout proof (plain `flock`) cannot pass a FIFO waiter | Holder (5 s), then a FIFO waiter, then a proof with the W25-5 library (d0ddf7f). 20 trials for each library. | **PASS**: branch 0 of 20 passed the waiter. Negative check: with the W25-14 library on main (9d53d3c), the old proof passed the waiter in 4 of 20 trials. | `/workspace/orblx-w18-proof/w25s-gate4-neg.log` |
+| 4. The first waiter waits only for the holder run | Time from the holder end to the waiter start. | Branch: 62 to 213 ms (20 trials). On main, in the 4 bad trials, the waiter also waited for the old proof run (1108 to 1368 ms with a 1 s old run). | same log |
+| 2. Gate 2 on PR #108 | The same 50-run loop on the PR #108 head (3200c9b7), 06:04 to 06:10 KST. | **PASS**, 50 of 50 | `/workspace/orblx-w18-proof/w25s-pr108-3200c9b7-fifo-50.log` |
+
+### W25-5 gates on the box lock (REAL, release build)
+
+| W25-5 gate | Check | Result | Log |
+|---|---|---|---|
+| 1 | Two `nat-realism.sh` release proofs from this branch (f0eec60) start at the same time, with their own prefixes, images and subnets. | **PASS**: both `proof_ok`, EXIT 0. natr2 held the lock 05:57:22.872 to 06:02:31.918 KST, natr1 06:02:31.940 to 06:07:40.116 KST. No overlap. natr1 took the lock 22 ms after natr2 released it. | `w25s-f0eec601-gate1-natr1.log`, `w25s-f0eec601-gate1-natr2.log` |
+| 2 | `serial-rtt.sh`, 10 runs, after gate 1. | **FAIL** in run 8 of 10 (the script stops at the first failed run). Runs 1 to 7: exit 0, max ping 1.55 to 2.43 ms. Run 8 (07:19:25 KST): relay ping on `prc_prc` after the direct-to-relay switch, seq 35 628 ms, seq 36 425 ms, seq 37 211 ms; the three replies came at the same time (07:21:14.96 KST), so the relay path stopped for about 0.63 s. The proof ran alone (0 other orblx containers, 0 of 61 contended samples) and no SVID renewal was in the run. The lock did its work (the proofs did not overlap); the spike is not from proof contention. Root cause not known; follow-up item. No file under `crates/` changes in this PR. | `w25s-f0eec601-gate2-serial.log`, `w25s-f0eec601-gate2/run8.log` |
+| 3 | No file under `crates/` changes. | **PASS** | `git diff --stat origin/main` |
+
+### Limits
+
+- The keeper holds the lock file only while a FIFO proof runs or waits first. When the holder is itself an old checkout (plain `flock`), the keeper and a plain-`flock` waiter race in the kernel for the lock file when it is released. The FIFO order is then not certain for that one handover.
+- A plain-`flock` proof from an old checkout waits until no FIFO proof runs or waits first. It can wait behind FIFO proofs that arrived after it.
+- The checks read `/proc/PID/fdinfo`. The `fdinfo` of a process of another user cannot be read. The keeper check then counts that process as the holder when it is alive and is not a zombie. The plain-`flock` check does not see a parent of another user that holds the lock. Hosts without `/proc` (macOS) do not have `flock`, so the proof runs without the lock, as before.
