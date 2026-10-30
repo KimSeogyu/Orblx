@@ -214,12 +214,25 @@ dc up -d "${NODES[@]}"
 for name in "${NODES[@]}"; do
   wait_log "$name" "The TUN device" 30
 done
+# A path shows "direct" only while packets come in (STALE_AFTER is 2 s in node.rs).
+# So each wait step sends one ping to each peer overlay IP.
+poke_peers() {
+  local name="$1" ip
+  for ip in $(status_of "$name" | read_all awk '$1 == "peer" {print $4}'); do
+    dc exec -T "$name" ping -c 1 -W 1 "$ip" >/dev/null 2>&1 || true
+  done
+}
 for name in "${NODES[@]}"; do
-  for ((i = 0; i < 60; i++)); do
+  for ((i = 0; i < 30; i++)); do
+    poke_peers "$name"
     [[ "$(direct_peers "$name")" -eq 3 ]] && break
     sleep 0.5
   done
-  [[ "$(direct_peers "$name")" -eq 3 ]] || fail "The node ${name} has no direct path to 3 peers after 30 s."
+  if [[ "$(direct_peers "$name")" -ne 3 ]]; then
+    echo "---- status ${name} ----"
+    status_of "$name" | read_all awk '$1 == "state" || $1 == "peer" {print $1, $2, $5, $6}'
+    fail "The node ${name} has no direct path to 3 peers after 30 tries."
+  fi
   ENROLL_SHA[$name]="$(ticket_sha "$name")"
 done
 
