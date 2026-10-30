@@ -5,6 +5,8 @@
 # only with a valid grant proof, a new nonce, and a path inside the prefix.
 # The proof checks: no grant, other service, other port, other path, replay,
 # and the end time. It checks the audit chain and greps the logs for tokens.
+# W24-B: a changed signed header is refused, and a restart with the audit
+# chain file removed still refuses a replay (the nonce file).
 # The script deletes the orblx-agent-proof volumes at the start.
 # The script does not print enroll tokens, private keys, tickets, or use proofs.
 set -euo pipefail
@@ -31,7 +33,7 @@ cleanup() {
 trap cleanup EXIT
 
 dc() {
-  docker compose --progress quiet --profile nodes -f "$FILE" "$@"
+  docker compose --progress quiet -p "${PROOF_PROJECT:-orblx-agent-proof}" --profile nodes -f "$FILE" "$@"
 }
 
 resolve_name() {
@@ -64,7 +66,7 @@ build_image() {
   # shellcheck source=stage-image.sh
   source "$ROOT/scripts/proof/stage-image.sh"
   image_dir="$(stage_proof_image "$ROOT" "$TARGET_DIR/debug/orblx")"
-  docker build -q -t orblx-agent:w21 "$image_dir"
+  docker build -q -t "${ORBLX_AGENT_IMAGE:-orblx-agent:w21}" "$image_dir"
   rm -rf "$image_dir"
 }
 
@@ -277,9 +279,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length") or 0)
         body = self.rfile.read(length) if length else b""
         hdr = "present" if self.headers.get("orblx-agent-proof") or self.headers.get("orblx-agent-nonce") else "absent"
-        text = "upstream ok method %s path %s agent %s grant %s proof_hdr %s body_len %d\n" % (
+        text = "upstream ok method %s path %s agent %s grant %s proof_hdr %s body_len %d kind %s\n" % (
             self.command, self.path.split("?")[0], self.headers.get("x-orblx-agent"),
-            self.headers.get("x-orblx-grant"), hdr, len(body))
+            self.headers.get("x-orblx-grant"), hdr, len(body), self.headers.get("x-kind"))
         data = text.encode()
         self.send_response(200)
         self.send_header("content-length", str(len(data)))
@@ -452,6 +454,83 @@ for reason in missing path ticket replay expired; do
   [[ "$hits" -ge 1 ]]
 done
 
+echo "=== [C] W24-B grant 3 for the header and nonce file checks ==="
+reply="$(api_request 8080 120)"
+printf '%s\n' "$reply"
+grant3="$(printf '%s\n' "$reply" | field grant_id)"
+owner grant-approve "$grant3"
+grant_fetch "$grant3" "$STATE/agent-g3"
+G3="$STATE/agent-g3"
+expect_http "W24-B a signed header goes to the upstream" "status 200 .*kind read$" \
+  --grant "$G3" --path /api/items --header 'X-Kind: read' --save-request "$STATE/hdr-request.bin"
+header_denied=0
+for change in 's/^x-kind: read/x-kind: write/' 's/^x-kind: read/x-kinx: read/' 's/^host: /host: 1/'; do
+  dc exec -T a sh -c "sed '${change}' $STATE/hdr-request.bin >$STATE/hdr-changed.bin"
+  if dc exec -T a cmp -s "$STATE/hdr-request.bin" "$STATE/hdr-changed.bin"; then
+    echo "The change ${change} did not change the request." >&2
+    exit 1
+  fi
+  expect_http "W24-B changed header (${change}) is refused" "status 403 reason ticket " \
+    --to "${b_ip}:8080" --send-file "$STATE/hdr-changed.bin"
+  header_denied=$(( header_denied + 1 ))
+done
+echo "header_change_refused ${header_denied} of 3"
+dc exec -T a rm -f "$STATE/hdr-request.bin" "$STATE/hdr-changed.bin"
+
+echo "=== [C] W24-B restart with the audit chain file removed ==="
+NONCES="$STATE/gateway-audit-api.jsonl.nonces"
+nf_first_ms="$(date +%s%3N)"
+expect_http "grant 3 request is forwarded and saved" "status 200 " \
+  --grant "$G3" --path /api/items --save-request "$STATE/saved-request-3.bin"
+dc exec -T b stat -c 'nonce_file mode %a' "$NONCES"
+nonce_lines="$(dc exec -T b sh -c "wc -l <$NONCES")"
+echo "nonce_file_lines_before ${nonce_lines}"
+old_pid="$(gateway_pid)"
+echo "gateway api pid ${old_pid} stop"
+dc exec -T b sh -c "kill ${old_pid}"
+for i in $(seq 1 50); do
+  if [[ -z "$(gateway_pid)" ]]; then
+    break
+  fi
+  sleep 0.1
+done
+[[ -z "$(gateway_pid)" ]]
+dc exec -T b orblx audit verify-config --file "$STATE/gateway-audit-api.jsonl" | grep -qx ok
+dc exec -T b rm "$STATE/gateway-audit-api.jsonl"
+if dc exec -T b test -e "$STATE/gateway-audit-api.jsonl"; then
+  echo "The audit chain file is still there." >&2
+  exit 1
+fi
+echo "audit_file removed"
+dc exec -d b sh -c "orblx gateway --listen ${b_ip}:8080 --service api \
+  --target 127.0.0.1:8081 --audit $STATE/gateway-audit-api.jsonl \
+  --coord ${coord_ip}:443 --state $STATE --bundle $STATE/bundle.pem \
+  --poll-ms 200 --stale-ms 2000 >$STATE/gateway-api-3.log 2>&1"
+wait_file_line b "$STATE/gateway-api-3.log" 'agent gateway service api'
+dc exec -T b cat "$STATE/gateway-api-3.log"
+loaded="$(dc exec -T b awk '/^agent gateway service api /{for (i = 1; i < NF; i++) if ($i == "nonces_loaded") print $(i + 1); exit}' "$STATE/gateway-api-3.log")"
+echo "nonces_loaded_after_audit_removed ${loaded}"
+[[ "$loaded" -ge 1 ]]
+sleep 1
+nf_out="$(http "W24-B replay after restart without the audit file" --to "${b_ip}:8080" \
+  --send-file "$STATE/saved-request-3.bin" || true)"
+nf_replay_ms="$(date +%s%3N)"
+printf '%s\n' "$nf_out" | grep -q '^http attempt 1 status 403 reason replay '
+nf_gap=$(( nf_replay_ms - nf_first_ms ))
+echo "noaudit_replay_after_first_ms ${nf_gap} result refused replay"
+(( nf_gap < 60000 ))
+expect_http "a new request with grant 3 after the restart is forwarded" "status 200 " \
+  --grant "$G3" --path /api/items
+new_verify="$(dc exec -T b orblx audit verify-config --file "$STATE/gateway-audit-api.jsonl")"
+printf '%s\n' "$new_verify"
+printf '%s\n' "$new_verify" | grep -qx ok
+new_replay="$(dc exec -T b grep -c 'reason replay ' "$STATE/gateway-audit-api.jsonl")"
+echo "new_chain_replay_records ${new_replay}"
+[[ "$new_replay" -eq 1 ]]
+dc exec -T a rm -f "$STATE/saved-request-3.bin"
+dc exec -T b cat "$NONCES" >"$WORK/nonces.txt"
+echo "nonce_file_lines_after $(wc -l <"$WORK/nonces.txt")"
+
 echo "=== [C] coordinator audit chain ==="
 coord_audit="$(owner audit)"
 printf '%s\n' "$coord_audit" | grep ' agent-' || true
@@ -461,21 +540,24 @@ printf '%s\n' "$coord_audit" | grep '^verify '
 echo "=== [C] logs hold no key, ticket, or use proof ==="
 {
   dc logs coord a b 2>&1
-  dc exec -T b cat "$STATE/gateway-api.log" "$STATE/gateway-api-2.log" "$STATE/gateway-db.log" \
+  dc exec -T b cat "$STATE/gateway-api.log" "$STATE/gateway-api-2.log" "$STATE/gateway-api-3.log" \
+    "$STATE/gateway-db.log" \
     "$STATE/upstream.log" \
     "$STATE/gateway-audit-api.jsonl" "$STATE/gateway-audit-db.jsonl"
   dc exec -T coord cat "$STATE/config-audit.jsonl" 2>/dev/null || true
   cat "$WORK"/*.txt
 } >"$WORK/all-logs.out"
-ticket_hex="$(dc exec -T a sh -c "od -An -tx1 $G/ticket.bin | tr -d ' \n'")"
-key_line="$(dc exec -T a sed -n 2p "$G/agent.key.pem")"
-for secret in "$ticket_hex" "$key_line"; do
-  if grep -qF "$secret" "$WORK/all-logs.out"; then
-    echo "A log holds a grant secret." >&2
-    exit 1
-  fi
+for grant_dir in "$G" "$G3"; do
+  ticket_hex="$(dc exec -T a sh -c "od -An -tx1 $grant_dir/ticket.bin | tr -d ' \n'")"
+  key_line="$(dc exec -T a sed -n 2p "$grant_dir/agent.key.pem")"
+  for secret in "$ticket_hex" "$key_line"; do
+    if grep -qF "$secret" "$WORK/all-logs.out"; then
+      echo "A log holds a grant secret." >&2
+      exit 1
+    fi
+  done
+  echo "secret_grep $(basename "$grant_dir") ticket 0 key 0"
 done
-echo "secret_grep agent-g1 ticket 0 key 0"
 for needle in 'PRIVATE KEY' 'T0JMWEFHVDE' 'ge1.' 'orblx-agent-proof' 'q=1'; do
   hits="$(grep -ciF "$needle" "$WORK/all-logs.out" || true)"
   echo "secret_grep '${needle}' ${hits}"
@@ -487,4 +569,5 @@ done
 echo "log_bytes $(wc -c <"$WORK/all-logs.out")"
 
 echo "summary ttl_deny_after_end_ms ${ttl_delta} gateway_ttl_after_end_ms $(( guard_ttl_ms - expires1_ms )) restart_replay_after_first_ms ${restart_gap} restart_replay refused api_requests ${sent} limit_ms ${LIMIT_MS}"
+echo "summary_w24b header_change_refused ${header_denied}/3 noaudit_replay refused noaudit_replay_after_first_ms ${nf_gap} nonces_loaded ${loaded}"
 echo "proof_ok"

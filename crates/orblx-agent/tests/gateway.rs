@@ -114,10 +114,15 @@ fn open_core(
         verifier: fixture.signer.verifier(),
         netmap_public: fixture.netmap.verifying_key().to_bytes(),
         audit_path: audit.to_path_buf(),
+        nonce_path: Some(nonce_path(audit)),
         poll: Duration::from_millis(200),
         stale_after: Duration::from_secs(2),
     };
     GuardCore::new(&config)
+}
+
+fn nonce_path(audit: &std::path::Path) -> PathBuf {
+    audit.with_file_name("gateway-nonces.log")
 }
 
 fn peer() -> SocketAddr {
@@ -136,6 +141,18 @@ fn sealed(
     nonce: u8,
     at: SystemTime,
 ) -> Vec<u8> {
+    sealed_with(fixture, service, method, target, &[], nonce, at)
+}
+
+fn sealed_with(
+    fixture: &Fixture,
+    service: &str,
+    method: &str,
+    target: &str,
+    headers: &[(String, String)],
+    nonce: u8,
+    at: SystemTime,
+) -> Vec<u8> {
     seal_http_request(
         &fixture.files,
         to(),
@@ -143,6 +160,7 @@ fn sealed(
         service,
         method,
         target,
+        headers,
         b"",
         [nonce; 16],
         at,
@@ -263,7 +281,9 @@ fn a_restart_keeps_the_used_nonces() {
         GatewayDecision::Forward(_, _)
     ));
     drop(first);
-    // A new process reads the use records from the chain.
+    // A new process reads the use records from the chain. The nonce file is
+    // gone here, so this checks the W22-1 chain path alone.
+    std::fs::remove_file(nonce_path(&audit)).unwrap();
     let second = open_core(&fixture, &audit).unwrap();
     assert_eq!(second.seen_count(), 1);
     let later = after(&fixture, 5000);
@@ -284,4 +304,80 @@ fn a_restart_keeps_the_used_nonces() {
     let text = std::fs::read_to_string(&audit).unwrap();
     std::fs::write(&audit, text.replacen("agent-use", "agent-deny", 1)).unwrap();
     assert!(open_core(&fixture, &audit).is_err());
+}
+
+#[test]
+fn a_restart_without_the_audit_file_keeps_the_used_nonces() {
+    let fixture = fixture(60);
+    let (first, audit) = core(&fixture, "noaudit");
+    let at = after(&fixture, 1000);
+    first.apply_deny(EMPTY_DENY, at).unwrap();
+    let bytes = sealed(&fixture, "api", "GET", "/api/items", 1, at);
+    assert!(matches!(
+        decide(&first, &bytes, at),
+        GatewayDecision::Forward(_, _)
+    ));
+    drop(first);
+    std::fs::remove_file(&audit).unwrap();
+    let nonces = std::fs::read_to_string(nonce_path(&audit)).unwrap();
+    assert_eq!(nonces.lines().count(), 1);
+    assert!(!nonces.contains(&hex(&fixture.files.ticket)));
+    // A new process with a new, empty chain reads the nonce file.
+    let second = open_core(&fixture, &audit).unwrap();
+    assert_eq!(second.seen_count(), 1);
+    let later = after(&fixture, 5000);
+    second.apply_deny(EMPTY_DENY, later).unwrap();
+    assert_eq!(
+        decide(&second, &bytes, later),
+        GatewayDecision::Refuse(403, "replay")
+    );
+    drop(second);
+    // A bad nonce file stops the start (fail closed).
+    std::fs::write(nonce_path(&audit), "not valid\n").unwrap();
+    assert!(open_core(&fixture, &audit).is_err());
+}
+
+#[test]
+fn a_changed_header_is_refused() {
+    let fixture = fixture(30);
+    let (core, _audit) = core(&fixture, "header");
+    let at = after(&fixture, 1000);
+    core.apply_deny(EMPTY_DENY, at).unwrap();
+    let kind = vec![("X-Kind".to_string(), "read".to_string())];
+    let base = |nonce: u8| {
+        String::from_utf8(sealed_with(
+            &fixture,
+            "api",
+            "GET",
+            "/api/items",
+            &kind,
+            nonce,
+            at,
+        ))
+        .unwrap()
+    };
+    let cases: [(u8, &dyn Fn(String) -> String); 5] = [
+        (1, &|text| text.replace("x-kind: read", "x-kind: write")),
+        (2, &|text| text.replace("x-kind: read\r\n", "")),
+        (3, &|text| {
+            text.replace("x-kind: read\r\n", "x-kind: read\r\nx-extra: 1\r\n")
+        }),
+        (4, &|text| text.replacen("host: 100.", "host: 101.", 1)),
+        (5, &|text| text.replacen("HTTP/1.1", "HTTP/1.0", 1)),
+    ];
+    for (nonce, change) in cases {
+        let original = base(nonce);
+        let changed = change(original.clone());
+        assert_ne!(changed, original);
+        assert_eq!(
+            decide(&core, changed.as_bytes(), at),
+            GatewayDecision::Refuse(403, "ticket")
+        );
+    }
+    // The bytes as sealed pass, and a name case change keeps the meaning.
+    let ok = base(6).replace("x-kind: read", "X-KIND: read");
+    assert!(matches!(
+        decide(&core, ok.as_bytes(), at),
+        GatewayDecision::Forward(_, _)
+    ));
 }
