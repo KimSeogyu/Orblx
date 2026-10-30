@@ -6,7 +6,13 @@
 # Output (ORBLX_PERF_OUT, default target/perf-watch):
 #   runN.log, runN.exit, perf-watch.json, perf-watch.md
 # The script runs every run, then fails when a run did not print proof_ok
-# or when the RTT gate (relay avg <= direct avg + 1 ms, 0/50 lost) did not pass.
+# or when a CI gate of perf-summary.py did not pass in a run (W24-E2):
+# relay ping median <= direct ping median + 1 ms, 0 lost, TCP above the floor,
+# and at most 3 of 50 pings above 10 ms on each path.
+# The avg is not a CI gate: one runner stall of 40 to 250 ms moves the avg of 50 pings by 1 to 5 ms.
+# So the CI sets the nat-realism avg limits to 1000 ms (the ping timeout, -W 1). Then the avg
+# checks cannot stop a run, and every path is measured. The avg gate stays in the summary as a report.
+# The box merge gate does not change: nat-realism.sh without these env vars keeps 1 ms and 5 ms.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -20,7 +26,8 @@ rm -f "$OUT"/run*.log "$OUT"/run*.exit "$OUT"/perf-watch.json "$OUT"/perf-watch.
 for i in $(seq 1 "$RUNS"); do
   echo "=== perf watch run ${i}/${RUNS} ==="
   start="$(date +%s)"
-  ORBLX_NATR_PROFILE=release ./scripts/proof/nat-realism.sh >"$OUT/run${i}.log" 2>&1
+  ORBLX_NATR_PROFILE=release ORBLX_RELAY_SLACK_MS=1000 ORBLX_RTT_LIMIT_MS=1000 \
+    ./scripts/proof/nat-realism.sh >"$OUT/run${i}.log" 2>&1
   code=$?
   echo "$code" >"$OUT/run${i}.exit"
   echo "run ${i} exit ${code} seconds $(($(date +%s) - start))"

@@ -126,7 +126,10 @@ The delta for gates 2 and 3 is the client time at the end of the first refused c
 expiry time or revoke time. All containers use the clock of the same host. One call takes about 110 ms in [C],
 so the delta includes the time of one call.
 
-After the merge, the proof runs again on `main`. The log is `/workspace/orblx-w18-proof/w25-c-api-tokens-main-SHA.log`.
+After the merge, the proof runs again on `main`. Logs: `/workspace/orblx-w18-proof/w25-c-api-tokens-main-*.log`.
+On `main` be8cbece, 2 of 3 runs failed at `audit verify-config did not print ok` while `verify ok` passed. The cause was a
+pipe into `head -n 1` and `grep -q` with `pipefail`: the reader stopped early, the CLI got `SIGPIPE`, and the pipe failed.
+The script now keeps each output in a variable before it checks it. 5 of 5 runs printed `proof_ok` after the fix.
 
 ## 8. W23-4 gates
 
