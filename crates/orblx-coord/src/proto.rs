@@ -30,6 +30,10 @@ pub struct Request {
     /// An old coordinator ignores the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_etag: Option<String>,
+    /// W25-9: `admin-policy-set` writes only when the live policy has this sha256.
+    /// The text `none` means that no policy file is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_sha256: Option<String>,
 }
 
 /// One agent grant request.

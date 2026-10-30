@@ -1,0 +1,82 @@
+# Example GitHub Actions workflow for policy GitOps (W25-9).
+# Copy this file to .github/workflows/orblx-policy.yml in the repository that keeps the policy.
+# Copy steps.sh to the root of that repository.
+# This file is an example. It does not run in the Orblx repository.
+#
+# Secrets (make them with `orblx admin token-create` on an owner node):
+#   ORBLX_POLICY_READ_TOKEN   scope policy:read   (pull requests and the merge diff)
+#   ORBLX_POLICY_WRITE_TOKEN  scope policy:write  (the merge apply only)
+# Variables:
+#   ORBLX_COORD   the coordinator address host:port
+#   ORBLX_BUNDLE  the coordinator trust bundle (PEM text, not secret)
+# A pull request from a fork gets no secrets. It then runs only `policy test`.
+name: orblx-policy
+
+on:
+  pull_request:
+    paths: ["policy.hujson"]
+  push:
+    branches: [main]
+    paths: ["policy.hujson"]
+
+permissions:
+  contents: read
+
+# One apply at a time. A second merge waits and then diffs again.
+concurrency:
+  group: orblx-policy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  POLICY_FILE: policy.hujson
+  ORBLX_COORD: ${{ vars.ORBLX_COORD }}
+
+jobs:
+  check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      HAS_READ: ${{ secrets.ORBLX_POLICY_READ_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install orblx
+        run: ./scripts/install-orblx.sh   # Replace: put a pinned orblx binary on PATH.
+      - name: Policy test
+        run: ./steps.sh test "$POLICY_FILE"
+      - name: Policy diff (needs the read token)
+        if: env.HAS_READ == 'true'
+        env:
+          READ_TOKEN: ${{ secrets.ORBLX_POLICY_READ_TOKEN }}
+          BUNDLE_PEM: ${{ vars.ORBLX_BUNDLE }}
+        run: |
+          umask 077
+          printf '%s' "$READ_TOKEN" > "$RUNNER_TEMP/read.token"
+          printf '%s\n' "$BUNDLE_PEM" > "$RUNNER_TEMP/bundle.pem"
+          trap 'rm -f "$RUNNER_TEMP/read.token"' EXIT
+          ORBLX_READ_TOKEN_FILE="$RUNNER_TEMP/read.token" \
+          ORBLX_BUNDLE="$RUNNER_TEMP/bundle.pem" \
+            ./steps.sh plan "$POLICY_FILE"
+
+  apply:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: orblx-policy   # Optional: require a reviewer for the apply.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install orblx
+        run: ./scripts/install-orblx.sh
+      - name: Policy test, diff, and apply
+        env:
+          READ_TOKEN: ${{ secrets.ORBLX_POLICY_READ_TOKEN }}
+          WRITE_TOKEN: ${{ secrets.ORBLX_POLICY_WRITE_TOKEN }}
+          BUNDLE_PEM: ${{ vars.ORBLX_BUNDLE }}
+        run: |
+          umask 077
+          printf '%s' "$READ_TOKEN" > "$RUNNER_TEMP/read.token"
+          printf '%s' "$WRITE_TOKEN" > "$RUNNER_TEMP/write.token"
+          printf '%s\n' "$BUNDLE_PEM" > "$RUNNER_TEMP/bundle.pem"
+          trap 'rm -f "$RUNNER_TEMP/read.token" "$RUNNER_TEMP/write.token"' EXIT
+          ORBLX_READ_TOKEN_FILE="$RUNNER_TEMP/read.token" \
+          ORBLX_WRITE_TOKEN_FILE="$RUNNER_TEMP/write.token" \
+          ORBLX_BUNDLE="$RUNNER_TEMP/bundle.pem" \
+            ./steps.sh apply "$POLICY_FILE"

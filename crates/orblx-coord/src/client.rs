@@ -34,6 +34,7 @@ pub async fn enroll_with_token(
         grant: None,
         api_token: None,
         deny_etag: None,
+        expect_sha256: None,
     };
     round_trip(coord, coord_name, bundle_pem, None, request, None, true).await
 }
@@ -88,6 +89,7 @@ pub async fn enroll_with_oidc(input: OidcEnroll<'_>) -> Result<EnrollResult, Coo
         grant: None,
         api_token: None,
         deny_etag: None,
+        expect_sha256: None,
     };
     round_trip(
         input.coord,
@@ -146,6 +148,7 @@ pub async fn advertise_routes(
         grant: None,
         api_token: None,
         deny_etag: None,
+        expect_sha256: None,
     };
     let result = round_trip(
         coord,
@@ -182,6 +185,7 @@ pub async fn fetch_netmap(
         grant: None,
         api_token: None,
         deny_etag: None,
+        expect_sha256: None,
     };
     let result = round_trip(
         coord,
@@ -234,6 +238,7 @@ pub async fn renew_svid(
         grant: None,
         api_token: None,
         deny_etag: None,
+        expect_sha256: None,
     };
     let result = round_trip(
         coord,
@@ -299,6 +304,7 @@ pub async fn publish_candidates(
         grant: None,
         api_token: None,
         deny_etag: None,
+        expect_sha256: None,
     };
     let result = round_trip(
         coord,
@@ -352,6 +358,7 @@ pub async fn advertise_exit(
         grant: None,
         api_token: None,
         deny_etag: None,
+        expect_sha256: None,
     };
     let result = round_trip(
         coord,
@@ -389,7 +396,7 @@ pub fn admin_blocking(
 /// The reply of one admin call with an API token (W25-3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminReply {
-    /// 200, 400, 401, or 403.
+    /// 200, 400, 401, 403, or 409.
     pub status: u16,
     /// The reply document when the status is 200.
     pub detail: Option<String>,
@@ -407,6 +414,22 @@ pub fn admin_token_blocking(
     api_token: &str,
     op: &str,
     name: &str,
+) -> Result<AdminReply, CoordError> {
+    admin_token_expect_blocking(coord, coord_name, bundle_pem, api_token, op, name, None)
+}
+
+/// Send one admin call with a scoped API token and an expected policy sha256 (W25-9).
+///
+/// `admin-policy-set` then writes only when the live policy has the sha256 `expect`.
+/// A stale call gets status 409. The token goes only in the request.
+pub fn admin_token_expect_blocking(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    api_token: &str,
+    op: &str,
+    name: &str,
+    expect: Option<&str>,
 ) -> Result<AdminReply, CoordError> {
     block_on(async move {
         let expect_coord = SpiffeId::coord(coord_name)?;
@@ -428,6 +451,7 @@ pub fn admin_token_blocking(
             grant: None,
             api_token: Some(api_token.to_string()),
             deny_etag: None,
+            expect_sha256: expect.map(str::to_string),
         };
         let endpoint =
             tlsutil::client_endpoint(&client_tls, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
@@ -494,6 +518,7 @@ pub fn fetch_deny_wait_blocking(
             grant: None,
             api_token: None,
             deny_etag: etag.map(str::to_string),
+            expect_sha256: None,
         };
         let limit = DENY_WAIT_HOLD + std::time::Duration::from_secs(10);
         tokio::time::timeout(
@@ -529,6 +554,7 @@ async fn admin_call(
         grant: None,
         api_token: None,
         deny_etag: None,
+        expect_sha256: None,
     };
     authed_detail(coord, coord_name, bundle_pem, material, request).await
 }
@@ -552,6 +578,7 @@ async fn fetch_deny(
         grant: None,
         api_token: None,
         deny_etag: None,
+        expect_sha256: None,
     };
     authed_detail(coord, coord_name, bundle_pem, material, request).await
 }
@@ -633,6 +660,7 @@ pub fn agent_grant_request_blocking(
             grant: Some(ask),
             api_token: None,
             deny_etag: None,
+            expect_sha256: None,
         };
         authed_detail(coord, coord_name, bundle_pem, material, request).await
     })
@@ -679,6 +707,7 @@ pub fn agent_grant_fetch_blocking(
             grant: None,
             api_token: None,
             deny_etag: None,
+            expect_sha256: None,
         };
         let response = authed_response(coord, coord_name, bundle_pem, material, request).await?;
         let invalid = || CoordError::Protocol("The grant reply is not valid.".to_string());
