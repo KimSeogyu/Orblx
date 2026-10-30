@@ -3,11 +3,13 @@
 # router-c and router-d are symmetric NAT.
 # The coordinator and the relay sit on the public network.
 # The relay runs two STUN servers on two ports.
+# ORBLX_NATR_IMAGE, ORBLX_NATR_PUB and ORBLX_NATR_LAN change the image and the subnets.
+# nat-realism.sh sets them. The defaults are the W20 values.
 name: orblx-natr-proof
 
 services:
   coord:
-    image: orblx-natr:w20
+    image: ${ORBLX_NATR_IMAGE:-orblx-natr:w20}
     command:
       - coord
       - serve
@@ -25,21 +27,21 @@ services:
       - coord:/var/lib/orblx
     networks:
       public:
-        ipv4_address: 172.29.20.10
+        ipv4_address: ${ORBLX_NATR_PUB:-172.29.20}.10
 
   relay:
-    image: orblx-natr:w20
+    image: ${ORBLX_NATR_IMAGE:-orblx-natr:w20}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "orblx stun-serve --listen 0.0.0.0:3478 & orblx stun-serve --listen 0.0.0.0:3479 & exec orblx relay --udp 0.0.0.0:443 --tcp 0.0.0.0:443"
     networks:
       public:
-        ipv4_address: 172.29.20.20
+        ipv4_address: ${ORBLX_NATR_PUB:-172.29.20}.20
 
   router-a:
-    image: orblx-natr:w20
+    image: ${ORBLX_NATR_IMAGE:-orblx-natr:w20}
     entrypoint: ["/bin/sh", "/nat-router.sh"]
-    command: ["172.29.20.11", "10.19.21.2", "10.19.21.10", "prc"]
+    command: ["${ORBLX_NATR_PUB:-172.29.20}.11", "${ORBLX_NATR_LAN:-10.19}.21.2", "${ORBLX_NATR_LAN:-10.19}.21.10", "prc"]
     privileged: true
     cap_add:
       - NET_ADMIN
@@ -47,14 +49,14 @@ services:
       - ./nat-router.sh:/nat-router.sh:ro
     networks:
       public:
-        ipv4_address: 172.29.20.11
+        ipv4_address: ${ORBLX_NATR_PUB:-172.29.20}.11
       lana:
-        ipv4_address: 10.19.21.2
+        ipv4_address: ${ORBLX_NATR_LAN:-10.19}.21.2
 
   router-b:
-    image: orblx-natr:w20
+    image: ${ORBLX_NATR_IMAGE:-orblx-natr:w20}
     entrypoint: ["/bin/sh", "/nat-router.sh"]
-    command: ["172.29.20.12", "10.19.22.2", "10.19.22.10", "prc"]
+    command: ["${ORBLX_NATR_PUB:-172.29.20}.12", "${ORBLX_NATR_LAN:-10.19}.22.2", "${ORBLX_NATR_LAN:-10.19}.22.10", "prc"]
     privileged: true
     cap_add:
       - NET_ADMIN
@@ -62,14 +64,14 @@ services:
       - ./nat-router.sh:/nat-router.sh:ro
     networks:
       public:
-        ipv4_address: 172.29.20.12
+        ipv4_address: ${ORBLX_NATR_PUB:-172.29.20}.12
       lanb:
-        ipv4_address: 10.19.22.2
+        ipv4_address: ${ORBLX_NATR_LAN:-10.19}.22.2
 
   router-c:
-    image: orblx-natr:w20
+    image: ${ORBLX_NATR_IMAGE:-orblx-natr:w20}
     entrypoint: ["/bin/sh", "/nat-router.sh"]
-    command: ["172.29.20.13", "10.19.23.2", "10.19.23.10", "symmetric"]
+    command: ["${ORBLX_NATR_PUB:-172.29.20}.13", "${ORBLX_NATR_LAN:-10.19}.23.2", "${ORBLX_NATR_LAN:-10.19}.23.10", "symmetric"]
     privileged: true
     cap_add:
       - NET_ADMIN
@@ -77,14 +79,14 @@ services:
       - ./nat-router.sh:/nat-router.sh:ro
     networks:
       public:
-        ipv4_address: 172.29.20.13
+        ipv4_address: ${ORBLX_NATR_PUB:-172.29.20}.13
       lanc:
-        ipv4_address: 10.19.23.2
+        ipv4_address: ${ORBLX_NATR_LAN:-10.19}.23.2
 
   router-d:
-    image: orblx-natr:w20
+    image: ${ORBLX_NATR_IMAGE:-orblx-natr:w20}
     entrypoint: ["/bin/sh", "/nat-router.sh"]
-    command: ["172.29.20.14", "10.19.24.2", "10.19.24.10", "symmetric"]
+    command: ["${ORBLX_NATR_PUB:-172.29.20}.14", "${ORBLX_NATR_LAN:-10.19}.24.2", "${ORBLX_NATR_LAN:-10.19}.24.10", "symmetric"]
     privileged: true
     cap_add:
       - NET_ADMIN
@@ -92,12 +94,12 @@ services:
       - ./nat-router.sh:/nat-router.sh:ro
     networks:
       public:
-        ipv4_address: 172.29.20.14
+        ipv4_address: ${ORBLX_NATR_PUB:-172.29.20}.14
       land:
-        ipv4_address: 10.19.24.2
+        ipv4_address: ${ORBLX_NATR_LAN:-10.19}.24.2
 
   node-a:
-    image: orblx-natr:w20
+    image: ${ORBLX_NATR_IMAGE:-orblx-natr:w20}
     profiles: ["nodes"]
     cap_add:
       - NET_ADMIN
@@ -108,10 +110,10 @@ services:
       - state-a:/var/lib/orblx
     networks:
       lana:
-        ipv4_address: 10.19.21.10
+        ipv4_address: ${ORBLX_NATR_LAN:-10.19}.21.10
 
   node-b:
-    image: orblx-natr:w20
+    image: ${ORBLX_NATR_IMAGE:-orblx-natr:w20}
     profiles: ["nodes"]
     cap_add:
       - NET_ADMIN
@@ -122,10 +124,10 @@ services:
       - state-b:/var/lib/orblx
     networks:
       lanb:
-        ipv4_address: 10.19.22.10
+        ipv4_address: ${ORBLX_NATR_LAN:-10.19}.22.10
 
   node-c:
-    image: orblx-natr:w20
+    image: ${ORBLX_NATR_IMAGE:-orblx-natr:w20}
     profiles: ["nodes"]
     cap_add:
       - NET_ADMIN
@@ -136,10 +138,10 @@ services:
       - state-c:/var/lib/orblx
     networks:
       lanc:
-        ipv4_address: 10.19.23.10
+        ipv4_address: ${ORBLX_NATR_LAN:-10.19}.23.10
 
   node-d:
-    image: orblx-natr:w20
+    image: ${ORBLX_NATR_IMAGE:-orblx-natr:w20}
     profiles: ["nodes"]
     cap_add:
       - NET_ADMIN
@@ -150,7 +152,7 @@ services:
       - state-d:/var/lib/orblx
     networks:
       land:
-        ipv4_address: 10.19.24.10
+        ipv4_address: ${ORBLX_NATR_LAN:-10.19}.24.10
 
 volumes:
   coord:
@@ -163,20 +165,20 @@ networks:
   public:
     ipam:
       config:
-        - subnet: 172.29.20.0/24
+        - subnet: ${ORBLX_NATR_PUB:-172.29.20}.0/24
   lana:
     ipam:
       config:
-        - subnet: 10.19.21.0/24
+        - subnet: ${ORBLX_NATR_LAN:-10.19}.21.0/24
   lanb:
     ipam:
       config:
-        - subnet: 10.19.22.0/24
+        - subnet: ${ORBLX_NATR_LAN:-10.19}.22.0/24
   lanc:
     ipam:
       config:
-        - subnet: 10.19.23.0/24
+        - subnet: ${ORBLX_NATR_LAN:-10.19}.23.0/24
   land:
     ipam:
       config:
-        - subnet: 10.19.24.0/24
+        - subnet: ${ORBLX_NATR_LAN:-10.19}.24.0/24

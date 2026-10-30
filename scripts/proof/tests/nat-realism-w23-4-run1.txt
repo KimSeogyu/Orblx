@@ -1,0 +1,19 @@
+rtt plain_avg_ms 0.051 direct_avg_ms 0.650 direct_i0.23_avg_ms 0.720
+throughput plain bytes 22503358464 seconds 5.000 mbit_s 36008.15
+throughput prc_prc_direct bytes 883294208 seconds 5.003 mbit_s 1412.29
+relay_ping prc_prc median_ms 1.105 slowest seq31:22.100@1793341861.430613 seq21:2.320@1793341859.371122 seq34:1.830@1793341862.037071
+relay_rtt prc_prc relay_avg_ms 1.541 direct_avg_ms 0.650 slack_ms 1 lost 0/50
+prc_prc relay_gate ok
+throughput prc_prc_relay bytes 708902912 seconds 5.008 mbit_s 1132.42
+relay_ping sym_sym median_ms 1.040 slowest seq6:1.500@1793341949.403649 seq40:1.480@1793341956.318982 seq30:1.350@1793341954.309866
+relay_rtt sym_sym relay_avg_ms 1.001 direct_avg_ms 0.650 slack_ms 1 lost 0/50
+sym_sym relay_gate ok
+throughput sym_sym_relay bytes 711196672 seconds 5.005 mbit_s 1136.86
+rtt plain_avg_ms 0.051 direct_avg_ms 0.650 direct_i0.23_avg_ms 0.720
+throughput plain bytes 22503358464 seconds 5.000 mbit_s 36008.15
+throughput prc_prc_direct bytes 883294208 seconds 5.003 mbit_s 1412.29
+relay_rtt prc_prc relay_avg_ms 1.541 direct_avg_ms 0.650 slack_ms 1 lost 0/50 relay_gate ok
+throughput prc_prc_relay bytes 708902912 seconds 5.008 mbit_s 1132.42
+relay_rtt sym_sym relay_avg_ms 1.001 direct_avg_ms 0.650 slack_ms 1 lost 0/50 relay_gate ok
+throughput sym_sym_relay bytes 711196672 seconds 5.005 mbit_s 1136.86
+proof_ok

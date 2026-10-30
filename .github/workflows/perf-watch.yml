@@ -1,0 +1,64 @@
+name: perf-watch
+
+# W24 perf watch: run the release nat-realism proof 3 times on a GitHub runner
+# and keep the RTT and throughput numbers as an artifact.
+# It runs on push to main and by hand. It does not run on pull requests,
+# because 3 release proof runs take too long to block a pull request.
+on:
+  push:
+    branches:
+      - main
+      - w24-perf-watch
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Number of release nat-realism runs
+        required: false
+        default: "3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-watch-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  nat-realism-perf:
+    name: release RTT and throughput gates (3 runs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Get the repository
+        uses: actions/checkout@v7
+
+      - name: Install the stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Show the runner host
+        run: |
+          uname -a
+          nproc
+          grep -m1 'model name' /proc/cpuinfo || true
+          docker version --format 'docker {{.Server.Version}}'
+          docker compose version
+          ls -l /dev/net/tun
+
+      - name: Run the release nat-realism proof
+        env:
+          ORBLX_PERF_RUNS: ${{ github.event.inputs.runs || '3' }}
+          ORBLX_PERF_OUT: ${{ github.workspace }}/target/perf-watch
+        run: ./scripts/proof/perf-watch.sh
+
+      - name: Upload the perf watch result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-watch-${{ github.sha }}
+          path: |
+            target/perf-watch/perf-watch.json
+            target/perf-watch/perf-watch.md
+            target/perf-watch/run*.log
+            target/perf-watch/run*.exit
+          if-no-files-found: warn
+          retention-days: 90
