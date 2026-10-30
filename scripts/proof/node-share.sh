@@ -13,9 +13,13 @@
 #      a -> b:8080 and g -> g2:8080 have no failure during and after the change.
 #   5. The unshare and the share again each write exactly 1 coordinator record.
 #      The chain verifies ok.
-# The port check (g -> b:9090) and the shared node check (b -> g) need the datapath
-# packet filter. The script prints the result of each and gates them only when
-# ORBLX_SHARE_PORT_GATE=1.
+#   6. Port scope (W25-1b): g sends 65536 bytes on TCP and on UDP to b:9090 (not shared).
+#      Node b counts 0 bytes from g, and its packet-audit chain has exactly 1 packet-deny
+#      record for g tcp/9090. The chain verifies. Node a sends the same to b:9090 as a control.
+#      A check from b to g:8080 is refused (the share gives b nothing on g).
+# ORBLX_SHARE_POLICY selects the policy. The default has an `acls` list.
+# scripts/proof/node-share-noacl.hujson has no `acls` list: then only the shared peers are filtered.
+# ORBLX_SHARE_PORT_GATE=0 prints the port checks without the gate.
 # The script deletes the orblx-w25a-node-share volumes at the start.
 # The script does not print enroll tokens, ID tokens, private keys, or tickets.
 set -euo pipefail
@@ -33,7 +37,8 @@ ISSUER="https://idp:8443"
 CLIENT="orblx-proof"
 LIMIT_MS=1000
 STATE=/var/lib/orblx
-PORT_GATE="${ORBLX_SHARE_PORT_GATE:-0}"
+PORT_GATE="${ORBLX_SHARE_PORT_GATE:-1}"
+POLICY_SRC="${ORBLX_SHARE_POLICY:-$ROOT/scripts/proof/node-share.hujson}"
 mkdir -p "$POLICY_DIR"
 : >"$IDP_CA_FILE"
 
@@ -181,7 +186,7 @@ expect_fail() {
   echo "check ${label} refused: ${out}"
 }
 
-# A check that needs the datapath packet filter. Gate it only with ORBLX_SHARE_PORT_GATE=1.
+# A port check of the packet filter. ORBLX_SHARE_PORT_GATE=0 turns off the gate.
 port_check() {
   local label="$1"
   shift
@@ -210,7 +215,8 @@ probe() {
   pids+=($!)
 }
 
-cp "$ROOT/scripts/proof/node-share.hujson" "$WORK/shared.hujson"
+cp "$POLICY_SRC" "$WORK/shared.hujson"
+echo "policy $(basename "$POLICY_SRC") acls $(grep -c '"acls"' "$WORK/shared.hujson" || true)"
 grep -v 'SHARE-B\|node/b:8080' "$WORK/shared.hujson" >"$WORK/unshared.hujson"
 if cmp -s "$WORK/shared.hujson" "$WORK/unshared.hujson"; then
   echo "The unshared policy is the same as the shared policy." >&2
@@ -318,7 +324,7 @@ done
 dc exec -T g cat "$STATE/grants.signed.json" 2>/dev/null \
   | jq -c '{reach: .grants.reach}' 2>/dev/null || true
 
-echo "=== [C] web servers: b on 8080 and 9090, a, g, and g2 on 8080 ==="
+echo "=== [C] web servers: a, b, g, and g2 on 8080 ==="
 for name in a b g g2; do
   dc exec -d "$name" python3 -m http.server 8080 --bind 0.0.0.0
   dc exec -T "$name" sh -c "cat > /tmp/share-get.py" <"$ROOT/scripts/proof/share-get.py"
@@ -329,7 +335,8 @@ done
 for name in a g2; do
   dc exec -d "$name" python3 /tmp/share-sink.py serve 7070 /tmp/sink-7070.txt
 done
-dc exec -d b python3 -m http.server 9090 --bind 0.0.0.0
+# Byte counter for the port gate: TCP and UDP 9090 on node b. Port 9090 is not shared.
+dc exec -d b python3 /tmp/share-sink.py serve 9090 /tmp/sink-9090.txt
 sleep 1
 
 echo "=== [C] gate 1: the guest reaches the shared node and port ==="
@@ -367,9 +374,49 @@ echo "=== [C] other access ==="
 expect_ok "a -> b:8080" a "$b_ip" 8080
 expect_ok "g -> g2:8080" g "$g2_ip" 8080
 port_results=()
-echo "=== [C] port checks (need the datapath packet filter, gate ${PORT_GATE}) ==="
+echo "=== [C] gate 6: the share gives only its ports (gate ${PORT_GATE}) ==="
 port_check "g -> b:9090" g "$b_ip" 9090
 port_check "b -> g:8080" b "$g_ip" 8080
+dc exec -T g python3 /tmp/share-sink.py send "$b_ip" 9090 65536 0.8
+dc exec -T a python3 /tmp/share-sink.py send "$b_ip" 9090 65536 0.8
+sleep 1
+b9090_from_g="$(dc exec -T b cat /tmp/sink-9090.txt | awk -v src="$g_ip" '$1 == src {n += $2} END {print n + 0}')"
+b9090_from_a="$(dc exec -T b cat /tmp/sink-9090.txt | awk -v src="$a_ip" '$1 == src {n += $2} END {print n + 0}')"
+echo "port_bytes b9090_from_g ${b9090_from_g} control_b9090_from_a ${b9090_from_a}"
+# The packet filter writes its records from a thread. Wait for the record.
+g_svid="spiffe://orblx.local/node/g"
+pd_tcp=0
+for _ in $(seq 1 30); do
+  dc exec -T b sh -c "cat $STATE/packet-audit.jsonl 2>/dev/null || true" >"$WORK/b-packet-audit.jsonl"
+  pd_tcp="$(jq -s --arg g "$g_svid" '[.[] | select(.action == "packet-deny" and .actor == $g and .target == "tcp/9090")] | length' "$WORK/b-packet-audit.jsonl")"
+  (( pd_tcp >= 1 )) && break
+  sleep 0.2
+done
+pd_udp="$(jq -s --arg g "$g_svid" '[.[] | select(.action == "packet-deny" and .actor == $g and .target == "udp/9090")] | length' "$WORK/b-packet-audit.jsonl")"
+pd_all="$(jq -s '[.[] | select(.action == "packet-deny")] | length' "$WORK/b-packet-audit.jsonl")"
+jq -c --arg g "$g_svid" 'select(.actor == $g and .target == "tcp/9090") | {action, actor, target, detail}' "$WORK/b-packet-audit.jsonl"
+# Read all the output first. With head -1 in the pipe, docker exec can fail with EPIPE (exit 255).
+pd_verify_out="$(dc exec -T b orblx audit verify-config --file "$STATE/packet-audit.jsonl" 2>&1 || true)"
+pd_verify="${pd_verify_out%%$'\n'*}"
+echo "packet_deny b tcp9090_from_g ${pd_tcp} udp9090_from_g ${pd_udp} all ${pd_all} verify ${pd_verify}"
+if [[ "$PORT_GATE" == 1 ]]; then
+  if (( b9090_from_g != 0 )); then
+    echo "Node b got bytes from g on the port that is not shared." >&2
+    exit 1
+  fi
+  if (( b9090_from_a == 0 )); then
+    echo "The control counter on b:9090 got no bytes, so the counter does not work." >&2
+    exit 1
+  fi
+  if (( pd_tcp != 1 )); then
+    echo "Node b has ${pd_tcp} packet-deny records for g tcp/9090, not 1." >&2
+    exit 1
+  fi
+  if [[ "$pd_verify" != ok* ]]; then
+    echo "The packet audit chain of b does not verify." >&2
+    exit 1
+  fi
+fi
 
 echo "=== [C] gate 4: remove the share ==="
 records_before="$(records)"
@@ -480,5 +527,5 @@ hits="$(grep -cF 'PRIVATE KEY' "$WORK/all-logs.log" || true)"
 echo "secret_grep tokens 0 id_tokens 0 'PRIVATE KEY' ${hits}"
 [[ "$hits" -eq 0 ]]
 
-echo "summary guest oidc:bob shared spiffe://orblx.local/node/b:8080 gate2_bytes_to_a ${a_from_g}+${a_from_g2} unshare_deny_ms ${deny_ms} limit_ms ${LIMIT_MS} other_access_failures 0 share_records ${share_records} unshare_records ${unshare_records} coord_verify ok share_again_restore_ms ${reshare} port_checks ${port_results[*]}"
+echo "summary guest oidc:bob shared spiffe://orblx.local/node/b:8080 gate2_bytes_to_a ${a_from_g}+${a_from_g2} unshare_deny_ms ${deny_ms} limit_ms ${LIMIT_MS} other_access_failures 0 share_records ${share_records} unshare_records ${unshare_records} coord_verify ok share_again_restore_ms ${reshare} port_checks ${port_results[*]} b9090_bytes_from_g ${b9090_from_g} packet_deny_tcp9090 ${pd_tcp} packet_audit_verify ${pd_verify%% *}"
 echo "proof_ok"
