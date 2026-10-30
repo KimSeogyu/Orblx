@@ -292,6 +292,10 @@ restore_router() {
 }
 
 proof_lock_take "ha-routers:${PROJECT}" "${PROJECT}-"
+# W25-14b: start from a clean compose state (all profiles, all volumes).
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$ROOT/scripts/proof/compose-clean.sh"
+proof_compose_clean "${PROJECT}" || exit 1
 echo "=== W25-10 HA subnet routers proof. All gates are [C] (Docker on one Linux host). ==="
 echo "project ${PROJECT} image ${IMAGE} runs ${RUNS} limit_ms ${LIMIT_MS} target_ms ${TARGET_MS} tcp_limit_ms ${TCP_LIMIT_MS} watch_secs ${WATCH_SECS}"
 echo "route ${CIDR} on router-a (lan ${LAN_IP[router-a]}) and router-b (lan ${LAN_IP[router-b]}); target ${TARGET}; nameserver ${NAMESERVER}"
