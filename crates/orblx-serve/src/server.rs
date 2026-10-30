@@ -6,6 +6,10 @@
 //! Each overlay connection maps the source address to a peer SPIFFE ID with the netmap.
 //! The policy must allow that ID to reach this node on TCP at the HTTPS port.
 //! A denied or unknown source gets no TLS handshake.
+//! A peer source address counts only when the connection comes in on the overlay TUN
+//! interface. A connection with a peer source address from a different interface is
+//! a forged peer address. It gets `serve_deny forged-source` and no TLS handshake.
+//! After the TLS handshake, the HTTP/1.1 proxy in `http.rs` reads each request.
 
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -16,7 +20,6 @@ use std::time::{Duration, SystemTime};
 
 use orblx_datapath::Netmap;
 use orblx_identity::{DenySet, Policy, SpiffeId, TrustBundle};
-use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -24,6 +27,8 @@ use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::ServeConfig;
+use crate::http::{self, Target};
+use crate::ingress::{self, Ingress};
 
 const WATCH_GAP: Duration = Duration::from_millis(300);
 const PROTO_TCP: u8 = 6;
@@ -41,9 +46,16 @@ enum Face {
     Funnel,
 }
 
-struct Running {
+/// One listener that the serve state wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Want {
     addr: SocketAddr,
     target_port: u16,
+    body_limit: u64,
+}
+
+struct Running {
+    want: Want,
     task: JoinHandle<()>,
 }
 
@@ -90,35 +102,36 @@ async fn watch(shared: Arc<Shared>) {
                 None
             }
         };
-        let want_overlay = config.as_ref().map(|config| {
-            (
-                SocketAddr::new(IpAddr::V4(shared.overlay), config.https_port),
-                config.target_port,
-            )
-        });
-        let want_funnel = config.as_ref().and_then(|config| {
-            if config.funnel {
-                config.funnel_listen.map(|addr| (addr, config.target_port))
-            } else {
-                None
-            }
-        });
+        let (want_overlay, want_funnel) = plan(config.as_ref(), shared.overlay);
         apply(&shared, Face::Overlay, &mut overlay, want_overlay).await;
         apply(&shared, Face::Funnel, &mut funnel, want_funnel).await;
         tokio::time::sleep(WATCH_GAP).await;
     }
 }
 
-async fn apply(
-    shared: &Arc<Shared>,
-    face: Face,
-    slot: &mut Option<Running>,
-    want: Option<(SocketAddr, u16)>,
-) {
+/// The listeners that one serve state wants: the overlay listener and the funnel listener.
+///
+/// The funnel listener is `None` unless the state has `funnel: true` and a listen address.
+/// No serve state means no listener.
+fn plan(config: Option<&ServeConfig>, overlay: Ipv4Addr) -> (Option<Want>, Option<Want>) {
+    let Some(config) = config else {
+        return (None, None);
+    };
+    let overlay = Want {
+        addr: SocketAddr::new(IpAddr::V4(overlay), config.https_port),
+        target_port: config.target_port,
+        body_limit: config.body_limit(),
+    };
+    let funnel = match (config.funnel, config.funnel_listen) {
+        (true, Some(addr)) => Some(Want { addr, ..overlay }),
+        _ => None,
+    };
+    (Some(overlay), funnel)
+}
+
+async fn apply(shared: &Arc<Shared>, face: Face, slot: &mut Option<Running>, want: Option<Want>) {
     let same = match (slot.as_ref(), want) {
-        (Some(running), Some((addr, target))) => {
-            running.addr == addr && running.target_port == target && !running.task.is_finished()
-        }
+        (Some(running), Some(want)) => running.want == want && !running.task.is_finished(),
         (None, None) => true,
         _ => false,
     };
@@ -128,11 +141,12 @@ async fn apply(
     if let Some(running) = slot.take() {
         running.task.abort();
         let _ = running.task.await;
-        println!("{}_closed {}", face_name(face), running.addr);
+        println!("{}_closed {}", face_name(face), running.want.addr);
     }
-    let Some((addr, target_port)) = want else {
+    let Some(want) = want else {
         return;
     };
+    let addr = want.addr;
     let listener = match TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(err) => {
@@ -143,12 +157,17 @@ async fn apply(
             return;
         }
     };
+    if face == Face::Overlay && !ingress::enable(&listener) {
+        // The W21-4 source address check still applies.
+        println!("serve_ingress_check unavailable");
+    }
     println!(
-        "{}_listen {addr} target 127.0.0.1:{target_port}",
-        face_name(face)
+        "{}_listen {addr} target 127.0.0.1:{} max_body {}",
+        face_name(face),
+        want.target_port,
+        want.body_limit
     );
     let shared = Arc::clone(shared);
-    let https_port = addr.port();
     let task = tokio::spawn(async move {
         // The listener task owns each connection task.
         // When the listener task stops, the JoinSet drop stops the open connections too.
@@ -162,18 +181,14 @@ async fn apply(
                     };
                     let shared = Arc::clone(&shared);
                     conns.spawn(async move {
-                        handle(shared, face, stream, peer, https_port, target_port).await;
+                        handle(shared, face, stream, peer, want).await;
                     });
                 }
                 Some(_) = conns.join_next(), if !conns.is_empty() => {}
             }
         }
     });
-    *slot = Some(Running {
-        addr,
-        target_port,
-        task,
-    });
+    *slot = Some(Running { want, task });
 }
 
 fn face_name(face: Face) -> &'static str {
@@ -183,16 +198,14 @@ fn face_name(face: Face) -> &'static str {
     }
 }
 
-async fn handle(
-    shared: Arc<Shared>,
-    face: Face,
-    stream: TcpStream,
-    peer: SocketAddr,
-    https_port: u16,
-    target_port: u16,
-) {
+async fn handle(shared: Arc<Shared>, face: Face, stream: TcpStream, peer: SocketAddr, want: Want) {
     match face {
-        Face::Overlay => match admit(&shared, peer.ip(), https_port) {
+        Face::Overlay => match admit(
+            &shared,
+            peer.ip(),
+            overlay_ingress(&shared, &stream),
+            want.addr.port(),
+        ) {
             Ok(src) => println!("serve_allow {src} from {}", peer.ip()),
             Err(reason) => {
                 // Close before TLS. The denied source gets no data.
@@ -210,28 +223,55 @@ async fn handle(
             return;
         }
     };
-    let Ok(Ok(mut tls)) = tokio::time::timeout(HANDSHAKE_LIMIT, acceptor.accept(stream)).await
-    else {
+    let Ok(Ok(tls)) = tokio::time::timeout(HANDSHAKE_LIMIT, acceptor.accept(stream)).await else {
         println!("{}_tls_failed from {}", face_name(face), peer.ip());
         return;
     };
-    let Ok(mut local) = TcpStream::connect((Ipv4Addr::LOCALHOST, target_port)).await else {
-        eprintln!("The local port 127.0.0.1:{target_port} did not accept the connection.");
-        return;
+    let target = Target {
+        face: face_name(face),
+        port: want.target_port,
+        body_limit: want.body_limit,
+        client: peer.ip(),
     };
-    let _ = copy_bidirectional(&mut tls, &mut local).await;
+    http::serve_connection(tls, target).await;
+}
+
+/// Where one overlay connection came in.
+///
+/// Without the Linux ingress check, the function returns `Tunnel`.
+/// The W21-4 source address check then still applies.
+fn overlay_ingress(shared: &Shared, stream: &TcpStream) -> Ingress {
+    if !ingress::CHECK_AVAILABLE {
+        return Ingress::Tunnel;
+    }
+    ingress::classify(
+        ingress::ingress_index(stream),
+        ingress::index_for_addr(shared.overlay),
+    )
 }
 
 /// Map the source address to a peer SPIFFE ID and check the policy.
 ///
+/// A peer address counts only when the connection came in on the overlay TUN interface.
 /// The error is a short reason. It does not hold secrets.
-fn admit(shared: &Shared, src: IpAddr, https_port: u16) -> Result<String, String> {
+fn admit(
+    shared: &Shared,
+    src: IpAddr,
+    ingress: Ingress,
+    https_port: u16,
+) -> Result<String, String> {
     let netmap =
         Netmap::from_path(&shared.netmap_path).map_err(|_| "netmap-not-valid".to_string())?;
     let src_text = src.to_string();
     let Some(peer) = netmap.peers.iter().find(|peer| peer.overlay_ip == src_text) else {
         return Err("unknown-source".to_string());
     };
+    match ingress {
+        Ingress::Tunnel => {}
+        // A peer address from an underlay interface did not pass the QUIC SVID check.
+        Ingress::Other => return Err("forged-source".to_string()),
+        Ingress::Unknown => return Err("ingress-unknown".to_string()),
+    }
     let src_id = SpiffeId::parse(&peer.svid).map_err(|_| "unknown-source".to_string())?;
     let self_id = node_id(&shared.state_dir)?;
     let policy_path = shared.state_dir.join("policy.hujson");
@@ -282,4 +322,107 @@ fn acceptor(state_dir: &Path) -> Result<TlsAcceptor, String> {
         .map_err(|_| "The node SVID key does not match the SVID.".to_string())?;
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("orblx-serve-server-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap_or_else(|_| panic!("temp dir"));
+        dir
+    }
+
+    fn shared_with_netmap(name: &str) -> Shared {
+        let dir = temp_dir(name);
+        let netmap = dir.join("netmap.json");
+        fs::write(
+            &netmap,
+            r#"{
+  "version": 1,
+  "self": {"name": "b", "overlay_ip": "100.64.0.2"},
+  "peers": [
+    {"name": "a", "overlay_ip": "100.64.0.1", "svid": "spiffe://orblx.local/node/a",
+     "endpoints": ["192.0.2.11:443"], "routes": ["100.64.0.1/32"]}
+  ]
+}"#,
+        )
+        .unwrap_or_else(|_| panic!("netmap"));
+        Shared {
+            state_dir: dir,
+            netmap_path: netmap,
+            overlay: Ipv4Addr::new(100, 64, 0, 2),
+        }
+    }
+
+    #[test]
+    fn a_forged_peer_address_is_rejected() {
+        let shared = shared_with_netmap("forged");
+        let peer_a = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1));
+        // The source is the netmap address of peer a, but the connection came in on an
+        // underlay interface, not on TUN.
+        assert_eq!(
+            admit(&shared, peer_a, Ingress::Other, 443),
+            Err("forged-source".to_string())
+        );
+        // Fail closed when the interface is not known.
+        assert_eq!(
+            admit(&shared, peer_a, Ingress::Unknown, 443),
+            Err("ingress-unknown".to_string())
+        );
+        // A source that is not a netmap peer stays unknown-source on each interface.
+        let outside = IpAddr::V4(Ipv4Addr::new(172, 30, 42, 20));
+        for ingress in [Ingress::Tunnel, Ingress::Other, Ingress::Unknown] {
+            assert_eq!(
+                admit(&shared, outside, ingress, 443),
+                Err("unknown-source".to_string())
+            );
+        }
+        // On TUN the peer address goes on to the SVID and policy checks.
+        // This state directory has no node SVID, so the check stops there.
+        assert_eq!(
+            admit(&shared, peer_a, Ingress::Tunnel, 443),
+            Err("no-node-svid".to_string())
+        );
+        let _ = fs::remove_dir_all(&shared.state_dir);
+    }
+
+    #[test]
+    fn funnel_stays_off_by_default() {
+        let overlay = Ipv4Addr::new(100, 64, 0, 2);
+        assert_eq!(plan(None, overlay), (None, None));
+
+        // The W21-4 file has no funnel field.
+        let config: ServeConfig =
+            serde_json::from_str(r#"{"version":1,"target_port":8080,"https_port":443}"#)
+                .unwrap_or_else(|_| panic!("serve config"));
+        let (serve, funnel) = plan(Some(&config), overlay);
+        let serve = serve.unwrap_or_else(|| panic!("serve listener"));
+        assert_eq!(
+            serve.addr,
+            "100.64.0.2:443".parse().unwrap_or_else(|_| panic!("addr"))
+        );
+        assert_eq!(funnel, None);
+
+        // A listen address alone does not open funnel. Only funnel: true does.
+        let mut config = config;
+        config.funnel_listen = Some("192.0.2.10:8443".parse().unwrap_or_else(|_| panic!("addr")));
+        assert_eq!(plan(Some(&config), overlay).1, None);
+        config.funnel = true;
+        let funnel = plan(Some(&config), overlay)
+            .1
+            .unwrap_or_else(|| panic!("funnel listener"));
+        assert_eq!(
+            funnel.addr,
+            "192.0.2.10:8443".parse().unwrap_or_else(|_| panic!("addr"))
+        );
+
+        // funnel: true without a listen address does not load.
+        let bad = r#"{"version":1,"target_port":8080,"https_port":443,"funnel":true}"#;
+        let bad: ServeConfig = serde_json::from_str(bad).unwrap_or_else(|_| panic!("parse"));
+        assert!(bad.check().is_err());
+    }
 }
