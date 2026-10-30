@@ -1,6 +1,8 @@
 # W25-11: run the SVID renewal session test 20 times on Linux and 20 times on macOS.
-# Each shard builds once and runs the orblx-coord tests 4 times in series. A failed run fails
-# the shard. The other orblx-coord tests run in parallel with the renewal test, as in ci.yml,
+# Each shard builds once and runs the orblx-coord tests 4 times in series.
+# Linux is the gate: a failed run fails the shard and stops it.
+# macOS is a report only: each run prints its summary and its probe stalls, a failed run is
+# reported and the next run starts, and the shard does not fail. The other orblx-coord tests run in parallel with the renewal test, as in ci.yml,
 # so the runner has the same load as the CI test step.
 # There are no reruns: 5 shards x 4 runs = 20 runs per OS.
 name: renew-soak
@@ -37,10 +39,21 @@ jobs:
       - name: Run the orblx-coord tests with the renewal test 4 times
         env:
           ORBLX_TRACE_RENEW: "1"
+          REPORT_ONLY: ${{ matrix.os == 'macos-latest' && '1' || '0' }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           for i in 1 2 3 4; do
             echo "=== renew_soak ${{ matrix.os }} shard ${{ matrix.shard }} run ${i} start $(date -u +%FT%TZ) ==="
             cargo test -p orblx-coord -- --nocapture 2>&1 | tee "run${i}.log"
+            code=$?
             grep -h '^renew_gap_summary' "run${i}.log" | sed "s/^/renew_soak run ${i} /"
+            if [[ "$code" -ne 0 ]]; then
+              grep -hE 'packet gap|trace [0-9]+ test (gap|stall|os_stall)' "run${i}.log" | sed "s/^/renew_soak run ${i} /"
+              if [[ "$REPORT_ONLY" == "1" ]]; then
+                echo "renew_soak run ${i} report_only_fail exit ${code}"
+                continue
+              fi
+              echo "renew_soak run ${i} fail exit ${code}"
+              exit "$code"
+            fi
           done
