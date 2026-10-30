@@ -126,6 +126,7 @@ The macOS runs are data only. Each failed macOS run of the new test:
 | 124129761509, run 1 | 7cceaaa | 226 ms | +1.69 s | 194 ms (194 ms) | 135 ms |
 | 124168988572, run 2 | dd5eec0 | 729 ms | +2.69 s | 430 ms (703 ms) | 547 ms |
 | 124168988494, run 2 | dd5eec0 | 388 ms | -1.19 s | 332 ms (332 ms) | 289 ms |
+| 124196116316, run 2 | ee56381 | 409 ms | +2.44 s | 336 ms (336 ms) | 335 ms |
 
 - In each failed run the OS-thread probe stalled 191 ms or more in the gap. A plain OS thread cannot run at that time,
   so the packet runtime cannot run.
@@ -133,6 +134,7 @@ The macOS runs are data only. Each failed macOS run of the new test:
   before a renewal. It is not a renewal gap.
 - In job 124168988572 and job 124168988494 the shard stopped after the failed run 2, so runs 3 and 4 did not start
   (`set -euo pipefail`). The failed runs ended normally after 192.35 s and 191.78 s. There was no hang and no timeout.
+- In job 124196116316 (run 41094354119) run 2 failed. The job is report only, so runs 3 and 4 ran and the job passed.
 - The original failure was job 124091852497 (run 41064382223): a gap of 2804 ms after the third renewal,
   before the fix. That job had no OS-thread probe.
 
