@@ -80,11 +80,15 @@ pub enum ConfigAction {
     FileReceive,
     /// A node refused a file or the file failed its checks (W23-3).
     FileDeny,
+    /// The policy shared one node with a guest (W25-1). One record for each share.
+    Share,
+    /// The policy removed one share (W25-1). One record for each share.
+    Unshare,
 }
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 27] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -110,6 +114,8 @@ impl ConfigAction {
         Self::LockRemove,
         Self::FileReceive,
         Self::FileDeny,
+        Self::Share,
+        Self::Unshare,
     ];
 
     /// Return the stable action token.
@@ -141,6 +147,8 @@ impl ConfigAction {
             Self::LockRemove => "lock-remove",
             Self::FileReceive => "file-receive",
             Self::FileDeny => "file-deny",
+            Self::Share => "share",
+            Self::Unshare => "unshare",
         }
     }
 
@@ -179,6 +187,9 @@ impl ConfigAction {
             Self::LockRemove => 23,
             Self::FileReceive => 24,
             Self::FileDeny => 25,
+            // Code 26 is kept for the W24-A packet-deny action.
+            Self::Share => 27,
+            Self::Unshare => 28,
         }
     }
 

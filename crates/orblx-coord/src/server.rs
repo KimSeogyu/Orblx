@@ -260,7 +260,7 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
-            let detail = admin::deny_json(coord, now)?;
+            let detail = admin::deny_json_for(coord, &request.name, now)?;
             Ok(Response {
                 ok: true,
                 detail: Some(detail),

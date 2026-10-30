@@ -1,0 +1,201 @@
+# Node sharing proof stack (W25-1).
+# idp is the [C] OIDC test issuer. The guest user bob enrolls nodes g and g2 with ID tokens.
+# owner, a, and b are home nodes of the owner. They enroll with tokens.
+# The coordinator reads the policy from the POLICY_DIR directory, so the script can
+# replace the policy file with one rename.
+name: orblx-w25a-node-share
+
+services:
+  idp:
+    image: orblx-w25a-share:w25
+    entrypoint: ["orblx-test-idp"]
+    command:
+      - serve
+      - --dir
+      - /idp
+      - --issuer
+      - https://idp:8443
+      - --listen
+      - 0.0.0.0:8443
+    volumes:
+      - orblx-w25a-share-idp:/idp
+      - orblx-w25a-share-tokens:/tokens
+    networks:
+      - proof
+
+  coord:
+    image: orblx-w25a-share:w25
+    entrypoint: ["orblx"]
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /policy/policy.hujson
+      - --config
+      - /etc/orblx/coord.toml
+    volumes:
+      - orblx-w25a-share-store:/var/lib/orblx
+      - ${POLICY_DIR:?set POLICY_DIR}:/policy:ro
+      - ${CONFIG_FILE:?set CONFIG_FILE}:/etc/orblx/coord.toml:ro
+      - ${IDP_CA_FILE:?set IDP_CA_FILE}:/etc/orblx/idp-ca.pem:ro
+    networks:
+      - proof
+
+  owner:
+    image: orblx-w25a-share:w25
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    volumes:
+      - orblx-w25a-share-store:/coord-state:ro
+      - orblx-w25a-share-owner:/var/lib/orblx
+    networks:
+      - proof
+
+  a:
+    image: orblx-w25a-share:w25
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-w25a-share-store:/coord-state:ro
+      - orblx-w25a-share-tokens:/tokens:ro
+      - orblx-w25a-share-a:/var/lib/orblx
+    networks:
+      - proof
+
+  b:
+    image: orblx-w25a-share:w25
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-w25a-share-store:/coord-state:ro
+      - orblx-w25a-share-tokens:/tokens:ro
+      - orblx-w25a-share-b:/var/lib/orblx
+    networks:
+      - proof
+
+  g:
+    image: orblx-w25a-share:w25
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-w25a-share-store:/coord-state:ro
+      - orblx-w25a-share-tokens:/tokens:ro
+      - orblx-w25a-share-g:/var/lib/orblx
+    networks:
+      - proof
+
+  g2:
+    image: orblx-w25a-share:w25
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-w25a-share-store:/coord-state:ro
+      - orblx-w25a-share-tokens:/tokens:ro
+      - orblx-w25a-share-g2:/var/lib/orblx
+    networks:
+      - proof
+
+volumes:
+  orblx-w25a-share-idp:
+  orblx-w25a-share-tokens:
+  orblx-w25a-share-store:
+  orblx-w25a-share-owner:
+  orblx-w25a-share-a:
+  orblx-w25a-share-b:
+  orblx-w25a-share-g:
+  orblx-w25a-share-g2:
+
+networks:
+  proof:

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_coord::{
     advertise_routes_blocking, decode_hex_32, encode_hex, renew_svid_blocking,
@@ -696,13 +696,15 @@ fn spawn_deny_refresh(options: &UpOptions) {
             .unwrap_or_else(|| "coord".to_string()),
     };
     let state = options.state_dir.clone();
+    // The fetch starts each DENY_REFRESH. The time of the fetch is not added to the interval (W25-1).
     thread::spawn(move || loop {
+        let start = Instant::now();
         if let Ok(bundle) = fs::read_to_string(state.join(BUNDLE_FILE)) {
             if let Ok(text) = orblx_coord::fetch_deny_blocking(coord, &name, &bundle, &state) {
                 let _ = store_deny(&state, &text);
             }
         }
-        thread::sleep(DENY_REFRESH);
+        thread::sleep(DENY_REFRESH.saturating_sub(start.elapsed()));
     });
 }
 

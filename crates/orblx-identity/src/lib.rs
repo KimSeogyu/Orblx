@@ -37,6 +37,7 @@ mod google;
 mod issuer;
 mod oidc;
 mod policy;
+mod share;
 mod spiffe;
 mod ticket;
 
@@ -84,6 +85,7 @@ pub fn ed25519_public_key_from_certificate_pem(pem: &str) -> Result<[u8; 32], Id
 pub fn leaf_ed25519_public_key(der: &[u8]) -> Result<[u8; 32], IdentityError> {
     cert::certificate_ed25519_public_key(der)
 }
+pub use share::{rules_without_shares, Share, ShareGuest};
 pub use spiffe::{SpiffeId, WorkloadKind, TRUST_DOMAIN};
 pub use ticket::{
     allow_agent_jit, sign_agent_jit_ticket, sign_ticket, ticket_hash, verify_ticket,

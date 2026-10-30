@@ -551,7 +551,11 @@ async fn run_mesh_inner(
     let deny_dir = Arc::clone(&state_dir);
     let mut deny_shutdown = mesh.shutdown.clone();
     tasks.push(tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(10));
+        // The deny list reloads each 100 ms, so an unshare or a revoke stops a peer
+        // at most 100 ms after the node writes the new list (W25-1).
+        // The node lock check stays at each 10 s (each 100 ticks).
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        let mut ticks: u64 = 0;
         loop {
             tokio::select! {
                 changed = deny_shutdown.changed() => {
@@ -561,9 +565,13 @@ async fn run_mesh_inner(
                 }
                 _ = tick.tick() => {
                     if let Some(deny) = read_deny_file(&deny_dir) {
+                        close_denied_links(&lock_mesh, &deny);
                         deny_endpoint.replace_deny(deny);
                     }
-                    apply_lock_allow(&lock_mesh);
+                    if ticks.is_multiple_of(100) {
+                        apply_lock_allow(&lock_mesh);
+                    }
+                    ticks = ticks.wrapping_add(1);
                 }
             }
         }
@@ -815,6 +823,36 @@ fn apply_lock_allow(mesh: &Mesh) {
     let netmap = fresh_netmap(mesh);
     let allow: HashSet<String> = netmap.peers.iter().map(|peer| peer.svid.clone()).collect();
     mesh.endpoint.replace_allow(Some(allow));
+}
+
+/// Close each open session whose peer SPIFFE ID is in the deny list (W25-1).
+///
+/// The per-frame check denies only ticket nonces. A peer that the coordinator
+/// hides or revokes after the session started must lose the session here.
+/// The dial task then tries again, and the session check refuses the denied peer.
+/// When the deny list drops the peer again, the next dial brings the session back.
+fn close_denied_links(mesh: &Mesh, deny: &DenySet) {
+    let netmap = fresh_netmap(mesh);
+    let svids: HashMap<&str, &str> = mesh
+        .netmap
+        .peers
+        .iter()
+        .chain(netmap.peers.iter())
+        .map(|peer| (peer.name.as_str(), peer.svid.as_str()))
+        .collect();
+    let links = lock(&mesh.links);
+    for (name, link) in links.iter() {
+        let Some(svid) = svids.get(name.as_str()) else {
+            continue;
+        };
+        let Ok(id) = SpiffeId::parse(svid) else {
+            continue;
+        };
+        if deny.reject_uri(&id).is_err() && !*link.cancel.borrow() {
+            println!("The peer {name} is in the deny list. The node closes the session.");
+            let _ = link.cancel.send(true);
+        }
+    }
 }
 
 fn read_deny_file(dir: &Path) -> Option<DenySet> {
