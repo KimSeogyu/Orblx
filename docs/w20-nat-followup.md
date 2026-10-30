@@ -123,5 +123,5 @@ The direct RTT is 1.55 ms above the plain RTT. The proof uses a debug build.
 - The macOS utun change compiles in CI. It was not run on a Mac.
 - The renewal proof uses new node names (node-e to node-h), because the coordinator does not allow a second enrollment of a name.
 - The relay path and the hold logic did not change. The relay loop still sleeps 2 ms for each round.
-- In the renewal case, the steady pings had one slow ping on each path (41 ms direct, 185 ms relay) and no loss. The cause was not measured.
+- In the renewal case of the dev run, the steady pings had one slow ping on each path (41 ms direct, 185 ms relay) and no loss. The run at the PR head did not show it (max 2.3 ms direct, 9.5 ms relay). The cause was not measured.
 - The resend window after a renewal is 5 s. A peer that loses all hello frames in this window keeps the old expiry until the next renewal.
