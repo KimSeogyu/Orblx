@@ -144,6 +144,22 @@ Because no single thread is at 100 %, the stream is also limited by the RTT and 
 The next steps on this path are a batch receive in the node receive threads and fewer thread hand-offs for each packet.
 This document does not measure those steps.
 
+## PR head proof ([C], release)
+
+One more release run at the PR head `f559d537` (this change on `main` `bd26bba`).
+Log: `pr60-f559d537-release-nat-realism.log`. It printed `proof_ok`.
+
+| Path | Mbit/s | RTT avg | Lost | Gate |
+| --- | --- | --- | --- | --- |
+| plain | 33455.48 | - | - | - |
+| prc_prc direct | 898.53 | 1.511 ms | 0/50 | - |
+| prc_prc relay | 977.01 | 1.795 ms | 0/50 | ok |
+| sym_sym relay | 967.18 | 1.983 ms | 0/50 | ok |
+
+This run is lower than the 3 after runs. It is in the before range on each path.
+With this run, the after medians of 4 runs are 1070.06 (direct), 1052.47 (prc_prc relay), and 1109.30 (sym_sym relay) Mbit/s.
+Each of these is still higher than the before median. The host was shared during this run too.
+
 ## Tests
 
 - REAL `cargo test -p orblx-relay`: `batch_send_and_receive_keep_bytes_order_and_source` sends 70 frames through `send_batch` and `recv_batch`.
