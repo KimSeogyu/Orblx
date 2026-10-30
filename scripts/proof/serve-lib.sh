@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Shared setup for the serve proofs (W21-4 serve-funnel.sh and W24-C serve-hardening.sh).
+# Shared setup for the serve proofs (W21-4 serve-funnel.sh, W24-C serve-hardening.sh,
+# and W25-4 serve-websocket.sh).
 # The caller sets ROOT and sources this file. Then it calls serve_setup.
 # Three node containers and one outside container on one Linux host.
 # The containers stand in for other hosts. The outside network stands in for a public network.
@@ -31,6 +32,9 @@ GET=/opt/orblx-proof/serve-get.py
 POST=/opt/orblx-proof/serve-post.py
 APP=/opt/orblx-proof/serve-app.py
 APP_LOG=/tmp/serve-app.log
+WS=/opt/orblx-proof/serve-ws.py
+WS_APP=/opt/orblx-proof/serve-ws-app.py
+WS_APP_LOG=/tmp/serve-ws-app.log
 ORBLX=""
 
 as_root() {
@@ -191,7 +195,8 @@ serve_setup() {
   cp "$WORK/b/bundle.pem" "$WORK/outside-bundle.pem"
   mkdir -p "$WORK/tools"
   cp "$ROOT/scripts/proof/serve-get.py" "$ROOT/scripts/proof/serve-post.py" \
-    "$ROOT/scripts/proof/serve-app.py" "$WORK/tools/"
+    "$ROOT/scripts/proof/serve-app.py" "$ROOT/scripts/proof/serve-ws.py" \
+    "$ROOT/scripts/proof/serve-ws-app.py" "$WORK/tools/"
 
   write_netmap "$WORK/netmap-a.json" a "$A_OVERLAY" b "$B_OVERLAY" "${SERVE_OVL}.12" c "$C_OVERLAY" "${SERVE_OVL}.13"
   write_netmap "$WORK/netmap-b.json" b "$B_OVERLAY" a "$A_OVERLAY" "${SERVE_OVL}.11" c "$C_OVERLAY" "${SERVE_OVL}.13"
