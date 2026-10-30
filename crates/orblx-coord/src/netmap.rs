@@ -264,6 +264,7 @@ mod tests {
                 lock_sig: None,
             }],
             lock: Vec::new(),
+            split_dns: Vec::new(),
         }
     }
 
