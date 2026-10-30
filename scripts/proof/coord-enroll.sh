@@ -10,16 +10,25 @@ require_root "$@"
 # W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$PROOF_LIB_DIR/proof-lock.sh"
-trap proof_lock_end EXIT
-proof_lock_take "coord-enroll"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 FILE="scripts/proof/compose.coord.yml"
+UP_NAME="orblx-coord-proof-up"
 
 dc() {
   docker compose --progress quiet -f "$FILE" "$@"
 }
+
+# W25-14b: on each exit, remove every proof container, so no container keeps port 443.
+cleanup() {
+  docker rm -f "$UP_NAME" >/dev/null 2>&1 || true
+  dc --profile nodes down -v --remove-orphans >/dev/null 2>&1 || true
+}
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "coord-enroll" "orblx-coord-proof-"
+# The test hook ORBLX_COORD_ENROLL_FAIL_AT=start makes the proof fail on purpose after it
+# starts the coordinator. The cleanup test uses it.
 
 resolve_coord() {
   dc --profile nodes run --rm --no-deps --entrypoint getent node-a ahostsv4 coord \
@@ -76,6 +85,10 @@ build_image
 
 echo "=== [C] start coordinator ==="
 dc up -d coord
+if [[ "${ORBLX_COORD_ENROLL_FAIL_AT:-}" == start ]]; then
+  echo "proof_fail: the test hook ORBLX_COORD_ENROLL_FAIL_AT=start stops the proof." >&2
+  exit 1
+fi
 wait_bundle
 
 echo "=== [C] token server-a ==="
@@ -164,24 +177,94 @@ echo "=== [C] netmap json ==="
 dc --profile nodes run --rm --entrypoint cat node-a /var/lib/orblx/netmap.json
 echo
 
-echo "=== [C] orblx up reads netmap.json ==="
+# W25-14b: since #41 (0c54129) enroll writes ticket.bin, so "orblx up" gets past the ticket
+# and opens the TUN device. The node-a container has no TUN device. The proof now runs
+# "up" two times on the same state:
+#   1. node-a (no TUN device): up must exit non-zero with the TUN message, print no ready
+#      line, and change no state file.
+#   2. node-a-tun (TUN device, NET_ADMIN): up must accept the netmap and open the TUN
+#      device, with no new enroll token.
+# A changed netmap must make up stop with 'The netmap is not valid' before the TUN step.
+state_sums() {
+  dc --profile nodes run --rm --entrypoint sh node-a -c \
+    'cd /var/lib/orblx && find . -type f | sort | xargs sha256sum'
+}
+self_ip="$(dc --profile nodes run --rm --entrypoint cat node-a /var/lib/orblx/netmap.json | jq -r '.self.overlay_ip')"
+[[ "$self_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "The netmap has no self overlay IP." >&2; exit 1; }
+
+echo "=== [C] orblx up reads netmap.json (no TUN device) ==="
+sums_before="$(state_sums)"
 set +e
 up_out="$(dc --profile nodes run --rm node-a up --state-dir /var/lib/orblx 2>&1)"
 up_code=$?
 set -e
 printf '%s\n' "$up_out"
 if [[ "$up_code" -eq 0 ]]; then
-  echo "orblx up started without the capability ticket." >&2
+  echo "orblx up reported success without a TUN device." >&2
   exit 1
 fi
 if printf '%s\n' "$up_out" | read_all grep -q 'The netmap is not valid'; then
   echo "orblx up rejected the coordinator netmap." >&2
   exit 1
 fi
-if ! printf '%s\n' "$up_out" | read_all grep -q 'ticket.bin'; then
+if ! printf '%s\n' "$up_out" | read_all grep -q 'The TUN device did not open'; then
+  echo "orblx up did not stop with the TUN message." >&2
+  exit 1
+fi
+if printf '%s\n' "$up_out" | read_all grep -q '^The TUN device is '; then
+  echo "orblx up reported a TUN device that did not open." >&2
+  exit 1
+fi
+sums_after="$(state_sums)"
+if [[ "$sums_before" != "$sums_after" ]]; then
+  echo "orblx up changed the node state when the TUN device did not open." >&2
+  diff <(printf '%s\n' "$sums_before") <(printf '%s\n' "$sums_after") >&2 || true
+  exit 1
+fi
+echo "up_without_tun exit ${up_code} state_files $(printf '%s\n' "$sums_after" | wc -l) unchanged"
+
+echo "=== [C] negative: orblx up with a changed netmap ==="
+set +e
+bad_out="$(timeout 120 docker compose --progress quiet -f "$FILE" --profile nodes run --rm --entrypoint sh node-a-tun -c \
+  'rm -rf /tmp/bad && cp -a /var/lib/orblx /tmp/bad && printf "{\"version\":1,\"self\":" > /tmp/bad/netmap.json && exec orblx up --state-dir /tmp/bad' 2>&1)"
+bad_code=$?
+set -e
+printf '%s\n' "$bad_out"
+if [[ "$bad_code" -eq 0 || "$bad_code" -eq 124 ]]; then
+  echo "orblx up did not stop on a changed netmap (exit ${bad_code})." >&2
+  exit 1
+fi
+if ! printf '%s\n' "$bad_out" | read_all grep -q 'The netmap is not valid'; then
+  echo "orblx up did not reject the changed netmap." >&2
+  exit 1
+fi
+if printf '%s\n' "$bad_out" | read_all grep -q '^The TUN device is '; then
+  echo "orblx up opened the TUN device with a changed netmap." >&2
+  exit 1
+fi
+echo "bad_netmap rejected exit ${bad_code}"
+
+echo "=== [C] orblx up reads netmap.json (TUN device, same state, no new enroll token) ==="
+dc --profile nodes run -d --name "$UP_NAME" node-a-tun up --state-dir /var/lib/orblx >/dev/null
+# The awk reader stops at the ready line. The result comes from the awk output only.
+# pipe-ok: the ready line in the awk output decides, not the pipe status.
+ready_out="$( { timeout 120 docker logs -f "$UP_NAME" 2>&1 || true; } \
+  | awk '{print} /^The TUN device is /{found = 1; exit} END {exit !found}' )" || true
+printf '%s\n' "$ready_out"
+if printf '%s\n' "$ready_out" | read_all grep -q 'The netmap is not valid'; then
+  echo "orblx up rejected the coordinator netmap." >&2
+  exit 1
+fi
+if ! printf '%s\n' "$ready_out" | read_all grep -qx "The overlay IP is ${self_ip}."; then
   echo "orblx up did not accept the netmap." >&2
   exit 1
 fi
+if ! printf '%s\n' "$ready_out" | read_all grep -q '^The TUN device is '; then
+  echo "orblx up did not accept the netmap." >&2
+  exit 1
+fi
+[[ "$(docker inspect -f '{{.State.Running}}' "$UP_NAME")" == true ]] || { echo "orblx up stopped after the ready line." >&2; exit 1; }
+docker rm -f "$UP_NAME" >/dev/null
 echo "orblx_up_read_netmap true"
 echo
 echo "proof_ok"
