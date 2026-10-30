@@ -200,6 +200,9 @@ echo "=== [C] node material ==="
   --node "a=${a_ip}" \
   --node "c=${c_ip}" >/dev/null
 cp -a "$WORK/nodes/router/." "$SPLIT_ROUTER_STATE/"
+# W24-A: the router uses the signed grants, so the port ACL covers its subnet route.
+cat "$WORK/enroll-router/netmap.pub" > "$SPLIT_ROUTER_STATE/netmap.pub"
+cat "$WORK/enroll-router/grants.signed.json" > "$SPLIT_ROUTER_STATE/grants.signed.json"
 cp -a "$WORK/nodes/a/." "$SPLIT_A_STATE/"
 cp -a "$WORK/nodes/c/." "$SPLIT_C_STATE/"
 
@@ -219,6 +222,7 @@ for node in a c; do
   [[ "$ready" -eq 1 ]] || fail "Node ${node} did not open a path to the router."
 done
 dc logs router 2>/dev/null | grep -q 'The node forwards 10.88.24.0/24' || fail "The router did not enable forwarding."
+dc logs router 2>/dev/null | grep -q 'The packet filter is on.' || fail "The router packet filter is not on."
 
 echo "---- [C] routes ----"
 echo "a: $(dc exec -T a ip route get 10.88.24.53 | head -n 1)"
@@ -351,9 +355,77 @@ out="$(ask a db.corp.lan "$a_ip")"
 echo "a after removal: ${out} (now from the system resolver)"
 echo "[C] gate4 ok"
 
+echo "=== Gate 5 [C] (W24-A): the port ACL covers the subnet route ==="
+fwd_bytes() {
+  dc exec -T router iptables -nvx -L FORWARD | awk '/orblx-w24acl-dns/ {print $2}'
+}
+router_reloads() {
+  lines_for router 'The DNS responder loaded new signed grants.'
+}
+deny_records() {
+  { dc exec -T router cat /var/lib/orblx/packet-audit.jsonl 2>/dev/null || true; } \
+    | jq -c 'select(.action == "packet-deny" and .target == "udp/53" and (.detail | contains("dst 10.88.24.53 ")))' \
+    | grep -c . || true
+}
+dc exec -T router iptables -I FORWARD 1 -d 10.88.24.53/32 -p udp --dport 53 -m comment --comment orblx-w24acl-dns
+land_q="query db.corp.lan type 1 from 10.88.24.2 "
+echo "---- [C] 5a: the policy allows udp 10.88.24.53/32:53 ----"
+f0="$(fwd_bytes)"
+l0="$(lines_for landns "$land_q")"
+out="$(ask a db.corp.lan 10.88.24.53)"
+sleep 0.5
+f1="$(fwd_bytes)"
+l1="$(lines_for landns "$land_q")"
+echo "a to 10.88.24.53:53: ${out}"
+echo "allowed_fwd_bytes $((f1 - f0)) allowed_landns_queries $((l1 - l0))"
+[[ "$out" == "db.corp.lan rcode 0 answers 1 address 10.88.24.20" ]] || fail "The allowed query did not get an answer."
+[[ $((f1 - f0)) -gt 0 && $((l1 - l0)) -ge 1 ]] || fail "The allowed query did not reach the zone DNS server."
+echo "---- [C] 5b: remove the UDP 53 rule; the router gets new signed grants ----"
+denied_policy="$WORK/policy-no-udp53.hujson"
+grep -v '^\s*//' "$SPLIT_POLICY_DIR/policy.hujson" | python3 -c 'import sys,re,json
+text=re.sub(r",(\s*[}\]])", r"\1", sys.stdin.read())
+data=json.loads(text)
+data["acls"]=[rule for rule in data["acls"] if rule.get("proto") != "udp"]
+print(json.dumps(data, indent=2))' > "$denied_policy"
+jq -c '.acls' "$denied_policy"
+reload0="$(router_reloads)"
+cp "$denied_policy" "$SPLIT_POLICY_DIR/policy.next"
+mv "$SPLIT_POLICY_DIR/policy.next" "$SPLIT_POLICY_DIR/policy.hujson"
+fetch_netmap router
+cat "$WORK/enroll-router/grants.signed.json" > "$SPLIT_ROUTER_STATE/grants.next"
+mv "$SPLIT_ROUTER_STATE/grants.next" "$SPLIT_ROUTER_STATE/grants.signed.json"
+for _ in $(seq 1 50); do
+  [[ "$(router_reloads)" -gt "$reload0" ]] && break
+  sleep 0.1
+done
+[[ "$(router_reloads)" -gt "$reload0" ]] || fail "The router did not load the new grants."
+d0="$(deny_records)"
+f2="$(fwd_bytes)"
+l2="$(lines_for landns "$land_q")"
+out="$(ask a db.corp.lan 10.88.24.53 2>&1 | tail -n 1 || true)"
+sleep 1
+f3="$(fwd_bytes)"
+l3="$(lines_for landns "$land_q")"
+d1="$(deny_records)"
+echo "a to 10.88.24.53:53: ${out}"
+echo "denied_fwd_bytes $((f3 - f2)) denied_landns_queries $((l3 - l2)) audit_packet_deny_udp53 $((d1 - d0))"
+[[ "$out" != *"rcode"* ]] || fail "The denied query got an answer."
+[[ $((f3 - f2)) -eq 0 && $((l3 - l2)) -eq 0 ]] || fail "The denied query reached the subnet."
+[[ $((d1 - d0)) -ge 1 ]] || fail "The router did not audit the denied query."
+dc exec -T router cat /var/lib/orblx/packet-audit.jsonl \
+  | jq -c 'select(.target == "udp/53") | {action, actor, target, detail}' | tail -n 1
+dc exec -T router orblx audit verify-config --file /var/lib/orblx/packet-audit.jsonl | grep -qx ok \
+  || fail "The router packet audit chain did not verify."
+echo "router packet audit verify ok"
+body="$(dc exec -T a curl -fsS --max-time 10 http://10.88.24.20/)"
+echo "a tcp 10.88.24.20:80 still allowed: body ${body}"
+[[ "$body" == "db-ok" ]] || fail "The TCP 80 rule stopped working."
+echo "[C] gate5 ok"
+
 echo "=== summary ==="
 echo "gate1 a db.corp.lan 10.88.24.20 via router, curl db-ok"
 echo "gate2 c REFUSED, leak delta $((leak_c1 - leak_c0)), sysdns corp.lan from c ${sys_corp_c}"
 echo "gate3 orblx names and other names unchanged"
 echo "gate4 policy_change_to_new_answer_ms ${policy_ms}"
+echo "gate5 subnet udp53 allowed fwd_bytes $((f1 - f0)) landns $((l1 - l0)); denied fwd_bytes $((f3 - f2)) landns $((l3 - l2)) audit $((d1 - d0))"
 echo "proof_ok"

@@ -20,8 +20,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use orblx_datapath::{
-    format_node_status, is_ipv4_packet, open_tun_port, NodeStatus, StatusPeer, TunConfig, TunPort,
-    LINUX_TUN_NAME, NODE_PID_FILE, NODE_STATUS_FILE,
+    format_node_status, is_ipv4_packet, open_tun_port, NodeStatus, PacketFilter, StatusPeer,
+    TunConfig, TunPort, LINUX_TUN_NAME, NODE_PID_FILE, NODE_STATUS_FILE,
 };
 use orblx_relay::{
     recv_batch, send_batch, BatchPeer, RecvBatch, RelayPipe, RelaySender, RelaySessionId, UDP_BATCH,
@@ -168,6 +168,10 @@ pub struct NatConfig {
     /// The peer then shows the new expiry.
     /// `None` keeps the first leaf.
     pub renew: Option<RenewFn>,
+    /// The receiver packet filter (W24).
+    ///
+    /// `None` keeps the old datapath. The node does not check the packet port.
+    pub filter: Option<Arc<PacketFilter>>,
 }
 
 /// Run one NAT node until SIGINT or SIGTERM.
@@ -204,6 +208,7 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         .status();
 
     let hub = Arc::new(Hub {
+        filter: config.filter,
         state_dir: config.state_dir,
         name: config.name,
         overlay: config.overlay,
@@ -384,6 +389,8 @@ fn gather_alt(client: &StunClient, server: SocketAddr) -> Option<SocketAddr> {
 }
 
 struct Hub {
+    /// The receiver packet filter. `None` keeps the old datapath.
+    filter: Option<Arc<PacketFilter>>,
     state_dir: PathBuf,
     name: String,
     overlay: Ipv4Addr,
@@ -554,7 +561,11 @@ impl Hub {
             Some(Opened::Data(packet)) => {
                 self.peer_confirmed.store(true, Ordering::Relaxed);
                 self.mark_rx(slot);
-                if is_ipv4_packet(&packet) {
+                let allowed = self
+                    .filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.allow_inbound(&self.peer_svid, &packet));
+                if is_ipv4_packet(&packet) && allowed {
                     (Some(packet), true)
                 } else {
                     (None, true)
@@ -621,7 +632,15 @@ impl Hub {
     /// When `wake` is false, the caller sends them with [`Hub::send_now`].
     fn enqueue_batch(&self, packets: Vec<Vec<u8>>, wake: bool) {
         let plan = self.current_plan();
-        let packets = packets.into_iter().filter(|packet| is_ipv4_packet(packet));
+        let packets = packets.into_iter().filter(|packet| {
+            if !is_ipv4_packet(packet) {
+                return false;
+            }
+            if let Some(filter) = &self.filter {
+                filter.note_outbound(packet);
+            }
+            true
+        });
         if plan == SendPlan::Hold {
             let mut queues = lock(&self.queues);
             for packet in packets {

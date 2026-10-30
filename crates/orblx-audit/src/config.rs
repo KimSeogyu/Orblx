@@ -92,13 +92,17 @@ pub enum ConfigAction {
     Share,
     /// The policy removed one share (W25-1). One record for each share.
     Unshare,
+    /// The node packet filter dropped packets that no grant allows (W24).
+    ///
+    /// The node writes a sample of the drops. The detail counts the drops it did not write.
+    PacketDeny,
     /// An owner removed the SVID deny entry of one principal (W25-2 revoke undo).
     Unrevoke,
 }
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 33] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -130,6 +134,7 @@ impl ConfigAction {
         Self::TokenRevoke,
         Self::Share,
         Self::Unshare,
+        Self::PacketDeny,
         Self::Unrevoke,
     ];
 
@@ -168,6 +173,7 @@ impl ConfigAction {
             Self::TokenRevoke => "token-revoke",
             Self::Share => "share",
             Self::Unshare => "unshare",
+            Self::PacketDeny => "packet-deny",
             Self::Unrevoke => "unrevoke",
         }
     }
@@ -213,7 +219,8 @@ impl ConfigAction {
             Self::TokenRevoke => 29,
             Self::Share => 30,
             Self::Unshare => 31,
-            Self::Unrevoke => 32,
+            Self::PacketDeny => 32,
+            Self::Unrevoke => 33,
         }
     }
 

@@ -108,6 +108,8 @@ fn run_node(options: RunOptions) -> Result<(), String> {
         .map_err(|err| format!("The netmap public key did not open. {err}"))?;
     let public = decode_hex_key(public_text.trim()).map_err(|err| err.to_string())?;
     let hello = hello_auth(&options.state, der, &peer.svid)?;
+    let (_visibility, filter) =
+        crate::up::load_grants(&options.state, &map.self_node.name, overlay)?;
     let renew = renewer(
         options.state.clone(),
         options.coord,
@@ -150,6 +152,7 @@ fn run_node(options: RunOptions) -> Result<(), String> {
         hello,
         publish,
         renew: Some(renew),
+        filter,
     };
     run_nat_node(config).map_err(|err| err.to_string())
 }

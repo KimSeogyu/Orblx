@@ -47,10 +47,10 @@ orblx admin revoke-undo spiffe://orblx.local/node/a --coord ... --admin-token-fi
 | Scope | API token scope `nodes:write` (op `admin-revoke-undo`). |
 | What it restores | The SVID of the principal only. The coordinator removes the URI from the revoked list and increases the deny version. The node then gets a new SVID at its next renew. |
 | What it does not restore | Grants and grant nonces that `revoke-all` revoked stay revoked. The owner issues new grants. |
-| Audit | Exactly 1 config record `unrevoke` (code 32). The detail is `principal URI scope all svid restored deny_version V`. |
+| Audit | Exactly 1 config record `unrevoke` (code 33). The detail is `principal URI scope all svid restored deny_version V`. |
 | Errors | An undo for a principal that is not revoked fails and writes no record. |
 
-New audit code: `unrevoke` = 32. W25-1 uses 30 (`share`) and 31 (`unshare`).
+New audit code: `unrevoke` = 33. W25-1 uses 30 (`share`) and 31 (`unshare`). W24-A uses 32 (`packet-deny`).
 
 ## 3. Deny list: wait for a change
 
