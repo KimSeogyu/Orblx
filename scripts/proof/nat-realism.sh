@@ -348,13 +348,18 @@ rtt_avg() {
 }
 
 # Print the median and the 3 slowest pings of one ping -D run (read on stdin).
+# Also print a ping_rtts line with every RTT and the sent and received counts (a record only).
 # Arguments: line kind (relay_ping or direct_ping), label.
 ping_detail() {
   python3 -c '
 import re, sys
 kind, label = sys.argv[1], sys.argv[2]
 rows = []
+sent = received = None
 for text in sys.stdin:
+    c = re.match(r"([0-9]+) packets transmitted, ([0-9]+) received", text)
+    if c:
+        sent, received = c.group(1), c.group(2)
     m = re.match(r"\[([0-9.]+)\].*icmp_seq=([0-9]+).*time=([0-9.]+) ms", text)
     if m:
         rows.append((float(m.group(3)), int(m.group(2)), m.group(1)))
@@ -364,6 +369,10 @@ if rows:
     mid = times[n // 2] if n % 2 else (times[n // 2 - 1] + times[n // 2]) / 2
     slow = " ".join("seq%d:%.3f@%s" % (r[1], r[0], r[2]) for r in sorted(rows, reverse=True)[:3])
     print("%s %s median_ms %.3f slowest %s" % (kind, label, mid, slow))
+# W24-E2: print every RTT in seq order and the sent and received counts. This line is a record only.
+# The CI perf watch reads it for the p99, the max and the spike count. No gate of this script reads it.
+print("ping_rtts %s %s sent %s received %s ms %s" % (kind, label, sent or "none", received or "none",
+      ",".join("%.3f" % r[0] for r in sorted(rows, key=lambda r: r[1])) or "none"))
 ' "$1" "$2"
 }
 

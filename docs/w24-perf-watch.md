@@ -1,6 +1,6 @@
 # W24-E CI perf watch
 
-This document describes the perf watch job and gives its first measured numbers.
+This document describes the perf watch job and gives its measured numbers. W24-E2 changed the CI gate from the avg to the median.
 
 Labels:
 
@@ -17,16 +17,28 @@ This document has no target numbers. Each number is a measured value from a log 
 - Runner: `ubuntu-latest` (REAL VM). The proof stack is [C] on that VM.
 - `scripts/proof/perf-watch.sh` runs `ORBLX_NATR_PROFILE=release scripts/proof/nat-realism.sh` 3 times.
   It runs every run, then `scripts/proof/perf-summary.py` reads the logs.
-- The job fails when a run does not print `proof_ok`, or when the RTT gate does not pass on every run.
-  The RTT gate is the nat-realism relay gate: relay ping avg <= direct ping avg + 1 ms, and 0/50 pings lost,
-  for the prc relay path and the sym relay path.
-- Throughput is recorded, not gated. `tcp-bulk.py` must finish on each path, or nat-realism fails.
-  No throughput floor is set, because the runner numbers and the local host numbers differ by about 4x (see below).
+- The job fails when a run does not print `proof_ok`, or when a CI gate (W24-E2) does not pass in a run.
+  A run fails when one of these is true:
+  - the relay ping median is more than the direct ping median + 1 ms (prc relay path and sym relay path),
+  - a ping is lost on a path (prc direct, prc direct at 0.23 s, prc relay, sym relay),
+  - the TCP throughput of a path is missing or not more than the floor. The floor is the nat-realism floor:
+    `tcp-bulk.py` must finish with a result (more than 0 Mbit/s, `ORBLX_PERF_MIN_MBIT`). This PR adds no new number,
+  - more than 3 of 50 pings on a path are above 10 ms (`ORBLX_PERF_MAX_SPIKES`, `ORBLX_PERF_SPIKE_MS`).
+- The job always reports, for each path and run: the ping median, p99 (linear interpolation), max,
+  and the spike count (pings above 10 ms). It also reports the box avg gate (relay avg <= direct avg + 1 ms)
+  as a record. The avg is not a CI gate, because one runner stall moves the avg of 50 pings (see below).
+- In CI, `perf-watch.sh` sets `ORBLX_RELAY_SLACK_MS=1000` and `ORBLX_RTT_LIMIT_MS=1000` (the ping timeout, `-W 1`).
+  Then the nat-realism avg checks cannot stop a run, and every path is measured.
+- **The box merge gate does not change.** `nat-realism.sh` without these env vars keeps relay avg <= direct avg + 1 ms
+  and direct avg <= plain avg + 5 ms.
+- `nat-realism.sh` prints a `ping_rtts` line (every RTT of the 50 pings, sent and received) after each
+  `direct_ping` and `relay_ping` line. It is a record only. No nat-realism gate reads it.
 - Artifact: `perf-watch-<commit sha>`, kept 90 days. It has:
   - `perf-watch.json`: for each path (`plain`, `prc_prc_direct`, `prc_prc_relay`, `sym_sym_relay`)
     the values of each run, the median, the min and max (range) of the RTT avg, the ping median,
     the relay minus direct value, the TCP throughput, the lost count, and the 3 slowest pings of each run
-    (seq, ms, time stamp). It also has the gate result of each run and the outlier check.
+    (seq, ms, time stamp). It also has the `ping_stats` of each run (median, p99, max, spikes, lost),
+    the CI gate result and the failures of each run, the box avg gate result (report), and the outlier check.
   - `perf-watch.md`: the same numbers as tables. The job also writes it to the job summary.
   - `runN.log` and `runN.exit`: the full nat-realism log and the exit code of each run.
 - Outlier check: a ping of 10 ms or more in the slowest pings is an outlier (`ORBLX_PERF_OUTLIER_MS`).
@@ -82,6 +94,42 @@ Log: `/workspace/orblx-w18-proof/w24e-e32392ea-perf-watch.log`, run logs and JSO
 Slowest ping on each path over the 3 runs: prc direct 1.340 ms, prc relay 4.010 ms, sym relay 4.220 ms.
 The prc relay throughput range (399 to 1405 Mbit/s) is wide. The host was shared, so this run does not show a regression or a gain.
 
+### Main runs of commit c3c536ba (W24-E, avg gate), 2 failed jobs
+
+REAL: GitHub runner VM (`ubuntu-latest`). [C]: the proof stack. Source: the artifact `perf-watch-c3c536ba...` of each run.
+The logs have the median and the 3 slowest pings of each path, not every ping. In each run below the third slowest
+ping is below 10 ms, so the spike count is exact.
+
+**Push run 41035129472** (2026-10-30 18:40 KST): 1 of 3 runs failed.
+
+| Run | exit | direct median | prc relay median | sym relay median | spikes (> 10 ms) | failure |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 0.090 | 0.183 | 0.189 | sym relay seq49 46.7 ms | sym relay avg 1.125 ms > direct avg 0.094 + 1 ms |
+| 2 | 0 | 0.122 | 0.192 | 0.167 | none | - |
+| 3 | 0 | 0.143 | 0.211 | 0.252 | none | - |
+
+One sym relay ping of 46.7 ms moved the sym relay avg of 50 pings from about 0.19 ms to 1.125 ms.
+The median stayed at 0.189 ms. Lost: 0/50.
+
+**Dispatch run 41037171843** (2026-10-30 18:57 KST): 3 of 3 runs failed.
+
+| Run | exit | direct median | prc relay median | sym relay median | spikes (> 10 ms) | failure |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 0.180 | 0.227 | not run | prc relay seq32 163 ms; direct (0.23 s) seq37 234 ms | prc relay avg 3.493 ms > direct avg 0.178 + 1 ms |
+| 2 | 1 | 0.159 | 0.213 | 0.255 | direct seq46 166 ms; sym relay seq42 251 ms and seq43 43.4 ms | sym relay avg 6.145 ms > direct avg 3.478 + 1 ms |
+| 3 | 1 | 0.180 | 0.233 | not run | prc relay seq26 80.1 ms; direct (0.23 s) seq9 22.7 ms | prc relay avg 1.834 ms > direct avg 0.187 + 1 ms |
+
+The spikes were on the direct path and on the relay paths. In run2 the direct spike (166 ms) moved the direct avg to 3.478 ms.
+The sym relay pings seq42 (251 ms) and seq43 (43.4 ms) have the same receive time stamp (17 us apart).
+The direct (0.23 s) pings seq37 (234 ms) and seq38 (2.05 ms) of run1 also have the same receive time stamp.
+So the replies waited and then came together. This agrees with a stall of the runner VM, not with a slow relay.
+In each run, lost was 0/50 and each median was normal (direct 0.159 - 0.180 ms, relay 0.213 - 0.255 ms).
+A failed run stops at the failed gate. So runs 1 and 3 have no sym relay numbers and no relay throughput after the failure.
+
+**With the W24-E2 gate.** On these logs, each relay median is less than the direct median + 1 ms
+(largest relay minus direct median: +0.109 ms, push run3 sym relay). No path has more than 2 pings above 10 ms. No ping was lost.
+The W24-E2 gate does not stop a run at the avg check, so a new run also measures the paths after a spike.
+
 ### The 22.1 ms outlier
 
 W23-4 branch run1 had one prc relay ping of 22.1 ms (seq 31).
@@ -95,4 +143,5 @@ The job keeps checking it on each push to main (`outlier` in `perf-watch.json`).
   and about 1200 Mbit/s on the local 8 vCPU host. Compare a runner number only with other runner numbers.
 - **Runner noise.** Each push gets a new runner VM. The CPU model and the neighbors can change.
 - **[C] only.** All overlay numbers are containers on one host. There is no number for a real network.
-- **No throughput gate.** A floor can be set after the job has a history of runner numbers.
+- **Throughput floor.** The only floor is the nat-realism floor (the transfer must finish with a result).
+  A higher floor can be set after the job has a history of runner numbers.
