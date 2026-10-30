@@ -89,6 +89,14 @@ The claim of this change is: the renewal gap is 200 ms or less on Linux.
 | 41086516186 | dd5eec0 | 20/20 | 106 ms |
 | 41094354119 | ee56381 (main #97, #98 merged) | 20/20 | 70 ms |
 | 41099476815 | e356060 (main #92, #99 merged) | 18 pass, 1 fail, 1 not run (see 4.1.1) | 295 ms |
+| 41103974113 | 0892f5c (status read on a blocking thread) | renew_test 17 pass, 3 not run (see 4.1.2) | 117 ms |
+
+#### 4.1.2 A shard stopped because of another test
+
+REAL, job 124228220291, shard 4, run 1. The renewal test passed (renewal max gap 48 ms).
+The W25-6 test `a_peer_that_enrolls_later_is_reachable_in_two_seconds` failed (5560 ms, limit 2 s),
+so the shard stopped and runs 2 to 4 did not start. The renewal test passed in all 17 runs that ran.
+That test is not part of this change. Its fix is in a separate PR.
 
 #### 4.1.1 The failed Linux run is a gap in the test loop
 
