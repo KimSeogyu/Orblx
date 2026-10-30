@@ -172,7 +172,9 @@ SSH_NETMAP_C=$WORK/netmap-c.json
 SSH_USERS=$WORK/users
 SSH_AGENTS=$WORK/agents
 SSH_PEERS=$WORK/peers
+SSH_REC_C=$WORK/c-rec
 EOF
+mkdir -p "$WORK/c-rec"
 
 open_legacy_forward
 echo "=== [C] start nodes ==="
@@ -218,6 +220,62 @@ agent_out="$(ssh_from node-a alice@b /var/lib/orblx-id/agents/helper /var/lib/or
 printf '%s\n' "$agent_out"
 [[ "$agent_out" == "alice" ]]
 expect_deny replay node-a alice@b /var/lib/orblx-id/agents/helper /var/lib/orblx-peers/b.pem
+
+echo "=== [C] recorded session on node b ==="
+rec_out="$(ssh_from node-a rec@b /var/lib/orblx-id/users/alice /var/lib/orblx-peers/b.pem)"
+printf '%s\n' "$rec_out"
+[[ "$rec_out" == "rec" ]]
+shopt -s nullglob
+rec_files=("$WORK"/b/recordings/*.cast)
+shopt -u nullglob
+echo "recording_files ${#rec_files[@]}"
+[[ "${#rec_files[@]}" -eq 1 ]]
+rec_file="${rec_files[0]}"
+echo "recording_file recordings/$(basename "$rec_file")"
+echo "---- recording ----"
+cat "$rec_file"
+echo "---- end recording ----"
+rec_sha="$(sha256sum "$rec_file" | cut -d' ' -f1)"
+echo "recording_sha256 ${rec_sha}"
+grep -q "\"kind\":\"record\".*\"recording_sha256\":\"${rec_sha}\"" "$WORK/b/ssh-audit.jsonl"
+echo "chain_has_recording_sha256 yes"
+b_audit="$(dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl)"
+printf '%s\n' "$b_audit"
+echo "$b_audit" | grep -qx 'record 1'
+
+echo "=== [C] one changed byte in the recording fails verify ==="
+cp "$rec_file" "$WORK/recording.orig"
+printf 'X' | dd of="$rec_file" bs=1 seek=1 count=1 conv=notrunc status=none
+if bad="$(dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl 2>&1)"; then
+  echo "The changed recording passed verify." >&2
+  exit 1
+fi
+printf 'verify_failed %s\n' "$bad"
+echo "$bad" | grep -q 'recording check failed'
+cp "$WORK/recording.orig" "$rec_file"
+dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl | grep -qx ok
+echo "verify_after_restore ok"
+
+echo "=== [C] read-only recording directory on node c fails closed ==="
+if dc exec -T node-c sh -c 'touch /var/lib/orblx/recordings/probe' 2>/dev/null; then
+  echo "The recording directory on node c is writable." >&2
+  exit 1
+fi
+echo "recording_dir_read_only yes"
+expect_deny recording node-a rec@c /var/lib/orblx-id/users/alice /var/lib/orblx-peers/c.pem
+c_rec_deny="$(grep -c '"kind":"deny".*"reason":"recording"' "$WORK/c/ssh-audit.jsonl" || true)"
+echo "deny_recording ${c_rec_deny}"
+[[ "$c_rec_deny" -ge 1 ]]
+
+echo "=== [C] rule without recording on node b works as before ==="
+alice_out="$(ssh_from node-a alice@b /var/lib/orblx-id/users/alice /var/lib/orblx-peers/b.pem)"
+printf '%s\n' "$alice_out"
+[[ "$alice_out" == "alice" ]]
+shopt -s nullglob
+rec_files=("$WORK"/b/recordings/*.cast)
+shopt -u nullglob
+echo "recording_files ${#rec_files[@]}"
+[[ "${#rec_files[@]}" -eq 1 ]]
 
 echo "=== [C] revoke alice ==="
 stamp="$(date +%s)"

@@ -73,6 +73,8 @@ services:
       net.ipv4.conf.default.rp_filter: "0"
     volumes:
       - ${SSH_STATE_C}:/var/lib/orblx
+      # A read-only recording directory. A rule that needs a recording fails closed.
+      - ${SSH_REC_C}:/var/lib/orblx/recordings:ro
       - ${SSH_NETMAP_C}:/etc/orblx/netmap.json:ro
       - ${SSH_USERS}:/var/lib/orblx-id/users:ro
       - ${SSH_AGENTS}:/var/lib/orblx-id/agents:ro

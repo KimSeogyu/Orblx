@@ -6,6 +6,7 @@
 //! An agent source needs one host, one protocol, and one port.
 //! A human source may use a group, a tag, and a port range.
 //! `ssh` names a source, a destination, the login users, and a check period.
+//! An `ssh` rule can set `"recording": "required"`. Then the node records the session.
 //! An agent SSH source needs one destination and one user.
 //! `tests` lists allow and deny assertions.
 //! `sshTests` lists SSH allow and deny assertions.
@@ -242,6 +243,7 @@ struct SshGrant {
     dst: SpiffeId,
     user: String,
     check_period: u64,
+    recording: bool,
 }
 
 #[derive(Clone)]
@@ -447,6 +449,16 @@ impl Policy {
             .min()
     }
 
+    /// Return true when a matching SSH rule needs a session recording.
+    ///
+    /// One matching rule with `"recording": "required"` is sufficient.
+    #[must_use]
+    pub fn ssh_recording_required(&self, src: &SpiffeId, dst: &SpiffeId, user: &str) -> bool {
+        self.ssh.iter().any(|grant| {
+            grant.src == *src && grant.dst == *dst && grant.user == user && grant.recording
+        })
+    }
+
     /// Return the inline SSH assertions.
     ///
     /// The assertions passed when [`Policy::from_hujson`] returned this value.
@@ -564,6 +576,8 @@ struct SshRuleFile {
     users: Vec<String>,
     #[serde(rename = "checkPeriod")]
     check_period: String,
+    #[serde(default)]
+    recording: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -745,6 +759,7 @@ fn compile_ssh(catalog: &Catalog, rules: &[SshRuleFile]) -> Result<Vec<SshGrant>
             ));
         }
         let period = parse_check_period(&rule.check_period)?;
+        let recording = parse_recording(rule.recording.as_deref())?;
         let mut users = Vec::new();
         for user in &rule.users {
             let name = parse_ssh_user(user)?;
@@ -781,6 +796,7 @@ fn compile_ssh(catalog: &Catalog, rules: &[SshRuleFile]) -> Result<Vec<SshGrant>
                                 dst: dst.clone(),
                                 user: user.clone(),
                                 check_period: period,
+                                recording,
                             });
                         }
                     }
@@ -794,12 +810,14 @@ fn compile_ssh(catalog: &Catalog, rules: &[SshRuleFile]) -> Result<Vec<SshGrant>
             left.dst.as_uri(),
             left.user.as_str(),
             left.check_period,
+            left.recording,
         )
             .cmp(&(
                 right.src.as_uri(),
                 right.dst.as_uri(),
                 right.user.as_str(),
                 right.check_period,
+                right.recording,
             ))
     });
     grants.dedup();
@@ -853,6 +871,16 @@ fn parse_ssh_user(text: &str) -> Result<String, PolicyError> {
         )));
     }
     Ok(text.to_string())
+}
+
+fn parse_recording(text: Option<&str>) -> Result<bool, PolicyError> {
+    match text {
+        None | Some("off") => Ok(false),
+        Some("required") => Ok(true),
+        Some(_) => Err(PolicyError::new(
+            "The SSH recording value is required or off.",
+        )),
+    }
 }
 
 fn parse_check_period(text: &str) -> Result<u64, PolicyError> {
@@ -1702,5 +1730,35 @@ mod tests {
         }"#;
         let err = Policy::from_hujson(text.as_bytes()).unwrap_err();
         assert!(err.to_string().contains("check period"));
+    }
+
+    #[test]
+    fn an_ssh_rule_can_require_a_recording() {
+        let text = r#"{
+          "ssh": [
+            {
+              "src": ["spiffe://orblx.local/user/alice"],
+              "dst": ["spiffe://orblx.local/node/box"],
+              "users": ["alice"],
+              "checkPeriod": "30s"
+            },
+            {
+              "src": ["spiffe://orblx.local/user/alice"],
+              "dst": ["spiffe://orblx.local/node/box"],
+              "users": ["rec"],
+              "checkPeriod": "30s",
+              "recording": "required"
+            }
+          ]
+        }"#;
+        let policy = Policy::from_hujson(text.as_bytes()).unwrap();
+        let alice = super::SpiffeId::user("alice").unwrap();
+        let box_id = super::SpiffeId::node("box").unwrap();
+        assert!(policy.ssh_recording_required(&alice, &box_id, "rec"));
+        assert!(!policy.ssh_recording_required(&alice, &box_id, "alice"));
+        assert_eq!(policy.ssh_check_period(&alice, &box_id, "alice"), Some(30));
+        let bad = text.replace("\"required\"", "\"maybe\"");
+        let err = Policy::from_hujson(bad.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("recording"));
     }
 }

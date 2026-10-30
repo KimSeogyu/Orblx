@@ -8,10 +8,13 @@
 //! An agent presents one `FLAG_AGENT_JIT` and `FLAG_ONE_SHOT` ticket.
 //! The ticket names one host.
 //! The SSH policy names one user for that agent.
+//! A rule with `"recording": "required"` records the session to a file.
+//! The audit chain then holds the SHA-256 of that file.
 
 mod auth;
 mod client;
 mod hostkey;
+mod record;
 mod server;
 
 pub use auth::{overlay_listen_addr, SSH_PORT};

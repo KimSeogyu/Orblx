@@ -27,6 +27,10 @@ pub enum AuditError {
     BadText,
     /// The export encoder failed.
     Export,
+    /// The recording path is not a plain relative path.
+    BadRecordingPath { index: u64 },
+    /// The recording file does not match the SHA-256 in the chain.
+    BadRecording { index: u64 },
 }
 
 impl fmt::Display for AuditError {
@@ -45,11 +49,22 @@ impl fmt::Display for AuditError {
             }
             Self::BadSession => formatter.write_str("The Relay session id is not valid."),
             Self::BadPeer => formatter.write_str("The peer SPIFFE ID is not valid."),
-            Self::BadKind => formatter.write_str("The event kind is not start, end, or deny."),
+            Self::BadKind => {
+                formatter.write_str("The event kind is not start, end, deny, or record.")
+            }
             Self::BadTicketHash => formatter.write_str("The ticket hash is not valid."),
             Self::BadReason => formatter.write_str("The deny reason is not valid."),
             Self::BadText => formatter.write_str("The record text is not valid."),
             Self::Export => formatter.write_str("The chain export failed."),
+            Self::BadRecordingPath { index } => {
+                write!(
+                    formatter,
+                    "The recording path at index {index} is not valid."
+                )
+            }
+            Self::BadRecording { index } => {
+                write!(formatter, "The recording check failed at index {index}.")
+            }
         }
     }
 }

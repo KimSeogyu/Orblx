@@ -8,6 +8,22 @@
       "checkPeriod": "30s",
     },
     {
+      // The user rec on node b needs a session recording.
+      "src": ["spiffe://orblx.local/user/alice"],
+      "dst": ["spiffe://orblx.local/node/b"],
+      "users": ["rec"],
+      "checkPeriod": "30s",
+      "recording": "required",
+    },
+    {
+      // Node c has a read-only recording directory. This rule fails closed there.
+      "src": ["spiffe://orblx.local/user/alice"],
+      "dst": ["spiffe://orblx.local/node/c"],
+      "users": ["rec"],
+      "checkPeriod": "30s",
+      "recording": "required",
+    },
+    {
       "src": ["spiffe://orblx.local/agent/helper"],
       "dst": ["spiffe://orblx.local/node/b"],
       "users": ["alice"],
