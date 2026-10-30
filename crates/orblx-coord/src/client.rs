@@ -61,7 +61,10 @@ pub struct OidcEnroll<'a> {
     pub bundle_pem: &'a str,
     pub name: &'a str,
     pub id_token: &'a str,
-    pub nonce: &'a str,
+    /// The nonce from the sign-in request.
+    ///
+    /// A generic issuer accepts `None` when the token has no `nonce` claim.
+    pub nonce: Option<&'a str>,
     pub endpoints: &'a [String],
     pub routes: &'a [String],
 }
@@ -75,7 +78,7 @@ pub async fn enroll_with_oidc(input: OidcEnroll<'_>) -> Result<EnrollResult, Coo
         name: input.name.to_string(),
         token: None,
         id_token: Some(input.id_token.to_string()),
-        nonce: Some(input.nonce.to_string()),
+        nonce: input.nonce.map(str::to_string),
         endpoints: input.endpoints.to_vec(),
         routes: input.routes.to_vec(),
         exit_node: false,

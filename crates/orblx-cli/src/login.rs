@@ -143,7 +143,7 @@ fn login(
         bundle_pem: &bundle_pem,
         name,
         id_token: &id_token,
-        nonce: &nonce,
+        nonce: Some(&nonce),
         endpoints,
         routes,
     })

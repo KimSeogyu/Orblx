@@ -1,15 +1,15 @@
 use std::net::SocketAddr;
 use std::time::SystemTime;
 
-use orblx_identity::{GoogleJwks, TrustBundle, WorkloadKind};
+use orblx_identity::{GoogleJwks, OidcJwks, TrustBundle, WorkloadKind};
 use rustls::pki_types::CertificateDer;
 
 use crate::admin;
 use crate::error::CoordError;
-use crate::http_util::fetch_google_jwks;
+use crate::http_util::{fetch_google_jwks, https_get};
 use crate::netmap::encode_hex;
 use crate::proto::{self, Request, Response};
-use crate::state::Coordinator;
+use crate::state::{Coordinator, IssuerFetch};
 use crate::ticket::ticket_response_fields;
 use crate::tlsutil;
 
@@ -63,6 +63,36 @@ async fn warm_jwks(coord: &Coordinator) {
             Err(_) => println!("Google JWKS is not loaded. Token enrollment is ready."),
         },
         Err(_) => println!("Google JWKS is not loaded. Token enrollment is ready."),
+    }
+}
+
+async fn refresh_issuer_jwks(coord: &Coordinator, plan: IssuerFetch) {
+    let roots = plan.extra_roots_pem.as_deref();
+    let result = async {
+        let discovery = https_get(&plan.issuer.discovery_url(), roots)
+            .await
+            .map_err(|step| ("discovery", step))?;
+        let jwks_uri = plan
+            .issuer
+            .jwks_uri_from_discovery(&discovery)
+            .map_err(|_| ("discovery", "document"))?;
+        let text = https_get(&jwks_uri, roots)
+            .await
+            .map_err(|step| ("jwks", step))?;
+        OidcJwks::from_json(&text).map_err(|_| ("jwks", "document"))
+    }
+    .await;
+    match result {
+        Ok(jwks) => {
+            let kids = jwks.kids().join(" ");
+            match coord.install_issuer_jwks(jwks, SystemTime::now()) {
+                Ok(()) => println!("oidc jwks loaded {} kids {kids}", plan.reason),
+                Err(_) => println!("oidc jwks not loaded {}", plan.reason),
+            }
+        }
+        Err((stage, step)) => {
+            println!("oidc jwks fetch failed {} {stage} {step}", plan.reason)
+        }
     }
 }
 
@@ -133,6 +163,10 @@ async fn dispatch(
                 (None, Some(id_token)) => {
                     if coord.google_client_id_for_fetch()?.is_some() {
                         warm_jwks(coord).await;
+                    }
+                    let kid = orblx_identity::token_kid(id_token);
+                    if let Some(plan) = coord.issuer_fetch_plan(kid.as_deref(), now)? {
+                        refresh_issuer_jwks(coord, plan).await;
                     }
                     coord.enroll_oidc(
                         &request.name,
