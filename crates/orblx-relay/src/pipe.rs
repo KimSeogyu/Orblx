@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crate::error::io_error;
 use crate::{
     decode_datagram, encode_datagram, encode_tcp_record, take_tcp_record, RelayError, RelayKind,
-    RelaySessionId, RelayTransport,
+    RelaySessionId, RelayTransport, MAX_PAYLOAD_LEN, RELAY_HEADER_LEN, RELAY_VERSION,
 };
 
 /// A peer attachment to the Relay.
@@ -209,6 +209,74 @@ impl RelaySender {
             SenderInner::Tcp(stream) => send_data_tcp(stream, self.session_id, payload),
         }
     }
+
+    /// Send many opaque payloads in order.
+    ///
+    /// UDP uses one sendmmsg(2) call for up to [`crate::UDP_BATCH`] payloads on Linux.
+    /// The function returns the number of payloads sent and the first error.
+    pub fn send_many(&mut self, payloads: &[Vec<u8>]) -> (usize, Result<(), RelayError>) {
+        if let Some(index) = payloads
+            .iter()
+            .position(|payload| payload.len() > MAX_PAYLOAD_LEN)
+        {
+            let (sent, result) = self.send_many(&payloads[..index]);
+            if result.is_err() {
+                return (sent, result);
+            }
+            return (sent, Err(RelayError::TooBig));
+        }
+        match &mut self.inner {
+            SenderInner::Udp(socket) => {
+                let header = data_header(self.session_id);
+                let frames: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+                send_many_udp(socket, &header, &frames)
+            }
+            SenderInner::Tcp(stream) => {
+                for (index, payload) in payloads.iter().enumerate() {
+                    if let Err(err) = send_data_tcp(stream, self.session_id, payload) {
+                        return (index, Err(err));
+                    }
+                }
+                (payloads.len(), Ok(()))
+            }
+        }
+    }
+}
+
+fn data_header(session_id: RelaySessionId) -> [u8; RELAY_HEADER_LEN] {
+    let mut header = [0u8; RELAY_HEADER_LEN];
+    header[0] = RELAY_VERSION;
+    header[1] = RelayKind::Data.as_u8();
+    header[2..].copy_from_slice(session_id.as_bytes());
+    header
+}
+
+fn send_many_udp(
+    socket: &UdpSocket,
+    header: &[u8],
+    frames: &[&[u8]],
+) -> (usize, Result<(), RelayError>) {
+    let started = Instant::now();
+    let mut sent = 0;
+    while sent < frames.len() {
+        match crate::send_batch(socket, header, &frames[sent..], crate::BatchPeer::Connected) {
+            Ok(count) if count > 0 => sent += count,
+            Ok(_) => {
+                return (
+                    sent,
+                    Err(RelayError::Io("The UDP send was short.".to_string())),
+                )
+            }
+            Err(err) if is_timeout(&err) => {
+                if started.elapsed() > Duration::from_millis(200) {
+                    return (sent, Err(RelayError::Timeout));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(err) => return (sent, Err(io_error(err))),
+        }
+    }
+    (sent, Ok(()))
 }
 
 fn send_data_udp(

@@ -80,7 +80,7 @@ pub enum RelayKind {
 }
 
 impl RelayKind {
-    fn as_u8(self) -> u8 {
+    pub(crate) fn as_u8(self) -> u8 {
         match self {
             Self::Attach => KIND_ATTACH,
             Self::Data => KIND_DATA,
@@ -152,6 +152,26 @@ pub fn decode_datagram(buf: &[u8]) -> Result<RelayDatagram, RelayError> {
         session_id: RelaySessionId::from_bytes(raw),
         payload: buf[RELAY_HEADER_LEN..].to_vec(),
     })
+}
+
+/// Split one datagram without a copy.
+///
+/// The checks are the same as in [`decode_datagram`]. The payload is a slice of `buf`.
+pub(crate) fn split_datagram(buf: &[u8]) -> Result<(RelayKind, RelaySessionId, &[u8]), RelayError> {
+    if buf.len() < RELAY_HEADER_LEN || buf.len() > MAX_DATAGRAM_LEN {
+        return Err(RelayError::BadDatagram);
+    }
+    if buf[0] != RELAY_VERSION {
+        return Err(RelayError::BadDatagram);
+    }
+    let kind = RelayKind::from_u8(buf[1])?;
+    let mut raw = [0u8; 16];
+    raw.copy_from_slice(&buf[2..RELAY_HEADER_LEN]);
+    Ok((
+        kind,
+        RelaySessionId::from_bytes(raw),
+        &buf[RELAY_HEADER_LEN..],
+    ))
 }
 
 /// Encode one TCP record.
