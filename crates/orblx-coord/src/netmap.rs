@@ -306,6 +306,7 @@ mod tests {
             }],
             reach: vec!["spiffe://orblx.local/node/mac".to_string()],
             filter: true,
+            subnets: Vec::new(),
         };
         let signed = key.sign_grants(&grants).unwrap();
         super::verify_signed_grants(&signed, &key.public()).unwrap();

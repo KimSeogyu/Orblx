@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use orblx_audit::verify_config_file;
-use orblx_identity::{ReceiverGrant, ReceiverGrants};
+use orblx_identity::{ReceiverGrant, ReceiverGrants, SubnetGrant};
 
 use super::{PacketFilter, PACKET_AUDIT_FILE};
 
@@ -26,6 +26,7 @@ fn grants(filter: bool, rows: &[(&str, u8, u16, u16)]) -> ReceiverGrants {
             .collect(),
         reach: Vec::new(),
         filter,
+        subnets: Vec::new(),
     }
 }
 
@@ -195,4 +196,35 @@ fn deny_audit_is_sampled_and_rate_limited() {
     assert_eq!(first.target, "tcp/23");
     assert_eq!(first.actor, ALICE);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn subnet_route_needs_a_subnet_grant() {
+    let lan_dns = Ipv4Addr::new(10, 88, 24, 53);
+    let lan_db = Ipv4Addr::new(10, 88, 24, 20);
+    let other = Ipv4Addr::new(192, 168, 1, 1);
+    let mut rules = grants(true, &[]);
+    rules.subnets = vec![SubnetGrant {
+        src: ALICE.to_string(),
+        dst: "10.88.24.53/32".to_string(),
+        proto: 17,
+        port_start: 53,
+        port_end: 53,
+    }];
+    let filter = PacketFilter::new(ME, &rules, None);
+    // Before the node sets its routes, transit keeps the old behavior.
+    assert!(filter.allow_inbound(BOB, &l4(17, PEER, 40000, lan_dns, 53)));
+    filter.set_routes(&["10.88.24.0/24".to_string(), "0.0.0.0/0".to_string()]);
+    assert!(filter.allow_inbound(ALICE, &l4(17, PEER, 40000, lan_dns, 53)));
+    assert!(!filter.allow_inbound(BOB, &l4(17, PEER, 40000, lan_dns, 53)));
+    assert!(!filter.allow_inbound(ALICE, &l4(6, PEER, 40000, lan_dns, 53)));
+    assert!(!filter.allow_inbound(ALICE, &l4(17, PEER, 40000, lan_dns, 54)));
+    assert!(!filter.allow_inbound(ALICE, &l4(6, PEER, 40000, lan_db, 80)));
+    // An address outside the subnet routes (exit traffic) keeps the old behavior.
+    assert!(filter.allow_inbound(BOB, &l4(6, PEER, 40000, other, 80)));
+    assert_eq!(filter.stats().denied, 4);
+    // Without an ACL the subnet route keeps the old behavior.
+    let open = PacketFilter::new(ME, &grants(false, &[]), None);
+    open.set_routes(&["10.88.24.0/24".to_string()]);
+    assert!(open.allow_inbound(BOB, &l4(17, PEER, 40000, lan_dns, 53)));
 }

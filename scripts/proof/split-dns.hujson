@@ -21,6 +21,20 @@
       "proto": "tcp",
       "dst": ["tag:router:80"],
     },
+    // W24-A: the router has these grants, so its subnet route needs a rule.
+    // Gate 5 removes the UDP 53 rule and shows the drop.
+    {
+      "action": "accept",
+      "src": ["group:humans"],
+      "proto": "udp",
+      "dst": ["10.88.24.53/32:53"],
+    },
+    {
+      "action": "accept",
+      "src": ["group:humans"],
+      "proto": "tcp",
+      "dst": ["10.88.24.20/32:80"],
+    },
   ],
   "autoApprovers": {
     "routes": {

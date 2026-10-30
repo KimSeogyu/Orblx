@@ -402,6 +402,10 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
         .parse()
         .map_err(|_| "The overlay address is not valid.".to_string())?;
     let (visibility, filter) = load_grants(&options.state_dir, &netmap.self_node.name, overlay)?;
+    if let Some(filter) = &filter {
+        // W24-A: a packet to a subnet route that this node forwards needs a subnet grant.
+        filter.set_routes(&forward_routes);
+    }
     let ssh_state = options.state_dir.clone();
     let serve_netmap = netmap_path.clone();
     spawn_deny_refresh(&options);
@@ -1643,6 +1647,7 @@ mod tests {
             grants: Vec::new(),
             reach,
             filter: false,
+            subnets: Vec::new(),
         };
         let signed = key.sign_grants(&grants).unwrap();
         let text = serde_json::to_string(&signed).unwrap();

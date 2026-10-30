@@ -112,6 +112,36 @@ pub struct ReceiverGrant {
     pub port_end: u16,
 }
 
+/// One grant row for a subnet route of the receiving node (W24-A).
+///
+/// The receiving node forwards the packet to the subnet only when one row matches.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubnetGrant {
+    /// Source SPIFFE ID.
+    pub src: String,
+    /// Destination IPv4 prefix in CIDR form, for example `10.88.24.53/32`.
+    pub dst: String,
+    /// IP protocol number. ICMP is 1. TCP is 6. UDP is 17.
+    pub proto: u8,
+    /// First destination port. The value is inclusive.
+    pub port_start: u16,
+    /// Last destination port. The value is inclusive.
+    pub port_end: u16,
+}
+
+impl SubnetGrant {
+    /// Return the destination prefix and its length.
+    pub fn prefix(&self) -> Result<(Ipv4Addr, u8), PolicyError> {
+        match parse_route_cidr(&self.dst) {
+            Ok((prefix, len)) if len > 0 => Ok((prefix, len)),
+            _ => Err(PolicyError::new(
+                "The subnet grant destination is not a valid CIDR.",
+            )),
+        }
+    }
+}
+
 /// The allow set for one receiving node.
 ///
 /// The coordinator signs this document with the netmap key.
@@ -139,6 +169,12 @@ pub struct ReceiverGrants {
     /// False keeps the old datapath, which does not check the packet port.
     #[serde(default, skip_serializing_if = "is_false")]
     pub filter: bool,
+    /// Allow rows for the subnet routes of this receiver (W24-A).
+    ///
+    /// When `filter` is true, the receiver drops each packet to one of its subnet routes
+    /// that no row allows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subnets: Vec<SubnetGrant>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -158,6 +194,19 @@ impl ReceiverGrants {
         for grant in &self.grants {
             let _ = SpiffeId::parse(&grant.src)
                 .map_err(|_| PolicyError::new("The grant source SPIFFE ID is not valid."))?;
+            if grant.proto != PROTO_TCP && grant.proto != PROTO_UDP && grant.proto != PROTO_ICMP {
+                return Err(PolicyError::new(
+                    "The grant protocol is not TCP, UDP, or ICMP.",
+                ));
+            }
+            if grant.port_start == 0 || grant.port_start > grant.port_end {
+                return Err(PolicyError::new("The grant port range is not valid."));
+            }
+        }
+        for grant in &self.subnets {
+            let _ = SpiffeId::parse(&grant.src)
+                .map_err(|_| PolicyError::new("The grant source SPIFFE ID is not valid."))?;
+            let _ = grant.prefix()?;
             if grant.proto != PROTO_TCP && grant.proto != PROTO_UDP && grant.proto != PROTO_ICMP {
                 return Err(PolicyError::new(
                     "The grant protocol is not TCP, UDP, or ICMP.",
@@ -205,6 +254,17 @@ impl ReceiverGrants {
 struct CompiledGrant {
     src: SpiffeId,
     dst: SpiffeId,
+    proto: u8,
+    port_start: u16,
+    port_end: u16,
+}
+
+/// One ACL row to an IPv4 prefix behind a subnet router (W24-A).
+#[derive(Clone, PartialEq, Eq)]
+struct CompiledSubnetGrant {
+    src: SpiffeId,
+    prefix: Ipv4Addr,
+    prefix_len: u8,
     proto: u8,
     port_start: u16,
     port_end: u16,
@@ -259,6 +319,7 @@ impl SshAssertion {
 #[derive(Clone)]
 pub struct Policy {
     grants: Vec<CompiledGrant>,
+    subnet_grants: Vec<CompiledSubnetGrant>,
     tests: Vec<StoredTest>,
     routes: Vec<RouteRule>,
     exit_nodes: Vec<SpiffeId>,
@@ -318,6 +379,7 @@ impl Policy {
     pub fn empty() -> Self {
         Self {
             grants: Vec::new(),
+            subnet_grants: Vec::new(),
             tests: Vec::new(),
             routes: Vec::new(),
             exit_nodes: Vec::new(),
@@ -457,7 +519,26 @@ impl Policy {
             grants,
             reach: reach.into_iter().collect(),
             filter: self.acl_set,
+            subnets: self.receiver_subnets(receiver),
         }
+    }
+
+    /// Return the subnet rows whose destination is inside a route that the policy approves
+    /// for `receiver` (W24-A).
+    fn receiver_subnets(&self, receiver: &SpiffeId) -> Vec<SubnetGrant> {
+        self.subnet_grants
+            .iter()
+            .filter_map(|grant| {
+                let dst = format!("{}/{}", grant.prefix, grant.prefix_len);
+                self.approves_route(receiver, &dst).then(|| SubnetGrant {
+                    src: grant.src.as_uri().to_string(),
+                    dst,
+                    proto: grant.proto,
+                    port_start: grant.port_start,
+                    port_end: grant.port_end,
+                })
+            })
+            .collect()
     }
 
     /// Return true when the policy approves `cidr` for `node`.
@@ -722,6 +803,7 @@ struct Catalog {
 fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
     let catalog = catalog(file)?;
     let mut grants = Vec::new();
+    let mut subnet_grants = Vec::new();
     for rule in file.acls.as_deref().unwrap_or(&[]) {
         if rule.action != "accept" {
             return Err(PolicyError::new(
@@ -741,11 +823,39 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
             let sources = expand(&catalog, src_text)?;
             for dst_text in &rule.dst {
                 let (selector, port_text) = split_target(dst_text)?;
-                let dests = expand(&catalog, selector)?;
                 let ranges = parse_port_spec(port_text)?;
                 if protos.contains(&PROTO_ICMP) && port_text != "*" {
                     return Err(PolicyError::new("An ICMP destination uses the port *."));
                 }
+                if let Some((prefix, prefix_len)) = subnet_destination(selector)? {
+                    for src in &sources {
+                        if src.kind() == WorkloadKind::Agent {
+                            return Err(PolicyError::new(format!(
+                                "The agent {} cannot use a subnet destination.",
+                                src.as_uri()
+                            )));
+                        }
+                        for proto in &protos {
+                            for (start, end) in &ranges {
+                                if grants.len() + subnet_grants.len() >= MAX_GRANTS {
+                                    return Err(PolicyError::new(
+                                        "The policy has too many grants.",
+                                    ));
+                                }
+                                subnet_grants.push(CompiledSubnetGrant {
+                                    src: src.clone(),
+                                    prefix,
+                                    prefix_len,
+                                    proto: *proto,
+                                    port_start: *start,
+                                    port_end: *end,
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let dests = expand(&catalog, selector)?;
                 for src in &sources {
                     for dst in &dests {
                         for proto in &protos {
@@ -814,6 +924,7 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
     let split_dns = compile_split_dns(&file.split_dns)?;
     Ok(Policy {
         grants,
+        subnet_grants,
         tests,
         routes,
         exit_nodes,
@@ -1176,6 +1287,30 @@ fn route_matches(rule: &RouteRule, prefix: Ipv4Addr, prefix_len: u8) -> bool {
     }
     let mask = ipv4_mask(rule.prefix_len);
     u32::from(prefix) & mask == u32::from(rule.prefix)
+}
+
+/// Return the prefix when an ACL destination is an IPv4 address or an IPv4 CIDR (W24-A).
+///
+/// A plain address is a /32. `0.0.0.0/0` is an exit route and is rejected.
+fn subnet_destination(selector: &str) -> Result<Option<(Ipv4Addr, u8)>, PolicyError> {
+    let first = selector.as_bytes().first().copied().unwrap_or(b'x');
+    if !first.is_ascii_digit() {
+        return Ok(None);
+    }
+    let parsed = if selector.contains('/') {
+        parse_route_cidr(selector).ok()
+    } else {
+        selector.parse::<Ipv4Addr>().ok().map(|ip| (ip, 32))
+    };
+    match parsed {
+        Some((_, 0)) => Err(PolicyError::new(
+            "The ACL destination 0.0.0.0/0 is an exit route. Use a subnet prefix.",
+        )),
+        Some(prefix) => Ok(Some(prefix)),
+        None => Err(PolicyError::new(format!(
+            "The ACL destination {selector} is not a valid IPv4 address or CIDR."
+        ))),
+    }
 }
 
 fn parse_route_cidr(text: &str) -> Result<(Ipv4Addr, u8), ()> {
@@ -2041,5 +2176,42 @@ mod tests {
         let empty = Policy::from_hujson(br#"{"acls": []}"#).unwrap();
         assert!(empty.acl_set());
         assert!(empty.receiver_grants(&receiver).filter);
+    }
+
+    #[test]
+    fn a_subnet_destination_goes_to_the_approved_router_only() {
+        let text = r#"{
+          "tags": {"tag:router": ["spiffe://orblx.local/node/router"]},
+          "tagOwners": {"tag:router": ["spiffe://orblx.local/node/mac"]},
+          "autoApprovers": {"routes": {"10.88.24.0/24": ["tag:router"]}},
+          "acls": [
+            {"action": "accept", "src": ["spiffe://orblx.local/node/mac"], "proto": "udp", "dst": ["10.88.24.53/32:53"]},
+            {"action": "accept", "src": ["spiffe://orblx.local/node/mac"], "proto": "tcp", "dst": ["10.88.24.20:80", "10.99.0.0/16:443"]}
+          ]
+        }"#;
+        let policy = Policy::from_hujson(text.as_bytes()).unwrap();
+        let router = super::SpiffeId::parse("spiffe://orblx.local/node/router").unwrap();
+        let grants = policy.receiver_grants(&router);
+        assert!(grants.filter);
+        assert!(grants.grants.is_empty());
+        let rows: Vec<(String, u8, u16)> = grants
+            .subnets
+            .iter()
+            .map(|row| (row.dst.clone(), row.proto, row.port_start))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("10.88.24.53/32".to_string(), super::PROTO_UDP, 53),
+                ("10.88.24.20/32".to_string(), PROTO_TCP, 80),
+            ]
+        );
+        grants.check().unwrap();
+        let other = super::SpiffeId::parse(BOX).unwrap();
+        assert!(policy.receiver_grants(&other).subnets.is_empty());
+        let exit = text.replace("10.99.0.0/16:443", "0.0.0.0/0:443");
+        assert!(Policy::from_hujson(exit.as_bytes()).is_err());
+        let bad = text.replace("10.99.0.0/16:443", "10.99.0.1/16:443");
+        assert!(Policy::from_hujson(bad.as_bytes()).is_err());
     }
 }

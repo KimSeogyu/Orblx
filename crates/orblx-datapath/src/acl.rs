@@ -140,6 +140,7 @@ mod tests {
             }],
             reach: Vec::new(),
             filter: false,
+            subnets: Vec::new(),
         }
     }
 

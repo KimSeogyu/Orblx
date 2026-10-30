@@ -101,7 +101,12 @@ struct FlowKey {
 struct Rules {
     /// Source SPIFFE ID to (protocol, first port, last port).
     by_src: HashMap<String, Vec<(u8, u16, u16)>>,
+    /// Source SPIFFE ID to (network, mask, protocol, first port, last port) for subnet routes.
+    subnets: HashMap<String, Vec<SubnetRow>>,
 }
+
+/// One subnet allow row: (network, mask, protocol, first port, last port).
+type SubnetRow = (u32, u32, u8, u16, u16);
 
 impl Rules {
     fn from_grants(grants: &ReceiverGrants) -> Self {
@@ -113,7 +118,32 @@ impl Rules {
                 grant.port_end,
             ));
         }
-        Self { by_src }
+        let mut subnets: HashMap<String, Vec<SubnetRow>> = HashMap::new();
+        for grant in &grants.subnets {
+            let Ok((prefix, len)) = grant.prefix() else {
+                continue;
+            };
+            let mask = prefix_mask(len);
+            subnets.entry(grant.src.clone()).or_default().push((
+                u32::from(prefix) & mask,
+                mask,
+                grant.proto,
+                grant.port_start,
+                grant.port_end,
+            ));
+        }
+        Self { by_src, subnets }
+    }
+
+    fn permits_subnet(&self, src: &str, proto: u8, dst: Ipv4Addr, port: u16) -> bool {
+        let dst = u32::from(dst);
+        self.subnets.get(src).is_some_and(|rows| {
+            rows.iter().any(|(net, mask, row_proto, start, end)| {
+                dst & mask == *net
+                    && *row_proto == proto
+                    && (proto == PROTO_ICMP || (port >= *start && port <= *end))
+            })
+        })
     }
 
     fn permits(&self, src: &str, proto: u8, port: u16) -> bool {
@@ -123,6 +153,26 @@ impl Rules {
             })
         })
     }
+}
+
+fn prefix_mask(len: u8) -> u32 {
+    if len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(len.min(32)))
+    }
+}
+
+/// Parse `a.b.c.d/n` into (network, mask). Return `None` for an exit route (`/0`).
+fn parse_route(text: &str) -> Option<(u32, u32)> {
+    let (addr, len) = text.split_once('/')?;
+    let addr: Ipv4Addr = addr.parse().ok()?;
+    let len: u8 = len.parse().ok()?;
+    if len == 0 || len > 32 {
+        return None;
+    }
+    let mask = prefix_mask(len);
+    Some((u32::from(addr) & mask, mask))
 }
 
 struct FlowTable {
@@ -275,6 +325,8 @@ pub struct PacketFilter {
     overlay: Ipv4Addr,
     active: AtomicBool,
     rules: RwLock<Rules>,
+    /// Subnet routes that this node forwards, as (network, mask).
+    routes: RwLock<Vec<(u32, u32)>>,
     flows: Mutex<FlowTable>,
     sample: Mutex<SampleGate>,
     audit: Option<SyncSender<ConfigEvent>>,
@@ -311,6 +363,7 @@ impl PacketFilter {
             overlay,
             active: AtomicBool::new(grants.filter),
             rules: RwLock::new(Rules::from_grants(grants)),
+            routes: RwLock::new(Vec::new()),
             flows: Mutex::new(FlowTable {
                 map: HashMap::new(),
                 last_sweep: now,
@@ -332,6 +385,27 @@ impl PacketFilter {
     pub fn replace(&self, grants: &ReceiverGrants) {
         *self.rules.write().unwrap_or_else(|err| err.into_inner()) = Rules::from_grants(grants);
         self.active.store(grants.filter, Ordering::Relaxed);
+    }
+
+    /// Set the subnet routes that this node forwards (W24-A).
+    ///
+    /// When the filter is on, a packet to one of these routes needs a subnet grant.
+    /// An exit route (`0.0.0.0/0`) is not a subnet route. Exit traffic keeps the old behavior.
+    pub fn set_routes(&self, routes: &[String]) {
+        let parsed = routes
+            .iter()
+            .filter_map(|route| parse_route(route))
+            .collect();
+        *self.routes.write().unwrap_or_else(|err| err.into_inner()) = parsed;
+    }
+
+    fn covers(&self, dst: Ipv4Addr) -> bool {
+        let dst = u32::from(dst);
+        self.routes
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .iter()
+            .any(|(net, mask)| dst & mask == *net)
     }
 
     /// Return true when the filter drops packets.
@@ -403,7 +477,11 @@ impl PacketFilter {
             return false;
         };
         if parsed.dst != self.overlay {
-            return true;
+            if !self.covers(parsed.dst) || self.subnet_allowed(src, &parsed) {
+                return true;
+            }
+            self.deny(src, Some(&parsed), parsed.proto, parsed.dst_port);
+            return false;
         }
         if self.allowed(src, &parsed) {
             return true;
@@ -462,6 +540,21 @@ impl PacketFilter {
             }
             _ => false,
         }
+    }
+
+    fn subnet_allowed(&self, src: &str, parsed: &Parsed) -> bool {
+        if parsed.tail {
+            return false;
+        }
+        let port = match parsed.proto {
+            PROTO_TCP | PROTO_UDP => parsed.dst_port,
+            PROTO_ICMP => 0,
+            _ => return false,
+        };
+        self.rules
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .permits_subnet(src, parsed.proto, parsed.dst, port)
     }
 
     fn flow_open(&self, key: &FlowKey, now: Instant) -> bool {
