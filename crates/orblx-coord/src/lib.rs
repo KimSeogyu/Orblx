@@ -530,6 +530,17 @@ mod tests {
             revoked = wait(Some(etag)).await.unwrap().0;
         }
         assert!(revoked_at.elapsed() < Duration::from_secs(1));
+        // W25-16: with no change, the hold ends with a reply without the view. The waiter
+        // gives the view that it has, on the same connection.
+        let revoked = revoked.unwrap();
+        let idle_at = std::time::Instant::now();
+        let (idle, idle_id) = wait(Some(revoked.etag.clone())).await.unwrap();
+        let idle = idle.unwrap();
+        assert!(idle_at.elapsed() >= super::DENY_WAIT_HOLD - Duration::from_secs(1));
+        assert_eq!(idle_id, Some(id), "the waiter opened a new connection");
+        assert_eq!(idle.etag, revoked.etag);
+        assert_eq!(idle.deny, revoked.deny);
+        assert_eq!(idle.view.signed_netmap.sig, revoked.view.signed_netmap.sig);
         // The waiter owns a runtime, so it drops outside of the async context.
         tokio::task::spawn_blocking(move || drop(waiter))
             .await

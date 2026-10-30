@@ -35,6 +35,7 @@ pub async fn enroll_with_token(
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        unchanged_ok: false,
     };
     round_trip(coord, coord_name, bundle_pem, None, request, None, true).await
 }
@@ -90,6 +91,7 @@ pub async fn enroll_with_oidc(input: OidcEnroll<'_>) -> Result<EnrollResult, Coo
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        unchanged_ok: false,
     };
     round_trip(
         input.coord,
@@ -149,6 +151,7 @@ pub async fn advertise_routes(
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        unchanged_ok: false,
     };
     let result = round_trip(
         coord,
@@ -186,6 +189,7 @@ pub async fn fetch_netmap(
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        unchanged_ok: false,
     };
     let result = round_trip(
         coord,
@@ -239,6 +243,7 @@ pub async fn renew_svid(
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        unchanged_ok: false,
     };
     let result = round_trip(
         coord,
@@ -305,6 +310,7 @@ pub async fn publish_candidates(
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        unchanged_ok: false,
     };
     let result = round_trip(
         coord,
@@ -359,6 +365,7 @@ pub async fn advertise_exit(
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        unchanged_ok: false,
     };
     let result = round_trip(
         coord,
@@ -452,6 +459,7 @@ pub fn admin_token_expect_blocking(
             api_token: Some(api_token.to_string()),
             deny_etag: None,
             expect_sha256: expect.map(str::to_string),
+            unchanged_ok: false,
         };
         let endpoint =
             tlsutil::client_endpoint(&client_tls, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
@@ -519,6 +527,7 @@ pub fn fetch_deny_wait_blocking(
             api_token: None,
             deny_etag: etag.map(str::to_string),
             expect_sha256: None,
+            unchanged_ok: false,
         };
         let limit = DENY_WAIT_HOLD + std::time::Duration::from_secs(10);
         tokio::time::timeout(
@@ -531,6 +540,7 @@ pub fn fetch_deny_wait_blocking(
 }
 
 /// One `policy-wait` reply (W25-6).
+#[derive(Clone)]
 pub struct PolicySync {
     /// The signed netmap and grants. The client checked the signatures with the pinned key.
     pub view: NetmapView,
@@ -593,6 +603,7 @@ async fn admin_call(
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        unchanged_ok: false,
     };
     authed_detail(coord, coord_name, bundle_pem, material, request).await
 }
@@ -617,6 +628,7 @@ async fn fetch_deny(
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        unchanged_ok: false,
     };
     authed_detail(coord, coord_name, bundle_pem, material, request).await
 }
@@ -716,6 +728,9 @@ pub struct PolicyWaiter {
     coord_name: String,
     runtime: tokio::runtime::Runtime,
     link: Option<PolicyLink>,
+    /// The last checked reply. With it, the waiter accepts a reply without the view when
+    /// the ETag did not change.
+    last: Option<PolicySync>,
 }
 
 struct PolicyLink {
@@ -745,6 +760,7 @@ impl PolicyWaiter {
             coord_name: coord_name.to_string(),
             runtime,
             link: None,
+            last: None,
         })
     }
 
@@ -762,7 +778,19 @@ impl PolicyWaiter {
     ) -> Result<PolicySync, CoordError> {
         let material = read_node_material(state_dir)?;
         let pinned = material.netmap_public;
-        let request = policy_wait_request(&material.name, etag);
+        let mut request = policy_wait_request(&material.name, etag);
+        // The waiter keeps the view of `etag` only for the bundle and the leaf of that view.
+        let kept = self.last.as_ref().is_some_and(|last| {
+            Some(last.etag.as_str()) == etag
+                && self.link.as_ref().is_some_and(|item| {
+                    item.bundle_pem == bundle_pem
+                        && item.certificate_pem == material.certificate_pem
+                })
+        });
+        if !kept {
+            self.last = None;
+        }
+        request.unchanged_ok = kept;
         let limit = DENY_WAIT_HOLD + std::time::Duration::from_secs(10);
         let coord = self.coord;
         let coord_name = self.coord_name.clone();
@@ -813,10 +841,26 @@ impl PolicyWaiter {
                 if let Some(item) = self.link.take() {
                     item.close();
                 }
+                self.last = None;
                 return Err(err);
             }
         };
-        policy_sync_from(response_ok(response)?, bundle_pem, pinned)
+        let response = response_ok(response)?;
+        if response.netmap.is_none() {
+            // A reply without the view: the view of the ETag did not change (W25-16).
+            let invalid = || CoordError::Protocol("The coordinator request failed.".to_string());
+            let etag = response.policy_etag.ok_or_else(invalid)?;
+            let deny = response.detail.ok_or_else(invalid)?;
+            let Some(last) = self.last.as_mut().filter(|last| last.etag == etag) else {
+                self.last = None;
+                return Err(invalid());
+            };
+            last.deny = deny;
+            return Ok(last.clone());
+        }
+        let sync = policy_sync_from(response, bundle_pem, pinned)?;
+        self.last = Some(sync.clone());
+        Ok(sync)
     }
 }
 
@@ -843,6 +887,7 @@ fn policy_wait_request(name: &str, etag: Option<&str>) -> Request {
         api_token: None,
         deny_etag: etag.map(str::to_string),
         expect_sha256: None,
+        unchanged_ok: false,
     }
 }
 
@@ -887,6 +932,7 @@ pub fn agent_grant_request_blocking(
             api_token: None,
             deny_etag: None,
             expect_sha256: None,
+            unchanged_ok: false,
         };
         authed_detail(coord, coord_name, bundle_pem, material, request).await
     })
@@ -934,6 +980,7 @@ pub fn agent_grant_fetch_blocking(
             api_token: None,
             deny_etag: None,
             expect_sha256: None,
+            unchanged_ok: false,
         };
         let response = authed_response(coord, coord_name, bundle_pem, material, request).await?;
         let invalid = || CoordError::Protocol("The grant reply is not valid.".to_string());

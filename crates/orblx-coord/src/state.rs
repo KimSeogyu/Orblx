@@ -15,8 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::error::CoordError;
 use crate::files::{create_private_dir, read_text, write_bytes, write_text};
 use crate::netmap::{
-    decode_hex_32, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap, NetmapKey,
-    SignedEndpoint, SignedGrants, SignedNetmap,
+    decode_hex_32, verify_signed_endpoint, NetmapKey, SignedEndpoint, SignedGrants, SignedNetmap,
 };
 use crate::store::{CreatedToken, NodeStore, StoredNode};
 use crate::ticket::{self, IssuedTicket};
@@ -218,14 +217,53 @@ struct ViewKey {
 #[derive(Default)]
 struct ViewCache {
     key: Option<ViewKey>,
+    /// The parts of each view that do not depend on the receiver, for `key`.
+    inputs: Option<ViewInputs>,
     views: HashMap<String, Arc<CachedView>>,
 }
 
-/// A signed view and the digest of its contents (W25-16).
+/// The parts of a signed view that do not depend on the receiver (W25-16).
+///
+/// The coordinator makes them one time for each set of inputs, not one time for each view.
+struct ViewInputs {
+    nodes: Vec<StoredNode>,
+    lock: crate::nodelock::LockStore,
+    /// The published routes and the exit approval of each node, by node name.
+    published: HashMap<String, (Vec<String>, bool)>,
+}
+
+impl ViewInputs {
+    fn new(inner: &Inner, lock: crate::nodelock::LockStore) -> Self {
+        let nodes = inner.store.nodes();
+        let published = nodes
+            .iter()
+            .map(|node| {
+                let routes = published_routes(&inner.policy, &node.svid, &node.routes);
+                let exit = published_exit(&inner.policy, &node.svid, node.exit_node);
+                (node.name.clone(), (routes, exit))
+            })
+            .collect();
+        Self {
+            nodes,
+            lock,
+            published,
+        }
+    }
+
+    fn published(&self, name: &str) -> (Vec<String>, bool) {
+        self.published.get(name).cloned().unwrap_or_default()
+    }
+}
+
+/// A signed view, its reply, and the digest of its contents (W25-16).
 #[derive(Debug)]
 pub struct CachedView {
     pub view: NetmapView,
-    /// The SHA-256 of the signed netmap, the signed grants, the endpoints, and the routes.
+    /// The JSON of the `policy-wait` reply without `detail` and `policy_etag`, and without
+    /// the last `}`. The server adds the two fields and the `}` for each reply.
+    pub reply_head: Vec<u8>,
+    /// The SHA-256 of the reply JSON. It covers the signed netmap, the signed grants, the
+    /// endpoints, the routes, and the exit approval.
     pub digest: [u8; 32],
 }
 
@@ -533,17 +571,35 @@ impl Coordinator {
             policy_gen: inner.policy_gen,
             lock: lock_digest,
         };
-        if inner.views.key != Some(key) {
+        if inner.views.key != Some(key) || inner.views.inputs.is_none() {
             inner.views.key = Some(key);
             inner.views.views.clear();
             prune_endpoint_sigs(&inner);
+            // The lock store is the store that gave `lock_digest`.
+            let lock = inner
+                .lock_loaded
+                .as_ref()
+                .map(|(_, store)| store.clone())
+                .unwrap_or_default();
+            let inputs = ViewInputs::new(&inner, lock);
+            inner.views.inputs = Some(inputs);
         }
         if let Some(view) = inner.views.views.get(name) {
             return Ok(Arc::clone(view));
         }
-        let view = sign_view(&inner, name)?;
-        let digest = view_digest(&view)?;
-        let cached = Arc::new(CachedView { view, digest });
+        let inputs = inner.views.inputs.as_ref().ok_or(CoordError::State)?;
+        let view = sign_view_with(&inner, name, inputs)?;
+        let mut reply_head =
+            serde_json::to_vec(&ViewReply::of(&view)).map_err(|_| CoordError::State)?;
+        let digest: [u8; 32] = Sha256::digest(&reply_head).into();
+        if reply_head.pop() != Some(b'}') {
+            return Err(CoordError::State);
+        }
+        let cached = Arc::new(CachedView {
+            view,
+            reply_head,
+            digest,
+        });
         inner
             .views
             .views
@@ -1254,22 +1310,6 @@ fn signed_endpoint(
     Ok(signed)
 }
 
-/// Return the SHA-256 of the parts of a view that a node applies (W25-16).
-fn view_digest(view: &NetmapView) -> Result<[u8; 32], CoordError> {
-    let mut hasher = Sha256::new();
-    let netmap = serde_json::to_vec(&view.signed_netmap).map_err(|_| CoordError::State)?;
-    let grants = serde_json::to_vec(&view.signed_grants).map_err(|_| CoordError::State)?;
-    let endpoints = serde_json::to_vec(&view.endpoints).map_err(|_| CoordError::State)?;
-    let approved = view.approved_routes.join(",").into_bytes();
-    let advertised = view.advertised_routes.join(",").into_bytes();
-    let exit = vec![u8::from(view.exit_approved)];
-    for part in [&netmap, &grants, &endpoints, &approved, &advertised, &exit] {
-        hasher.update((part.len() as u64).to_be_bytes());
-        hasher.update(part);
-    }
-    Ok(hasher.finalize().into())
-}
-
 fn refresh_policy(inner: &mut Inner) {
     let path = inner.policy_path.clone();
     if !path.exists() {
@@ -1716,20 +1756,31 @@ fn node_visible(node: &StoredNode) -> bool {
 }
 
 fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
-    let lock_store = crate::nodelock::read_store(&inner.state_dir)?;
-    let nodes = inner.store.nodes();
+    let lock = crate::nodelock::read_store(&inner.state_dir)?;
+    sign_view_with(inner, name, &ViewInputs::new(inner, lock))
+}
+
+/// Sign the view of node `name` from `inputs` (W25-16).
+///
+/// Each call signs a new netmap and new grants. The signatures are checked before they go out.
+fn sign_view_with(
+    inner: &Inner,
+    name: &str,
+    inputs: &ViewInputs,
+) -> Result<NetmapView, CoordError> {
+    let nodes = &inputs.nodes;
     let self_node = nodes
         .iter()
         .find(|node| node.name == name)
-        .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?
-        .clone();
-    let self_visible = node_visible(&self_node);
+        .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+    let self_visible = node_visible(self_node);
     let mut peers = Vec::new();
     let mut endpoints = Vec::new();
     if self_visible {
-        for node in nodes.iter().filter(|node| {
-            node_visible(node) && crate::share::sees(&inner.policy, &self_node, node)
-        }) {
+        for node in nodes
+            .iter()
+            .filter(|node| node_visible(node) && crate::share::sees(&inner.policy, self_node, node))
+        {
             for endpoint in &node.endpoints {
                 endpoints.push(signed_endpoint(inner, &node.name, endpoint)?);
             }
@@ -1737,20 +1788,21 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
                 continue;
             }
             // A shared node from another tenant gives no subnet routes and no exit node.
-            let other = crate::share::cross_tenant(&inner.policy, &self_node, node);
+            let other = crate::share::cross_tenant(&inner.policy, self_node, node);
+            let (routes, exit_node) = if other {
+                (Vec::new(), false)
+            } else {
+                inputs.published(&node.name)
+            };
             peers.push(NetmapPeer {
                 name: node.name.clone(),
                 overlay_ip: node.overlay_ip.clone(),
                 svid: node.svid.clone(),
                 endpoints: node.endpoints.clone(),
-                routes: if other {
-                    Vec::new()
-                } else {
-                    published_routes(&inner.policy, &node.svid, &node.routes)
-                },
-                exit_node: !other && published_exit(&inner.policy, &node.svid, node.exit_node),
+                routes,
+                exit_node,
                 owner: String::new(),
-                lock_sig: lock_store.sigs.get(&node.name).cloned(),
+                lock_sig: inputs.lock.sigs.get(&node.name).cloned(),
             });
         }
     }
@@ -1762,18 +1814,15 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
             owner: String::new(),
         },
         peers,
-        lock: lock_store.updates.clone(),
+        lock: inputs.lock.updates.clone(),
         split_dns: published_split_dns(&inner.policy, self_visible),
     };
-    let signed_netmap = inner.netmap_key.sign_netmap(&payload)?;
+    let signed_netmap = inner.netmap_key.sign_netmap_owned(payload)?;
     let receiver = SpiffeId::node(&self_node.name)?;
-    let grants = filtered_grants(inner, &receiver, &self_node, self_visible);
-    let signed_grants = inner.netmap_key.sign_grants(&grants)?;
+    let grants = filtered_grants(inner, &receiver, self_node, self_visible, nodes);
+    let signed_grants = inner.netmap_key.sign_grants_owned(grants)?;
     let netmap_public = inner.netmap_key.public();
-    verify_signed_netmap(&signed_netmap, &netmap_public)?;
-    verify_signed_grants(&signed_grants, &netmap_public)?;
-    let approved_routes = published_routes(&inner.policy, &self_node.svid, &self_node.routes);
-    let exit_approved = published_exit(&inner.policy, &self_node.svid, self_node.exit_node);
+    let (approved_routes, exit_approved) = inputs.published(&self_node.name);
     Ok(NetmapView {
         signed_netmap,
         signed_grants,
@@ -1783,6 +1832,54 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
         advertised_routes: self_node.routes.clone(),
         exit_approved,
     })
+}
+
+/// The JSON shape of [`NetmapView::response`], with borrowed fields (W25-16).
+///
+/// The field names and their order are those of `proto::Response`, so the JSON is the same
+/// and the coordinator does not copy the view to encode it.
+#[derive(serde::Serialize)]
+struct ViewReply<'a> {
+    ok: bool,
+    netmap_pub_hex: String,
+    netmap: &'a SignedNetmap,
+    endpoints: &'a [SignedEndpoint],
+    grants: &'a SignedGrants,
+    approved_routes: &'a [String],
+    advertised_routes: &'a [String],
+    exit_approved: bool,
+}
+
+impl<'a> ViewReply<'a> {
+    fn of(view: &'a NetmapView) -> Self {
+        Self {
+            ok: true,
+            netmap_pub_hex: crate::netmap::encode_hex(&view.netmap_public),
+            netmap: &view.signed_netmap,
+            endpoints: &view.endpoints,
+            grants: &view.signed_grants,
+            approved_routes: &view.approved_routes,
+            advertised_routes: &view.advertised_routes,
+            exit_approved: view.exit_approved,
+        }
+    }
+}
+
+impl NetmapView {
+    /// The coordinator reply that carries this view.
+    pub(crate) fn response(&self) -> crate::proto::Response {
+        crate::proto::Response {
+            ok: true,
+            netmap_pub_hex: Some(crate::netmap::encode_hex(&self.netmap_public)),
+            netmap: Some(self.signed_netmap.clone()),
+            endpoints: Some(self.endpoints.clone()),
+            grants: Some(self.signed_grants.clone()),
+            approved_routes: Some(self.approved_routes.clone()),
+            advertised_routes: Some(self.advertised_routes.clone()),
+            exit_approved: Some(self.exit_approved),
+            ..crate::proto::Response::default()
+        }
+    }
 }
 
 /// Copy the policy `splitDns` zones into the netmap (W24-F).
@@ -1817,6 +1914,7 @@ fn filtered_grants(
     receiver: &SpiffeId,
     self_node: &StoredNode,
     self_visible: bool,
+    nodes: &[StoredNode],
 ) -> orblx_identity::ReceiverGrants {
     if !self_visible {
         return orblx_identity::ReceiverGrants {
@@ -1829,7 +1927,6 @@ fn filtered_grants(
             guarded: Vec::new(),
         };
     }
-    let nodes = inner.store.nodes();
     // A node that the receiver does not see gives no grant and is not in reach (W25-1).
     let hidden: std::collections::BTreeSet<String> = nodes
         .iter()
@@ -1846,7 +1943,7 @@ fn filtered_grants(
     let mut grants = inner.policy.receiver_grants(receiver);
     grants.grants.retain(|grant| !other.contains(&grant.src));
     grants.reach.retain(|dst| !other.contains(dst));
-    for grant in crate::share::share_grants(&inner.policy, self_node, &nodes) {
+    for grant in crate::share::share_grants(&inner.policy, self_node, nodes) {
         if !grants.grants.contains(&grant) {
             grants.grants.push(grant);
         }

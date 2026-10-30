@@ -151,8 +151,9 @@ async fn policy_wait(
     coord: &Coordinator,
     name: &str,
     known: Option<&str>,
+    unchanged_ok: bool,
     mut stamp: watch::Receiver<u64>,
-) -> Result<Response, CoordError> {
+) -> Result<Vec<u8>, CoordError> {
     let deadline = tokio::time::Instant::now() + crate::DENY_WAIT_HOLD;
     loop {
         stamp.borrow_and_update();
@@ -167,12 +168,41 @@ async fn policy_wait(
                 Ok(Ok(()))
             )
         {
-            let mut response = netmap_response(&cached.view);
-            response.detail = Some(deny);
-            response.policy_etag = Some(etag);
-            return Ok(response);
+            if !changed && unchanged_ok {
+                // W25-16: the node has this view. Send only the deny list and the ETag.
+                return proto::encode_json(&Response {
+                    ok: true,
+                    detail: Some(deny),
+                    policy_etag: Some(etag),
+                    ..Response::default()
+                });
+            }
+            return policy_reply(&cached, &deny, &etag);
         }
     }
+}
+
+/// The JSON of one `policy-wait` reply (W25-16).
+///
+/// The bytes are the bytes of `serde_json::to_vec` of the full [`Response`]: the cached head
+/// holds the fields before `detail`, and `detail` and `policy_etag` are the last fields of the
+/// reply. The server encodes the large signed view one time, not one time for each reply.
+fn policy_reply(
+    cached: &crate::state::CachedView,
+    deny: &str,
+    etag: &str,
+) -> Result<Vec<u8>, CoordError> {
+    let invalid = || CoordError::Protocol("The coordinator request failed.".to_string());
+    let deny = serde_json::to_string(deny).map_err(|_| invalid())?;
+    let etag = serde_json::to_string(etag).map_err(|_| invalid())?;
+    let mut bytes = Vec::with_capacity(cached.reply_head.len() + deny.len() + etag.len() + 32);
+    bytes.extend_from_slice(&cached.reply_head);
+    bytes.extend_from_slice(b",\"detail\":");
+    bytes.extend_from_slice(deny.as_bytes());
+    bytes.extend_from_slice(b",\"policy_etag\":");
+    bytes.extend_from_slice(etag.as_bytes());
+    bytes.push(b'}');
+    Ok(bytes)
 }
 
 /// The SHA-256 of the view digest and the deny list ETag, in hex (W25-6, W25-16).
@@ -303,20 +333,50 @@ async fn handle_stream(
     stamp: watch::Receiver<u64>,
 ) -> Result<(), CoordError> {
     let request = proto::read_json::<Request>(&mut recv).await?;
-    let response = match dispatch(coord, connection, request, stamp).await {
-        Ok(response) => response,
+    // W25-16: a `policy-wait` reply comes as JSON bytes from the cached view.
+    let reply = if request.op == "policy-wait" {
+        policy_wait_op(coord, connection, &request, stamp).await
+    } else {
+        match dispatch(coord, connection, request, stamp).await {
+            Ok(response) => proto::encode_json(&response),
+            Err(err) => Err(err),
+        }
+    };
+    let bytes = match reply {
+        Ok(bytes) => bytes,
         Err(err) => {
             println!("coord rejected: {}", err.public_text());
-            Response {
+            proto::encode_json(&Response {
                 ok: false,
                 error: Some(err.public_text()),
                 ..Response::default()
-            }
+            })?
         }
     };
-    proto::write_json(&mut send, &response).await?;
+    proto::write_bytes(&mut send, &bytes).await?;
     let _ = send.finish();
     Ok(())
+}
+
+/// Serve one `policy-wait` request (W25-6, W25-16). The caller must be the named node.
+async fn policy_wait_op(
+    coord: &Coordinator,
+    connection: &quinn::Connection,
+    request: &Request,
+    stamp: watch::Receiver<u64>,
+) -> Result<Vec<u8>, CoordError> {
+    let peer = peer_node(coord, connection)?;
+    if peer != request.name {
+        return Err(CoordError::Peer);
+    }
+    policy_wait(
+        coord,
+        &request.name,
+        request.deny_etag.as_deref(),
+        request.unchanged_ok,
+        stamp,
+    )
+    .await
 }
 
 async fn dispatch(
@@ -428,13 +488,6 @@ async fn dispatch(
                 detail: Some(detail),
                 ..Response::default()
             })
-        }
-        "policy-wait" => {
-            let peer = peer_node(coord, connection)?;
-            if peer != request.name {
-                return Err(CoordError::Peer);
-            }
-            policy_wait(coord, &request.name, request.deny_etag.as_deref(), stamp).await
         }
         "agent-grant" => {
             let peer = peer_node(coord, connection)?;
@@ -773,17 +826,7 @@ fn leaf_response(result: crate::state::EnrollResult) -> Response {
 }
 
 fn netmap_response(view: &crate::state::NetmapView) -> Response {
-    Response {
-        ok: true,
-        netmap_pub_hex: Some(encode_hex(&view.netmap_public)),
-        netmap: Some(view.signed_netmap.clone()),
-        endpoints: Some(view.endpoints.clone()),
-        grants: Some(view.signed_grants.clone()),
-        approved_routes: Some(view.approved_routes.clone()),
-        advertised_routes: Some(view.advertised_routes.clone()),
-        exit_approved: Some(view.exit_approved),
-        ..Response::default()
-    }
+    view.response()
 }
 
 fn peer_node(coord: &Coordinator, connection: &quinn::Connection) -> Result<String, CoordError> {
@@ -843,7 +886,95 @@ mod tests {
             api_token: Some(secret.to_string()),
             deny_etag: None,
             expect_sha256: None,
+            unchanged_ok: false,
         }
+    }
+
+    /// W25-16: the `policy-wait` reply from the cached head is the JSON of the full reply.
+    /// The client parses it like any reply and verifies the netmap and the grants.
+    #[test]
+    fn the_cached_policy_reply_is_the_json_of_the_full_reply() {
+        let dir = std::env::temp_dir().join(format!(
+            "orblx-coord-reply-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
+        let now = SystemTime::now();
+        for name in ["reply-a", "reply-b"] {
+            let token = coord
+                .create_token_at(std::time::Duration::from_secs(60), now)
+                .unwrap();
+            coord
+                .enroll_token(name, &token.secret, &[format!("{name}:443")], &[], now)
+                .unwrap();
+        }
+        let cached = coord.netmap_cached("reply-a").unwrap();
+        let deny = "{\"deny\": [\"a \\\" b\"]}";
+        let etag = super::policy_etag(&cached.digest, deny);
+        let bytes = super::policy_reply(&cached, deny, &etag).unwrap();
+        let mut full = super::netmap_response(&cached.view);
+        full.detail = Some(deny.to_string());
+        full.policy_etag = Some(etag);
+        assert_eq!(bytes, serde_json::to_vec(&full).unwrap());
+        let parsed: super::Response = serde_json::from_slice(&bytes).unwrap();
+        let netmap = parsed.netmap.unwrap();
+        crate::netmap::verify_signed_netmap(&netmap, &cached.view.netmap_public).unwrap();
+        crate::netmap::verify_signed_grants(&parsed.grants.unwrap(), &cached.view.netmap_public)
+            .unwrap();
+        assert_eq!(netmap.netmap.peers.len(), 1);
+        // W25-16: when the ETag did not change at the end of the hold, a node that keeps its
+        // view gets only the deny list and the ETag. Other nodes get the full view.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let deny = crate::admin::deny_json_for(&coord, "reply-a", SystemTime::now()).unwrap();
+        let etag = super::policy_etag(&cached.digest, &deny);
+        let ended = || {
+            // A closed stamp channel ends the hold at once.
+            let (_, stamp) = tokio::sync::watch::channel(0);
+            stamp
+        };
+        let small: super::Response = serde_json::from_slice(
+            &runtime
+                .block_on(super::policy_wait(
+                    &coord,
+                    "reply-a",
+                    Some(&etag),
+                    true,
+                    ended(),
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(small.ok && small.netmap.is_none() && small.grants.is_none());
+        assert_eq!(small.policy_etag.as_deref(), Some(etag.as_str()));
+        assert_eq!(small.detail.as_deref(), Some(deny.as_str()));
+        let held = runtime
+            .block_on(super::policy_wait(
+                &coord,
+                "reply-a",
+                Some(&etag),
+                false,
+                ended(),
+            ))
+            .unwrap();
+        assert_eq!(held, super::policy_reply(&cached, &deny, &etag).unwrap());
+        // A changed ETag always gets the full view, also with the flag.
+        let changed = runtime
+            .block_on(super::policy_wait(
+                &coord,
+                "reply-a",
+                Some("old"),
+                true,
+                ended(),
+            ))
+            .unwrap();
+        assert_eq!(changed, held);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The W25-3 kill check: no token runs an operation outside its scope.

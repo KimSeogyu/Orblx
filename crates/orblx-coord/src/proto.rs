@@ -35,6 +35,11 @@ pub struct Request {
     /// The text `none` means that no policy file is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect_sha256: Option<String>,
+    /// W25-16: for `policy-wait`, the node keeps the view of `deny_etag`. When the hold ends
+    /// and the ETag did not change, the coordinator replies with only the deny list and the
+    /// ETag, without the view. An old coordinator ignores the field and sends the full reply.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unchanged_ok: bool,
 }
 
 /// One agent grant request.
@@ -121,8 +126,18 @@ pub async fn write_json(
     send: &mut quinn::SendStream,
     value: &impl Serialize,
 ) -> Result<(), CoordError> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|_| CoordError::Protocol("The coordinator request failed.".to_string()))?;
+    let bytes = encode_json(value)?;
+    write_bytes(send, &bytes).await
+}
+
+/// Encode one message as JSON.
+pub fn encode_json(value: &impl Serialize) -> Result<Vec<u8>, CoordError> {
+    serde_json::to_vec(value)
+        .map_err(|_| CoordError::Protocol("The coordinator request failed.".to_string()))
+}
+
+/// Write one message that is JSON already, with its length prefix (W25-16).
+pub async fn write_bytes(send: &mut quinn::SendStream, bytes: &[u8]) -> Result<(), CoordError> {
     if bytes.len() > MAX_MESSAGE {
         return Err(CoordError::Protocol(
             "The coordinator request failed.".to_string(),
@@ -133,7 +148,7 @@ pub async fn write_json(
     send.write_all(&len.to_be_bytes())
         .await
         .map_err(|err| CoordError::Tls(err.to_string()))?;
-    send.write_all(&bytes)
+    send.write_all(bytes)
         .await
         .map_err(|err| CoordError::Tls(err.to_string()))?;
     Ok(())
