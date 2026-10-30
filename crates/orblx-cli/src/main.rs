@@ -255,6 +255,9 @@ where
     if args.first().map(String::as_str) == Some("agent") {
         return agent::parse(&args[1..]).map(Action::Agent);
     }
+    if args.first().map(String::as_str) == Some("gateway") {
+        return agent::parse_gateway(&args[1..]).map(Action::Agent);
+    }
     if args.first().map(String::as_str) == Some("netcheck") {
         return netcheck::parse(&args[1..]).map(Action::Netcheck);
     }
