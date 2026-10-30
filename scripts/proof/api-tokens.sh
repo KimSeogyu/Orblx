@@ -47,6 +47,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# A pipe into head or grep -q can stop the writer early (SIGPIPE). With pipefail, the
+# pipe then fails at random. So the script keeps each output in a variable first.
+first_line() {
+  local text="$1"
+  printf '%s\n' "${text%%$'\n'*}"
+}
+
 fail() {
   echo "proof_fail: $*" >&2
   echo "---- coord log (last 40 lines) ----" >&2
@@ -121,13 +128,14 @@ ADMIN=(--coord "$COORD" --state /var/lib/orblx --bundle /var/lib/orblx/bundle.pe
 
 echo "=== [C] gate 6: owner SVID (mTLS) still works ==="
 owner admin nodes "${ADMIN[@]}"
-owner admin policy "${ADMIN[@]}" | head -n 1
+policy_out="$(owner admin policy "${ADMIN[@]}")"
+first_line "$policy_out"
 set +e
 a_out="$(dc run --rm --no-deps -T a admin nodes "${ADMIN[@]}" 2>&1)"
 a_rc=$?
 set -e
 printf '%s\n' "$a_out" | tail -n 1
-[[ "$a_rc" -ne 0 ]] && printf '%s\n' "$a_out" | grep -q "not an owner" || fail "node a was not refused"
+[[ "$a_rc" -ne 0 ]] && grep -q "not an owner" <<< "$a_out" || fail "node a was not refused"
 echo "node_a_admin refused (not an owner)"
 
 echo "=== [C] owner creates tokens ==="
@@ -172,8 +180,10 @@ for op in "${ops[@]}"; do
   if [[ "$want" == 200 ]]; then allowed=$((allowed + 1)); else refused=$((refused + 1)); fi
 done
 echo "gate1 ops ${#ops[@]} allowed ${allowed} refused_403 ${refused}"
-owner admin nodes "${ADMIN[@]}" | grep -q '^node a ' || fail "node a is gone after the 403 calls"
-owner admin policy "${ADMIN[@]}" | grep -q 'node/owner' || fail "the policy changed after the 403 calls"
+nodes_out="$(owner admin nodes "${ADMIN[@]}")"
+grep -q '^node a ' <<< "$nodes_out" || fail "node a is gone after the 403 calls"
+policy_out="$(owner admin policy "${ADMIN[@]}")"
+grep -q 'node/owner' <<< "$policy_out" || fail "the policy changed after the 403 calls"
 echo "after_403 node a still enrolled, policy owners unchanged"
 
 echo "=== [C] policy:write token: policy-set 200, nodes 403 ==="
@@ -208,7 +218,7 @@ exp_allowed="$(printf '%s\n' "$exp_out" | awk '/^allowed /{print $2}')"
 deny_ms="$(printf '%s\n' "$exp_out" | awk '/^first_deny /{print $5}')"
 deny_status="$(printf '%s\n' "$exp_out" | awk '/^first_deny /{print $3}')"
 [[ "$deny_status" == 401 ]] || fail "the expired token did not get 401"
-printf '%s\n' "$exp_out" | grep -q "The API token is expired." || fail "the deny reason is not expired"
+grep -q "The API token is expired." <<< "$exp_out" || fail "the deny reason is not expired"
 last_ok_ms="$(printf '%s\n' "$exp_out" | awk '/^last_ok /{print $5}')"
 expiry_delta=$((deny_ms - expire_at))
 echo "expire expires_unix_ms ${expire_at} last_ok_done_ms ${last_ok_ms} first_401_done_ms ${deny_ms} expiry_to_401_ms ${expiry_delta}"
@@ -232,7 +242,7 @@ rev_allowed="$(printf '%s\n' "$rl" | awk '/^allowed /{print $2}')"
 rdeny_ms="$(printf '%s\n' "$rl" | awk '/^first_deny /{print $5}')"
 rdeny_status="$(printf '%s\n' "$rl" | awk '/^first_deny /{print $3}')"
 [[ "$rdeny_status" == 401 ]] || fail "the revoked token did not get 401"
-printf '%s\n' "$rl" | grep -q "The API token is revoked." || fail "the deny reason is not revoked"
+grep -q "The API token is revoked." <<< "$rl" || fail "the deny reason is not revoked"
 revoke_delta=$((rdeny_ms - revoked_at))
 echo "revoke revoked_unix_ms ${revoked_at} first_401_done_ms ${rdeny_ms} revoke_to_401_ms ${revoke_delta}"
 (( revoke_delta >= 0 && revoke_delta <= REVOKE_LIMIT_MS )) || fail "revoke_to_401_ms ${revoke_delta}"
@@ -276,11 +286,12 @@ check_count token-use "$REVOKE_ID" "$rev_allowed"
 check_count token-deny "$REVOKE_ID" 2
 check_count token-revoke "$REVOKE_ID" 1
 printf '%s\n' "$audit_json" | jq -r 'select(.action | startswith("token-")) | "\(.action) \(.target) \(.actor) \(.detail)"' \
-  | sort | uniq -c | sort -k2 | head -n 40
+  | sort | uniq -c | sort -k2
 owner admin audit --verify "${ADMIN[@]}"
-dc exec -T coord orblx audit verify-config --file /var/lib/orblx/config-audit.jsonl | head -n 1 | grep -qx ok \
-  || fail "audit verify-config did not print ok"
-echo "audit verify-config ok"
+verify_out="$(dc exec -T coord orblx audit verify-config --file /var/lib/orblx/config-audit.jsonl)" \
+  || fail "audit verify-config failed"
+[[ "$(first_line "$verify_out")" == ok ]] || fail "audit verify-config did not print ok"
+echo "audit verify-config ok $(grep '^records ' <<< "$verify_out")"
 
 echo "=== [C] gate 5: no token text in logs, audit records, or state files ==="
 # The check reads the 4 token files inside [C] and does not print them.
