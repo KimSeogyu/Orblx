@@ -1,0 +1,104 @@
+# W25-13 SIEM streaming proof stack.
+# coord: the coordinator. It streams each config audit record to the sinks in the policy.
+#   The sink credentials and the CA bundle are files in /sinks (ORBLX_AUDIT_SINK_DIR).
+# siemhttp: an HTTPS receiver with three sinks (Splunk HEC, Datadog, NDJSON).
+# syslog: an RFC 5425 syslog TLS receiver with a certificate from the lab CA.
+# badsyslog: a syslog TLS receiver with a certificate from a different CA.
+# owner: the owner SVID. client: a host with no SVID. It has only the trust bundle and token files.
+name: orblx-w25m-siem
+
+x-receiver: &receiver
+  image: ${SIEM_IMAGE:?set SIEM_IMAGE}
+  volumes:
+    - ${SIEM_LAB:?set SIEM_LAB}/recv-conf:/conf:ro
+    - ${SIEM_LAB:?set SIEM_LAB}/sinks:/sinks:ro
+    - recv:/recv
+    - ./siem-sink-receiver.py:/proof/siem-sink-receiver.py:ro
+  networks:
+    - proof
+
+services:
+  coord:
+    image: ${SIEM_IMAGE:?set SIEM_IMAGE}
+    # No systemd-resolved: it does not resolve the one-label receiver names.
+    entrypoint: ["orblx"]
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /var/lib/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+      ORBLX_AUDIT_SINK_DIR: /sinks
+      HOSTNAME: coord
+    volumes:
+      - store:/var/lib/orblx
+      - ${SIEM_LAB:?set SIEM_LAB}/sinks:/sinks:ro
+    networks:
+      - proof
+
+  siemhttp:
+    <<: *receiver
+    entrypoint: ["python3", "/proof/siem-sink-receiver.py", "https"]
+    environment:
+      RECV_PORT: "8088"
+      RECV_CERT: /conf/good.pem
+      RECV_KEY: /conf/good.key
+      RECV_CRED_DIR: /sinks
+      RECV_DIR: /recv
+
+  syslog:
+    <<: *receiver
+    entrypoint: ["python3", "/proof/siem-sink-receiver.py", "syslog"]
+    environment:
+      RECV_PORT: "6514"
+      RECV_CERT: /conf/good.pem
+      RECV_KEY: /conf/good.key
+      RECV_DIR: /recv
+      RECV_SINK: syslog
+
+  badsyslog:
+    <<: *receiver
+    entrypoint: ["python3", "/proof/siem-sink-receiver.py", "syslog"]
+    environment:
+      RECV_PORT: "6514"
+      RECV_CERT: /conf/bad.pem
+      RECV_KEY: /conf/bad.key
+      RECV_DIR: /recv
+      RECV_SINK: bad
+
+  owner:
+    image: ${SIEM_IMAGE:?set SIEM_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    volumes:
+      - store:/coord-state:ro
+      - owner:/var/lib/orblx
+      - tokens:/tokens
+    networks:
+      - proof
+
+  client:
+    image: ${SIEM_IMAGE:?set SIEM_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - store:/coord-state:ro
+      - tokens:/tokens:ro
+    networks:
+      - proof
+
+volumes:
+  store:
+  recv:
+  owner:
+  tokens:
+
+networks:
+  proof:
