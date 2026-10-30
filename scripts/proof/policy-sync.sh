@@ -16,6 +16,7 @@
 #         do not restart.
 # The script deletes the proof containers at the start and at the end.
 # The script does not print enroll tokens or private keys.
+# The script takes the box proof lock (proof-lock.sh, W25-5). Proofs run one at a time.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -51,7 +52,10 @@ cleanup() {
   dc --profile nodes --profile tool --profile load down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$ROOT/scripts/proof/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "policy-sync:${PROOF_PROJECT}" "${PROOF_PROJECT}-"
 
 fail() {
   echo "$1" >&2
