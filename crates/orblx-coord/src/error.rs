@@ -39,6 +39,8 @@ pub enum CoordError {
     Route,
     /// The time value is not valid.
     Time,
+    /// The live policy sha256 is not the expected sha256 (W25-9).
+    Conflict,
 }
 
 impl CoordError {
@@ -67,6 +69,9 @@ impl CoordError {
             Self::Endpoint => "The endpoint is not valid.".to_string(),
             Self::Route => "The route is not valid.".to_string(),
             Self::Time => "The time value is not valid.".to_string(),
+            Self::Conflict => {
+                "The live policy changed. Its sha256 is not the expected sha256.".to_string()
+            }
         }
     }
 }

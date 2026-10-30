@@ -1,0 +1,22 @@
+// The mesh policy in Git (W25-9 example).
+// A pull request runs `orblx policy test`. The merge applies the file.
+{
+  "nodeApproval": false,
+  "owners": ["spiffe://orblx.local/node/owner"],
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a"],
+      "proto": "tcp",
+      "dst": ["spiffe://orblx.local/node/owner:22"],
+    },
+  ],
+  "tests": [
+    {
+      "src": "spiffe://orblx.local/node/a",
+      "proto": "tcp",
+      "accept": ["spiffe://orblx.local/node/owner:22"],
+      "deny": ["spiffe://orblx.local/node/owner:5432"],
+    },
+  ],
+}

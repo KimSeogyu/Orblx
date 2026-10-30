@@ -1,0 +1,57 @@
+# W25-9 policy GitOps proof stack. All services are [C] containers.
+# coord: the coordinator. owner: the owner SVID (makes tokens, reads the audit).
+# ci: a host with no SVID, like a CI runner. It has the trust bundle, the token
+# files, and the example directory.
+name: orblx-w25i-gitops-proof
+
+services:
+  coord:
+    image: ${GITOPS_IMAGE:?set GITOPS_IMAGE}
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /var/lib/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+    volumes:
+      - store:/var/lib/orblx
+    networks:
+      - proof
+
+  owner:
+    image: ${GITOPS_IMAGE:?set GITOPS_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    volumes:
+      - store:/coord-state:ro
+      - owner:/var/lib/orblx
+      - tokens:/tokens
+    networks:
+      - proof
+
+  ci:
+    image: ${GITOPS_IMAGE:?set GITOPS_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["sleep", "infinity"]
+    working_dir: /work
+    volumes:
+      - store:/coord-state:ro
+      - tokens:/tokens:ro
+      - ${GITOPS_EXAMPLE:?set GITOPS_EXAMPLE}:/example:ro
+    networks:
+      - proof
+
+volumes:
+  store:
+  owner:
+  tokens:
+
+networks:
+  proof:

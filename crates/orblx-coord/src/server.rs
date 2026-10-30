@@ -409,8 +409,14 @@ fn dispatch_token(
     ) {
         Ok(value) => value,
         Err(err) => {
-            println!("admin token use {} op {op} status 400", checked.id);
-            return status_response(400, err.public_text());
+            // W25-9: a stale policy-set is a conflict (409), not a bad request.
+            let status = if matches!(err, CoordError::Conflict) {
+                409
+            } else {
+                400
+            };
+            println!("admin token use {} op {op} status {status}", checked.id);
+            return status_response(status, err.public_text());
         }
     };
     let Ok(detail) = serde_json::to_string(&value) else {
@@ -489,7 +495,7 @@ fn run_admin(
         "admin-policy" => admin::policy_show(coord)?,
         "admin-policy-set" => {
             let lock = policy_lock.ok_or(CoordError::State)?;
-            admin::policy_set(coord, lock, &request.name)?
+            admin::policy_set(coord, lock, &request.name, request.expect_sha256.as_deref())?
         }
         "admin-token-create" => {
             owner_only()?;
@@ -657,6 +663,7 @@ mod tests {
             exit_node: false,
             grant: None,
             api_token: Some(secret.to_string()),
+            expect_sha256: None,
         }
     }
 
@@ -858,6 +865,72 @@ mod tests {
         assert!(coord.caller_is_owner(&a_id).unwrap());
         let audit = coord.config_audit_text().unwrap();
         let _ = orblx_audit::verify_config_jsonl(&audit).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn replace_count(coord: &Coordinator) -> usize {
+        coord
+            .config_audit_text()
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("\"policy-replace\""))
+            .count()
+    }
+
+    /// W25-9: a stale policy-set gets 409 and does not write. The same text does not write.
+    #[test]
+    fn policy_set_with_an_expected_sha_refuses_a_stale_write() {
+        let dir = std::env::temp_dir().join(format!("orblx-server-expect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        let policy_path = dir.join("policy.hujson");
+        std::fs::write(&policy_path, policy_text(&[OWNER], 22)).unwrap();
+        coord.set_policy_file(&policy_path).unwrap();
+        let now = SystemTime::now();
+        let made = apitoken::create(
+            &coord,
+            &CreateAsk {
+                scopes: vec!["policy:write".to_string()],
+                ttl_secs: 60,
+            },
+            OWNER,
+            now,
+        )
+        .unwrap();
+        let live = sha(&policy_path);
+        let next = policy_text(&[OWNER], 2222);
+        let with_expect = |text: &str, expect: &str| {
+            let mut ask = call_with("admin-policy-set", text, &made.secret);
+            ask.expect_sha256 = Some(expect.to_string());
+            dispatch_token(&coord, &ask, &made.secret, now)
+        };
+        // A stale sha: 409, and the file does not change.
+        let replaces = replace_count(&coord);
+        let reply = with_expect(&next, &"0".repeat(64));
+        assert_eq!(reply.status, Some(409));
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("live policy changed"));
+        assert_eq!(sha(&policy_path), live);
+        assert_eq!(replace_count(&coord), replaces);
+        // The live sha: 200, and the file changes.
+        let reply = with_expect(&next, &live);
+        assert_eq!(reply.status, Some(200));
+        assert!(reply.detail.unwrap().contains("\"changed\":true"));
+        let applied = sha(&policy_path);
+        assert_ne!(applied, live);
+        assert_eq!(replace_count(&coord), replaces + 1);
+        // The same text again: 200, "changed": false, and no new policy record.
+        let reply = with_expect(&next, &applied);
+        assert_eq!(reply.status, Some(200));
+        assert!(reply.detail.unwrap().contains("\"changed\":false"));
+        assert_eq!(sha(&policy_path), applied);
+        assert_eq!(replace_count(&coord), replaces + 1);
+        // The sha that the first diff saw is now stale.
+        let reply = with_expect(&policy_text(&[OWNER], 23), &live);
+        assert_eq!(reply.status, Some(409));
+        assert_eq!(sha(&policy_path), applied);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
