@@ -15,7 +15,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,7 @@ use orblx_datapath::{
     format_node_status, is_ipv4_packet, open_tun, NodeStatus, StatusPeer, TunConfig,
     LINUX_TUN_NAME, NODE_PID_FILE, NODE_STATUS_FILE,
 };
-use orblx_relay::{RelayPipe, RelaySender, RelaySessionId};
+use orblx_relay::{send_batch, BatchPeer, RelayPipe, RelaySender, RelaySessionId};
 
 use crate::birthday::{
     local_kind, peer_kind, strategy, MappingKind, RateGate, Spray, Strategy, BIRTHDAY_SOCKETS,
@@ -39,6 +39,9 @@ use crate::signed::{encode_hex, verify_signed_candidate, SignedCandidate};
 use crate::{EdgeError, StunClient, DIRECT_ATTEMPT_BUDGET, DIRECT_QUIC_PORT};
 
 const HOLD_LIMIT: usize = 64;
+/// The router takes up to this many TUN packets for one seal and send round.
+/// The value is less than HOLD_LIMIT, so one round does not push a queued frame out.
+const ROUTER_BATCH: usize = orblx_relay::UDP_BATCH;
 const RECENT_LIMIT: usize = 128;
 const PROBE_GAP: Duration = Duration::from_millis(PROBE_GAP_MS);
 const HELLO_GAP: Duration = Duration::from_millis(50);
@@ -49,6 +52,8 @@ const DIRECT_READ: Duration = Duration::from_millis(5);
 ///
 /// Data frames wake the loop at once. The limit only sets the timing of the control frames and the stop check.
 const RELAY_WAIT: Duration = Duration::from_millis(20);
+/// The send thread also flushes the queues after this time without a wake.
+const SEND_WAIT: Duration = Duration::from_millis(50);
 /// After a renewal the node sends the new hello on each path for this time.
 const RENEW_HELLO_MS: u64 = 5_000;
 /// The gap between two hello frames after a renewal.
@@ -232,6 +237,7 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         keys: Mutex::new(gate),
         select: Mutex::new(PathSelect::default()),
         queues: Mutex::new(Queues::default()),
+        queued: Condvar::new(),
         peer_endpoints: Mutex::new(Vec::new()),
         candidate_at: Mutex::new(None),
         plan: AtomicU64::new(0),
@@ -259,6 +265,11 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
     thread::Builder::new()
         .name("orblx-nat-relay".to_string())
         .spawn(move || relay_loop(relay_hub))
+        .map_err(|err| EdgeError::Io(err.to_string()))?;
+    let send_hub = Arc::clone(&hub);
+    thread::Builder::new()
+        .name("orblx-nat-send".to_string())
+        .spawn(move || send_loop(send_hub))
         .map_err(|err| EdgeError::Io(err.to_string()))?;
     let router_hub = Arc::clone(&hub);
     thread::Builder::new()
@@ -407,6 +418,8 @@ struct Hub {
     keys: Mutex<KeyGate>,
     select: Mutex<PathSelect>,
     queues: Mutex<Queues>,
+    /// Wakes the send thread. It goes with `queues`.
+    queued: Condvar,
     peer_endpoints: Mutex<Vec<SocketAddr>>,
     candidate_at: Mutex<Option<Instant>>,
     plan: AtomicU64,
@@ -429,6 +442,8 @@ struct Queues {
     ///
     /// A move to relay sends these frames again.
     recent: VecDeque<(u64, Vec<u8>)>,
+    /// True when new frames wait for the send thread.
+    wake: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -579,26 +594,63 @@ impl Hub {
         plan_of(self.plan.load(Ordering::Relaxed))
     }
 
-    fn enqueue(&self, packet: Vec<u8>) {
-        if !is_ipv4_packet(&packet) {
-            return;
-        }
+    /// Seal and queue a batch of TUN packets.
+    ///
+    /// The function takes the key lock one time and the queue lock one time for the batch.
+    fn enqueue_batch(&self, packets: Vec<Vec<u8>>) {
         let plan = self.current_plan();
+        let packets = packets.into_iter().filter(|packet| is_ipv4_packet(packet));
         if plan == SendPlan::Hold {
-            push_bound(&mut lock(&self.queues).hold, packet);
+            let mut queues = lock(&self.queues);
+            for packet in packets {
+                push_bound(&mut queues.hold, packet);
+            }
             return;
         }
-        // One seal for each packet.
+        // One seal for each packet. The key gate gives each frame its own counter.
         // The same frame can go on two paths. The receiver drops the second copy.
-        match self.seal(KIND_DATA, &packet) {
-            Some(frame) => self.route(frame, plan),
-            None => push_bound(&mut lock(&self.queues).hold, packet),
+        let mut frames = Vec::with_capacity(ROUTER_BATCH);
+        let mut held = Vec::new();
+        {
+            let mut gate = lock(&self.keys);
+            for packet in packets {
+                let sealed = if gate.ready() {
+                    gate.seal(KIND_DATA, &packet).ok()
+                } else {
+                    None
+                };
+                match sealed {
+                    Some(frame) => frames.push(frame),
+                    None => held.push(packet),
+                }
+            }
         }
+        let mut queues = lock(&self.queues);
+        for packet in held {
+            push_bound(&mut queues.hold, packet);
+        }
+        let now = self.now_ms();
+        for frame in frames {
+            Self::route_locked(&mut queues, frame, plan, now);
+        }
+        queues.wake = true;
+        drop(queues);
+        self.queued.notify_one();
+    }
+
+    /// Wake the send thread.
+    fn wake_sender(&self) {
+        lock(&self.queues).wake = true;
+        self.queued.notify_one();
     }
 
     fn route(&self, frame: Vec<u8>, plan: SendPlan) {
         let now = self.now_ms();
         let mut queues = lock(&self.queues);
+        Self::route_locked(&mut queues, frame, plan, now);
+    }
+
+    fn route_locked(queues: &mut Queues, frame: Vec<u8>, plan: SendPlan, now: u64) {
         if plan.uses_direct() {
             push_bound(&mut queues.direct, frame.clone());
             queues.recent.push_back((now, frame.clone()));
@@ -632,21 +684,27 @@ impl Hub {
         count
     }
 
-    fn pop(&self, path: OverlayPath) -> Option<Vec<u8>> {
-        let mut queues = lock(&self.queues);
-        match path {
-            OverlayPath::Direct => queues.direct.pop_front(),
-            OverlayPath::Relay => queues.relay.pop_front(),
-        }
-    }
-
-    fn push_front(&self, path: OverlayPath, frame: Vec<u8>) {
+    /// Take up to `max` frames from the front of one queue.
+    fn pop_many(&self, path: OverlayPath, max: usize) -> Vec<Vec<u8>> {
         let mut queues = lock(&self.queues);
         let queue = match path {
             OverlayPath::Direct => &mut queues.direct,
             OverlayPath::Relay => &mut queues.relay,
         };
-        queue.push_front(frame);
+        let count = queue.len().min(max);
+        queue.drain(..count).collect()
+    }
+
+    /// Put frames back at the front of one queue. The frames keep their order.
+    fn push_front_many(&self, path: OverlayPath, frames: Vec<Vec<u8>>) {
+        let mut queues = lock(&self.queues);
+        let queue = match path {
+            OverlayPath::Direct => &mut queues.direct,
+            OverlayPath::Relay => &mut queues.relay,
+        };
+        for frame in frames.into_iter().rev() {
+            queue.push_front(frame);
+        }
     }
 
     fn flush_hold(&self, plan: SendPlan) {
@@ -683,15 +741,19 @@ impl Hub {
         let Some(sender) = out.as_mut() else {
             return true;
         };
-        while let Some(frame) = self.pop(OverlayPath::Relay) {
-            if sender.send_opaque(&frame).is_err() {
-                self.push_front(OverlayPath::Relay, frame);
+        loop {
+            let mut frames = self.pop_many(OverlayPath::Relay, ROUTER_BATCH);
+            if frames.is_empty() {
+                return true;
+            }
+            let (sent, result) = sender.send_many(&frames);
+            if result.is_err() {
+                self.push_front_many(OverlayPath::Relay, frames.split_off(sent));
                 *out = None;
                 self.relay_broken.store(true, Ordering::Relaxed);
                 return false;
             }
         }
-        true
     }
 
     /// Send control frames on the relay. Return false when a send fails.
@@ -1150,11 +1212,15 @@ fn coordinated_punch(hub: &Hub, socket: &UdpSocket) -> (Option<SocketAddr>, Stra
 
 fn drain_direct(hub: &Hub, socket: &UdpSocket, peer: SocketAddr) {
     while !stopped() {
-        let Some(frame) = hub.pop(OverlayPath::Direct) else {
+        let mut frames = hub.pop_many(OverlayPath::Direct, ROUTER_BATCH);
+        if frames.is_empty() {
             return;
-        };
-        if socket.send_to(&frame, peer).is_err() {
-            hub.push_front(OverlayPath::Direct, frame);
+        }
+        // One sendmmsg call on Linux for the batch.
+        let refs: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
+        let sent = send_batch(socket, &[], &refs, BatchPeer::One(peer)).unwrap_or(0);
+        if sent < frames.len() {
+            hub.push_front_many(OverlayPath::Direct, frames.split_off(sent));
             return;
         }
     }
@@ -1321,6 +1387,27 @@ fn connect_relay(hub: &Hub) -> Result<RelayPipe, orblx_relay::RelayError> {
     }
 }
 
+/// Send the queued frames on the direct socket and on the relay.
+///
+/// The router seals. This thread does the kernel send, so the two parts run on two cores.
+/// One thread sends each path, so the frames keep their order.
+fn send_loop(hub: Arc<Hub>) {
+    while !stopped() {
+        {
+            let mut queues = lock(&hub.queues);
+            if !queues.wake {
+                queues = match hub.queued.wait_timeout(queues, SEND_WAIT) {
+                    Ok((guard, _)) => guard,
+                    Err(err) => err.into_inner().0,
+                };
+            }
+            queues.wake = false;
+        }
+        hub.flush_direct();
+        hub.flush_relay();
+    }
+}
+
 fn router_loop(hub: Arc<Hub>, packets: std::sync::mpsc::Receiver<Vec<u8>>) {
     let mut reported: Option<OverlayPath> = None;
     let mut known = false;
@@ -1330,10 +1417,17 @@ fn router_loop(hub: Arc<Hub>, packets: std::sync::mpsc::Receiver<Vec<u8>>) {
     while !stopped() {
         match packets.recv_timeout(Duration::from_millis(10)) {
             Ok(packet) => {
-                hub.enqueue(packet);
-                // Do not wait for the direct read timeout or the relay wait.
-                hub.flush_direct();
-                hub.flush_relay();
+                // Take the packets that already wait, up to one batch.
+                let mut batch = Vec::with_capacity(ROUTER_BATCH);
+                batch.push(packet);
+                while batch.len() < ROUTER_BATCH {
+                    match packets.try_recv() {
+                        Ok(next) => batch.push(next),
+                        Err(_) => break,
+                    }
+                }
+                // The send thread sends the frames. The router does not wait for the kernel send.
+                hub.enqueue_batch(batch);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
@@ -1372,8 +1466,8 @@ fn router_loop(hub: Arc<Hub>, packets: std::sync::mpsc::Receiver<Vec<u8>>) {
             }
         }
         hub.flush_hold(plan);
-        // The hold queue and the resend can put frames on the relay queue.
-        hub.flush_relay();
+        // The hold queue and the resend can put frames on the queues.
+        hub.wake_sender();
         if !known || next != reported {
             if let Some(path) = next {
                 println!("The path to {} is {}.", hub.peer_name, path.as_str());

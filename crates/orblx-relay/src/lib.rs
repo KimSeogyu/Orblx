@@ -8,12 +8,14 @@
 //! UDP port 443 is the preferred socket.
 //! TCP port 443 carries the same datagram behind a length prefix.
 
+mod batch;
 mod error;
 mod pipe;
 mod server;
 mod session;
 mod wire;
 
+pub use batch::{recv_batch, send_batch, BatchPeer, RecvBatch, UDP_BATCH};
 pub use error::RelayError;
 pub use pipe::{RelayPipe, RelaySender};
 pub use server::{RelayServer, RelayStats, ServerConfig};
