@@ -1,0 +1,12 @@
+{
+  "nodeApproval": false,
+  "owners": ["spiffe://orblx.local/node/owner"],
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a"],
+      "proto": "udp",
+      "dst": ["spiffe://orblx.local/node/owner:*"]
+    }
+  ]
+}

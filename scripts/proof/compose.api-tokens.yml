@@ -1,0 +1,66 @@
+# W25-3 scoped API token proof stack.
+# coord: the coordinator. owner: the owner SVID. a: a node that is not an owner.
+# client: a host with no SVID. It has only the trust bundle and token files.
+name: orblx-api-tokens-proof
+
+services:
+  coord:
+    image: ${TOKENS_IMAGE:?set TOKENS_IMAGE}
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /var/lib/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+    volumes:
+      - store:/var/lib/orblx
+    networks:
+      - proof
+
+  owner:
+    image: ${TOKENS_IMAGE:?set TOKENS_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    volumes:
+      - store:/coord-state:ro
+      - owner:/var/lib/orblx
+      - tokens:/tokens
+    networks:
+      - proof
+
+  a:
+    image: ${TOKENS_IMAGE:?set TOKENS_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    volumes:
+      - store:/coord-state:ro
+      - node-a:/var/lib/orblx
+      - tokens:/tokens:ro
+    networks:
+      - proof
+
+  client:
+    image: ${TOKENS_IMAGE:?set TOKENS_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - store:/coord-state:ro
+      - tokens:/tokens:ro
+    networks:
+      - proof
+
+volumes:
+  store:
+  owner:
+  node-a:
+  tokens:
+
+networks:
+  proof:

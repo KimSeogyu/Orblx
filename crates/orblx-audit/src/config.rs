@@ -80,11 +80,19 @@ pub enum ConfigAction {
     FileReceive,
     /// A node refused a file or the file failed its checks (W23-3).
     FileDeny,
+    /// An owner created a scoped admin API token (W25-3).
+    TokenCreate,
+    /// The admin API accepted one call with an API token (W25-3).
+    TokenUse,
+    /// The admin API refused one call with an API token (W25-3).
+    TokenDeny,
+    /// An owner revoked an admin API token (W25-3).
+    TokenRevoke,
 }
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 29] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -110,6 +118,10 @@ impl ConfigAction {
         Self::LockRemove,
         Self::FileReceive,
         Self::FileDeny,
+        Self::TokenCreate,
+        Self::TokenUse,
+        Self::TokenDeny,
+        Self::TokenRevoke,
     ];
 
     /// Return the stable action token.
@@ -141,6 +153,10 @@ impl ConfigAction {
             Self::LockRemove => "lock-remove",
             Self::FileReceive => "file-receive",
             Self::FileDeny => "file-deny",
+            Self::TokenCreate => "token-create",
+            Self::TokenUse => "token-use",
+            Self::TokenDeny => "token-deny",
+            Self::TokenRevoke => "token-revoke",
         }
     }
 
@@ -179,6 +195,10 @@ impl ConfigAction {
             Self::LockRemove => 23,
             Self::FileReceive => 24,
             Self::FileDeny => 25,
+            Self::TokenCreate => 26,
+            Self::TokenUse => 27,
+            Self::TokenDeny => 28,
+            Self::TokenRevoke => 29,
         }
     }
 

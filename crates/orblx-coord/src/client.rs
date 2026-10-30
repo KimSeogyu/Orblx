@@ -32,6 +32,7 @@ pub async fn enroll_with_token(
         routes: routes.to_vec(),
         exit_node: false,
         grant: None,
+        api_token: None,
     };
     round_trip(coord, coord_name, bundle_pem, None, request, None, true).await
 }
@@ -84,6 +85,7 @@ pub async fn enroll_with_oidc(input: OidcEnroll<'_>) -> Result<EnrollResult, Coo
         routes: input.routes.to_vec(),
         exit_node: false,
         grant: None,
+        api_token: None,
     };
     round_trip(
         input.coord,
@@ -140,6 +142,7 @@ pub async fn advertise_routes(
         routes: routes.to_vec(),
         exit_node: false,
         grant: None,
+        api_token: None,
     };
     let result = round_trip(
         coord,
@@ -174,6 +177,7 @@ pub async fn fetch_netmap(
         routes: Vec::new(),
         exit_node: false,
         grant: None,
+        api_token: None,
     };
     let result = round_trip(
         coord,
@@ -224,6 +228,7 @@ pub async fn renew_svid(
         routes: Vec::new(),
         exit_node: false,
         grant: None,
+        api_token: None,
     };
     let result = round_trip(
         coord,
@@ -287,6 +292,7 @@ pub async fn publish_candidates(
         routes: Vec::new(),
         exit_node: false,
         grant: None,
+        api_token: None,
     };
     let result = round_trip(
         coord,
@@ -338,6 +344,7 @@ pub async fn advertise_exit(
         routes: Vec::new(),
         exit_node: enabled,
         grant: None,
+        api_token: None,
     };
     let result = round_trip(
         coord,
@@ -372,6 +379,75 @@ pub fn admin_blocking(
     ))
 }
 
+/// The reply of one admin call with an API token (W25-3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminReply {
+    /// 200, 400, 401, or 403.
+    pub status: u16,
+    /// The reply document when the status is 200.
+    pub detail: Option<String>,
+    /// The error sentence when the status is not 200.
+    pub error: Option<String>,
+}
+
+/// Send one admin call with a scoped API token and no client certificate.
+///
+/// The token goes only in the request. This function does not print it.
+pub fn admin_token_blocking(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    api_token: &str,
+    op: &str,
+    name: &str,
+) -> Result<AdminReply, CoordError> {
+    block_on(async move {
+        let expect_coord = SpiffeId::coord(coord_name)?;
+        let client_tls = ClientTls {
+            trust_pem: bundle_pem.to_string(),
+            expect_coord,
+            certificate_pem: None,
+            private_key_pem: None,
+        };
+        let request = Request {
+            op: op.to_string(),
+            name: name.to_string(),
+            token: None,
+            id_token: None,
+            nonce: None,
+            endpoints: Vec::new(),
+            routes: Vec::new(),
+            exit_node: false,
+            grant: None,
+            api_token: Some(api_token.to_string()),
+        };
+        let endpoint =
+            tlsutil::client_endpoint(&client_tls, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
+        let connection = endpoint
+            .connect(coord, tlsutil::SERVER_NAME)
+            .map_err(|err| CoordError::Tls(format!("connect: {err}")))?
+            .await
+            .map_err(|err| CoordError::Tls(format!("handshake: {err}")))?;
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .map_err(|err| CoordError::Tls(format!("open: {err}")))?;
+        proto::write_json(&mut send, &request).await?;
+        let _ = send.finish();
+        let response: Response = proto::read_json(&mut recv).await?;
+        connection.close(quinn::VarInt::from_u32(0), b"done");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.wait_idle()).await;
+        let status = response
+            .status
+            .unwrap_or(if response.ok { 200 } else { 400 });
+        Ok(AdminReply {
+            status,
+            detail: response.detail,
+            error: response.error,
+        })
+    })
+}
+
 /// Fetch the deny document with the node SVID in `state_dir`.
 pub fn fetch_deny_blocking(
     coord: SocketAddr,
@@ -401,6 +477,7 @@ async fn admin_call(
         routes: Vec::new(),
         exit_node: false,
         grant: None,
+        api_token: None,
     };
     authed_detail(coord, coord_name, bundle_pem, material, request).await
 }
@@ -422,6 +499,7 @@ async fn fetch_deny(
         routes: Vec::new(),
         exit_node: false,
         grant: None,
+        api_token: None,
     };
     authed_detail(coord, coord_name, bundle_pem, material, request).await
 }
@@ -501,6 +579,7 @@ pub fn agent_grant_request_blocking(
             routes: Vec::new(),
             exit_node: false,
             grant: Some(ask),
+            api_token: None,
         };
         authed_detail(coord, coord_name, bundle_pem, material, request).await
     })
@@ -545,6 +624,7 @@ pub fn agent_grant_fetch_blocking(
             routes: Vec::new(),
             exit_node: false,
             grant: None,
+            api_token: None,
         };
         let response = authed_response(coord, coord_name, bundle_pem, material, request).await?;
         let invalid = || CoordError::Protocol("The grant reply is not valid.".to_string());
