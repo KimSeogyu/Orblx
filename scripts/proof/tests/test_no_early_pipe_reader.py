@@ -389,3 +389,87 @@ class FullOutputAndSecretScanTest(unittest.TestCase):
         self.assertIn('secret_scan "$WORK/all-logs.out" || fail', text)
         self.assertIn('logs >"$WORK/all-logs.out" 2>&1 || fail', text)
         self.assertNotIn("grep -cF 'PRIVATE KEY'", text)
+
+
+SIEM = os.path.join(REPO, "scripts", "proof", "siem-streaming.sh")
+
+
+class SiemStreamingTest(unittest.TestCase):
+    """W25-14 items 8 and 9: the siem-streaming leak checks fail closed, and gate 1 uses one clock."""
+
+    def script(self):
+        with open(SIEM) as f:
+            return f.read()
+
+    def arrivals(self, tmp, rows, start, limit=10000, lo=0, hi=3):
+        import json
+        src = self.script()
+        a = src.index("cat > \"$WORK/arrivals.py\" <<'PY'\n")
+        a = src.index("\n", a) + 1
+        b = src.index("\nPY\n", a)
+        prog = os.path.join(tmp, "arrivals.py")
+        with open(prog, "w") as f:
+            f.write(src[a:b] + "\n")
+        os.makedirs(os.path.join(tmp, "recv", "s"), exist_ok=True)
+        with open(os.path.join(tmp, "recv", "s", "arrivals.jsonl"), "w") as f:
+            for seq, ms in rows:
+                f.write(json.dumps({"seq": seq, "recv_ms": ms}) + "\n")
+        with open(os.path.join(tmp, "chain.jsonl"), "w") as f:
+            f.write("")
+        res = subprocess.run(["python3", prog, os.path.join(tmp, "chain.jsonl"), os.path.join(tmp, "recv"),
+                              str(start), str(lo), str(hi), str(limit), "s"], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return res.stdout
+
+    def test_gate1_has_no_second_clock(self):
+        src = self.script()
+        self.assertNotIn("coord-ts.log\" \"$g", src)
+        self.assertNotIn("latency_ms min", src)
+        for g in ("g1", "g3", "g4"):
+            self.assertIn('%s_start_ms="$(now_ms)"' % g, src)
+
+    def test_gate1_passes_inside_the_limit(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.arrivals(tmp, [(0, 1010.0), (1, 1020.0), (2, 1030.5)], 1000)
+        self.assertIn("start_to_last_arrival_ms 30.5", out)
+        self.assertTrue(out.endswith("arrivals ok\n"), out)
+
+    def test_gate1_fails_over_the_limit(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.arrivals(tmp, [(0, 1010.0), (1, 1020.0), (2, 11000.1)], 1000)
+        self.assertTrue(out.endswith("arrivals fail\n"), out)
+
+    def test_gate1_fails_when_a_record_arrives_before_the_start(self):
+        # The old reader printed a negative latency (min -13.9 ms) and passed.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.arrivals(tmp, [(0, 986.1), (1, 1020.0), (2, 1030.0)], 1000)
+        self.assertIn("start_to_first_arrival_ms -13.9", out)
+        self.assertTrue(out.endswith("arrivals fail\n"), out)
+
+    def test_gate1_fails_on_a_gap_duplicate_or_no_records(self):
+        import tempfile
+        for rows in ([(0, 1010.0), (2, 1030.0)], [(0, 1010.0), (1, 1020.0), (1, 1021.0), (2, 1030.0)], []):
+            with tempfile.TemporaryDirectory() as tmp:
+                out = self.arrivals(tmp, rows, 1000)
+            self.assertTrue(out.endswith("arrivals fail\n"), (rows, out))
+
+    def test_leak_checks_fail_closed(self):
+        src = self.script()
+        self.assertIn('. "$ROOT/scripts/proof/pipe-lib.sh"', src)
+        self.assertIn('> "$WORK/logs.txt" 2>&1 || fail', src)
+        self.assertIn('secret_scan "$WORK/logs.txt" || fail', src)
+        self.assertNotIn("/var/lib/orblx | wc -l", src)
+        self.assertNotIn("/recv | wc -l", src)
+        self.assertRegex(src, r'hits_state=.*\|\| fail')
+        self.assertRegex(src, r'hits_recv=.*\|\| fail')
+        self.assertIn('[[ "$recv_files" -gt 0 ]] || fail', src)
+
+    def test_container_scan_fails_when_grep_fails(self):
+        # The old form "grep -rlF ... DIR | wc -l" printed 0 when DIR was missing.
+        old = subprocess.run(["sh", "-c", "grep -rlF x /no/such/dir 2>/dev/null | wc -l"], capture_output=True, text=True)
+        self.assertEqual((old.returncode, old.stdout.strip()), (0, "0"))
+        new = subprocess.run(["sh", "-c", "set -e; test -d /no/such/dir; wc -l < /dev/null"], capture_output=True, text=True)
+        self.assertNotEqual(new.returncode, 0)
