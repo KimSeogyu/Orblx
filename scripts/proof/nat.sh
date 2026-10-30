@@ -210,6 +210,10 @@ now_s() {
 . "$PROOF_LIB_DIR/proof-lock.sh"
 trap 'cleanup; proof_lock_end' EXIT
 proof_lock_take "nat"
+# W25-14b: start from a clean compose state (all profiles, all volumes).
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
+proof_compose_clean "orblx-nat-proof" || exit 1
 
 echo "=== REAL cargo test tampered candidate ==="
 cargo test -p orblx-edge --lib signed::tests::tampered_candidate_signature_is_rejected -- --nocapture

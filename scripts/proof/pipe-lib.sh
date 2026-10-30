@@ -44,8 +44,23 @@ require_root() {
 # Print "<label> steady lost L/N max_ms M limit_ms X". Return 1 when the loss or the
 # max RTT is more than the limit, or when the summary is missing.
 steady_ping_gate() {
-  local label="$1" pings="$2" max_loss="$3" max_ms="$4" input received max
+  local label="$1" pings="$2" max_loss="$3" max_ms="$4" warn_ms="${5:-}" input received max seq ms context
   input="$(cat)"
+  # W25-14: each reply above WARN_MS prints a report-only steady_warn line. It does not fail.
+  if [[ -n "$warn_ms" ]]; then
+    while read -r seq ms; do
+      context="proof_context none"
+      if declare -F proof_context >/dev/null; then
+        context="$(proof_context steady_warn)"
+      fi
+      echo "steady_warn ${label} icmp_seq ${seq} ms ${ms} warn_ms ${warn_ms} limit_ms ${max_ms} time $(date '+%Y-%m-%dT%H:%M:%S.%3N%z') ${context}"
+    done < <(printf '%s\n' "$input" | awk -v w="$warn_ms" '
+      /icmp_seq=/ && / time=/ {
+        s = $0; sub(/.*icmp_seq=/, "", s); sub(/ .*/, "", s)
+        t = $0; sub(/.* time=/, "", t); sub(/ .*/, "", t)
+        if (t + 0 > w + 0) print s, t
+      }')
+  fi
   received="$(printf '%s\n' "$input" | awk '/packets transmitted/ {v = $4} END {print v}')"
   max="$(printf '%s\n' "$input" | awk -F'/' '/^rtt / {v = $6} END {print v}')"
   if [[ -z "$received" || ( "$received" != "0" && -z "$max" ) ]]; then

@@ -151,8 +151,9 @@ proof_lock_queue_position() {
   printf '%s\n' "$n"
 }
 
-proof_lock_queue_wait() {
-  local file="$1" note="$2" from="$3" dir first next_note
+# proof_lock_queue_join LOCK_FILE: write this proof's ticket into the queue.
+proof_lock_queue_join() {
+  local file="$1" dir
   dir="${file}.queue"
   if [[ ! -d "$dir" ]]; then
     (umask 000 && mkdir -p "$dir") 2>/dev/null || true
@@ -160,6 +161,14 @@ proof_lock_queue_wait() {
   fi
   PROOF_LOCK_TICKET="$(date +%s%N)-$$"
   printf 'label=%s\n' "$PROOF_LOCK_LABEL" >"${dir}/${PROOF_LOCK_TICKET}" 2>/dev/null || PROOF_LOCK_TICKET=""
+}
+
+proof_lock_queue_wait() {
+  local file="$1" note="$2" from="$3" dir first next_note
+  dir="${file}.queue"
+  if [[ -z "${PROOF_LOCK_TICKET:-}" ]]; then
+    proof_lock_queue_join "$file"
+  fi
   next_note=0
   while :; do
     first="$(proof_lock_queue_first "$dir" || true)"
@@ -192,6 +201,11 @@ proof_lock_take() {
   local file waited_from note
   file="$(proof_lock_file)"
   note="${ORBLX_PROOF_LOCK_NOTE_SECS:-30}"
+  # W25-14: take the queue ticket first. proof_context runs docker ps, which can take
+  # seconds; a ticket taken after it lets a later proof go first.
+  if command -v flock >/dev/null 2>&1 && ! proof_lock_parent_holds "$file"; then
+    proof_lock_queue_join "$file"
+  fi
   proof_context queued
   if proof_lock_parent_holds "$file"; then
     echo "proof_lock ${PROOF_LOCK_LABEL} held by the parent proof, file ${file}"
