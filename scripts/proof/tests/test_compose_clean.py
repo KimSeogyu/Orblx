@@ -51,6 +51,9 @@ def compose_proofs():
             src = f.read()
         if "proof_lock_take " in src and re.search(r"compose[.a-z0-9_-]*\.yml|serve-lib\.sh", src):
             out.append((name, src))
+    gitops = os.path.join(os.path.dirname(os.path.dirname(PROOF)), "examples", "policy-gitops", "proof", "proof.sh")
+    with open(gitops) as f:
+        out.append(("examples/policy-gitops/proof/proof.sh", f.read()))
     return out
 
 
@@ -109,7 +112,7 @@ class ComposeCleanTest(unittest.TestCase):
 
     def test_every_compose_proof_cleans_after_the_lock_and_before_the_first_start(self):
         proofs = compose_proofs()
-        self.assertGreaterEqual(len(proofs), 30)
+        self.assertGreaterEqual(len(proofs), 32)
         start = re.compile(r"(?m)^\s*(?:dc|compose|docker compose)\b[^\n]*\s(?:up|run|build|create)\b")
         for name, src in proofs:
             with self.subTest(proof=name):
