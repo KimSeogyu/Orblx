@@ -2,7 +2,7 @@
 # W25-18 proof: the coordinator removes an ephemeral node that stays offline longer than T.
 # The host is REAL. The coordinator, the nodes, and the load clients are [C] containers
 # (compose.ephemeral-nodes.yml). T is EPH_T seconds (default 6). The node SVID life is
-# EPH_SVID_TTL seconds (default 60), so a node renews in the run.
+# EPH_SVID_TTL seconds (default 120), so a node renews in the run.
 # Nodes: a, b, and n1 are not ephemeral. e1 to e4 and load1 to load20 are ephemeral
 # (`orblx coord token create --ephemeral`).
 # Gates:
@@ -40,7 +40,7 @@ FILE="scripts/proof/compose.ephemeral-nodes.yml"
 export PROOF_PROJECT="${PROOF_PROJECT:-orblx-w25q-eph-proof}"
 export EPH_IMAGE="${EPH_IMAGE:-orblx-w25q-eph:local}"
 export EPH_T="${EPH_T:-6}"
-export EPH_SVID_TTL="${EPH_SVID_TTL:-60}"
+export EPH_SVID_TTL="${EPH_SVID_TTL:-120}"
 T_MS=$((EPH_T * 1000))
 NETMAP_LIMIT_MS=2000
 RESTART_LATE_MS=1500
@@ -247,7 +247,7 @@ as_root sh -c "
     sleep 0.02
   done" &
 watcher=$!
-dc --profile nodes kill e1 >/dev/null
+dc --profile nodes stop -t 10 e1 >/dev/null
 e1_stop_ms="$(now_ms)"
 wait_removed e1 $((EPH_T + 40))
 e1_seen_removed_ms="$(now_ms)"
@@ -281,7 +281,9 @@ for _ in $(seq 1 $((EPH_SVID_TTL + 15))); do
   [[ "$got" -gt "$renew_fail0" ]] && break
   sleep 1
 done
-dc --profile nodes logs --no-color e1 2>&1 | grep -F 'The SVID renewal failed' | tail -n 2
+echo "---- [C] e1 log after the start (full) ----"
+dc --profile nodes logs --since "$(date -u -d "@$((removed_ms / 1000))" +%Y-%m-%dT%H:%M:%SZ)" --no-color e1 2>&1 || true
+echo "e1 renew_fail_lines before ${renew_fail0} after ${got}"
 [[ "$got" -gt "$renew_fail0" ]] || fail "e1 did not try to renew."
 dc --profile nodes logs --no-color e1 2>&1 | read_all grep -q 'The node renewed the SVID' \
   && [[ "$(dc --profile nodes logs --no-color e1 2>&1 | grep -c 'The node renewed the SVID' || true)" -gt 0 ]] \
@@ -302,7 +304,7 @@ if [[ "$rx0" != none && "$rx1" != none ]]; then
 else
   echo "e1 rx_bytes_after_removal 0 (e1 has no orblx0: $(dc --profile nodes ps -a --format '{{.Service}} {{.State}}' e1))"
 fi
-dc --profile nodes kill e1 >/dev/null
+dc --profile nodes stop -t 10 e1 >/dev/null
 
 echo "---- [C] the name e1 cannot enroll again; a new node gets the address ----"
 token e1 --ephemeral
@@ -318,7 +320,7 @@ echo "e1_ip ${e1_ip} r1_ip ${r1_ip}"
 echo "[C] gate2 ok"
 
 echo "=== Gate 3 [C]: e2 stops and comes back before T ==="
-dc --profile nodes kill e2 >/dev/null
+dc --profile nodes stop -t 10 e2 >/dev/null
 e2_stop_ms="$(now_ms)"
 off=none
 for _ in $(seq 1 300); do

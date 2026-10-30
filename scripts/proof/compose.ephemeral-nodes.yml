@@ -36,7 +36,7 @@ services:
       - "${EPH_T:-6}"
     environment:
       ORBLX_OIDC_MODE: mock
-      ORBLX_SVID_TTL: "${EPH_SVID_TTL:-60}"
+      ORBLX_SVID_TTL: "${EPH_SVID_TTL:-120}"
     volumes:
       - ${EPH_LAB:?set EPH_LAB}/coord:/var/lib/orblx
       - ${EPH_LAB:?set EPH_LAB}/policy:/etc/orblx:ro
