@@ -17,6 +17,7 @@ orblx-coord = { path = "../orblx-coord" }
 orblx-crypto = { path = "../orblx-crypto" }
 orblx-datapath = { path = "../orblx-datapath" }
 orblx-edge = { path = "../orblx-edge" }
+orblx-file = { path = "../orblx-file" }
 orblx-identity = { path = "../orblx-identity" }
 orblx-relay = { path = "../orblx-relay" }
 orblx-serve = { path = "../orblx-serve" }

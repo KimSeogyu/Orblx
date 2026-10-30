@@ -1,0 +1,128 @@
+# File send proof stack (W23-3).
+# `docker compose up` starts only the coordinator.
+# The node services use the nodes profile.
+name: orblx-w23a-file-send
+
+services:
+  coord:
+    image: orblx-w23a-file:w23
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /var/lib/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+    volumes:
+      - orblx-w23a-file-store:/var/lib/orblx
+      - ${POLICY_FILE:?set POLICY_FILE}:/var/lib/orblx/policy.hujson:ro
+    networks:
+      - proof
+
+  a:
+    image: orblx-w23a-file:w23
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-w23a-file-store:/coord-state:ro
+      - orblx-w23a-file-a:/var/lib/orblx
+    networks:
+      - proof
+
+  b:
+    image: orblx-w23a-file:w23
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-w23a-file-store:/coord-state:ro
+      - orblx-w23a-file-b:/var/lib/orblx
+    networks:
+      - proof
+
+  c:
+    image: orblx-w23a-file:w23
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-w23a-file-store:/coord-state:ro
+      - orblx-w23a-file-c:/var/lib/orblx
+    networks:
+      - proof
+
+volumes:
+  orblx-w23a-file-store:
+  orblx-w23a-file-a:
+  orblx-w23a-file-b:
+  orblx-w23a-file-c:
+
+networks:
+  proof:
