@@ -111,7 +111,7 @@ class ReleaseSweepTest(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         with open(os.path.join(self.out, "rc3-sweep-testsha-loud.log")) as f:
             lines = f.read().splitlines()
-        body = [l for l in lines if not l.startswith(("proof_lock ", "proof_context ", "proof_contention "))]
+        body = [l for l in lines if not l.startswith(("proof_lock ", "proof_context ", "proof_contention ", "release_sweep: "))]
         self.assertEqual(body[:100000], [str(i) for i in range(1, 100001)])
         self.assertEqual(body[100000:], ["to stderr", "no newline at end", "proof_ok"])
 
