@@ -699,11 +699,30 @@ fn spawn_deny_refresh(options: &UpOptions) {
     thread::spawn(move || loop {
         if let Ok(bundle) = fs::read_to_string(state.join(BUNDLE_FILE)) {
             if let Ok(text) = orblx_coord::fetch_deny_blocking(coord, &name, &bundle, &state) {
-                let _ = fs::write(state.join("deny.json"), text.as_bytes());
+                let _ = store_deny(&state, &text);
             }
         }
-        thread::sleep(Duration::from_secs(10));
+        thread::sleep(DENY_REFRESH);
     });
+}
+
+/// The time between two deny fetches (W24-D).
+///
+/// The SSH server and the file receiver read `deny.json` for each new login or file.
+/// A revoke-all must stop them within 1 s, so the node fetches the deny file each 500 ms.
+const DENY_REFRESH: Duration = Duration::from_millis(500);
+
+/// Write `deny.json` when its text changes.
+///
+/// The function writes a temp file and renames it. A reader never sees a part file.
+fn store_deny(state: &Path, text: &str) -> std::io::Result<()> {
+    let path = state.join("deny.json");
+    if fs::read_to_string(&path).is_ok_and(|old| old == text) {
+        return Ok(());
+    }
+    let temp = state.join(".deny.json.tmp");
+    fs::write(&temp, text.as_bytes())?;
+    fs::rename(&temp, &path)
 }
 
 fn run_down(options: StateOptions) -> Result<(), String> {
@@ -1257,6 +1276,26 @@ mod tests {
     use orblx_identity::{verify_ticket, DenySet, TicketVerifier};
 
     use super::{parse_issue, parse_set, parse_up, run, Command, DEFAULT_STATE_DIR};
+
+    #[test]
+    fn store_deny_replaces_the_file_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("orblx-deny-store-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        super::store_deny(&dir, "{\"version\":1}").unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("deny.json")).unwrap(),
+            "{\"version\":1}"
+        );
+        super::store_deny(&dir, "{\"version\":2}").unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("deny.json")).unwrap(),
+            "{\"version\":2}"
+        );
+        assert!(!dir.join(".deny.json.tmp").exists());
+        assert!(super::DENY_REFRESH <= std::time::Duration::from_millis(500));
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn up_defaults_the_state_directory_and_the_port() {

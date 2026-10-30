@@ -33,7 +33,9 @@ mod store;
 mod ticket;
 mod tlsutil;
 
-pub use admin::{approve, audit, deny_json, deny_set, expire, nodes, revoke, routes, users};
+pub use admin::{
+    approve, audit, deny_json, deny_set, expire, nodes, revoke, revoke_all, routes, users,
+};
 pub use client::{
     admin_blocking, advertise_exit_blocking, advertise_routes_blocking, agent_grant_fetch_blocking,
     agent_grant_request_blocking, enroll_with_oidc_blocking, enroll_with_token_blocking,
