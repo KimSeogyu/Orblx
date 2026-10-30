@@ -359,7 +359,7 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 dc exec -T coord test -s /var/lib/orblx/trust-bundle.pem || fail "no trust bundle"
-coord_ip="$(dc exec -T client getent ahostsv4 coord | awk '{print $1; exit}')"
+coord_ip="$(dc exec -T client getent ahostsv4 coord | awk 'NR == 1 {print $1}')"
 COORD="${coord_ip}:443"
 ADMIN=(--coord "$COORD" --state /var/lib/orblx --bundle /var/lib/orblx/bundle.pem)
 echo "coord ${COORD}"
@@ -508,7 +508,7 @@ cursor_before="$(dc exec -T coord sh -c 'cat /var/lib/orblx/audit-webhooks/*.jso
 printf 'cursor_before %s\n' "$cursor_before" | sed 's/}{/}\ncursor_before {/g'
 dc kill -s SIGKILL coord >/dev/null
 dc start coord >/dev/null
-coord_ip="$(dc exec -T client getent ahostsv4 coord | awk '{print $1; exit}')"
+coord_ip="$(dc exec -T client getent ahostsv4 coord | awk 'NR == 1 {print $1}')"
 COORD="${coord_ip}:443"
 ADMIN=(--coord "$COORD" --state /var/lib/orblx --bundle /var/lib/orblx/bundle.pem)
 for _ in $(seq 1 60); do
