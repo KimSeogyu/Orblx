@@ -277,6 +277,134 @@ shopt -u nullglob
 echo "recording_files ${#rec_files[@]}"
 [[ "${#rec_files[@]}" -eq 1 ]]
 
+echo "=== [C] interactive PTY shell on node b is recorded ==="
+# The input goes in with pauses, as a person types. The shell does not
+# echo the line after `stty -echo`, so the recording keeps only a marker.
+pty_out="$(
+  {
+    sleep 2
+    printf 'echo pty-$((6*7))\n'
+    sleep 2
+    printf 'stty -echo; read -r s; stty echo; echo got-${#s}\n'
+    sleep 2
+    printf 'hidden-w23\n'
+    sleep 2
+    printf 'exit\n'
+    sleep 2
+  } | dc exec -T -e TERM=xterm-256color node-a orblx ssh rec@b \
+    --identity /var/lib/orblx-id/users/alice \
+    --netmap /etc/orblx/netmap.json \
+    --peer-cert /var/lib/orblx-peers/b.pem \
+    --shell
+)"
+printf '%s\n' "$pty_out" | tr -d '\r' | grep -E '^(pty-42|got-10)$'
+printf '%s\n' "$pty_out" | tr -d '\r' | grep -qx 'pty-42'
+printf '%s\n' "$pty_out" | tr -d '\r' | grep -qx 'got-10'
+shopt -s nullglob
+rec_files=("$WORK"/b/recordings/*.cast)
+shopt -u nullglob
+echo "recording_files ${#rec_files[@]}"
+[[ "${#rec_files[@]}" -eq 2 ]]
+pty_file=""
+for candidate in "${rec_files[@]}"; do
+  [[ "$candidate" == "$rec_file" ]] || pty_file="$candidate"
+done
+echo "pty_recording_file recordings/$(basename "$pty_file")"
+echo "---- pty recording ----"
+cat "$pty_file"
+echo "---- end pty recording ----"
+if grep -q 'hidden-w23' "$pty_file"; then
+  echo "The hidden input is in the recording." >&2
+  exit 1
+fi
+echo "hidden_input_not_recorded yes"
+python3 - "$pty_file" <<'PY'
+import json
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+header = json.loads(lines[0])
+events = [json.loads(line) for line in lines[1:]]
+times = [event[0] for event in events]
+assert times == sorted(times), "The event times are not in order."
+codes = {event[1] for event in events}
+assert codes <= {"i", "o", "r", "m"}, codes
+first_input = next(n for n, e in enumerate(events) if e[1] == "i" and "pty-" in e[2])
+first_output = next(n for n, e in enumerate(events) if e[1] == "o" and "pty-42" in e[2])
+assert first_input < first_output, "The output is before its input."
+assert any(e[1] == "m" for e in events), "The hidden input has no marker."
+print("pty_header width %d height %d term %s" % (
+    header["width"], header["height"], header.get("env", {}).get("TERM", "-")))
+print("pty_events %d input %d output %d marker %d" % (
+    len(events),
+    sum(1 for e in events if e[1] == "i"),
+    sum(1 for e in events if e[1] == "o"),
+    sum(1 for e in events if e[1] == "m")))
+print("pty_time_order ok input_before_output ok")
+PY
+pty_sha="$(sha256sum "$pty_file" | cut -d' ' -f1)"
+echo "pty_recording_sha256 ${pty_sha}"
+grep -q "\"kind\":\"record\".*\"recording_sha256\":\"${pty_sha}\"" "$WORK/b/ssh-audit.jsonl"
+echo "chain_has_pty_recording_sha256 yes"
+b_audit="$(dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl)"
+printf '%s\n' "$b_audit"
+echo "$b_audit" | grep -qx 'record 2'
+
+echo "=== [C] one changed byte in the PTY recording fails verify ==="
+cp "$pty_file" "$WORK/pty.orig"
+size="$(stat -c %s "$pty_file")"
+printf 'X' | dd of="$pty_file" bs=1 seek="$((size - 3))" count=1 conv=notrunc status=none
+if bad="$(dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl 2>&1)"; then
+  echo "The changed PTY recording passed verify." >&2
+  exit 1
+fi
+printf 'verify_failed %s\n' "$bad"
+echo "$bad" | grep -q 'recording check failed'
+cp "$WORK/pty.orig" "$pty_file"
+dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl | grep -qx ok
+echo "verify_after_restore ok"
+
+echo "=== [C] PTY shell with a read-only recording directory on node c fails closed ==="
+if c_out="$(printf 'echo leaked\nexit\n' | dc exec -T node-a orblx ssh rec@c \
+  --identity /var/lib/orblx-id/users/alice \
+  --netmap /etc/orblx/netmap.json \
+  --peer-cert /var/lib/orblx-peers/c.pem \
+  --shell 2>&1)"; then
+  echo "The PTY shell on node c was accepted." >&2
+  exit 1
+fi
+printf '%s\n' "$c_out"
+echo "$c_out" | grep -q 'The SSH shell was refused.'
+if echo "$c_out" | grep -q leaked; then
+  echo "The refused shell ran input." >&2
+  exit 1
+fi
+echo "denied pty_recording"
+c_rec_deny="$(grep -c '"kind":"deny".*"reason":"recording"' "$WORK/c/ssh-audit.jsonl" || true)"
+echo "deny_recording ${c_rec_deny}"
+[[ "$c_rec_deny" -ge 2 ]]
+
+echo "=== [C] PTY shell without recording on node b ==="
+plain_out="$(
+  {
+    sleep 2
+    printf 'echo plain-$ORBLX_SSH_USER\n'
+    sleep 2
+    printf 'exit\n'
+    sleep 2
+  } | dc exec -T node-a orblx ssh alice@b \
+    --identity /var/lib/orblx-id/users/alice \
+    --netmap /etc/orblx/netmap.json \
+    --peer-cert /var/lib/orblx-peers/b.pem \
+    --shell
+)"
+printf '%s\n' "$plain_out" | tr -d '\r' | grep -x 'plain-alice'
+shopt -s nullglob
+rec_files=("$WORK"/b/recordings/*.cast)
+shopt -u nullglob
+echo "recording_files ${#rec_files[@]}"
+[[ "${#rec_files[@]}" -eq 2 ]]
+
 echo "=== [C] revoke alice ==="
 stamp="$(date +%s)"
 cat >"$WORK/b/deny.json" <<EOF
