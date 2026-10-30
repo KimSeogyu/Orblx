@@ -29,7 +29,7 @@ cleanup() {
 trap cleanup EXIT
 
 dc() {
-  docker compose --progress quiet --profile nodes -f "$FILE" "$@"
+  docker compose --progress quiet -p "${PROOF_PROJECT:-orblx-agent-proof}" --profile nodes -f "$FILE" "$@"
 }
 
 resolve_name() {
@@ -62,7 +62,7 @@ build_image() {
   # shellcheck source=stage-image.sh
   source "$ROOT/scripts/proof/stage-image.sh"
   image_dir="$(stage_proof_image "$ROOT" "$TARGET_DIR/debug/orblx")"
-  docker build -q -t orblx-agent:w21 "$image_dir"
+  docker build -q -t "${ORBLX_AGENT_IMAGE:-orblx-agent:w21}" "$image_dir"
   rm -rf "$image_dir"
 }
 

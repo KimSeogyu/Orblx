@@ -48,6 +48,7 @@ pub(crate) struct Http {
     max_wait: Duration,
     save_request: Option<PathBuf>,
     send_file: Option<PathBuf>,
+    headers: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -90,6 +91,7 @@ pub(crate) struct Guard {
     service: String,
     target: SocketAddr,
     audit: PathBuf,
+    nonce_file: Option<PathBuf>,
     coord: Option<(SocketAddr, String, PathBuf)>,
     poll: Duration,
     stale: Duration,
@@ -122,6 +124,13 @@ impl Flags {
             .iter()
             .rev()
             .find(|(flag, _)| flag == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.values
+            .iter()
+            .filter(move |(flag, _)| flag == name)
             .map(|(_, value)| value.as_str())
     }
 
@@ -253,6 +262,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
                     "--max-wait",
                     "--save-request",
                     "--send-file",
+                    "--header",
                 ],
             )?;
             let to = flags
@@ -271,6 +281,14 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
                 Some(_) => Some(Duration::from_millis(flags.number("--every-ms", 100)?)),
                 None => None,
             };
+            let mut headers = Vec::new();
+            for text in flags.all("--header") {
+                let (name, value) = text
+                    .split_once(':')
+                    .ok_or_else(|| format!("A --header value needs NAME:VALUE.\n{}", help()))?;
+                headers
+                    .push(orblx_agent::request_header(name, value).map_err(|err| err.to_string())?);
+            }
             let method = flags.get("--method").unwrap_or("GET").to_string();
             let path = flags.get("--path").unwrap_or("/").to_string();
             Ok(Command::Http(Http {
@@ -286,6 +304,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
                 max_wait: Duration::from_secs(flags.number("--max-wait", 400)?),
                 save_request: flags.get("--save-request").map(PathBuf::from),
                 send_file,
+                headers,
             }))
         }
         _ => Err(format!("The mode is not valid.\n{}", help())),
@@ -308,6 +327,7 @@ fn parse_guard(args: &[String]) -> Result<Guard, String> {
             "--service",
             "--target",
             "--audit",
+            "--nonce-file",
             "--poll-ms",
             "--stale-ms",
         ]),
@@ -329,6 +349,7 @@ fn parse_guard(args: &[String]) -> Result<Guard, String> {
         service: flags.need("--service")?.to_string(),
         target: parse_socket(flags.need("--target")?, 0)?,
         audit,
+        nonce_file: flags.get("--nonce-file").map(PathBuf::from),
         coord,
         poll: Duration::from_millis(flags.number("--poll-ms", 200)?),
         stale: Duration::from_millis(flags.number("--stale-ms", 2000)?),
@@ -557,6 +578,8 @@ fn run_guard_command(guard: Guard, http: bool) -> Result<i32, String> {
         verifier,
         netmap_public,
         audit_path: guard.audit,
+        // The TCP guard has no request nonce. The gateway default is AUDIT.nonces.
+        nonce_path: if http { guard.nonce_file } else { None },
         poll: guard.poll,
         stale_after: guard.stale,
     };
@@ -609,6 +632,7 @@ fn run_http(command: Http) -> Result<i32, String> {
                 &service,
                 &command.method,
                 &command.path,
+                &command.headers,
                 command.body.as_bytes(),
                 new_nonce(),
                 SystemTime::now(),
@@ -729,8 +753,8 @@ fn help() -> String {
 orblx agent grant request --agent NAME --node NODE --service NAME --port N [--ttl SECS] [--path PREFIX] --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx agent grant fetch --id ID --out DIR [--wait SECS] --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx agent connect --grant DIR [--to IP:PORT] [--service NAME] [--send TEXT] [--timeout SECS] [--every-ms MS] [--max-wait SECS]
-orblx agent http [--grant DIR] [--to IP:PORT] [--service NAME] [--method M] [--path TARGET] [--body TEXT] [--repeat N] [--timeout SECS] [--every-ms MS] [--max-wait SECS] [--save-request FILE] [--send-file FILE]
-orblx gateway --listen IP:PORT --service NAME --target ADDR [--audit FILE] [--poll-ms MS] [--stale-ms MS] [--coord ADDR] [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx agent http [--grant DIR] [--to IP:PORT] [--service NAME] [--method M] [--path TARGET] [--body TEXT] [--repeat N] [--timeout SECS] [--every-ms MS] [--max-wait SECS] [--save-request FILE] [--send-file FILE] [--header NAME:VALUE]...
+orblx gateway --listen IP:PORT --service NAME --target ADDR [--audit FILE] [--nonce-file FILE] [--poll-ms MS] [--stale-ms MS] [--coord ADDR] [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx agent guard --listen IP:PORT --service NAME --target ADDR [--audit FILE] [--poll-ms MS] [--stale-ms MS] [--coord ADDR] [--state DIR] [--coord-name NAME] [--bundle FILE]
 
 grant request asks the coordinator for one agent grant with the node SVID in the state directory.
@@ -750,6 +774,8 @@ gateway is an HTTP gateway. It reads one request per connection.
 gateway forwards a request only with a valid grant proof, a new nonce, and a path inside the grant path prefix.
 gateway refuses a request without a grant, out of scope, after the end time, or with a used nonce.
 gateway removes the proof headers before it forwards the request. It does not log header values or the query.
+gateway refuses a request with a header that is not the same as the signed header (each header except the proof).
+gateway keeps used nonces in --nonce-file (default AUDIT.nonces), apart from the audit chain. A restart reads that file.
 http sends one HTTP request with a grant proof and a new nonce. Without --grant it sends no proof.
 http with --repeat N sends the same request bytes N times. The second send is a replay.
 http with --every-ms sends a new request each MS until the gateway refuses.
@@ -876,6 +902,42 @@ mod tests {
         ]))
         .unwrap_err()
         .contains("--send-file needs --to"));
+        let Command::Http(with_headers) = parse(&args(&[
+            "http",
+            "--grant",
+            "/tmp/g",
+            "--header",
+            "X-Kind: read",
+            "--header",
+            "X-Team:a",
+        ]))
+        .unwrap() else {
+            panic!("not http");
+        };
+        assert_eq!(
+            with_headers.headers,
+            vec![
+                ("x-kind".to_string(), "read".to_string()),
+                ("x-team".to_string(), "a".to_string())
+            ]
+        );
+        for bad in ["NoColon", "Host: h", "Orblx-Agent-Nonce: 00"] {
+            assert!(parse(&args(&["http", "--grant", "/tmp/g", "--header", bad])).is_err());
+        }
+        let Command::Gateway(gateway) = super::parse_gateway(&args(&[
+            "--listen",
+            "100.64.0.3:8080",
+            "--service",
+            "api",
+            "--target",
+            "127.0.0.1:8081",
+            "--nonce-file",
+            "/tmp/n",
+        ]))
+        .unwrap() else {
+            panic!("not gateway");
+        };
+        assert_eq!(gateway.nonce_file, Some(std::path::PathBuf::from("/tmp/n")));
     }
 
     #[test]
