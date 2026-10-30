@@ -85,7 +85,8 @@ pub(crate) fn open_linux_device(config: &TunConfig) -> Result<tun::Device, Hello
 mod linux {
     use super::{tun_capability_note, Duration, HelloError, TunBridge, TunConfig};
     use std::io::ErrorKind;
-    use tokio::sync::mpsc::{self, error::TryRecvError};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
     use tun::AbstractDevice;
 
     pub(super) fn open(config: &TunConfig) -> Result<TunBridge, HelloError> {
@@ -95,9 +96,16 @@ mod linux {
             .map_err(|err| HelloError::Tun(err.to_string()))?;
         let (from_tun_tx, from_tun_rx) = mpsc::channel(32);
         let (to_tun_tx, to_tun_rx) = mpsc::channel(32);
+        // Two threads: a read poll must not delay a write.
+        let device = Arc::new(device);
+        let reader = Arc::clone(&device);
         std::thread::Builder::new()
-            .name("orblx-tun".to_string())
-            .spawn(move || tun_loop(device, from_tun_tx, to_tun_rx))
+            .name("orblx-tun-read".to_string())
+            .spawn(move || tun_read_loop(reader, from_tun_tx))
+            .map_err(|err| HelloError::Tun(err.to_string()))?;
+        std::thread::Builder::new()
+            .name("orblx-tun-write".to_string())
+            .spawn(move || tun_write_loop(device, to_tun_rx))
             .map_err(|err| HelloError::Tun(err.to_string()))?;
         Ok(TunBridge {
             from_tun: from_tun_rx,
@@ -123,11 +131,11 @@ mod linux {
             .map_err(|err| HelloError::Tun(format!("{} {err}", tun_capability_note())))
     }
 
-    fn tun_loop(
-        device: tun::Device,
-        from_tun: mpsc::Sender<Vec<u8>>,
-        mut to_tun: mpsc::Receiver<Vec<u8>>,
-    ) {
+    /// Read packets from the TUN device.
+    ///
+    /// This thread only reads. The read timeout lets the thread see a closed channel.
+    /// The read timeout does not delay a write, because [`tun_write_loop`] writes on a different thread.
+    fn tun_read_loop(device: Arc<tun::Device>, from_tun: mpsc::Sender<Vec<u8>>) {
         let mut buf = vec![0u8; 65_535];
         loop {
             match device.recv_timeout(&mut buf, Duration::from_millis(50)) {
@@ -138,23 +146,26 @@ mod linux {
                 }
                 Err(err)
                     if err.kind() == ErrorKind::TimedOut
-                        || err.kind() == ErrorKind::Interrupted => {}
+                        || err.kind() == ErrorKind::Interrupted =>
+                {
+                    if from_tun.is_closed() {
+                        return;
+                    }
+                }
                 Err(err) => {
                     eprintln!("The TUN device stopped. {err}");
                     return;
                 }
             }
-            loop {
-                match to_tun.try_recv() {
-                    Ok(packet) => {
-                        if let Err(err) = device.send(&packet) {
-                            eprintln!("The TUN device write failed. {err}");
-                            return;
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => return,
-                }
+        }
+    }
+
+    /// Write packets to the TUN device as soon as they arrive.
+    fn tun_write_loop(device: Arc<tun::Device>, mut to_tun: mpsc::Receiver<Vec<u8>>) {
+        while let Some(packet) = to_tun.blocking_recv() {
+            if let Err(err) = device.send(&packet) {
+                eprintln!("The TUN device write failed. {err}");
+                return;
             }
         }
     }

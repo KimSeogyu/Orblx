@@ -294,6 +294,8 @@ pub struct KeyGate {
     auth: HelloAuth,
     peer_public: Option<[u8; 32]>,
     peer_not_after: Option<u64>,
+    /// The peer leaf DER of the last hello that set `peer_not_after`.
+    peer_der: Option<Vec<u8>>,
     key: Option<[u8; 32]>,
     send_counter: u64,
     replay: Replay,
@@ -335,6 +337,7 @@ impl KeyGate {
             auth,
             peer_public: None,
             peer_not_after: None,
+            peer_der: None,
             key: None,
             send_counter: 0,
             replay: Replay::default(),
@@ -356,6 +359,15 @@ impl KeyGate {
         frame
     }
 
+    /// Use a renewed local leaf SVID for the next hello frames.
+    ///
+    /// The X25519 key and the counters do not change.
+    /// The caller must not log the seed.
+    pub fn set_leaf(&mut self, cert_der: Vec<u8>, seed: &[u8; 32]) {
+        self.auth.cert_der = cert_der;
+        self.auth.signing = SigningKey::from_bytes(seed);
+    }
+
     /// The `not_after` time of the peer SVID as Unix seconds.
     ///
     /// The value is `None` until a signed peer hello is checked.
@@ -373,7 +385,9 @@ impl KeyGate {
         let mut signature = [0u8; 64];
         signature.copy_from_slice(&body[32..HELLO_FIXED]);
         let der = &body[HELLO_FIXED..];
-        if self.peer_public == Some(peer) && self.peer_not_after.is_some() {
+        // The same key and the same leaf were checked before.
+        // A renewed leaf has a different DER, so the node checks it again.
+        if self.peer_public == Some(peer) && self.peer_der.as_deref() == Some(der) {
             return Ok(peer);
         }
         let id = self
@@ -392,7 +406,18 @@ impl KeyGate {
                 &Signature::from_bytes(&signature),
             )
             .map_err(|_| hello_error())?;
-        self.peer_not_after = Some(leaf_not_after(der).map_err(|_| hello_error())?);
+        let not_after = leaf_not_after(der).map_err(|_| hello_error())?;
+        // For the same key, an older leaf does not move the expiry back.
+        // This stops a replay of an old hello.
+        let same_key = self.peer_public == Some(peer);
+        if !same_key
+            || self
+                .peer_not_after
+                .is_none_or(|current| not_after >= current)
+        {
+            self.peer_not_after = Some(not_after);
+            self.peer_der = Some(der.to_vec());
+        }
         Ok(peer)
     }
 
@@ -668,12 +693,16 @@ mod tests {
         }
 
         fn auth(&self, local: &str, peer: &str) -> (HelloAuth, u64) {
+            self.auth_for(local, peer, Duration::from_secs(600))
+        }
+
+        fn auth_for(&self, local: &str, peer: &str, life: Duration) -> (HelloAuth, u64) {
             let issued = self
                 .ca
                 .issue(
                     &SpiffeId::node(local).unwrap(),
                     SystemTime::now(),
-                    Duration::from_secs(600),
+                    life,
                     &DenySet::empty(),
                 )
                 .unwrap();
@@ -750,6 +779,80 @@ mod tests {
         hello[26] ^= 1;
         assert!(right.open_frame(&hello).is_err());
         assert!(!right.ready());
+    }
+
+    #[test]
+    fn a_renewed_hello_moves_the_peer_expiry_forward() {
+        let lab = Lab::new();
+        let id = session_id("node-x", "node-z").unwrap();
+        let (auth, _) = lab.auth_for("node-x", "node-z", Duration::from_secs(300));
+        let mut left = KeyGate::generate(id, "node-x", "node-z", auth).unwrap();
+        let (mut right, _) = gate(&lab, "node-z", "node-x");
+        let first = left.hello_frame();
+        assert_eq!(right.open_frame(&first).unwrap(), Some(Opened::Hello));
+        assert_eq!(
+            left.open_frame(&right.hello_frame()).unwrap(),
+            Some(Opened::Hello)
+        );
+        let before = right.peer_not_after().unwrap();
+        let sealed = left.seal(KIND_DATA, &[1, 2, 3]).unwrap();
+        assert!(right.open_frame(&sealed).unwrap().is_some());
+
+        // The coordinator issues a leaf with a longer life.
+        let issued = lab
+            .ca
+            .issue(
+                &SpiffeId::node("node-x").unwrap(),
+                SystemTime::now(),
+                Duration::from_secs(600),
+                &DenySet::empty(),
+            )
+            .unwrap();
+        assert!(issued.not_after > before);
+        let seed = ed25519_seed_from_private_pem(&issued.private_key_pem).unwrap();
+        left.set_leaf(issued.certificate_der.clone(), &seed);
+        assert_eq!(
+            right.open_frame(&left.hello_frame()).unwrap(),
+            Some(Opened::Hello)
+        );
+        assert_eq!(right.peer_not_after(), Some(issued.not_after));
+
+        // The session key and the counters stay in place.
+        let sealed = left.seal(KIND_DATA, &[4, 5, 6]).unwrap();
+        assert_eq!(
+            right.open_frame(&sealed).unwrap(),
+            Some(Opened::Data(vec![4, 5, 6]))
+        );
+
+        // A replay of the old hello does not move the expiry back.
+        assert_eq!(right.open_frame(&first).unwrap(), Some(Opened::Hello));
+        assert_eq!(right.peer_not_after(), Some(issued.not_after));
+    }
+
+    #[test]
+    fn a_renewed_hello_from_another_ca_is_rejected() {
+        let lab = Lab::new();
+        let other = Lab::new();
+        let (mut left, _) = gate(&lab, "node-x", "node-z");
+        let (mut right, _) = gate(&lab, "node-z", "node-x");
+        assert_eq!(
+            right.open_frame(&left.hello_frame()).unwrap(),
+            Some(Opened::Hello)
+        );
+        let before = right.peer_not_after();
+        let issued = other
+            .ca
+            .issue(
+                &SpiffeId::node("node-x").unwrap(),
+                SystemTime::now(),
+                Duration::from_secs(600),
+                &DenySet::empty(),
+            )
+            .unwrap();
+        let seed = ed25519_seed_from_private_pem(&issued.private_key_pem).unwrap();
+        left.set_leaf(issued.certificate_der.clone(), &seed);
+        assert!(right.open_frame(&left.hello_frame()).is_err());
+        assert_eq!(right.peer_not_after(), before);
     }
 
     #[test]

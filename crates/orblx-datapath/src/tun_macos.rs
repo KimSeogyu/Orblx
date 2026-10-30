@@ -250,8 +250,9 @@ struct SockaddrCtl {
 mod device {
     use std::io::ErrorKind;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::sync::Arc;
 
-    use tokio::sync::mpsc::{self, error::TryRecvError};
+    use tokio::sync::mpsc;
 
     use super::{
         apply_overlay, bsd_ioctl_readwrite, prefix_len, requested_control_unit, utun_index,
@@ -272,9 +273,16 @@ mod device {
             .map_err(HelloError::Tun)?;
         let (from_tun_tx, from_tun_rx) = mpsc::channel(32);
         let (to_tun_tx, to_tun_rx) = mpsc::channel(32);
+        // Two threads: a read poll must not delay a write.
+        let fd = Arc::new(fd);
+        let reader = Arc::clone(&fd);
         std::thread::Builder::new()
-            .name("orblx-tun".to_string())
-            .spawn(move || utun_loop(fd, from_tun_tx, to_tun_rx))
+            .name("orblx-tun-read".to_string())
+            .spawn(move || utun_read_loop(reader, from_tun_tx))
+            .map_err(|err| HelloError::Tun(err.to_string()))?;
+        std::thread::Builder::new()
+            .name("orblx-tun-write".to_string())
+            .spawn(move || utun_write_loop(fd, to_tun_rx))
             .map_err(|err| HelloError::Tun(err.to_string()))?;
         Ok(TunBridge {
             from_tun: from_tun_rx,
@@ -453,11 +461,11 @@ mod device {
         Closed,
     }
 
-    fn utun_loop(
-        fd: OwnedFd,
-        from_tun: mpsc::Sender<Vec<u8>>,
-        mut to_tun: mpsc::Receiver<Vec<u8>>,
-    ) {
+    /// Read packets from the utun device.
+    ///
+    /// This thread only reads. A read poll does not delay a write,
+    /// because [`utun_write_loop`] writes on a different thread.
+    fn utun_read_loop(fd: Arc<OwnedFd>, from_tun: mpsc::Sender<Vec<u8>>) {
         let raw = fd.as_raw_fd();
         loop {
             match read_ipv4(raw) {
@@ -468,23 +476,26 @@ mod device {
                 }
                 Ok(PacketRead::Other) => {}
                 Ok(PacketRead::Closed) => return,
-                Err(err) if is_wait(err.kind()) => {}
+                Err(err) if is_wait(err.kind()) => {
+                    if from_tun.is_closed() {
+                        return;
+                    }
+                }
                 Err(err) => {
                     eprintln!("The utun device stopped. {err}");
                     return;
                 }
             }
-            loop {
-                match to_tun.try_recv() {
-                    Ok(packet) => {
-                        if let Err(err) = write_ipv4(raw, &packet) {
-                            eprintln!("The utun device write failed. {err}");
-                            return;
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => return,
-                }
+        }
+    }
+
+    /// Write packets to the utun device as soon as they arrive.
+    fn utun_write_loop(fd: Arc<OwnedFd>, mut to_tun: mpsc::Receiver<Vec<u8>>) {
+        let raw = fd.as_raw_fd();
+        while let Some(packet) = to_tun.blocking_recv() {
+            if let Err(err) = write_ipv4(raw, &packet) {
+                eprintln!("The utun device write failed. {err}");
+                return;
             }
         }
     }

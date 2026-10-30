@@ -179,6 +179,6 @@ proof_ok
 - The symmetric routers use `--random-fully` over 1024-65535. A NAT with sequential ports makes the prediction better. A NAT with a small port pool or a per-host port limit can make the birthday attempt fail.
 - The birthday attempt is probabilistic. With 256 sockets and up to 2048 probes over 64512 ports, the expected number of hits is about 8, so the chance of no hit is about 0.03 percent. When it fails, the node uses the relay. The node makes one birthday attempt for each process start.
 - Two symmetric NATs always use the relay. The code does not try a punch in that case.
-- The hello carries the SVID at the start of the session. The NAT runtime does not send a new hello after an SVID renewal, so the peer line shows the expiry of the SVID from the hello.
-- The overlay RTT in the lab is about 50 ms on a direct path. It was 100 ms in W19. The bridge RTT is below 1 ms, so the delay is in the node. A poll timer in the node is a possible cause. This change did not measure or fix it.
+- The hello carries the SVID at the start of the session. After an SVID renewal, the NAT runtime now sends a new signed hello on the direct path and on the relay path. See [w20-nat-followup.md](w20-nat-followup.md).
+- The overlay RTT in the lab was about 50 ms on a direct path. The cause was the 50 ms read timeout in the TUN thread: a write waited for the read timeout. The fix and the measurement are in [w20-nat-followup.md](w20-nat-followup.md).
 - One host runs all containers. The bridge has no packet loss and no delay. The switch numbers do not include real WAN loss.
