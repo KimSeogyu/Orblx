@@ -6,7 +6,7 @@
 //! Linux uses the `orblx0` TUN device.
 //! macOS uses a kernel-chosen utun device.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -545,6 +545,8 @@ async fn run_mesh_inner(
             Err(err) => eprintln!("{err}"),
         }
     }
+    apply_lock_allow(&mesh);
+    let lock_mesh = mesh.clone();
     let deny_endpoint = Arc::clone(&endpoint);
     let deny_dir = Arc::clone(&state_dir);
     let mut deny_shutdown = mesh.shutdown.clone();
@@ -561,6 +563,7 @@ async fn run_mesh_inner(
                     if let Some(deny) = read_deny_file(&deny_dir) {
                         deny_endpoint.replace_deny(deny);
                     }
+                    apply_lock_allow(&lock_mesh);
                 }
             }
         }
@@ -798,6 +801,20 @@ fn fresh_netmap(mesh: &Mesh) -> Netmap {
         Ok(netmap) => netmap,
         Err(_) => (*mesh.netmap).clone(),
     }
+}
+
+/// Limit new sessions to the netmap peers when node lock is on (W23-1).
+///
+/// The node lock pass already removed each peer without a trusted owner signature
+/// from the netmap file. Without a node lock file, the endpoint allows every trusted leaf.
+fn apply_lock_allow(mesh: &Mesh) {
+    if !mesh.state_dir.join(crate::NODE_LOCK_FILE).exists() {
+        mesh.endpoint.replace_allow(None);
+        return;
+    }
+    let netmap = fresh_netmap(mesh);
+    let allow: HashSet<String> = netmap.peers.iter().map(|peer| peer.svid.clone()).collect();
+    mesh.endpoint.replace_allow(Some(allow));
 }
 
 fn read_deny_file(dir: &Path) -> Option<DenySet> {

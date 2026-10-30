@@ -35,7 +35,9 @@ pub use exit_route::{plan_exit_routes, underlay_addresses, ExitRoutePlan};
 pub use framing::{decode_length_prefixed, encode_length_prefixed, MAX_FRAME_LEN};
 pub use gate::PeerGate;
 pub use ipv4::{ipv4_destination, ipv4_packet, is_icmp_echo_reply, is_ipv4_packet};
-pub use netmap::{Netmap, NetmapError, NetmapPeer, NetmapSelf};
+pub use netmap::{
+    LockUpdate, Netmap, NetmapError, NetmapPeer, NetmapSelf, NodeLockSig, NODE_LOCK_FILE,
+};
 pub use node::{
     format_node_status, read_status_text, run_memory_node, run_node, running_pid, MemoryDevice,
     NodeRequest, NodeStatus, RenewedLeaf, StatusPeer, SvidRenewer, NODE_PID_FILE, NODE_RECORD_FILE,

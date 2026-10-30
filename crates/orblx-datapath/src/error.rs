@@ -50,6 +50,8 @@ pub enum HelloError {
     EndpointClosed,
     /// The node daemon failed.
     Node(String),
+    /// Node lock is on and the peer is not in the signed peer list (W23-1).
+    NodeLock(String),
 }
 
 impl fmt::Display for HelloError {
@@ -91,6 +93,10 @@ impl fmt::Display for HelloError {
             Self::Connector(detail) => write!(formatter, "The connector failed. {detail}"),
             Self::EndpointClosed => formatter.write_str("The QUIC endpoint is closed."),
             Self::Node(detail) => write!(formatter, "The node failed. {detail}"),
+            Self::NodeLock(peer) => write!(
+                formatter,
+                "Node lock refused the peer {peer}. No trusted owner key signed it."
+            ),
         }
     }
 }
@@ -118,7 +124,8 @@ impl std::error::Error for HelloError {
             | Self::DestinationDenied
             | Self::Connector(_)
             | Self::EndpointClosed
-            | Self::Node(_) => None,
+            | Self::Node(_)
+            | Self::NodeLock(_) => None,
         }
     }
 }
