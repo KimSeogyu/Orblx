@@ -256,6 +256,6 @@ A busy link does not send keepalives.
 
 - REAL: `a_silent_bridge_keeps_its_relay_slot` attaches the accept side over UDP, waits 1.5 s, and attaches the dial side over TCP. The first packet must reach the accept side. The test fails without the fix and passes with it.
 - [C]: `bash scripts/proof/exit-node.sh` prints `The path to exit uses the TCP Relay.` and `proof_ok`.
-- CI: `bash -n` reads only its first file. The old CI step checked only 4 of the scripts on its lines. The CI step now checks each script in `scripts/`, `scripts/proof/` and `scripts/release/`.
+- CI: `bash -n` reads only its first file. The old CI step checked only the first script on each line. The CI step now checks each script in `scripts/`, `scripts/proof/` and `scripts/release/`.
 
 Logs are in `/workspace/orblx-w18-proof/` on the proof host: `w256-git-bisect.log`, `w256-bisect-*-exit-node.log` and `w256-*-exit-node-run*.log`.
