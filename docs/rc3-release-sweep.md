@@ -1,71 +1,84 @@
-# rc.3 release sweep
+# W25-17 proof sweep runner (rc.3 condition 4)
 
-This change adds the release sweep for rc.3 condition 4.
-It changes scripts and docs only. It does not change datapath code, crypto, or the wire format.
+`scripts/proof/release-sweep.sh` runs, in one command, every proof that backs a shipped row of
+the Tailscale gap matrix on one commit. The proofs run one at a time under the W25-5 box proof
+lock. The exit code is not 0 when a proof fails or when a shipped row has no proof. This is rc.3
+condition 4, and later the nightly run on main (the nightly schedule is not in this change).
 
-Marks: **[C]** = shown in the container proof. **REAL** = shown on the real host (the Linux box). Every node, router, coordinator and relay in the proofs is a [C] container.
+The rc.3 sweep counts only on a commit that has the W25-14 and the W25-6b merges.
 
-## Why
-
-The exit-node proof over the TCP Relay broke in #45, before rc.2. No gate found it, because each proof ran only on its own PR. Condition 4 of rc.3: on the rc.3 candidate commit, every proof that backs a "shipped" row of the Tailscale gap matrix must run serially under the proof lock and print `proof_ok`.
-
-## The sweep
+## Commands
 
 ```bash
-scripts/proof/release-sweep.sh COMMIT
+scripts/proof/release-sweep.sh --plan COMMIT   # list every row and its proof, and a time estimate
+scripts/proof/release-sweep.sh COMMIT          # run the sweep
 ```
 
-1. The script resolves `COMMIT` (after `git fetch origin`) and makes a detached worktree of it (`/workspace/orblx-rc3-sweep-<sha>`).
-2. It builds the release binary there with the `~/.cargo/bin` toolchain (the build log has the `rustc --version` line). It also builds the debug binaries that the older proofs use, so that no proof compiles while it holds the lock.
-3. It runs each proof of the list below, one at a time, from that worktree. A wrapper takes the W25-5 box proof lock (`proof-lock.sh`) before the proof starts and releases it after the proof ends. Since W25-14 every proof takes the lock itself; it sees that its parent (the wrapper) holds it and does not wait again.
-4. The log of each proof is `/workspace/orblx-w18-proof/rc3-sweep-<sha>-<proof>.log`. The table is `/workspace/orblx-w18-proof/rc3-sweep-<sha>.md`. The table has 4 columns: proof, gap row, log path, result.
-5. The log of a proof is the full stdout and stderr of the proof, with no filter and no cut. The sweep adds only the lock lines (`proof_lock`, `proof_context`, `proof_contention`) and its own `release_sweep:` notes. A step that a proof script filters itself is filtered in the log too; the sweep does not change the proof scripts. Since W25-14d (#101) no proof pipes `cargo` output into a filter, and the excerpt steps use `show_matching`, which prints the full step output when no line matches. The sweep takes a `show_matching: no line matches` or `secret_scan:` line as an error line.
-6. After each proof, the script removes the images that the proof built (without `-f`, so an image that a running container uses stays). At the end, it removes the worktree and its target.
+`--plan` does not build and does not run a proof. It checks that each proof script is in
+`COMMIT`, prints every row with its proofs, and prints a time estimate. The estimate of a proof
+is its run time under the lock (from the lock `acquired` line to the `released` line, or the
+sweep marks) in its newest passing log in `ORBLX_SWEEP_OUT`. A proof with no such log is listed
+as "no measure", and the total is the sum of the measured proofs only, plus the build and the
+lock waits. The plan exits 1 when a row has no proof or a script is missing.
 
-Result rules:
+The run:
 
-| Result | Rule |
+1. It resolves `COMMIT` (after `git fetch origin`) and makes a detached worktree
+   (`/workspace/orblx-rc3-sweep-<sha>`).
+2. It builds the release binary there with the `~/.cargo/bin` toolchain (the build log has the
+   `rustc --version` line), and the debug binaries that the older proofs use, so no proof
+   compiles while it holds the lock.
+3. It runs each proof of the manifest once, from that worktree. A wrapper takes the box proof
+   lock before the proof starts and releases it after the proof ends. Since W25-14 each proof
+   takes the lock itself; it sees that its parent holds it and does not wait again. The
+   timeout (`ORBLX_SWEEP_TIMEOUT`) counts only the proof, not the lock wait.
+4. It writes the summary `/workspace/orblx-w18-proof/rc3-sweep-<sha>.md` after each proof.
+5. After each proof it removes the images of that proof (without `-f`). At the end it removes
+   the worktree and its target.
+
+There is no retry, no skip and no "run until it passes": each proof runs once. A failed proof
+does not stop the sweep. `ORBLX_SWEEP_ONLY` runs some proofs only; such a run never counts
+(exit 3 at best, and the summary says "Partial run").
+
+| Exit | Meaning |
 |---|---|
-| `proof_ok` | The proof exit code is 0 and the log has a line `proof_ok` (`docker-image.sh` adds fields after it; `w18-linux-daemon.sh` prints `W18 proof passed`). |
-| `FAIL (exit N): LINE` | Any other case. `LINE` is the first log line that matches `error`, `FAIL`, `failed`, `panicked`, `: line N:`, `command not found`, `No such file`, `timed out`, `Traceback`, `show_matching: no line matches` or `secret_scan:`. When no line matches, it is the last log line. |
-| `FAIL (exit 0, no proof_ok line)` | The proof skipped itself (for example, it was not root). A skip is not a pass. |
-| `FAIL (exit 0, no pass line RE)` | A proof with its own pass line (`sym-throughput`: `^sym_gate ok: `) ended with exit 0 but without that line. |
-| `FAIL (exit 124, timeout ...)` | The proof ran longer than `ORBLX_SWEEP_TIMEOUT` (default 3600 s, the lock wait does not count). |
+| 0 | Every row passed: each of its proofs gave its pass line. |
+| 1 | A proof failed, or a shipped row has no proof. The summary line `Failed rows: ...` names the rows. |
+| 2 | Setup, manifest or build error. |
+| 3 | `ORBLX_SWEEP_ONLY` run with no failure. It does not count. |
 
-A failed proof does not stop the sweep. The exit code is 1 when a proof failed, 2 when the setup or the build failed, and 0 when every proof gave `proof_ok`.
+## Manifest
 
-The script sends no proof output through a pipe. The output goes to the log file, and the checks read the whole file (the `has_line` helper of #94, and awk with no early exit). So no reader can end early and cause SIGPIPE (exit 141) under `set -o pipefail`. `scripts/proof/tests/test_no_early_pipe_reader.py` also checks `release-sweep.sh` now.
+`scripts/proof/sweep-manifest.txt` maps the shipped rows (by the row number of the gap matrix)
+to their proofs, and holds the settings of each proof:
 
-| Env | Default | Meaning |
-|---|---|---|
-| `ORBLX_SWEEP_OUT` | `/workspace/orblx-w18-proof` | Log and table directory. |
-| `ORBLX_SWEEP_WT` | `/workspace/orblx-rc3-sweep-<sha>` | Worktree path. |
-| `ORBLX_SWEEP_ONLY` | every proof | Space list of proof names. |
-| `ORBLX_SWEEP_TIMEOUT` | 3600 | Seconds for each proof, without the wait for the lock. |
-| `ORBLX_SWEEP_KEEP` | 0 | 1 keeps the worktree, the target and the images. |
-| `ORBLX_SWEEP_FETCH` | 1 | 0 does not run `git fetch`. |
-| `ORBLX_SWEEP_PROGRESS` | none | A file. The script adds one line for each step. |
-| `ORBLX_SWEEP_LOCK_MODE` | `proof` | `proof`: take the lock for each proof, so other proofs can run between two sweep proofs. `sweep`: take the lock once and hold it for all the proofs. |
-| `ORBLX_SWEEP_LIST`, `ORBLX_SWEEP_TEST_ROOT` | none | Test only (`tests/test_release_sweep.py`). |
+- `row|NUMBER|FEATURE|PROOFS`: one line for each shipped row. `PROOFS` is a list of proof
+  names, or `-`. A row with `-` is `FAIL: no proof for this shipped row`, and the sweep exits 1.
+- `gate|NAME|TEXT|PROOFS`: a gate with no shipped row of its own (W23-4 sym gate).
+- `proof|NAME|SCRIPT|ENV|IMAGES[|PASS ERE[|STEP LOGS]]`: the script, its env (`@BIN@` is the
+  release binary), its images, the pass line (default `proof_ok`), and the logs that the proof
+  writes to its own files.
 
-The script runs git as the caller. It runs the build and the proofs with `sudo -n` when the caller is not root, so it never asks for a password.
+The script stops with exit 2 when a row names an unknown proof or a proof backs no row. The
+sweep reads the manifest of `COMMIT`; when the commit has none (an older commit), it reads the
+manifest of the checkout of the script, and the summary says so.
 
-## Shipped rows and their proofs
+Source of the rows: the Page "Orblx vs Tailscale 기능 격차 매트릭스 + Wave 계획" (not in this
+repository) and the PO list of 2026-10-31: rows 17, 24, 38, 51 and 52 are shipped, plus the
+earlier rows. The proof of each row comes from the evidence doc that the row names.
 
-Source: the Page "Orblx vs Tailscale 기능 격차 매트릭스 + Wave 계획" (the gap matrix is not in this repository). It has 26 shipped rows (row 17 shipped with W25-6). The proof of each row comes from the `docs/wNN-*.md` file that the row names as its evidence.
-
-| Row | Feature | Evidence doc | Proof in the sweep |
+| Row | Feature | Evidence doc | Proofs |
 |---|---|---|---|
 | 1 | P2P mesh datapath | `w18-linux-daemon.md` | `w18-linux-daemon` |
 | 9 | Subnet routers | `w18-subnet.md` | `subnet` |
 | 10 | Split tunneling / accept-routes | `w18-subnet.md` | `subnet` |
 | 11 | Exit nodes | `w19-exit-node.md` | `exit-node` |
 | 16 | MagicDNS | `w18-names.md` | `w18-names` |
-| 17 | Split DNS (Linux only) | `w25-6-policy-sync.md` | `policy-sync` |
+| 17 | Split DNS / policy sync (Linux only) | `w24-split-dns.md`, `w25-6-policy-sync.md` | `split-dns`, `policy-sync` |
 | 19 | ACL policy file | `w18-policy.md`, `w24-port-acl.md` | `policy`, `datapath-acl` |
 | 21 | ACL tests | `w18-policy.md` | `policy` |
 | 24 | GitOps for ACLs | `w25-policy-gitops.md` | `policy-gitops` (`examples/policy-gitops/proof/proof.sh`) |
-| 28 | Node key expiry / auth period | `gyeol-identity/src/clock.rs` (code constants) | **none: gap** (no proof script) |
+| 28 | Node key expiry / auth period | `crates/orblx-identity/src/clock.rs` (code constants) | **none: the sweep fails on this row** |
 | 29 | Key / SVID rotation UX | `w18-svid-renew.md`, `w20-nat-followup.md` | `svid-renew`, `nat-realism` |
 | 30 | Revocation / device removal | `w19-admin-cli.md`, `w24-revoke-all.md`, `w25-revoke-followup.md` | `admin`, `revoke-all`, `revoke-followup` |
 | 31 | Device approval | `w19-admin-cli.md` | `admin` |
@@ -76,42 +89,139 @@ Source: the Page "Orblx vs Tailscale 기능 격차 매트릭스 + Wave 계획" (
 | 41 | SSH session recording | `w22-ssh-recording.md`, `w23-ssh-pty-recording.md` | `ssh` |
 | 45 | Taildrop | `w23-file-send.md` | `file-send` |
 | 49 | Configuration audit logs | `w20-config-audit.md` | `config-audit` |
+| 51 | Log streaming (SIEM) | `w25-siem-streaming.md` | `siem-streaming` |
 | 52 | Webhooks | `w25-audit-webhooks.md` | `audit-webhooks` |
 | 53 | status / netcheck / ping / metrics | `w19-admin-cli.md` | `admin` |
-| 54 | Linux client | `w18-linux-daemon.md`, `w23-release.md` | `w18-linux-daemon`; **gap** for the rc.2 real install (`release-real.sh` installs a published GitHub release, not a commit) |
+| 54 | Linux client | `w18-linux-daemon.md`, `w23-release.md` | `w18-linux-daemon` (the rc.2 real install part is `release-real.sh`, which tests a published release, not a commit) |
 | 58 | Docker image | `w25-docker-image.md` | `docker-image` |
 | 61 | CLI UX (login/up/down/set) | `w18-linux-daemon.md`, `w18-coord-enroll.md`, `w19-exit-node.md` | `w18-linux-daemon`, `coord-enroll`, `exit-node` |
 | 62 | Admin CLI / console | `w19-admin-cli.md` | `admin` |
+| W23-4 gate | sym relay throughput: sym_sym median of at least 5 runs of 30 s at or above 1113 Mbit/s (#104) | `w25-sym-throughput.md` | `sym-throughput` |
 
-Gate with no shipped row:
+27 shipped rows, one gate, 25 proofs. Row 28 has no proof script (its evidence is the TTL
+constants in `clock.rs` and their unit tests), so every sweep fails on row 28 until a proof for
+it is in the manifest. The sweep does not hide this row.
 
-| Gate | Evidence doc | Proof in the sweep |
+## Results and logs
+
+| Result | Rule |
+|---|---|
+| `proof_ok` | The proof exit code is 0 and the log has its pass line: a `proof_ok` line (`docker-image.sh` adds fields after it; `w18-linux-daemon.sh` prints `W18 proof passed`), or the pass line of the manifest (`sym-throughput`: `^sym_gate ok: `). |
+| `FAIL (exit N): LINE` | Any other case. `LINE` is the first log line that matches `error`, `FAIL`, `failed`, `panicked`, `: line N:`, `command not found`, `No such file`, `timed out`, `Traceback`, `show_matching: no line matches` or `secret_scan:`. When no line matches, it is the last log line. |
+| `FAIL (exit 0, no proof_ok line)` | The proof skipped itself (for example, it was not root). A skip is not a pass. |
+| `FAIL (exit 0, no pass line RE)` | A proof with its own pass line ended with exit 0 but without that line. |
+| `FAIL (exit 124, timeout ...)` | The proof ran longer than `ORBLX_SWEEP_TIMEOUT`. |
+| `FAIL: no proof for this shipped row` | The manifest row has `-`. |
+
+The summary has one line for each row and proof: row, feature, proof, result, log path, time
+(`T s (run R s, lock wait W s)`) and the `proof_contention` line of the proof (samples,
+contended samples, the most other orblx containers, the most load). Then `Failed rows: ...`,
+and the proof count and the total time.
+
+The log of a proof (`/workspace/orblx-w18-proof/rc3-sweep-<sha>-<proof>.log`) is the full
+stdout and stderr of the proof, with no filter and no cut. The sweep adds only its own lines
+(`proof_lock`, `proof_context`, `proof_contention`, `release_sweep:`). When a proof writes step
+output to files of its own (`sym-throughput`: `target/sym-throughput/runN.log` of
+`serial-rtt.sh`), the sweep adds each file, whole, after the proof output
+(`=== release_sweep: step log ... (full) ===`). The sweep does not change the proof scripts
+(W25-14 owns them); since W25-14d (#101) no proof pipes `cargo` output into a filter.
+
+The script sends no proof output through a pipe. The checks read the whole file (the
+`has_line` helper of #94, and awk with no early exit), so no reader can end early and cause
+SIGPIPE (exit 141) under `set -o pipefail`.
+
+| Env | Default | Meaning |
 |---|---|---|
-| W23-4 sym relay throughput: the sym_sym relay median of at least 5 runs with a 30 s bulk is at or above 1113 Mbit/s (W25-12, #104) | `w25-sym-throughput.md` | `sym-throughput` |
+| `ORBLX_SWEEP_OUT` | `/workspace/orblx-w18-proof` | Log and summary directory. |
+| `ORBLX_SWEEP_WT` | `/workspace/orblx-rc3-sweep-<sha>` | Worktree path. |
+| `ORBLX_SWEEP_MANIFEST` | the manifest of `COMMIT` | Manifest file. |
+| `ORBLX_SWEEP_ONLY` | every proof | Space list of proof names. A partial run, exit 3 at best. |
+| `ORBLX_SWEEP_TIMEOUT` | 3600 | Seconds for each proof, without the lock wait. |
+| `ORBLX_SWEEP_KEEP` | 0 | 1 keeps the worktree, the target and the images. |
+| `ORBLX_SWEEP_FETCH` | 1 | 0 does not run `git fetch`. |
+| `ORBLX_SWEEP_PROGRESS` | none | A file. The script adds one line for each step. |
+| `ORBLX_SWEEP_LOCK_MODE` | `proof` | `proof`: take the lock for each proof. `sweep`: take the lock once and hold it for all the proofs. |
+| `ORBLX_SWEEP_TEST_ROOT` | none | Test only (`tests/test_release_sweep.py`). |
 
-The gap matrix rows near it (4 Relay, 8 Throughput / latency) are `partial`, not shipped, so the table column says `W23-4 sym gate (no shipped row)`.
-
-Gaps (a shipped row, or part of one, with no proof script that the sweep can run on a commit):
-
-- Row 28: the evidence is the TTL constants in `clock.rs` (unit tests only). No proof script.
-- Row 54, rc.2 install part: `scripts/proof/release-real.sh` checks a published release tag from github.com. It does not test a commit, so it is not in the sweep. Run it after the rc.3 tag.
-
-The sweep has 23 proofs: 22 for the shipped rows and `sym-throughput`. The proof list is the `PROOFS` variable in the script. When a shipped row changes, change the list and this table together.
+The script runs git as the caller. It runs the build and the proofs with `sudo -n` when the
+caller is not root, so it never asks for a password.
 
 ## Proof settings
 
 - `nat-realism`: `ORBLX_NATR_PROFILE=release`, own names `orblx-rc3sw-natr`.
 - `revoke-followup`: `ORBLX_PROOF_PROFILE=release` (its default).
-- `api-tokens`, `token-no-escalation`, `audit-webhooks`, `policy-gitops`: the release binary (`TOKENS_BIN`, `ESC_BIN`, `HOOKS_BIN`, `GITOPS_BIN`) and own `orblx-rc3sw-*` project and image names.
-- `policy-sync`: `ORBLX_SYNC_PROFILE=release` (its default) and own names `orblx-rc3sw-sync`. Linux only (gap matrix row 17).
-- `sym-throughput`: own names `orblx-rc3sw-symt` (the `ORBLX_NATR_*` variables pass to the five release `nat-realism.sh` runs of `serial-rtt.sh`). It passes only with the line `sym_gate ok: ...` and exit 0; a `proof_ok` of one run is not enough. `serial-rtt.sh` writes each run to `target/sym-throughput/runN.log`; the sweep adds each run log, whole, to the end of the sweep log (`=== release_sweep: step log ... (full) ===`).
-- `docker-image`: own `orblx-rc3sw-*` names. It builds `docker/Dockerfile` (release build in the image).
-- The other proofs have no binary setting. They use the debug binary of the same commit (the sweep builds it before the first proof) and their fixed names.
+- `api-tokens`, `token-no-escalation`, `audit-webhooks`, `policy-gitops`, `siem-streaming`: the
+  release binary (`TOKENS_BIN`, `ESC_BIN`, `HOOKS_BIN`, `GITOPS_BIN`, `SIEM_BIN`) and own
+  `orblx-rc3sw-*` project and image names.
+- `split-dns`, `policy-sync`: own `orblx-rc3sw-*` project and image names; `policy-sync` uses
+  `ORBLX_SYNC_PROFILE=release` (its default). Linux only.
+- `sym-throughput`: own names `orblx-rc3sw-symt` (the `ORBLX_NATR_*` variables pass to the five
+  release `nat-realism.sh` runs of `serial-rtt.sh`). Its pass line is `sym_gate ok: ...`; a
+  `proof_ok` of one run is not enough.
+- `docker-image`: own `orblx-rc3sw-*` names. It builds `docker/Dockerfile`.
+- The other proofs have no binary setting. They use the debug binary of the same commit (the
+  sweep builds it before the first proof) and their fixed names.
 - Each proof gets `PROOF_LOG` set to its log, so the secret checks also read the log.
 
-## Dry run on main
+## Tests
 
-This dry run is for early detection only. **It does not count for rc.3.** The real sweep runs later on a commit that has the W25-14 merge.
+`scripts/proof/tests/test_release_sweep.py` (no git, no build, no Docker):
+
+- every proof runs once, a failure does not stop the sweep, and `Failed rows:` names the rows;
+- negative test: one proof made to fail makes the sweep exit 1 and names its row;
+- a shipped row with no proof fails the sweep; a bad manifest is exit 2;
+- a skip (exit 0, no `proof_ok`) is a FAIL; a partial run is exit 3;
+- the log keeps the full proof output (100000 lines, stderr, a last line with no newline) and
+  the step logs, whole;
+- the lock is taken (lock mode `proof` and `sweep`);
+- `--plan` lists every row and proof and prints the estimate;
+- the real manifest has every shipped row, and each proof it names is defined.
+
+`scripts/proof/tests/test_no_early_pipe_reader.py` checks the script for early pipe readers.
+
+## Plan on main
+
+`scripts/proof/release-sweep.sh --plan 92c698e7` (main on 2026-10-31 04:25 KST, with the
+manifest of this change):
+
+| proof | rows | estimate s (proof run, no lock wait) | source log |
+|---|---|---|---|
+| w18-linux-daemon | 1, 54, 61 | 37 | rc3-sweep-cd6c8eea-w18-linux-daemon.log |
+| coord-enroll | 33, 61 | no measure | - |
+| subnet | 9, 10 | 20 | rc3-sweep-cd6c8eea-subnet.log |
+| exit-node | 11, 61 | no measure | - |
+| w18-names | 16 | 28 | w25n-main-8996f4e8-w18-names.log |
+| split-dns | 17 | 66 | w25n-main-8996f4e8-split-dns.log |
+| policy-sync | 17 | 196 | w256-w256b-eb57e2b4-policy-sync-run1.log |
+| policy | 19, 21 | 49 | w25n-main-a5a38013-policy.log |
+| datapath-acl | 19 | no measure | - |
+| policy-gitops | 24 | no measure | - |
+| svid-renew | 29 | no measure | - |
+| nat-realism | 29 | 323 | w25o-r1-release-nat-realism.log |
+| admin | 30, 31, 53, 62 | 63 | rc3-sweep-cd6c8eea-admin.log |
+| revoke-all | 30 | 64 | rc3-sweep-cd6c8eea-revoke-all.log |
+| revoke-followup | 30 | 274 | rc3-sweep-cd6c8eea-revoke-followup.log |
+| api-tokens | 35 | 35 | rc3-sweep-cd6c8eea-api-tokens.log |
+| token-no-escalation | 35 | 32 | rc3-sweep-cd6c8eea-token-no-escalation.log |
+| node-share | 38 | 89 | rc3-sweep-cd6c8eea-node-share.log |
+| ssh | 40, 41 | 34 | rc3-sweep-cd6c8eea-ssh.log |
+| file-send | 45 | 86 | rc3-sweep-cd6c8eea-file-send.log |
+| config-audit | 49 | 32 | w25n-main-8996f4e8-config-audit.log |
+| siem-streaming | 51 | no measure | - |
+| audit-webhooks | 52 | no measure | - |
+| docker-image | 58 | no measure | - |
+| sym-throughput | W23-4 | no measure | - |
+
+Rows: 28. Proofs: 25.
+Estimate: 1428 s (23 min) for the 16 proofs with a measure (the run time under the lock, from the newest passing log in /workspace/orblx-w18-proof), plus the build and the lock waits. No measure: coord-enroll exit-node datapath-acl policy-gitops svid-renew siem-streaming audit-webhooks docker-image sym-throughput.
+Plan FAIL: rows 28.
+
+The plan fails on row 28 (no proof). The real rc.3 sweep runs later, on a commit with the
+W25-14 and W25-6b merges, when the PO says so.
+
+## Proof dry run on main (pass 1)
+
+This run used the first version of the script (one line for each proof, no manifest). It is for early detection only. **It does not count for rc.3.** The real sweep runs later on a commit that has the W25-14 and W25-6b merges.
 
 Commit: `cd6c8eea` (main at the start of the dry run, before W25-6, W25-14 and the FIFO lock). Started 00:29:53 KST, lock mode `proof`. The build took about 1 min. The other proofs of the box ran at the same time, so most of each proof time below is the wait for the lock. The live table is `/workspace/orblx-w18-proof/rc3-sweep-cd6c8eea.md`. `policy-sync` and `sym-throughput` are not in this commit.
 
@@ -144,9 +254,9 @@ State at the merge of this PR (18 of 21 proofs done; `config-audit`, `audit-webh
 
 ## Limits
 
-- The dry run started before W25-14c (#99). Then `flock` did not serve waiters in order: other workers ran `nat-realism.sh` in loops, and the sweep waited up to about 24 minutes for one proof. #99 makes the lock first come, first served, so a sweep proof now waits at most for the queue in front of it. `ORBLX_SWEEP_LOCK_MODE=sweep` still makes the sweep wait once and then hold the lock until it ends.
+- The dry run started before W25-14c (#99). Then `flock` did not serve waiters in order: other workers ran `nat-realism.sh` in loops, and the sweep waited about 50 minutes for one proof (`ssh`). #99 makes the lock first come, first served, so a sweep proof now waits at most for the queue in front of it. `ORBLX_SWEEP_LOCK_MODE=sweep` still makes the sweep wait once and then hold the lock until it ends.
 - The lock only orders the proofs that take it. A proof that does not take the lock (from another branch or another agent) can run at the same time. Proofs with fixed container names or subnets (for example `subnet.sh`, `exit-node.sh`) can then collide with the same proof of another worktree.
 - The `proof_context` and `proof_contention` lines count every other running orblx container. For the proofs with fixed names, this count includes the containers of the proof itself.
 - The proofs with no binary setting use a debug binary, not the release binary.
 - The "first error line" is a text match. A proof that prints an expected error before its real failure gives the expected line. The exit code and the log path are in the row.
-- The real sweep is Linux only (`flock`, `timeout`, Docker). On a host with no `timeout` (macOS CI), a proof runs with no time limit; with no `flock`, it runs without the lock. The unit test runs on both.
+- The sweep is Linux only (`flock`, `timeout`, Docker). On a host with no `timeout` (macOS CI), a proof runs with no time limit; with no `flock`, it runs without the lock. The unit test runs on both.
