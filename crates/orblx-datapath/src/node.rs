@@ -1056,10 +1056,10 @@ async fn accept_loop(mut mesh: Mesh) {
                         });
                     }
                     Err(HelloError::EndpointClosed) => return,
-                    Err(err) => {
-                        eprintln!("The node did not accept a peer. {err}");
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                    }
+                    // The error is for one connection only. The next accept waits for a new
+                    // connection, so the loop does not spin. A pause here would delay each
+                    // connection behind it, for example after a peer stops its extra dial attempts.
+                    Err(err) => eprintln!("The node did not accept a peer. {err}"),
                 }
             }
         }
@@ -1121,7 +1121,7 @@ async fn reconnect(
     remote_tx: &watch::Sender<u64>,
     task: &mut JoinHandle<()>,
 ) {
-    let Some((session, relay_face)) = dial_once(mesh, peer).await else {
+    let Some((session, relay_face)) = dial_once(mesh, peer, false).await else {
         return;
     };
     let next = spawn_link(
@@ -1144,27 +1144,47 @@ async fn dial_ready(
     mesh: &mut Mesh,
     peer: &NetmapPeer,
 ) -> Option<(HelloSession, Option<crate::relay_path::RelayFace>)> {
+    let fast_until = Instant::now() + FAST_DIAL_WINDOW;
     loop {
         if stopped(mesh) {
             return None;
         }
-        if let Some(session) = dial_once(mesh, peer).await {
+        let fast = Instant::now() < fast_until;
+        if let Some(session) = dial_once(mesh, peer, fast).await {
             return Some(session);
         }
+        let pause = if fast {
+            FAST_DIAL_PROBE
+        } else {
+            Duration::from_secs(1)
+        };
         tokio::select! {
             changed = mesh.shutdown.changed() => {
                 if changed.is_err() || *mesh.shutdown.borrow() {
                     return None;
                 }
             }
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            _ = tokio::time::sleep(pause) => {}
         }
     }
 }
 
+/// The time after the start of a dial task, or after a session ends, with fast dial attempts.
+///
+/// A peer can enroll, and so be in the netmap, before its UDP listener is up.
+/// In this window the node starts a new QUIC attempt each [`FAST_DIAL_PROBE`] in one dial
+/// attempt, and it waits only [`FAST_DIAL_PROBE`] after a failed dial attempt.
+/// After the window, the node uses one QUIC attempt at a time and waits 1 s after a failed dial attempt.
+const FAST_DIAL_WINDOW: Duration = Duration::from_secs(10);
+/// The time between two QUIC attempts to one endpoint in the fast dial window.
+const FAST_DIAL_PROBE: Duration = Duration::from_millis(250);
+/// The time limit of one dial attempt to one endpoint.
+const DIAL_ATTEMPT: Duration = Duration::from_secs(3);
+
 async fn dial_once(
     mesh: &mut Mesh,
     peer: &NetmapPeer,
+    fast: bool,
 ) -> Option<(HelloSession, Option<crate::relay_path::RelayFace>)> {
     for endpoint_text in &peer.endpoints {
         if stopped(mesh) {
@@ -1180,7 +1200,14 @@ async fn dial_once(
                 continue;
             }
         };
-        let connect = mesh.endpoint.connect_one(addr);
+        let endpoint = Arc::clone(&mesh.endpoint);
+        let connect = async move {
+            if fast {
+                endpoint.connect_probed(addr, FAST_DIAL_PROBE).await
+            } else {
+                endpoint.connect_one(addr).await
+            }
+        };
         let result = tokio::select! {
             changed = mesh.shutdown.changed() => {
                 if changed.is_err() || *mesh.shutdown.borrow() {
@@ -1188,7 +1215,7 @@ async fn dial_once(
                 }
                 continue;
             }
-            result = tokio::time::timeout(Duration::from_secs(3), connect) => result,
+            result = tokio::time::timeout(DIAL_ATTEMPT, connect) => result,
         };
         match result {
             Ok(Ok(session)) => {
