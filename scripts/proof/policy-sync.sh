@@ -62,6 +62,10 @@ cleanup() {
 . "$ROOT/scripts/proof/proof-lock.sh"
 trap 'cleanup; proof_lock_end' EXIT
 proof_lock_take "policy-sync:${PROOF_PROJECT}" "${PROOF_PROJECT}-"
+# W25-14b: start from a clean compose state (all profiles, all volumes).
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
+proof_compose_clean "${PROOF_PROJECT:-orblx-w256-sync-proof}" || exit 1
 
 fail() {
   echo "$1" >&2
