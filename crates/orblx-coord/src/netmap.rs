@@ -108,6 +108,14 @@ impl NetmapKey {
         })
     }
 
+    pub(crate) fn sign_agent_grant(
+        &self,
+        grant: &orblx_agent::AgentGrant,
+    ) -> Result<orblx_agent::SignedAgentGrant, CoordError> {
+        orblx_agent::sign_grant(&self.signing, grant)
+            .map_err(|err| CoordError::Protocol(err.to_string()))
+    }
+
     pub fn sign_endpoint(&self, name: &str, endpoint: &str) -> Result<SignedEndpoint, CoordError> {
         let payload = endpoint_sign_payload(name, endpoint).map_err(|_| CoordError::Endpoint)?;
         let sig = STANDARD.encode(self.signing.sign(payload.as_bytes()).to_bytes());

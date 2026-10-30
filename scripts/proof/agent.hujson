@@ -1,0 +1,14 @@
+{
+  // Agent JIT grant proof.
+  // Node a may open any TCP port on node b. The agent guard on b is the gate.
+  "nodeApproval": true,
+  "owners": ["spiffe://orblx.local/node/owner"],
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a"],
+      "proto": "tcp",
+      "dst": ["spiffe://orblx.local/node/b:*"],
+    },
+  ],
+}

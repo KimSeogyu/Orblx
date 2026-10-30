@@ -1,0 +1,485 @@
+//! The grant guard on the target node.
+//!
+//! The guard listens on `overlay:port` for one service.
+//! Each new connection sends one proof line first.
+//! The guard checks the line, then forwards the connection to the local service.
+//! A poll thread fetches the deny document. The guard refuses every new
+//! connection when the last good deny fetch is older than `stale_after`.
+//! The guard writes grant, use, deny, expire, and revoke records to a hash chain.
+
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, SystemTime};
+
+use orblx_audit::{sha256_digest, ConfigAction, ConfigEvent, ConfigLog, EMPTY_DIGEST};
+use orblx_identity::{DenySet, SpiffeId, TicketVerifier, TrustBundle};
+
+use crate::grant::AgentGrant;
+use crate::hex::encode_hex;
+use crate::proof::{open_use, unix_millis, Admitted, Refused, UseTarget, UseTrust};
+use crate::AgentError;
+
+const MAX_LINE: usize = 32 * 1024;
+const LINE_TIMEOUT: Duration = Duration::from_secs(5);
+const DIAL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// A function that returns the current deny document text.
+pub type DenyFetch = Box<dyn Fn() -> Result<String, String> + Send + 'static>;
+
+/// Guard settings.
+pub struct GuardConfig {
+    /// Overlay listen address. The port is the service port.
+    pub listen: SocketAddr,
+    /// Service name.
+    pub service: String,
+    /// Local service address.
+    pub target: SocketAddr,
+    /// SPIFFE ID of this node.
+    pub node: SpiffeId,
+    /// SVID trust bundle.
+    pub bundle: TrustBundle,
+    /// Coordinator ticket key.
+    pub verifier: TicketVerifier,
+    /// Coordinator netmap key.
+    pub netmap_public: [u8; 32],
+    /// Grant audit chain file.
+    pub audit_path: PathBuf,
+    /// Deny poll interval.
+    pub poll: Duration,
+    /// The guard refuses all uses when the last good deny fetch is older.
+    pub stale_after: Duration,
+}
+
+impl std::fmt::Debug for GuardConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardConfig")
+            .field("listen", &self.listen)
+            .field("service", &self.service)
+            .field("node", &self.node)
+            .finish()
+    }
+}
+
+/// One guard decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardDecision {
+    /// The use is admitted.
+    Admit(Box<Admitted>),
+    /// The use is refused. The text is the stable reason token.
+    Refuse(&'static str),
+}
+
+struct Known {
+    agent: SpiffeId,
+    nonce: [u8; 16],
+    expires_ms: u64,
+    expired: bool,
+    revoked: bool,
+}
+
+struct CoreState {
+    deny: DenySet,
+    deny_ok_at: Option<SystemTime>,
+    audit: ConfigLog,
+    known: BTreeMap<String, Known>,
+}
+
+/// Shared guard checks and the grant audit chain.
+///
+/// The TCP guard and an HTTP gateway use the same core.
+pub struct GuardCore {
+    node: SpiffeId,
+    addr: Ipv4Addr,
+    bundle: TrustBundle,
+    verifier: TicketVerifier,
+    netmap_public: [u8; 32],
+    stale_after: Duration,
+    state: Mutex<CoreState>,
+}
+
+impl GuardCore {
+    /// Open the core and the audit chain.
+    pub fn new(config: &GuardConfig) -> Result<Self, AgentError> {
+        let IpAddr::V4(addr) = config.listen.ip() else {
+            return Err(AgentError::Io(
+                "The listen address is not IPv4.".to_string(),
+            ));
+        };
+        let audit = ConfigLog::open(&config.audit_path)
+            .map_err(|err| AgentError::Audit(err.to_string()))?;
+        Ok(Self {
+            node: config.node.clone(),
+            addr,
+            bundle: config.bundle.clone(),
+            verifier: config.verifier.clone(),
+            netmap_public: config.netmap_public,
+            stale_after: config.stale_after,
+            state: Mutex::new(CoreState {
+                deny: DenySet::empty(),
+                deny_ok_at: None,
+                audit,
+                known: BTreeMap::new(),
+            }),
+        })
+    }
+
+    /// Apply one deny document and record revoked grants.
+    pub fn apply_deny(&self, text: &str, now: SystemTime) -> Result<(), AgentError> {
+        let mut state = self.lock()?;
+        let _ = state
+            .deny
+            .apply_json(text.as_bytes())
+            .map_err(|_| AgentError::Io("The deny document is not valid.".to_string()))?;
+        state.deny_ok_at = Some(now);
+        let version = state.deny.version().unwrap_or(0);
+        let mut revoked = Vec::new();
+        for (id, known) in &state.known {
+            // An ended grant cannot be used, so a later deny entry does not revoke it.
+            if known.revoked || known.expired {
+                continue;
+            }
+            if state.deny.reject_uri(&known.agent).is_err()
+                || state.deny.reject_nonce(&known.nonce).is_err()
+            {
+                revoked.push(id.clone());
+            }
+        }
+        let at_ms = unix_millis(now)?;
+        for id in revoked {
+            if let Some(known) = state.known.get_mut(&id) {
+                known.revoked = true;
+            }
+            let detail = format!("deny_version {version} seen_ms {at_ms}");
+            let actor = self.node.as_uri().to_string();
+            append(
+                &mut state,
+                &actor,
+                ConfigAction::AgentRevoke,
+                &id,
+                EMPTY_DIGEST,
+                &detail,
+            )?;
+            println!("agent grant {id} revoked deny_version {version} seen_ms {at_ms}");
+        }
+        Ok(())
+    }
+
+    /// Record grants that reached their end time.
+    pub fn tick(&self, now: SystemTime) -> Result<(), AgentError> {
+        let at_ms = unix_millis(now)?;
+        let mut state = self.lock()?;
+        let mut ended = Vec::new();
+        for (id, known) in &state.known {
+            if !known.expired && at_ms >= known.expires_ms {
+                ended.push(id.clone());
+            }
+        }
+        for id in ended {
+            let expires_ms = match state.known.get_mut(&id) {
+                Some(known) => {
+                    known.expired = true;
+                    known.expires_ms
+                }
+                None => continue,
+            };
+            let detail = format!("expires_ms {expires_ms} seen_ms {at_ms}");
+            let actor = self.node.as_uri().to_string();
+            append(
+                &mut state,
+                &actor,
+                ConfigAction::AgentExpire,
+                &id,
+                EMPTY_DIGEST,
+                &detail,
+            )?;
+            println!("agent grant {id} expired expires_ms {expires_ms} seen_ms {at_ms}");
+        }
+        Ok(())
+    }
+
+    /// Check one proof line and record the decision.
+    ///
+    /// `peer` is the remote socket address. It goes to the audit record.
+    pub fn admit(
+        &self,
+        line: &str,
+        service: &str,
+        port: u16,
+        extra: &[u8],
+        peer: SocketAddr,
+        now: SystemTime,
+    ) -> Result<GuardDecision, AgentError> {
+        let mut state = self.lock()?;
+        let fresh = state
+            .deny_ok_at
+            .and_then(|at| now.duration_since(at).ok())
+            .is_some_and(|age| age <= self.stale_after);
+        let at_ms = unix_millis(now)?;
+        if !fresh {
+            let detail =
+                format!("reason stale service {service} port {port} peer {peer} at_ms {at_ms}");
+            append(
+                &mut state,
+                "unknown",
+                ConfigAction::AgentDeny,
+                "none",
+                EMPTY_DIGEST,
+                &detail,
+            )?;
+            println!("agent deny reason stale service {service} port {port} at_ms {at_ms}");
+            return Ok(GuardDecision::Refuse("stale"));
+        }
+        let target = UseTarget {
+            node: &self.node,
+            addr: self.addr,
+            service,
+            port,
+        };
+        let trust = UseTrust {
+            bundle: &self.bundle,
+            verifier: &self.verifier,
+            netmap_public: &self.netmap_public,
+            deny: &state.deny,
+        };
+        match open_use(line, target, trust, extra, now) {
+            Ok(admitted) => {
+                self.note_grant(&mut state, &admitted.grant, admitted.nonce, &admitted.agent)?;
+                let detail = format!(
+                    "service {service} port {port} peer {peer} ticket_hash {} at_ms {at_ms}",
+                    encode_hex(&admitted.ticket_hash)
+                );
+                let actor = admitted.agent.as_uri().to_string();
+                let id = admitted.grant.id.clone();
+                append(
+                    &mut state,
+                    &actor,
+                    ConfigAction::AgentUse,
+                    &id,
+                    EMPTY_DIGEST,
+                    &detail,
+                )?;
+                println!("agent use grant {id} service {service} port {port} at_ms {at_ms}");
+                Ok(GuardDecision::Admit(Box::new(admitted)))
+            }
+            Err(refused) => {
+                let reason = refused.reason.as_str();
+                record_refused(&mut state, &refused, service, port, peer, at_ms)?;
+                println!("agent deny reason {reason} service {service} port {port} at_ms {at_ms}");
+                Ok(GuardDecision::Refuse(reason))
+            }
+        }
+    }
+
+    fn note_grant(
+        &self,
+        state: &mut CoreState,
+        grant: &AgentGrant,
+        nonce: [u8; 16],
+        agent: &SpiffeId,
+    ) -> Result<(), AgentError> {
+        if state.known.contains_key(&grant.id) {
+            return Ok(());
+        }
+        state.known.insert(
+            grant.id.clone(),
+            Known {
+                agent: agent.clone(),
+                nonce,
+                expires_ms: grant.expires.saturating_mul(1000),
+                expired: false,
+                revoked: false,
+            },
+        );
+        let body = serde_json::to_vec(grant).map_err(|_| AgentError::Grant)?;
+        let detail = format!(
+            "agent {} requester {} node {} service {} port {} path {} not_before {} expires {}",
+            grant.agent,
+            grant.requester,
+            grant.node,
+            grant.service,
+            grant.port,
+            grant.path_prefix,
+            grant.not_before,
+            grant.expires
+        );
+        append(
+            state,
+            &grant.approver,
+            ConfigAction::AgentGrant,
+            &grant.id,
+            sha256_digest(&body),
+            &detail,
+        )
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, CoreState>, AgentError> {
+        self.state
+            .lock()
+            .map_err(|_| AgentError::Io("The guard state lock failed.".to_string()))
+    }
+}
+
+fn record_refused(
+    state: &mut CoreState,
+    refused: &Refused,
+    service: &str,
+    port: u16,
+    peer: SocketAddr,
+    at_ms: u64,
+) -> Result<(), AgentError> {
+    let actor = refused
+        .peer
+        .as_ref()
+        .map_or_else(|| "unknown".to_string(), |id| id.as_uri().to_string());
+    let target = refused
+        .grant_id
+        .clone()
+        .unwrap_or_else(|| "none".to_string());
+    let detail = format!(
+        "reason {} service {service} port {port} peer {peer} at_ms {at_ms}",
+        refused.reason.as_str()
+    );
+    append(
+        state,
+        &actor,
+        ConfigAction::AgentDeny,
+        &target,
+        EMPTY_DIGEST,
+        &detail,
+    )
+}
+
+fn append(
+    state: &mut CoreState,
+    actor: &str,
+    action: ConfigAction,
+    target: &str,
+    after: [u8; 32],
+    detail: &str,
+) -> Result<(), AgentError> {
+    let at_unix = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| AgentError::Time)?
+        .as_secs();
+    state
+        .audit
+        .append(ConfigEvent {
+            actor: actor.to_string(),
+            at_unix,
+            action,
+            target: target.to_string(),
+            before: EMPTY_DIGEST,
+            after,
+            detail: detail.to_string(),
+        })
+        .map(|_| ())
+        .map_err(|err| AgentError::Audit(err.to_string()))
+}
+
+/// Run the TCP guard until the process stops.
+pub fn run_guard(config: GuardConfig, fetch: DenyFetch) -> Result<(), AgentError> {
+    let core = Arc::new(GuardCore::new(&config)?);
+    let listener =
+        TcpListener::bind(config.listen).map_err(|err| AgentError::Io(err.to_string()))?;
+    let poll_core = Arc::clone(&core);
+    let poll = config.poll;
+    thread::spawn(move || loop {
+        match fetch() {
+            Ok(text) => {
+                if let Err(err) = poll_core.apply_deny(&text, SystemTime::now()) {
+                    eprintln!("agent guard deny apply failed. {err}");
+                }
+            }
+            Err(err) => eprintln!("agent guard deny fetch failed. {err}"),
+        }
+        if let Err(err) = poll_core.tick(SystemTime::now()) {
+            eprintln!("agent guard tick failed. {err}");
+        }
+        thread::sleep(poll);
+    });
+    println!(
+        "agent guard service {} listen {} target {}",
+        config.service, config.listen, config.target
+    );
+    let service = Arc::new(config.service.clone());
+    let port = config.listen.port();
+    let target = config.target;
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else {
+            continue;
+        };
+        let core = Arc::clone(&core);
+        let service = Arc::clone(&service);
+        thread::spawn(move || {
+            if let Err(err) = serve_one(&core, stream, &service, port, target) {
+                eprintln!("agent guard connection failed. {err}");
+            }
+        });
+    }
+    Ok(())
+}
+
+fn serve_one(
+    core: &GuardCore,
+    stream: TcpStream,
+    service: &str,
+    port: u16,
+    target: SocketAddr,
+) -> Result<(), AgentError> {
+    let io = |err: std::io::Error| AgentError::Io(err.to_string());
+    let peer = stream.peer_addr().map_err(io)?;
+    stream.set_read_timeout(Some(LINE_TIMEOUT)).map_err(io)?;
+    let mut writer = stream.try_clone().map_err(io)?;
+    let mut reader = BufReader::new(stream);
+    let line = read_line(&mut reader)?;
+    let decision = core.admit(&line, service, port, &[], peer, SystemTime::now())?;
+    match decision {
+        GuardDecision::Refuse(reason) => {
+            let _ = writer.write_all(format!("orblx-deny {reason}\n").as_bytes());
+            let _ = writer.shutdown(Shutdown::Both);
+            Ok(())
+        }
+        GuardDecision::Admit(_) => {
+            let mut upstream = TcpStream::connect_timeout(&target, DIAL_TIMEOUT).map_err(io)?;
+            writer.write_all(b"orblx-ok\n").map_err(io)?;
+            let buffered = reader.buffer().to_vec();
+            if !buffered.is_empty() {
+                upstream.write_all(&buffered).map_err(io)?;
+            }
+            let client = reader.into_inner();
+            client.set_read_timeout(None).map_err(io)?;
+            splice(client, upstream).map_err(io)
+        }
+    }
+}
+
+fn read_line(reader: &mut BufReader<TcpStream>) -> Result<String, AgentError> {
+    let mut raw = Vec::new();
+    let mut limited = reader
+        .by_ref()
+        .take(u64::try_from(MAX_LINE).unwrap_or(u64::MAX));
+    match limited.read_until(b'\n', &mut raw) {
+        Ok(_) => Ok(String::from_utf8(raw).unwrap_or_default()),
+        Err(_) => Ok(String::new()),
+    }
+}
+
+fn splice(client: TcpStream, upstream: TcpStream) -> std::io::Result<()> {
+    let mut client_read = client.try_clone()?;
+    let mut upstream_write = upstream.try_clone()?;
+    let forward = thread::spawn(move || {
+        let _ = std::io::copy(&mut client_read, &mut upstream_write);
+        let _ = upstream_write.shutdown(Shutdown::Write);
+    });
+    let mut upstream_read = upstream;
+    let mut client_write = client;
+    let _ = std::io::copy(&mut upstream_read, &mut client_write);
+    let _ = client_write.shutdown(Shutdown::Write);
+    let _ = forward.join();
+    Ok(())
+}

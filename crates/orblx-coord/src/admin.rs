@@ -198,7 +198,7 @@ pub fn audit(coord: &Coordinator, since: Option<u64>) -> Result<Value, CoordErro
 /// The largest record text in one admin reply.
 const AUDIT_REPLY_LIMIT: usize = 160 * 1024;
 
-fn deny_digest(coord: &Coordinator) -> Result<[u8; 32], CoordError> {
+pub(crate) fn deny_digest(coord: &Coordinator) -> Result<[u8; 32], CoordError> {
     let path = coord.state_dir()?.join(DENY_FILE);
     if !path.exists() {
         return Ok(EMPTY_DIGEST);
@@ -208,12 +208,35 @@ fn deny_digest(coord: &Coordinator) -> Result<[u8; 32], CoordError> {
 }
 
 fn push_revoke(coord: &Coordinator, svid: &str, now: SystemTime) -> Result<u64, CoordError> {
-    let _ = SpiffeId::parse(svid)?;
+    push_deny(coord, &[svid.to_string()], &[], now)
+}
+
+/// Add SPIFFE IDs and ticket nonces to the deny file.
+///
+/// The function raises the deny version by one.
+pub(crate) fn push_deny(
+    coord: &Coordinator,
+    uris: &[String],
+    nonces: &[String],
+    now: SystemTime,
+) -> Result<u64, CoordError> {
     let mut file = read_deny(coord, now)?;
-    if !file.revoked_uris.iter().any(|item| item == svid) {
-        file.revoked_uris.push(svid.to_string());
-        file.revoked_uris.sort();
+    for uri in uris {
+        let _ = SpiffeId::parse(uri)?;
+        if !file.revoked_uris.iter().any(|item| item == uri) {
+            file.revoked_uris.push(uri.clone());
+        }
     }
+    for nonce in nonces {
+        if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(CoordError::State);
+        }
+        if !file.revoked_ticket_nonces.iter().any(|item| item == nonce) {
+            file.revoked_ticket_nonces.push(nonce.clone());
+        }
+    }
+    file.revoked_uris.sort();
+    file.revoked_ticket_nonces.sort();
     file.version = file.version.saturating_add(1);
     file.generated_at = unix_now(now)?;
     let text = file.to_json()?;

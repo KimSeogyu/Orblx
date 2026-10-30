@@ -43,6 +43,9 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         "expire" => "admin-expire",
         "routes" => "admin-routes",
         "audit" => "admin-audit",
+        "grants" => "admin-grants",
+        "grant-approve" => "admin-grant-approve",
+        "grant-revoke" => "admin-grant-revoke",
         other => return Err(format!("The mode {other} is not valid.\n{}", help())),
     };
     let mut target = String::new();
@@ -53,12 +56,24 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
     let mut json = false;
     let mut verify_only = false;
     let mut index = 1;
-    if matches!(op, "admin-approve" | "admin-revoke" | "admin-expire") {
+    if matches!(
+        op,
+        "admin-approve"
+            | "admin-revoke"
+            | "admin-expire"
+            | "admin-grant-approve"
+            | "admin-grant-revoke"
+    ) {
+        let what = if op.starts_with("admin-grant") {
+            "a grant id"
+        } else {
+            "a node name"
+        };
         let name = args
             .get(index)
-            .ok_or_else(|| format!("The command needs a node name.\n{}", help()))?;
+            .ok_or_else(|| format!("The command needs {what}.\n{}", help()))?;
         if name.starts_with('-') {
-            return Err(format!("The command needs a node name.\n{}", help()));
+            return Err(format!("The command needs {what}.\n{}", help()));
         }
         target = name.clone();
         index += 1;
@@ -110,6 +125,7 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
         Command::Call(call) => {
             let bundle = std::fs::read_to_string(&call.bundle)
                 .map_err(|err| format!("The file {} did not open. {err}", call.bundle.display()))?;
+            let started_ms = now_millis();
             let detail = admin_blocking(
                 call.coord,
                 &call.coord_name,
@@ -124,7 +140,12 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             if call.op == "admin-audit" {
                 return print_audit(&value, call.json, call.verify_only);
             }
-            print_admin(&call.op, &value)
+            print_admin(&call.op, &value)?;
+            if call.op == "admin-grant-revoke" {
+                println!("revoke_start_ms {started_ms}");
+                println!("revoke_done_ms {}", now_millis());
+            }
+            Ok(())
         }
     }
 }
@@ -200,6 +221,38 @@ fn print_admin(op: &str, value: &Value) -> Result<(), String> {
                         }
                     }
                 }
+            }
+        }
+        "admin-grants" => {
+            let grants = value
+                .get("grants")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "The coordinator response is not valid.".to_string())?;
+            for grant in grants {
+                let port = grant.get("port").and_then(Value::as_u64).unwrap_or(0);
+                println!(
+                    "grant {} {} agent {} node {} service {} port {port} ttl {}",
+                    text_field(grant, "id")?,
+                    text_field(grant, "state")?,
+                    text_field(grant, "agent")?,
+                    text_field(grant, "node")?,
+                    text_field(grant, "service")?,
+                    grant.get("ttl_secs").and_then(Value::as_u64).unwrap_or(0),
+                );
+            }
+            println!("grants {}", grants.len());
+        }
+        "admin-grant-approve" => {
+            let grant = value.get("grant").unwrap_or(&Value::Null);
+            println!("approved_grant {}", text_field(grant, "id")?);
+            println!("grant_state {}", text_field(grant, "state")?);
+        }
+        "admin-grant-revoke" => {
+            let grant = value.get("grant").unwrap_or(&Value::Null);
+            println!("revoked_grant {}", text_field(grant, "id")?);
+            println!("grant_state {}", text_field(grant, "state")?);
+            if let Some(version) = value.get("deny_version").and_then(Value::as_u64) {
+                println!("deny_version {version}");
             }
         }
         _ => return Err("The admin operation is not valid.".to_string()),
@@ -319,6 +372,13 @@ fn now_unix() -> Result<u64, String> {
         .map_err(|_| "The system time is not valid.".to_string())
 }
 
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
 fn text_field(value: &Value, name: &str) -> Result<String, String> {
     value
         .get(name)
@@ -335,6 +395,9 @@ orblx admin approve NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundl
 orblx admin revoke NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin expire NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin routes --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin grants --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin grant-approve ID --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin grant-revoke ID --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin audit --coord ADDR [--since TIME] [--json] [--verify] [--state DIR] [--coord-name NAME] [--bundle FILE]
 
 The command uses the node SVID in the state directory.
@@ -342,6 +405,9 @@ The coordinator accepts the call when that SVID is an owner.
 approve puts the node into netmaps and grants.
 revoke adds the node to the deny set.
 expire removes the node from netmaps until approve.
+grants lists the agent JIT grants.
+grant-approve lets the agent fetch the grant. Only an owner approves an agent grant.
+grant-revoke ends the grant. The agent SVID and the ticket nonce go into the deny set.
 audit prints the control-plane audit chain and the chain check.
 TIME is Unix seconds, YYYY-MM-DDTHH:MM:SSZ, or an age such as 30m, 2h, or 7d.
 --json prints one JSON record on each line.

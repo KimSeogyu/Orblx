@@ -10,6 +10,7 @@ use orblx_identity::crate_name as identity_crate;
 use orblx_identity::TrustBundle;
 
 mod admin;
+mod agent;
 mod audit;
 mod connector;
 mod coord;
@@ -44,6 +45,7 @@ enum Action {
     Policy(policy::Command),
     Ssh(ssh::Command),
     Admin(admin::Command),
+    Agent(agent::Command),
     Nat(nat::Command),
     Netcheck(netcheck::Command),
     Ping(ping::Command),
@@ -153,6 +155,14 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Ok(Action::Agent(command)) => match agent::run(command) {
+            Ok(0) => {}
+            Ok(code) => std::process::exit(code),
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        },
         Ok(Action::Nat(command)) => {
             if let Err(err) = nat::run(command) {
                 eprintln!("{err}");
@@ -233,6 +243,9 @@ where
     }
     if args.first().map(String::as_str) == Some("admin") {
         return admin::parse(&args[1..]).map(Action::Admin);
+    }
+    if args.first().map(String::as_str) == Some("agent") {
+        return agent::parse(&args[1..]).map(Action::Agent);
     }
     if args.first().map(String::as_str) == Some("netcheck") {
         return netcheck::parse(&args[1..]).map(Action::Netcheck);

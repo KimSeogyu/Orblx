@@ -48,11 +48,23 @@ pub enum ConfigAction {
     ExitNode,
     /// A node enrolled.
     Enroll,
+    /// An agent JIT grant was requested, or a guard saw a new grant.
+    AgentGrant,
+    /// An owner approved an agent JIT grant.
+    AgentApprove,
+    /// A guard admitted one connection or one request with a grant.
+    AgentUse,
+    /// A guard refused one connection or one request.
+    AgentDeny,
+    /// An agent JIT grant reached its end time.
+    AgentExpire,
+    /// An owner revoked an agent JIT grant.
+    AgentRevoke,
 }
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 15] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -62,6 +74,12 @@ impl ConfigAction {
         Self::Routes,
         Self::ExitNode,
         Self::Enroll,
+        Self::AgentGrant,
+        Self::AgentApprove,
+        Self::AgentUse,
+        Self::AgentDeny,
+        Self::AgentExpire,
+        Self::AgentRevoke,
     ];
 
     /// Return the stable action token.
@@ -77,6 +95,12 @@ impl ConfigAction {
             Self::Routes => "routes",
             Self::ExitNode => "exit-node",
             Self::Enroll => "enroll",
+            Self::AgentGrant => "agent-grant",
+            Self::AgentApprove => "agent-approve",
+            Self::AgentUse => "agent-use",
+            Self::AgentDeny => "agent-deny",
+            Self::AgentExpire => "agent-expire",
+            Self::AgentRevoke => "agent-revoke",
         }
     }
 
@@ -99,6 +123,12 @@ impl ConfigAction {
             Self::Routes => 7,
             Self::ExitNode => 8,
             Self::Enroll => 9,
+            Self::AgentGrant => 10,
+            Self::AgentApprove => 11,
+            Self::AgentUse => 12,
+            Self::AgentDeny => 13,
+            Self::AgentExpire => 14,
+            Self::AgentRevoke => 15,
         }
     }
 
@@ -607,7 +637,7 @@ mod tests {
         }
         assert_eq!(checked.tip, written.last().unwrap().hash);
         let reopened = ConfigLog::open(&path).unwrap();
-        assert_eq!(reopened.len(), 9);
+        assert_eq!(reopened.len(), ConfigAction::ALL.len() as u64);
         assert_eq!(reopened.tip(), checked.tip);
         assert_eq!(reopened.last_policy_digest(), Some(sha256_digest(b"after")));
     }

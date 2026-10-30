@@ -191,6 +191,26 @@ impl std::fmt::Debug for EnrollResult {
     }
 }
 
+/// The agent SVID and the agent JIT ticket of one grant.
+///
+/// Debug output elides the key and the ticket.
+pub(crate) struct AgentMaterial {
+    pub certificate_pem: String,
+    pub private_key_pem: String,
+    pub trust_bundle_pem: String,
+    pub ticket: orblx_identity::SignedTicket,
+}
+
+impl std::fmt::Debug for AgentMaterial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentMaterial")
+            .field("private_key_pem", &"[elided]")
+            .field("ticket", &"[elided]")
+            .finish()
+    }
+}
+
 /// A signed netmap for one enrolled node.
 #[derive(Debug, Clone)]
 pub struct NetmapView {
@@ -746,6 +766,45 @@ impl Coordinator {
                 Err(CoordError::Oidc)
             }
         }
+    }
+
+    /// Issue one agent SVID and one agent JIT ticket.
+    ///
+    /// The caller must not log the key or the ticket.
+    pub(crate) fn issue_agent_material(
+        &self,
+        agent: &SpiffeId,
+        now: SystemTime,
+        ttl: Duration,
+        dest: orblx_identity::Ipv4Destination,
+        deny: &DenySet,
+    ) -> Result<AgentMaterial, CoordError> {
+        let inner = self.lock()?;
+        let issued = inner.ca.issue(agent, now, ttl, deny)?;
+        let ticket = ticket::issue_agent_ticket(
+            &inner.state_dir,
+            inner.ca.public_key(),
+            &inner.coord_name,
+            agent,
+            now,
+            ttl,
+            dest,
+        )?;
+        Ok(AgentMaterial {
+            certificate_pem: issued.certificate_pem,
+            private_key_pem: issued.private_key_pem,
+            trust_bundle_pem: inner.ca.trust_bundle_pem().to_string(),
+            ticket,
+        })
+    }
+
+    /// Sign one agent grant document with the netmap key.
+    pub(crate) fn sign_agent_grant(
+        &self,
+        grant: &orblx_agent::AgentGrant,
+    ) -> Result<orblx_agent::SignedAgentGrant, CoordError> {
+        let inner = self.lock()?;
+        inner.netmap_key.sign_agent_grant(grant)
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>, CoordError> {

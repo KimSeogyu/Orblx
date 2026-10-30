@@ -1,0 +1,109 @@
+# Agent JIT grant proof stack.
+# `docker compose up` starts only the coordinator.
+# The node services use the nodes profile.
+name: orblx-agent-proof
+
+services:
+  coord:
+    image: orblx-agent:w21
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /var/lib/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+    volumes:
+      - orblx-agent-store:/var/lib/orblx
+      - ${POLICY_FILE:?set POLICY_FILE}:/var/lib/orblx/policy.hujson:ro
+    networks:
+      - proof
+
+  owner:
+    image: orblx-agent:w21
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    volumes:
+      - orblx-agent-store:/coord-state:ro
+      - orblx-agent-owner:/var/lib/orblx
+    networks:
+      - proof
+
+  a:
+    image: orblx-agent:w21
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-agent-store:/coord-state:ro
+      - orblx-agent-a:/var/lib/orblx
+    networks:
+      - proof
+
+  b:
+    image: orblx-agent:w21
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-agent-store:/coord-state:ro
+      - orblx-agent-b:/var/lib/orblx
+    networks:
+      - proof
+
+volumes:
+  orblx-agent-store:
+  orblx-agent-owner:
+  orblx-agent-a:
+  orblx-agent-b:
+
+networks:
+  proof:

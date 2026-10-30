@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/orblx-agent",
     "crates/orblx-audit",
     "crates/orblx-cli",
     "crates/orblx-coord",

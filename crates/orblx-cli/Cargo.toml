@@ -11,6 +11,7 @@ name = "orblx"
 path = "src/main.rs"
 
 [dependencies]
+orblx-agent = { path = "../orblx-agent" }
 orblx-audit = { path = "../orblx-audit" }
 orblx-coord = { path = "../orblx-coord" }
 orblx-crypto = { path = "../orblx-crypto" }
