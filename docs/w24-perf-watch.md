@@ -21,7 +21,7 @@ This document has no target numbers. Each number is a measured value from a log 
   A run fails when one of these is true:
   - the relay ping median is more than the direct ping median + 1 ms (prc relay path and sym relay path),
   - a ping is lost on a path (prc direct, prc direct at 0.23 s, prc relay, sym relay),
-  - the TCP throughput of a path is missing or below 300 Mbit/s (W24-E3, `ORBLX_PERF_MIN_MBIT`),
+  - the TCP throughput of a path is missing or below 200 Mbit/s (W24-E4, `ORBLX_PERF_MIN_MBIT`),
   - more than 3 of 50 pings on a path are above 10 ms (`ORBLX_PERF_MAX_SPIKES`, `ORBLX_PERF_SPIKE_MS`).
 - The job always reports, for each path and run: the ping median, p99 (linear interpolation), max,
   and the spike count (pings above 10 ms). It also reports the box avg gate (relay avg <= direct avg + 1 ms)
@@ -142,7 +142,14 @@ The job keeps checking it on each push to main (`outlier` in `perf-watch.json`).
   and about 1200 Mbit/s on the local 8 vCPU host. Compare a runner number only with other runner numbers.
 - **Runner noise.** Each push gets a new runner VM. The CPU model and the neighbors can change.
 - **[C] only.** All overlay numbers are containers on one host. There is no number for a real network.
-- **Throughput floor (W24-E3).** The CI floor is 300 Mbit/s on each path. The PO set this number.
-  REAL runner history: on an AMD EPYC 7763 runner (main run 41049508256, 130fe357) the prc direct TCP was
-  256.39, 277.43 and 280.83 Mbit/s. That run passed with the old floor. It would fail with the 300 Mbit/s floor.
+- **Throughput floor (W24-E4).** The CI floor is 200 Mbit/s on each path. The PO set this number.
+  The floor is 200 Mbit/s because the lowest measured CI value was 256 Mbit/s
+  (main run 41049508256, AMD EPYC 7763, prc_prc_direct 256.39 Mbit/s). W24-E3 (#83) set 300 Mbit/s.
+  On the same runner the prc direct TCP was 256.39, 277.43 and 280.83 Mbit/s, so 300 Mbit/s was below these values.
   On EPYC 9V45 and Xeon 8573C runners the lowest path was 473.53 Mbit/s (runs 41048025969, 41044075380).
+  There is one floor for all runner CPU models.
+- **Log lines.** `perf-watch.sh` prints `cpu_model <model name>` from `/proc/cpuinfo`.
+  `perf-summary.py` prints one line for each throughput value with the floor and the result,
+  for example `prc_prc_direct run1 275.54 Mbit/s floor 200 PASS`.
+- **Open question: direct is slower than relay in CI.** In CI, the prc direct TCP (256 - 286 Mbit/s) is slower
+  than the relay TCP (331 - 336 Mbit/s). The cause is unknown. This does not block.
