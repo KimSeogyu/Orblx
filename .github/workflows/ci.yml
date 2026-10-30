@@ -31,7 +31,7 @@ jobs:
       - name: Check the shell syntax of the release scripts
         run: |
           sh -n scripts/install.sh
-          bash -n scripts/release/package.sh scripts/proof/release.sh
+          bash -n scripts/release/package.sh scripts/proof/release.sh scripts/proof/release-real.sh
 
       - name: Run the harness demo
         env:
