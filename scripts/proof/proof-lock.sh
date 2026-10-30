@@ -354,9 +354,12 @@ proof_lock_take() {
     if [[ ! -e "$file" ]]; then
       (umask 000 && : >>"$file")
     fi
-    if [[ ! -e "${file}.fifo" ]]; then
-      (umask 000 && : >>"${file}.fifo")
-    fi
+    local extra
+    for extra in "${file}.fifo" "${file}.keeper.lock"; do
+      if [[ ! -e "$extra" ]]; then
+        (umask 000 && : >>"$extra")
+      fi
+    done
     waited_from="$(proof_lock_ms)"
     proof_lock_queue_join "$file"
   fi
