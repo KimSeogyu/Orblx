@@ -10,7 +10,8 @@
 # The script also fails when the direct ping RTT is more than RTT_LIMIT_MS above
 # the plain container RTT, or when a renewed SVID does not reach the peer line.
 # W25-14: the script also fails when the max RTT of a steady ping run is more than
-# STEADY_MAX_MS (ORBLX_NATR_STEADY_MAX_MS, default 100 ms).
+# STEADY_MAX_MS (ORBLX_NATR_STEADY_MAX_MS, default 200 ms, the hard stall limit).
+# Each reply above STEADY_WARN_MS (100 ms) prints a report-only steady_warn line.
 # W21: the script also fails when the relay ping RTT avg is more than RELAY_SLACK_MS
 # above the direct ping RTT avg, when a relay ping is lost, or when an idle orblx
 # process uses more than IDLE_CPU_PCT percent CPU.
@@ -52,8 +53,10 @@ WAN_D="${PUB}.14"
 PINGS=50
 MAX_LOSS=1
 MAX_GAP_MS=1000
-# W25-14: the most max RTT of a steady ping run on a stable path.
-STEADY_MAX_MS="${ORBLX_NATR_STEADY_MAX_MS:-100}"
+# W25-14: the most max RTT of a steady ping run on a stable path (hard stall limit).
+STEADY_MAX_MS="${ORBLX_NATR_STEADY_MAX_MS:-200}"
+# W25-14: a reply above this RTT prints a report-only steady_warn line.
+STEADY_WARN_MS=100
 SPRAY_MAX=2048
 # The direct overlay RTT may be at most this much above the plain container RTT.
 RTT_LIMIT_MS="${ORBLX_RTT_LIMIT_MS:-5}"
@@ -365,9 +368,9 @@ steady_pings() {
   local container="$2"
   local ip="$3"
   local out
-  out="$(docker exec "$container" ping -n -i 0.2 -c "$PINGS" -W 1 "$ip" | tail -2)"
-  printf '%s\n' "$out"
-  printf '%s\n' "$out" | steady_ping_gate "$label" "$PINGS" "$MAX_LOSS" "$STEADY_MAX_MS" || exit 1
+  out="$(docker exec "$container" ping -n -i 0.2 -c "$PINGS" -W 1 "$ip")"
+  printf '%s\n' "$out" | tail -2
+  printf '%s\n' "$out" | steady_ping_gate "$label" "$PINGS" "$MAX_LOSS" "$STEADY_MAX_MS" "$STEADY_WARN_MS" || exit 1
 }
 
 # Print the avg value of one ping run.

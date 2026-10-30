@@ -408,7 +408,8 @@ async fn late_peer_case(
 
     let enrolled_at = Instant::now();
     let token_b = coord.create_token(Duration::from_secs(600)).unwrap();
-    let enrolled_b = client::enroll_with_token(
+    let token_done = Instant::now();
+    let (enrolled_b, close_waits) = with_close_waits(client::enroll_with_token(
         addr,
         "coord",
         &bundle,
@@ -416,12 +417,16 @@ async fn late_peer_case(
         &token_b.secret,
         &[format!("127.0.0.1:{port_b}")],
         &[],
-    )
-    .await
-    .unwrap();
+    ))
+    .await;
+    let enrolled_b = enrolled_b.unwrap();
+    let enroll_done = Instant::now();
     enrolled_b.write_state(&node_b.0).unwrap();
+    let state_done = Instant::now();
     let map_b = Netmap::from_path(&node_b.0.join("netmap.json")).unwrap();
+    let netmap_done = Instant::now();
     let config_b = leaf_config(&enrolled_b, &trust, &signer, &mac_key, &ring, now);
+    let config_done = Instant::now();
     if !before_listen.is_zero() {
         tokio::time::sleep(before_listen).await;
     }
@@ -441,6 +446,7 @@ async fn late_peer_case(
             std::thread::sleep(after_listen);
         }
     }));
+    let spawn_at = Instant::now();
     let task_b = tokio::spawn(run_memory_node(
         request_b,
         MemoryDevice {
@@ -448,6 +454,16 @@ async fn late_peer_case(
             to_tun: b_out_tx,
         },
     ));
+    let marks = StartMarks {
+        enroll_start: enrolled_at,
+        token_done,
+        enroll_done,
+        close_waits,
+        state_done,
+        netmap_done,
+        config_done,
+        spawn_at,
+    };
     let mut first_packet = None;
     let wait = before_listen + after_listen + Duration::from_secs(8);
     while enrolled_at.elapsed() < wait {
@@ -474,6 +490,10 @@ async fn late_peer_case(
     handle.abort();
     let _ = tokio::time::timeout(Duration::from_secs(25), sync).await;
     let listener = *listened.lock().unwrap();
+    if let Some(event) = listener {
+        // Report only (W25-21).
+        println!("late_peer {tag} {}", startup_phases(&marks, &event).line());
+    }
     let times = LatePeerTimes {
         enroll_to_listener: listener.map(|event| event.at.saturating_duration_since(enrolled_at)),
         listener_to_first_packet: match (listener, first_packet) {
@@ -500,6 +520,263 @@ async fn late_peer_case(
         ms(times.listener_to_first_packet)
     );
     times
+}
+
+/// The harness times of one node start, from the enroll call to the spawn of the node (W25-21).
+struct StartMarks {
+    enroll_start: Instant,
+    token_done: Instant,
+    enroll_done: Instant,
+    /// The close-wait times of the enroll call (client::CLOSE_WAITS).
+    close_waits: Vec<Duration>,
+    state_done: Instant,
+    netmap_done: Instant,
+    config_done: Instant,
+    spawn_at: Instant,
+}
+
+/// The start-up phases from the enroll call to the listener start (W25-21).
+///
+/// The harness gives the times up to the spawn. The node gives the other times in its
+/// listener start event.
+#[derive(Clone, Copy, Debug)]
+struct StartupPhases {
+    /// The coordinator makes the enroll token (the harness, not the node).
+    token: Duration,
+    /// The enroll call up to the reply: connect, handshake, request and reply.
+    enroll_call: Duration,
+    /// The enroll call after the reply: the close and the endpoint wait (up to 2 s).
+    close_wait: Duration,
+    write_state: Duration,
+    netmap_read: Duration,
+    leaf_config: Duration,
+    /// A test delay before the spawn. It is zero without an injected delay.
+    harness_wait: Duration,
+    spawn_to_node: Duration,
+    prepare: Duration,
+    to_bind: Duration,
+    bind: Duration,
+    total: Duration,
+}
+
+/// The phases of [`StartupPhases`] in time order, with their names.
+const PHASES: [(&str, PhaseField); 12] = [
+    ("token", |p| p.token),
+    ("enroll_call", |p| p.enroll_call),
+    ("close_wait", |p| p.close_wait),
+    ("write_state", |p| p.write_state),
+    ("netmap_read", |p| p.netmap_read),
+    ("leaf_config", |p| p.leaf_config),
+    ("harness_wait", |p| p.harness_wait),
+    ("spawn_to_node", |p| p.spawn_to_node),
+    ("prepare", |p| p.prepare),
+    ("to_bind", |p| p.to_bind),
+    ("bind", |p| p.bind),
+    ("total", |p| p.total),
+];
+
+impl StartupPhases {
+    fn line(&self) -> String {
+        let mut text = "startup_ms".to_string();
+        for (name, field) in PHASES {
+            text.push_str(&format!(
+                " {name} {:.1}",
+                field(self).as_secs_f64() * 1000.0
+            ));
+        }
+        text
+    }
+}
+
+/// One phase of [`StartupPhases`].
+type PhaseField = fn(&StartupPhases) -> Duration;
+
+fn startup_phases(marks: &StartMarks, event: &ListenEvent) -> StartupPhases {
+    let span = |from: Instant, to: Instant| to.saturating_duration_since(from);
+    let call = span(marks.token_done, marks.enroll_done);
+    let close_wait = marks.close_waits.iter().sum::<Duration>().min(call);
+    StartupPhases {
+        token: span(marks.enroll_start, marks.token_done),
+        enroll_call: call - close_wait,
+        close_wait,
+        write_state: span(marks.enroll_done, marks.state_done),
+        netmap_read: span(marks.state_done, marks.netmap_done),
+        leaf_config: span(marks.netmap_done, marks.config_done),
+        harness_wait: span(marks.config_done, marks.spawn_at),
+        spawn_to_node: span(marks.spawn_at, event.phases.entered_at),
+        prepare: span(event.phases.entered_at, event.phases.prepared_at),
+        to_bind: span(event.phases.prepared_at, event.bind_at),
+        bind: span(event.bind_at, event.at),
+        total: span(marks.enroll_start, event.at),
+    }
+}
+
+/// Runs a coordinator call and returns its result and the close-wait times of its calls.
+async fn with_close_waits<T>(call: impl std::future::Future<Output = T>) -> (T, Vec<Duration>) {
+    client::CLOSE_WAITS
+        .scope(std::cell::RefCell::new(Vec::new()), async {
+            let out = call.await;
+            let waits = client::CLOSE_WAITS.with(|waits| waits.borrow().clone());
+            (out, waits)
+        })
+        .await
+}
+
+/// W25-21 measurement: `ORBLX_STARTUP_RUNS` node starts (default 10), each from the enroll
+/// call to the listener start, with a new coordinator for each run.
+///
+/// Run it with `cargo test -p orblx-coord --lib -- --ignored --nocapture startup_cost_runs`.
+/// The gate: the median of the enroll-to-listener time is 1 s or less.
+/// A median above 2 s prints an alert line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement: run it on demand under the proof lock"]
+async fn startup_cost_runs() {
+    let runs: usize = std::env::var("ORBLX_STARTUP_RUNS")
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(10);
+    assert!(runs > 0, "ORBLX_STARTUP_RUNS must be 1 or more");
+    let mut all = Vec::new();
+    for run in 1..=runs {
+        let phases = startup_cost_once().await;
+        println!("startup_cost run {run} {}", phases.line());
+        all.push(phases);
+    }
+    let pick = |field: PhaseField, q: f64| {
+        let mut values: Vec<Duration> = all.iter().map(field).collect();
+        values.sort();
+        // Nearest rank.
+        let rank = ((q * values.len() as f64).ceil() as usize).clamp(1, values.len());
+        values[rank - 1]
+    };
+    let median = |field: PhaseField| {
+        let mut values: Vec<Duration> = all.iter().map(field).collect();
+        values.sort();
+        let n = values.len();
+        if n % 2 == 1 {
+            values[n / 2]
+        } else {
+            (values[n / 2 - 1] + values[n / 2]) / 2
+        }
+    };
+    for (name, field) in PHASES {
+        println!(
+            "startup_cost phase {name} median_ms {:.1} p95_ms {:.1} max_ms {:.1}",
+            median(field).as_secs_f64() * 1000.0,
+            pick(field, 0.95).as_secs_f64() * 1000.0,
+            pick(field, 1.0).as_secs_f64() * 1000.0
+        );
+    }
+    let total = median(|p| p.total);
+    println!(
+        "startup_cost summary runs {runs} enroll_to_listener median_ms {} p95_ms {} max_ms {} limit_ms 1000",
+        total.as_millis(),
+        pick(|p| p.total, 0.95).as_millis(),
+        pick(|p| p.total, 1.0).as_millis()
+    );
+    if total > Duration::from_secs(2) {
+        println!(
+            "startup_cost alert median_ms {} is more than 2000 ms",
+            total.as_millis()
+        );
+    }
+    // ORBLX_STARTUP_REPORT_ONLY=1 is for the busy CI runner: it prints the numbers and does
+    // not apply the idle-box gate.
+    if std::env::var("ORBLX_STARTUP_REPORT_ONLY").as_deref() == Ok("1") {
+        println!("startup_cost report_only: the idle-box gate is not applied");
+        return;
+    }
+    assert!(
+        total <= Duration::from_secs(1),
+        "the enroll-to-listener median is {} ms, more than 1000 ms",
+        total.as_millis()
+    );
+}
+
+/// One node start from the enroll call to the listener start. The node then stops.
+async fn startup_cost_once() -> StartupPhases {
+    let scratch = Scratch::new("start");
+    let node_dir = Scratch::new("start-n");
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    let (addr, handle) = server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+    let trust = TrustBundle::from_pem(&bundle).unwrap();
+    let signer = TicketSigner::generate();
+    let mac_key = [0x47; 32];
+    let now = SystemTime::now();
+    let ticket_key = TicketKey::new(
+        signer.verifier(),
+        mac_key,
+        now - Duration::from_secs(60),
+        now + Duration::from_secs(3_600),
+    )
+    .unwrap();
+    let ring = TicketRing::single(ticket_key, &[7; 32]).unwrap();
+    let port = free_port();
+    let enroll_start = Instant::now();
+    let token = coord.create_token(Duration::from_secs(600)).unwrap();
+    let token_done = Instant::now();
+    let (enrolled, close_waits) = with_close_waits(client::enroll_with_token(
+        addr,
+        "coord",
+        &bundle,
+        "b",
+        &token.secret,
+        &[format!("127.0.0.1:{port}")],
+        &[],
+    ))
+    .await;
+    let enrolled = enrolled.unwrap();
+    let enroll_done = Instant::now();
+    enrolled.write_state(&node_dir.0).unwrap();
+    let state_done = Instant::now();
+    let map = Netmap::from_path(&node_dir.0.join("netmap.json")).unwrap();
+    let netmap_done = Instant::now();
+    let config = leaf_config(&enrolled, &trust, &signer, &mac_key, &ring, now);
+    let config_done = Instant::now();
+    let (stop_tx, stop) = watch::channel(false);
+    let (listen_tx, listen_rx) = tokio::sync::oneshot::channel::<ListenEvent>();
+    let mut request = node_request(
+        config,
+        map,
+        port,
+        node_dir.0.clone(),
+        renewer(addr, bundle.clone(), node_dir.0.clone()),
+        stop,
+    );
+    request.on_listen = Some(Box::new(move |event| {
+        let _ = listen_tx.send(event);
+    }));
+    let (_in_tx, in_rx) = mpsc::channel(64);
+    let (out_tx, _out_rx) = mpsc::channel(64);
+    let spawn_at = Instant::now();
+    let task = tokio::spawn(run_memory_node(
+        request,
+        MemoryDevice {
+            from_tun: in_rx,
+            to_tun: out_tx,
+        },
+    ));
+    let event = tokio::time::timeout(Duration::from_secs(30), listen_rx)
+        .await
+        .expect("node b did not start its listener in 30 s")
+        .expect("node b ended before its listener started");
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    handle.abort();
+    let marks = StartMarks {
+        enroll_start,
+        token_done,
+        enroll_done,
+        close_waits,
+        state_done,
+        netmap_done,
+        config_done,
+        spawn_at,
+    };
+    startup_phases(&marks, &event)
 }
 
 /// W25-6 and W25-6c: a peer that enrolls after a node started is reachable 2 s or less
