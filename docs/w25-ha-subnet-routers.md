@@ -19,7 +19,7 @@ The old client rejected that netmap (`RouterError::Ambiguous`).
 | `crates/orblx-datapath/src/router.rs` | A subnet prefix has a list of routers, sorted by name. An overlay address still has one owner. A subnet route cannot take an overlay address. |
 | `crates/orblx-datapath/src/ha.rs` | `RouteSelector`: the active router for each HA route. `RouteAudit`: the `route-failover` audit chain. |
 | `crates/orblx-datapath/src/node.rs` | The TUN reader asks the selector for each packet to an HA route. The keepalive interval is 250 ms (was 1 s). |
-| `crates/orblx-audit/src/config.rs` | New config action `route-failover`, code 34. |
+| `crates/orblx-audit/src/config.rs` | New config action `route-failover`, code 35 (W25-13 took 34). |
 
 Selection rules:
 

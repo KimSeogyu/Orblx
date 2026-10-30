@@ -37,6 +37,10 @@ pub struct WebhookBody {
     pub id: String,
     /// The action name, for example `revoke`.
     pub action: String,
+    /// The record time in Unix seconds (UTC).
+    pub at_unix: u64,
+    /// The record time as RFC 3339 UTC text, for example `2026-10-30T12:00:00Z`.
+    pub at_utc: String,
     /// The JSON body bytes.
     pub json: String,
 }
@@ -71,6 +75,15 @@ pub fn webhook_body(line: &str) -> Result<WebhookBody, AuditError> {
         .and_then(serde_json::Value::as_str)
         .ok_or(AuditError::BadLine { line: 0 })?
         .to_string();
+    let at_unix = record
+        .get("at_unix")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(AuditError::BadLine { line: 0 })?;
+    let at_utc = record
+        .get("at_utc")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(AuditError::BadLine { line: 0 })?
+        .to_string();
     let json = serde_json::to_string(&BodyOut {
         kind: WEBHOOK_BODY_TYPE,
         version: WEBHOOK_BODY_VERSION,
@@ -83,6 +96,8 @@ pub fn webhook_body(line: &str) -> Result<WebhookBody, AuditError> {
         seq,
         id: id.to_string(),
         action,
+        at_unix,
+        at_utc,
         json,
     })
 }
