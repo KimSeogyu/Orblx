@@ -18,7 +18,7 @@ mod wire;
 pub use batch::{recv_batch, send_batch, BatchPeer, RecvBatch, UDP_BATCH};
 pub use error::RelayError;
 pub use pipe::{RelayPipe, RelaySender};
-pub use server::{RelayServer, RelayStats, ServerConfig};
+pub use server::{RelayServer, RelayStats, ServerConfig, PEER_IDLE};
 pub use session::RelaySessionId;
 pub use wire::{
     contains_needle, decode_datagram, encode_datagram, encode_tcp_record, framing_name,

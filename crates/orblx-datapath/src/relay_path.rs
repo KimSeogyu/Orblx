@@ -10,9 +10,9 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use orblx_relay::{RelayPipe, RelaySessionId, RelayTransport};
+use orblx_relay::{RelayPipe, RelaySessionId, RelayTransport, PEER_IDLE};
 use sha2::{Digest, Sha256};
 
 use crate::quic::{HelloConfig, HelloEndpoint, HelloSocketRole};
@@ -22,6 +22,13 @@ use crate::HelloError;
 const BRIDGE_WAIT: Duration = Duration::from_millis(50);
 const UDP_TIMEOUT: Duration = Duration::from_millis(400);
 const TCP_TIMEOUT: Duration = Duration::from_secs(4);
+/// A bridge that sent nothing for this time sends an empty DATA payload.
+///
+/// The Relay removes a slot that is quiet for [`PEER_IDLE`] when the other peer attaches.
+/// The QUIC server side is quiet until the first client packet comes.
+/// Without the keepalive, the dial side finds no peer on the session.
+const KEEPALIVE: Duration = Duration::from_millis(250);
+const _: () = assert!(KEEPALIVE.as_millis() * 3 < PEER_IDLE.as_millis());
 
 /// One Relay attachment that carries QUIC.
 pub struct RelayFace {
@@ -110,6 +117,7 @@ fn spawn_bridge(mut pipe: RelayPipe, face: UdpSocket, stop: Arc<AtomicBool>) -> 
     thread::spawn(move || {
         let _ = face.set_nonblocking(true);
         let mut buf = [0u8; 65_535];
+        let mut last_send = Instant::now();
         while !stop.load(Ordering::Relaxed) {
             let mut idle = true;
             match face.recv(&mut buf) {
@@ -118,12 +126,21 @@ fn spawn_bridge(mut pipe: RelayPipe, face: UdpSocket, stop: Arc<AtomicBool>) -> 
                     if pipe.send_opaque(&buf[..size]).is_err() {
                         break;
                     }
+                    last_send = Instant::now();
                 }
                 Err(err) if is_idle(&err) => {}
                 Err(_) => break,
             }
+            if last_send.elapsed() >= KEEPALIVE {
+                if pipe.send_opaque(&[]).is_err() {
+                    break;
+                }
+                last_send = Instant::now();
+            }
             loop {
                 match pipe.recv_opaque() {
+                    // An empty payload is the keepalive of the other bridge. QUIC does not get it.
+                    Ok(Some(payload)) if payload.is_empty() => {}
                     Ok(Some(payload)) => {
                         idle = false;
                         if !send_face(&face, &payload) {
@@ -179,7 +196,55 @@ fn loopback() -> SocketAddr {
 
 #[cfg(test)]
 mod tests {
-    use super::relay_session_id;
+    use super::{loopback, relay_session_id, spawn_bridge};
+    use orblx_relay::{RelayPipe, RelayServer, ServerConfig};
+    use std::net::UdpSocket;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn a_silent_bridge_keeps_its_relay_slot() {
+        let server = RelayServer::spawn(ServerConfig {
+            udp_bind: Some(loopback()),
+            tcp_bind: Some(loopback()),
+            audit_absent: None,
+            audit_path: None,
+            udp_discard: false,
+        })
+        .unwrap();
+        let session_id = relay_session_id("client", "exit");
+        // The accept side attaches over UDP and then waits with no data.
+        let pipe = RelayPipe::connect_udp(
+            server.udp_addr().unwrap(),
+            session_id,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let quinn = UdpSocket::bind(loopback()).unwrap();
+        let face = UdpSocket::bind(loopback()).unwrap();
+        face.connect(quinn.local_addr().unwrap()).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let bridge = spawn_bridge(pipe, face, Arc::clone(&stop));
+        // The wait is longer than the Relay idle time.
+        std::thread::sleep(Duration::from_millis(1_500));
+        // The dial side attaches over TCP and sends the first packet.
+        let mut dial = RelayPipe::connect_tcp(
+            server.tcp_addr().unwrap(),
+            session_id,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        dial.send_opaque(b"initial").unwrap();
+        quinn
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let size = quinn.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..size], b"initial");
+        stop.store(true, Ordering::Relaxed);
+        bridge.join().unwrap();
+    }
 
     #[test]
     fn the_relay_session_id_depends_on_the_pair_and_not_the_order() {

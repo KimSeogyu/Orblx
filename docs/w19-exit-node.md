@@ -225,3 +225,37 @@ HTTP through that path returns `10.77.0.2` for 123 seconds.
 The script sets iptables-legacy FORWARD to ACCEPT when that policy is DROP and iptables-nft FORWARD is ACCEPT.
 The recorded lines do not include that step.
 FORWARD was already ACCEPT.
+
+## W25: the TCP Relay step after the NAT traversal change
+
+Marks: [C] is a run on Docker on one Linux host. REAL is `cargo test`.
+
+From #45 (5d3e607) to #85, `exit-node.sh` stopped at `wait for the TCP Relay`.
+The client log repeated `The Relay path to exit failed. The QUIC connection failed. timed out`.
+
+`git bisect` with the exit-node proof on a release build found the commits:
+
+| Commit | Result |
+|---|---|
+| b07c1db (#44) | last good: the client log shows `uses the TCP Relay` |
+| 5d3e607 (#45) | first bad: the client times out |
+
+The cause is in the product, not in the proof script.
+#45 added `PEER_IDLE` (1 s) to the Relay server.
+When a peer attaches, the server removes each slot that sent nothing for 1 s.
+The exit node attaches as the QUIC server, and its bridge sends nothing until the first client packet.
+The client attaches more than 1 s later, so the server removes the exit node slot.
+The client is then alone on the session, and the QUIC handshake times out.
+The NAT path did not see this, because it sends probes more often than 1 s.
+
+The fix is in the bridge (`crates/orblx-datapath/src/relay_path.rs`).
+A bridge that sent nothing for 250 ms sends an empty DATA payload.
+The bridge drops an empty payload that it receives, so QUIC does not get it.
+A compile-time check keeps the keepalive below one third of `PEER_IDLE`.
+A busy link does not send keepalives.
+
+- REAL: `a_silent_bridge_keeps_its_relay_slot` attaches the accept side over UDP, waits 1.5 s, and attaches the dial side over TCP. The first packet must reach the accept side. The test fails without the fix and passes with it.
+- [C]: `bash scripts/proof/exit-node.sh` prints `The path to exit uses the TCP Relay.` and `proof_ok`.
+- CI: `bash -n` reads only its first file. The old CI step checked only 4 of the scripts on its lines. The CI step now checks each script in `scripts/`, `scripts/proof/` and `scripts/release/`.
+
+Logs are in `/workspace/orblx-w18-proof/` on the proof host: `w256-git-bisect.log`, `w256-bisect-*-exit-node.log` and `w256-*-exit-node-run*.log`.
