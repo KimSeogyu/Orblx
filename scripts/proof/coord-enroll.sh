@@ -10,6 +10,9 @@ require_root "$@"
 # W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$PROOF_LIB_DIR/proof-lock.sh"
+# W25-14b: start from a clean compose state (all profiles, all volumes), under the lock.
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -27,6 +30,7 @@ cleanup() {
 }
 trap 'cleanup; proof_lock_end' EXIT
 proof_lock_take "coord-enroll" "orblx-coord-proof-"
+proof_compose_clean "orblx-coord-proof" || exit 1
 # The test hook ORBLX_COORD_ENROLL_FAIL_AT=start makes the proof fail on purpose after it
 # starts the coordinator. The cleanup test uses it.
 

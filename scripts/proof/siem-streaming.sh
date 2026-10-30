@@ -70,6 +70,10 @@ cleanup() {
 }
 trap 'cleanup; proof_lock_end' EXIT
 proof_lock_take "siem-streaming:${SIEM_PROJECT}" "${SIEM_PROJECT}-"
+# W25-14b: start from a clean compose state (all profiles, all volumes).
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
+proof_compose_clean "$SIEM_PROJECT" || exit 1
 
 # No pipe into head or grep -q: with pipefail, an early reader can fail the pipe (SIGPIPE).
 has_line() {

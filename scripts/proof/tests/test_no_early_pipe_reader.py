@@ -211,7 +211,7 @@ ROOT_PROOFS = ["coord-enroll.sh", "split-dns.sh", "svid-renew.sh", "w18-names.sh
 PROOFS_WITH_OWN_LOCK = sorted(
     f for f in os.listdir(os.path.join(REPO, "scripts", "proof"))
     if f.endswith(".sh") and f not in {
-        "proof-lock.sh", "pipe-lib.sh", "serve-lib.sh", "stage-image.sh", "entrypoint.sh", "nat-router.sh",
+        "proof-lock.sh", "pipe-lib.sh", "compose-clean.sh", "serve-lib.sh", "stage-image.sh", "entrypoint.sh", "nat-router.sh",
         # The rc.3 release sweep is a driver, not a proof. It builds before the lock (so no proof
         # waits for a build) and takes the lock for each proof it runs (test_release_sweep.py).
         "release-sweep.sh"}
@@ -512,7 +512,8 @@ class SiemStreamingTest(unittest.TestCase):
         self.assertNotEqual(new.returncode, 0)
 
 
-COMPOSE_PROOF_LIBS = {"serve-lib.sh", "stage-image.sh", "pipe-lib.sh", "proof-lock.sh"}
+# compose-clean.sh (#114) is a library. It removes containers and starts none.
+COMPOSE_PROOF_LIBS = {"serve-lib.sh", "stage-image.sh", "pipe-lib.sh", "proof-lock.sh", "compose-clean.sh"}
 
 
 class ComposeCleanupTest(unittest.TestCase):
