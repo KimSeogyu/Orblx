@@ -8,11 +8,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use orblx_crypto::{mac_input, ticket_mac, TicketKey, TicketRing};
 use orblx_datapath::{
     ipv4_packet, run_memory_node, AllowPeers, HelloEndpoint, ListenEvent, MemoryDevice, Netmap,
-    NodeRequest, RenewedLeaf, SvidRenewer, NODE_STATUS_FILE,
+    NodeRequest, RenewedLeaf, RenewedTicket, SvidRenewer, NODE_STATUS_FILE,
 };
 use orblx_identity::{
     decode_certificate_pem, leaf_validity, sign_ticket, SpiffeId, TicketClaims, TicketFlags,
-    TicketSigner, TrustBundle,
+    TicketSigner, TicketVerifier, TrustBundle,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -283,6 +283,180 @@ async fn session_stays_up_for_three_svid_lifetimes() {
     assert!(
         expiries.len() >= 3,
         "svid expiries {expiries:?} over three lifetimes"
+    );
+}
+
+/// W25-26: the node presents the renewed coordinator ticket after a renewal.
+///
+/// The ticket life is the SVID life. Before W25-26 the node kept the ticket from enroll,
+/// and the peer refused each new handshake after the ticket end + `MAX_SKEW`.
+/// Each renewal starts a new handshake, so the test also covers new handshakes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_crosses_coordinator_ticket_ends() {
+    const LIFE_SECS: u64 = 15;
+    let skew = orblx_identity::MAX_SKEW.as_secs();
+    let scratch = Scratch::new("tix");
+    let node_a = Scratch::new("tix-a");
+    let node_b = Scratch::new("tix-b");
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord
+        .set_node_svid_ttl(Duration::from_secs(LIFE_SECS))
+        .unwrap();
+    let token_a = coord.create_token(Duration::from_secs(600)).unwrap();
+    let token_b = coord.create_token(Duration::from_secs(600)).unwrap();
+    let (addr, handle) = server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+    let port_a = free_port();
+    let port_b = free_port();
+    let enroll_unix = unix(SystemTime::now());
+    let enrolled_a = client::enroll_with_token(
+        addr,
+        "coord",
+        &bundle,
+        "a",
+        &token_a.secret,
+        &[format!("127.0.0.1:{port_a}")],
+        &[],
+    )
+    .await
+    .unwrap();
+    let enrolled_b = client::enroll_with_token(
+        addr,
+        "coord",
+        &bundle,
+        "b",
+        &token_b.secret,
+        &[format!("127.0.0.1:{port_b}")],
+        &[],
+    )
+    .await
+    .unwrap();
+    enrolled_a.write_state(&node_a.0).unwrap();
+    enrolled_b.write_state(&node_b.0).unwrap();
+    // The first tickets end at most LIFE_SECS + 1 s after this time.
+    let first_end = enroll_unix + LIFE_SECS + 1;
+
+    let trust = TrustBundle::from_pem(&bundle).unwrap();
+    let config_a = coord_ticket_config(&enrolled_a, &trust);
+    let config_b = coord_ticket_config(&enrolled_b, &trust);
+    let map_a = netmap("a", "100.64.0.1", "b", "100.64.0.2", port_b);
+    let map_b = netmap("b", "100.64.0.2", "a", "100.64.0.1", port_a);
+
+    let (stop_tx, stop_a) = watch::channel(false);
+    let stop_b = stop_a.clone();
+    let (a_in_tx, a_in_rx) = mpsc::channel(64);
+    let (a_out_tx, mut a_out_rx) = mpsc::channel(64);
+    let (b_in_tx, b_in_rx) = mpsc::channel(64);
+    let (b_out_tx, mut b_out_rx) = mpsc::channel(64);
+    let task_a = tokio::spawn(run_memory_node(
+        node_request(
+            config_a,
+            map_a,
+            port_a,
+            node_a.0.clone(),
+            coord_renewer(addr, bundle.clone(), node_a.0.clone()),
+            stop_a,
+        ),
+        MemoryDevice {
+            from_tun: a_in_rx,
+            to_tun: a_out_tx,
+        },
+    ));
+    let task_b = tokio::spawn(run_memory_node(
+        node_request(
+            config_b,
+            map_b,
+            port_b,
+            node_b.0.clone(),
+            coord_renewer(addr, bundle.clone(), node_b.0.clone()),
+            stop_b,
+        ),
+        MemoryDevice {
+            from_tun: b_in_rx,
+            to_tun: b_out_tx,
+        },
+    ));
+
+    // Send until 20 s after the first ticket end + MAX_SKEW.
+    let end_unix = first_end + skew + 20;
+    let mut last_ab: Option<Instant> = None;
+    let mut last_ba: Option<Instant> = None;
+    let mut max_gap = Duration::ZERO;
+    let mut late_ab = 0u64;
+    let mut late_ba = 0u64;
+    let mut ends = HashSet::new();
+    while unix(SystemTime::now()) < end_unix {
+        let late = unix(SystemTime::now()) > first_end + skew;
+        let _ = a_in_tx
+            .send(
+                ipv4_packet(
+                    Ipv4Addr::new(100, 64, 0, 1),
+                    Ipv4Addr::new(100, 64, 0, 2),
+                    b"ab",
+                )
+                .unwrap(),
+            )
+            .await;
+        let _ = b_in_tx
+            .send(
+                ipv4_packet(
+                    Ipv4Addr::new(100, 64, 0, 2),
+                    Ipv4Addr::new(100, 64, 0, 1),
+                    b"ba",
+                )
+                .unwrap(),
+            )
+            .await;
+        let slice_end = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < slice_end {
+            if let Ok(Some(_)) =
+                tokio::time::timeout(Duration::from_millis(20), b_out_rx.recv()).await
+            {
+                note_gap(&mut last_ab, &mut max_gap);
+                if late {
+                    late_ab += 1;
+                }
+            }
+            if let Ok(Some(_)) =
+                tokio::time::timeout(Duration::from_millis(20), a_out_rx.recv()).await
+            {
+                note_gap(&mut last_ba, &mut max_gap);
+                if late {
+                    late_ba += 1;
+                }
+            }
+        }
+        if let Ok(bytes) = fs::read(node_a.0.join("ticket.bin")) {
+            ends.insert(orblx_identity::ticket_hash(&bytes));
+        }
+    }
+    let quiet_ab = last_ab.map_or(u128::MAX, |time| time.elapsed().as_millis());
+    let quiet_ba = last_ba.map_or(u128::MAX, |time| time.elapsed().as_millis());
+
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(3), task_a).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), task_b).await;
+    handle.abort();
+
+    println!(
+        "ticket_ends {} late_ab {late_ab} late_ba {late_ba} max_gap_ms {} quiet_ab_ms {quiet_ab} quiet_ba_ms {quiet_ba}",
+        ends.len(),
+        max_gap.as_millis()
+    );
+    assert!(
+        ends.len() >= 3,
+        "the node wrote {} coordinator tickets",
+        ends.len()
+    );
+    assert!(
+        late_ab > 50 && late_ba > 50,
+        "packets after the first ticket end + skew: a-to-b {late_ab} b-to-a {late_ba}"
+    );
+    assert!(
+        quiet_ab < 1_000 && quiet_ba < 1_000,
+        "the session stopped: a-to-b {quiet_ab} ms, b-to-a {quiet_ba} ms"
     );
 }
 
@@ -1110,8 +1284,54 @@ fn renewer(addr: SocketAddr, bundle: String, state: PathBuf) -> SvidRenewer {
         Ok(RenewedLeaf {
             certificate_pem: result.certificate_pem,
             private_key_pem: result.private_key_pem,
+            ticket: None,
         })
     })
+}
+
+/// The node renewer of `orblx up --coord`: the leaf and the coordinator ticket (W25-26).
+fn coord_renewer(addr: SocketAddr, bundle: String, state: PathBuf) -> SvidRenewer {
+    SvidRenewer::new(move || {
+        let result = client::renew_svid_blocking(addr, "coord", &bundle, &state)
+            .map_err(|err| err.to_string())?;
+        let ticket = result
+            .ticket
+            .as_ref()
+            .ok_or_else(|| "The renewal reply has no capability ticket.".to_string())?;
+        Ok(RenewedLeaf {
+            certificate_pem: result.certificate_pem.clone(),
+            private_key_pem: result.private_key_pem.clone(),
+            ticket: Some(RenewedTicket {
+                bytes: ticket.bytes.clone(),
+                mac: ticket.mac,
+            }),
+        })
+    })
+}
+
+/// The node config from the enroll reply: the leaf and the coordinator ticket.
+fn coord_ticket_config(
+    enrolled: &crate::EnrollResult,
+    trust: &TrustBundle,
+) -> orblx_datapath::HelloConfig {
+    let ticket = enrolled.ticket.as_ref().unwrap();
+    let verifier = TicketVerifier::from_public_pem(&ticket.verifier_pem).unwrap();
+    let key = TicketKey::new(
+        verifier,
+        ticket.mac_key,
+        UNIX_EPOCH + Duration::from_secs(ticket.not_before),
+        UNIX_EPOCH + Duration::from_secs(ticket.not_after),
+    )
+    .unwrap();
+    let ring = TicketRing::single(key, &ticket.svid_ca_pub).unwrap();
+    orblx_datapath::HelloConfig::from_issued(
+        &enrolled.certificate_pem,
+        &enrolled.private_key_pem,
+        trust.clone(),
+        ticket.bytes.clone(),
+        ticket.mac,
+        ring,
+    )
 }
 
 fn node_request(

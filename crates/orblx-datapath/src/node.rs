@@ -60,6 +60,21 @@ pub struct RenewedLeaf {
     pub certificate_pem: String,
     /// PEM private key for this node.
     pub private_key_pem: String,
+    /// The capability ticket that the coordinator issued with the leaf (W25-26).
+    ///
+    /// `None` keeps the current ticket. Use `None` only for a ticket that the
+    /// coordinator did not issue, for example a lab ticket.
+    pub ticket: Option<RenewedTicket>,
+}
+
+/// A capability ticket from a renewal.
+///
+/// Debug output elides the ticket bytes and the tag.
+pub struct RenewedTicket {
+    /// Identity version-1 ticket bytes.
+    pub bytes: Vec<u8>,
+    /// HMAC-SHA256 tag over `bytes`.
+    pub mac: [u8; 32],
 }
 
 impl std::fmt::Debug for RenewedLeaf {
@@ -67,6 +82,7 @@ impl std::fmt::Debug for RenewedLeaf {
         formatter
             .debug_struct("RenewedLeaf")
             .field("private_key_pem", &"[elided]")
+            .field("ticket", &self.ticket.as_ref().map(|_| "[elided]"))
             .finish()
     }
 }
@@ -1751,10 +1767,26 @@ fn apply_leaf(mesh: &Mesh, leaf: &RenewedLeaf) -> Result<u64, HelloError> {
     }
     let (not_before, not_after) = leaf_validity(&der).map_err(HelloError::Identity)?;
     let previous = lock(&mesh.identity).clone();
+    if let Some(ticket) = &leaf.ticket {
+        // The new ticket must pass the same check that a peer runs.
+        let _checked = orblx_crypto::verify_ticket(
+            &previous.ticket_ring,
+            &ticket.bytes,
+            &ticket.mac,
+            &id,
+            SystemTime::now(),
+            &DenySet::empty(),
+        )
+        .map_err(HelloError::Ticket)?;
+    }
     let next = {
         let mut config = lock(&mesh.identity);
         config.certificate_pem = leaf.certificate_pem.clone();
         config.private_key_pem = leaf.private_key_pem.clone();
+        if let Some(ticket) = &leaf.ticket {
+            config.ticket_bytes = ticket.bytes.clone();
+            config.ticket_mac = ticket.mac;
+        }
         config.clone()
     };
     if let Err(err) = mesh.endpoint.install_identity(&next) {
