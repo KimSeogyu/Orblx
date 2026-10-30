@@ -433,6 +433,7 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
             }
             orblx_serve::spawn_serve(&ssh_state, &serve_netmap, overlay);
         })),
+        on_listen: None,
         metrics: options.metrics,
         filter,
     })

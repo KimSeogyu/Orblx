@@ -1090,6 +1090,7 @@ fn a_ping_increments_the_overlay_counters() {
                     netmap_path: PathBuf::from("netmap.json"),
                     visibility: Arc::new(AllowPeers),
                     on_ready: None,
+                    on_listen: None,
                     metrics: Some(metrics),
                     filter: None,
                 },
