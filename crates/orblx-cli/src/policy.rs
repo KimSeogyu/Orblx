@@ -1,4 +1,4 @@
-//! `orblx policy check`, `orblx policy test`, and `orblx policy enforce`.
+//! `orblx policy check`, `test`, `enforce`, `diff`, and `apply`.
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -8,6 +8,7 @@ use orblx_coord::{decode_hex_32, verify_signed_grants, SignedGrants};
 use orblx_datapath::enforce_receiver_tcp;
 use orblx_identity::{Policy, SpiffeId};
 
+use super::policy_gitops::{self, Apply, Diff};
 use super::take_value;
 
 /// A policy command.
@@ -27,6 +28,10 @@ pub(crate) enum Command {
         ports: Vec<u16>,
         audit: PathBuf,
     },
+    /// W25-9: compare a file with the live policy.
+    Diff(Box<Diff>),
+    /// W25-9: write a tested file when the live policy has the expected sha256.
+    Apply(Box<Apply>),
 }
 
 pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
@@ -37,6 +42,12 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         "check" => parse_file(&args[1..]).map(|file| Command::Check { file }),
         "test" => parse_file(&args[1..]).map(|file| Command::Test { file }),
         "enforce" => parse_enforce(&args[1..]),
+        "diff" => policy_gitops::parse_diff(&args[1..])
+            .map(|diff| Command::Diff(Box::new(diff)))
+            .map_err(|err| format!("{err}\n{}", help())),
+        "apply" => policy_gitops::parse_apply(&args[1..])
+            .map(|apply| Command::Apply(Box::new(apply)))
+            .map_err(|err| format!("{err}\n{}", help())),
         other => Err(format!("The mode {other} is not valid.\n{}", help())),
     }
 }
@@ -70,6 +81,16 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             ports,
             audit,
         } => run_enforce(&state, &src, dst_ip, &ports, &audit),
+        // Exit 0: the same. Exit 1: they differ. Exit 2: the diff did not run.
+        Command::Diff(diff) => match policy_gitops::run_diff(&diff) {
+            Ok(true) => Ok(()),
+            Ok(false) => std::process::exit(1),
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(2);
+            }
+        },
+        Command::Apply(apply) => policy_gitops::run_apply(&apply),
     }
 }
 
@@ -183,6 +204,9 @@ fn help() -> String {
 orblx policy check --file FILE
 orblx policy test --file FILE
 orblx policy enforce --state DIR --src NAME --dst-ip ADDR --port PORT --audit FILE
+orblx policy diff --file FILE --coord ADDR [--token-file FILE] [--sha-out FILE]
+orblx policy apply --file FILE --coord ADDR --token-file FILE (--expect-sha SHA | --expect-sha-file FILE)
+  diff and apply also take --coord-name NAME (default coord), --bundle FILE, and --state DIR.
 
 The policy file is HuJSON.
 The file may contain comments and trailing commas.
@@ -198,6 +222,14 @@ A failed test rejects the file.
 The enforce command checks the signed grants on the receiver.
 An allow writes no audit record.
 A deny appends one record to the audit hash chain.
+diff prints the live sha256, the file sha256, and the changed lines.
+diff exits 0 when they are the same, 1 when they differ, and 2 on an error.
+diff needs a policy:read token or an owner SVID.
+apply runs the tests in the file first. A failed test sends nothing.
+apply needs a policy:write token and the live sha256 that diff printed.
+A stale apply gets status 409 and writes nothing.
+The same file again writes nothing and prints changed false.
+A token cannot change the owners (status 403).
 "
     .to_string()
 }
@@ -235,7 +267,11 @@ mod tests {
                 assert_eq!(ports, vec![22, 5432]);
                 assert_eq!(src, "mac");
             }
-            Command::Help | Command::Check { .. } | Command::Test { .. } => {
+            Command::Help
+            | Command::Check { .. }
+            | Command::Test { .. }
+            | Command::Diff(_)
+            | Command::Apply(_) => {
                 panic!("the parser did not select enforce");
             }
         }

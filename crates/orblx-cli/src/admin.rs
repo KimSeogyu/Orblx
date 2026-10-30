@@ -45,6 +45,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         "approve" => "admin-approve",
         "revoke" => "admin-revoke",
         "revoke-all" => "admin-revoke-all",
+        "revoke-undo" => "admin-revoke-undo",
         "expire" => "admin-expire",
         "routes" => "admin-routes",
         "audit" => "admin-audit",
@@ -107,13 +108,14 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         "admin-approve"
             | "admin-revoke"
             | "admin-revoke-all"
+            | "admin-revoke-undo"
             | "admin-expire"
             | "admin-grant-approve"
             | "admin-grant-revoke"
     ) {
         let what = if op.starts_with("admin-grant") {
             "a grant id"
-        } else if op == "admin-revoke-all" {
+        } else if op == "admin-revoke-all" || op == "admin-revoke-undo" {
             "a principal"
         } else {
             "a node name"
@@ -216,7 +218,10 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
                 return print_created(&value, call.out.as_deref());
             }
             print_admin(&call.op, &value)?;
-            if matches!(call.op.as_str(), "admin-grant-revoke" | "admin-revoke-all") {
+            if matches!(
+                call.op.as_str(),
+                "admin-grant-revoke" | "admin-revoke-all" | "admin-revoke-undo"
+            ) {
                 println!("revoke_start_ms {started_ms}");
                 println!("revoke_done_ms {}", now_millis());
             }
@@ -407,6 +412,15 @@ fn print_admin(op: &str, value: &Value) -> Result<(), String> {
                 .get("deny_version")
                 .and_then(Value::as_u64)
                 .ok_or_else(bad)?;
+            println!("deny_version {version}");
+        }
+        "admin-revoke-undo" => {
+            println!("unrevoked {}", text_field(value, "principal")?);
+            println!("svid_restored yes");
+            let version = value
+                .get("deny_version")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "The coordinator response is not valid.".to_string())?;
             println!("deny_version {version}");
         }
         "admin-expire" => {
@@ -615,6 +629,7 @@ orblx admin users --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin approve NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin revoke NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin revoke-all PRINCIPAL --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin revoke-undo PRINCIPAL --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin expire NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin routes --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin grants --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
@@ -633,7 +648,7 @@ With --token-file, the command sends the scoped API token in FILE and no client 
 The coordinator accepts the call only when the token has the scope of the operation.
 The command then prints `status N done_ms MS`. 401: the token is not valid, expired, or revoked.
 403: the token does not have the scope. Only an owner SVID can create, list, or revoke tokens.
-Scopes: nodes:read (nodes, users, routes), nodes:write (approve, revoke, revoke-all, expire),
+Scopes: nodes:read (nodes, users, routes), nodes:write (approve, revoke, revoke-all, revoke-undo, expire),
 grants:read (grants), grants:write (grant-approve, grant-revoke), audit:read (audit),
 lock:read and lock:write (node lock), policy:read (policy), policy:write (policy-set).
 TIME for --ttl is seconds or an age such as 90s, 30m, 2h, or 7d. The maximum is 30d.
@@ -648,6 +663,8 @@ revoke adds the node to the deny set.
 revoke-all stops all access of one principal with one deny change and one audit record:
 the SVID, all agent grants of the principal, SSH, and file send.
 PRINCIPAL is a node name or a SPIFFE URI of a node, a user, or an agent.
+revoke-undo removes the SVID deny entry of the principal with one deny change and one audit record.
+The grants that revoke-all revoked stay revoked.
 expire removes the node from netmaps until approve.
 grants lists the agent JIT grants.
 grant-approve lets the agent fetch the grant. Only an owner approves an agent grant.
@@ -707,6 +724,31 @@ mod tests {
         }
         let err = parse(&[
             "revoke-all".to_string(),
+            "--coord".to_string(),
+            "127.0.0.1:443".to_string(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("a principal"));
+    }
+
+    #[test]
+    fn revoke_undo_parses_the_principal() {
+        let command = parse(&[
+            "revoke-undo".to_string(),
+            "a".to_string(),
+            "--coord".to_string(),
+            "127.0.0.1:443".to_string(),
+        ])
+        .unwrap();
+        match command {
+            Command::Call(call) => {
+                assert_eq!(call.op, "admin-revoke-undo");
+                assert_eq!(call.target, "a");
+            }
+            Command::Help => panic!("the parser did not select revoke-undo"),
+        }
+        let err = parse(&[
+            "revoke-undo".to_string(),
             "--coord".to_string(),
             "127.0.0.1:443".to_string(),
         ])
