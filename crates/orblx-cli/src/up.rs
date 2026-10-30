@@ -394,7 +394,7 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
 fn run_up(mut options: UpOptions) -> Result<(), String> {
     apply_saved_exit(&mut options)?;
     let (netmap_path, forward_routes, forward_exit) = publish_routes(&options)?;
-    let netmap = Netmap::from_path(&netmap_path).map_err(|err| err.to_string())?;
+    let netmap = locked_netmap(&options.state_dir, &netmap_path)?;
     let config = load_config(&options.state_dir)?;
     let visibility = load_visibility(&options.state_dir, &netmap.self_node.name)?;
     let ssh_state = options.state_dir.clone();
@@ -427,6 +427,26 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
         metrics: options.metrics,
     })
     .map_err(|err| err.to_string())
+}
+
+/// Read the netmap and apply node lock (W23-1).
+///
+/// With a node lock file, the function writes the netmap file again without the peers
+/// that no trusted owner key signed. The accept path reads that file.
+fn locked_netmap(state_dir: &Path, netmap_path: &Path) -> Result<Netmap, String> {
+    let mut netmap = Netmap::from_path(netmap_path).map_err(|err| err.to_string())?;
+    let report = orblx_coord::nodelock::apply_node_lock(state_dir, &mut netmap)
+        .map_err(|err| format!("Node lock refused the netmap. {err}"))?;
+    if let Some(report) = report {
+        orblx_coord::nodelock::print_report(&report);
+        if !report.dropped.is_empty() {
+            let text = serde_json::to_string(&netmap)
+                .map_err(|_| "The netmap is not valid.".to_string())?;
+            fs::write(netmap_path, text.as_bytes())
+                .map_err(|err| format!("The netmap file was not written. {err}"))?;
+        }
+    }
+    Ok(netmap)
 }
 
 fn push_ipv4(extra: &mut Vec<Ipv4Addr>, addr: Option<SocketAddr>) {
@@ -1467,6 +1487,7 @@ mod tests {
             routes: Vec::new(),
             exit_node: false,
             owner: "lab".to_string(),
+            lock_sig: None,
         };
         let mut peer_c = peer_b.clone();
         peer_c.name = "c".to_string();
@@ -1515,6 +1536,7 @@ mod tests {
             routes: Vec::new(),
             exit_node: false,
             owner: "lab".to_string(),
+            lock_sig: None,
         }
     }
 

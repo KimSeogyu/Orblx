@@ -24,6 +24,49 @@ pub struct Netmap {
     pub self_node: NetmapSelf,
     /// The other nodes.
     pub peers: Vec<NetmapPeer>,
+    /// Owner key updates for node lock (W23-1).
+    ///
+    /// Each update holds an owner signature. A node with a node lock file applies the updates.
+    /// An empty list stays out of the JSON text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lock: Vec<LockUpdate>,
+}
+
+/// The node lock file name in a node state directory.
+///
+/// The file holds the trusted owner keys. A node with this file accepts a peer
+/// only when a trusted owner key signed that peer.
+pub const NODE_LOCK_FILE: &str = "node-lock.json";
+
+/// One owner signature for one node (W23-1 node lock).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeLockSig {
+    /// The owner public key as 64 hex characters.
+    pub key_id: String,
+    /// The base64 Ed25519 signature.
+    pub sig: String,
+}
+
+/// One owner key update (W23-1 node lock).
+///
+/// `keys` is the full trusted key set after the update.
+/// A key in the set before the update signs the update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LockUpdate {
+    /// The lock version after the update. The first update is version 1.
+    pub version: u64,
+    /// `rotate` or `remove`.
+    pub action: String,
+    /// The trusted owner keys after the update, as 64 hex characters each.
+    pub keys: Vec<String>,
+    /// The head hash before the update. Empty for version 1.
+    pub prev: String,
+    /// The owner key that signed the update.
+    pub signer: String,
+    /// The base64 Ed25519 signature.
+    pub sig: String,
 }
 
 /// The local node in a netmap.
@@ -67,6 +110,11 @@ pub struct NetmapPeer {
     /// Empty means the peer has no `<node>.<owner>.orblx` name.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub owner: String,
+    /// The owner signature for node lock (W23-1).
+    ///
+    /// None stays out of the JSON text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_sig: Option<NodeLockSig>,
 }
 
 /// A netmap document is not valid.

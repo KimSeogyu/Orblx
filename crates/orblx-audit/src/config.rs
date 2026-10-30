@@ -68,11 +68,19 @@ pub enum ConfigAction {
     FunnelOn,
     /// A node turned funnel off. The outside listener closes.
     FunnelOff,
+    /// An owner set up node lock with the first trusted owner keys.
+    LockInit,
+    /// An owner signed one node for node lock.
+    LockSign,
+    /// An owner key replaced itself with a new owner key.
+    LockRotate,
+    /// An owner key removed one owner key.
+    LockRemove,
 }
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 23] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -92,6 +100,10 @@ impl ConfigAction {
         Self::ServeOff,
         Self::FunnelOn,
         Self::FunnelOff,
+        Self::LockInit,
+        Self::LockSign,
+        Self::LockRotate,
+        Self::LockRemove,
     ];
 
     /// Return the stable action token.
@@ -117,6 +129,10 @@ impl ConfigAction {
             Self::ServeOff => "serve-off",
             Self::FunnelOn => "funnel-on",
             Self::FunnelOff => "funnel-off",
+            Self::LockInit => "lock-init",
+            Self::LockSign => "lock-sign",
+            Self::LockRotate => "lock-rotate",
+            Self::LockRemove => "lock-remove",
         }
     }
 
@@ -149,6 +165,10 @@ impl ConfigAction {
             Self::ServeOff => 17,
             Self::FunnelOn => 18,
             Self::FunnelOff => 19,
+            Self::LockInit => 20,
+            Self::LockSign => 21,
+            Self::LockRotate => 22,
+            Self::LockRemove => 23,
         }
     }
 

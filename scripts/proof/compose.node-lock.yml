@@ -1,0 +1,212 @@
+# Node lock proof stack (W23-1).
+# `docker compose up` starts only the coordinator.
+# The node services use the nodes profile.
+# The owner keys stay in the owner volume. The nodes get only the .pub files from /proof.
+name: orblx-w23a-node-lock
+
+services:
+  coord:
+    image: orblx-w23a-lock:w23
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /var/lib/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+    volumes:
+      - orblx-w23a-lock-store:/var/lib/orblx
+      - ${POLICY_FILE:?set POLICY_FILE}:/var/lib/orblx/policy.hujson:ro
+    networks:
+      - proof
+
+  owner:
+    image: orblx-w23a-lock:w23
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    volumes:
+      - orblx-w23a-lock-store:/coord-state:ro
+      - orblx-w23a-lock-owner:/var/lib/orblx
+      - ${PUB_DIR:?set PUB_DIR}:/proof
+    networks:
+      - proof
+
+  a:
+    image: orblx-w23a-lock:w23
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-w23a-lock-store:/coord-state:ro
+      - orblx-w23a-lock-a:/var/lib/orblx
+      - ${PUB_DIR:?set PUB_DIR}:/proof:ro
+    networks:
+      - proof
+
+  b:
+    image: orblx-w23a-lock:w23
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-w23a-lock-store:/coord-state:ro
+      - orblx-w23a-lock-b:/var/lib/orblx
+      - ${PUB_DIR:?set PUB_DIR}:/proof:ro
+    networks:
+      - proof
+
+  c:
+    image: orblx-w23a-lock:w23
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-w23a-lock-store:/coord-state:ro
+      - orblx-w23a-lock-c:/var/lib/orblx
+      - ${PUB_DIR:?set PUB_DIR}:/proof:ro
+    networks:
+      - proof
+
+  ak2:
+    image: orblx-w23a-lock:w23
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-w23a-lock-store:/coord-state:ro
+      - orblx-w23a-lock-ak2:/var/lib/orblx
+      - ${PUB_DIR:?set PUB_DIR}:/proof:ro
+    networks:
+      - proof
+
+  arogue:
+    image: orblx-w23a-lock:w23
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-w23a-lock-store:/coord-state:ro
+      - orblx-w23a-lock-arogue:/var/lib/orblx
+      - ${PUB_DIR:?set PUB_DIR}:/proof:ro
+    networks:
+      - proof
+
+volumes:
+  orblx-w23a-lock-store:
+  orblx-w23a-lock-owner:
+  orblx-w23a-lock-a:
+  orblx-w23a-lock-b:
+  orblx-w23a-lock-c:
+  orblx-w23a-lock-ak2:
+  orblx-w23a-lock-arogue:
+
+networks:
+  proof:

@@ -309,7 +309,11 @@ async fn dispatch(
         | "admin-audit"
         | "admin-grants"
         | "admin-grant-approve"
-        | "admin-grant-revoke" => dispatch_admin(coord, connection, &request, now),
+        | "admin-grant-revoke"
+        | "admin-lock"
+        | "admin-lock-init"
+        | "admin-lock-sign"
+        | "admin-lock-update" => dispatch_admin(coord, connection, &request, now),
         _ => Err(CoordError::Protocol(
             "The request is not valid.".to_string(),
         )),
@@ -339,6 +343,23 @@ fn dispatch_admin(
         "admin-grants" => agent::list(coord, now)?,
         "admin-grant-approve" => agent::approve(coord, &request.name, caller.as_uri(), now)?,
         "admin-grant-revoke" => agent::revoke(coord, &request.name, caller.as_uri(), now)?,
+        "admin-lock" => coord.lock_show()?,
+        "admin-lock-init" => {
+            let ask: LockInitAsk = lock_json(&request.name)?;
+            coord.lock_init(&ask.keys, caller.as_uri())?
+        }
+        "admin-lock-sign" => {
+            let ask: LockSignAsk = lock_json(&request.name)?;
+            let sig = orblx_datapath::NodeLockSig {
+                key_id: ask.key_id,
+                sig: ask.sig,
+            };
+            coord.lock_sign(&ask.name, sig, caller.as_uri())?
+        }
+        "admin-lock-update" => {
+            let update: orblx_datapath::LockUpdate = lock_json(&request.name)?;
+            coord.lock_update(update, caller.as_uri())?
+        }
         _ => {
             return Err(CoordError::Protocol(
                 "The request is not valid.".to_string(),
@@ -363,6 +384,27 @@ fn detail_response(value: &serde_json::Value) -> Result<Response, CoordError> {
         detail: Some(detail),
         ..Response::default()
     })
+}
+
+/// The node lock admin calls put one JSON document in the name field.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LockInitAsk {
+    keys: Vec<String>,
+}
+
+/// One owner signature for one node.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LockSignAsk {
+    name: String,
+    key_id: String,
+    sig: String,
+}
+
+fn lock_json<T: for<'de> serde::Deserialize<'de>>(text: &str) -> Result<T, CoordError> {
+    serde_json::from_str(text)
+        .map_err(|_| CoordError::Protocol("The node lock request is not valid.".to_string()))
 }
 
 /// The admin audit call puts the `since` Unix time in the name field.
