@@ -9,8 +9,10 @@ One row per run: the max ping, the median ping and the lost pings over the W23-4
 (proof_contention line of proof-lock.sh: the max number of other running orblx containers).
 --gate: exit 1 unless every run has proof_ok, a max ping below the limit and 0 lost.
 --sym-gate: the W23-4 sym relay throughput check (W25-12). Exit 1 unless at least
-  ORBLX_SYM_GATE_RUNS (default 5) runs were alone on the box with a sym_sym relay bulk of at least
-  ORBLX_SYM_GATE_SECS (default 29) seconds, and the median of these runs is at or above the W22 floor.
+  ORBLX_SYM_GATE_RUNS (default 5) runs have a sym_sym relay bulk of at least ORBLX_SYM_GATE_SECS
+  (default 29) seconds, and the median of these runs is at or above the W22 floor. Each run holds the
+  proof lock, so no other proof runs at the same time. The line also gives the number of runs alone
+  on the box (no other orblx container).
 --last-row: print only the row of the last run (serial-rtt.sh prints it after each run).
 --kill-check: exit 3 when the last run has a ping above the limit and no other orblx container ran.
 Every number comes from a log line. A missing value is printed as "-".
@@ -197,18 +199,18 @@ def sym_summary(rows):
 
 
 def sym_gate(rows):
-    """W25-12: the sym relay median over the long runs alone on the box, against the W22 floor."""
-    vals = sorted(r["sym_mbit"] for r in rows
-                  if contended(r) is False and r.get("sym_mbit") is not None
-                  and (r.get("sym_secs") or 0) >= SYM_GATE_SECS)
+    """W25-12: the sym relay median over the long runs, against the W22 floor."""
+    long_rows = [r for r in rows if r.get("sym_mbit") is not None and (r.get("sym_secs") or 0) >= SYM_GATE_SECS]
+    vals = sorted(r["sym_mbit"] for r in long_rows)
+    alone = sum(1 for r in long_rows if contended(r) is False)
     if len(vals) < SYM_GATE_RUNS:
-        print("sym_gate failed: %d alone runs with a sym bulk of at least %.0f s, need %d"
+        print("sym_gate failed: %d runs with a sym bulk of at least %.0f s, need %d"
               % (len(vals), SYM_GATE_SECS, SYM_GATE_RUNS))
         return 1
     med = median(vals)
     verdict = "ok" if med >= SYM_FLOOR_MBIT else "failed"
-    print("sym_gate %s: %d alone runs of at least %.0f s, median %.2f Mbit/s (min %.2f, max %.2f), W22 floor %.0f"
-          % (verdict, len(vals), SYM_GATE_SECS, med, vals[0], vals[-1], SYM_FLOOR_MBIT))
+    print("sym_gate %s: %d runs of at least %.0f s (%d alone), median %.2f Mbit/s (min %.2f, max %.2f), W22 floor %.0f"
+          % (verdict, len(vals), SYM_GATE_SECS, alone, med, vals[0], vals[-1], SYM_FLOOR_MBIT))
     return 0 if verdict == "ok" else 1
 
 

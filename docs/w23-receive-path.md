@@ -12,6 +12,7 @@ All [C] containers share this host. Another worker used the same host on the sam
 All numbers come from the logs in `/workspace/orblx-w18-proof/` on that host.
 This document has no target numbers. Each number is a measured value.
 The W22 medians (direct 1094, prc relay 1128, sym relay 1113 Mbit/s) are the minimum values from the brief.
+W25-12: the sym relay check now uses the median of 5 runs with 30 s samples (`scripts/proof/sym-throughput.sh`, see [W25-12](w25-sym-throughput.md)). One 5 s sample is not sufficient.
 
 ## Cause
 
