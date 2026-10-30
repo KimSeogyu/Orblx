@@ -104,14 +104,15 @@ The script uses the names `orblx-w25h-dimg-*` (containers, volumes, one network)
 It runs the coordinator from the same image with `ORBLX_SVID_TTL=60`.
 It does not print enroll tokens, keys, or certificates.
 
-Log: `/workspace/orblx-w18-proof/w25-h-docker-image-ecb00bfa.log` (branch commit `ecb00bf`, on main `1dbbec6`).
+Log: `/workspace/orblx-w18-proof/w25-h-docker-image-ed4c0a83.log` (branch commit `ed4c0a8`, with main `06e4a0b`).
+Earlier branch runs (`ecb00bfa`, `75bf8530`) are `proof_ok` too.
 
 | Gate | Label | Result |
 | --- | --- | --- |
-| 1. Multi-stage build, slim runtime, at most 60 MB | REAL | `size_bytes 40259589` (40.3 MB), 1 layer. PR CI (BuildKit, run 41055756663) reports `size_bytes 27703428` (27.7 MB) for the same Dockerfile. The two engines measure the size differently. Both are below the limit. The stripped release binary is 14964872 bytes (15.0 MB). |
-| 2. Only a token, `NET_ADMIN`, and `/dev/net/tun`: enroll, SVID, overlay ping | [C] | `b` used a token file. `a` used a token env var (`--env-file`). `privileged false cap_add [CAP_NET_ADMIN] devices 1` for both. Overlay `a 100.64.0.2`, `b 100.64.0.1`. `ping a->b`: 20/20, 0% loss, avg 1.736 ms, max 6.010 ms. The `orblx up` process has 0 `ORBLX_ENROLL_TOKEN*` variables. 0 temp token files. `resolvectl` missing: 1 line, the node continues. |
-| 3. Restart with the state volume: same overlay IP, no new enroll | [C] | `a overlay before 100.64.0.2 after 100.64.0.2 enrolled_lines 1 no_enroll_lines 1`. `ping a->b after restart`: 20/20, 0% loss, avg 0.620 ms. |
-| 4. SVID renew in the container, short life | [C] | `ORBLX_SVID_TTL=60`. `The node renewed the SVID. The new expiry is 1793363346.` `svid_expiry before 1793363306 after 1793363346` (+40 s). Ping after renew: 20/20, 0% loss, avg 1.075 ms. |
+| 1. Multi-stage build, slim runtime, at most 60 MB | REAL | `size_bytes 40603039` (40.6 MB), 1 layer. PR CI (BuildKit, run 41055756663, before #80 and #85) reports `size_bytes 27703428` (27.7 MB) for the same Dockerfile. The two engines measure the size differently. Both are below the limit. The stripped release binary is 14964872 bytes (15.0 MB). |
+| 2. Only a token, `NET_ADMIN`, and `/dev/net/tun`: enroll, SVID, overlay ping | [C] | `b` used a token file. `a` used a token env var (`--env-file`). `privileged false cap_add [CAP_NET_ADMIN] devices 1` for both. Overlay `a 100.64.0.2`, `b 100.64.0.1`. `ping a->b`: 20/20, 0% loss, avg 0.811 ms, max 1.245 ms. The `orblx up` process has 0 `ORBLX_ENROLL_TOKEN*` variables. 0 temp token files. `resolvectl` missing: 1 line, the node continues. |
+| 3. Restart with the state volume: same overlay IP, no new enroll | [C] | `a overlay before 100.64.0.2 after 100.64.0.2 enrolled_lines 1 no_enroll_lines 1`. `ping a->b after restart`: 20/20, 0% loss, avg 0.815 ms. |
+| 4. SVID renew in the container, short life | [C] | `ORBLX_SVID_TTL=60`. `svid_expiry before 1793366042 after 1793366082` (+40 s), after the line `The node renewed the SVID`. Ping after renew: 20/20, 0% loss, avg 0.726 ms. |
 | 5. No token, key, or PEM in the image | REAL | `docker history --no-trunc`: 6 lines, 0 hits (the two tokens, `BEGIN`, `ORBLX_ENROLL_TOKEN=`). `Config.Env` has only `PATH`. Scan: `layers 1 files 206 needles 2 hits 0`. |
 | 5. Control | REAL | An image from this image with a planted fake PEM block and a planted string: `control history hit 1`, scan `hits 3` (the string in the layer and in the config, the PEM block in `etc/planted.pem`). |
 | 6. CI builds the image on each PR, no push | REAL | The CI job builds the image, checks the size, checks the history, scans the image, runs the control, and runs `orblx --version`. |
@@ -124,19 +125,19 @@ The `orblx` binary has PEM label strings, but no PEM body. A label alone is not 
 ## 4. W23-4 gates
 
 Script: `scripts/proof/nat-realism.sh` with `ORBLX_NATR_PROFILE=release`, names `orblx-w25h-natr-*`,
-subnets `172.29.127.0/24` and `10.127.21.0/24` to `10.127.24.0/24`. Branch commit `05f4be2` on main `38b1638`.
-Main `1dbbec6` changed only the perf watch files, so the Rust code and this script are the same.
+subnets `172.29.127.0/24` and `10.127.21.0/24` to `10.127.24.0/24`. Branch commit `75bf853` (with main `d153c70`, #80 port ACL in the data path).
+Main `06e4a0b` (#85) changed the coordinator policy API and the CLI. It did not change the data path or this script.
 
-Log: `/workspace/orblx-w18-proof/w25-h-nat-realism.log`. Result: `proof_ok` [C].
+Log: `/workspace/orblx-w18-proof/w25-h-nat-realism-75bf8530.log`. An earlier run on `05f4be2` (`w25-h-nat-realism.log`) is `proof_ok` too. Result: `proof_ok` [C].
 
 | Check | Result |
 | --- | --- |
-| Direct RTT | `rtt plain_avg_ms 0.044 direct_avg_ms 0.316`, `rtt limit_ms 5 ok` |
-| prc_prc relay gate | relay avg 0.685 ms, direct avg 0.316 ms, slack 1 ms, 0/50 lost, `relay_gate ok` |
-| sym_sym relay gate | relay avg 0.910 ms, direct avg 0.316 ms, slack 1 ms, 0/50 lost, `relay_gate ok` |
-| Switch direct to relay | detect 439 ms, 0/50 lost, max gap 468 ms |
-| Switch relay to direct | detect 459 ms, 0/50 lost, max gap 210 ms |
-| Throughput | prc_prc direct 816.80 Mbit/s, prc_prc relay 716.13 Mbit/s |
+| Direct RTT | `rtt plain_avg_ms 0.041 direct_avg_ms 0.538`, `rtt limit_ms 5 ok` |
+| prc_prc relay gate | relay avg 0.804 ms, direct avg 0.538 ms, slack 1 ms, 0/50 lost, `relay_gate ok` |
+| sym_sym relay gate | relay avg 0.841 ms, direct avg 0.538 ms, slack 1 ms, 0/50 lost, `relay_gate ok` |
+| Switch direct to relay | prc_prc: detect 416 ms, 0/50 lost, max gap 444 ms. prc_sym: detect 1010 ms, 0/50 lost, max gap 539 ms |
+| Switch relay to direct | prc_prc: detect 520 ms, 0/50 lost, max gap 209 ms. prc_sym: detect 1173 ms, 0/50 lost, max gap 208 ms |
+| Throughput | prc_prc direct 1296.54 Mbit/s, prc_prc relay 1041.32 Mbit/s |
 | SVID renew | direct and relay peers see the new peer expiry |
 
 ## 5. CI
