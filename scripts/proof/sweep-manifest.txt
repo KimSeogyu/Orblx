@@ -1,0 +1,69 @@
+# W25-17 proof sweep manifest (rc.3 condition 4). scripts/proof/release-sweep.sh reads it.
+# Source of the rows: the "shipped" rows of the gap matrix (the Page "Orblx vs Tailscale
+# 기능 격차 매트릭스 + Wave 계획"), with the row numbers of the matrix, and the PO list of
+# 2026-10-31 (rows 17, 24, 38, 51 and 52 are shipped). Change this file when a row changes.
+#
+# row|NUMBER|FEATURE|PROOFS   One line for each shipped row. PROOFS: space list of proof
+#                             names, or "-". A row with "-" makes the sweep fail.
+# gate|NAME|TEXT|PROOFS       A gate with no shipped row of its own (it runs and can fail).
+# proof|NAME|SCRIPT|ENV|IMAGES[|PASS ERE[|STEP LOGS]]
+#   ENV: space list of NAME=VALUE ("-" for none). @BIN@ is the release orblx binary.
+#   IMAGES: the image tags that the proof builds. The sweep removes them after the proof.
+#   PASS ERE: the line that a pass needs (default: a proof_ok line).
+#   STEP LOGS: a glob under the worktree for the logs that the proof writes to files of its
+#     own. The sweep adds each file, whole, to the sweep log of the proof.
+
+row|1|P2P mesh datapath|w18-linux-daemon
+row|9|Subnet routers|subnet
+row|10|Split tunneling / accept-routes|subnet
+row|11|Exit nodes|exit-node
+row|16|MagicDNS|w18-names
+row|17|Split DNS / policy sync (Linux only)|split-dns policy-sync
+row|19|ACL policy file|policy datapath-acl
+row|21|ACL tests|policy
+row|24|GitOps for ACLs|policy-gitops
+row|28|Node key expiry / auth period|-
+row|29|Key / SVID rotation UX|svid-renew nat-realism
+row|30|Revocation / device removal|admin revoke-all revoke-followup
+row|31|Device approval|admin
+row|33|Auth keys (headless enroll)|coord-enroll
+row|35|OAuth clients / API tokens|api-tokens token-no-escalation
+row|38|Node sharing|node-share
+row|40|Tailscale SSH|ssh
+row|41|SSH session recording|ssh
+row|45|Taildrop|file-send
+row|49|Configuration audit logs|config-audit
+row|51|Log streaming (SIEM)|siem-streaming
+row|52|Webhooks|audit-webhooks
+row|53|status / netcheck / ping / metrics|admin
+row|54|Linux client|w18-linux-daemon
+row|58|Docker image|docker-image
+row|61|CLI UX (login/up/down/set)|w18-linux-daemon coord-enroll exit-node
+row|62|Admin CLI / console|admin
+gate|W23-4|sym relay throughput: sym_sym median of 5 runs of 30 s >= 1113 Mbit/s (W25-12)|sym-throughput
+
+proof|w18-linux-daemon|scripts/proof/w18-linux-daemon.sh|-|orblx-w18:local
+proof|coord-enroll|scripts/proof/coord-enroll.sh|-|orblx-coord:w18
+proof|subnet|scripts/proof/subnet.sh|-|orblx-subnet:local
+proof|exit-node|scripts/proof/exit-node.sh|-|orblx-exit:local
+proof|w18-names|scripts/proof/w18-names.sh|-|orblx-w18:local
+proof|split-dns|scripts/proof/split-dns.sh|PROOF_PROJECT=orblx-rc3sw-split ORBLX_SPLIT_IMAGE=orblx-rc3sw-split:local|orblx-rc3sw-split:local
+proof|policy-sync|scripts/proof/policy-sync.sh|ORBLX_SYNC_PROFILE=release PROOF_PROJECT=orblx-rc3sw-sync ORBLX_SYNC_IMAGE=orblx-rc3sw-sync:local|orblx-rc3sw-sync:local
+proof|policy|scripts/proof/policy.sh|-|orblx-coord:w18
+proof|datapath-acl|scripts/proof/datapath-acl.sh|-|orblx-w24acl:w24
+proof|policy-gitops|examples/policy-gitops/proof/proof.sh|GITOPS_BIN=@BIN@ GITOPS_PROJECT=orblx-rc3sw-gitops GITOPS_IMAGE=orblx-rc3sw-gitops:local|orblx-rc3sw-gitops:local
+proof|svid-renew|scripts/proof/svid-renew.sh|-|orblx-svid:local
+proof|nat-realism|scripts/proof/nat-realism.sh|ORBLX_NATR_PROFILE=release ORBLX_NATR_PREFIX=orblx-rc3sw-natr- ORBLX_NATR_PROJECT=orblx-rc3sw-natr ORBLX_NATR_IMAGE=orblx-rc3sw-natr:local|orblx-rc3sw-natr:local
+proof|admin|scripts/proof/admin.sh|-|orblx-admin:w19
+proof|revoke-all|scripts/proof/revoke-all.sh|-|orblx-w24d-revoke:w24
+proof|revoke-followup|scripts/proof/revoke-followup.sh|ORBLX_PROOF_PROFILE=release|orblx-w25a-revoke:w25
+proof|api-tokens|scripts/proof/api-tokens.sh|TOKENS_BIN=@BIN@ TOKENS_PROJECT=orblx-rc3sw-tokens TOKENS_IMAGE=orblx-rc3sw-tokens:local|orblx-rc3sw-tokens:local
+proof|token-no-escalation|scripts/proof/token-no-escalation.sh|ESC_BIN=@BIN@ ESC_PROJECT=orblx-rc3sw-escalation ESC_IMAGE=orblx-rc3sw-escalation:local|orblx-rc3sw-escalation:local
+proof|node-share|scripts/proof/node-share.sh|-|orblx-w25a-share:w25
+proof|ssh|scripts/proof/ssh.sh|-|orblx-ssh:local
+proof|file-send|scripts/proof/file-send.sh|-|orblx-w23a-file:w23
+proof|config-audit|scripts/proof/config-audit.sh|-|orblx-audit:w20
+proof|siem-streaming|scripts/proof/siem-streaming.sh|SIEM_BIN=@BIN@ SIEM_PROJECT=orblx-rc3sw-siem SIEM_IMAGE=orblx-rc3sw-siem:local|orblx-rc3sw-siem:local
+proof|audit-webhooks|scripts/proof/audit-webhooks.sh|HOOKS_BIN=@BIN@ HOOKS_PROJECT=orblx-rc3sw-webhooks HOOKS_IMAGE=orblx-rc3sw-webhooks:local|orblx-rc3sw-webhooks:local
+proof|docker-image|scripts/proof/docker-image.sh|ORBLX_DIMG_PREFIX=orblx-rc3sw-dimg ORBLX_DIMG_IMAGE=orblx-rc3sw-image:local|orblx-rc3sw-image:local
+proof|sym-throughput|scripts/proof/sym-throughput.sh|ORBLX_NATR_PREFIX=orblx-rc3sw-symt- ORBLX_NATR_PROJECT=orblx-rc3sw-symt ORBLX_NATR_IMAGE=orblx-rc3sw-symt:local|orblx-rc3sw-symt:local|^sym_gate ok: |target/sym-throughput/run*.log
