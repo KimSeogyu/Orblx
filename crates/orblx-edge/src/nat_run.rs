@@ -45,6 +45,12 @@ const HELLO_GAP: Duration = Duration::from_millis(50);
 const PUNCH_GAP: Duration = Duration::from_millis(200);
 const RELAY_ONLY_PUNCH_GAP: Duration = Duration::from_secs(2);
 const DIRECT_READ: Duration = Duration::from_millis(5);
+/// After a renewal the node sends the new hello on each path for this time.
+const RENEW_HELLO_MS: u64 = 5_000;
+/// The gap between two hello frames after a renewal.
+const RENEW_HELLO_GAP: Duration = Duration::from_millis(500);
+const RENEW_RETRY_MIN: Duration = Duration::from_secs(1);
+const RENEW_RETRY_MAX: Duration = Duration::from_secs(30);
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -66,6 +72,31 @@ fn install_signals() {
 
 /// Publish reflexive endpoints and return the signed candidate list.
 pub type PublishFn = Box<dyn FnMut(Vec<String>) -> Result<Vec<SignedCandidate>, String> + Send>;
+
+/// A renewed leaf SVID for the signed hello.
+///
+/// The value does not print the seed.
+pub struct RenewedLeaf {
+    /// The renewed leaf DER.
+    pub cert_der: Vec<u8>,
+    /// The Ed25519 seed of the renewed leaf key.
+    pub seed: [u8; 32],
+}
+
+impl std::fmt::Debug for RenewedLeaf {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RenewedLeaf")
+            .field("cert_der_len", &self.cert_der.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Renew the leaf SVID at the coordinator and return the new leaf.
+///
+/// The closure stores the new state files.
+/// The closure must not log a private key.
+pub type RenewFn = Box<dyn FnMut() -> Result<RenewedLeaf, String> + Send>;
 
 /// Inputs for one NAT node.
 pub struct NatConfig {
@@ -108,6 +139,12 @@ pub struct NatConfig {
     /// The closure talks to the coordinator.
     /// The closure must not log a private key.
     pub publish: PublishFn,
+    /// Renew the leaf SVID before it expires.
+    ///
+    /// After a renewal the node sends a new signed hello on the direct path and on the relay path.
+    /// The peer then shows the new expiry.
+    /// `None` keeps the first leaf.
+    pub renew: Option<RenewFn>,
 }
 
 /// Run one NAT node until SIGINT or SIGTERM.
@@ -123,6 +160,7 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
     }
     let nat_kind = local_kind(reflexive, alt);
     println!("The local NAT mapping is {}.", nat_kind.as_str());
+    let leaf_der = config.hello.cert_der.clone();
     let session = session_id(&config.name, &config.peer_name)?;
     println!("session {}", encode_hex(&session));
     let gate = KeyGate::generate(session, &config.name, &config.peer_name, config.hello)?;
@@ -171,7 +209,9 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         name: config.name,
         overlay: config.overlay,
         svid: config.svid,
-        svid_expiry: config.svid_expiry,
+        svid_expiry: AtomicU64::new(config.svid_expiry),
+        hello_until: AtomicU64::new(0),
+        direct_out: Mutex::new(None),
         peer_name: config.peer_name,
         peer_overlay: config.peer_overlay,
         peer_svid: config.peer_svid,
@@ -219,6 +259,13 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         .name("orblx-nat-router".to_string())
         .spawn(move || router_loop(router_hub, from_rx))
         .map_err(|err| EdgeError::Io(err.to_string()))?;
+    if let Some(renew) = config.renew {
+        let renew_hub = Arc::clone(&hub);
+        thread::Builder::new()
+            .name("orblx-nat-renew".to_string())
+            .spawn(move || renew_loop(renew_hub, leaf_der, renew))
+            .map_err(|err| EdgeError::Io(err.to_string()))?;
+    }
     let direct_hub = Arc::clone(&hub);
     thread::Builder::new()
         .name("orblx-nat-direct".to_string())
@@ -326,7 +373,13 @@ struct Hub {
     name: String,
     overlay: Ipv4Addr,
     svid: String,
-    svid_expiry: u64,
+    svid_expiry: AtomicU64,
+    /// Until this time in ms, the node sends its hello again on each path.
+    hello_until: AtomicU64,
+    /// The direct socket and the peer address after a punch.
+    ///
+    /// The router sends a data frame at once with this socket.
+    direct_out: Mutex<Option<(UdpSocket, SocketAddr)>>,
     peer_name: String,
     peer_overlay: Ipv4Addr,
     peer_svid: String,
@@ -475,7 +528,14 @@ impl Hub {
         // A node that already stored the peer key still sends its own key.
         // The punch loop drops frames that are not punch datagrams.
         // The peer may miss the first hello.
-        if !confirmed && now.duration_since(*last_hello) >= HELLO_GAP {
+        // After a renewal the node sends the new hello again, also to a confirmed peer.
+        let renewed = self.now_ms() < self.hello_until.load(Ordering::Relaxed);
+        let gap = if confirmed {
+            RENEW_HELLO_GAP
+        } else {
+            HELLO_GAP
+        };
+        if (!confirmed || renewed) && now.duration_since(*last_hello) >= gap {
             out.push(lock(&self.keys).hello_frame());
             *last_hello = now;
         }
@@ -595,6 +655,25 @@ impl Hub {
         }
     }
 
+    /// Send the queued direct frames now, when the direct socket is known.
+    fn flush_direct(&self) {
+        let out = lock(&self.direct_out);
+        if let Some((socket, peer)) = out.as_ref() {
+            drain_direct(self, socket, *peer);
+        }
+    }
+
+    /// Store the direct socket and the peer address for [`Hub::flush_direct`].
+    fn set_direct_out(&self, socket: &UdpSocket, peer: SocketAddr) {
+        match socket.try_clone() {
+            Ok(clone) => *lock(&self.direct_out) = Some((clone, peer)),
+            Err(err) => {
+                eprintln!("The direct socket did not clone. {err}");
+                *lock(&self.direct_out) = None;
+            }
+        }
+    }
+
     fn deliver(&self, packet: Vec<u8>) {
         let sender = lock(&self.to_tun);
         let _ = sender.send(packet);
@@ -611,7 +690,7 @@ impl Hub {
             name: self.name.clone(),
             overlay_ip: self.overlay.to_string(),
             svid: self.svid.clone(),
-            svid_expiry: self.svid_expiry,
+            svid_expiry: self.svid_expiry.load(Ordering::Relaxed),
             exit_node: None,
             peers: vec![StatusPeer {
                 name: self.peer_name.clone(),
@@ -855,7 +934,16 @@ fn direct_loop(hub: Arc<Hub>, socket: UdpSocket) {
     let mut last_probe = Instant::now() - PROBE_GAP;
     let mut last_punch = Instant::now() - punch_gap;
     let mut buf = [0u8; 65_535];
+    // The direct peer and socket that the router uses. A change stores them again.
+    let mut shared: Option<(SocketAddr, Option<SocketAddr>)> = None;
     while !stopped() {
+        if let Some(peer) = direct_peer {
+            let key = (peer, socket.local_addr().ok());
+            if shared != Some(key) {
+                hub.set_direct_out(&socket, peer);
+                shared = Some(key);
+            }
+        }
         let now = Instant::now();
         let fresh = hub.fresh(Slot::Direct, hub.now_ms());
         if (direct_peer.is_none() || !fresh) && last_punch.elapsed() >= punch_gap {
@@ -1085,6 +1173,93 @@ fn relay_loop(hub: Arc<Hub>) {
     }
 }
 
+/// Renew the leaf SVID at two thirds of its life.
+///
+/// After a renewal the node sends the new signed hello on each path.
+fn renew_loop(hub: Arc<Hub>, first_der: Vec<u8>, mut renew: RenewFn) {
+    let mut der = first_der;
+    let mut retry = RENEW_RETRY_MIN;
+    while !stopped() {
+        let due = match orblx_identity::leaf_validity(&der) {
+            Ok((not_before, not_after)) => renew_unix(not_before, not_after),
+            Err(err) => {
+                eprintln!("The leaf SVID validity did not decode. The node does not renew. {err}");
+                return;
+            }
+        };
+        if !sleep_until_unix(due) {
+            return;
+        }
+        match renew() {
+            Ok(leaf) => {
+                let expiry = match orblx_identity::leaf_not_after(&leaf.cert_der) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        eprintln!("The renewed SVID did not decode. The node will retry. {err}");
+                        if !sleep_for(retry) {
+                            return;
+                        }
+                        retry = (retry * 2).min(RENEW_RETRY_MAX);
+                        continue;
+                    }
+                };
+                lock(&hub.keys).set_leaf(leaf.cert_der.clone(), &leaf.seed);
+                hub.svid_expiry.store(expiry, Ordering::Relaxed);
+                hub.hello_until.store(
+                    hub.now_ms().saturating_add(RENEW_HELLO_MS),
+                    Ordering::Relaxed,
+                );
+                println!("The node renewed the SVID. The new expiry is {expiry}.");
+                der = leaf.cert_der;
+                retry = RENEW_RETRY_MIN;
+            }
+            Err(err) => {
+                eprintln!("The SVID renewal failed. The node will retry. {err}");
+                if !sleep_for(retry) {
+                    return;
+                }
+                retry = (retry * 2).min(RENEW_RETRY_MAX);
+            }
+        }
+    }
+}
+
+/// The Unix time to renew a leaf: two thirds of its life.
+fn renew_unix(not_before: u64, not_after: u64) -> u64 {
+    let life = not_after.saturating_sub(not_before);
+    not_before.saturating_add(life.saturating_mul(2) / 3)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0)
+}
+
+/// Sleep until the Unix time. Return false when the node stops.
+fn sleep_until_unix(due: u64) -> bool {
+    while unix_now() < due {
+        if stopped() {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    !stopped()
+}
+
+/// Sleep for the time. Return false when the node stops.
+fn sleep_for(time: Duration) -> bool {
+    let end = Instant::now() + time;
+    while Instant::now() < end {
+        if stopped() {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    !stopped()
+}
+
 fn connect_relay(hub: &Hub) -> Result<RelayPipe, orblx_relay::RelayError> {
     match RelayPipe::connect_udp(hub.relay_udp, hub.relay_id, Duration::from_millis(800)) {
         Ok(pipe) => Ok(pipe),
@@ -1116,7 +1291,11 @@ fn router_loop(hub: Arc<Hub>, packets: std::sync::mpsc::Receiver<Vec<u8>>) {
     let mut left_direct: Option<u64> = None;
     while !stopped() {
         match packets.recv_timeout(Duration::from_millis(10)) {
-            Ok(packet) => hub.enqueue(packet),
+            Ok(packet) => {
+                hub.enqueue(packet);
+                // Do not wait for the direct read timeout.
+                hub.flush_direct();
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }

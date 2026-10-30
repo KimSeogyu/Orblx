@@ -54,7 +54,7 @@ pub use nat_feed::{
     LAB_OVERLAY_IP, NAT_EVENT_VERSION, NAT_FEED_SOURCE,
 };
 pub use nat_path::{select_path, session_id, HelloAuth, OverlayPath, PathSelect, SendPlan};
-pub use nat_run::{prepare_nat_gateway, run_nat_node, NatConfig};
+pub use nat_run::{prepare_nat_gateway, run_nat_node, NatConfig, RenewFn, RenewedLeaf};
 pub use nat_smash::{run_nat_smash, NatSmash, NatSmashReport};
 pub use path::{
     AllocatePhase, DirectPhase, PathId, PathMachine, PathState, RelayPhase, DIRECT_ATTEMPT_BUDGET,

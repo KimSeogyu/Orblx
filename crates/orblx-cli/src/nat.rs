@@ -4,11 +4,11 @@ use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
-use orblx_coord::publish_candidates_blocking;
+use orblx_coord::{publish_candidates_blocking, renew_svid_blocking};
 use orblx_datapath::Netmap;
 use orblx_edge::{
     decode_hex_key, prepare_nat_gateway, run_nat_node, verify_signed_candidate, HelloAuth,
-    NatConfig, SignedCandidate,
+    NatConfig, RenewFn, RenewedLeaf, SignedCandidate,
 };
 use orblx_identity::{
     decode_certificate_pem, ed25519_seed_from_private_pem, extract_spiffe_id, leaf_not_after,
@@ -108,6 +108,12 @@ fn run_node(options: RunOptions) -> Result<(), String> {
         .map_err(|err| format!("The netmap public key did not open. {err}"))?;
     let public = decode_hex_key(public_text.trim()).map_err(|err| err.to_string())?;
     let hello = hello_auth(&options.state, der, &peer.svid)?;
+    let renew = renewer(
+        options.state.clone(),
+        options.coord,
+        &options.coord_name,
+        &bundle_pem,
+    );
     let state = options.state.clone();
     let coord = options.coord;
     let coord_name = options.coord_name.clone();
@@ -143,8 +149,27 @@ fn run_node(options: RunOptions) -> Result<(), String> {
         netmap_public: public,
         hello,
         publish,
+        renew: Some(renew),
     };
     run_nat_node(config).map_err(|err| err.to_string())
+}
+
+/// Renew the leaf SVID at the coordinator.
+///
+/// The coordinator call also stores the new state files.
+/// The closure does not print the key.
+fn renewer(state: PathBuf, coord: SocketAddr, coord_name: &str, bundle_pem: &str) -> RenewFn {
+    let coord_name = coord_name.to_string();
+    let bundle_pem = bundle_pem.to_string();
+    Box::new(move || {
+        let result = renew_svid_blocking(coord, &coord_name, &bundle_pem, &state)
+            .map_err(|err| err.to_string())?;
+        let cert_der =
+            decode_certificate_pem(&result.certificate_pem).map_err(|err| err.to_string())?;
+        let seed = ed25519_seed_from_private_pem(&result.private_key_pem)
+            .map_err(|_| "The renewed key is not valid.".to_string())?;
+        Ok(RenewedLeaf { cert_der, seed })
+    })
 }
 
 /// Load the SVID material for the signed hello.

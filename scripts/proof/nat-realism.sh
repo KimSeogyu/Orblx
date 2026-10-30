@@ -7,6 +7,8 @@
 # and block and unblock switches with ping loss and ping gap.
 # The script fails when a switch loses more than 1 of 50 pings,
 # when a switch gap is more than 1 second, or when svid_expiry is unknown.
+# The script also fails when the direct ping RTT is more than RTT_LIMIT_MS above
+# the plain container RTT, or when a renewed SVID does not reach the peer line.
 # The script prints proof_ok.
 set -euo pipefail
 
@@ -26,6 +28,10 @@ PINGS=50
 MAX_LOSS=1
 MAX_GAP_MS=1000
 SPRAY_MAX=2048
+# The direct overlay RTT may be at most this much above the plain container RTT.
+RTT_LIMIT_MS="${ORBLX_RTT_LIMIT_MS:-5}"
+# The node leaf life in seconds for the renewal case.
+RENEW_TTL=60
 
 dc() {
   docker compose --progress quiet -f "$FILE" "$@"
@@ -302,6 +308,98 @@ steady_pings() {
   fi
 }
 
+# Print the avg value of one ping run.
+rtt_avg() {
+  awk -F'/' '/^rtt / {print $5; exit}'
+}
+
+# Compare the plain container RTT with the direct overlay RTT.
+# The plain ping goes node-a -> router-a (NAT) -> router-b WAN address. It does not use orblx.
+# The overlay ping goes node-a -> orblx TUN -> router-a -> router-b -> node-b -> orblx TUN.
+measure_rtt() {
+  local container="$1"
+  local wan="$2"
+  local ip="$3"
+  local plain overlay odd out
+  out="$(docker exec "$container" ping -n -c "$PINGS" -i 0.2 -W 1 "$wan" | tail -2)"
+  printf 'plain %s\n' "$out"
+  plain="$(printf '%s\n' "$out" | rtt_avg)"
+  out="$(docker exec "$container" ping -n -c "$PINGS" -i 0.2 -W 1 "$ip" | tail -2)"
+  printf 'overlay %s\n' "$out"
+  overlay="$(printf '%s\n' "$out" | rtt_avg)"
+  # A second interval that is not a multiple of 50 ms shows a timer phase effect.
+  out="$(docker exec "$container" ping -n -c "$PINGS" -i 0.23 -W 1 "$ip" | tail -2)"
+  printf 'overlay_i0.23 %s\n' "$out"
+  odd="$(printf '%s\n' "$out" | rtt_avg)"
+  echo "rtt plain_avg_ms ${plain} direct_avg_ms ${overlay} direct_i0.23_avg_ms ${odd}"
+  if ! python3 -c 'import sys; p, a, b, lim = map(float, sys.argv[1:5]); sys.exit(0 if max(a, b) - p <= lim else 1)' \
+    "$plain" "$overlay" "$odd" "$RTT_LIMIT_MS"; then
+    echo "The direct overlay RTT is more than ${RTT_LIMIT_MS} ms above the plain RTT." >&2
+    exit 1
+  fi
+  echo "rtt limit_ms ${RTT_LIMIT_MS} ok"
+  RTT_LINE="rtt plain_avg_ms ${plain} direct_avg_ms ${overlay} direct_i0.23_avg_ms ${odd}"
+}
+
+# Enroll a new node name into the state volume of a node service.
+enroll_as() {
+  local service="$1"
+  local name="$2"
+  echo "=== [C] enroll ${name} in the ${service} LAN ==="
+  dc --profile nodes run --rm --no-deps --entrypoint /bin/sh "$service" -c \
+    "rm -rf /var/lib/orblx/* && ip route replace default via $(gateway_of "$service") && orblx coord enroll --name ${name} --coord ${COORD} --bundle /coord-state/trust-bundle.pem --token-file /coord-state/tokens/${name} --state /var/lib/orblx --endpoint 127.0.0.1:9"
+}
+
+self_overlay() {
+  status_text "$1" | awk '/^overlay_ip / {print $2; exit}'
+}
+
+peer_expiry_of() {
+  printf '%s
+' "$1" | awk '/^peer / {print $10; exit}'
+}
+
+self_expiry_of() {
+  printf '%s
+' "$1" | awk '/^svid_expiry / {print $2; exit}'
+}
+
+# Wait until the peer line on one node shows the renewed expiry of the other node.
+# Arguments: label, container, other container, want path, peer expiry before the renewal.
+check_renewal() {
+  local label="$1"
+  local container="$2"
+  local other="$3"
+  local want="$4"
+  local before="$5"
+  local text after other_self kind i
+  echo "${label} before peer_svid_expiry ${before}"
+  for i in $(seq 1 120); do
+    text="$(status_text "$container")"
+    after="$(peer_expiry_of "$text")"
+    other_self="$(self_expiry_of "$(status_text "$other")")"
+    kind="$(path_of "$text")"
+    if [[ "$after" =~ ^[0-9]+$ && "$before" =~ ^[0-9]+$ ]] \
+      && (( after > before )) && [[ "$after" == "$other_self" ]]; then
+      printf '%s
+' "$text"
+      echo "${label} after peer_svid_expiry ${after} peer_self_svid_expiry ${other_self} path ${kind}"
+      if [[ "$kind" != "$want" ]]; then
+        echo "${label} path is ${kind}, not ${want}." >&2
+        exit 1
+      fi
+      docker logs "$other" 2>&1 | grep -E '^The node renewed the SVID' | sed "s/^/${other}: /"
+      SUMMARY+=("renew ${label} path ${kind} peer_svid_expiry ${before} to ${after}")
+      return 0
+    fi
+    sleep 1
+  done
+  echo "${label} peer svid_expiry did not move forward. It is ${after}." >&2
+  status_text "$container" >&2
+  docker logs "$other" >&2 || true
+  exit 1
+}
+
 # Print punch evidence from the node log.
 punch_log() {
   local container="$1"
@@ -539,6 +637,9 @@ punch_log orblx-natr-a
 punch_log orblx-natr-b
 steady_pings prc_prc orblx-natr-a "$IP_B"
 
+echo "=== [C] RTT on the prc_prc topology ==="
+measure_rtt orblx-natr-a "$WAN_B" "$IP_B"
+
 echo "=== [C] switch prc_prc direct to relay (block UDP between router-a and router-b) ==="
 measure_switch "switch prc_prc direct_to_relay" orblx-natr-a node-b "$IP_B" relay block_ab
 echo "=== [C] switch prc_prc relay to direct (restore UDP) ==="
@@ -616,6 +717,59 @@ steady_pings sym_sym orblx-natr-c "$IP_D"
 stop_node orblx-natr-c
 stop_node orblx-natr-d
 
+echo "=== [C] renewal case: restart the coordinator with a node leaf life of ${RENEW_TTL} s ==="
+ORBLX_NATR_SVID_TTL="$RENEW_TTL" dc up -d coord
+wait_bundle
+TTL_LINE=""
+for _ in $(seq 1 30); do
+  TTL_LINE="$(dc logs --no-log-prefix coord 2>/dev/null | grep -E '^node svid ttl' | tail -1 || true)"
+  [[ -n "$TTL_LINE" ]] && break
+  sleep 1
+done
+if [[ "$TTL_LINE" != "node svid ttl ${RENEW_TTL}" ]]; then
+  echo "The coordinator did not start with a node leaf life of ${RENEW_TTL} s." >&2
+  dc logs coord >&2 || true
+  exit 1
+fi
+echo "coord ${TTL_LINE}"
+sleep 1
+for name in node-e node-f node-g node-h; do
+  echo "=== [C] token ${name} ==="
+  dc exec -T coord orblx coord token create --state /var/lib/orblx --ttl 3600 --out "/var/lib/orblx/tokens/${name}" | sed 's/[A-Za-z0-9_-]\{32,\}/<redacted>/g'
+done
+# node-e and node-f sit behind the prc routers. node-g and node-h sit behind the symmetric routers.
+enroll_as node-a node-e
+enroll_as node-b node-f
+enroll_as node-c node-g
+enroll_as node-d node-h
+start_nat node-a node-f
+start_nat node-b node-e
+start_nat node-c node-h
+start_nat node-d node-g
+wait_path orblx-natr-a direct node-f >/dev/null
+wait_path orblx-natr-c relay node-h >/dev/null
+# Read each peer expiry before the first renewal (at two thirds of the leaf life).
+BEFORE_A="$(peer_expiry_of "$(wait_svid orblx-natr-a)")"
+BEFORE_B="$(peer_expiry_of "$(wait_svid orblx-natr-b)")"
+BEFORE_C="$(peer_expiry_of "$(wait_svid orblx-natr-c)")"
+BEFORE_D="$(peer_expiry_of "$(wait_svid orblx-natr-d)")"
+for name in $NAT_CONTAINERS; do
+  status_text "$name"
+done
+check_renewal "direct node-e sees node-f" orblx-natr-a orblx-natr-b direct "$BEFORE_A"
+check_renewal "direct node-f sees node-e" orblx-natr-b orblx-natr-a direct "$BEFORE_B"
+check_renewal "relay node-g sees node-h" orblx-natr-c orblx-natr-d relay "$BEFORE_C"
+check_renewal "relay node-h sees node-g" orblx-natr-d orblx-natr-c relay "$BEFORE_D"
+steady_pings renew_direct orblx-natr-a "$(self_overlay orblx-natr-b)"
+steady_pings renew_relay orblx-natr-c "$(self_overlay orblx-natr-d)"
+for name in $NAT_CONTAINERS; do
+  if docker logs "$name" 2>&1 | grep -q "PRIVATE KEY"; then
+    echo "The ${name} log contains a private key." >&2
+    exit 1
+  fi
+  stop_node "$name"
+done
+
 if dc logs coord relay 2>&1 | grep -q "PRIVATE KEY"; then
   echo "A log contains a private key." >&2
   exit 1
@@ -625,6 +779,7 @@ echo "=== summary ==="
 echo "prc_prc path ${PP_PATH}"
 echo "prc_sym path ${PS_PATH_A} ${PS_PATH_C}"
 echo "sym_sym path ${SS_PATH}"
+echo "${RTT_LINE}"
 for line in "${SUMMARY[@]}"; do
   echo "$line"
 done

@@ -19,6 +19,8 @@ services:
       - coord
     environment:
       ORBLX_OIDC_MODE: mock
+      # The renewal case sets a short node leaf life. Empty means the default life.
+      ORBLX_SVID_TTL: ${ORBLX_NATR_SVID_TTL:-}
     volumes:
       - coord:/var/lib/orblx
     networks:
