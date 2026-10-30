@@ -17,6 +17,11 @@ pub const SERVE_AUDIT_FILE: &str = "serve-audit.jsonl";
 /// The default HTTPS port on the overlay address.
 pub const DEFAULT_HTTPS_PORT: u16 = 443;
 
+/// The default limit for one request body, in bytes (10 MiB).
+///
+/// A request with a larger body gets `413 Payload Too Large`.
+pub const DEFAULT_MAX_BODY_BYTES: u64 = 10 * 1024 * 1024;
+
 /// The serve state.
 ///
 /// The CLI writes the file. The node daemon reads it again every 300 ms.
@@ -35,6 +40,12 @@ pub struct ServeConfig {
     /// The outside `ip:port` for funnel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub funnel_listen: Option<SocketAddr>,
+    /// The limit for one request body, in bytes.
+    ///
+    /// `None` means [`DEFAULT_MAX_BODY_BYTES`]. A file without this field keeps
+    /// the same bytes and the same audit digest as a W21-4 file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<u64>,
 }
 
 impl ServeConfig {
@@ -54,6 +65,12 @@ impl ServeConfig {
         Ok(Some(config))
     }
 
+    /// The limit for one request body, in bytes.
+    #[must_use]
+    pub fn body_limit(&self) -> u64 {
+        self.max_body_bytes.unwrap_or(DEFAULT_MAX_BODY_BYTES)
+    }
+
     /// Check the values.
     pub fn check(&self) -> Result<(), String> {
         if self.version != 1 {
@@ -61,6 +78,9 @@ impl ServeConfig {
         }
         if self.target_port == 0 || self.https_port == 0 {
             return Err("A serve port is 0.".to_string());
+        }
+        if self.max_body_bytes == Some(0) {
+            return Err("The body limit is 0.".to_string());
         }
         if self.funnel && self.funnel_listen.is_none() {
             return Err("Funnel is on but it has no listen address.".to_string());
@@ -106,14 +126,16 @@ pub struct ServeChange {
     pub record: Option<u64>,
 }
 
-/// Turn serve on, or change its ports.
+/// Turn serve on, or change its ports or its body limit.
 ///
 /// A new serve state has funnel off.
 /// A port change keeps the funnel state.
+/// `max_body_bytes: None` keeps the body limit that the state has.
 pub fn enable_serve(
     state_dir: &Path,
     target_port: u16,
     https_port: u16,
+    max_body_bytes: Option<u64>,
     actor: &str,
 ) -> Result<ServeChange, String> {
     let before = ServeConfig::load(state_dir)?;
@@ -123,10 +145,17 @@ pub fn enable_serve(
         https_port,
         funnel: false,
         funnel_listen: None,
+        max_body_bytes: None,
     });
     next.target_port = target_port;
     next.https_port = https_port;
-    let detail = format!("serve target 127.0.0.1:{target_port} https {https_port}");
+    if max_body_bytes.is_some() {
+        next.max_body_bytes = max_body_bytes;
+    }
+    let mut detail = format!("serve target 127.0.0.1:{target_port} https {https_port}");
+    if let Some(limit) = next.max_body_bytes {
+        detail.push_str(&format!(" max_body {limit}"));
+    }
     commit(
         state_dir,
         before.as_ref(),
@@ -293,7 +322,8 @@ mod tests {
     fn funnel_is_off_by_default_and_each_change_is_audited() {
         let dir = temp_dir("audit");
         let actor = "spiffe://orblx.local/node/b";
-        let change = enable_serve(&dir, 8080, 443, actor).unwrap_or_else(|err| panic!("{err}"));
+        let change =
+            enable_serve(&dir, 8080, 443, None, actor).unwrap_or_else(|err| panic!("{err}"));
         let config = change.config.unwrap_or_else(|| panic!("serve config"));
         assert!(!config.funnel);
         assert_eq!(config.funnel_listen, None);
@@ -345,10 +375,49 @@ mod tests {
     }
 
     #[test]
+    fn a_w21_serve_file_loads_with_funnel_off_and_the_default_body_limit() {
+        let dir = temp_dir("w21");
+        // The W21-4 file has no funnel field and no body limit.
+        fs::write(
+            dir.join(SERVE_FILE),
+            "{\"version\":1,\"target_port\":8080,\"https_port\":443}",
+        )
+        .unwrap_or_else(|_| panic!("write"));
+        let config = ServeConfig::load(&dir)
+            .unwrap_or_else(|err| panic!("{err}"))
+            .unwrap_or_else(|| panic!("serve config"));
+        assert!(!config.funnel);
+        assert_eq!(config.funnel_listen, None);
+        assert_eq!(config.body_limit(), DEFAULT_MAX_BODY_BYTES);
+        // The default limit stays out of the file, so the W21-4 digests do not change.
+        let text = String::from_utf8(config.to_bytes().unwrap_or_else(|err| panic!("{err}")))
+            .unwrap_or_else(|_| panic!("utf8"));
+        assert!(!text.contains("max_body_bytes"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_body_limit_change_is_audited_and_kept() {
+        let dir = temp_dir("limit");
+        let actor = "spiffe://orblx.local/node/b";
+        let change =
+            enable_serve(&dir, 8080, 443, Some(4096), actor).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(change.record, Some(0));
+        let again =
+            enable_serve(&dir, 8080, 443, None, actor).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(again.record, None);
+        let config = again.config.unwrap_or_else(|| panic!("serve config"));
+        assert_eq!(config.body_limit(), 4096);
+        assert!(!config.funnel);
+        assert!(enable_serve(&dir, 8080, 443, Some(0), actor).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_broken_chain_blocks_the_change() {
         let dir = temp_dir("broken");
         let actor = "spiffe://orblx.local/node/b";
-        enable_serve(&dir, 8080, 443, actor).unwrap_or_else(|err| panic!("{err}"));
+        enable_serve(&dir, 8080, 443, None, actor).unwrap_or_else(|err| panic!("{err}"));
         let path = dir.join(SERVE_AUDIT_FILE);
         let text = fs::read_to_string(&path).unwrap_or_else(|_| panic!("chain"));
         fs::write(&path, text.replace("8080", "9090")).unwrap_or_else(|_| panic!("write"));
