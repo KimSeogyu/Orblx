@@ -15,6 +15,7 @@
 # W23: RELAY_SLACK_MS is 1. The relay gate also prints the median and the slowest pings.
 # W24: the direct RTT check prints them too (direct_ping). W24-A: ORBLX_NATR_POLICY sets an ACL policy. ORBLX_NATR_PREFIX, ORBLX_NATR_PROJECT,
 # ORBLX_NATR_IMAGE, ORBLX_NATR_PUB and ORBLX_NATR_LAN change the names and the subnets.
+# W25-5: the script takes the box proof lock (proof-lock.sh) and prints proof_context lines.
 # The script measures TCP bulk throughput on the plain, direct and relay paths.
 # The script prints proof_ok.
 set -euo pipefail
@@ -30,6 +31,11 @@ IMAGE="${ORBLX_NATR_IMAGE:-orblx-natr:w20}"
 PUB="${ORBLX_NATR_PUB:-172.29.20}"
 LAN="${ORBLX_NATR_LAN:-10.19}"
 export ORBLX_NATR_IMAGE="$IMAGE" ORBLX_NATR_PUB="$PUB" ORBLX_NATR_LAN="$LAN"
+# W25-5: one RTT or throughput proof at a time on this host. The lock waits.
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$ROOT/scripts/proof/proof-lock.sh"
+trap proof_lock_end EXIT
+proof_lock_take "nat-realism:${PROJECT}" "$NATR_PREFIX" "${PROJECT}-"
 COORD="${PUB}.10:443"
 STUN="${PUB}.20:3478"
 STUN_ALT="${PUB}.20:3479"
@@ -149,6 +155,8 @@ enroll_node() {
 }
 
 stop_node() {
+  # W25-5: keep the SVID renewal times of the node before its log goes away.
+  svid_renewal_of "$1"
   docker rm -f "$1" >/dev/null 2>&1 || true
 }
 
@@ -239,8 +247,26 @@ now_s() {
 
 NAT_CONTAINERS="${NATR_PREFIX}a ${NATR_PREFIX}b ${NATR_PREFIX}c ${NATR_PREFIX}d"
 
+# W25-5: print the time of each SVID renewal of each proof container, before cleanup removes them.
+# A record only (serial-rtt-table.py puts the nearest renewal next to each ping sample).
+# It prints the docker log time stamp (UTC) and the container name. It does not print the log text.
+# stop_node calls it for each node before docker rm. cleanup calls it for every container left.
+svid_renewal_of() {
+  docker logs --timestamps "$1" 2>/dev/null \
+    | awk -v n="$1" '/The node renewed the SVID/ {print "svid_renewal " n " " $1}' || true
+}
+
+svid_renewals() {
+  local name
+  for name in $(docker ps -a --format '{{.Names}}' --filter "name=^/${NATR_PREFIX}" 2>/dev/null); do
+    svid_renewal_of "$name"
+  done
+  echo "svid_renewal_scan done"
+}
+
 cleanup() {
   local name
+  svid_renewals
   for name in $NAT_CONTAINERS; do
     stop_node "$name"
   done
@@ -373,6 +399,9 @@ if rows:
 # The CI perf watch reads it for the p99, the max and the spike count. No gate of this script reads it.
 print("ping_rtts %s %s sent %s received %s ms %s" % (kind, label, sent or "none", received or "none",
       ",".join("%.3f" % r[0] for r in sorted(rows, key=lambda r: r[1])) or "none"))
+# W25-5: the time stamp (epoch s) of each ping sample, in seq order. A record only.
+print("ping_times %s %s %s" % (kind, label,
+      ",".join("%d@%s" % (r[1], r[2]) for r in sorted(rows, key=lambda r: r[1])) or "none"))
 ' "$1" "$2"
 }
 
@@ -712,7 +741,7 @@ cargo test -p orblx-edge --lib -- nat_path:: birthday:: 2>&1 | grep -E '^test |t
 
 echo "=== [C] remove old proof stack ==="
 cleanup
-trap cleanup EXIT
+trap 'cleanup; proof_lock_end' EXIT
 open_legacy_forward
 
 echo "=== [C] build image ==="

@@ -20,6 +20,13 @@ cd "$ROOT"
 RUNS="${ORBLX_PERF_RUNS:-3}"
 OUT="${ORBLX_PERF_OUT:-$ROOT/target/perf-watch}"
 
+# W25-5: hold the box proof lock for all runs. nat-realism.sh sees ORBLX_PROOF_LOCK_HELD
+# and does not take it again.
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$ROOT/scripts/proof/proof-lock.sh"
+trap proof_lock_end EXIT
+proof_lock_take perf-watch orblx-natr- orblx-natr-proof-
+
 mkdir -p "$OUT"
 echo "cpu_model $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//' || true)"
 echo "throughput_floor_mbit ${ORBLX_PERF_MIN_MBIT:-200}"
@@ -45,4 +52,5 @@ status=$?
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" && -f "$OUT/perf-watch.md" ]]; then
   cat "$OUT/perf-watch.md" >>"$GITHUB_STEP_SUMMARY"
 fi
+proof_lock_end
 exit "$status"
