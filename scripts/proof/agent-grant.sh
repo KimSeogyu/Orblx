@@ -388,7 +388,17 @@ grant2="$(printf '%s\n' "$reply" | field grant_id)"
 owner grant-approve "$grant2"
 grant_fetch "$grant2" "$STATE/agent-g2"
 
-echo "=== [C] revoke loop ==="
+echo "=== [C] grant 3 for the same agent name: request, approve, fetch ==="
+reply="$(grant_request 8080 300)"
+printf '%s\n' "$reply"
+grant3="$(printf '%s\n' "$reply" | field grant_id)"
+owner grant-approve "$grant3"
+grant_fetch "$grant3" "$STATE/agent-g3"
+g3_before="$(on_a agent connect --grant "$STATE/agent-g3" --send 'GET / HTTP/1.0\r\n\r\n')"
+printf '%s\n' "$g3_before"
+printf '%s\n' "$g3_before" | grep -q '^reply HTTP/1.0 200'
+
+echo "=== [C] revoke loop: revoke grant 2 only ==="
 on_a agent connect --grant "$STATE/agent-g2" --every-ms 50 --max-wait 60 >"$WORK/revoke-loop.txt" 2>&1 &
 loop_pid=$!
 sleep 2
@@ -415,19 +425,37 @@ wait_file_line b "$STATE/guard-web.log" "agent grant ${grant2} revoked"
 guard_rv_ms="$(dc exec -T b awk '/^agent deny reason revoked /{print $NF; exit}' "$STATE/guard-web.log")"
 echo "guard_revoked_deny_ms ${guard_rv_ms} guard_deny_after_revoke_done_ms $(( guard_rv_ms - revoke_done ))"
 
-echo "=== [C] a later grant for the same agent name is refused after the revoke ==="
-reply="$(grant_request 8080 300)"
-printf '%s\n' "$reply"
-grant3="$(printf '%s\n' "$reply" | field grant_id)"
-owner grant-approve "$grant3"
-# The agent SPIFFE ID is in the deny set. The coordinator does not issue grant 3.
-if grant_fetch "$grant3" "$STATE/agent-g3" >"$WORK/g3.txt" 2>&1; then
-  cat "$WORK/g3.txt"
-  echo "The coordinator issued a grant for a revoked agent name." >&2
+echo "=== [C] grant 3 for the same agent name still works after the revoke ==="
+g3_after="$(on_a agent connect --grant "$STATE/agent-g3" --send 'GET / HTTP/1.0\r\n\r\n')"
+printf '%s\n' "$g3_after"
+printf '%s\n' "$g3_after" | grep -q '^connect ok '
+printf '%s\n' "$g3_after" | grep -q '^reply HTTP/1.0 200'
+expect_denied "grant 2 stays refused" revoked --grant "$STATE/agent-g2"
+if dc exec -T b grep -q "agent grant ${grant3} revoked" "$STATE/guard-web.log"; then
+  echo "The guard revoked grant 3." >&2
   exit 1
 fi
-cat "$WORK/g3.txt"
-echo "later_grant_same_agent fetch refused"
+echo "other_grant_same_agent status 200 after_revoke ok"
+
+echo "=== [C] a new grant for the same agent name after the revoke ==="
+reply="$(grant_request 8080 300)"
+printf '%s\n' "$reply"
+grant4="$(printf '%s\n' "$reply" | field grant_id)"
+owner grant-approve "$grant4"
+grant_fetch "$grant4" "$STATE/agent-g4"
+g4_out="$(on_a agent connect --grant "$STATE/agent-g4" --send 'GET / HTTP/1.0\r\n\r\n')"
+printf '%s\n' "$g4_out"
+printf '%s\n' "$g4_out" | grep -q '^reply HTTP/1.0 200'
+echo "new_grant_same_agent status 200"
+
+echo "=== [C] the deny set holds the ticket nonce, not the agent name ==="
+deny_text="$(dc exec -T coord cat "$STATE/deny.json")"
+if grep -q 'spiffe://orblx.local/agent/bot' <<<"$deny_text"; then
+  echo "The deny set holds the agent name." >&2
+  exit 1
+fi
+g2_nonce_count="$(grep -c '[0-9a-f]\{32\}' <<<"$deny_text" || true)"
+echo "deny_agent_uri 0 deny_nonce_lines ${g2_nonce_count}"
 
 echo "=== [C] guard logs ==="
 dc exec -T b cat "$STATE/guard-web.log"
@@ -468,7 +496,7 @@ echo "=== [C] logs hold no key, ticket, or use proof ==="
   dc exec -T coord cat "$STATE/config-audit.jsonl" 2>/dev/null || true
   cat "$WORK"/*.txt
 } >"$WORK/all-logs.out"
-for grant in agent-g1 agent-g2; do
+for grant in agent-g1 agent-g2 agent-g3 agent-g4; do
   ticket_hex="$(dc exec -T a sh -c "od -An -tx1 $STATE/$grant/ticket.bin | tr -d ' \n'")"
   key_line="$(dc exec -T a sed -n 2p "$STATE/$grant/agent.key.pem")"
   if grep -qF "$ticket_hex" "$WORK/all-logs.out"; then
@@ -491,5 +519,5 @@ for needle in 'PRIVATE KEY' 'T0JMWEFHVDE' 'ge1.'; do
 done
 echo "log_bytes $(wc -c <"$WORK/all-logs.out")"
 
-echo "summary coord_expire_after_end_ms ${coord_expire_delta} ttl_deny_after_end_ms ${ttl_delta} guard_ttl_after_end_ms $(( guard_ttl_ms - expires1_ms )) revoke_deny_after_done_ms ${rv_delta} revoke_deny_after_start_ms ${rv_delta_start} guard_revoke_after_done_ms $(( guard_rv_ms - revoke_done )) limit_ms ${LIMIT_MS}"
+echo "summary other_grant_after_revoke 200 coord_expire_after_end_ms ${coord_expire_delta} ttl_deny_after_end_ms ${ttl_delta} guard_ttl_after_end_ms $(( guard_ttl_ms - expires1_ms )) revoke_deny_after_done_ms ${rv_delta} revoke_deny_after_start_ms ${rv_delta_start} guard_revoke_after_done_ms $(( guard_rv_ms - revoke_done )) limit_ms ${LIMIT_MS}"
 echo "proof_ok"

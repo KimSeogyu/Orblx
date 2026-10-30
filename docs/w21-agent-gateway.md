@@ -113,4 +113,4 @@ The log grep covers the Compose logs, the gateway logs, the upstream log, the ch
 - The signature covers only the method, the target (path and query), the nonce, and the body hash. Other request headers are not signed. A party on the path between the agent and the gateway can change them. The WireGuard tunnel between the nodes protects the path.
 - The gateway reads one request on each connection. It sends `Connection: close`.
 - The gateway does not support `Transfer-Encoding: chunked`. It refuses such a request with `400 request`.
-- A revoke stops all grants for that agent name. See [W21 agent grant](w21-agent-grant.md).
+- A revoke stops one grant (W22-2). See [W22 grant revoke](w22-grant-revoke.md).

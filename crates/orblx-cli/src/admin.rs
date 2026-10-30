@@ -251,7 +251,7 @@ fn print_admin(op: &str, value: &Value) -> Result<(), String> {
             let grant = value.get("grant").unwrap_or(&Value::Null);
             println!("revoked_grant {}", text_field(grant, "id")?);
             println!("revoked_agent {}", text_field(grant, "agent")?);
-            println!("revoke_scope all grants for this agent");
+            println!("revoke_scope this grant only");
             println!("grant_state {}", text_field(grant, "state")?);
             if let Some(version) = value.get("deny_version").and_then(Value::as_u64) {
                 println!("deny_version {version}");
@@ -409,10 +409,9 @@ revoke adds the node to the deny set.
 expire removes the node from netmaps until approve.
 grants lists the agent JIT grants.
 grant-approve lets the agent fetch the grant. Only an owner approves an agent grant.
-grant-revoke ends the grant. The agent SPIFFE ID and the ticket nonce go into the deny set.
-grant-revoke stops all grants for that agent name, not only grant ID.
-The coordinator does not issue a later grant for the same agent name. Use a new agent name.
-A revoke for one grant only is not available.
+grant-revoke ends grant ID only. The ticket nonce of the grant goes into the deny set.
+Other grants for the same agent name stay valid. The coordinator can issue new grants for that name.
+To stop all grants for an agent, revoke each grant ID.
 audit prints the control-plane audit chain and the chain check.
 TIME is Unix seconds, YYYY-MM-DDTHH:MM:SSZ, or an age such as 30m, 2h, or 7d.
 --json prints one JSON record on each line.
