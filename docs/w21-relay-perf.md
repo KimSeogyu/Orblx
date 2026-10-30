@@ -132,8 +132,9 @@ On the relay path, the relay server used about 77 % of one core: one `recv` and 
 The relay server is the next limit.
 The receiver relay thread used 65 % to 67 %. It opens each frame and gives the packet to the TUN writer.
 
-**Debug build (about 32 Mbit/s on all overlay paths).** The debug binary has no optimization.
-The ChaCha20-Poly1305 code and the frame code are much slower without optimization.
+**Debug build (about 30 Mbit/s on all overlay paths).** The debug binary has no optimization.
+In the debug bulk transfer, the sender router thread and the receiver thread each used 85 % to 88 % of one core.
+The seal and open code and the frame code are much slower without optimization. The relay path is not the limit.
 Use the release numbers to compare paths.
 
 **RTT.** The direct path RTT is about 1.2 ms to 2.0 ms. The bare veth RTT is 0.04 ms.
@@ -157,7 +158,39 @@ That thread sends the candidate update to the coordinator once each second. It i
 
 ## PR head proof
 
-PR_HEAD_PROOF
+The gate and the proofs ran at the PR head `360bc861` (PR #54). Later commits on the branch change only this document.
+
+- REAL: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` gave exit 0
+  (`pr54-360bc861-fmt.log`, `pr54-360bc861-clippy.log`, `pr54-360bc861-test.log`).
+- [C] `scripts/proof/nat-realism.sh` (debug build, default gates) printed `proof_ok` (`pr54-360bc861-nat-realism.log`).
+- [C] `scripts/proof/nat.sh` printed `proof_ok` (`pr54-360bc861-nat.log`).
+
+Lines from `pr54-360bc861-nat-realism.log`:
+
+```text
+rtt plain_avg_ms 0.042 direct_avg_ms 1.834 direct_i0.23_avg_ms 1.805
+relay_rtt prc_prc relay_avg_ms 2.246 direct_avg_ms 1.834 slack_ms 2 lost 0/50 relay_gate ok
+relay_rtt sym_sym relay_avg_ms 2.289 direct_avg_ms 1.834 slack_ms 2 lost 0/50 relay_gate ok
+switch prc_prc direct_to_relay detect_ms 592 lost 0/50 max_gap_ms 435
+switch prc_prc relay_to_direct detect_ms 509 lost 0/50 max_gap_ms 201
+switch prc_sym direct_to_relay detect_ms 545 lost 0/50 max_gap_ms 362
+switch prc_sym relay_to_direct detect_ms 747 lost 0/50 max_gap_ms 228
+throughput plain bytes 14598995968 seconds 5.001 mbit_s 23351.48
+throughput prc_prc_direct bytes 18612224 seconds 5.101 mbit_s 29.19
+throughput prc_prc_relay bytes 20840448 seconds 5.391 mbit_s 30.93
+throughput sym_sym_relay bytes 20512768 seconds 5.308 mbit_s 30.92
+idle_cpu prc_prc_relay orblx-natr-a thread pid 1 name orblx-nat-relay ticks 5 cpu_pct 0.50
+idle_cpu prc_prc_relay relay cpu pid 1 ticks 4 hz 100 seconds 10 cpu_pct 0.40 cmd orblx relay
+idle_cpu sym_sym_relay relay cpu pid 1 ticks 5 hz 100 seconds 10 cpu_pct 0.50 cmd orblx relay
+```
+
+The plain number in this run (23351.48 Mbit/s) is lower than in the other runs (about 33000 Mbit/s).
+The other worker used the host at the same time. The plain path uses the host CPU and has no orblx code.
+
+CPU during the debug bulk transfer at the PR head (3 s sample, percent of one core):
+the sender router thread used 86.00 % (direct) and 87.67 % (relay).
+The receiver direct thread used 85.33 %, and the receiver relay thread used 87.67 %.
+The relay server used 7.00 %. Both node threads are near one full core. The debug build is CPU-bound in the node.
 
 ## Caveats
 
