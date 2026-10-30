@@ -32,7 +32,10 @@ jobs:
         run: |
           sh -n scripts/install.sh
           bash -n scripts/release/package.sh scripts/proof/release.sh scripts/proof/release-real.sh
-          bash -n scripts/proof/agent-grant.sh scripts/proof/agent-gateway.sh
+          bash -n scripts/proof/agent-grant.sh scripts/proof/agent-gateway.sh scripts/proof/agent-python-sdk.sh
+
+      - name: Run the Python agent SDK tests
+        run: python3 -m unittest discover -s sdk/python/tests -v
 
       - name: Run the harness demo
         env:
@@ -64,3 +67,6 @@ jobs:
 
       - name: Run the tests
         run: cargo test --workspace
+
+      - name: Run the Python agent SDK tests
+        run: python3 -m unittest discover -s sdk/python/tests -v

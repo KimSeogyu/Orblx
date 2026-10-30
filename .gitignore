@@ -19,3 +19,7 @@
 # Operating system files
 .DS_Store
 Thumbs.db
+
+# Python files
+__pycache__/
+*.pyc
