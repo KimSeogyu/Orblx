@@ -7,7 +7,7 @@
 #   runN.log, runN.exit, perf-watch.json, perf-watch.md
 # The script runs every run, then fails when a run did not print proof_ok
 # or when a CI gate of perf-summary.py did not pass in a run (W24-E2):
-# relay ping median <= direct ping median + 1 ms, 0 lost, TCP above the floor,
+# relay ping median <= direct ping median + 1 ms, 0 lost, TCP >= 300 Mbit/s on each path (W24-E3),
 # and at most 3 of 50 pings above 10 ms on each path.
 # The avg is not a CI gate: one runner stall of 40 to 250 ms moves the avg of 50 pings by 1 to 5 ms.
 # So the CI sets the nat-realism avg limits to 1000 ms (the ping timeout, -W 1). Then the avg

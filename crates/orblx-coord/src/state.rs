@@ -141,6 +141,8 @@ struct Inner {
     policy_path: PathBuf,
     policy: Policy,
     policy_hash: Option<[u8; 32]>,
+    /// The digest of the policy rules without the `shares` list (W25-1).
+    rules_hash: Option<[u8; 32]>,
     policy_fail: Option<String>,
     has_good: bool,
     saw_file: bool,
@@ -301,6 +303,7 @@ impl Coordinator {
                 policy_path: dir.join(POLICY_FILE),
                 policy: Policy::empty(),
                 policy_hash: None,
+                rules_hash: None,
                 policy_fail: None,
                 has_good: false,
                 saw_file: false,
@@ -408,6 +411,23 @@ impl Coordinator {
         let owner = owner_from_oidc(&inner.oidc, id_token, nonce, now)?;
         let plan = inner.store.begin_oidc(name, &owner, endpoints, routes)?;
         finish_enroll(&mut inner, plan, now)
+    }
+
+    /// Return the SPIFFE IDs that node `name` does not see, and the config record count (W25-1).
+    ///
+    /// The deny list of a node adds these IDs.
+    /// The count grows with each record, so the deny list version stays monotonic.
+    pub fn share_deny_for(&self, name: &str) -> Result<(Vec<String>, u64), CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        let nodes = inner.store.nodes();
+        let viewer = nodes
+            .iter()
+            .find(|node| node.name == name)
+            .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        let hidden = crate::share::hidden_for(&inner.policy, viewer, &nodes);
+        let count = inner.audit.as_ref().map_or(0, ConfigLog::len);
+        Ok((hidden, count))
     }
 
     pub fn netmap_for(&self, name: &str) -> Result<NetmapView, CoordError> {
@@ -1030,17 +1050,29 @@ fn refresh_policy(inner: &mut Inner) {
     match Policy::from_hujson(&bytes) {
         Ok(policy) => {
             let before = inner.policy_hash.filter(|_| inner.has_good);
+            let old_lines = crate::share::share_lines(&inner.policy);
+            let new_lines = crate::share::share_lines(&policy);
+            let rules = rules_digest(&bytes);
+            let rules_changed = inner.rules_hash != Some(rules);
             inner.policy = policy;
             inner.policy_hash = Some(hash);
+            inner.rules_hash = Some(rules);
             inner.has_good = true;
             inner.policy_fail = None;
             inner.fail_hash = None;
-            let action = if before.is_some() {
-                ConfigAction::PolicyReplace
-            } else {
-                ConfigAction::PolicyLoad
-            };
-            record_policy(inner, action, before.unwrap_or(EMPTY_DIGEST), hash, "file");
+            match before {
+                None => {
+                    record_policy(inner, ConfigAction::PolicyLoad, EMPTY_DIGEST, hash, "file");
+                }
+                Some(before) => {
+                    // A change of only the shares writes one record for each share
+                    // and no policy record (W25-1).
+                    if rules_changed || old_lines == new_lines {
+                        record_policy(inner, ConfigAction::PolicyReplace, before, hash, "file");
+                    }
+                    record_share_diff(inner, &old_lines, &new_lines);
+                }
+            }
             let saved = inner.state_dir.join(LOADED_POLICY_FILE);
             match std::str::from_utf8(&bytes) {
                 Ok(text) => {
@@ -1071,6 +1103,50 @@ fn adopt_saved_policy(inner: &mut Inner) {
         inner.policy = policy;
         inner.has_good = true;
         inner.policy_hash = Some(sha256(&bytes));
+        inner.rules_hash = Some(rules_digest(&bytes));
+    }
+}
+
+/// The digest of the policy rules without the `shares` list.
+fn rules_digest(bytes: &[u8]) -> [u8; 32] {
+    match orblx_identity::rules_without_shares(bytes) {
+        Some(text) => sha256(text.as_bytes()),
+        None => sha256(bytes),
+    }
+}
+
+/// Write one `unshare` record for each removed share and one `share` record for each new share.
+///
+/// The target is the shared node. The detail is the share line.
+fn record_share_diff(
+    inner: &mut Inner,
+    old_lines: &std::collections::BTreeSet<String>,
+    new_lines: &std::collections::BTreeSet<String>,
+) {
+    if inner.audit.is_none() {
+        return;
+    }
+    let Ok(actor) = coord_actor_of(inner) else {
+        return;
+    };
+    let mut changes: Vec<(ConfigAction, &String)> = Vec::new();
+    for line in old_lines.difference(new_lines) {
+        changes.push((ConfigAction::Unshare, line));
+    }
+    for line in new_lines.difference(old_lines) {
+        changes.push((ConfigAction::Share, line));
+    }
+    for (action, line) in changes {
+        let target = line.split(' ').next().unwrap_or_default().to_string();
+        let digest = sha256(line.as_bytes());
+        let (before, after) = if action == ConfigAction::Share {
+            (EMPTY_DIGEST, digest)
+        } else {
+            (digest, EMPTY_DIGEST)
+        };
+        if record(inner, &actor, action, &target, before, after, line).is_err() {
+            println!("config audit write failed: {}", action.as_str());
+        }
     }
 }
 
@@ -1395,20 +1471,28 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
     let mut peers = Vec::new();
     let mut endpoints = Vec::new();
     if self_visible {
-        for node in nodes.iter().filter(|node| node_visible(node)) {
+        for node in nodes.iter().filter(|node| {
+            node_visible(node) && crate::share::sees(&inner.policy, &self_node, node)
+        }) {
             for endpoint in &node.endpoints {
                 endpoints.push(inner.netmap_key.sign_endpoint(&node.name, endpoint)?);
             }
             if node.name == self_node.name {
                 continue;
             }
+            // A shared node from another tenant gives no subnet routes and no exit node.
+            let other = crate::share::cross_tenant(&inner.policy, &self_node, node);
             peers.push(NetmapPeer {
                 name: node.name.clone(),
                 overlay_ip: node.overlay_ip.clone(),
                 svid: node.svid.clone(),
                 endpoints: node.endpoints.clone(),
-                routes: published_routes(&inner.policy, &node.svid, &node.routes),
-                exit_node: published_exit(&inner.policy, &node.svid, node.exit_node),
+                routes: if other {
+                    Vec::new()
+                } else {
+                    published_routes(&inner.policy, &node.svid, &node.routes)
+                },
+                exit_node: !other && published_exit(&inner.policy, &node.svid, node.exit_node),
                 owner: String::new(),
                 lock_sig: lock_store.sigs.get(&node.name).cloned(),
             });
@@ -1427,7 +1511,7 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
     };
     let signed_netmap = inner.netmap_key.sign_netmap(&payload)?;
     let receiver = SpiffeId::node(&self_node.name)?;
-    let grants = filtered_grants(inner, &receiver, self_visible);
+    let grants = filtered_grants(inner, &receiver, &self_node, self_visible);
     let signed_grants = inner.netmap_key.sign_grants(&grants)?;
     let netmap_public = inner.netmap_key.public();
     verify_signed_netmap(&signed_netmap, &netmap_public)?;
@@ -1478,6 +1562,7 @@ fn published_exit(policy: &Policy, svid: &str, offered: bool) -> bool {
 fn filtered_grants(
     inner: &Inner,
     receiver: &SpiffeId,
+    self_node: &StoredNode,
     self_visible: bool,
 ) -> orblx_identity::ReceiverGrants {
     if !self_visible {
@@ -1488,14 +1573,33 @@ fn filtered_grants(
             reach: Vec::new(),
         };
     }
-    let hidden: std::collections::BTreeSet<String> = inner
-        .store
-        .nodes()
-        .into_iter()
-        .filter(|node| !node_visible(node))
-        .map(|node| node.svid)
+    let nodes = inner.store.nodes();
+    // A node that the receiver does not see gives no grant and is not in reach (W25-1).
+    let hidden: std::collections::BTreeSet<String> = nodes
+        .iter()
+        .filter(|node| !node_visible(node) || !crate::share::sees(&inner.policy, self_node, node))
+        .map(|node| node.svid.clone())
+        .collect();
+    // Between two tenants, only a share gives a grant or a reach entry.
+    // A policy acl does not cross a tenant (W25-1).
+    let other: std::collections::BTreeSet<String> = nodes
+        .iter()
+        .filter(|node| crate::share::cross_tenant(&inner.policy, self_node, node))
+        .map(|node| node.svid.clone())
         .collect();
     let mut grants = inner.policy.receiver_grants(receiver);
+    grants.grants.retain(|grant| !other.contains(&grant.src));
+    grants.reach.retain(|dst| !other.contains(dst));
+    for grant in crate::share::share_grants(&inner.policy, self_node, &nodes) {
+        if !grants.grants.contains(&grant) {
+            grants.grants.push(grant);
+        }
+    }
+    for dst in crate::share::share_reach(&inner.policy, self_node) {
+        if !grants.reach.contains(&dst) {
+            grants.reach.push(dst);
+        }
+    }
     grants.grants.retain(|grant| !hidden.contains(&grant.src));
     grants.reach.retain(|dst| !hidden.contains(dst));
     grants

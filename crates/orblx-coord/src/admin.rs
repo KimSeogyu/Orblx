@@ -49,6 +49,28 @@ pub fn deny_json(coord: &Coordinator, now: SystemTime) -> Result<String, CoordEr
     file.to_json()
 }
 
+/// Return the deny list for one node (W25-1).
+///
+/// The list is the global deny list plus the nodes that this node does not see.
+/// A guest node does not see the other nodes of the owner, and the owner nodes do not see it.
+/// The version is the global version plus the config record count.
+/// Each change that can change the hidden nodes writes a config record, so the version grows.
+pub fn deny_json_for(
+    coord: &Coordinator,
+    name: &str,
+    now: SystemTime,
+) -> Result<String, CoordError> {
+    let mut file = read_deny(coord, now)?;
+    let (hidden, count) = coord.share_deny_for(name)?;
+    file.version = file.version.saturating_add(count);
+    for uri in hidden {
+        if !file.revoked_uris.contains(&uri) {
+            file.revoked_uris.push(uri);
+        }
+    }
+    file.to_json()
+}
+
 pub fn deny_set(coord: &Coordinator, now: SystemTime) -> Result<DenySet, CoordError> {
     let text = deny_json(coord, now)?;
     let mut deny = DenySet::empty();

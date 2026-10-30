@@ -29,6 +29,9 @@ mod proto;
 #[cfg(test)]
 mod renew_test;
 mod server;
+mod share;
+#[cfg(test)]
+mod share_test;
 mod state;
 mod store;
 mod ticket;

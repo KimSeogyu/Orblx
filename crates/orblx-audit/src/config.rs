@@ -88,11 +88,15 @@ pub enum ConfigAction {
     TokenDeny,
     /// An owner revoked an admin API token (W25-3).
     TokenRevoke,
+    /// The policy shared one node with a guest (W25-1). One record for each share.
+    Share,
+    /// The policy removed one share (W25-1). One record for each share.
+    Unshare,
 }
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 31] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -122,6 +126,8 @@ impl ConfigAction {
         Self::TokenUse,
         Self::TokenDeny,
         Self::TokenRevoke,
+        Self::Share,
+        Self::Unshare,
     ];
 
     /// Return the stable action token.
@@ -157,6 +163,8 @@ impl ConfigAction {
             Self::TokenUse => "token-use",
             Self::TokenDeny => "token-deny",
             Self::TokenRevoke => "token-revoke",
+            Self::Share => "share",
+            Self::Unshare => "unshare",
         }
     }
 
@@ -199,6 +207,8 @@ impl ConfigAction {
             Self::TokenUse => 27,
             Self::TokenDeny => 28,
             Self::TokenRevoke => 29,
+            Self::Share => 30,
+            Self::Unshare => 31,
         }
     }
 
