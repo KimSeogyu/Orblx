@@ -59,6 +59,7 @@ impl Default for Presence {
                 offline: DEFAULT_OFFLINE,
                 last_seen_ms: BTreeMap::new(),
                 open: BTreeMap::new(),
+                grace_until_ms: BTreeMap::new(),
                 last_save_ms: 0,
             }),
         }
@@ -71,6 +72,9 @@ struct PresenceState {
     last_seen_ms: BTreeMap<String, u64>,
     /// The number of open requests of each node.
     open: BTreeMap<String, u32>,
+    /// Unix milliseconds until which each node is online after a coordinator start.
+    /// A request does not end the grace.
+    grace_until_ms: BTreeMap<String, u64>,
     last_save_ms: u64,
 }
 
@@ -155,13 +159,16 @@ impl Presence {
         let mut state = self.state.lock().map_err(|_| CoordError::State)?;
         let grace = u64::try_from(RECONNECT_GRACE.as_millis()).unwrap_or(u64::MAX);
         for (name, seen) in &file.last_seen_ms {
-            let restored = if file.online.contains(name) {
+            let offline_before = file.saved_ms.saturating_sub(*seen);
+            state
+                .last_seen_ms
+                .insert(name.clone(), now.saturating_sub(offline_before));
+            if file.online.contains(name) {
                 // The node was online at the stop. Its offline time starts after the grace.
-                now.saturating_add(grace)
-            } else {
-                now.saturating_sub(file.saved_ms.saturating_sub(*seen))
-            };
-            state.last_seen_ms.insert(name.clone(), restored);
+                state
+                    .grace_until_ms
+                    .insert(name.clone(), now.saturating_add(grace));
+            }
         }
         Ok(file.last_seen_ms.len())
     }
@@ -182,6 +189,7 @@ impl Presence {
                 continue;
             }
             let seen = *state.last_seen_ms.entry(name.clone()).or_insert(now);
+            let seen = seen.max(state.grace_until_ms.get(name).copied().unwrap_or(0));
             let offline = now.saturating_sub(seen);
             if offline > limit {
                 due.push((name.clone(), offline));
@@ -197,13 +205,16 @@ impl Presence {
             return None;
         }
         let limit = u64::try_from(state.offline.as_millis()).unwrap_or(u64::MAX);
-        let offline = now.saturating_sub(*state.last_seen_ms.get(name)?);
+        let seen = (*state.last_seen_ms.get(name)?)
+            .max(state.grace_until_ms.get(name).copied().unwrap_or(0));
+        let offline = now.saturating_sub(seen);
         (offline > limit).then_some(offline)
     }
 
     fn forget(&self, name: &str) {
         if let Ok(mut state) = self.state.lock() {
             state.last_seen_ms.remove(name);
+            state.grace_until_ms.remove(name);
         }
     }
 
@@ -227,7 +238,12 @@ impl Presence {
                 if let Some(seen) = state.last_seen_ms.get(name) {
                     last_seen_ms.insert(name.clone(), *seen);
                 }
-                if state.open.contains_key(name) {
+                // A node in its grace time is online too, so a second restart keeps the grace.
+                let in_grace = state
+                    .grace_until_ms
+                    .get(name)
+                    .is_some_and(|until| *until > now);
+                if state.open.contains_key(name) || in_grace {
                     online.push(name.clone());
                 }
             }
@@ -440,6 +456,31 @@ mod tests {
         assert_eq!(
             second.due(&names(&["eph1"]), limit + 1),
             vec![("eph1".to_string(), 10_001)]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_short_request_after_the_start_does_not_end_the_grace() {
+        let dir = scratch("grace-renew");
+        let first = Presence::default();
+        first.set_offline(Duration::from_secs(10)).unwrap();
+        let guard = first.begin("eph1");
+        let at = now_ms(SystemTime::now());
+        first.save(&dir, &names(&["eph1"]), at, true).unwrap();
+        drop(guard);
+        let second = Presence::default();
+        second.set_offline(Duration::from_secs(10)).unwrap();
+        let start = now_ms(SystemTime::now());
+        second.load(&dir, start).unwrap();
+        // A renew after the start ends at once. Then the node waits on a request to the old
+        // coordinator. Without the grace it would be offline for 11 s at start + 11 s.
+        drop(second.begin("eph1"));
+        assert!(second.due(&names(&["eph1"]), start + 11_000).is_empty());
+        let grace = u64::try_from(RECONNECT_GRACE.as_millis()).unwrap();
+        assert_eq!(
+            second.due(&names(&["eph1"]), start + grace + 10_001).len(),
+            1
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

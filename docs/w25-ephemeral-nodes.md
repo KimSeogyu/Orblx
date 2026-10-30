@@ -68,7 +68,8 @@ The coordinator prints `ephemeral removed NAME overlay_ip IP offline_ms X deny_v
 - A node that had an open request at the last save (the `online` list in the file) was online when
   the coordinator stopped. Its request to the stopped coordinator can take up to `DENY_WAIT_HOLD` + 10 s = 30 s
   to fail before it connects again. Thus after a start that node gets 30 s (`RECONNECT_GRACE`) before its offline
-  time starts. A node that never comes back is removed 30 s + `T` after the start. Late, never early.
+  time starts. A short request in the grace (for example a renew) does not end the grace.
+  A node that never comes back is removed 30 s + `T` after the start. Late, never early.
 - A file without the `online` list (an older file of this change) reads with an empty list.
 - A node that the file does not have starts as online at coordinator start.
 - The coordinator prints `ephemeral offline_secs T loaded N` at start.
