@@ -284,6 +284,8 @@ for name in owner a b; do
     --bundle /coord-state/trust-bundle.pem --token-file "/coord-state/tokens/${name}" \
     --state "$STATE" --endpoint "${name}:443"
 done
+# W25-15: a new OIDC user waits for approval. The owner approves bob before the enroll.
+owner user-approve oidc:bob
 for name in g g2; do
   echo "=== [C] enroll ${name} with an ID token of guest bob ==="
   idp mint --dir /idp --kid rs1 --issuer "$ISSUER" --aud "$CLIENT" --out "/tokens/${name}" \

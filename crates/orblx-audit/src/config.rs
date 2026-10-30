@@ -98,11 +98,15 @@ pub enum ConfigAction {
     PacketDeny,
     /// An owner removed the SVID deny entry of one principal (W25-2 revoke undo).
     Unrevoke,
+    /// An owner or the policy approved one OIDC user (W25-15).
+    UserApprove,
+    /// An owner rejected one OIDC user (W25-15).
+    UserReject,
 }
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 35] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -136,6 +140,8 @@ impl ConfigAction {
         Self::Unshare,
         Self::PacketDeny,
         Self::Unrevoke,
+        Self::UserApprove,
+        Self::UserReject,
     ];
 
     /// Return the stable action token.
@@ -175,6 +181,8 @@ impl ConfigAction {
             Self::Unshare => "unshare",
             Self::PacketDeny => "packet-deny",
             Self::Unrevoke => "unrevoke",
+            Self::UserApprove => "user-approve",
+            Self::UserReject => "user-reject",
         }
     }
 
@@ -221,6 +229,9 @@ impl ConfigAction {
             Self::Unshare => 31,
             Self::PacketDeny => 32,
             Self::Unrevoke => 33,
+            // 34 and 35 stay free for open work (W25-10, W25-13).
+            Self::UserApprove => 36,
+            Self::UserReject => 37,
         }
     }
 
