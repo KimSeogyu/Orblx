@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """W25-5: the table of the serial nat-realism runs.
 
-Usage: serial-rtt-table.py OUT_DIR [--upto N] [--gate | --kill-check]
+Usage: serial-rtt-table.py OUT_DIR [--upto N] [--gate | --sym-gate | --kill-check | --last-row]
 
 OUT_DIR has run1.log, run1.exit, and so on (serial-rtt.sh writes them).
 One row per run: the max ping, the median ping and the lost pings over the W23-4 gate paths
 (direct prc_prc, direct prc_prc at 0.23 s, relay prc_prc, relay sym_sym), and the contention
 (proof_contention line of proof-lock.sh: the max number of other running orblx containers).
 --gate: exit 1 unless every run has proof_ok, a max ping below the limit and 0 lost.
+--sym-gate: the W23-4 sym relay throughput check (W25-12). Exit 1 unless at least
+  ORBLX_SYM_GATE_RUNS (default 5) runs have a sym_sym relay bulk of at least ORBLX_SYM_GATE_SECS
+  (default 29) seconds, and the median of these runs is at or above the W22 floor. Each run holds the
+  proof lock, so no other proof runs at the same time. The line also gives the number of runs alone
+  on the box (no other orblx container).
+--last-row: print only the row of the last run (serial-rtt.sh prints it after each run).
 --kill-check: exit 3 when the last run has a ping above the limit and no other orblx container ran.
 Every number comes from a log line. A missing value is printed as "-".
 Each run also gets runN.samples.tsv: every gate ping sample with its time and the nearest SVID
@@ -28,7 +34,11 @@ perf_summary = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(perf_summary)
 
 # W22: the sym_sym relay TCP throughput floor. The table reports it. It is not a --gate check.
+# --sym-gate checks it with long samples only (W25-12: one 5 s sample has a spread of about 30%).
 SYM_FLOOR_MBIT = float(os.environ.get("ORBLX_SERIAL_SYM_FLOOR_MBIT", "1113"))
+SYM_GATE_RUNS = int(os.environ.get("ORBLX_SYM_GATE_RUNS", "5"))
+SYM_GATE_SECS = float(os.environ.get("ORBLX_SYM_GATE_SECS", "29"))
+SYM_SECS_RE = re.compile(r"^throughput sym_sym_relay bytes \d+ seconds ([0-9.]+) mbit_s", re.M)
 LIMIT_MS = float(os.environ.get("ORBLX_SERIAL_SPIKE_MS", "20"))
 GATE_PATHS = ["prc_prc_direct", "prc_prc_direct_i0.23", "prc_prc_relay", "sym_sym_relay"]
 CONTENTION_RE = re.compile(
@@ -112,6 +122,8 @@ def run_row(out_dir, i):
     row["sent"] = sent
     row["complete"] = len(row["paths"]) == len(GATE_PATHS)
     row["sym_mbit"] = run["throughput"].get("sym_sym_relay")
+    secs = SYM_SECS_RE.search(text)
+    row["sym_secs"] = float(secs.group(1)) if secs else None
     m = CONTENTION_RE.findall(text)
     row["contention"] = m[-1] if m else None
     s = START_RE.search(text)
@@ -186,6 +198,22 @@ def sym_summary(rows):
     return "sym_sym_relay throughput " + "; ".join(parts)
 
 
+def sym_gate(rows):
+    """W25-12: the sym relay median over the long runs, against the W22 floor."""
+    long_rows = [r for r in rows if r.get("sym_mbit") is not None and (r.get("sym_secs") or 0) >= SYM_GATE_SECS]
+    vals = sorted(r["sym_mbit"] for r in long_rows)
+    alone = sum(1 for r in long_rows if contended(r) is False)
+    if len(vals) < SYM_GATE_RUNS:
+        print("sym_gate failed: %d runs with a sym bulk of at least %.0f s, need %d"
+              % (len(vals), SYM_GATE_SECS, SYM_GATE_RUNS))
+        return 1
+    med = median(vals)
+    verdict = "ok" if med >= SYM_FLOOR_MBIT else "failed"
+    print("sym_gate %s: %d runs of at least %.0f s (%d alone), median %.2f Mbit/s (min %.2f, max %.2f), W22 floor %.0f"
+          % (verdict, len(vals), SYM_GATE_SECS, alone, med, vals[0], vals[-1], SYM_FLOOR_MBIT))
+    return 0 if verdict == "ok" else 1
+
+
 def main(argv):
     out_dir = argv[1]
     upto = None
@@ -196,11 +224,17 @@ def main(argv):
     while os.path.exists(os.path.join(out_dir, "run%d.log" % i)) and (upto is None or i <= upto):
         rows.append(run_row(out_dir, i))
         i += 1
+    if "--last-row" in argv:
+        if rows:
+            print(fmt_row(rows[-1]))
+        return 0
     if "--kill-check" in argv:
         last = rows[-1] if rows else None
         if last and last["max"] and last["max"][0] > LIMIT_MS and contended(last) is False:
             return 3
         return 0
+    if "--sym-gate" in argv:
+        return sym_gate(rows)
     if "--gate" in argv:
         bad = [r["run"] for r in rows
                if not r["proof_ok"] or not r["complete"] or r["lost"] or not r["max"] or r["max"][0] >= LIMIT_MS]
