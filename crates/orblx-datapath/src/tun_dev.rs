@@ -71,6 +71,179 @@ pub fn open_tun(config: &TunConfig) -> Result<TunBridge, HelloError> {
     }
 }
 
+/// A TUN device that the caller reads and writes on its own threads.
+///
+/// On Linux the calls go to the device file. No packet thread runs between the caller and the device.
+/// A read and a write can run at the same time on two threads.
+/// On other hosts the port uses the [`TunBridge`] threads of [`open_tun`].
+pub struct TunPort {
+    inner: std::sync::Arc<port::Inner>,
+    /// The kernel interface name.
+    pub name: String,
+}
+
+impl Clone for TunPort {
+    fn clone(&self) -> Self {
+        Self {
+            inner: std::sync::Arc::clone(&self.inner),
+            name: self.name.clone(),
+        }
+    }
+}
+
+impl TunPort {
+    /// Read one packet into `buf`.
+    ///
+    /// The call waits up to `timeout`. `Ok(None)` means that no packet came in that time.
+    /// A zero timeout does not wait.
+    pub fn recv_timeout(
+        &self,
+        buf: &mut [u8],
+        timeout: std::time::Duration,
+    ) -> std::io::Result<Option<usize>> {
+        self.inner.recv_timeout(buf, timeout)
+    }
+
+    /// Write one IPv4 packet.
+    pub fn send(&self, packet: &[u8]) -> std::io::Result<()> {
+        self.inner.send(packet)
+    }
+}
+
+/// Open a TUN device for [`TunPort`] calls.
+///
+/// The address and the privilege are the same as for [`open_tun`].
+pub fn open_tun_port(config: &TunConfig) -> Result<TunPort, HelloError> {
+    port::open(config)
+}
+
+#[cfg(target_os = "linux")]
+mod port {
+    use std::io::ErrorKind;
+    use std::time::Duration;
+
+    use tun::AbstractDevice;
+
+    use super::{TunConfig, TunPort};
+    use crate::HelloError;
+
+    pub(super) struct Inner {
+        device: tun::Device,
+    }
+
+    impl Inner {
+        pub(super) fn recv_timeout(
+            &self,
+            buf: &mut [u8],
+            timeout: Duration,
+        ) -> std::io::Result<Option<usize>> {
+            match self.device.recv_timeout(buf, timeout) {
+                Ok(size) => Ok(Some(size)),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::TimedOut | ErrorKind::WouldBlock | ErrorKind::Interrupted
+                    ) =>
+                {
+                    Ok(None)
+                }
+                Err(err) => Err(err),
+            }
+        }
+
+        pub(super) fn send(&self, packet: &[u8]) -> std::io::Result<()> {
+            self.device.send(packet).map(|_| ())
+        }
+    }
+
+    pub(super) fn open(config: &TunConfig) -> Result<TunPort, HelloError> {
+        let device = super::linux::open_device(config)?;
+        let name = device
+            .tun_name()
+            .map_err(|err| HelloError::Tun(err.to_string()))?;
+        Ok(TunPort {
+            inner: std::sync::Arc::new(Inner { device }),
+            name,
+        })
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod port {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
+
+    use super::{open_tun, TunConfig, TunPort};
+    use crate::HelloError;
+
+    pub(super) struct Inner {
+        from: Mutex<std::sync::mpsc::Receiver<Vec<u8>>>,
+        to: mpsc::Sender<Vec<u8>>,
+    }
+
+    impl Inner {
+        pub(super) fn recv_timeout(
+            &self,
+            buf: &mut [u8],
+            timeout: Duration,
+        ) -> std::io::Result<Option<usize>> {
+            let from = self.from.lock().unwrap_or_else(|err| err.into_inner());
+            let packet = if timeout.is_zero() {
+                match from.try_recv() {
+                    Ok(packet) => packet,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(None),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        return Err(std::io::Error::other("The TUN device stopped."))
+                    }
+                }
+            } else {
+                match from.recv_timeout(timeout) {
+                    Ok(packet) => packet,
+                    Err(RecvTimeoutError::Timeout) => return Ok(None),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(std::io::Error::other("The TUN device stopped."))
+                    }
+                }
+            };
+            let size = packet.len().min(buf.len());
+            buf[..size].copy_from_slice(&packet[..size]);
+            Ok(Some(size))
+        }
+
+        pub(super) fn send(&self, packet: &[u8]) -> std::io::Result<()> {
+            self.to
+                .blocking_send(packet.to_vec())
+                .map_err(|_| std::io::Error::other("The TUN device stopped."))
+        }
+    }
+
+    pub(super) fn open(config: &TunConfig) -> Result<TunPort, HelloError> {
+        let bridge = open_tun(config)?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut from_tun = bridge.from_tun;
+        std::thread::Builder::new()
+            .name("orblx-tun-port".to_string())
+            .spawn(move || {
+                while let Some(packet) = from_tun.blocking_recv() {
+                    if tx.send(packet).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|err| HelloError::Tun(err.to_string()))?;
+        Ok(TunPort {
+            inner: std::sync::Arc::new(Inner {
+                from: Mutex::new(rx),
+                to: bridge.to_tun,
+            }),
+            name: bridge.name,
+        })
+    }
+}
+
 /// Open one Linux TUN device with the same configuration as [`open_tun`].
 ///
 /// The caller owns the device.

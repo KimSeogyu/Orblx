@@ -51,7 +51,8 @@ pub use router::{route_packet, RouterError, RouterTable};
 pub use run::{run_hello, HelloRequest, HelloRole};
 pub use tun_bench::{run_local_tun_bench, TunBenchOutcome, TunBenchReport};
 pub use tun_dev::{
-    open_tun, tun_capability_note, TunBridge, TunConfig, DEFAULT_UDP_PORT, LINUX_TUN_NAME,
+    open_tun, open_tun_port, tun_capability_note, TunBridge, TunConfig, TunPort, DEFAULT_UDP_PORT,
+    LINUX_TUN_NAME,
 };
 
 #[cfg(test)]
