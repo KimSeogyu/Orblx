@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_identity::{decode_certificate_pem, extract_spiffe_id, leaf_validity, DenySet, SpiffeId};
@@ -248,6 +248,111 @@ struct RetiredLink {
     cancel: watch::Sender<bool>,
 }
 
+/// The status file writer (W25-11).
+///
+/// One OS thread writes the newest status text. A slow disk thus does not stop the
+/// runtime that moves the packets. A newer text replaces a text that is not written yet.
+struct StatusFile {
+    path: PathBuf,
+    next: Mutex<StatusSlot>,
+    wake: Condvar,
+    writer: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+#[derive(Default)]
+struct StatusSlot {
+    text: Option<String>,
+    closed: bool,
+}
+
+impl StatusFile {
+    fn start(path: PathBuf) -> Arc<Self> {
+        let status = Arc::new(Self {
+            path,
+            next: Mutex::new(StatusSlot::default()),
+            wake: Condvar::new(),
+            writer: Mutex::new(None),
+        });
+        let worker = Arc::clone(&status);
+        // Without the thread, put writes the file at once, as before W25-11.
+        let handle = std::thread::Builder::new()
+            .name("orblx-status".to_string())
+            .spawn(move || worker.run())
+            .ok();
+        *lock(&status.writer) = handle;
+        status
+    }
+
+    fn put(&self, text: String) {
+        if lock(&self.writer).is_none() {
+            if !lock(&self.next).closed {
+                write_status(&self.path, &text);
+            }
+            return;
+        }
+        let mut slot = lock(&self.next);
+        if slot.closed {
+            return;
+        }
+        slot.text = Some(text);
+        self.wake.notify_one();
+    }
+
+    fn run(&self) {
+        loop {
+            let text = {
+                let mut slot = lock(&self.next);
+                loop {
+                    if let Some(text) = slot.text.take() {
+                        break Some(text);
+                    }
+                    if slot.closed {
+                        break None;
+                    }
+                    slot = self
+                        .wake
+                        .wait(slot)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            };
+            match text {
+                Some(text) => write_status(&self.path, &text),
+                None => return,
+            }
+        }
+    }
+
+    /// Stop the thread after it writes the text it has. Then write `last`, if any.
+    fn close(&self, last: Option<String>) {
+        {
+            let mut slot = lock(&self.next);
+            slot.closed = true;
+            self.wake.notify_one();
+        }
+        if let Some(handle) = lock(&self.writer).take() {
+            let _ = handle.join();
+        }
+        if let Some(text) = last {
+            write_status(&self.path, &text);
+        }
+    }
+}
+
+/// Stops the status writer when the node function returns, also on an error.
+struct StatusGuard(Arc<StatusFile>);
+
+impl Drop for StatusGuard {
+    fn drop(&mut self) {
+        self.0.close(None);
+    }
+}
+
+fn write_status(path: &Path, text: &str) {
+    if let Err(err) = write_atomic(path, text.as_bytes()) {
+        eprintln!("The node did not write the status file. {err}");
+    }
+}
+
 struct NodeCounters {
     tx: AtomicU64,
     rx: AtomicU64,
@@ -268,6 +373,7 @@ struct Mesh {
     to_tun: mpsc::Sender<Vec<u8>>,
     overlay: Ipv4Addr,
     state_dir: Arc<PathBuf>,
+    status: Arc<StatusFile>,
     relay: Option<SocketAddr>,
     shutdown: watch::Receiver<bool>,
     rekey_tx: watch::Sender<u64>,
@@ -488,11 +594,13 @@ async fn run_mesh_inner(
     let bound = endpoint.local_addr()?;
     println!("The node {} listens on UDP {bound}.", view.name);
     let state_dir = Arc::new(request.state_dir);
+    let status = StatusFile::start(state_dir.join(NODE_STATUS_FILE));
+    let _status_guard = StatusGuard(Arc::clone(&status));
     let node = Arc::new(view);
     let peers = Arc::new(Mutex::new(initial_peers(&request.netmap)));
     let links = Arc::new(Mutex::new(HashMap::<String, LiveLink>::new()));
     let router = Arc::new(router);
-    publish(&state_dir, &node, &peers, "up");
+    publish(&status, &node, &peers, "up");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (rekey_tx, rekey_rx) = watch::channel(0u64);
@@ -538,6 +646,7 @@ async fn run_mesh_inner(
         to_tun: to_tun.clone(),
         overlay,
         state_dir: Arc::clone(&state_dir),
+        status: Arc::clone(&status),
         relay,
         shutdown: shutdown_rx,
         rekey_tx,
@@ -594,7 +703,11 @@ async fn run_mesh_inner(
                     }
                 }
                 _ = tick.tick() => {
-                    if let Ok(bytes) = fs::read(deny_dir.join("deny.json")) {
+                    // The read runs on a blocking thread, so a slow disk does not stop
+                    // the packet runtime (W25-11).
+                    let path = deny_dir.join("deny.json");
+                    let read = tokio::task::spawn_blocking(move || fs::read(path)).await;
+                    if let Ok(Ok(bytes)) = read {
                         if last_text.as_deref() != Some(bytes.as_slice()) {
                             if let Some(deny) = parse_deny(&bytes) {
                                 // Replace first, so a session that starts now uses the new list.
@@ -652,7 +765,7 @@ async fn run_mesh_inner(
                     }
                 }
                 _ = tick.tick() => {
-                    publish(&status_mesh.state_dir, &status_mesh.node, &status_mesh.peers, "up");
+                    publish(&status_mesh.status, &status_mesh.node, &status_mesh.peers, "up");
                 }
             }
         }
@@ -693,7 +806,7 @@ async fn run_mesh_inner(
     for task in tasks {
         let _ = task.await;
     }
-    publish(&state_dir, &node, &peers, "down");
+    status.close(Some(status_text(&node, &peers, "down")));
     println!("The node is down.");
     drop(to_tun);
     Ok(())
@@ -1287,11 +1400,11 @@ async fn run_link(
         }
     }
     set_session(&mesh.peers, &name, true, Some(expiry));
-    publish(&mesh.state_dir, &mesh.node, &mesh.peers, "up");
+    publish(&mesh.status, &mesh.node, &mesh.peers, "up");
     let peer_svid = session.peer_id().as_uri().to_string();
     let (sender, receiver) = session.split();
     let peers = Arc::clone(&mesh.peers);
-    let state_dir = Arc::clone(&mesh.state_dir);
+    let status = Arc::clone(&mesh.status);
     let node = Arc::clone(&mesh.node);
     let peer_name = name.clone();
     drive_session(
@@ -1311,7 +1424,7 @@ async fn run_link(
             peer: name.clone(),
             label: format!("{} peer={} gen={}", mesh.node.name, name, generation),
         },
-        move || note_rx(&peers, &state_dir, &node, &peer_name),
+        move || note_rx(&peers, &status, &node, &peer_name),
     )
     .await;
     lock(&mesh.retired).remove(&generation);
@@ -1326,7 +1439,7 @@ async fn run_link(
     };
     if removed {
         set_session(&mesh.peers, &name, false, None);
-        publish(&mesh.state_dir, &mesh.node, &mesh.peers, "up");
+        publish(&mesh.status, &mesh.node, &mesh.peers, "up");
     }
 }
 
@@ -1532,7 +1645,7 @@ fn set_session(peers: &Mutex<Vec<PeerView>>, name: &str, session: bool, expiry: 
     }
 }
 
-fn note_rx(peers: &Mutex<Vec<PeerView>>, dir: &Path, node: &NodeView, name: &str) {
+fn note_rx(peers: &Mutex<Vec<PeerView>>, status: &StatusFile, node: &NodeView, name: &str) {
     let changed = {
         let mut peers = lock(peers);
         let Some(peer) = peers.iter_mut().find(|peer| peer.name == name) else {
@@ -1544,7 +1657,7 @@ fn note_rx(peers: &Mutex<Vec<PeerView>>, dir: &Path, node: &NodeView, name: &str
         before != after
     };
     if changed {
-        publish(dir, node, peers, "up");
+        publish(status, node, peers, "up");
     }
 }
 
@@ -1565,7 +1678,12 @@ fn path_kind(session: bool, age: Option<Duration>) -> &'static str {
     }
 }
 
-fn publish(dir: &Path, node: &NodeView, peers: &Mutex<Vec<PeerView>>, state: &str) {
+/// Give the newest status text to the status writer. This does no file I/O (W25-11).
+fn publish(status: &StatusFile, node: &NodeView, peers: &Mutex<Vec<PeerView>>, state: &str) {
+    status.put(status_text(node, peers, state));
+}
+
+fn status_text(node: &NodeView, peers: &Mutex<Vec<PeerView>>, state: &str) -> String {
     let now = Instant::now();
     let peers = {
         let mut peers = lock(peers);
@@ -1596,10 +1714,7 @@ fn publish(dir: &Path, node: &NodeView, peers: &Mutex<Vec<PeerView>>, state: &st
             })
             .collect(),
     };
-    let text = format_node_status(&status);
-    if let Err(err) = write_atomic(&dir.join(NODE_STATUS_FILE), text.as_bytes()) {
-        eprintln!("The node did not write the status file. {err}");
-    }
+    format_node_status(&status)
 }
 
 async fn renew_loop(mut mesh: Mesh, renewer: SvidRenewer) {
@@ -1656,7 +1771,7 @@ async fn renew_loop(mut mesh: Mesh, renewer: SvidRenewer) {
                 Ok(expiry) => {
                     tr!("{} renew_applied signal_rekey", mesh.node.name);
                     signal_rekey(&mesh);
-                    publish(&mesh.state_dir, &mesh.node, &mesh.peers, "up");
+                    publish(&mesh.status, &mesh.node, &mesh.peers, "up");
                     println!("The node renewed the SVID. The new expiry is {expiry}.");
                     break;
                 }
