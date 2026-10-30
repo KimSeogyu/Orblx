@@ -26,6 +26,10 @@ const MAX_GRANTS: usize = 4096;
 const MAX_TEST_PORTS: usize = 128;
 
 const MAX_SPLIT_ZONES: usize = 32;
+/// The most audit webhook URLs in one policy (W25-7).
+pub const MAX_AUDIT_WEBHOOKS: usize = 8;
+/// The longest audit webhook URL in bytes (W25-7).
+pub const MAX_AUDIT_WEBHOOK_URL: usize = 256;
 const MAX_SPLIT_SERVERS: usize = 4;
 
 const PROTO_TCP: u8 = 6;
@@ -250,6 +254,7 @@ pub struct Policy {
     ssh: Vec<SshGrant>,
     ssh_tests: Vec<StoredSshTest>,
     split_dns: Vec<SplitDnsZone>,
+    audit_webhooks: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -281,6 +286,7 @@ impl std::fmt::Debug for Policy {
             .field("owners", &self.owners.len())
             .field("ssh", &self.ssh.len())
             .field("split_dns", &self.split_dns.len())
+            .field("audit_webhooks", &self.audit_webhooks.len())
             .finish()
     }
 }
@@ -301,7 +307,16 @@ impl Policy {
             ssh: Vec::new(),
             ssh_tests: Vec::new(),
             split_dns: Vec::new(),
+            audit_webhooks: Vec::new(),
         }
+    }
+
+    /// Return the audit webhook URLs from `auditWebhooks` (W25-7).
+    ///
+    /// The coordinator posts each config audit record to each URL.
+    #[must_use]
+    pub fn audit_webhooks(&self) -> &[String] {
+        &self.audit_webhooks
     }
 
     /// Return the split DNS zones from `splitDns` (W24-F).
@@ -593,6 +608,8 @@ struct PolicyFile {
     ssh_tests: Vec<SshTestFile>,
     #[serde(default, rename = "splitDns")]
     split_dns: BTreeMap<String, Vec<String>>,
+    #[serde(default, rename = "auditWebhooks")]
+    audit_webhooks: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -747,6 +764,7 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
         ssh_tests.push(compile_ssh_test(&catalog, test)?);
     }
     let split_dns = compile_split_dns(&file.split_dns)?;
+    let audit_webhooks = compile_audit_webhooks(&file.audit_webhooks)?;
     Ok(Policy {
         grants,
         tests,
@@ -757,7 +775,62 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
         ssh,
         ssh_tests,
         split_dns,
+        audit_webhooks,
     })
+}
+
+/// Check the `auditWebhooks` field (W25-7).
+///
+/// A URL is `http://` or `https://`, a host, an optional port, and an optional path.
+/// A URL has no user part, no query, and no fragment, so it cannot hold a secret.
+fn compile_audit_webhooks(urls: &[String]) -> Result<Vec<String>, PolicyError> {
+    if urls.len() > MAX_AUDIT_WEBHOOKS {
+        return Err(PolicyError::new(format!(
+            "The policy has more than {MAX_AUDIT_WEBHOOKS} audit webhooks."
+        )));
+    }
+    let mut out: Vec<String> = Vec::new();
+    for url in urls {
+        if !audit_webhook_ok(url) {
+            return Err(PolicyError::new(format!(
+                "The audit webhook {} is not valid.",
+                printable(url)
+            )));
+        }
+        if !out.contains(url) {
+            out.push(url.clone());
+        }
+    }
+    Ok(out)
+}
+
+fn audit_webhook_ok(url: &str) -> bool {
+    if url.len() > MAX_AUDIT_WEBHOOK_URL
+        || url.contains(['?', '#', '@', '\\'])
+        || url.bytes().any(|byte| !(0x21..=0x7e).contains(&byte))
+    {
+        return false;
+    }
+    let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host = match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            if !matches!(port.parse::<u16>(), Ok(value) if value != 0) {
+                return false;
+            }
+            host
+        }
+        None => authority,
+    };
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
 /// Check the `splitDns` field (W24-F).
@@ -1729,6 +1802,31 @@ mod tests {
             let text = format!("{{\"splitDns\": {{{body}}}}}");
             let err = Policy::from_hujson(text.as_bytes()).unwrap_err();
             assert!(err.to_string().contains("split DNS"), "{body}: {err}");
+        }
+    }
+
+    #[test]
+    fn audit_webhooks_accept_plain_urls_only() {
+        let text = r#"{"auditWebhooks": ["http://receiver:9000/hook", "https://siem.example.com/in", "http://receiver:9000/hook"]}"#;
+        let policy = Policy::from_hujson(text.as_bytes()).unwrap();
+        assert_eq!(
+            policy.audit_webhooks(),
+            ["http://receiver:9000/hook", "https://siem.example.com/in"]
+        );
+        assert!(Policy::empty().audit_webhooks().is_empty());
+        for url in [
+            "ftp://receiver/hook",
+            "http://user:pass@receiver/hook",
+            "http://receiver/hook?key=1",
+            "http://receiver/hook#x",
+            "http://:9000/hook",
+            "http://receiver:0/hook",
+            "http://receiver:99999/hook",
+            "http://rec eiver/hook",
+        ] {
+            let text = format!("{{\"auditWebhooks\": [\"{url}\"]}}");
+            let err = Policy::from_hujson(text.as_bytes()).unwrap_err();
+            assert!(err.to_string().contains("audit webhook"), "{url}: {err}");
         }
     }
 

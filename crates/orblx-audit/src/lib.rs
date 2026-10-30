@@ -20,6 +20,7 @@ mod event;
 mod expose;
 mod hexutil;
 mod metrics;
+mod webhook;
 
 pub use chain::{
     canonical_bytes, event_hash, recording_path_ok, verify_file, verify_jsonl, AuditLog,
@@ -39,6 +40,11 @@ pub use error::AuditError;
 pub use event::{DenyReason, EventKind, SessionEvent, SessionIds};
 pub use expose::{default_metrics_addr, sample_line, spawn_metrics_server, DEFAULT_METRICS_PORT};
 pub use metrics::SessionMetrics;
+pub use webhook::{
+    webhook_body, webhook_secret, webhook_signature, webhook_signature_ok, WebhookBody,
+    MAX_WEBHOOK_SECRET, MIN_WEBHOOK_SECRET, WEBHOOK_BODY_TYPE, WEBHOOK_BODY_VERSION,
+    WEBHOOK_SIGNATURE_HEADER,
+};
 
 /// This function returns the name of this crate.
 pub fn crate_name() -> &'static str {

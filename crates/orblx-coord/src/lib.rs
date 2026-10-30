@@ -33,6 +33,7 @@ mod state;
 mod store;
 mod ticket;
 mod tlsutil;
+mod webhook;
 
 pub use admin::{
     approve, audit, deny_json, deny_set, expire, nodes, revoke, revoke_all, routes, users,

@@ -130,13 +130,16 @@ pub enum Refusal {
     /// The call would add, remove, or change a policy owner (403, W25-3b).
     /// Only an owner SVID (mTLS) can change the owners.
     Owners,
+    /// The call would add, remove, or change an audit webhook URL (403, W25-7).
+    /// Only an owner SVID (mTLS) can change the audit webhooks.
+    Webhooks,
 }
 
 impl Refusal {
     /// The HTTP-style status code.
     pub fn status(self) -> u16 {
         match self {
-            Self::Scope | Self::Owners => 403,
+            Self::Scope | Self::Owners | Self::Webhooks => 403,
             _ => 401,
         }
     }
@@ -149,6 +152,7 @@ impl Refusal {
             Self::Revoked => "revoked",
             Self::Scope => "scope",
             Self::Owners => "owners",
+            Self::Webhooks => "webhooks",
         }
     }
 
@@ -161,6 +165,9 @@ impl Refusal {
             Self::Scope => "The API token does not have the scope for this operation.",
             Self::Owners => {
                 "An API token cannot change the policy owners. Only an owner SVID can do this."
+            }
+            Self::Webhooks => {
+                "An API token cannot change the audit webhooks. Only an owner SVID can do this."
             }
         }
     }
