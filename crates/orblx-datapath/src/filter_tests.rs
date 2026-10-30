@@ -96,6 +96,22 @@ fn reply_to_own_flow_passes() {
 }
 
 #[test]
+fn flow_cache_stays_in_one_filter() {
+    // The thread caches skip the flow table lock for a steady flow.
+    // A second filter on the same thread must not use the flows of the first filter.
+    let first = PacketFilter::new(ME, &grants(true, &[]), None);
+    first.note_outbound(&l4(6, ME, 40001, PEER, 5201));
+    assert!(first.allow_inbound(ALICE, &l4(6, PEER, 5201, ME, 40001)));
+    assert!(first.allow_inbound(ALICE, &l4(6, PEER, 5201, ME, 40001)));
+    let second = PacketFilter::new(ME, &grants(true, &[]), None);
+    assert!(!second.allow_inbound(ALICE, &l4(6, PEER, 5201, ME, 40001)));
+    second.note_outbound(&l4(6, ME, 40001, PEER, 5201));
+    assert!(second.allow_inbound(ALICE, &l4(6, PEER, 5201, ME, 40001)));
+    // The same ports with another protocol are not the same flow.
+    assert!(!second.allow_inbound(ALICE, &l4(17, PEER, 5201, ME, 40001)));
+}
+
+#[test]
 fn icmp_rule_works_as_written() {
     let receiver = PacketFilter::new(ME, &grants(true, &[(ALICE, 1, 1, 65535)]), None);
     assert!(receiver.allow_inbound(ALICE, &echo(8, PEER, ME, 9)));

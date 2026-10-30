@@ -10,6 +10,7 @@
 //! It writes at most one record for each source, protocol, and port in `AUDIT_KEY_GAP`,
 //! and at most `AUDIT_PER_SECOND` records in one second.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -48,6 +49,45 @@ const AUDIT_PER_SECOND: u32 = 5;
 const MAX_AUDIT_KEYS: usize = 4_096;
 /// The most records that wait for the audit thread.
 const AUDIT_QUEUE: usize = 64;
+/// A thread does not lock the flow table again for the same flow in this time.
+/// The time is much shorter than `FLOW_IDLE`.
+const FLOW_CACHE_FOR: Duration = Duration::from_secs(1);
+
+/// The id of the next filter. The thread caches use it to keep the filters apart.
+static NEXT_FILTER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// One flow that one thread checked: filter id, flow, time of the check.
+type FlowCacheEntry = Option<(u64, FlowKey, Instant)>;
+
+thread_local! {
+    /// The last flow that this thread noted as outbound.
+    static OUT_CACHE: Cell<FlowCacheEntry> = const { Cell::new(None) };
+    /// The last flow that this thread found open for a reply.
+    static REPLY_CACHE: Cell<FlowCacheEntry> = const { Cell::new(None) };
+}
+
+/// Return true when the cache holds `key` of filter `id` from less than `FLOW_CACHE_FOR` ago.
+fn cache_hit(
+    cache: &'static std::thread::LocalKey<Cell<FlowCacheEntry>>,
+    id: u64,
+    key: &FlowKey,
+    now: Instant,
+) -> bool {
+    cache.with(|cell| {
+        cell.get().is_some_and(|(seen_id, seen_key, at)| {
+            seen_id == id && seen_key == *key && now.saturating_duration_since(at) < FLOW_CACHE_FOR
+        })
+    })
+}
+
+fn cache_set(
+    cache: &'static std::thread::LocalKey<Cell<FlowCacheEntry>>,
+    id: u64,
+    key: FlowKey,
+    now: Instant,
+) {
+    cache.with(|cell| cell.set(Some((id, key, now))));
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct FlowKey {
@@ -231,6 +271,7 @@ struct SampleGate {
 
 /// The receiver packet filter of one node.
 pub struct PacketFilter {
+    id: u64,
     overlay: Ipv4Addr,
     active: AtomicBool,
     rules: RwLock<Rules>,
@@ -266,6 +307,7 @@ impl PacketFilter {
         let audit = audit_path.and_then(spawn_audit);
         let now = Instant::now();
         Arc::new(Self {
+            id: NEXT_FILTER_ID.fetch_add(1, Ordering::Relaxed),
             overlay,
             active: AtomicBool::new(grants.filter),
             rules: RwLock::new(Rules::from_grants(grants)),
@@ -337,10 +379,15 @@ impl PacketFilter {
             _ => return,
         };
         let now = Instant::now();
+        // A steady flow does not lock the flow table for each packet.
+        if cache_hit(&OUT_CACHE, self.id, &key, now) {
+            return;
+        }
         self.flows
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .note(key, now);
+        cache_set(&OUT_CACHE, self.id, key, now);
     }
 
     /// Check one packet from the peer `src` (a SPIFFE ID).
@@ -418,10 +465,19 @@ impl PacketFilter {
     }
 
     fn flow_open(&self, key: &FlowKey, now: Instant) -> bool {
-        self.flows
+        // A steady reply flow does not lock the flow table for each packet.
+        if cache_hit(&REPLY_CACHE, self.id, key, now) {
+            return true;
+        }
+        let open = self
+            .flows
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-            .has(key, now)
+            .has(key, now);
+        if open {
+            cache_set(&REPLY_CACHE, self.id, *key, now);
+        }
+        open
     }
 
     fn deny(&self, src: &str, parsed: Option<&Parsed>, proto: u8, port: u16) {
