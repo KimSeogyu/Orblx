@@ -79,7 +79,7 @@ REAL `cargo test`:
 - `orblx-ssh` `record` tests: the header, the command, and the output are in the file; a file in place of the directory makes `create` fail.
 - `orblx-ssh` `a_rule_with_recording_writes_the_file_and_fails_closed`: a full SSH session through the server with a recorded user, verify, a byte change, a plain user with no new file, and a deny when the directory cannot open.
 
-[C] `scripts/proof/ssh.sh` (log `w22-3-dev1-ssh.log`, and the PR head log `pr<N>-<sha8>-ssh.log`):
+[C] `scripts/proof/ssh.sh` (log `w22-3-dev1-ssh.log`, and the PR head log `pr61-feedbd20-ssh.log`):
 
 | Step | Result |
 | --- | --- |
