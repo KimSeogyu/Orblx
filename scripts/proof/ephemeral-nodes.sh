@@ -78,6 +78,10 @@ cleanup() {
 . "$ROOT/scripts/proof/proof-lock.sh"
 trap 'cleanup; proof_lock_end' EXIT
 proof_lock_take "ephemeral-nodes:${PROOF_PROJECT}" "${PROOF_PROJECT}-"
+# W25-14b: start from a clean compose state (all profiles, all volumes).
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$ROOT/scripts/proof/compose-clean.sh"
+proof_compose_clean "$PROOF_PROJECT" || exit 1
 
 fail() {
   echo "FAIL: $1" >&2
