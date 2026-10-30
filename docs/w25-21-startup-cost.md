@@ -4,6 +4,16 @@ W25-21 does not block rc.3. It measures the time from the enroll call of a node 
 of its listener, by phase, and gives an idle-box gate for it. It does not change the datapath,
 the handshake, the keys, or the SVID check. It adds no pre-start and no cache.
 
+Summary:
+
+| Set | n | median | p95 | max |
+|---|---|---|---|---|
+| Idle box (REAL, FIFO lock, load1 2.88 on 8 CPUs) | 10 | 181.0 ms | 207.4 ms | 207.4 ms |
+| Busy ubuntu runner (report only) | 100 | 251.1 ms | 396.8 ms | **3410.2 ms (3.4 s)** |
+
+The idle gate (median ≤1000 ms) passes. The busy max of 3.4 s is one run in which the state
+write took 2658.2 ms (section 3.2). W25-21 makes no speedup (section 5).
+
 Marks:
 
 - **REAL**: the Linux box (8 CPUs), the GitHub-hosted ubuntu and macOS runners, `cargo test`
@@ -74,6 +84,8 @@ All numbers are medians / p95 / max in ms, nearest rank.
 | bind | 1.3 | 2.8 | 2.8 |
 | **total (enroll_to_listener)** | **181.0** | **207.4** | **207.4** |
 
+This idle result is at load1 2.88 (8 CPUs), not at load 0.
+
 Gate: median ≤1000 ms. **PASS (181 ms).** The median is not above 2000 ms, so there is no
 rc.3 alert.
 
@@ -127,7 +139,10 @@ median 284, p95 315, max 328, and macOS median 179, p95 291, max 350.
 4. The late-peer gate (listener to first packet, ≤2000 ms) is not affected by these phases,
    since #112 starts it at the listener start.
 
-## 5. Options (not done; for a PO decision)
+## 5. Options (not done)
+
+PO decision: W25-21 makes neither change, and the close wait stays.
+
 
 - close_wait: do not wait for the drain after the reply (the coordinator already answered).
   Saves about 0.1 s per coordinator call. It changes the close of the client, not the handshake.
@@ -148,3 +163,6 @@ median 284, p95 315, max 328, and macOS median 179, p95 291, max 350.
 - The node runs with the in-memory TUN of the tests. A real TUN open is not in these phases.
 - The box run is not fully idle: the load average was 2.88 and the container count was unknown.
 - The busy p95 values come from GitHub-hosted runners. They change from run to run.
+- Release notes: these numbers give no join-time claim. Enroll-to-listener is an internal
+  start-up phase. The only allowed join number is enroll to first packet (median and p95) from
+  the real rc.3 sweep, marked [C] Linux lab, one host, with n. There is no Tailscale comparison.
