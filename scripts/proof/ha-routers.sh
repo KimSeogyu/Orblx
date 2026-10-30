@@ -49,6 +49,8 @@ dc() {
 # W25-5: one box proof at a time. The lock waits.
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$ROOT/scripts/proof/proof-lock.sh"
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$ROOT/scripts/proof/pipe-lib.sh"
 
 cleanup() {
   if [[ "${ORBLX_HA_KEEP:-0}" == 1 ]]; then
@@ -73,9 +75,9 @@ now_ms() {
 
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -127,7 +129,7 @@ route_lines() {
 
 peer_direct() {
   local node="$1" peer="$2"
-  dc exec -T "$node" cat /var/lib/orblx/status.txt 2>/dev/null | grep -q "^peer ${peer} .* path direct "
+  dc exec -T "$node" cat /var/lib/orblx/status.txt 2>/dev/null | read_all grep -q "^peer ${peer} .* path direct "
 }
 
 wait_direct() {
@@ -179,7 +181,7 @@ add_counters() {
 
 fwd_bytes() {
   local router="$1" tag="$2"
-  dc exec -T "$router" iptables -nvx -L FORWARD | awk -v t="orblx-w25ha-${tag}" '$0 ~ t {print $2; exit}'
+  dc exec -T "$router" iptables -nvx -L FORWARD | read_all awk -v t="orblx-w25ha-${tag}" '$0 ~ t {print $2; exit}'
 }
 
 route_audit_count() {
@@ -398,7 +400,7 @@ for node in client guest; do
     wait_direct "$node" "$router" 120 || fail "${node} has no direct path to ${router}."
   done
 done
-dc exec -T client ip route show dev orblx0 | grep -q "^${CIDR}" || fail "The client has no route to ${CIDR}."
+dc exec -T client ip route show dev orblx0 | read_all grep -q "^${CIDR}" || fail "The client has no route to ${CIDR}."
 
 echo "=== Gate 1 [C]: an unapproved second router carries 0 bytes ==="
 b0="$(fwd_bytes router-b fwd)"
@@ -453,7 +455,7 @@ done
 echo "client log: $(dc logs --no-log-prefix client 2>/dev/null | grep "The HA route ${CIDR} has the routers" | tail -n 1)"
 [[ "$(log_count client "The HA route ${CIDR} has the routers router-a, router-b.")" -ge 1 ]] \
   || fail "The client did not see two routers for ${CIDR}."
-echo "client: $(dc exec -T client ip route get "$TARGET" | head -n 1)"
+echo "client: $(dc exec -T client ip route get "$TARGET" | read_all head -n 1)"
 echo "[C] gate1 ok: both routes approved"
 
 echo "---- [C] ping (report each value above 20 ms) ----"
@@ -608,7 +610,7 @@ for run in $(seq 1 "$RUNS"); do
   sleep 8
   log="$(target_log u9000)"
   before="$(printf '%s\n' "$log" | awk -v t="$t_kill" -v ip="${LAN_IP[$active]}" -v tag="run${run}" '$4 == tag && $3 == ip && $2 < t' | grep -c . || true)"
-  first_new="$(printf '%s\n' "$log" | awk -v t="$t_kill" -v ip="${LAN_IP[$standby]}" -v tag="run${run}" '$4 == tag && $3 == ip && $2 >= t {print $2; exit}')"
+  first_new="$(printf '%s\n' "$log" | read_all awk -v t="$t_kill" -v ip="${LAN_IP[$standby]}" -v tag="run${run}" '$4 == tag && $3 == ip && $2 >= t {print $2; exit}')"
   after_new="$(printf '%s\n' "$log" | awk -v ip="${LAN_IP[$standby]}" -v tag="run${run}" '$4 == tag && $3 == ip' | grep -c . || true)"
   old_after="$(printf '%s\n' "$log" | awk -v t="$t_killed" -v ip="${LAN_IP[$active]}" -v tag="run${run}" '$4 == tag && $3 == ip && $2 > t' | grep -c . || true)"
   total="$(printf '%s\n' "$log" | awk -v tag="run${run}" '$4 == tag' | grep -c . || true)"
@@ -648,14 +650,14 @@ for run in $(seq 1 "$RUNS"); do
       sleep 0.5
     done
     hold="$(dc exec -T client cat /tmp/hold.txt 2>/dev/null || true)"
-    printf '%s\n' "$hold" | grep -v '^event connect_fail' | head -n 8
+    printf '%s\n' "$hold" | grep -v '^event connect_fail' | read_all head -n 8
     echo "connect_fail events: $(printf '%s\n' "$hold" | grep -c '^event connect_fail' || true)"
-    printf '%s\n' "$hold" | grep -q '^event end' || fail "The TCP hold client did not end."
-    lost_at="$(printf '%s\n' "$hold" | awk '$2 == "lost" {print $NF; exit}')"
+    printf '%s\n' "$hold" | read_all grep -q '^event end' || fail "The TCP hold client did not end."
+    lost_at="$(printf '%s\n' "$hold" | read_all awk '$2 == "lost" {print $NF; exit}')"
     if [[ -z "$lost_at" ]]; then
       tcp_result="survived connections 1"
     else
-      re_at="$(printf '%s\n' "$hold" | awk '$2 == "reconnect" {print $NF; exit}')"
+      re_at="$(printf '%s\n' "$hold" | read_all awk '$2 == "reconnect" {print $NF; exit}')"
       [[ -n "$re_at" ]] || fail "The TCP flow did not reconnect."
       tcp_reconnect_ms=$((re_at - t_kill))
       tcp_result="reconnected lost_after_kill_ms $((lost_at - t_kill)) reconnect_after_kill_ms ${tcp_reconnect_ms}"
@@ -695,10 +697,10 @@ echo "client eth0 packets to ${CIDR}: ${leak0_client} -> ${leak1_client}; guest:
 [[ "$leak1_client" == "$leak0_client" && "$leak1_guest" == "$leak0_guest" ]] || fail "A packet to ${CIDR} left on eth0."
 
 for router in router-a router-b; do
-  dc exec -T "$router" orblx audit verify-config --file /var/lib/orblx/packet-audit.jsonl | grep -qx ok \
+  dc exec -T "$router" orblx audit verify-config --file /var/lib/orblx/packet-audit.jsonl | read_all grep -qx ok \
     || fail "The ${router} packet audit chain did not verify."
 done
-dc exec -T client orblx audit verify-config --file /var/lib/orblx/route-audit.jsonl | grep -qx ok \
+dc exec -T client orblx audit verify-config --file /var/lib/orblx/route-audit.jsonl | read_all grep -qx ok \
   || fail "The client route audit chain did not verify."
 echo "packet audit verify ok on router-a and router-b; route audit verify ok on client ($(route_audit_count) route-failover records)"
 
