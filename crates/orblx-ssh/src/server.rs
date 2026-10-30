@@ -1535,21 +1535,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_shell_stops_when_a_recording_write_fails() {
         let spec = crate::pty::PtySpec::from_request("xterm", 80, 24);
         let mut shell = crate::pty::spawn_shell(&spec, "rec").unwrap();
-        let full = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/full")
-            .unwrap();
+        // A file that is open only for read fails each write.
+        let path = std::env::temp_dir().join(format!("orblx-ssh-ro-{}", std::process::id()));
+        std::fs::write(&path, b"").unwrap();
+        let full = std::fs::File::open(&path).unwrap();
         let live = LiveShell {
             writer: Mutex::new(shell.master.try_clone().unwrap()),
             pid: shell.child.id(),
             started: Instant::now(),
             record: Mutex::new(Some(ShellRecord {
-                recorder: Recorder::from_file_for_test(full, "/dev/full".into()),
+                recorder: Recorder::from_file_for_test(full, path.clone()),
                 input: Utf8Carry::default(),
                 output: Utf8Carry::default(),
                 hidden: false,
@@ -1571,6 +1570,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(stopped, "the shell did not stop");
+        let _ = std::fs::remove_file(&path);
     }
 
     async fn session_within(

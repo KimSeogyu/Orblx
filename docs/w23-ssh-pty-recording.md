@@ -72,7 +72,7 @@ This keeps passwords out of the recording.
 - `pty::tests::a_bad_terminal_type_and_size_become_safe_values`
 - `pty::tests::a_shell_on_the_pty_runs_input_and_echo_off_is_seen`
 - `server::tests::a_pty_shell_records_input_and_output_in_time_order`: input and output in time order, the hidden input marker, 1-byte change fails verify, a rule without recording writes no file, a recording directory that cannot open refuses the shell with a `recording` deny.
-- `server::tests::a_shell_stops_when_a_recording_write_fails` (Linux only, `/dev/full`): the shell stops and the failure is `recording`.
+- `server::tests::a_shell_stops_when_a_recording_write_fails` (a recording file that is open only for read): the shell stops and the failure is `recording`.
 - `ssh::tests::the_shell_flag_takes_no_value_and_refuses_a_command` (orblx-cli).
 
 `scripts/proof/ssh.sh` ([C], log `/workspace/orblx-w18-proof/w23-2-dev2-ssh.log`) reruns all W22-3 exec steps and then:
