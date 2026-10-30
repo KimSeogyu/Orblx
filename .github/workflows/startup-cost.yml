@@ -1,0 +1,68 @@
+# W25-21: the node start-up cost from the enroll call to the listener start on a busy runner.
+# Report only: the job prints the phase times and does not apply the idle-box gate
+# (ORBLX_STARTUP_REPORT_ONLY=1). The idle-box gate is scripts/proof/startup-cost.sh.
+# Each shard runs the orblx-coord tests 4 times with --nocapture, as renew-soak.yml does, and
+# prints the "late_peer TAG startup_ms" lines of the late-peer tests (the node start inside the
+# loaded test process). In run 1, the ignored test startup_cost_runs (20 node starts) runs in
+# parallel with the orblx-coord tests. There are no reruns.
+name: startup-cost
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - crates/orblx-datapath/src/node.rs
+      - crates/orblx-coord/src/client.rs
+      - crates/orblx-coord/src/renew_test.rs
+      - .github/workflows/startup-cost.yml
+
+jobs:
+  startup-cost:
+    name: startup-cost ${{ matrix.os }} shard ${{ matrix.shard }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        shard: [1, 2, 3, 4, 5]
+        include:
+          - os: macos-latest
+            shard: 1
+    steps:
+      - name: Get the repository
+        uses: actions/checkout@v7
+
+      - name: Install the stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the test
+        run: cargo test -p orblx-coord --no-run
+
+      - name: Measure the start-up cost while the orblx-coord tests run
+        env:
+          ORBLX_STARTUP_RUNS: "20"
+          ORBLX_STARTUP_REPORT_ONLY: "1"
+          ORBLX_TRACE_COORD: "1"
+        run: |
+          set +e  # GitHub runs this step with bash -e; the step checks each exit code itself.
+          set -uo pipefail
+          status=0
+          for i in 1 2 3 4; do
+            echo "=== startup_cost ${{ matrix.os }} shard ${{ matrix.shard }} run ${i} start $(date -u +%FT%TZ) ==="
+            cargo test -p orblx-coord -- --nocapture >"load${i}.log" 2>&1 &
+            load=$!
+            if [[ "$i" -eq 1 ]]; then
+              cargo test -p orblx-coord --lib startup_cost_runs -- --ignored --nocapture >measure.log 2>&1
+              code=$?
+              if kill -0 "$load" 2>/dev/null; then overlap=yes; else overlap=no; fi
+              cat measure.log
+              echo "startup_cost measure_exit ${code} load_running_at_measure_end ${overlap}"
+              if [[ "$code" -ne 0 ]]; then status=1; fi
+            fi
+            wait "$load"
+            load_code=$?
+            grep -h '^late_peer ' "load${i}.log" | sed "s/^/startup_cost run ${i} /"
+            echo "=== startup_cost run ${i} end $(date -u +%FT%TZ) load_exit ${load_code} ==="
+          done
+          exit "$status"
