@@ -114,7 +114,7 @@ fetch_netmap() {
 
 log_count() {
   local service="$1" pattern="$2"
-  dc logs --no-log-prefix "$service" 2>/dev/null | grep -F -- "$pattern" | count_lines
+  dc logs --no-log-prefix "$service" 2>/dev/null | count_matching -F -- "$pattern"
 }
 
 # The router that the client uses now, from the last route line of the client log.
@@ -154,9 +154,24 @@ count_lines() {
   echo "${n:-0}"
 }
 
+# Count the lines of stdin that match the grep arguments. Print 0 when no line matches.
+# grep exit 1 (no match) is not an error. grep exit 2 and a failed writer fail.
+count_matching() {
+  local n
+  n="$(grep -c "$@")" || [[ $? -eq 1 ]]
+  echo "${n:-0}"
+}
+
 # Print a file in a container. A missing file prints nothing. A failed docker exec fails.
 cat_in() {
   dc exec -T "$1" sh -c 'cat "$1" 2>/dev/null; exit 0' sh "$2"
+}
+
+# Count the running orblx containers of other projects. A failed docker ps fails.
+other_orblx_containers() {
+  local names
+  names="$(as_root docker ps --format '{{.Names}}')"
+  printf '%s\n' "$names" | awk -v p="$PROJECT" 'index($0, "orblx") == 1 && index($0, p) != 1 {n++} END {print n + 0}'
 }
 
 leak_count() {
@@ -282,7 +297,7 @@ echo "project ${PROJECT} image ${IMAGE} runs ${RUNS} limit_ms ${LIMIT_MS} target
 echo "route ${CIDR} on router-a (lan ${LAN_IP[router-a]}) and router-b (lan ${LAN_IP[router-b]}); target ${TARGET}; nameserver ${NAMESERVER}"
 echo "host $(uname -sm) $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
 echo "start_kst $(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M:%S')"
-other="$(as_root docker ps --format '{{.Names}}' | grep '^orblx' | grep -vc "^${PROJECT}" || true)"
+other="$(other_orblx_containers)"
 echo "other_orblx_containers_at_start ${other}"
 
 mkdir -p "$WORK/coord" "$WORK/policy" "$WORK/tool"
@@ -503,14 +518,14 @@ acl_through() {
   local d0 d1 t80 t81 u91 g80 a80_0 a80_1 a81 u91_rx f81 f91
   echo "=== Gate 4 [C]: the port ACL applies on the new router ${router} ==="
   d0="$(deny_to "$router" "$TARGET")"
-  a80_0="$(target_log t8080 | grep "accept ${LAN_IP[$router]} " | count_lines)"
+  a80_0="$(target_log t8080 | count_matching -F -- "accept ${LAN_IP[$router]} ")"
   t80="$(probe client tcp "$TARGET" 8080 3)"
   t81="$(probe client tcp "$TARGET" 8081 2)"
   u91="$(probe client udp "$TARGET" 9001 2)"
   g80="$(probe guest tcp "$TARGET" 8080 2)"
   sleep 1
   d1="$(deny_to "$router" "$TARGET")"
-  a80_1="$(target_log t8080 | grep "accept ${LAN_IP[$router]} " | count_lines)"
+  a80_1="$(target_log t8080 | count_matching -F -- "accept ${LAN_IP[$router]} ")"
   a81="$(target_log t8081 | count_lines)"
   u91_rx="$(target_log u9001 | count_lines)"
   f81="$(fwd_bytes "$router" t8081)"
@@ -752,7 +767,7 @@ under_target=0
 for value in "${RESULTS[@]}"; do
   ((value <= TARGET_MS)) && under_target=$((under_target + 1))
 done
-other_end="$(as_root docker ps --format '{{.Names}}' | grep '^orblx' | grep -vc "^${PROJECT}" || true)"
+other_end="$(other_orblx_containers)"
 echo "=== summary ==="
 echo "gate1 unapproved ${gate1_unapproved}"
 for i in "${!RESULTS[@]}"; do
