@@ -13,7 +13,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROOF = os.path.join(HERE, "..")
-SCRIPTS = ["nat-realism.sh", "perf-watch.sh"]
+SCRIPTS = ["nat-realism.sh", "perf-watch.sh", "release-sweep.sh"]
 BAD = [
     re.compile(r"\|\s*head\b"),
     re.compile(r"\|\s*grep\s+(-\S+\s+)*-[a-zA-Z]*[qm]"),
