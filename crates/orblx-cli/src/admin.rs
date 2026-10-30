@@ -1,12 +1,14 @@
 //! `orblx admin` talks to the coordinator over the node mTLS API.
 //!
-//! The caller SVID must be an owner in the policy.
+//! The caller SVID must be an owner in the policy, or the caller gives a scoped
+//! API token with `--token-file` (W25-3).
 //! The command does not print private keys or enroll tokens.
+//! It prints an API token only at `token-create` without `--out`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use orblx_coord::admin_blocking;
+use orblx_coord::{admin_blocking, admin_token_blocking, parse_api_token_ttl, parse_scopes};
 use serde_json::Value;
 
 use super::{parse_socket, take_value};
@@ -16,7 +18,7 @@ const DEFAULT_STATE: &str = "/var/lib/orblx";
 #[derive(Debug)]
 pub(crate) enum Command {
     Help,
-    Call(Call),
+    Call(Box<Call>),
 }
 
 #[derive(Debug)]
@@ -29,6 +31,8 @@ pub(crate) struct Call {
     coord: SocketAddr,
     coord_name: String,
     bundle: PathBuf,
+    token_file: Option<PathBuf>,
+    out: Option<PathBuf>,
 }
 
 pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
@@ -47,8 +51,20 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         "grants" => "admin-grants",
         "grant-approve" => "admin-grant-approve",
         "grant-revoke" => "admin-grant-revoke",
+        "policy" => "admin-policy",
+        "policy-set" => "admin-policy-set",
+        "token-create" => "admin-token-create",
+        "token-list" => "admin-token-list",
+        "token-revoke" => "admin-token-revoke",
+        "call" => "call",
         other => return Err(format!("The mode {other} is not valid.\n{}", help())),
     };
+    let mut op = op.to_string();
+    let mut token_file = None;
+    let mut out = None;
+    let mut scopes = None;
+    let mut ttl = None;
+    let mut policy_file = None;
     let mut target = String::new();
     let mut state = None;
     let mut coord = None;
@@ -57,8 +73,37 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
     let mut json = false;
     let mut verify_only = false;
     let mut index = 1;
-    if matches!(
-        op,
+    // A raw call sends ARG as the target and skips the local mode checks.
+    let raw = op == "call";
+    if raw {
+        let wire = args
+            .get(index)
+            .filter(|name| name.starts_with("admin-"))
+            .ok_or_else(|| format!("The command needs an admin operation.\n{}", help()))?;
+        op = wire.clone();
+        index += 1;
+        if let Some(arg) = args.get(index).filter(|arg| !arg.starts_with("--")) {
+            target = arg.clone();
+            index += 1;
+        }
+    } else if op == "admin-token-revoke" || op == "admin-policy-set" {
+        let what = if op == "admin-token-revoke" {
+            "a token id"
+        } else {
+            "a policy file"
+        };
+        let name = args
+            .get(index)
+            .filter(|name| !name.starts_with('-'))
+            .ok_or_else(|| format!("The command needs {what}.\n{}", help()))?;
+        if op == "admin-token-revoke" {
+            target = name.clone();
+        } else {
+            policy_file = Some(PathBuf::from(name));
+        }
+        index += 1;
+    } else if matches!(
+        op.as_str(),
         "admin-approve"
             | "admin-revoke"
             | "admin-revoke-all"
@@ -95,6 +140,15 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         }
         let value = take_value(args, &mut index)?;
         match flag {
+            "--token-file" => token_file = Some(PathBuf::from(value)),
+            "--out" if op == "admin-token-create" && !raw => out = Some(PathBuf::from(value)),
+            "--scope" if op == "admin-token-create" && !raw => {
+                let list = parse_scopes(&value).map_err(|err| err.to_string())?;
+                scopes = Some(list);
+            }
+            "--ttl" if op == "admin-token-create" && !raw => {
+                ttl = Some(parse_api_token_ttl(&value)?)
+            }
             "--since" if op == "admin-audit" => {
                 target = parse_since(&value, now_unix()?)?.to_string();
             }
@@ -108,8 +162,17 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
     let state = state.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE));
     let coord = coord.ok_or_else(|| format!("The command needs --coord.\n{}", help()))?;
     let bundle = bundle.unwrap_or_else(|| state.join("bundle.pem"));
-    Ok(Command::Call(Call {
-        op: op.to_string(),
+    if op == "admin-token-create" && !raw {
+        let scopes = scopes.ok_or_else(|| format!("The command needs --scope.\n{}", help()))?;
+        let ttl = ttl.ok_or_else(|| format!("The command needs --ttl.\n{}", help()))?;
+        target = serde_json::json!({"scopes": scopes, "ttl_secs": ttl.as_secs()}).to_string();
+    }
+    if let Some(file) = policy_file {
+        target = std::fs::read_to_string(&file)
+            .map_err(|err| format!("The file {} did not open. {err}", file.display()))?;
+    }
+    Ok(Command::Call(Box::new(Call {
+        op,
         target,
         json,
         verify_only,
@@ -117,7 +180,9 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         coord,
         coord_name: coord_name.unwrap_or_else(|| "coord".to_string()),
         bundle,
-    }))
+        token_file,
+        out,
+    })))
 }
 
 pub(crate) fn run(command: Command) -> Result<(), String> {
@@ -130,19 +195,25 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             let bundle = std::fs::read_to_string(&call.bundle)
                 .map_err(|err| format!("The file {} did not open. {err}", call.bundle.display()))?;
             let started_ms = now_millis();
-            let detail = admin_blocking(
-                call.coord,
-                &call.coord_name,
-                &bundle,
-                &call.state,
-                &call.op,
-                &call.target,
-            )
-            .map_err(|err| err.to_string())?;
+            let detail = match &call.token_file {
+                Some(file) => token_call(&call, &bundle, file)?,
+                None => admin_blocking(
+                    call.coord,
+                    &call.coord_name,
+                    &bundle,
+                    &call.state,
+                    &call.op,
+                    &call.target,
+                )
+                .map_err(|err| err.to_string())?,
+            };
             let value: Value = serde_json::from_str(&detail)
                 .map_err(|_| "The coordinator response is not valid.".to_string())?;
             if call.op == "admin-audit" {
                 return print_audit(&value, call.json, call.verify_only);
+            }
+            if call.op == "admin-token-create" {
+                return print_created(&value, call.out.as_deref());
             }
             print_admin(&call.op, &value)?;
             if matches!(call.op.as_str(), "admin-grant-revoke" | "admin-revoke-all") {
@@ -154,8 +225,125 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
     }
 }
 
+/// Send one admin call with the API token in `file`.
+///
+/// The command prints `status N done_ms MS`. It fails when the status is not 200.
+fn token_call(call: &Call, bundle: &str, file: &std::path::Path) -> Result<String, String> {
+    let token = std::fs::read_to_string(file)
+        .map_err(|err| format!("The file {} did not open. {err}", file.display()))?;
+    let reply = admin_token_blocking(
+        call.coord,
+        &call.coord_name,
+        bundle,
+        token.trim(),
+        &call.op,
+        &call.target,
+    )
+    .map_err(|err| err.to_string())?;
+    println!("status {} done_ms {}", reply.status, now_millis());
+    if reply.status != 200 {
+        return Err(reply
+            .error
+            .unwrap_or_else(|| "The coordinator request failed.".to_string()));
+    }
+    reply
+        .detail
+        .ok_or_else(|| "The coordinator response is not valid.".to_string())
+}
+
+/// Write the new token to `out` with mode 0600, or print it one time.
+fn print_created(value: &Value, out: Option<&std::path::Path>) -> Result<(), String> {
+    let bad = || "The coordinator response is not valid.".to_string();
+    let token = text_field(value, "token")?;
+    let id = text_field(value, "id")?;
+    let scopes: Vec<&str> = value
+        .get("scopes")
+        .and_then(Value::as_array)
+        .ok_or_else(bad)?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let expires = value
+        .get("expires_unix_ms")
+        .and_then(Value::as_u64)
+        .ok_or_else(bad)?;
+    match out {
+        Some(path) => {
+            write_private(path, &format!("{token}\n"))?;
+            println!("wrote one api token");
+            println!("out {}", path.display());
+        }
+        None => {
+            println!("api_token {token}");
+            println!(
+                "The coordinator keeps only a digest. This is the only time the token is shown."
+            );
+        }
+    }
+    println!("token_id {id}");
+    println!("scopes {}", scopes.join(","));
+    println!("expires_unix_ms {expires}");
+    Ok(())
+}
+
+fn write_private(path: &std::path::Path, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|err| format!("The file {} did not open. {err}", path.display()))?;
+    file.write_all(text.as_bytes())
+        .map_err(|err| format!("The file {} was not written. {err}", path.display()))
+}
+
 fn print_admin(op: &str, value: &Value) -> Result<(), String> {
     match op {
+        "admin-token-list" => {
+            let tokens = value
+                .get("tokens")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "The coordinator response is not valid.".to_string())?;
+            for token in tokens {
+                let scopes: Vec<&str> = token
+                    .get("scopes")
+                    .and_then(Value::as_array)
+                    .map(|list| list.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                println!(
+                    "token {} {} scopes {} expires_unix_ms {}",
+                    text_field(token, "id")?,
+                    text_field(token, "state")?,
+                    scopes.join(","),
+                    token
+                        .get("expires_unix_ms")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                );
+            }
+            println!("tokens {}", tokens.len());
+        }
+        "admin-token-revoke" => {
+            println!("revoked_token {}", text_field(value, "id")?);
+            let at = value
+                .get("revoked_unix_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            println!("revoked_unix_ms {at}");
+        }
+        "admin-policy" => {
+            if value.get("present").and_then(Value::as_bool) == Some(true) {
+                println!("policy_sha256 {}", text_field(value, "sha256")?);
+                print!("{}", text_field(value, "text")?);
+            } else {
+                println!("policy none");
+            }
+        }
+        "admin-policy-set" => {
+            println!("policy_set {}", text_field(value, "sha256")?);
+        }
         "admin-nodes" => {
             let nodes = value
                 .get("nodes")
@@ -285,7 +473,10 @@ fn print_admin(op: &str, value: &Value) -> Result<(), String> {
                 println!("deny_version {version}");
             }
         }
-        _ => return Err("The admin operation is not valid.".to_string()),
+        _ => println!(
+            "{}",
+            serde_json::to_string(value).map_err(|err| err.to_string())?
+        ),
     }
     Ok(())
 }
@@ -430,6 +621,25 @@ orblx admin grants --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE
 orblx admin grant-approve ID --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin grant-revoke ID --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin audit --coord ADDR [--since TIME] [--json] [--verify] [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin policy --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin policy-set FILE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin token-create --scope SCOPE[,SCOPE] --ttl TIME --coord ADDR [--out FILE] [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin token-list --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin token-revoke ID --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin call OP [ARG] --coord ADDR [--token-file FILE] [--state DIR] [--coord-name NAME] [--bundle FILE]
+
+Each command except token-create, token-list, and token-revoke also accepts --token-file FILE.
+With --token-file, the command sends the scoped API token in FILE and no client certificate.
+The coordinator accepts the call only when the token has the scope of the operation.
+The command then prints `status N done_ms MS`. 401: the token is not valid, expired, or revoked.
+403: the token does not have the scope. Only an owner SVID can create, list, or revoke tokens.
+Scopes: nodes:read (nodes, users, routes), nodes:write (approve, revoke, revoke-all, expire),
+grants:read (grants), grants:write (grant-approve, grant-revoke), audit:read (audit),
+lock:read and lock:write (node lock), policy:read (policy), policy:write (policy-set).
+TIME for --ttl is seconds or an age such as 90s, 30m, 2h, or 7d. The maximum is 30d.
+token-create prints the token one time. With --out, it writes the token to FILE (mode 0600) and does not print it.
+The coordinator keeps only the SHA-256 digest of the token.
+call sends one admin operation by its wire name, such as admin-lock-init. It is for scripts and tests.
 
 The command uses the node SVID in the state directory.
 The coordinator accepts the call when that SVID is an owner.
@@ -552,5 +762,100 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.contains("node name"));
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn token_create_needs_known_scopes_and_a_life() {
+        let command = parse(&args(&[
+            "token-create",
+            "--scope",
+            "nodes:read,audit:read",
+            "--ttl",
+            "10m",
+            "--out",
+            "/tmp/t",
+            "--coord",
+            "127.0.0.1:443",
+        ]))
+        .unwrap();
+        match command {
+            Command::Call(call) => {
+                assert_eq!(call.op, "admin-token-create");
+                assert_eq!(
+                    call.target,
+                    r#"{"scopes":["audit:read","nodes:read"],"ttl_secs":600}"#
+                );
+                assert_eq!(call.out.as_deref(), Some(std::path::Path::new("/tmp/t")));
+            }
+            Command::Help => panic!("the parser did not select token-create"),
+        }
+        let bad = parse(&args(&[
+            "token-create",
+            "--scope",
+            "nodes:all",
+            "--ttl",
+            "10m",
+            "--coord",
+            "127.0.0.1:443",
+        ]))
+        .unwrap_err();
+        assert!(bad.contains("scope"));
+        let no_ttl = parse(&args(&[
+            "token-create",
+            "--scope",
+            "nodes:read",
+            "--coord",
+            "127.0.0.1:443",
+        ]))
+        .unwrap_err();
+        assert!(no_ttl.contains("--ttl"));
+    }
+
+    #[test]
+    fn token_file_and_call_parse() {
+        let command = parse(&args(&[
+            "call",
+            "admin-lock-init",
+            "{}",
+            "--token-file",
+            "/tmp/t",
+            "--coord",
+            "127.0.0.1:443",
+        ]))
+        .unwrap();
+        match command {
+            Command::Call(call) => {
+                assert_eq!(call.op, "admin-lock-init");
+                assert_eq!(call.target, "{}");
+                assert_eq!(
+                    call.token_file.as_deref(),
+                    Some(std::path::Path::new("/tmp/t"))
+                );
+            }
+            Command::Help => panic!("the parser did not select call"),
+        }
+        assert!(parse(&args(&["call", "nodes", "--coord", "127.0.0.1:443"])).is_err());
+        let raw = r#"{"scopes":["nodes:write"],"ttl_secs":60}"#;
+        let command = parse(&args(&[
+            "call",
+            "admin-token-create",
+            raw,
+            "--coord",
+            "127.0.0.1:443",
+        ]))
+        .unwrap();
+        match command {
+            Command::Call(call) => assert_eq!(call.target, raw),
+            Command::Help => panic!("the parser did not select call"),
+        }
+        let command = parse(&args(&["token-revoke", "abcd", "--coord", "127.0.0.1:443"])).unwrap();
+        match command {
+            Command::Call(call) => assert_eq!(call.target, "abcd"),
+            Command::Help => panic!("the parser did not select token-revoke"),
+        }
     }
 }

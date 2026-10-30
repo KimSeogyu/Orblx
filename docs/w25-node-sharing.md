@@ -55,15 +55,15 @@ The coordinator compares the share lines of the old and the new policy when the 
 
 | Change | Records |
 |---|---|
-| One share line added | Exactly 1 record `share` (code 27). Digest before = empty, after = SHA-256 of the line. |
-| One share line removed | Exactly 1 record `unshare` (code 28). Digest before = SHA-256 of the line, after = empty. |
+| One share line added | Exactly 1 record `share` (code 30). Digest before = empty, after = SHA-256 of the line. |
+| One share line removed | Exactly 1 record `unshare` (code 31). Digest before = SHA-256 of the line, after = empty. |
 | Other rules changed | 1 record `policy-replace` (as before). The rules digest does not include `shares`. |
 | Only shares changed | No `policy-replace` record. |
 | First load | 1 record `policy-load` (as before). No share records. |
 
 Actor = `spiffe://orblx.local/coord/coord` (the coordinator reads the file; the file has no signer). Target = the shared node URI. Detail = the share line.
 A share with two guests in `with` is two share lines, so it writes two records.
-Code 26 is not used. It is kept for the W24-A `PacketDeny` action.
+Codes 26 to 29 are the W25-3 API token actions in main.
 
 No new crypto design. The change uses the existing policy file, deny list, signed grants, and config audit chain.
 
@@ -73,7 +73,7 @@ The brief scope is the policy, coordinator, and sharing files. These files are o
 
 | File | Change | Why |
 |---|---|---|
-| `crates/orblx-audit/src/config.rs` | Adds the actions `share` (27) and `unshare` (28). | Gate 5 needs one record of each kind. |
+| `crates/orblx-audit/src/config.rs` | Adds the actions `share` (30) and `unshare` (31). | Gate 5 needs one record of each kind. |
 | `crates/orblx-datapath/src/node.rs` | The deny tick is 100 ms (was 10 s). The node lock check stays at 10 s. The node applies the deny list only when the text of `deny.json` changes. Then it replaces the endpoint deny list and closes each open session whose peer SPIFFE ID is in the list (new `close_denied_links`). | Session control, not the packet path. The per-frame check denies only ticket nonces. Without this, an open session stays after the unshare (proof run 1 failed for this reason). The dial task tries again, so a share again restores the session with no restart. |
 | `crates/orblx-cli/src/up.rs` | The deny fetch starts each 500 ms. The fetch time is not added to the interval. | With the fetch time added, one run took 1120 ms (run 5) and failed the 1 s gate. |
 

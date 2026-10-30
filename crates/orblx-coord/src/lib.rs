@@ -13,6 +13,7 @@
 
 mod admin;
 mod agent;
+mod apitoken;
 mod client;
 mod config;
 mod error;
@@ -39,11 +40,15 @@ mod tlsutil;
 pub use admin::{
     approve, audit, deny_json, deny_set, expire, nodes, revoke, revoke_all, routes, users,
 };
+pub use apitoken::{
+    admin_ops, all_scopes, parse_scopes, parse_ttl as parse_api_token_ttl, scope_of,
+    API_TOKEN_FILE, API_TOKEN_PREFIX, MAX_API_TOKEN_TTL_SECS, OWNER_ONLY_OPS,
+};
 pub use client::{
-    admin_blocking, advertise_exit_blocking, advertise_routes_blocking, agent_grant_fetch_blocking,
-    agent_grant_request_blocking, enroll_with_oidc_blocking, enroll_with_token_blocking,
-    fetch_deny_blocking, fetch_netmap_blocking, netmap_json, publish_candidates_blocking,
-    renew_svid_blocking, GrantFetch, OidcEnroll,
+    admin_blocking, admin_token_blocking, advertise_exit_blocking, advertise_routes_blocking,
+    agent_grant_fetch_blocking, agent_grant_request_blocking, enroll_with_oidc_blocking,
+    enroll_with_token_blocking, fetch_deny_blocking, fetch_netmap_blocking, netmap_json,
+    publish_candidates_blocking, renew_svid_blocking, AdminReply, GrantFetch, OidcEnroll,
 };
 pub use config::{CoordConfig, OidcSection};
 pub use error::CoordError;
@@ -381,6 +386,39 @@ mod tests {
         );
         let exit = coord.advertise_routes("router", &["0.0.0.0/0".to_string()]);
         assert!(exit.unwrap_err().to_string().contains("exit route"));
+    }
+
+    #[test]
+    fn split_dns_follows_the_policy_file_without_a_restart() {
+        let scratch = Scratch::new();
+        let policy = r#"{
+          "splitDns": {
+            "corp.lan": ["10.88.0.53"]
+          }
+        }"#;
+        fs::write(scratch.0.join("policy.hujson"), policy).unwrap();
+        let now = SystemTime::now();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+        coord
+            .enroll_token(
+                "client",
+                &token.secret,
+                &["client:443".to_string()],
+                &[],
+                now,
+            )
+            .unwrap();
+        let view = coord.netmap_for("client").unwrap();
+        let zones = &view.signed_netmap.netmap.split_dns;
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].domain, "corp.lan");
+        assert_eq!(zones[0].nameservers, vec!["10.88.0.53".to_string()]);
+        fs::write(scratch.0.join("policy.hujson"), "{}").unwrap();
+        let again = coord.netmap_for("client").unwrap();
+        assert!(again.signed_netmap.netmap.split_dns.is_empty());
+        let text = serde_json::to_string(&again.signed_netmap.netmap).unwrap();
+        assert!(!text.contains("split_dns"));
     }
 
     #[test]

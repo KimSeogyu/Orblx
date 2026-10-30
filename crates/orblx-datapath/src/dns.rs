@@ -8,6 +8,12 @@
 //! [`GrantPeers`] reads the `reach` list on the signed grants.
 //! A peer absent from that list is NXDOMAIN.
 //! [`AllowPeers`] allows every peer when the node has no grant file.
+//!
+//! Split DNS (W24-F): the netmap field `split_dns` maps a domain to nameservers.
+//! A name in that domain goes to a zone nameserver over the overlay route.
+//! The node sends the query only when a netmap peer route covers the nameserver
+//! and the kernel route for the nameserver uses the overlay device.
+//! Otherwise the node answers REFUSED. The query never goes to the system resolver.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -17,7 +23,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::thread;
@@ -27,7 +33,7 @@ use orblx_identity::ReceiverGrants;
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::watch;
 
-use crate::netmap::{valid_owner_name, Netmap, NetmapPeer};
+use crate::netmap::{ipv4_mask, parse_cidr, valid_owner_name, Netmap, NetmapPeer};
 
 /// UDP port for the overlay DNS responder.
 pub const DNS_PORT: u16 = 53;
@@ -110,6 +116,141 @@ impl PeerVisibility for GrantPeers {
 pub struct DnsTable {
     names: HashMap<String, usize>,
     nodes: Vec<DnsNode>,
+    split: Vec<SplitZone>,
+    source: Option<Ipv4Addr>,
+}
+
+/// One split DNS zone with the nameservers that a netmap peer route covers (W24-F).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplitZone {
+    domain: String,
+    routed: Vec<Ipv4Addr>,
+}
+
+/// Split DNS queries that the node sent over the overlay (W24-F).
+static SPLIT_SENT: AtomicU64 = AtomicU64::new(0);
+
+/// Split DNS queries that the node refused without a send (W24-F).
+static SPLIT_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// The split DNS counters: sent over the overlay, and refused without a send (W24-F).
+#[cfg(test)]
+fn split_dns_counters() -> (u64, u64) {
+    (
+        SPLIT_SENT.load(Ordering::Relaxed),
+        SPLIT_REFUSED.load(Ordering::Relaxed),
+    )
+}
+
+/// The path for a split DNS query (W24-F).
+pub(crate) trait SplitPath: Send + Sync {
+    /// Return true when the kernel route for `server` uses the overlay device.
+    fn overlay_route(&self, server: Ipv4Addr) -> bool;
+    /// Send one query to `server` port 53 from `source` and return the response.
+    fn exchange(
+        &self,
+        source: Option<Ipv4Addr>,
+        server: Ipv4Addr,
+        query: &[u8],
+    ) -> Result<Vec<u8>, ForwardError>;
+}
+
+/// The host route table and a UDP socket (W24-F).
+pub(crate) struct SystemSplitPath;
+
+impl SplitPath for SystemSplitPath {
+    fn overlay_route(&self, server: Ipv4Addr) -> bool {
+        kernel_route_uses_overlay(server)
+    }
+
+    fn exchange(
+        &self,
+        source: Option<Ipv4Addr>,
+        server: Ipv4Addr,
+        query: &[u8],
+    ) -> Result<Vec<u8>, ForwardError> {
+        udp_exchange(
+            source.unwrap_or(Ipv4Addr::UNSPECIFIED),
+            SocketAddr::from((server, DNS_PORT)),
+            query,
+        )
+    }
+}
+
+/// Return true when the best kernel route for `server` uses the overlay device.
+///
+/// Linux reads `/proc/net/route`. macOS runs `route -n get`.
+/// Other systems return false, so the node answers REFUSED.
+fn kernel_route_uses_overlay(server: Ipv4Addr) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_to_string("/proc/net/route").is_ok_and(|text| {
+            best_route_device(&text, server).as_deref() == Some(crate::LINUX_TUN_NAME)
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("route")
+            .args(["-n", "get", &server.to_string()])
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .is_some_and(|text| {
+                text.lines().any(|line| {
+                    line.trim()
+                        .strip_prefix("interface:")
+                        .is_some_and(|name| name.trim().starts_with("utun"))
+                })
+            })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = server;
+        false
+    }
+}
+
+/// Return the device of the longest matching route in `/proc/net/route` text.
+///
+/// A tie on the prefix length uses the lower metric.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn best_route_device(text: &str, server: Ipv4Addr) -> Option<String> {
+    let target = u32::from(server);
+    let mut best: Option<(u32, u32, String)> = None;
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 8 {
+            continue;
+        }
+        let (Ok(dest), Ok(flags), Ok(metric), Ok(mask)) = (
+            u32::from_str_radix(fields[1], 16),
+            u16::from_str_radix(fields[3], 16),
+            fields[6].parse::<u32>(),
+            u32::from_str_radix(fields[7], 16),
+        ) else {
+            continue;
+        };
+        if flags & 1 == 0 {
+            continue;
+        }
+        // The kernel prints the network-order bytes as one host-order word.
+        let dest = u32::from_be_bytes(dest.to_ne_bytes());
+        let mask = u32::from_be_bytes(mask.to_ne_bytes());
+        if target & mask != dest & mask {
+            continue;
+        }
+        let len = mask.count_ones();
+        let better = match &best {
+            None => true,
+            Some((best_len, best_metric, _)) => {
+                len > *best_len || (len == *best_len && metric < *best_metric)
+            }
+        };
+        if better {
+            best = Some((len, metric, fields[0].to_string()));
+        }
+    }
+    best.map(|(_, _, device)| device)
 }
 
 #[derive(Debug, Clone)]
@@ -190,28 +331,35 @@ impl QueryForwarder for ExitNodeForwarder {
             "The node sends a DNS query for {name} through the exit node {}.",
             self.name
         );
-        let socket =
-            UdpSocket::bind(SocketAddr::from((self.source, 0))).map_err(|_| ForwardError)?;
-        socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .map_err(|_| ForwardError)?;
-        let server = SocketAddr::from((self.exit, DNS_PORT));
-        if query.len() < 2 {
-            return Err(ForwardError);
-        }
-        let id = u16::from_be_bytes([query[0], query[1]]);
-        socket.send_to(query, server).map_err(|_| ForwardError)?;
-        let mut buf = [0u8; 1500];
-        match socket.recv_from(&mut buf) {
-            Ok((size, from)) if size >= 12 && from == server => {
-                let response_id = u16::from_be_bytes([buf[0], buf[1]]);
-                if response_id == id {
-                    return Ok(buf[..size].to_vec());
-                }
-                Err(ForwardError)
+        udp_exchange(self.source, SocketAddr::from((self.exit, DNS_PORT)), query)
+    }
+}
+
+/// Send one DNS query from `source` to `server` and wait 2 s for the response.
+fn udp_exchange(
+    source: Ipv4Addr,
+    server: SocketAddr,
+    query: &[u8],
+) -> Result<Vec<u8>, ForwardError> {
+    if query.len() < 2 {
+        return Err(ForwardError);
+    }
+    let socket = UdpSocket::bind(SocketAddr::from((source, 0))).map_err(|_| ForwardError)?;
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|_| ForwardError)?;
+    let id = u16::from_be_bytes([query[0], query[1]]);
+    socket.send_to(query, server).map_err(|_| ForwardError)?;
+    let mut buf = [0u8; 1500];
+    match socket.recv_from(&mut buf) {
+        Ok((size, from)) if size >= 12 && from == server => {
+            let response_id = u16::from_be_bytes([buf[0], buf[1]]);
+            if response_id == id {
+                return Ok(buf[..size].to_vec());
             }
-            Ok(_) | Err(_) => Err(ForwardError),
+            Err(ForwardError)
         }
+        Ok(_) | Err(_) => Err(ForwardError),
     }
 }
 
@@ -285,6 +433,8 @@ impl DnsTable {
         let mut table = Self {
             names: HashMap::new(),
             nodes: Vec::new(),
+            split: split_zones(map),
+            source: map.self_node.overlay_ip.parse().ok(),
         };
         table.insert_node(
             &map.self_node.name,
@@ -301,6 +451,27 @@ impl DnsTable {
             );
         }
         table
+    }
+
+    /// Return the split zone with the longest domain that holds `name` (W24-F).
+    fn split_zone(&self, name: &str) -> Option<&SplitZone> {
+        self.split
+            .iter()
+            .filter(|zone| {
+                name == zone.domain
+                    || name
+                        .strip_suffix(zone.domain.as_str())
+                        .is_some_and(|head| head.ends_with('.'))
+            })
+            .max_by_key(|zone| zone.domain.len())
+    }
+
+    /// The `resolvectl` routing domains for the split zones, for example `~corp.lan`.
+    fn split_routing_domains(&self) -> Vec<String> {
+        self.split
+            .iter()
+            .map(|zone| format!("~{}", zone.domain))
+            .collect()
     }
 
     fn insert_node(&mut self, name: &str, owner: &str, address: &str, peer: Option<NetmapPeer>) {
@@ -342,6 +513,35 @@ impl DnsTable {
         }
         NameClass::Address(node.address)
     }
+}
+
+/// Build the split zones from the netmap (W24-F).
+///
+/// A nameserver stays in a zone only when a peer route in the netmap covers it.
+fn split_zones(map: &Netmap) -> Vec<SplitZone> {
+    let routes: Vec<(u32, u32)> = map
+        .peers
+        .iter()
+        .flat_map(|peer| peer.routes.iter())
+        .filter_map(|route| parse_cidr(route).ok())
+        .filter(|(_, len)| *len > 0)
+        .map(|(ip, len)| (u32::from(ip), ipv4_mask(len)))
+        .collect();
+    map.split_dns
+        .iter()
+        .map(|zone| SplitZone {
+            domain: zone.domain.to_ascii_lowercase(),
+            routed: zone
+                .nameservers
+                .iter()
+                .filter_map(|text| text.parse::<Ipv4Addr>().ok())
+                .filter(|ip| {
+                    let value = u32::from(*ip);
+                    routes.iter().any(|(net, mask)| value & mask == *net)
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 /// Search domains for the visible nodes.
@@ -423,6 +623,10 @@ pub(crate) fn domain_args(interface: &str, search: &[String], capture_all: bool)
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) fn macos_resolver_text(nameserver: Ipv4Addr, search: &[String]) -> String {
     let mut text = format!("nameserver {nameserver}\n");
+    let search: Vec<&String> = search
+        .iter()
+        .filter(|item| !item.starts_with('~'))
+        .collect();
     if !search.is_empty() {
         text.push_str("search");
         for domain in search {
@@ -489,11 +693,19 @@ pub(crate) fn refresh_resolver(
     armed: &AtomicBool,
     capture_all: bool,
 ) {
-    let search = search_domains(table, visibility);
+    let mut search = search_domains(table, visibility);
+    let split = table.split_routing_domains();
+    search.extend(split.iter().cloned());
     match install_link_resolver(interface, nameserver, &search, capture_all) {
         Ok(()) => {
             armed.store(true, Ordering::Relaxed);
             println!("The DNS resolver for {interface} uses {nameserver} and the domain ~orblx.");
+            if !split.is_empty() {
+                println!(
+                    "The DNS resolver for {interface} also routes {}.",
+                    split.join(" ")
+                );
+            }
         }
         Err(err) => eprintln!("{err}"),
     }
@@ -557,6 +769,16 @@ fn respond(
     query: &[u8],
     forwarder: &dyn QueryForwarder,
 ) -> Vec<u8> {
+    respond_with(table, visibility, query, forwarder, &SystemSplitPath)
+}
+
+fn respond_with(
+    table: &DnsTable,
+    visibility: &dyn PeerVisibility,
+    query: &[u8],
+    forwarder: &dyn QueryForwarder,
+    split: &dyn SplitPath,
+) -> Vec<u8> {
     if query.len() < 12 {
         return formerr(query);
     }
@@ -578,11 +800,57 @@ fn respond(
         NameClass::Address(ip) => local_address(&parsed, ip),
         NameClass::Hidden => local_error(&parsed, RCODE_NXDOMAIN),
         NameClass::Unknown if in_overlay_zone(&parsed.name) => local_error(&parsed, RCODE_NXDOMAIN),
-        NameClass::Unknown => match forwarder.forward(query) {
-            Ok(bytes) => bytes,
-            Err(ForwardError) => local_error(&parsed, RCODE_SERVFAIL),
+        NameClass::Unknown => match table.split_zone(&parsed.name) {
+            Some(zone) => split_answer(table, zone, &parsed, query, split),
+            None => forward_answer(&parsed, query, forwarder),
         },
     }
+}
+
+fn forward_answer(parsed: &ParsedQuery, query: &[u8], forwarder: &dyn QueryForwarder) -> Vec<u8> {
+    match forwarder.forward(query) {
+        Ok(bytes) => bytes,
+        Err(ForwardError) => local_error(parsed, RCODE_SERVFAIL),
+    }
+}
+
+/// Answer a name in a split zone (W24-F).
+///
+/// The node sends the query to a zone nameserver over the overlay route.
+/// Without an overlay route, the node answers REFUSED.
+/// The node never sends a split zone query to the system resolver.
+fn split_answer(
+    table: &DnsTable,
+    zone: &SplitZone,
+    parsed: &ParsedQuery,
+    query: &[u8],
+    split: &dyn SplitPath,
+) -> Vec<u8> {
+    let servers: Vec<Ipv4Addr> = zone
+        .routed
+        .iter()
+        .copied()
+        .filter(|server| split.overlay_route(*server))
+        .collect();
+    if servers.is_empty() {
+        let count = SPLIT_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+        println!(
+            "The node refused a DNS query for {}. No overlay route reaches a nameserver for {}. split_refused={count}",
+            parsed.name, zone.domain
+        );
+        return local_error(parsed, RCODE_REFUSED);
+    }
+    for server in servers {
+        let count = SPLIT_SENT.fetch_add(1, Ordering::Relaxed) + 1;
+        println!(
+            "The node sends a DNS query for {} to {server} for {} through the overlay. split_sent={count}",
+            parsed.name, zone.domain
+        );
+        if let Ok(bytes) = split.exchange(table.source, server, query) {
+            return bytes;
+        }
+    }
+    local_error(parsed, RCODE_SERVFAIL)
 }
 
 fn local_address(parsed: &ParsedQuery, ip: Ipv4Addr) -> Vec<u8> {
@@ -1357,5 +1625,218 @@ mod tests {
             }
         }
         panic!("the DNS responder sent no reply");
+    }
+
+    struct FakeSplit {
+        overlay: bool,
+        answer: bool,
+        sent: std::sync::Mutex<Vec<(Option<Ipv4Addr>, Ipv4Addr)>>,
+    }
+
+    impl FakeSplit {
+        fn new(overlay: bool, answer: bool) -> Self {
+            Self {
+                overlay,
+                answer,
+                sent: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn sent(&self) -> Vec<(Option<Ipv4Addr>, Ipv4Addr)> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    impl super::SplitPath for FakeSplit {
+        fn overlay_route(&self, _server: Ipv4Addr) -> bool {
+            self.overlay
+        }
+
+        fn exchange(
+            &self,
+            source: Option<Ipv4Addr>,
+            server: Ipv4Addr,
+            query: &[u8],
+        ) -> Result<Vec<u8>, ForwardError> {
+            self.sent.lock().unwrap().push((source, server));
+            if !self.answer {
+                return Err(ForwardError);
+            }
+            let mut out = query.to_vec();
+            out[2] |= 0x80;
+            out.extend_from_slice(&[10, 88, 0, 20]);
+            Ok(out)
+        }
+    }
+
+    fn split_map(zones: &str) -> Netmap {
+        let text = format!(
+            r#"{{
+                "version": 1,
+                "self": {{"name": "a", "overlay_ip": "100.64.0.1", "owner": "lab"}},
+                "peers": [{{
+                    "name": "router",
+                    "overlay_ip": "100.64.0.2",
+                    "owner": "lab",
+                    "svid": "spiffe://orblx.local/node/router",
+                    "endpoints": ["172.30.18.12:443"],
+                    "routes": ["10.88.0.0/24"]
+                }}],
+                "split_dns": [{zones}]
+            }}"#
+        );
+        Netmap::from_slice(text.as_bytes()).unwrap()
+    }
+
+    const CORP: &str = r#"{"domain": "corp.lan", "nameservers": ["10.99.0.53", "10.88.0.53"]}"#;
+
+    fn ask(
+        table: &DnsTable,
+        name: &str,
+        split: &FakeSplit,
+        forwarder: &CountingForward,
+    ) -> Vec<u8> {
+        super::respond_with(table, &AllowPeers, &encode_query(name), forwarder, split)
+    }
+
+    #[test]
+    fn a_split_name_goes_to_the_routed_nameserver_over_the_overlay() {
+        let table = DnsTable::from_netmap(&split_map(CORP));
+        let split = FakeSplit::new(true, true);
+        let forwarder = CountingForward::new();
+        let (sent_before, _) = super::split_dns_counters();
+        for name in ["db.corp.lan", "DB.Corp.Lan.", "corp.lan", "a.b.corp.lan"] {
+            let response = ask(&table, name, &split, &forwarder);
+            assert!(response.ends_with(&[10, 88, 0, 20]), "{name}");
+        }
+        // 10.99.0.53 has no netmap route. Only 10.88.0.53 gets the queries.
+        let sent = split.sent();
+        assert_eq!(sent.len(), 4);
+        assert!(sent.iter().all(|item| *item
+            == (
+                Some(Ipv4Addr::new(100, 64, 0, 1)),
+                Ipv4Addr::new(10, 88, 0, 53)
+            )));
+        assert_eq!(forwarder.calls(), 0);
+        assert!(super::split_dns_counters().0 >= sent_before + 4);
+    }
+
+    #[test]
+    fn a_split_name_without_an_overlay_route_is_refused_and_not_forwarded() {
+        let table = DnsTable::from_netmap(&split_map(CORP));
+        let split = FakeSplit::new(false, true);
+        let forwarder = CountingForward::new();
+        let (_, refused_before) = super::split_dns_counters();
+        let response = ask(&table, "db.corp.lan", &split, &forwarder);
+        assert_eq!(rcode(&response), 5);
+        assert!(split.sent().is_empty());
+        assert_eq!(forwarder.calls(), 0);
+        assert!(super::split_dns_counters().1 > refused_before);
+    }
+
+    #[test]
+    fn a_nameserver_outside_every_netmap_route_is_refused() {
+        let zone = r#"{"domain": "other.lan", "nameservers": ["10.99.0.53"]}"#;
+        let table = DnsTable::from_netmap(&split_map(zone));
+        let split = FakeSplit::new(true, true);
+        let forwarder = CountingForward::new();
+        let response = ask(&table, "db.other.lan", &split, &forwarder);
+        assert_eq!(rcode(&response), 5);
+        assert!(split.sent().is_empty());
+        assert_eq!(forwarder.calls(), 0);
+    }
+
+    #[test]
+    fn a_silent_split_nameserver_is_servfail_and_not_forwarded() {
+        let table = DnsTable::from_netmap(&split_map(CORP));
+        let split = FakeSplit::new(true, false);
+        let forwarder = CountingForward::new();
+        let response = ask(&table, "db.corp.lan", &split, &forwarder);
+        assert_eq!(rcode(&response), 2);
+        assert_eq!(split.sent().len(), 1);
+        assert_eq!(forwarder.calls(), 0);
+    }
+
+    #[test]
+    fn names_outside_the_split_zones_keep_the_w18_behavior() {
+        let table = DnsTable::from_netmap(&split_map(CORP));
+        let split = FakeSplit::new(true, true);
+        let forwarder = CountingForward::new();
+        let router = ask(&table, "router.lab.orblx", &split, &forwarder);
+        assert_eq!(first_a(&router), Some(Ipv4Addr::new(100, 64, 0, 2)));
+        let missing = ask(&table, "db.corp.lan.orblx", &split, &forwarder);
+        assert_eq!(rcode(&missing), 3);
+        for name in ["notcorp.lan", "example.test", "lan"] {
+            let response = ask(&table, name, &split, &forwarder);
+            assert!(
+                response.windows(4).any(|bytes| bytes == [203, 0, 113, 10]),
+                "{name}"
+            );
+        }
+        assert_eq!(forwarder.calls(), 3);
+        assert!(split.sent().is_empty());
+    }
+
+    #[test]
+    fn a_removed_split_zone_goes_back_to_the_forwarder() {
+        let split = FakeSplit::new(true, true);
+        let forwarder = CountingForward::new();
+        let table = DnsTable::from_netmap(&lab_map("100.64.0.2"));
+        let response = ask(&table, "db.corp.lan", &split, &forwarder);
+        assert!(response.windows(4).any(|bytes| bytes == [203, 0, 113, 10]));
+        assert_eq!(forwarder.calls(), 1);
+        assert!(split.sent().is_empty());
+    }
+
+    #[test]
+    fn the_longest_split_domain_wins() {
+        let zones =
+            format!(r#"{CORP}, {{"domain": "db.corp.lan", "nameservers": ["10.99.0.54"]}}"#);
+        let table = DnsTable::from_netmap(&split_map(&zones));
+        let split = FakeSplit::new(true, true);
+        let forwarder = CountingForward::new();
+        let response = ask(&table, "x.db.corp.lan", &split, &forwarder);
+        assert_eq!(rcode(&response), 5);
+        let response = ask(&table, "web.corp.lan", &split, &forwarder);
+        assert_eq!(rcode(&response), 0);
+    }
+
+    #[test]
+    fn split_zones_add_routing_domains() {
+        let table = DnsTable::from_netmap(&split_map(CORP));
+        let domains = table.split_routing_domains();
+        assert_eq!(domains, vec!["~corp.lan".to_string()]);
+        let args = domain_args("orblx0", &domains, false);
+        assert_eq!(args, vec!["domain", "orblx0", "~orblx", "~corp.lan"]);
+        let text = macos_resolver_text(Ipv4Addr::new(100, 64, 0, 1), &domains);
+        assert_eq!(text, "nameserver 100.64.0.1\n");
+    }
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn the_longest_kernel_route_picks_the_device() {
+        let text =
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+            eth0\t00000000\t011E1EAC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
+            eth0\t00121EAC\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n\
+            orblx0\t0000580A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n\
+            orblx0\t0000400A\t00000000\t0000\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+        assert_eq!(
+            super::best_route_device(text, Ipv4Addr::new(10, 88, 0, 53)).as_deref(),
+            Some("orblx0")
+        );
+        assert_eq!(
+            super::best_route_device(text, Ipv4Addr::new(10, 99, 0, 53)).as_deref(),
+            Some("eth0")
+        );
+        // A route without the up flag does not count.
+        assert_eq!(
+            super::best_route_device(text, Ipv4Addr::new(10, 64, 0, 5)).as_deref(),
+            Some("eth0")
+        );
+        assert_eq!(
+            super::best_route_device("Iface\n", Ipv4Addr::new(10, 88, 0, 53)),
+            None
+        );
     }
 }

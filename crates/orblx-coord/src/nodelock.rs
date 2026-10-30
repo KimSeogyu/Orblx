@@ -605,6 +605,7 @@ mod tests {
                 signed(&k2, "c", "100.64.0.3"),
             ],
             lock: Vec::new(),
+            split_dns: Vec::new(),
         };
         let untouched = netmap.clone();
         let mut plain = netmap.clone();

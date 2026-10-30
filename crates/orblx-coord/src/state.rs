@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use orblx_audit::{ConfigAction, ConfigEvent, ConfigLog, ConfigRecord, EMPTY_DIGEST};
-use orblx_datapath::{Netmap, NetmapPeer, NetmapSelf};
+use orblx_datapath::{Netmap, NetmapPeer, NetmapSelf, SplitDns};
 use orblx_identity::{
     google_client_id_ok, DenySet, GoogleJwks, IssueGate, IssuedSvid, MiniCa, OidcIssuer, OidcJwks,
     Policy, SpiffeId, MAX_USER_TTL,
@@ -906,6 +906,12 @@ impl Coordinator {
         Ok(inner.policy.is_owner(id))
     }
 
+    /// Return the policy file path.
+    pub fn policy_file(&self) -> Result<PathBuf, CoordError> {
+        let inner = self.lock()?;
+        Ok(inner.policy_path.clone())
+    }
+
     /// Return the state directory.
     pub fn state_dir(&self) -> Result<PathBuf, CoordError> {
         let inner = self.lock()?;
@@ -1486,6 +1492,7 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
         },
         peers,
         lock: lock_store.updates.clone(),
+        split_dns: published_split_dns(&inner.policy, self_visible),
     };
     let signed_netmap = inner.netmap_key.sign_netmap(&payload)?;
     let receiver = SpiffeId::node(&self_node.name)?;
@@ -1508,6 +1515,23 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
         advertised_routes: self_node.routes.clone(),
         exit_approved,
     })
+}
+
+/// Copy the policy `splitDns` zones into the netmap (W24-F).
+///
+/// A node that waits for approval gets no zone.
+fn published_split_dns(policy: &Policy, self_visible: bool) -> Vec<SplitDns> {
+    if !self_visible {
+        return Vec::new();
+    }
+    policy
+        .split_dns()
+        .iter()
+        .map(|zone| SplitDns {
+            domain: zone.domain.clone(),
+            nameservers: zone.nameservers.iter().map(ToString::to_string).collect(),
+        })
+        .collect()
 }
 
 fn published_exit(policy: &Policy, svid: &str, offered: bool) -> bool {

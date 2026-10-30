@@ -26,6 +26,9 @@ const MAX_POLICY_BYTES: usize = 256 * 1024;
 const MAX_GRANTS: usize = 4096;
 const MAX_TEST_PORTS: usize = 128;
 
+const MAX_SPLIT_ZONES: usize = 32;
+const MAX_SPLIT_SERVERS: usize = 4;
+
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 
@@ -50,6 +53,17 @@ impl std::fmt::Display for PolicyError {
 }
 
 impl std::error::Error for PolicyError {}
+
+/// One split DNS zone from the policy field `splitDns` (W24-F).
+///
+/// The coordinator copies each zone into the signed netmap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitDnsZone {
+    /// The DNS domain in lowercase, for example `corp.lan`.
+    pub domain: String,
+    /// The nameserver IPv4 addresses.
+    pub nameservers: Vec<Ipv4Addr>,
+}
 
 /// One allow or deny assertion from a loaded policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +254,7 @@ pub struct Policy {
     guests: BTreeSet<String>,
     /// Node shares (W25-1).
     shares: Vec<Share>,
+    split_dns: Vec<SplitDnsZone>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -272,6 +287,7 @@ impl std::fmt::Debug for Policy {
             .field("ssh", &self.ssh.len())
             .field("guests", &self.guests.len())
             .field("shares", &self.shares.len())
+            .field("split_dns", &self.split_dns.len())
             .finish()
     }
 }
@@ -293,6 +309,7 @@ impl Policy {
             ssh_tests: Vec::new(),
             guests: BTreeSet::new(),
             shares: Vec::new(),
+            split_dns: Vec::new(),
         }
     }
 
@@ -314,6 +331,14 @@ impl Policy {
     #[must_use]
     pub fn is_guest_owner(&self, owner: &str) -> bool {
         self.guests.contains(owner)
+    }
+
+    /// Return the split DNS zones from `splitDns` (W24-F).
+    ///
+    /// The zones are sorted by domain.
+    #[must_use]
+    pub fn split_dns(&self) -> &[SplitDnsZone] {
+        &self.split_dns
     }
 
     /// Return true when a new node waits for `orblx admin approve`.
@@ -599,6 +624,8 @@ struct PolicyFile {
     guests: Vec<String>,
     #[serde(default)]
     shares: Vec<ShareFile>,
+    #[serde(default, rename = "splitDns")]
+    split_dns: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -754,6 +781,7 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
     }
     let guests = compile_guests(&file.guests)?;
     let shares = compile_shares(&guests, &file.shares)?;
+    let split_dns = compile_split_dns(&file.split_dns)?;
     Ok(Policy {
         grants,
         tests,
@@ -765,7 +793,89 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
         ssh_tests,
         guests,
         shares,
+        split_dns,
     })
+}
+
+/// Check the `splitDns` field (W24-F).
+///
+/// A domain is lowercase DNS labels outside the `orblx` zone.
+/// A nameserver is a unicast IPv4 address outside 100.64.0.0/10 and 127.0.0.0/8.
+fn compile_split_dns(
+    zones: &BTreeMap<String, Vec<String>>,
+) -> Result<Vec<SplitDnsZone>, PolicyError> {
+    if zones.len() > MAX_SPLIT_ZONES {
+        return Err(PolicyError::new(format!(
+            "The policy has more than {MAX_SPLIT_ZONES} split DNS domains."
+        )));
+    }
+    let mut out = Vec::new();
+    for (domain, servers) in zones {
+        if !split_domain_ok(domain) {
+            return Err(PolicyError::new(format!(
+                "The split DNS domain {} is not valid.",
+                printable(domain)
+            )));
+        }
+        if servers.is_empty() || servers.len() > MAX_SPLIT_SERVERS {
+            return Err(PolicyError::new(format!(
+                "The split DNS domain {domain} needs 1 to {MAX_SPLIT_SERVERS} nameservers."
+            )));
+        }
+        let mut nameservers = Vec::new();
+        for text in servers {
+            let Some(ip) = split_nameserver(text) else {
+                return Err(PolicyError::new(format!(
+                    "The split DNS nameserver {} for {domain} is not valid.",
+                    printable(text)
+                )));
+            };
+            if !nameservers.contains(&ip) {
+                nameservers.push(ip);
+            }
+        }
+        out.push(SplitDnsZone {
+            domain: domain.clone(),
+            nameservers,
+        });
+    }
+    Ok(out)
+}
+
+fn printable(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_control())
+        .take(64)
+        .collect()
+}
+
+fn split_domain_ok(domain: &str) -> bool {
+    if domain.is_empty() || domain.len() > 253 || domain == "orblx" || domain.ends_with(".orblx") {
+        return false;
+    }
+    domain.split('.').all(|label| {
+        let bytes = label.as_bytes();
+        !bytes.is_empty()
+            && bytes.len() <= 63
+            && bytes[0] != b'-'
+            && bytes[bytes.len() - 1] != b'-'
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+    })
+}
+
+fn split_nameserver(text: &str) -> Option<Ipv4Addr> {
+    let ip: Ipv4Addr = text.parse().ok()?;
+    let octets = ip.octets();
+    let overlay = octets[0] == 100 && (octets[1] & 0xc0) == 64;
+    let usable = ip.to_string() == text
+        && !ip.is_unspecified()
+        && !ip.is_broadcast()
+        && !ip.is_multicast()
+        && !ip.is_loopback()
+        && !overlay;
+    usable.then_some(ip)
 }
 
 fn compile_exit_nodes(
@@ -1432,6 +1542,8 @@ fn strip_trailing_commas(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::{Policy, PROTO_TCP};
 
     const MAC: &str = "spiffe://orblx.local/node/mac";
@@ -1613,6 +1725,48 @@ mod tests {
         }"#;
         let err = Policy::from_hujson(text.as_bytes()).unwrap_err();
         assert!(err.to_string().contains("exit route"));
+    }
+
+    #[test]
+    fn split_dns_maps_a_domain_to_nameservers() {
+        let text = r#"{
+          // W24-F split DNS.
+          "splitDns": {
+            "corp.lan": ["10.88.0.53", "10.88.0.53", "10.88.0.54"],
+            "db.example": ["192.168.50.53"]
+          }
+        }"#;
+        let policy = Policy::from_hujson(text.as_bytes()).unwrap();
+        let zones = policy.split_dns();
+        assert_eq!(zones.len(), 2);
+        assert_eq!(zones[0].domain, "corp.lan");
+        assert_eq!(
+            zones[0].nameservers,
+            vec![Ipv4Addr::new(10, 88, 0, 53), Ipv4Addr::new(10, 88, 0, 54)]
+        );
+        assert_eq!(zones[1].domain, "db.example");
+        assert!(Policy::empty().split_dns().is_empty());
+    }
+
+    #[test]
+    fn a_bad_split_dns_entry_is_rejected() {
+        for body in [
+            r#""lab.orblx": ["10.88.0.53"]"#,
+            r#""orblx": ["10.88.0.53"]"#,
+            r#""Corp.lan": ["10.88.0.53"]"#,
+            r#""-corp.lan": ["10.88.0.53"]"#,
+            r#""corp..lan": ["10.88.0.53"]"#,
+            r#""corp.lan": []"#,
+            r#""corp.lan": ["100.64.0.9"]"#,
+            r#""corp.lan": ["127.0.0.53"]"#,
+            r#""corp.lan": ["10.88.0.053"]"#,
+            r#""corp.lan": ["224.0.0.1"]"#,
+            r#""corp.lan": ["1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9"]"#,
+        ] {
+            let text = format!("{{\"splitDns\": {{{body}}}}}");
+            let err = Policy::from_hujson(text.as_bytes()).unwrap_err();
+            assert!(err.to_string().contains("split DNS"), "{body}: {err}");
+        }
     }
 
     #[test]

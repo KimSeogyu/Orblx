@@ -1,0 +1,41 @@
+{
+  // W24-F split DNS proof.
+  // The router may publish 10.88.24.0/24.
+  // corp.lan names go to 10.88.24.53 behind the router.
+  "groups": {
+    "group:humans": [
+      "spiffe://orblx.local/node/a",
+      "spiffe://orblx.local/node/c",
+    ],
+  },
+  "tags": {
+    "tag:router": ["spiffe://orblx.local/node/router"],
+  },
+  "tagOwners": {
+    "tag:router": ["group:humans"],
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["group:humans"],
+      "proto": "tcp",
+      "dst": ["tag:router:80"],
+    },
+  ],
+  "autoApprovers": {
+    "routes": {
+      "10.88.24.0/24": ["tag:router"],
+    },
+  },
+  "splitDns": {
+    "corp.lan": ["10.88.24.53"],
+  },
+  "tests": [
+    {
+      "src": "spiffe://orblx.local/node/a",
+      "proto": "tcp",
+      "accept": ["tag:router:80"],
+      "deny": ["spiffe://orblx.local/node/router:22"],
+    },
+  ],
+}

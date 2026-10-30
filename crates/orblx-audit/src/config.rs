@@ -80,6 +80,14 @@ pub enum ConfigAction {
     FileReceive,
     /// A node refused a file or the file failed its checks (W23-3).
     FileDeny,
+    /// An owner created a scoped admin API token (W25-3).
+    TokenCreate,
+    /// The admin API accepted one call with an API token (W25-3).
+    TokenUse,
+    /// The admin API refused one call with an API token (W25-3).
+    TokenDeny,
+    /// An owner revoked an admin API token (W25-3).
+    TokenRevoke,
     /// The policy shared one node with a guest (W25-1). One record for each share.
     Share,
     /// The policy removed one share (W25-1). One record for each share.
@@ -88,7 +96,7 @@ pub enum ConfigAction {
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 31] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -114,6 +122,10 @@ impl ConfigAction {
         Self::LockRemove,
         Self::FileReceive,
         Self::FileDeny,
+        Self::TokenCreate,
+        Self::TokenUse,
+        Self::TokenDeny,
+        Self::TokenRevoke,
         Self::Share,
         Self::Unshare,
     ];
@@ -147,6 +159,10 @@ impl ConfigAction {
             Self::LockRemove => "lock-remove",
             Self::FileReceive => "file-receive",
             Self::FileDeny => "file-deny",
+            Self::TokenCreate => "token-create",
+            Self::TokenUse => "token-use",
+            Self::TokenDeny => "token-deny",
+            Self::TokenRevoke => "token-revoke",
             Self::Share => "share",
             Self::Unshare => "unshare",
         }
@@ -187,9 +203,12 @@ impl ConfigAction {
             Self::LockRemove => 23,
             Self::FileReceive => 24,
             Self::FileDeny => 25,
-            // Code 26 is kept for the W24-A packet-deny action.
-            Self::Share => 27,
-            Self::Unshare => 28,
+            Self::TokenCreate => 26,
+            Self::TokenUse => 27,
+            Self::TokenDeny => 28,
+            Self::TokenRevoke => 29,
+            Self::Share => 30,
+            Self::Unshare => 31,
         }
     }
 
