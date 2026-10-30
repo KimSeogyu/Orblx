@@ -1,0 +1,13 @@
+{
+  // Node sharing proof (W25-1b) without an `acls` list.
+  // Without `acls`, the nodes of one tenant reach each other on all ports (old behavior).
+  // A shared peer of another tenant still gets only the share ports.
+  // owner, a, and b are the nodes of the owner. g and g2 are the nodes of guest user bob.
+  // The owner shares TCP 8080 on node b with bob. Node b also serves TCP 9090. That port is not shared.
+  "owners": ["spiffe://orblx.local/node/owner"],
+  "guests": ["oidc:bob"],
+  "shares": [
+    // SHARE-B
+    {"dst": "spiffe://orblx.local/node/b:8080", "proto": "tcp", "with": ["oidc:bob"]},
+  ],
+}

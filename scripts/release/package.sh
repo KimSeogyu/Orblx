@@ -5,6 +5,8 @@
 # The top directory in the tarball is orblx-VERSION-TARGET.
 # The script does not sign. The release job writes SHA256SUMS and signs it.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../proof/pipe-lib.sh"
 
 if [[ "$#" -ne 4 ]]; then
   echo "Usage: $0 VERSION TARGET BIN OUT_DIR" >&2
@@ -41,7 +43,7 @@ install -m 0644 "$root/LICENSE" "$root/NOTICE" "$root/README.md" "$stage/$name/"
 install -m 0644 "$root/scripts/orblxd.service" "$root/scripts/dev.orblx.plist" "$stage/$name/"
 # A fixed order, owner, and time make the tarball the same for the same input.
 tar_flags=(--owner=0 --group=0 --numeric-owner --sort=name --mtime=@0)
-if ! tar --version 2>/dev/null | grep -q 'GNU tar'; then
+if ! tar --version 2>/dev/null | read_all grep -q 'GNU tar'; then
   tar_flags=(--uid 0 --gid 0)
 fi
 tar -C "$stage" "${tar_flags[@]}" -czf "$out_dir/orblx-${target}.tar.gz" "$name"

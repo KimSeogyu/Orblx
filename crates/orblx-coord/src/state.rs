@@ -1573,6 +1573,7 @@ fn filtered_grants(
             reach: Vec::new(),
             filter: inner.policy.acl_set(),
             subnets: Vec::new(),
+            guarded: Vec::new(),
         };
     }
     let nodes = inner.store.nodes();
@@ -1605,6 +1606,8 @@ fn filtered_grants(
     grants.grants.retain(|grant| !hidden.contains(&grant.src));
     grants.subnets.retain(|grant| !hidden.contains(&grant.src));
     grants.reach.retain(|dst| !hidden.contains(dst));
+    // A peer in another tenant gets only the grants of a share, also without an `acls` list (W25-1b).
+    grants.guarded = other.difference(&hidden).cloned().collect();
     grants
 }
 

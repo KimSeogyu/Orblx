@@ -3,7 +3,9 @@
 # Source this file. Then call: proof_lock_take LABEL [OWN_NAME_PREFIX ...]
 # Every proof that runs the RTT or throughput gates takes one lock for the whole host,
 # so that these proofs run one at a time. The lock waits. It does not fail.
-# While it waits, it prints the holder every ORBLX_PROOF_LOCK_NOTE_SECS seconds (default 30).
+# W25-14: the waiters take the lock in arrival order (a ticket queue next to the lock file).
+# While it waits, it prints the wait time in s, the queue position, and the holder at once and
+# then every ORBLX_PROOF_LOCK_NOTE_SECS seconds (default 30).
 # At the start and at the end, it prints a proof_context line: the host load average and the
 # number of other running orblx containers. A sampler counts them every ORBLX_PROOF_SAMPLE_SECS
 # seconds (default 2) during the run, and the end line gives the maximum.
@@ -23,6 +25,7 @@ PROOF_LOCK_LABEL=""
 PROOF_LOCK_OWN=()
 PROOF_LOCK_SAMPLER=""
 PROOF_LOCK_SAMPLES=""
+PROOF_LOCK_TICKET=""
 
 proof_lock_file() {
   if [[ -n "${ORBLX_PROOF_LOCK:-}" ]]; then
@@ -116,6 +119,72 @@ proof_lock_sample_loop() {
   done
 }
 
+# W25-14: first come, first served. Each waiter writes a ticket file in "${file}.queue".
+# Only the waiter with the oldest live ticket tries flock. A ticket is live while its pid runs.
+# While it waits, the waiter prints "waiting for lock, N s, position P, holder X"
+# every NOTE seconds. A proof from an older checkout without the queue can still take the
+# lock between two waiters; the queue then continues after it.
+proof_lock_queue_first() {
+  local dir="$1" t pid
+  for t in $(ls "$dir" 2>/dev/null | LC_ALL=C sort); do
+    pid="${t##*-}"
+    if [[ -d "/proc/${pid}" ]] || kill -0 "$pid" 2>/dev/null; then
+      printf '%s\n' "$t"
+      return 0
+    fi
+    rm -f "${dir}/${t}" 2>/dev/null || true
+  done
+  return 1
+}
+
+proof_lock_queue_position() {
+  local dir="$1" t pid n=0
+  for t in $(ls "$dir" 2>/dev/null | LC_ALL=C sort); do
+    pid="${t##*-}"
+    if [[ -d "/proc/${pid}" ]] || kill -0 "$pid" 2>/dev/null; then
+      n=$((n + 1))
+    fi
+    if [[ "$t" == "$PROOF_LOCK_TICKET" ]]; then
+      break
+    fi
+  done
+  printf '%s\n' "$n"
+}
+
+proof_lock_queue_wait() {
+  local file="$1" note="$2" from="$3" dir first next_note
+  dir="${file}.queue"
+  if [[ ! -d "$dir" ]]; then
+    (umask 000 && mkdir -p "$dir") 2>/dev/null || true
+    chmod 1777 "$dir" 2>/dev/null || true
+  fi
+  PROOF_LOCK_TICKET="$(date +%s%N)-$$"
+  printf 'label=%s\n' "$PROOF_LOCK_LABEL" >"${dir}/${PROOF_LOCK_TICKET}" 2>/dev/null || PROOF_LOCK_TICKET=""
+  next_note=0
+  while :; do
+    first="$(proof_lock_queue_first "$dir" || true)"
+    if [[ -z "$PROOF_LOCK_TICKET" || "$first" == "$PROOF_LOCK_TICKET" ]] && flock -w 1 "$PROOF_LOCK_FD"; then
+      break
+    fi
+    if [[ -z "$PROOF_LOCK_TICKET" || "$first" != "$PROOF_LOCK_TICKET" ]]; then
+      sleep 1
+    fi
+    local waited=$(( ($(proof_lock_ms) - from) / 1000 ))
+    if (( waited >= next_note )); then
+      echo "proof_lock ${PROOF_LOCK_LABEL} waiting for lock, ${waited} s, position $(proof_lock_queue_position "$dir"), at $(proof_lock_now), file ${file}, holder: $(proof_lock_holder "$file")"
+      next_note=$(( waited + note ))
+    fi
+  done
+  proof_lock_queue_leave
+}
+
+proof_lock_queue_leave() {
+  if [[ -n "$PROOF_LOCK_TICKET" ]]; then
+    rm -f "$(proof_lock_file).queue/${PROOF_LOCK_TICKET}" 2>/dev/null || true
+    PROOF_LOCK_TICKET=""
+  fi
+}
+
 proof_lock_take() {
   PROOF_LOCK_LABEL="$1"
   shift
@@ -135,12 +204,7 @@ proof_lock_take() {
     fi
     eval "exec ${PROOF_LOCK_FD}>>\"\$file\""
     waited_from="$(proof_lock_ms)"
-    if ! flock -n "$PROOF_LOCK_FD"; then
-      echo "proof_lock ${PROOF_LOCK_LABEL} waiting at $(proof_lock_now), file ${file}, holder: $(proof_lock_holder "$file")"
-      until flock -w "$note" "$PROOF_LOCK_FD"; do
-        echo "proof_lock ${PROOF_LOCK_LABEL} still waiting at $(proof_lock_now), holder: $(proof_lock_holder "$file")"
-      done
-    fi
+    proof_lock_queue_wait "$file" "$note" "$waited_from"
     PROOF_LOCK_OWNER=1
     export ORBLX_PROOF_LOCK_HELD="$$"
     {
@@ -170,6 +234,7 @@ proof_lock_take() {
 # Call in the EXIT trap. It prints the end context and the sampler maximum, then releases the lock.
 proof_lock_end() {
   [[ -n "$PROOF_LOCK_LABEL" ]] || return 0
+  proof_lock_queue_leave
   if [[ -n "$PROOF_LOCK_SAMPLER" ]]; then
     kill "$PROOF_LOCK_SAMPLER" 2>/dev/null || true
     PROOF_LOCK_SAMPLER=""

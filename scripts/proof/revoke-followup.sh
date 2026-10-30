@@ -14,6 +14,8 @@
 # The script deletes the orblx-w25a-revoke-followup volumes at the start.
 # The script does not print enroll tokens, private keys, or SVID material.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -60,7 +62,11 @@ cleanup() {
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "revoke-followup"
 
 now_ms() {
   date +%s%3N
@@ -68,9 +74,9 @@ now_ms() {
 
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -109,7 +115,7 @@ wait_log() {
   local needle="$2"
   local i
   for i in $(seq 1 60); do
-    if dc logs "$service" 2>&1 | grep -q "$needle"; then
+    if dc logs "$service" 2>&1 | read_all grep -q "$needle"; then
       return 0
     fi
     sleep 1
@@ -124,7 +130,7 @@ wait_path() {
   local i
   for i in $(seq 1 60); do
     if dc exec -T "$from" orblx status --state-dir "$STATE" 2>/dev/null \
-      | grep -q "^peer ${to} .* path direct "; then
+      | read_all grep -q "^peer ${to} .* path direct "; then
       echo "path ${from} ${to} direct"
       return 0
     fi
@@ -176,7 +182,7 @@ ssh_cmd() {
 coord_ticks() {
   dc exec -T coord sh -c '
     for p in /proc/[0-9]*; do
-      if tr "\0" " " <"$p/cmdline" 2>/dev/null | grep -q "orblx coord serve"; then
+      if tr "\0" " " <"$p/cmdline" 2>/dev/null | read_all grep -q "orblx coord serve"; then
         sed "s/.*) //" "$p/stat" | awk "{print \$12 + \$13}"
         exit 0
       fi
@@ -216,7 +222,7 @@ for name in owner a b c; do
 done
 
 coord_ip="$(dc run --rm --no-deps --entrypoint getent owner ahostsv4 coord \
-  | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}')"
+  | read_all awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}')"
 if [[ -z "$coord_ip" ]]; then
   echo "The coordinator address did not resolve." >&2
   exit 1
@@ -291,7 +297,7 @@ revoke_out="$(owner revoke-all a)"
 printf '%s\n' "$revoke_out"
 revoke_start="$(printf '%s\n' "$revoke_out" | field revoke_start_ms)"
 revoke_done="$(printf '%s\n' "$revoke_out" | field revoke_done_ms)"
-printf '%s\n' "$revoke_out" | grep -qx 'revoked_all spiffe://orblx.local/node/a'
+printf '%s\n' "$revoke_out" | read_all grep -qx 'revoked_all spiffe://orblx.local/node/a'
 sleep 3
 
 results=()
@@ -350,8 +356,8 @@ echo "coord_records before_revoke ${records_before_revoke} before_undo ${records
 undo_out="$(owner revoke-undo a)"
 printf '%s\n' "$undo_out"
 undo_done="$(printf '%s\n' "$undo_out" | field revoke_done_ms)"
-printf '%s\n' "$undo_out" | grep -qx 'unrevoked spiffe://orblx.local/node/a'
-printf '%s\n' "$undo_out" | grep -qx 'svid_restored yes'
+printf '%s\n' "$undo_out" | read_all grep -qx 'unrevoked spiffe://orblx.local/node/a'
+printf '%s\n' "$undo_out" | read_all grep -qx 'svid_restored yes'
 restored=""
 for _ in $(seq 1 150); do
   if dc exec -T a sh -c "timeout 5 $(ssh_cmd) --command 'echo ssh_ok'" >"$WORK/ssh-restore.txt" 2>&1 \
