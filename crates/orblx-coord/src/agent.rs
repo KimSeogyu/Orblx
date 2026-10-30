@@ -746,6 +746,60 @@ mod tests {
     }
 
     #[test]
+    fn revoke_undo_restores_the_svid_with_one_record() {
+        let dir = scratch();
+        let now = SystemTime::now();
+        let coord = Coordinator::open(&dir.0, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        for name in ["a", "b", "c"] {
+            let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+            coord
+                .enroll_token(name, &token.secret, &[format!("{name}:443")], &[], now)
+                .unwrap();
+        }
+        let owner = SpiffeId::node("owner").unwrap();
+        let (a1, a1_nonce) = issue_for(&coord, "a", &owner, now);
+        // Undo needs a deny entry.
+        assert!(crate::revoke_undo(&coord, "a", owner.as_uri(), now).is_err());
+        crate::revoke_all(&coord, "a", owner.as_uri(), now).unwrap();
+        crate::revoke_all(&coord, "c", owner.as_uri(), now).unwrap();
+        let records_before = audit_actions(&coord).len();
+
+        let reply = crate::revoke_undo(&coord, "a", owner.as_uri(), now).unwrap();
+        assert_eq!(reply["principal"], "spiffe://orblx.local/node/a");
+        assert_eq!(reply["svid_restored"], true);
+        assert_eq!(reply["deny_version"], 3);
+
+        // The SVID of a is allowed again. The other entry and the grant nonce stay.
+        let deny = crate::deny_set(&coord, now).unwrap();
+        assert!(deny.reject_uri(&SpiffeId::node("a").unwrap()).is_ok());
+        assert!(deny.reject_uri(&SpiffeId::node("c").unwrap()).is_err());
+        let text = crate::deny_json(&coord, now).unwrap();
+        assert!(text.contains(&a1_nonce));
+        let listed = list(&coord, now).unwrap();
+        let grant = listed["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|grant| grant["id"] == a1.as_str())
+            .unwrap();
+        assert_eq!(grant["state"], "revoked");
+
+        // Exactly one audit record for the undo.
+        let records = audit_actions(&coord);
+        assert_eq!(records.len(), records_before + 1);
+        let last = records.last().unwrap();
+        assert_eq!(last["action"], "unrevoke");
+        assert_eq!(last["target"], "spiffe://orblx.local/node/a");
+        let detail = last["detail"].as_str().unwrap();
+        assert!(detail.contains("svid restored deny_version 3"), "{detail}");
+
+        // A second undo has no entry to remove and writes no record.
+        assert!(crate::revoke_undo(&coord, "a", owner.as_uri(), now).is_err());
+        assert_eq!(audit_actions(&coord).len(), records_before + 1);
+    }
+
+    #[test]
     fn revoke_all_refuses_bad_principals() {
         let dir = scratch();
         let now = SystemTime::now();

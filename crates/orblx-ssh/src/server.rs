@@ -309,7 +309,13 @@ impl Handler for SshHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         let command = String::from_utf8_lossy(data).into_owned();
-        let outcome = self.exec_command(&command);
+        // The command blocks until it ends (up to its time limit).
+        // Run it on a blocking thread, so that other sessions on this runtime continue.
+        let worker = self.clone();
+        let outcome = tokio::task::spawn_blocking(move || worker.exec_command(&command))
+            .await
+            .ok()
+            .flatten();
         if let Some((code, stdout)) = outcome {
             let _ = session.channel_success(channel);
             let _ = session.data(channel, Bytes::from(stdout));
@@ -386,7 +392,7 @@ impl SshHandler {
         }
     }
 
-    fn exec_command(&mut self, command: &str) -> Option<(u32, Vec<u8>)> {
+    fn exec_command(&self, command: &str) -> Option<(u32, Vec<u8>)> {
         let admitted = self.admitted.clone()?;
         if !command_ok(command) {
             self.audit_refuse(&RefusedLogin {
@@ -573,6 +579,7 @@ impl SshHandler {
     ) {
         let period = Duration::from_secs(admitted.check_period.max(1));
         let mut next_check = Instant::now() + period;
+        let mut watch = DenyWatch::new(&self.shared);
         let mut buf = [0u8; 4096];
         let mut eof = false;
         let mut exit: Option<(std::process::ExitStatus, Instant)> = None;
@@ -615,6 +622,9 @@ impl SshHandler {
                 if recheck(&self.shared, admitted).is_err() {
                     live.fail(orblx_audit::DenyReason::Revoked);
                 }
+            }
+            if watch.denied(&self.shared, admitted) {
+                live.fail(orblx_audit::DenyReason::Revoked);
             }
         }
         // A process that the shell left behind can keep the terminal open.
@@ -715,6 +725,52 @@ fn session_ids(admitted: &Admitted) -> SessionIds {
     SessionIds::receiver_acl(admitted.src.clone(), admitted.frame, admitted.ticket_hash)
 }
 
+/// The time between two reads of `deny.json` for an open session (W25-2).
+const DENY_WATCH: Duration = Duration::from_millis(100);
+
+/// Watch `deny.json` for a revoke of an open session (W25-2).
+///
+/// The full recheck runs at each checkPeriod. The watch reads only the deny file,
+/// each `DENY_WATCH`, and parses it only when the text changes. When the file
+/// denies the source or this node, the session stops. Thus a revoke-all stops an
+/// open session within one node deny fetch plus one watch period.
+struct DenyWatch {
+    path: PathBuf,
+    next: Instant,
+    last: Option<Vec<u8>>,
+}
+
+impl DenyWatch {
+    fn new(shared: &Shared) -> Self {
+        Self {
+            path: shared.state_dir.join("deny.json"),
+            next: Instant::now(),
+            last: None,
+        }
+    }
+
+    /// Return true when a new deny file text denies the session.
+    fn denied(&mut self, shared: &Shared, admitted: &Admitted) -> bool {
+        let now = Instant::now();
+        if now < self.next {
+            return false;
+        }
+        self.next = now + DENY_WATCH;
+        let Ok(bytes) = fs::read(&self.path) else {
+            return false;
+        };
+        if self.last.as_deref() == Some(bytes.as_slice()) {
+            return false;
+        }
+        let mut deny = DenySet::empty();
+        let parsed = deny.apply_json(&bytes).is_ok();
+        self.last = Some(bytes);
+        parsed
+            && (deny.reject_uri(&admitted.src).is_err()
+                || deny.reject_uri(&shared.node_id).is_err())
+    }
+}
+
 fn recheck(shared: &Shared, admitted: &Admitted) -> Result<(), RefusedLogin> {
     let policy = load_policy(&shared.state_dir.join("policy.hujson"));
     let deny = load_deny(&shared.state_dir.join("deny.json"));
@@ -783,6 +839,7 @@ fn run_command(
     });
     let mut stdout = Vec::new();
     let mut checked = false;
+    let mut watch = DenyWatch::new(shared);
     let fail = |child: &mut std::process::Child, reason| {
         let _ = child.kill();
         let _ = child.wait();
@@ -797,6 +854,9 @@ fn run_command(
             if recheck(shared, admitted).is_err() {
                 return fail(&mut child, orblx_audit::DenyReason::Revoked);
             }
+        }
+        if watch.denied(shared, admitted) {
+            return fail(&mut child, orblx_audit::DenyReason::Revoked);
         }
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -1247,6 +1307,37 @@ mod tests {
             r#"{{"version":3,"generated_at":3,"revoked_uris":["{}"],"revoked_ticket_nonces":[]}}"#,
             alice.as_uri()
         );
+        // W25-2: an open session stops soon after the deny file denies the source.
+        // The server runs the command on a runtime thread, so a plain thread writes the file.
+        let deny_path = dir.join("deny.json");
+        let deny_text = document.clone();
+        let opened = std::time::Instant::now();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            std::fs::write(deny_path, deny_text).unwrap();
+            std::time::Instant::now()
+        });
+        let open = session_within(SessionRequest {
+            user: "alice".to_string(),
+            addr,
+            dst: node.clone(),
+            identity_dir: alice_dir.clone(),
+            peer_cert: dir.join("peer.pem"),
+            command: "sleep 5; printf %s\\n late".to_string(),
+        })
+        .await;
+        let ended = std::time::Instant::now();
+        let denied_at = writer.join().unwrap();
+        assert!(
+            ended.duration_since(denied_at) < Duration::from_millis(1000),
+            "the open session ran {:?} after the deny",
+            ended.duration_since(denied_at)
+        );
+        assert!(ended.duration_since(opened) < Duration::from_millis(4000));
+        if let Ok(output) = &open {
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("late"));
+            assert_ne!(output.exit_status, 0);
+        }
         std::fs::write(dir.join("deny.json"), document).unwrap();
         let started = std::time::Instant::now();
         let revoked = session_within(SessionRequest {

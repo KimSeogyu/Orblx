@@ -71,6 +71,25 @@ pub fn deny_json_for(
     file.to_json()
 }
 
+/// Return the ETag of one deny list text (W25-2).
+///
+/// The ETag is the SHA-256 of the list with `generated_at` set to 0, in hex.
+/// A list with no file has the time of the call in `generated_at`, so the time is not in the ETag.
+pub fn deny_etag(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::from_str::<DenyFile>(text)
+        .ok()
+        .and_then(|mut file| {
+            file.generated_at = 0;
+            file.to_json().ok()
+        })
+        .unwrap_or_else(|| text.to_string());
+    Sha256::digest(canonical.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 pub fn deny_set(coord: &Coordinator, now: SystemTime) -> Result<DenySet, CoordError> {
     let text = deny_json(coord, now)?;
     let mut deny = DenySet::empty();
@@ -177,6 +196,46 @@ pub fn revoke_all(
         "grants": done.grants,
         "nonces": done.nonces,
         "deny_version": done.deny_version
+    }))
+}
+
+/// Undo the SVID deny of one principal (W25-2).
+///
+/// The call removes the principal URI from the deny file in one new deny version.
+/// It writes one `unrevoke` audit record. The grants that a revoke-all marked
+/// revoked stay revoked, and their ticket nonces stay denied. The owner issues
+/// new grants when the principal needs them again.
+pub fn revoke_undo(
+    coord: &Coordinator,
+    principal: &str,
+    actor: &str,
+    now: SystemTime,
+) -> Result<Value, CoordError> {
+    let id = principal_id(coord, principal)?;
+    let uri = id.as_uri().to_string();
+    let mut file = read_deny(coord, now)?;
+    if !file.revoked_uris.contains(&uri) {
+        return Err(CoordError::Protocol(
+            "The principal is not in the deny list.".to_string(),
+        ));
+    }
+    let before = deny_digest(coord)?;
+    file.revoked_uris.retain(|item| *item != uri);
+    file.version = file.version.saturating_add(1);
+    file.generated_at = unix_now(now)?;
+    let text = file.to_json()?;
+    write_text(&coord.state_dir()?.join(DENY_FILE), &text, 0o644)?;
+    let after = deny_digest(coord)?;
+    let detail = format!(
+        "principal {uri} scope all svid restored deny_version {}",
+        file.version
+    );
+    coord.record_change(actor, ConfigAction::Unrevoke, &uri, before, after, &detail)?;
+    Ok(json!({
+        "op": "revoke-undo",
+        "principal": uri,
+        "svid_restored": true,
+        "deny_version": file.version
     }))
 }
 
