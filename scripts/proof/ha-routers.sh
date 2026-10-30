@@ -47,6 +47,10 @@ dc() {
 }
 
 cleanup() {
+  if [[ "${ORBLX_HA_KEEP:-0}" == 1 ]]; then
+    echo "ORBLX_HA_KEEP=1: the proof keeps the containers and ${WORK}" >&2
+    return
+  fi
   dc --profile nodes --profile tool down -v --remove-orphans >/dev/null 2>&1 || true
   as_root rm -rf "$WORK" >/dev/null 2>&1 || rm -rf "$WORK" >/dev/null 2>&1 || true
 }
@@ -205,6 +209,11 @@ refresh_router_grants() {
   before="$(grant_reloads "$router")"
   fetch_netmap "$router"
   as_root cat "$WORK/enroll-${router}/grants.signed.json" > "$WORK/state-${router}/grants.next"
+  # The node logs a reload only for new bytes. Same bytes: nothing to load.
+  if cmp -s "$WORK/state-${router}/grants.next" "$WORK/state-${router}/grants.signed.json"; then
+    rm -f "$WORK/state-${router}/grants.next"
+    return 0
+  fi
   mv "$WORK/state-${router}/grants.next" "$WORK/state-${router}/grants.signed.json"
   for _ in $(seq 1 50); do
     [[ "$(grant_reloads "$router")" -gt "$before" ]] && return 0
@@ -263,7 +272,7 @@ POLICY_BOTH="$WORK/policy-both.json"
 POLICY_A="$WORK/policy-a.json"
 POLICY_NODNS="$WORK/policy-nodns.json"
 policy_variant "$POLICY_BOTH" "pass"
-policy_variant "$POLICY_A" "data['routeApprovals'][0]['src'] = ['spiffe://orblx.local/node/router-a']"
+policy_variant "$POLICY_A" "data['autoApprovers']['routes']['${CIDR}'] = ['spiffe://orblx.local/node/router-a']"
 policy_variant "$POLICY_NODNS" "data['acls'] = [a for a in data['acls'] if not any(d.endswith(':53') for d in a['dst'])]"
 chmod 755 "$WORK/policy"
 put_policy "$POLICY_A"

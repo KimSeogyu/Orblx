@@ -1,6 +1,6 @@
 {
   // W25-10 HA subnet routers proof.
-  // router-a and router-b may both publish 10.88.125.0/24 (routeApprovals).
+  // router-a and router-b may both publish 10.88.125.0/24.
   // Gate 1 starts with a copy of this file that approves only router-a.
   // The client may reach the target 10.88.125.5 on UDP 9000, TCP 8080, TCP 8090, and ICMP,
   // and the nameserver 10.88.125.53 on UDP 53. Gate 4 removes the UDP 53 rule.
@@ -34,15 +34,16 @@
       "dst": ["10.88.125.53/32:53"],
     },
   ],
-  "routeApprovals": [
-    {
-      "src": [
+  // autoApprovers (not routeApprovals): the router grants get the subnet rows for the
+  // /32 rules above only when the policy approves a prefix that contains them (W24-A).
+  "autoApprovers": {
+    "routes": {
+      "10.88.125.0/24": [
         "spiffe://orblx.local/node/router-a",
         "spiffe://orblx.local/node/router-b",
       ],
-      "routes": ["10.88.125.0/24"],
     },
-  ],
+  },
   "tests": [
     {
       "src": "spiffe://orblx.local/node/client",
