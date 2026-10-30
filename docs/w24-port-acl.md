@@ -53,13 +53,15 @@ The chain uses the hash chain of `orblx-audit`. It does not add a new crypto des
 
 `orblx admin revoke-all` (W24-D) adds the SVID of the principal to the coordinator deny list.
 
-| Step | Before | Now |
-|---|---|---|
-| `orblx up` fetches the deny list | each 500 ms after the end of the fetch | each 500 ms from the start of the fetch |
-| The datapath reads `deny.json` | each 10 s | each 50 ms. The node parses the file only when its bytes change. |
-| Live sessions of the revoked peer | stay open | The node ends them when the deny list changes. |
+W25-1 (#77) is on main. It gives the revoke path below. This change adds one check to it.
 
-The node lock allow list is still set again each 10 s (200 deny reads).
+| Step | Code |
+|---|---|
+| `orblx up` fetches the deny list | each 500 ms from the start of the fetch (W25-1) |
+| The datapath reads `deny.json` | each 100 ms. The node applies the file only when its bytes change, and closes the sessions of the denied peers (W25-1). |
+| A session that completes its handshake during the change | W24-A: `run_link` checks the deny list under the link lock before it adds the session, so the session does not stay open. |
+
+The node lock allow list is still set again each 10 s.
 
 ## Proof
 
