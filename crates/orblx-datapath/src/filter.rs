@@ -11,7 +11,7 @@
 //! and at most `AUDIT_PER_SECOND` records in one second.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -103,6 +103,8 @@ struct Rules {
     by_src: HashMap<String, Vec<(u8, u16, u16)>>,
     /// Source SPIFFE ID to (network, mask, protocol, first port, last port) for subnet routes.
     subnets: HashMap<String, Vec<SubnetRow>>,
+    /// Peers in another tenant (W25-1b). Their packets need a grant also when `filter` is off.
+    guarded: HashSet<String>,
 }
 
 /// One subnet allow row: (network, mask, protocol, first port, last port).
@@ -132,7 +134,12 @@ impl Rules {
                 grant.port_end,
             ));
         }
-        Self { by_src, subnets }
+        let guarded = grants.guarded.iter().cloned().collect();
+        Self {
+            by_src,
+            subnets,
+            guarded,
+        }
     }
 
     fn permits_subnet(&self, src: &str, proto: u8, dst: Ipv4Addr, port: u16) -> bool {
@@ -153,6 +160,11 @@ impl Rules {
             })
         })
     }
+}
+
+/// Return true when the grants turn on a check for at least one peer.
+fn checks_any(grants: &ReceiverGrants) -> bool {
+    grants.filter || !grants.guarded.is_empty()
 }
 
 fn prefix_mask(len: u8) -> u32 {
@@ -323,7 +335,10 @@ struct SampleGate {
 pub struct PacketFilter {
     id: u64,
     overlay: Ipv4Addr,
+    /// True when the filter checks the packets of some peers.
     active: AtomicBool,
+    /// True when the filter checks the packets of all peers (`grants.filter`).
+    strict: AtomicBool,
     rules: RwLock<Rules>,
     /// Subnet routes that this node forwards, as (network, mask).
     routes: RwLock<Vec<(u32, u32)>>,
@@ -348,7 +363,8 @@ impl std::fmt::Debug for PacketFilter {
 impl PacketFilter {
     /// Make a filter for the node with the overlay address `overlay`.
     ///
-    /// The filter drops packets only when `grants.filter` is true.
+    /// The filter drops packets only when `grants.filter` is true,
+    /// or from the peers in `grants.guarded`.
     /// With `audit_path`, a thread writes the sampled drops to that config audit chain.
     #[must_use]
     pub fn new(
@@ -361,7 +377,8 @@ impl PacketFilter {
         Arc::new(Self {
             id: NEXT_FILTER_ID.fetch_add(1, Ordering::Relaxed),
             overlay,
-            active: AtomicBool::new(grants.filter),
+            active: AtomicBool::new(checks_any(grants)),
+            strict: AtomicBool::new(grants.filter),
             rules: RwLock::new(Rules::from_grants(grants)),
             routes: RwLock::new(Vec::new()),
             flows: Mutex::new(FlowTable {
@@ -384,7 +401,8 @@ impl PacketFilter {
     /// Use new signed grants.
     pub fn replace(&self, grants: &ReceiverGrants) {
         *self.rules.write().unwrap_or_else(|err| err.into_inner()) = Rules::from_grants(grants);
-        self.active.store(grants.filter, Ordering::Relaxed);
+        self.strict.store(grants.filter, Ordering::Relaxed);
+        self.active.store(checks_any(grants), Ordering::Relaxed);
     }
 
     /// Set the subnet routes that this node forwards (W24-A).
@@ -412,6 +430,12 @@ impl PacketFilter {
     #[must_use]
     pub fn active(&self) -> bool {
         self.active.load(Ordering::Relaxed)
+    }
+
+    /// Return true when the filter checks the packets of all peers (the policy has `acls`).
+    #[must_use]
+    pub fn strict(&self) -> bool {
+        self.strict.load(Ordering::Relaxed)
     }
 
     /// Return the counters.
@@ -472,12 +496,17 @@ impl PacketFilter {
         if !self.active() {
             return true;
         }
+        if !self.strict.load(Ordering::Relaxed) && !self.guarded(src) {
+            return true;
+        }
         let Some(parsed) = parse(packet) else {
             self.deny(src, None, 0, 0);
             return false;
         };
         if parsed.dst != self.overlay {
-            if !self.covers(parsed.dst) || self.subnet_allowed(src, &parsed) {
+            // A share gives one node, not its routes. A guarded peer gets only subnet grants.
+            let open = !self.covers(parsed.dst) && !self.guarded(src);
+            if open || self.subnet_allowed(src, &parsed) {
                 return true;
             }
             self.deny(src, Some(&parsed), parsed.proto, parsed.dst_port);
@@ -488,6 +517,14 @@ impl PacketFilter {
         }
         self.deny(src, Some(&parsed), parsed.proto, parsed.dst_port);
         false
+    }
+
+    fn guarded(&self, src: &str) -> bool {
+        self.rules
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .guarded
+            .contains(src)
     }
 
     fn allowed(&self, src: &str, parsed: &Parsed) -> bool {
