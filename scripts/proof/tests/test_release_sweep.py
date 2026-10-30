@@ -84,7 +84,7 @@ class ReleaseSweepTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp)
 
-    def run_sweep(self, manifest, only=None, mode=None, plan=False):
+    def run_sweep(self, manifest, only=None, mode=None, plan=False, min_free_gb=None):
         path = os.path.join(self.tmp, "manifest.txt")
         with open(path, "w") as f:
             f.write(manifest)
@@ -95,11 +95,14 @@ class ReleaseSweepTest(unittest.TestCase):
             "ORBLX_SWEEP_MANIFEST": path,
             "ORBLX_PROOF_LOCK": os.path.join(self.tmp, "proof.lock"),
             "ORBLX_SWEEP_TIMEOUT": "60",
+            "ORBLX_SWEEP_MIN_FREE_GB": "0",
         })
         if only is not None:
             env["ORBLX_SWEEP_ONLY"] = only
         if mode is not None:
             env["ORBLX_SWEEP_LOCK_MODE"] = mode
+        if min_free_gb is not None:
+            env["ORBLX_SWEEP_MIN_FREE_GB"] = min_free_gb
         args = ["bash", SWEEP] + (["--plan"] if plan else []) + ["testsha"]
         return subprocess.run(args, env=env, capture_output=True, text=True)
 
@@ -221,6 +224,15 @@ class ReleaseSweepTest(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("steady_warn: 0 of 3 nat-realism runs have a steady_warn line (0.0%).", out.stdout)
         self.assertNotIn("steady_warn_rate over 1%", out.stdout)
+
+    def test_too_little_free_disk_stops_the_run_before_any_proof(self):
+        out = self.run_sweep(GOOD, min_free_gb="999999999")
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertRegex(out.stderr, r"disk FAIL: only \d+ GB free at .*; the sweep needs at least 999999999 GB free")
+        self.assertIn("never counts", out.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.out, "rc3-sweep-testsha-ok.log")))
+        self.assertEqual(self.run_sweep(GOOD, min_free_gb="lots").returncode, 2)
+        self.assertEqual(self.run_sweep(GOOD, min_free_gb="0").returncode, 0)
 
     def test_the_real_manifest_maps_every_shipped_row(self):
         with open(REAL_MANIFEST) as f:

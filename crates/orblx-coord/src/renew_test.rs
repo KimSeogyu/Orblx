@@ -2,13 +2,13 @@ use std::collections::HashSet;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_crypto::{mac_input, ticket_mac, TicketKey, TicketRing};
 use orblx_datapath::{
-    ipv4_packet, run_memory_node, AllowPeers, HelloEndpoint, MemoryDevice, Netmap, NodeRequest,
-    RenewedLeaf, SvidRenewer, NODE_STATUS_FILE,
+    ipv4_packet, run_memory_node, AllowPeers, HelloEndpoint, ListenEvent, MemoryDevice, Netmap,
+    NodeRequest, RenewedLeaf, SvidRenewer, NODE_STATUS_FILE,
 };
 use orblx_identity::{
     decode_certificate_pem, leaf_validity, sign_ticket, SpiffeId, TicketClaims, TicketFlags,
@@ -286,13 +286,40 @@ async fn session_stays_up_for_three_svid_lifetimes() {
     );
 }
 
-/// W25-6: a peer that enrolls after a node started becomes reachable in 2 s or less.
+/// The times of one late peer case (W25-6c).
 ///
-/// Node a runs with a netmap that has no peer. A sync loop does what `orblx up --coord`
-/// does: it waits with `policy-wait` and writes the new files. Then b enrolls and starts.
-/// Node a must add b from the new netmap file and dial b. No node restarts.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_peer_that_enrolls_later_is_reachable_in_two_seconds() {
+/// `listener` is the listener start event that node `b` logs itself.
+struct LatePeerTimes {
+    enroll_to_listener: Option<Duration>,
+    listener_to_first_packet: Option<Duration>,
+    enroll_to_first_packet: Option<Duration>,
+}
+
+/// The late peer gate: the first packet from `a` comes to `b` 2 s or less after `b` starts
+/// its UDP listener. The start is the listener start event of node `b`.
+fn late_peer_gate(times: &LatePeerTimes) -> Result<(), String> {
+    let limit = Duration::from_secs(2);
+    match times.listener_to_first_packet {
+        None => Err("no packet came from node a after the listener of b started".to_string()),
+        Some(took) if took > limit => Err(format!(
+            "the first packet came {} ms after the listener of b started (limit {} ms)",
+            took.as_millis(),
+            limit.as_millis()
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Node `a` runs first. Node `b` enrolls later, so `a` gets `b` from a new netmap.
+///
+/// `before_listen` delays the start of node `b` after its enrollment, before its listener starts.
+/// `after_listen` stops node `b` in its listener start hook, before it accepts or dials.
+/// Both are test-only. The node daemon has no delay.
+async fn late_peer_case(
+    tag: &str,
+    before_listen: Duration,
+    after_listen: Duration,
+) -> LatePeerTimes {
     let scratch = Scratch::new("late");
     let node_a = Scratch::new("late-a");
     let node_b = Scratch::new("late-b");
@@ -332,7 +359,6 @@ async fn a_peer_that_enrolls_later_is_reachable_in_two_seconds() {
     .unwrap();
     let ring = TicketRing::single(ticket_key, &[8; 32]).unwrap();
     let config_a = leaf_config(&enrolled_a, &trust, &signer, &mac_key, &ring, now);
-
     let (stop_tx, stop_a) = watch::channel(false);
     let stop_b = stop_a.clone();
     let (a_in_tx, a_in_rx) = mpsc::channel(64);
@@ -396,22 +422,35 @@ async fn a_peer_that_enrolls_later_is_reachable_in_two_seconds() {
     enrolled_b.write_state(&node_b.0).unwrap();
     let map_b = Netmap::from_path(&node_b.0.join("netmap.json")).unwrap();
     let config_b = leaf_config(&enrolled_b, &trust, &signer, &mac_key, &ring, now);
+    if !before_listen.is_zero() {
+        tokio::time::sleep(before_listen).await;
+    }
+    let listened = Arc::new(Mutex::new(None::<ListenEvent>));
+    let mut request_b = node_request(
+        config_b,
+        map_b,
+        port_b,
+        node_b.0.clone(),
+        renewer(addr, bundle.clone(), node_b.0.clone()),
+        stop_b,
+    );
+    let hook = Arc::clone(&listened);
+    request_b.on_listen = Some(Box::new(move |event| {
+        *hook.lock().unwrap() = Some(event);
+        if !after_listen.is_zero() {
+            std::thread::sleep(after_listen);
+        }
+    }));
     let task_b = tokio::spawn(run_memory_node(
-        node_request(
-            config_b,
-            map_b,
-            port_b,
-            node_b.0.clone(),
-            renewer(addr, bundle.clone(), node_b.0.clone()),
-            stop_b,
-        ),
+        request_b,
         MemoryDevice {
             from_tun: b_in_rx,
             to_tun: b_out_tx,
         },
     ));
-    let mut reached = None;
-    while enrolled_at.elapsed() < Duration::from_secs(6) {
+    let mut first_packet = None;
+    let wait = before_listen + after_listen + Duration::from_secs(8);
+    while enrolled_at.elapsed() < wait {
         let _ = a_in_tx
             .send(
                 ipv4_packet(
@@ -424,7 +463,7 @@ async fn a_peer_that_enrolls_later_is_reachable_in_two_seconds() {
             .await;
         if let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(50), b_out_rx.recv()).await
         {
-            reached = Some(enrolled_at.elapsed());
+            first_packet = Some(Instant::now());
             break;
         }
     }
@@ -434,13 +473,87 @@ async fn a_peer_that_enrolls_later_is_reachable_in_two_seconds() {
     let _ = tokio::time::timeout(Duration::from_secs(3), task_b).await;
     handle.abort();
     let _ = tokio::time::timeout(Duration::from_secs(25), sync).await;
-    let reached = reached.expect("node a did not reach the late peer b");
-    println!("late_peer_reachable_ms {}", reached.as_millis());
-    assert!(
-        reached <= Duration::from_secs(2),
-        "the late peer took {} ms",
-        reached.as_millis()
+    let listener = *listened.lock().unwrap();
+    let times = LatePeerTimes {
+        enroll_to_listener: listener.map(|event| event.at.saturating_duration_since(enrolled_at)),
+        listener_to_first_packet: match (listener, first_packet) {
+            (Some(event), Some(at)) => Some(at.saturating_duration_since(event.at)),
+            _ => None,
+        },
+        enroll_to_first_packet: first_packet.map(|at| at.saturating_duration_since(enrolled_at)),
+    };
+    let ms = |value: Option<Duration>| {
+        value.map_or_else(|| "none".to_string(), |took| took.as_millis().to_string())
+    };
+    // Report only. The gate uses listener_to_first_packet.
+    println!(
+        "late_peer {tag} enroll_to_listener_ms {}",
+        ms(times.enroll_to_listener)
     );
+    println!(
+        "late_peer {tag} enroll_to_first_packet_ms {}",
+        ms(times.enroll_to_first_packet)
+    );
+    // The gate line.
+    println!(
+        "late_peer {tag} listener_to_first_packet_ms {} limit_ms 2000",
+        ms(times.listener_to_first_packet)
+    );
+    times
+}
+
+/// W25-6 and W25-6c: a peer that enrolls after a node started is reachable 2 s or less
+/// after its UDP listener starts.
+///
+/// Node a runs with a netmap that has no peer. A sync loop does what `orblx up --coord`
+/// does: it waits with `policy-wait` and writes the new files. Then b enrolls and starts.
+/// Node a must add b from the new netmap file and dial b. No node restarts.
+/// The start of the gate is the listener start event that node b logs itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_that_enrolls_later_is_reachable_in_two_seconds() {
+    let times = late_peer_case("gate", Duration::ZERO, Duration::ZERO).await;
+    if let Err(why) = late_peer_gate(&times) {
+        panic!("the late peer gate failed: {why}");
+    }
+}
+
+/// W25-6c negative test: a stop of 2.5 s after the listener of b starts, before b accepts,
+/// makes the gate fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_late_peer_gate_fails_when_the_peer_stops_after_its_listener_starts() {
+    let stop = Duration::from_millis(2_500);
+    let times = late_peer_case("stop_after_listen", Duration::ZERO, stop).await;
+    let took = times
+        .listener_to_first_packet
+        .expect("no packet came after the stop");
+    assert!(
+        took >= stop,
+        "the first packet came {} ms after the listener",
+        took.as_millis()
+    );
+    assert!(
+        late_peer_gate(&times).is_err(),
+        "the gate passed with a 2.5 s stop after the listener start"
+    );
+}
+
+/// W25-6c negative test: a delay of 2.5 s before the listener of b starts does not make
+/// the gate fail. The enroll-to-listener line shows the delay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_late_peer_gate_passes_when_the_listener_of_the_peer_starts_late() {
+    let delay = Duration::from_millis(2_500);
+    let times = late_peer_case("delay_before_listen", delay, Duration::ZERO).await;
+    let to_listener = times
+        .enroll_to_listener
+        .expect("node b did not start its listener");
+    assert!(
+        to_listener >= delay,
+        "enroll to listener was {} ms, less than the delay",
+        to_listener.as_millis()
+    );
+    if let Err(why) = late_peer_gate(&times) {
+        panic!("the late peer gate failed: {why}");
+    }
 }
 
 /// W25-6b: a dial to a peer that starts to listen late ends soon after the peer listens.
@@ -749,6 +862,7 @@ fn node_request(
         relay: None,
         visibility: Arc::new(AllowPeers),
         on_ready: None,
+        on_listen: None,
         metrics: None,
         filter: None,
     }
