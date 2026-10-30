@@ -5,10 +5,12 @@ The tests check that:
 - a proof from an old checkout (a plain flock of the lock file) cannot pass a FIFO waiter;
 - a W25-14 waiter (an old checkout with the ticket queue) keeps its place in the queue;
 - a proof that runs under a plain flock of the lock file stops at once with a message;
+- that check stays fast when an ancestor has many fds;
 - no proof script on this branch calls flock itself.
 The old libraries are copies of scripts/proof/proof-lock.sh at d0ddf7f (W25-5) and 9d53d3c (W25-14).
 """
 
+import fcntl
 import glob
 import os
 import re
@@ -141,6 +143,32 @@ class ProofLockFairnessTest(unittest.TestCase):
                                      r"not with the FIFO queue\. .*Use proof_lock_take")
         self.assertFalse(os.path.exists(self.order), "the wrapped proof ran")
         self.assertLess(took, 5.0)
+
+    def test_the_plain_flock_check_is_fast_under_a_parent_with_many_fds(self):
+        # A CI runner can be an ancestor with hundreds of fds. The check must not make one
+        # grep per fd: that took 0.7 s with 600 fds and made the W25-5 waiter test fail on CI.
+        open(self.lock, "a").close()
+        check = ('. "$0"; s=$(date +%s%3N); p="$(proof_lock_plain_parent "$1")"; rc=$?; '
+                 'echo "rc=$rc ms=$(( $(date +%s%3N) - s )) pid=${p%% *}"')
+        fds = [os.open(os.devnull, os.O_RDONLY) for _ in range(2000)]
+        held = os.open(self.lock, os.O_RDWR)
+        try:
+            free = subprocess.run(["bash", "-c", check, LIB, self.lock], env=self.env,
+                                  capture_output=True, text=True, timeout=30)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            plain = subprocess.run(["bash", "-c", check, LIB, self.lock], env=self.env,
+                                   capture_output=True, text=True, timeout=30)
+        finally:
+            os.close(held)
+            for fd in fds:
+                os.close(fd)
+        m = re.search(r"rc=(\d+) ms=(\d+) pid=", free.stdout)
+        self.assertIsNotNone(m, free.stdout + free.stderr)
+        self.assertEqual(m.group(1), "1", free.stdout)
+        self.assertLess(int(m.group(2)), 500, free.stdout)
+        # The check still finds an ancestor that holds the lock among its many fds.
+        self.assertIn("rc=0 ", plain.stdout, plain.stdout + plain.stderr)
+        self.assertIn(f"pid={os.getpid()}", plain.stdout)
 
 
 class NoPlainFlockTest(unittest.TestCase):

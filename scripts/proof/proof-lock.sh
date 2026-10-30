@@ -190,19 +190,14 @@ proof_lock_inode() {
 # /proc/locks does not list a lock after the flock(1) process that took it ends.
 # When the fdinfo of the process cannot be read (another user), a live process counts.
 proof_lock_pid_holds() {
-  local pid="$1" ino="$2" f state
+  local pid="$1" ino="$2" state
   [[ -n "$ino" && -d "/proc/${pid}" ]] || return 1
   state="$(sed -n 's/^State:[[:space:]]*\(.\).*/\1/p' "/proc/${pid}/status" 2>/dev/null)"
   [[ "$state" != "Z" ]] || return 1
   if ! ls "/proc/${pid}/fdinfo" >/dev/null 2>&1; then
     return 0
   fi
-  for f in "/proc/${pid}/fdinfo/"*; do
-    if grep -q "^lock:.*FLOCK.*WRITE.*:${ino} " "$f" 2>/dev/null; then
-      return 0
-    fi
-  done
-  return 1
+  grep -qs "^lock:.*FLOCK.*WRITE.*:${ino} " "/proc/${pid}/fdinfo/"* 2>/dev/null
 }
 
 # True when the keeper holds the lock file now.
@@ -274,18 +269,18 @@ proof_lock_keeper_stop() {
 # W25-19: print "PID COMMAND" when this shell or a parent process holds a flock on the lock
 # file. Then the proof runs under a plain flock and not in the FIFO queue.
 proof_lock_plain_parent() {
-  local file="$1" ino pid cmd f
+  local file="$1" ino pid cmd
   [[ -d /proc/self/fdinfo && -e "$file" ]] || return 1
   ino="$(proof_lock_inode "$file")"
   pid="$$"
   while [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )); do
-    for f in "/proc/${pid}/fdinfo/"*; do
-      if grep -q "^lock:.*FLOCK.*WRITE.*:${ino} " "$f" 2>/dev/null; then
-        cmd="$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null)"
-        printf '%s %s\n' "$pid" "${cmd% }"
-        return 0
-      fi
-    done
+    # One grep per process, not one per fd: an ancestor such as a CI runner can have
+    # hundreds of fds, and one grep per fd made the check take 0.7 s or more.
+    if grep -qs "^lock:.*FLOCK.*WRITE.*:${ino} " "/proc/${pid}/fdinfo/"* 2>/dev/null; then
+      cmd="$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null)"
+      printf '%s %s\n' "$pid" "${cmd% }"
+      return 0
+    fi
     pid="$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/${pid}/status" 2>/dev/null)"
   done
   return 1
