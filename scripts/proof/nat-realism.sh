@@ -41,6 +41,10 @@ export ORBLX_NATR_IMAGE="$IMAGE" ORBLX_NATR_PUB="$PUB" ORBLX_NATR_LAN="$LAN"
 . "$ROOT/scripts/proof/proof-lock.sh"
 trap proof_lock_end EXIT
 proof_lock_take "nat-realism:${PROJECT}" "$NATR_PREFIX" "${PROJECT}-"
+# W25-14b: start from a clean compose state (all profiles, all volumes).
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
+proof_compose_clean "$PROJECT" || exit 1
 COORD="${PUB}.10:443"
 STUN="${PUB}.20:3478"
 STUN_ALT="${PUB}.20:3479"

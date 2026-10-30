@@ -210,7 +210,7 @@ ROOT_PROOFS = ["coord-enroll.sh", "split-dns.sh", "svid-renew.sh", "w18-names.sh
 PROOFS_WITH_OWN_LOCK = sorted(
     f for f in os.listdir(os.path.join(REPO, "scripts", "proof"))
     if f.endswith(".sh") and f not in {
-        "proof-lock.sh", "pipe-lib.sh", "serve-lib.sh", "stage-image.sh", "entrypoint.sh", "nat-router.sh",
+        "proof-lock.sh", "pipe-lib.sh", "compose-clean.sh", "serve-lib.sh", "stage-image.sh", "entrypoint.sh", "nat-router.sh",
         # The rc.3 release sweep is a driver, not a proof. It builds before the lock (so no proof
         # waits for a build) and takes the lock for each proof it runs (test_release_sweep.py).
         "release-sweep.sh"}
