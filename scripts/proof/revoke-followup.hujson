@@ -1,0 +1,24 @@
+{
+  // Revoke follow-up proof (W25-2).
+  // Node a is the principal that the owner revokes and then restores.
+  // Node c is the other principal. Both may reach node b on all TCP ports and use SSH on b.
+  // checkPeriod is 30 s, so the periodic SSH recheck cannot close a session in the gate window.
+  "nodeApproval": false,
+  "owners": ["spiffe://orblx.local/node/owner"],
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a", "spiffe://orblx.local/node/c"],
+      "proto": "tcp",
+      "dst": ["spiffe://orblx.local/node/b:*"],
+    },
+  ],
+  "ssh": [
+    {
+      "src": ["spiffe://orblx.local/node/a", "spiffe://orblx.local/node/c"],
+      "dst": ["spiffe://orblx.local/node/b"],
+      "users": ["root"],
+      "checkPeriod": "30s",
+    },
+  ],
+}
