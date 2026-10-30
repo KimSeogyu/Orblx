@@ -154,7 +154,7 @@ expect_reject() {
     dc logs coord >&2 || true
     exit 1
   fi
-  dc logs coord 2>&1 | grep "oidc reject ${reason}" | tail -1 | sed 's/^[^|]*| //'
+  dc logs coord 2>&1 | show_matching "oidc reject ${reason}" | tail -1 | sed 's/^[^|]*| //'
 }
 
 cp "$ROOT/scripts/proof/oidc.hujson" "$POLICY_FILE"
@@ -187,7 +187,7 @@ wait_log idp "idp serve"
 dc up -d coord
 wait_bundle
 wait_log coord "oidc issuer"
-dc logs coord 2>&1 | grep "oidc issuer" | sed 's/^[^|]*| //'
+dc logs coord 2>&1 | show_matching "oidc issuer" | sed 's/^[^|]*| //'
 
 coord_ip="$(resolve_name coord)"
 if [[ -z "$coord_ip" ]]; then
@@ -216,7 +216,7 @@ nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 mint laptop rs1 --sub alice --email alice@example.test --nonce "$nonce"
 enroll_oidc laptop laptop --nonce "$nonce"
 wait_log coord "oidc accept sub alice"
-dc logs coord 2>&1 | grep -E "oidc (jwks|accept)" | sed 's/^[^|]*| //'
+dc logs coord 2>&1 | show_matching -E "oidc (jwks|accept)" | sed 's/^[^|]*| //'
 
 echo "=== [C] netmap on srv ==="
 dc run --rm --no-deps --entrypoint orblx srv coord netmap \
@@ -265,12 +265,12 @@ idp rotate --dir /idp --kid es2 --alg ES256 --drop rs1
 mint rotated es2 --sub dave --email dave@example.test
 enroll_oidc rotated rotated
 wait_log coord "oidc accept sub dave"
-dc logs coord 2>&1 | grep "oidc jwks loaded unknown-kid" | tail -1 | sed 's/^[^|]*| //'
-dc logs coord 2>&1 | grep "oidc jwks loaded unknown-kid" | tail -1 | read_all grep -q "kids es1 es2"
+dc logs coord 2>&1 | show_matching "oidc jwks loaded unknown-kid" | tail -1 | sed 's/^[^|]*| //'
+dc logs coord 2>&1 | show_matching "oidc jwks loaded unknown-kid" | tail -1 | read_all grep -q "kids es1 es2"
 expect_reject "dropped key rs1" unknown-kid old-key
 
 echo "=== [C] coordinator OIDC log lines ==="
-dc logs coord 2>&1 | grep -E "oidc |enrolled " | sed 's/^[^|]*| //'
+dc logs coord 2>&1 | show_matching -E "oidc |enrolled " | sed 's/^[^|]*| //'
 
 echo "=== [C] no token text in logs or the node store ==="
 for name in laptop desk rotated wrong-issuer; do

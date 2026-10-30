@@ -1036,6 +1036,33 @@ impl Coordinator {
         Ok(inner.policy.audit_webhooks().to_vec())
     }
 
+    /// Return the SIEM sinks of the loaded policy (W25-13).
+    ///
+    /// The call does not read the policy file.
+    pub fn audit_sinks(&self) -> Result<Vec<orblx_identity::AuditSink>, CoordError> {
+        let inner = self.lock()?;
+        Ok(inner.policy.audit_sinks().to_vec())
+    }
+
+    /// Write one `sink-error` record for the sink `name` (W25-13).
+    ///
+    /// The delivery thread calls this one time for each run of failures.
+    /// The detail holds the failed step. It does not hold a credential.
+    pub fn record_sink_error(&self, name: &str, detail: &str) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        let actor = coord_actor_of(&inner)?;
+        let digest = orblx_audit::sha256_digest(name.as_bytes());
+        record(
+            &mut inner,
+            &actor,
+            ConfigAction::SinkError,
+            name,
+            digest,
+            digest,
+            detail,
+        )
+    }
+
     /// Return the policy file path.
     pub fn policy_file(&self) -> Result<PathBuf, CoordError> {
         let inner = self.lock()?;
