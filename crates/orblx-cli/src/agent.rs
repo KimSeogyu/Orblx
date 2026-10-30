@@ -7,7 +7,10 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use orblx_agent::{connect, run_guard, unix_millis, ConnectError, GrantFiles, GuardConfig};
+use orblx_agent::{
+    connect, new_nonce, plain_http_request, run_gateway, run_guard, seal_http_request, send_http,
+    unix_millis, ConnectError, GrantFiles, GuardConfig,
+};
 use orblx_coord::{
     agent_grant_fetch_blocking, agent_grant_request_blocking, decode_hex_32, fetch_deny_blocking,
     GrantAsk, GrantFetch,
@@ -27,6 +30,22 @@ pub(crate) enum Command {
     Fetch(Fetch),
     Connect(Connect),
     Guard(Guard),
+    Gateway(Guard),
+    Http(Http),
+}
+
+#[derive(Debug)]
+pub(crate) struct Http {
+    grant: Option<PathBuf>,
+    to: Option<SocketAddr>,
+    service: Option<String>,
+    method: String,
+    path: String,
+    body: String,
+    repeat: u32,
+    timeout: Duration,
+    every: Option<Duration>,
+    max_wait: Duration,
 }
 
 #[derive(Debug)]
@@ -215,43 +234,96 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
                 max_wait: Duration::from_secs(flags.number("--max-wait", 400)?),
             }))
         }
-        ("guard", _) => {
+        ("guard", _) => parse_guard(&args[1..]).map(Command::Guard),
+        ("http", _) => {
             let flags = Flags::parse(
                 &args[1..],
-                &with_coord(&[
-                    "--listen",
+                &[
+                    "--grant",
+                    "--to",
                     "--service",
-                    "--target",
-                    "--audit",
-                    "--poll-ms",
-                    "--stale-ms",
-                ]),
+                    "--method",
+                    "--path",
+                    "--body",
+                    "--repeat",
+                    "--timeout",
+                    "--every-ms",
+                    "--max-wait",
+                ],
             )?;
-            let state = PathBuf::from(flags.get("--state").unwrap_or(DEFAULT_STATE));
-            let coord = match flags.get("--coord") {
-                Some(_) => {
-                    let parsed = flags.coord()?;
-                    Some((parsed.coord, parsed.coord_name, parsed.bundle))
-                }
+            let to = flags
+                .get("--to")
+                .map(|text| parse_socket(text, 0))
+                .transpose()?;
+            let grant = flags.get("--grant").map(PathBuf::from);
+            if grant.is_none() && to.is_none() {
+                return Err(format!("The command needs --grant or --to.\n{}", help()));
+            }
+            let every = match flags.get("--every-ms") {
+                Some(_) => Some(Duration::from_millis(flags.number("--every-ms", 100)?)),
                 None => None,
             };
-            let audit = flags
-                .get("--audit")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| state.join("agent-audit.jsonl"));
-            Ok(Command::Guard(Guard {
-                listen: parse_socket(flags.need("--listen")?, 0)?,
-                service: flags.need("--service")?.to_string(),
-                target: parse_socket(flags.need("--target")?, 0)?,
-                audit,
-                coord,
-                poll: Duration::from_millis(flags.number("--poll-ms", 200)?),
-                stale: Duration::from_millis(flags.number("--stale-ms", 2000)?),
-                state,
+            let method = flags.get("--method").unwrap_or("GET").to_string();
+            let path = flags.get("--path").unwrap_or("/").to_string();
+            Ok(Command::Http(Http {
+                grant,
+                to,
+                service: flags.get("--service").map(str::to_string),
+                method,
+                path,
+                body: flags.get("--body").unwrap_or("").to_string(),
+                repeat: flags.number("--repeat", 1)?,
+                timeout: Duration::from_secs(flags.number("--timeout", 5)?),
+                every,
+                max_wait: Duration::from_secs(flags.number("--max-wait", 400)?),
             }))
         }
         _ => Err(format!("The mode is not valid.\n{}", help())),
     }
+}
+
+/// Parse the `orblx gateway` flags. They are the same as the guard flags.
+pub(crate) fn parse_gateway(args: &[String]) -> Result<Command, String> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        return Ok(Command::Help);
+    }
+    parse_guard(args).map(Command::Gateway)
+}
+
+fn parse_guard(args: &[String]) -> Result<Guard, String> {
+    let flags = Flags::parse(
+        args,
+        &with_coord(&[
+            "--listen",
+            "--service",
+            "--target",
+            "--audit",
+            "--poll-ms",
+            "--stale-ms",
+        ]),
+    )?;
+    let state = PathBuf::from(flags.get("--state").unwrap_or(DEFAULT_STATE));
+    let coord = match flags.get("--coord") {
+        Some(_) => {
+            let parsed = flags.coord()?;
+            Some((parsed.coord, parsed.coord_name, parsed.bundle))
+        }
+        None => None,
+    };
+    let audit = flags
+        .get("--audit")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.join("agent-audit.jsonl"));
+    Ok(Guard {
+        listen: parse_socket(flags.need("--listen")?, 0)?,
+        service: flags.need("--service")?.to_string(),
+        target: parse_socket(flags.need("--target")?, 0)?,
+        audit,
+        coord,
+        poll: Duration::from_millis(flags.number("--poll-ms", 200)?),
+        stale: Duration::from_millis(flags.number("--stale-ms", 2000)?),
+        state,
+    })
 }
 
 pub(crate) fn run(command: Command) -> Result<i32, String> {
@@ -263,7 +335,9 @@ pub(crate) fn run(command: Command) -> Result<i32, String> {
         Command::Request(request) => run_request(request),
         Command::Fetch(fetch) => run_fetch(fetch),
         Command::Connect(connect) => run_connect(connect),
-        Command::Guard(guard) => run_guard_command(guard),
+        Command::Guard(guard) => run_guard_command(guard, false),
+        Command::Gateway(guard) => run_guard_command(guard, true),
+        Command::Http(http) => run_http(http),
     }
 }
 
@@ -436,7 +510,7 @@ fn one_connect(
     Ok(reply.lines().next().map(str::to_string))
 }
 
-fn run_guard_command(guard: Guard) -> Result<i32, String> {
+fn run_guard_command(guard: Guard, http: bool) -> Result<i32, String> {
     let name = read_text(&guard.state.join("node-name"))?
         .trim()
         .to_string();
@@ -476,8 +550,144 @@ fn run_guard_command(guard: Guard) -> Result<i32, String> {
         poll: guard.poll,
         stale_after: guard.stale,
     };
-    run_guard(config, fetch).map_err(|err| err.to_string())?;
+    if http {
+        run_gateway(config, fetch).map_err(|err| err.to_string())?;
+    } else {
+        run_guard(config, fetch).map_err(|err| err.to_string())?;
+    }
     Ok(0)
+}
+
+fn run_http(command: Http) -> Result<i32, String> {
+    let files = match &command.grant {
+        Some(dir) => Some(GrantFiles::load(dir).map_err(|err| err.to_string())?),
+        None => None,
+    };
+    let (to, service, node, expires_ms) = match &files {
+        Some(files) => {
+            let grant = &files.grant.grant;
+            let addr: Ipv4Addr = grant
+                .addr
+                .parse()
+                .map_err(|_| "The grant address is not valid.".to_string())?;
+            let node = SpiffeId::parse(&grant.node).map_err(|err| err.to_string())?;
+            (
+                command
+                    .to
+                    .unwrap_or_else(|| SocketAddr::from((addr, grant.port))),
+                command
+                    .service
+                    .clone()
+                    .unwrap_or_else(|| grant.service.clone()),
+                Some(node),
+                grant.expires.saturating_mul(1000),
+            )
+        }
+        None => (
+            command.to.ok_or("The command needs --to.")?,
+            command.service.clone().unwrap_or_default(),
+            None,
+            0,
+        ),
+    };
+    let build = || -> Result<Vec<u8>, String> {
+        match (&files, &node) {
+            (Some(files), Some(node)) => seal_http_request(
+                files,
+                to,
+                node,
+                &service,
+                &command.method,
+                &command.path,
+                command.body.as_bytes(),
+                new_nonce(),
+                SystemTime::now(),
+            )
+            .map_err(|err| err.to_string()),
+            _ => Ok(plain_http_request(
+                to,
+                &command.method,
+                &command.path,
+                command.body.as_bytes(),
+            )),
+        }
+    };
+    let send = |bytes: &[u8]| -> Result<(u16, String), String> {
+        let reply = send_http(to, bytes, command.timeout)
+            .map_err(|err| format!("The gateway request failed. {err}"))?;
+        let reason = reply
+            .first_body_line
+            .strip_prefix("orblx-deny ")
+            .map_or_else(|| "-".to_string(), str::to_string);
+        Ok((
+            reply.status,
+            if reply.status == 200 {
+                reply.first_body_line
+            } else {
+                reason
+            },
+        ))
+    };
+    let Some(every) = command.every else {
+        // One request. With --repeat N the same bytes go N times on new connections.
+        let bytes = build()?;
+        let mut code = 0;
+        for attempt in 1..=command.repeat.max(1) {
+            let at = now_ms();
+            let (status, text) = send(&bytes)?;
+            if status == 200 {
+                println!(
+                    "http attempt {attempt} status 200 method {} path {} at_ms {at} body {text}",
+                    command.method,
+                    path_only(&command.path)
+                );
+                code = 0;
+            } else {
+                println!(
+                    "http attempt {attempt} status {status} reason {text} method {} path {} at_ms {at}",
+                    command.method,
+                    path_only(&command.path)
+                );
+                code = EXIT_DENIED;
+            }
+        }
+        return Ok(code);
+    };
+    // Loop mode: a new nonce each time, until the gateway refuses.
+    let limit = Instant::now() + command.max_wait;
+    let mut last_ok: Option<u64> = None;
+    let mut attempts = 0u64;
+    loop {
+        let at = now_ms();
+        attempts += 1;
+        let bytes = build()?;
+        let (status, text) = send(&bytes)?;
+        if status != 200 {
+            let done = now_ms();
+            println!("loop attempts {attempts}");
+            println!(
+                "loop last_ok_ms {}",
+                last_ok.map_or_else(|| "none".to_string(), |value| value.to_string())
+            );
+            println!("loop first_deny_start_ms {at}");
+            println!("loop first_deny_ms {done}");
+            println!("loop deny_status {status}");
+            println!("loop deny_reason {text}");
+            println!("loop grant_expires_ms {expires_ms}");
+            return Ok(0);
+        }
+        last_ok = Some(at);
+        if Instant::now() >= limit {
+            println!("loop attempts {attempts}");
+            println!("loop no_deny_until_ms {}", now_ms());
+            return Ok(EXIT_DENIED);
+        }
+        std::thread::sleep(every);
+    }
+}
+
+fn path_only(target: &str) -> &str {
+    target.split(['?', '#']).next().unwrap_or("")
 }
 
 fn help() -> String {
@@ -485,6 +695,8 @@ fn help() -> String {
 orblx agent grant request --agent NAME --node NODE --service NAME --port N [--ttl SECS] [--path PREFIX] --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx agent grant fetch --id ID --out DIR [--wait SECS] --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx agent connect --grant DIR [--to IP:PORT] [--service NAME] [--send TEXT] [--timeout SECS] [--every-ms MS] [--max-wait SECS]
+orblx agent http [--grant DIR] [--to IP:PORT] [--service NAME] [--method M] [--path TARGET] [--body TEXT] [--repeat N] [--timeout SECS] [--every-ms MS] [--max-wait SECS]
+orblx gateway --listen IP:PORT --service NAME --target ADDR [--audit FILE] [--poll-ms MS] [--stale-ms MS] [--coord ADDR] [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx agent guard --listen IP:PORT --service NAME --target ADDR [--audit FILE] [--poll-ms MS] [--stale-ms MS] [--coord ADDR] [--state DIR] [--coord-name NAME] [--bundle FILE]
 
 grant request asks the coordinator for one agent grant with the node SVID in the state directory.
@@ -500,6 +712,13 @@ guard accepts a TCP connection on --listen only with a valid use proof, then for
 guard reads the deny set from the coordinator each --poll-ms with the node SVID.
 guard refuses each connection when the last good deny read is older than --stale-ms.
 guard writes each grant, use, deny, expiry, and revoke to the audit chain file.
+gateway is an HTTP gateway. It reads one request per connection.
+gateway forwards a request only with a valid grant proof, a new nonce, and a path inside the grant path prefix.
+gateway refuses a request without a grant, out of scope, after the end time, or with a used nonce.
+gateway removes the proof headers before it forwards the request. It does not log header values or the query.
+http sends one HTTP request with a grant proof and a new nonce. Without --grant it sends no proof.
+http with --repeat N sends the same request bytes N times. The second send is a replay.
+http with --every-ms sends a new request each MS until the gateway refuses.
 Use orblx audit verify-config --file FILE to check that chain.
 The command does not print private keys or tickets.
 "
@@ -572,5 +791,31 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("--listen"));
+    }
+
+    #[test]
+    fn gateway_and_http_parse() {
+        let command = super::parse_gateway(&args(&[
+            "--listen",
+            "100.64.0.3:8080",
+            "--service",
+            "api",
+            "--target",
+            "127.0.0.1:8081",
+        ]))
+        .unwrap();
+        assert!(matches!(command, Command::Gateway(_)));
+        let Command::Http(http) = parse(&args(&[
+            "http", "--grant", "/tmp/g", "--path", "/api/x", "--repeat", "2",
+        ]))
+        .unwrap() else {
+            panic!("not http");
+        };
+        assert_eq!(http.method, "GET");
+        assert_eq!(http.path, "/api/x");
+        assert_eq!(http.repeat, 2);
+        assert!(parse(&args(&["http", "--path", "/"]))
+            .unwrap_err()
+            .contains("--to"));
     }
 }

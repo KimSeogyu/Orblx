@@ -8,22 +8,30 @@
 //! The agent shows a proof line to the guard on the target node.
 //! The guard checks the proof, the ticket, the grant, and the deny set
 //! for each new connection, and writes each decision to a hash chain.
+//! The HTTP gateway uses the same checks for each request, and adds a path
+//! scope and a nonce replay check.
 //!
 //! This crate adds no new cryptographic design.
 //! It uses the SVID, Ed25519 signatures, and the W19 SSH JIT ticket pattern.
 
 mod client;
+mod gateway;
 mod grant;
 mod guard;
 mod hex;
 mod proof;
 
 pub use client::{connect, ConnectError, GrantFiles};
+pub use gateway::{
+    check_request, forward_bytes, http_extra, new_nonce, parse_request, path_in_scope,
+    plain_http_request, run_gateway, seal_http_request, send_http, GatewayDecision, HttpReply,
+    RequestHead, NONCE_HEADER, PROOF_HEADER,
+};
 pub use grant::{
     grant_id_ok, path_prefix_ok, service_name_ok, sign_grant, verify_grant, AgentGrant,
     SignedAgentGrant, GRANT_VERSION, MAX_GRANT_SECS,
 };
-pub use guard::{run_guard, DenyFetch, GuardConfig, GuardCore, GuardDecision};
+pub use guard::{run_guard, DenyFetch, GuardConfig, GuardCore, GuardDecision, RequestCheck};
 pub use proof::{
     open_use, seal_use, unix_millis, Admitted, Refused, UseTarget, UseTrust, PROOF_WINDOW_SECS,
 };
