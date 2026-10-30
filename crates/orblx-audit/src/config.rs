@@ -102,11 +102,13 @@ pub enum ConfigAction {
     ///
     /// The coordinator writes one record for each run of failures, not one for each try.
     SinkError,
+    /// The coordinator removed one ephemeral node after it stayed offline too long (W25-18).
+    NodeRemove,
 }
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 35] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -141,6 +143,7 @@ impl ConfigAction {
         Self::PacketDeny,
         Self::Unrevoke,
         Self::SinkError,
+        Self::NodeRemove,
     ];
 
     /// Return the stable action token.
@@ -181,6 +184,7 @@ impl ConfigAction {
             Self::PacketDeny => "packet-deny",
             Self::Unrevoke => "unrevoke",
             Self::SinkError => "sink-error",
+            Self::NodeRemove => "node-remove",
         }
     }
 
@@ -228,6 +232,7 @@ impl ConfigAction {
             Self::PacketDeny => 32,
             Self::Unrevoke => 33,
             Self::SinkError => 34,
+            Self::NodeRemove => 35,
         }
     }
 

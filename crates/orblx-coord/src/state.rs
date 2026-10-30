@@ -158,6 +158,8 @@ struct Inner {
 #[derive(Clone)]
 pub struct Coordinator {
     inner: Arc<Mutex<Inner>>,
+    /// W25-18: when each node was last online. The data is not in the node store.
+    presence: Arc<crate::ephemeral::Presence>,
 }
 
 /// A successful enrollment.
@@ -310,6 +312,7 @@ impl Coordinator {
                 audit: None,
                 fail_hash: None,
             })),
+            presence: Arc::new(crate::ephemeral::Presence::default()),
         };
         {
             let mut inner = coord.lock()?;
@@ -379,6 +382,18 @@ impl Coordinator {
         inner.store.create_token(ttl, now)
     }
 
+    /// Create one enroll token for an ephemeral node (W25-18).
+    ///
+    /// A node that enrolls with the token is removed after it stays offline too long.
+    pub fn create_ephemeral_token(
+        &self,
+        ttl: std::time::Duration,
+    ) -> Result<CreatedToken, CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        inner.store.create_token_with(ttl, SystemTime::now(), true)
+    }
+
     pub fn enroll_token(
         &self,
         name: &str,
@@ -387,9 +402,10 @@ impl Coordinator {
         routes: &[String],
         now: SystemTime,
     ) -> Result<EnrollResult, CoordError> {
-        let _ = SpiffeId::node(name)?;
+        let id = SpiffeId::node(name)?;
         let mut inner = self.lock()?;
         reload(&mut inner)?;
+        refuse_denied_name(&inner, &id)?;
         let plan = inner
             .store
             .begin_enroll(name, secret, now, endpoints, routes)?;
@@ -405,9 +421,10 @@ impl Coordinator {
         routes: &[String],
         now: SystemTime,
     ) -> Result<EnrollResult, CoordError> {
-        let _ = SpiffeId::node(name)?;
+        let id = SpiffeId::node(name)?;
         let mut inner = self.lock()?;
         reload(&mut inner)?;
+        refuse_denied_name(&inner, &id)?;
         let owner = owner_from_oidc(&inner.oidc, id_token, nonce, now)?;
         let plan = inner.store.begin_oidc(name, &owner, endpoints, routes)?;
         finish_enroll(&mut inner, plan, now)
@@ -884,6 +901,46 @@ impl Coordinator {
             return Ok(String::new());
         }
         read_text(&path)
+    }
+
+    /// Delete one ephemeral node and write one `node-remove` record (W25-18).
+    ///
+    /// The caller adds the SVID to the deny file first. `detail` follows `reason ephemeral`.
+    /// The store refuses a node that is not ephemeral.
+    pub fn remove_ephemeral_node(
+        &self,
+        name: &str,
+        detail: &str,
+    ) -> Result<StoredNode, CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        let before = node_digest(&inner, name);
+        let removed = inner.store.remove_ephemeral(name)?;
+        let actor = coord_actor_of(&inner)?;
+        let detail = format!(
+            "reason ephemeral {detail} svid {} overlay_ip {}",
+            removed.svid, removed.overlay_ip
+        );
+        record(
+            &mut inner,
+            &actor,
+            ConfigAction::NodeRemove,
+            name,
+            before,
+            EMPTY_DIGEST,
+            &detail,
+        )?;
+        Ok(removed)
+    }
+
+    /// Return the presence table of the nodes (W25-18).
+    pub(crate) fn presence(&self) -> &crate::ephemeral::Presence {
+        &self.presence
+    }
+
+    /// Set how long an ephemeral node can stay offline (W25-18).
+    pub fn set_ephemeral_offline(&self, offline: std::time::Duration) -> Result<(), CoordError> {
+        self.presence.set_offline(offline)
     }
 
     /// Return the coordinator SPIFFE ID text.
@@ -1381,6 +1438,18 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&digest);
     hash
+}
+
+/// Refuse a node name whose SPIFFE ID is in the deny file (W25-18).
+///
+/// The SVID of a removed ephemeral node stays denied, so the name cannot enroll again.
+fn refuse_denied_name(inner: &Inner, id: &SpiffeId) -> Result<(), CoordError> {
+    if crate::admin::uri_denied_in(&inner.state_dir, id.as_uri())? {
+        return Err(CoordError::Protocol(
+            "The node name is revoked. Use a new name.".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn finish_enroll(

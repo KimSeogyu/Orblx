@@ -128,6 +128,7 @@ mod tests {
             exit_node: false,
             approved: true,
             expired: false,
+            ephemeral: false,
         }
     }
 

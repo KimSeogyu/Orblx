@@ -50,6 +50,11 @@ pub async fn spawn(
     tokio::spawn(async move {
         expire_tick(tick_coord).await;
     });
+    crate::ephemeral::start(coord)?;
+    let ephemeral_coord = coord.clone();
+    tokio::spawn(async move {
+        crate::ephemeral::tick(ephemeral_coord).await;
+    });
     let (stamp_tx, stamp_rx) = watch::channel(0u64);
     let stamp_coord = coord.clone();
     tokio::spawn(async move {
@@ -278,6 +283,9 @@ async fn handle_connection(
         CoordError::Protocol("The request is not valid.".to_string())
     })?;
     let request = proto::read_json::<Request>(&mut recv).await?;
+    // W25-18: a node is online while it has an open request. Enroll has no node SVID.
+    let node = peer_node(coord, &connection).ok();
+    let seen = node.as_deref().map(|name| coord.presence().begin(name));
     let response = match dispatch(coord, &connection, request, stamp).await {
         Ok(response) => response,
         Err(err) => {
@@ -289,6 +297,7 @@ async fn handle_connection(
             }
         }
     };
+    drop(seen);
     proto::write_json(&mut send, &response).await?;
     let _ = send.finish();
     drop(send);
