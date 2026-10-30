@@ -22,6 +22,7 @@ mod netcheck;
 mod ping;
 mod policy;
 mod relay;
+mod serve;
 mod ssh;
 mod status;
 mod ticket_load;
@@ -44,6 +45,7 @@ enum Action {
     Login(login::Command),
     Policy(policy::Command),
     Ssh(ssh::Command),
+    Serve(serve::Command),
     Admin(admin::Command),
     Agent(agent::Command),
     Nat(nat::Command),
@@ -139,6 +141,12 @@ fn main() {
         }
         Ok(Action::Ssh(command)) => {
             if let Err(err) = ssh::run(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
+        Ok(Action::Serve(command)) => {
+            if let Err(err) = serve::run(command) {
                 eprintln!("{err}");
                 std::process::exit(1);
             }
@@ -273,6 +281,12 @@ where
     }
     if args.first().map(String::as_str) == Some("ssh") {
         return ssh::parse(&args[1..]).map(Action::Ssh);
+    }
+    if args.first().map(String::as_str) == Some("serve") {
+        return serve::parse_serve(&args[1..]).map(Action::Serve);
+    }
+    if args.first().map(String::as_str) == Some("funnel") {
+        return serve::parse_funnel(&args[1..]).map(Action::Serve);
     }
     for arg in &args {
         if arg == "--version" || arg == "-V" {

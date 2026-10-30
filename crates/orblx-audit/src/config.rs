@@ -60,11 +60,19 @@ pub enum ConfigAction {
     AgentExpire,
     /// An owner revoked an agent JIT grant.
     AgentRevoke,
+    /// A node turned serve on or changed the serve ports.
+    Serve,
+    /// A node turned serve off.
+    ServeOff,
+    /// A node turned funnel on. The outside listener opens.
+    FunnelOn,
+    /// A node turned funnel off. The outside listener closes.
+    FunnelOff,
 }
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 19] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -80,6 +88,10 @@ impl ConfigAction {
         Self::AgentDeny,
         Self::AgentExpire,
         Self::AgentRevoke,
+        Self::Serve,
+        Self::ServeOff,
+        Self::FunnelOn,
+        Self::FunnelOff,
     ];
 
     /// Return the stable action token.
@@ -101,6 +113,10 @@ impl ConfigAction {
             Self::AgentDeny => "agent-deny",
             Self::AgentExpire => "agent-expire",
             Self::AgentRevoke => "agent-revoke",
+            Self::Serve => "serve",
+            Self::ServeOff => "serve-off",
+            Self::FunnelOn => "funnel-on",
+            Self::FunnelOff => "funnel-off",
         }
     }
 
@@ -129,6 +145,10 @@ impl ConfigAction {
             Self::AgentDeny => 13,
             Self::AgentExpire => 14,
             Self::AgentRevoke => 15,
+            Self::Serve => 16,
+            Self::ServeOff => 17,
+            Self::FunnelOn => 18,
+            Self::FunnelOff => 19,
         }
     }
 

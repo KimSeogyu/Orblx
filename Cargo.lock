@@ -1643,6 +1643,7 @@ dependencies = [
  "orblx-edge",
  "orblx-identity",
  "orblx-relay",
+ "orblx-serve",
  "orblx-ssh",
  "serde",
  "serde_json",
@@ -1750,6 +1751,21 @@ version = "0.1.0-rc.1"
 dependencies = [
  "getrandom 0.2.17",
  "libc",
+]
+
+[[package]]
+name = "orblx-serve"
+version = "0.1.0-rc.1"
+dependencies = [
+ "orblx-audit",
+ "orblx-datapath",
+ "orblx-identity",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
