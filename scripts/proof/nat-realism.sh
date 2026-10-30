@@ -20,6 +20,13 @@
 # The script prints proof_ok.
 set -euo pipefail
 
+# Exit 0 when a line of stdin matches the ERE $1. It reads all of stdin.
+# Do not use grep -q, grep -m, head or awk with exit on a pipe: the reader exits early,
+# the writer gets SIGPIPE (exit 141), and set -o pipefail fails the pipe (W24-E4b, W25-3).
+has_line() {
+  awk -v re="$1" '$0 ~ re {found = 1} END {exit !found}'
+}
+
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 FILE="scripts/proof/compose.nat-realism.yml"
@@ -82,7 +89,7 @@ as_root() {
 # The [C] routers must receive each frame by MAC.
 open_legacy_forward() {
   if command -v iptables-legacy >/dev/null 2>&1; then
-    if as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP'; then
+    if as_root iptables-legacy -S FORWARD 2>/dev/null | has_line '^-P FORWARD DROP$'; then
       echo "=== REAL set iptables-legacy FORWARD ACCEPT ==="
       as_root iptables-legacy -P FORWARD ACCEPT
     fi
@@ -183,7 +190,7 @@ status_text() {
 }
 
 path_of() {
-  printf '%s\n' "$1" | awk '/^peer / {print $6; exit}'
+  printf '%s\n' "$1" | awk '!found && /^peer / {print $6; found = 1}'
 }
 
 wait_path() {
@@ -194,7 +201,7 @@ wait_path() {
   local i text kind
   for i in $(seq 1 "$tries"); do
     text="$(status_text "$container")"
-    if printf '%s\n' "$text" | grep -q "^peer ${peer} "; then
+    if printf '%s\n' "$text" | has_line "^peer ${peer} "; then
       kind="$(path_of "$text")"
       if [[ -n "$kind" && "$kind" != "down" && "$kind" != "starting" ]]; then
         if [[ "$want" == "any" || "$kind" == "$want" ]]; then
@@ -216,8 +223,8 @@ check_svid() {
   local label="$1"
   local text="$2"
   local own peer
-  own="$(printf '%s\n' "$text" | awk '/^svid_expiry / {print $2; exit}')"
-  peer="$(printf '%s\n' "$text" | awk '/^peer / {print $10; exit}')"
+  own="$(printf '%s\n' "$text" | awk '!found && /^svid_expiry / {print $2; found = 1}')"
+  peer="$(printf '%s\n' "$text" | awk '!found && /^peer / {print $10; found = 1}')"
   echo "${label} svid_expiry self ${own:-none} peer ${peer:-none}"
   if [[ ! "$own" =~ ^[0-9]+$ || ! "$peer" =~ ^[0-9]+$ ]]; then
     echo "${label} has an svid_expiry that is not known." >&2
@@ -232,7 +239,7 @@ wait_svid() {
   local i text
   for i in $(seq 1 30); do
     text="$(status_text "$container")"
-    if printf '%s\n' "$text" | awk '/^peer / {print $10}' | grep -Eq '^[0-9]+$'; then
+    if printf '%s\n' "$text" | awk '/^peer / {print $10}' | has_line '^[0-9]+$'; then
       printf '%s\n' "$text"
       return 0
     fi
@@ -370,7 +377,7 @@ steady_pings() {
 
 # Print the avg value of one ping run.
 rtt_avg() {
-  awk -F'/' '/^rtt / {print $5; exit}'
+  awk -F'/' '!found && /^rtt / {print $5; found = 1}'
 }
 
 # Print the median and the 3 slowest pings of one ping -D run (read on stdin).
@@ -582,17 +589,17 @@ enroll_as() {
 }
 
 self_overlay() {
-  status_text "$1" | awk '/^overlay_ip / {print $2; exit}'
+  status_text "$1" | awk '!found && /^overlay_ip / {print $2; found = 1}'
 }
 
 peer_expiry_of() {
   printf '%s
-' "$1" | awk '/^peer / {print $10; exit}'
+' "$1" | awk '!found && /^peer / {print $10; found = 1}'
 }
 
 self_expiry_of() {
   printf '%s
-' "$1" | awk '/^svid_expiry / {print $2; exit}'
+' "$1" | awk '!found && /^svid_expiry / {print $2; found = 1}'
 }
 
 # Wait until the peer line on one node shows the renewed expiry of the other node.
@@ -733,7 +740,7 @@ mapping_ports() {
 }
 
 port_of_mapping() {
-  printf '%s\n' "$1" | awk -v dest="$2" '$2 == "mapping" && $5 == dest {n = split($7, a, ":"); print a[n]; exit}'
+  printf '%s\n' "$1" | awk -v dest="$2" '!found && $2 == "mapping" && $5 == dest {n = split($7, a, ":"); print a[n]; found = 1}'
 }
 
 echo "=== REAL cargo test signed hello and birthday bounds ==="
@@ -828,7 +835,7 @@ done
 overlay_of() {
   dc --profile nodes run --rm --no-deps --entrypoint /bin/sh "$1" -c \
     "ip route replace default via $(gateway_of "$1") && orblx coord netmap --coord ${COORD} --bundle /coord-state/trust-bundle.pem --state /var/lib/orblx" \
-    | awk '/^overlay_ip /{print $2; exit}'
+    | awk '!found && /^overlay_ip / {print $2; found = 1}'
 }
 
 echo "=== [C] overlay addresses ==="
@@ -845,7 +852,7 @@ echo "=== [C] no LAN shortcut ==="
 LAN_REACH="$(dc --profile nodes run --rm --no-deps --entrypoint /bin/sh node-a -c \
   "ip route replace default via ${LAN}.21.2; for ip in ${LAN}.22.10 ${LAN}.23.10 ${LAN}.24.10 ${LAN}.22.2 ${LAN}.23.2; do if ping -c 1 -W 1 \$ip >/dev/null 2>&1; then echo lan_reach \$ip yes; else echo lan_reach \$ip no; fi; done")"
 printf '%s\n' "$LAN_REACH"
-if printf '%s\n' "$LAN_REACH" | grep -q ' yes$'; then
+if printf '%s\n' "$LAN_REACH" | has_line ' yes$'; then
   echo "node-a can reach another LAN without NAT." >&2
   exit 1
 fi
@@ -923,7 +930,7 @@ punch_log ${NATR_PREFIX}c
 check_probe_bound ${NATR_PREFIX}a
 check_probe_bound ${NATR_PREFIX}c
 if [[ "$PS_PATH_A" == "direct" ]]; then
-  REACHED="$(docker logs ${NATR_PREFIX}a 2>&1 | awk '/^The hole punch reached / {sub(/\.$/, "", $5); print $5; exit}')"
+  REACHED="$(docker logs ${NATR_PREFIX}a 2>&1 | awk '!found && /^The hole punch reached / {sub(/\.$/, "", $5); print $5; found = 1}')"
   echo "prc_sym node-a punch_peer ${REACHED}"
   if [[ "${REACHED%%:*}" != "$WAN_C" ]]; then
     echo "The prc_sym direct path did not go through the router-c WAN address." >&2
@@ -959,7 +966,7 @@ if [[ "$SS_PATH" != "relay relay" ]]; then
   echo "The sym_sym case did not use the relay." >&2
   exit 1
 fi
-if docker logs ${NATR_PREFIX}c 2>&1 | grep -q '^The hole punch reached'; then
+if docker logs ${NATR_PREFIX}c 2>&1 | has_line '^The hole punch reached'; then
   echo "The sym_sym case reported a hole punch." >&2
   exit 1
 fi
@@ -1016,14 +1023,14 @@ check_renewal "relay node-h sees node-g" ${NATR_PREFIX}d ${NATR_PREFIX}c relay "
 steady_pings renew_direct ${NATR_PREFIX}a "$(self_overlay ${NATR_PREFIX}b)"
 steady_pings renew_relay ${NATR_PREFIX}c "$(self_overlay ${NATR_PREFIX}d)"
 for name in $NAT_CONTAINERS; do
-  if docker logs "$name" 2>&1 | grep -q "PRIVATE KEY"; then
+  if docker logs "$name" 2>&1 | has_line "PRIVATE KEY"; then
     echo "The ${name} log contains a private key." >&2
     exit 1
   fi
   stop_node "$name"
 done
 
-if dc logs coord relay 2>&1 | grep -q "PRIVATE KEY"; then
+if dc logs coord relay 2>&1 | has_line "PRIVATE KEY"; then
   echo "A log contains a private key." >&2
   exit 1
 fi

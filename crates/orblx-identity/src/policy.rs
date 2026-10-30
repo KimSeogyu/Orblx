@@ -180,6 +180,12 @@ pub struct ReceiverGrants {
     /// that no row allows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subnets: Vec<SubnetGrant>,
+    /// Peers in another tenant that this node sees through a share (W25-1b).
+    ///
+    /// The receiver drops each packet from one of these peers that no grant allows,
+    /// also when `filter` is false. Thus a share gives only its protocols and ports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guarded: Vec<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -219,6 +225,15 @@ impl ReceiverGrants {
             }
             if grant.port_start == 0 || grant.port_start > grant.port_end {
                 return Err(PolicyError::new("The grant port range is not valid."));
+            }
+        }
+        for (index, src) in self.guarded.iter().enumerate() {
+            let _ = SpiffeId::parse(src)
+                .map_err(|_| PolicyError::new("The grant guarded SPIFFE ID is not valid."))?;
+            if self.guarded[..index].iter().any(|item| item == src) {
+                return Err(PolicyError::new(
+                    "The grant guarded list repeats a SPIFFE ID.",
+                ));
             }
         }
         for (index, dst) in self.reach.iter().enumerate() {
@@ -545,6 +560,7 @@ impl Policy {
             reach: reach.into_iter().collect(),
             filter: self.acl_set,
             subnets: self.receiver_subnets(receiver),
+            guarded: Vec::new(),
         }
     }
 
