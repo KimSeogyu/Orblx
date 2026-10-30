@@ -7,6 +7,11 @@ publish.workspace = true
 version.workspace = true
 
 [dependencies]
+bytes = "1"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+libc = "0.2"
 orblx-audit = { path = "../orblx-audit" }
 orblx-datapath = { path = "../orblx-datapath" }
 orblx-identity = { path = "../orblx-identity" }

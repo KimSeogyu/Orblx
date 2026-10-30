@@ -12,7 +12,7 @@ use std::time::SystemTime;
 use orblx_identity::{DenySet, TrustBundle};
 use orblx_serve::{
     disable_serve, enable_serve, set_funnel, ServeChange, ServeConfig, DEFAULT_HTTPS_PORT,
-    SERVE_AUDIT_FILE,
+    DEFAULT_MAX_BODY_BYTES, SERVE_AUDIT_FILE,
 };
 
 use super::take_value;
@@ -27,6 +27,7 @@ pub(crate) enum Command {
         state_dir: PathBuf,
         target_port: u16,
         https_port: u16,
+        max_body_bytes: Option<u64>,
     },
     ServeOff {
         state_dir: PathBuf,
@@ -58,6 +59,7 @@ pub(crate) fn parse_serve(args: &[String]) -> Result<Command, String> {
                 state_dir,
                 target_port,
                 https_port: flags.https_port.unwrap_or(DEFAULT_HTTPS_PORT),
+                max_body_bytes: flags.max_body_bytes,
             })
         }
         _ => Err(format!("The serve command is not valid.\n{}", serve_help())),
@@ -88,6 +90,7 @@ struct Flags {
     state_dir: PathBuf,
     https_port: Option<u16>,
     listen: Option<SocketAddr>,
+    max_body_bytes: Option<u64>,
 }
 
 fn split(args: &[String]) -> Result<(Vec<String>, Flags), String> {
@@ -95,6 +98,7 @@ fn split(args: &[String]) -> Result<(Vec<String>, Flags), String> {
     let mut state_dir = None;
     let mut https_port = None;
     let mut listen = None;
+    let mut max_body_bytes = None;
     let mut index = 0;
     while index < args.len() {
         let item = args[index].as_str();
@@ -111,6 +115,12 @@ fn split(args: &[String]) -> Result<(Vec<String>, Flags), String> {
                             .map_err(|_| "The --listen value is not ip:port.".to_string())?,
                     );
                 }
+                "--max-body" => match value.parse::<u64>() {
+                    Ok(limit) if limit > 0 => max_body_bytes = Some(limit),
+                    _ => {
+                        return Err("The --max-body value is not a positive byte count.".to_string())
+                    }
+                },
                 other => return Err(format!("The flag {other} is not valid.")),
             }
         } else {
@@ -124,6 +134,7 @@ fn split(args: &[String]) -> Result<(Vec<String>, Flags), String> {
             state_dir: state_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
             https_port,
             listen,
+            max_body_bytes,
         },
     ))
 }
@@ -145,9 +156,10 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             state_dir,
             target_port,
             https_port,
+            max_body_bytes,
         } => {
             let actor = actor(&state_dir)?;
-            let change = enable_serve(&state_dir, target_port, https_port, &actor)?;
+            let change = enable_serve(&state_dir, target_port, https_port, max_body_bytes, &actor)?;
             report(&state_dir, &change)
         }
         Command::ServeOff { state_dir } => {
@@ -193,8 +205,10 @@ fn print_state(config: Option<&ServeConfig>) {
         }
         Some(config) => {
             println!(
-                "serve on https_port {} target 127.0.0.1:{}",
-                config.https_port, config.target_port
+                "serve on https_port {} target 127.0.0.1:{} max_body {}",
+                config.https_port,
+                config.target_port,
+                config.body_limit()
             );
             match (config.funnel, config.funnel_listen) {
                 (true, Some(addr)) => println!("funnel on listen {addr}"),
@@ -223,7 +237,7 @@ fn actor(state_dir: &Path) -> Result<String, String> {
 fn serve_help() -> String {
     format!(
         "\
-orblx serve PORT [--https-port N] [--state-dir DIR]
+orblx serve PORT [--https-port N] [--max-body BYTES] [--state-dir DIR]
 orblx serve off [--state-dir DIR]
 orblx serve status [--state-dir DIR]
 
@@ -232,6 +246,9 @@ The TLS certificate is the node SVID. The orblx.local CA signs it.
 The policy file DIR/policy.hujson must allow the source on TCP at the HTTPS port.
 The default is deny.
 The default HTTPS port is {DEFAULT_HTTPS_PORT}.
+serve reads each HTTP/1.1 request. It accepts Content-Length and chunked bodies.
+A body above the limit gets 413. The default limit is {DEFAULT_MAX_BODY_BYTES} bytes.
+Only a connection that comes in on the overlay TUN interface can use a peer address.
 Funnel stays off. Use orblx funnel on to publish outside the overlay.
 Each change appends one record to DIR/{SERVE_AUDIT_FILE}.
 The default state directory is {DEFAULT_STATE_DIR}.
@@ -277,10 +294,20 @@ mod tests {
         }
         match parse_serve(&args("8080 --https-port 8443")) {
             Ok(Command::Serve {
-                https_port: 8443, ..
+                https_port: 8443,
+                max_body_bytes: None,
+                ..
             }) => {}
             other => panic!("{other:?}"),
         }
+        match parse_serve(&args("8080 --max-body 4096")) {
+            Ok(Command::Serve {
+                max_body_bytes: Some(4096),
+                ..
+            }) => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(parse_serve(&args("8080 --max-body 0")).is_err());
         assert!(matches!(
             parse_serve(&args("off")),
             Ok(Command::ServeOff { .. })
