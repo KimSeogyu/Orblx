@@ -325,7 +325,14 @@ fn dispatch_admin(
             "The caller is not an owner.".to_string(),
         ));
     }
-    let value = run_admin(coord, request, Caller::Owner(caller.as_uri()), now)?;
+    let policy_lock = policy_lock_for(&request.op)?;
+    let value = run_admin(
+        coord,
+        request,
+        Caller::Owner(caller.as_uri()),
+        policy_lock.as_ref(),
+        now,
+    )?;
     let detail = serde_json::to_string(&value)
         .map_err(|_| CoordError::Protocol("The request is not valid.".to_string()))?;
     println!("admin {}", request.op.trim_start_matches("admin-"));
@@ -364,7 +371,19 @@ fn dispatch_token(
     now: SystemTime,
 ) -> Response {
     let op = request.op.trim_start_matches("admin-");
-    let checked = match apitoken::check(coord, secret, &request.op, now) {
+    let Ok(policy_lock) = policy_lock_for(&request.op) else {
+        println!("admin token check failed op {op}: policy lock");
+        return status_response(500, "The coordinator request failed.".to_string());
+    };
+    // W25-3b: a token cannot change the policy owners. The owner check and the
+    // write use the same lock.
+    let rule = || match &policy_lock {
+        Some(lock) if !admin::policy_keeps_owners(coord, lock, &request.name)? => {
+            Ok(Some(apitoken::Refusal::Owners))
+        }
+        _ => Ok(None),
+    };
+    let checked = match apitoken::check(coord, secret, &request.op, now, rule) {
         Ok(checked) => checked,
         Err(err) => {
             println!("admin token check failed op {op}: {}", err.public_text());
@@ -381,7 +400,13 @@ fn dispatch_token(
         return status_response(refusal.status(), refusal.text().to_string());
     }
     let actor = apitoken::actor_of(&checked.id);
-    let value = match run_admin(coord, request, Caller::Token(&actor), now) {
+    let value = match run_admin(
+        coord,
+        request,
+        Caller::Token(&actor),
+        policy_lock.as_ref(),
+        now,
+    ) {
         Ok(value) => value,
         Err(err) => {
             println!("admin token use {} op {op} status 400", checked.id);
@@ -400,6 +425,15 @@ fn dispatch_token(
     }
 }
 
+/// Take the policy write lock for `admin-policy-set` only.
+fn policy_lock_for(op: &str) -> Result<Option<admin::PolicyWrite>, CoordError> {
+    if op == "admin-policy-set" {
+        admin::policy_write_lock().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 fn status_response(status: u16, error: String) -> Response {
     Response {
         ok: false,
@@ -413,6 +447,7 @@ fn run_admin(
     coord: &Coordinator,
     request: &Request,
     caller: Caller<'_>,
+    policy_lock: Option<&admin::PolicyWrite>,
     now: SystemTime,
 ) -> Result<serde_json::Value, CoordError> {
     let actor = caller.actor();
@@ -452,7 +487,10 @@ fn run_admin(
             coord.lock_update(update, actor)?
         }
         "admin-policy" => admin::policy_show(coord)?,
-        "admin-policy-set" => admin::policy_set(coord, &request.name)?,
+        "admin-policy-set" => {
+            let lock = policy_lock.ok_or(CoordError::State)?;
+            admin::policy_set(coord, lock, &request.name)?
+        }
         "admin-token-create" => {
             owner_only()?;
             let ask: apitoken::CreateAsk = serde_json::from_str(&request.name)
@@ -599,14 +637,18 @@ fn peer_id(
 mod tests {
     use std::time::SystemTime;
 
-    use super::{dispatch_token, Request};
+    use super::{dispatch_token, run_admin, Caller, Request};
     use crate::apitoken::{self, admin_ops, all_scopes, scope_of, CreateAsk};
     use crate::state::{Coordinator, OidcConfig};
 
     fn call(op: &str, secret: &str) -> Request {
+        call_with(op, "", secret)
+    }
+
+    fn call_with(op: &str, name: &str, secret: &str) -> Request {
         Request {
             op: op.to_string(),
-            name: String::new(),
+            name: name.to_string(),
             token: None,
             id_token: None,
             nonce: None,
@@ -671,6 +713,151 @@ mod tests {
             now,
         );
         assert_eq!(reply.status, Some(401));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const OWNER: &str = "spiffe://orblx.local/node/owner";
+    const NODE_A: &str = "spiffe://orblx.local/node/a";
+
+    fn policy_text(owners: &[&str], port: u16) -> String {
+        let owners: Vec<String> = owners.iter().map(|id| format!("\"{id}\"")).collect();
+        format!(
+            "{{\"owners\": [{}], \"acls\": [{{\"action\": \"accept\", \"src\": [\"{NODE_A}\"], \"proto\": \"tcp\", \"dst\": [\"{OWNER}:{port}\"]}}]}}",
+            owners.join(", ")
+        )
+    }
+
+    fn sha(path: &std::path::Path) -> String {
+        match std::fs::read(path) {
+            Ok(bytes) => crate::netmap::encode_hex(&orblx_audit::sha256_digest(&bytes)),
+            Err(_) => "missing".to_string(),
+        }
+    }
+
+    fn deny_count(coord: &Coordinator, id: &str, reason: &str) -> usize {
+        coord
+            .config_audit_text()
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                line.contains("\"token-deny\"")
+                    && line.contains(&format!("\"target\":\"{id}\""))
+                    && line.contains(&format!("reason {reason} status 403"))
+            })
+            .count()
+    }
+
+    /// W25-3b: no token changes the owners, the node lock signers, or the token rules.
+    #[test]
+    fn a_token_cannot_escalate_past_its_scope() {
+        let dir = std::env::temp_dir().join(format!("orblx-server-escal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        let policy_path = dir.join("policy.hujson");
+        std::fs::write(&policy_path, policy_text(&[OWNER], 22)).unwrap();
+        coord.set_policy_file(&policy_path).unwrap();
+        let now = SystemTime::now();
+        let owner_id = orblx_identity::SpiffeId::parse(OWNER).unwrap();
+        let a_id = orblx_identity::SpiffeId::parse(NODE_A).unwrap();
+        // A policy:write token and a token with every scope get the same refusals.
+        for scopes in [
+            vec!["policy:write".to_string()],
+            all_scopes().iter().map(|s| s.to_string()).collect(),
+        ] {
+            let made = apitoken::create(
+                &coord,
+                &CreateAsk {
+                    scopes,
+                    ttl_secs: 60,
+                },
+                OWNER,
+                now,
+            )
+            .unwrap();
+            let before = sha(&policy_path);
+            let tokens_before = sha(&dir.join(apitoken::API_TOKEN_FILE));
+            for owners in [vec![OWNER, NODE_A], vec![], vec![NODE_A]] {
+                let ask = call_with("admin-policy-set", &policy_text(&owners, 22), &made.secret);
+                let reply = dispatch_token(&coord, &ask, &made.secret, now);
+                assert_eq!(reply.status, Some(403), "{owners:?}");
+                assert!(!reply.ok);
+                assert!(reply.detail.is_none());
+            }
+            assert_eq!(sha(&policy_path), before);
+            assert!(coord.caller_is_owner(&owner_id).unwrap());
+            assert!(!coord.caller_is_owner(&a_id).unwrap());
+            assert_eq!(deny_count(&coord, &made.id, "owners"), 3);
+            // The same owners in a new policy is allowed.
+            let ask = call_with(
+                "admin-policy-set",
+                &policy_text(&[OWNER], 2222),
+                &made.secret,
+            );
+            let reply = dispatch_token(&coord, &ask, &made.secret, now);
+            assert_eq!(reply.status, Some(200));
+            assert_ne!(sha(&policy_path), before);
+            assert!(coord.caller_is_owner(&owner_id).unwrap());
+            std::fs::write(&policy_path, policy_text(&[OWNER], 22)).unwrap();
+            // Token rules: owner SVID only, for every token.
+            for (op, name) in [
+                (
+                    "admin-token-create",
+                    r#"{"scopes":["policy:write"],"ttl_secs":60}"#.to_string(),
+                ),
+                ("admin-token-list", String::new()),
+                ("admin-token-revoke", made.id.clone()),
+            ] {
+                let reply = dispatch_token(
+                    &coord,
+                    &call_with(op, &name, &made.secret),
+                    &made.secret,
+                    now,
+                );
+                assert_eq!(reply.status, Some(403), "{op}");
+            }
+            assert_eq!(sha(&dir.join(apitoken::API_TOKEN_FILE)), tokens_before);
+        }
+        // Node lock signers: lock:write only. A policy:write token gets 403.
+        let made = apitoken::create(
+            &coord,
+            &CreateAsk {
+                scopes: vec!["policy:write".to_string()],
+                ttl_secs: 60,
+            },
+            OWNER,
+            now,
+        )
+        .unwrap();
+        let lock_before = sha(&dir.join(crate::nodelock::COORD_LOCK_FILE));
+        let key = "a".repeat(64);
+        for (op, name) in [
+            ("admin-lock-init", format!(r#"{{"keys":["{key}"]}}"#)),
+            ("admin-lock-update", "{}".to_string()),
+            ("admin-lock-sign", "{}".to_string()),
+        ] {
+            let reply = dispatch_token(
+                &coord,
+                &call_with(op, &name, &made.secret),
+                &made.secret,
+                now,
+            );
+            assert_eq!(reply.status, Some(403), "{op}");
+        }
+        assert_eq!(
+            sha(&dir.join(crate::nodelock::COORD_LOCK_FILE)),
+            lock_before
+        );
+        assert_eq!(deny_count(&coord, &made.id, "scope"), 3);
+        // Only the owner SVID path can change the owners.
+        let lock = crate::admin::policy_write_lock().unwrap();
+        let ask = call_with("admin-policy-set", &policy_text(&[OWNER, NODE_A], 22), "");
+        run_admin(&coord, &ask, Caller::Owner(OWNER), Some(&lock), now).unwrap();
+        drop(lock);
+        assert!(coord.caller_is_owner(&a_id).unwrap());
+        let audit = coord.config_audit_text().unwrap();
+        let _ = orblx_audit::verify_config_jsonl(&audit).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -127,13 +127,16 @@ pub enum Refusal {
     Revoked,
     /// The token does not hold the scope of the operation (403).
     Scope,
+    /// The call would add, remove, or change a policy owner (403, W25-3b).
+    /// Only an owner SVID (mTLS) can change the owners.
+    Owners,
 }
 
 impl Refusal {
     /// The HTTP-style status code.
     pub fn status(self) -> u16 {
         match self {
-            Self::Scope => 403,
+            Self::Scope | Self::Owners => 403,
             _ => 401,
         }
     }
@@ -145,6 +148,7 @@ impl Refusal {
             Self::Expired => "expired",
             Self::Revoked => "revoked",
             Self::Scope => "scope",
+            Self::Owners => "owners",
         }
     }
 
@@ -155,6 +159,9 @@ impl Refusal {
             Self::Expired => "The API token is expired.",
             Self::Revoked => "The API token is revoked.",
             Self::Scope => "The API token does not have the scope for this operation.",
+            Self::Owners => {
+                "An API token cannot change the policy owners. Only an owner SVID can do this."
+            }
         }
     }
 }
@@ -371,13 +378,22 @@ fn state_word(token: &TokenRecord, now_ms: u64) -> &'static str {
 ///
 /// An allowed call writes `token-use`. A refused call writes `token-deny`.
 /// The record holds the token id, never the token text.
+///
+/// `rule` runs only when the token and the scope are good (W25-3b). When it returns
+/// a refusal, the call is refused and the record is `token-deny`, not `token-use`.
 pub fn check(
     coord: &Coordinator,
     secret: &str,
     op: &str,
     now: SystemTime,
+    rule: impl FnOnce() -> Result<Option<Refusal>, CoordError>,
 ) -> Result<Checked, CoordError> {
-    let checked = decide(coord, secret, op, now)?;
+    let mut checked = decide(coord, secret, op, now)?;
+    if checked.result.is_ok() {
+        if let Some(refusal) = rule()? {
+            checked.result = Err(refusal);
+        }
+    }
     let dir = coord.state_dir()?;
     let digest = file_digest(&dir)?;
     let (action, detail) = match checked.result {
@@ -558,6 +574,10 @@ mod tests {
 
     const OWNER: &str = "spiffe://orblx.local/node/owner";
 
+    fn no_rule() -> Result<Option<Refusal>, crate::error::CoordError> {
+        Ok(None)
+    }
+
     struct Scratch(PathBuf);
 
     impl Scratch {
@@ -698,15 +718,15 @@ mod tests {
         let made = create(&coord, &ask(&["nodes:read"], 60), OWNER, now).unwrap();
         assert!(made.secret.starts_with(API_TOKEN_PREFIX));
         assert_eq!(count(&coord, "token-create", &made.id), 1);
-        let used = check(&coord, &made.secret, "admin-nodes", now).unwrap();
+        let used = check(&coord, &made.secret, "admin-nodes", now, no_rule).unwrap();
         assert_eq!(used.result, Ok(()));
         assert_eq!(count(&coord, "token-use", &made.id), 1);
-        let denied = check(&coord, &made.secret, "admin-policy-set", now).unwrap();
+        let denied = check(&coord, &made.secret, "admin-policy-set", now, no_rule).unwrap();
         assert_eq!(denied.result, Err(Refusal::Scope));
         assert_eq!(count(&coord, "token-deny", &made.id), 1);
         revoke(&coord, &made.id, OWNER, now).unwrap();
         assert_eq!(count(&coord, "token-revoke", &made.id), 1);
-        let late = check(&coord, &made.secret, "admin-nodes", now).unwrap();
+        let late = check(&coord, &made.secret, "admin-nodes", now, no_rule).unwrap();
         assert_eq!(late.result, Err(Refusal::Revoked));
         assert_eq!(count(&coord, "token-deny", &made.id), 2);
         assert_eq!(count(&coord, "token-use", &made.id), 1);

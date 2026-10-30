@@ -8,6 +8,7 @@
 //! audit record: the SVID, the agent grants, SSH, and file send.
 
 use std::collections::BTreeMap;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use orblx_audit::{sha256_digest, verify_config_jsonl, ConfigAction, EMPTY_DIGEST};
@@ -289,11 +290,58 @@ pub fn policy_show(coord: &Coordinator) -> Result<Value, CoordError> {
     }))
 }
 
+static POLICY_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Proof that the caller holds the policy write lock (W25-3b).
+///
+/// A token caller checks the owner list and writes the policy with the same lock.
+/// So an owner change between the check and the write cannot be lost.
+pub struct PolicyWrite(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+/// Take the policy write lock.
+pub fn policy_write_lock() -> Result<PolicyWrite, CoordError> {
+    POLICY_WRITE_LOCK
+        .lock()
+        .map(PolicyWrite)
+        .map_err(|_| CoordError::State)
+}
+
+/// Return true when the policy text has the same owner set as the loaded policy.
+///
+/// A text that is not a valid policy returns true. `policy_set` refuses it later.
+pub fn policy_keeps_owners(
+    coord: &Coordinator,
+    _lock: &PolicyWrite,
+    text: &str,
+) -> Result<bool, CoordError> {
+    let Ok(next) = orblx_identity::Policy::from_hujson(text.as_bytes()) else {
+        return Ok(true);
+    };
+    let mut now: Vec<String> = coord
+        .policy_owners()?
+        .iter()
+        .map(|id| id.as_uri().to_string())
+        .collect();
+    let mut want: Vec<String> = next
+        .owners()
+        .iter()
+        .map(|id| id.as_uri().to_string())
+        .collect();
+    now.sort();
+    want.sort();
+    Ok(now == want)
+}
+
 /// Replace the policy file (W25-3, scope `policy:write`).
 ///
 /// The coordinator checks the text first. A bad text does not change the file.
 /// The coordinator then loads the file and writes one `policy-replace` record.
-pub fn policy_set(coord: &Coordinator, text: &str) -> Result<Value, CoordError> {
+/// The caller holds the policy write lock.
+pub fn policy_set(
+    coord: &Coordinator,
+    _lock: &PolicyWrite,
+    text: &str,
+) -> Result<Value, CoordError> {
     if orblx_identity::Policy::from_hujson(text.as_bytes()).is_err() {
         return Err(CoordError::Protocol("The policy is not valid.".to_string()));
     }
