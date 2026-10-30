@@ -17,6 +17,8 @@
 #   GITOPS_BIN      An orblx binary. Without it, the script builds target/debug/orblx.
 #   PROOF_LOG       The log file of this run. The secret check also reads this file.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../../../scripts/proof/pipe-lib.sh"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 EXAMPLE="$(cd "$HERE/.." && pwd)"
@@ -27,6 +29,11 @@ GITOPS_PROJECT="${GITOPS_PROJECT:-orblx-w25i-gitops-proof}"
 GITOPS_IMAGE="${GITOPS_IMAGE:-orblx-w25i-gitops:local}"
 WORK="$(mktemp -d)"
 ENV_FILE="$WORK/env"
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap proof_lock_end EXIT
+proof_lock_take "policy-gitops" "$GITOPS_PROJECT"
 printf 'GITOPS_IMAGE=%s\nGITOPS_EXAMPLE=%s\n' "$GITOPS_IMAGE" "$EXAMPLE" > "$ENV_FILE"
 
 as_root() {
@@ -45,7 +52,8 @@ cleanup() {
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the cleanup runs first, then the lock is released.
+trap 'cleanup; proof_lock_end' EXIT
 
 fail() {
   echo "proof_fail: $*" >&2
@@ -158,7 +166,7 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 dc exec -T coord test -s /var/lib/orblx/trust-bundle.pem || fail "no trust bundle"
-coord_ip="$(dc exec -T ci getent ahostsv4 coord | awk '{print $1; exit}')"
+coord_ip="$(dc exec -T ci getent ahostsv4 coord | read_all awk '{print $1; exit}')"
 COORD="${coord_ip}:443"
 echo "coord ${COORD}"
 

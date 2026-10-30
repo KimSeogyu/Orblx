@@ -141,7 +141,7 @@ say "checksum ok ${actual}"
 
 mkdir "${work}/x"
 tar -xzf "${work}/${tarball}" -C "${work}/x" || fail "The tarball did not extract."
-dir="$(find "${work}/x" -mindepth 1 -maxdepth 1 -type d -name 'orblx-*' | head -n 1)"
+dir="$(find "${work}/x" -mindepth 1 -maxdepth 1 -type d -name 'orblx-*' | sed -n 1p)"
 [ -n "$dir" ] && [ -f "${dir}/orblx" ] || fail "The tarball has no orblx binary."
 
 as_root=""

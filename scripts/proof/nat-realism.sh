@@ -20,12 +20,8 @@
 # The script prints proof_ok.
 set -euo pipefail
 
-# Exit 0 when a line of stdin matches the ERE $1. It reads all of stdin.
-# Do not use grep -q, grep -m, head or awk with exit on a pipe: the reader exits early,
-# the writer gets SIGPIPE (exit 141), and set -o pipefail fails the pipe (W24-E4b, W25-3).
-has_line() {
-  awk -v re="$1" '$0 ~ re {found = 1} END {exit !found}'
-}
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"

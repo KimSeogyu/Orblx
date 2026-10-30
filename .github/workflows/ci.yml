@@ -32,12 +32,12 @@ jobs:
         run: |
           sh -n scripts/install.sh
           # bash -n reads only its first file, so check each script alone.
-          for script in scripts/release/*.sh scripts/proof/*.sh scripts/*.sh; do
+          for script in $(git ls-files '*.sh'); do
             bash -n "$script"
           done
           sh -n docker/entrypoint.sh
 
-      - name: Run the perf watch summary tests
+      - name: Run the proof script tests (perf watch summary, early pipe readers, lock, root)
         run: python3 -m unittest discover -s scripts/proof/tests -v
 
       - name: Run the Python agent SDK tests
@@ -125,6 +125,15 @@ jobs:
           grep -E '^renew_gap_summary|packet gap|trace [0-9]+ test (gap|stall|os_stall)' renew-report.log
           echo "renew_gap_report macos test_exit ${code} (report only)"
           exit 0
+
+      - name: Check the shell syntax of all shell scripts
+        run: |
+          for script in $(git ls-files '*.sh'); do
+            bash -n "$script"
+          done
+
+      - name: Run the proof script tests (perf watch summary, early pipe readers, lock, root)
+        run: python3 -m unittest discover -s scripts/proof/tests -v
 
       - name: Run the Python agent SDK tests
         run: python3 -m unittest discover -s sdk/python/tests -v

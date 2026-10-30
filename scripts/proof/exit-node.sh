@@ -6,6 +6,8 @@
 # The script deletes the orblx-exit-proof containers at the start.
 # The script does not print enroll tokens or private keys.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -49,7 +51,11 @@ cleanup() {
     sudo -n rm -rf "$WORK" >/dev/null 2>&1 || rm -rf "$WORK" >/dev/null 2>&1 || true
   fi
 }
-trap cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "exit-node"
 
 dc() {
   "${DOCKER[@]}" compose --env-file "$WORK/proof.env" --progress quiet -f "$FILE" "$@"
@@ -67,9 +73,9 @@ as_root() {
 # That policy drops UDP on a user-defined bridge.
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -105,7 +111,7 @@ wait_log() {
   local limit="$3"
   local i
   for i in $(seq 1 "$limit"); do
-    if dc logs "$service" 2>/dev/null | grep -q "$pattern"; then
+    if dc logs "$service" 2>/dev/null | read_all grep -q "$pattern"; then
       return 0
     fi
     sleep 1
@@ -148,7 +154,7 @@ route_uses_tun() {
   echo "=== [C] ip route get ${dest} ==="
   text="$(dc exec -T client ip route get "$dest")"
   printf '%s\n' "$text"
-  printf '%s\n' "$text" | grep -q 'orblx0'
+  printf '%s\n' "$text" | read_all grep -q 'orblx0'
 }
 
 mkdir -p "$EXIT_COORD_STATE" "$WORK/enroll-exit" "$WORK/enroll-client" "$EXIT_NODE_STATE" "$EXIT_CLIENT_STATE"

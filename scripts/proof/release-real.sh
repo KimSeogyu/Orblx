@@ -9,6 +9,8 @@
 # and serves the changed copy from a [C] mirror container. The install must refuse it.
 # The release has no private key. The script prints no token and no key.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 TAG="${RELEASE_TAG:-v0.1.0-rc.2}"
@@ -37,7 +39,11 @@ cleanup() {
   as_root docker image rm "$IMAGE" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "release-real"
 
 case "$TAG" in
   v[0-9]*) ;;
@@ -159,8 +165,8 @@ if [[ "$status" -eq 0 || "$status" -eq 98 || "$status" -eq 99 ]]; then
   echo "The install did not refuse the changed tarball." >&2
   exit 1
 fi
-printf '%s\n' "$out" | grep -q '^signature ok\|signature ok$'
-printf '%s\n' "$out" | grep -qF "The checksum of ${TARBALL} is not correct. The script installed nothing."
-printf '%s\n' "$out" | grep -q '^install_exit [1-9]'
+printf '%s\n' "$out" | read_all grep -q '^signature ok\|signature ok$'
+printf '%s\n' "$out" | read_all grep -qF "The checksum of ${TARBALL} is not correct. The script installed nothing."
+printf '%s\n' "$out" | read_all grep -q '^install_exit [1-9]'
 
 echo "proof_ok"
