@@ -395,7 +395,9 @@ done
 pd_udp="$(jq -s --arg g "$g_svid" '[.[] | select(.action == "packet-deny" and .actor == $g and .target == "udp/9090")] | length' "$WORK/b-packet-audit.jsonl")"
 pd_all="$(jq -s '[.[] | select(.action == "packet-deny")] | length' "$WORK/b-packet-audit.jsonl")"
 jq -c --arg g "$g_svid" 'select(.actor == $g and .target == "tcp/9090") | {action, actor, target, detail}' "$WORK/b-packet-audit.jsonl"
-pd_verify="$(dc exec -T b orblx audit verify-config --file "$STATE/packet-audit.jsonl" 2>&1 | head -1)"
+# Read all the output first. With head -1 in the pipe, docker exec can fail with EPIPE (exit 255).
+pd_verify_out="$(dc exec -T b orblx audit verify-config --file "$STATE/packet-audit.jsonl" 2>&1 || true)"
+pd_verify="${pd_verify_out%%$'\n'*}"
 echo "packet_deny b tcp9090_from_g ${pd_tcp} udp9090_from_g ${pd_udp} all ${pd_all} verify ${pd_verify}"
 if [[ "$PORT_GATE" == 1 ]]; then
   if (( b9090_from_g != 0 )); then
