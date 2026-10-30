@@ -98,11 +98,15 @@ pub enum ConfigAction {
     PacketDeny,
     /// An owner removed the SVID deny entry of one principal (W25-2 revoke undo).
     Unrevoke,
+    /// The delivery to one SIEM sink started to fail (W25-13).
+    ///
+    /// The coordinator writes one record for each run of failures, not one for each try.
+    SinkError,
 }
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -136,6 +140,7 @@ impl ConfigAction {
         Self::Unshare,
         Self::PacketDeny,
         Self::Unrevoke,
+        Self::SinkError,
     ];
 
     /// Return the stable action token.
@@ -175,6 +180,7 @@ impl ConfigAction {
             Self::Unshare => "unshare",
             Self::PacketDeny => "packet-deny",
             Self::Unrevoke => "unrevoke",
+            Self::SinkError => "sink-error",
         }
     }
 
@@ -221,6 +227,7 @@ impl ConfigAction {
             Self::Unshare => 31,
             Self::PacketDeny => 32,
             Self::Unrevoke => 33,
+            Self::SinkError => 34,
         }
     }
 

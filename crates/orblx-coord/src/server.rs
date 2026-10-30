@@ -464,12 +464,16 @@ fn dispatch_token(
     // write use the same lock.
     // W25-7: a token cannot change the audit webhooks. A token that could remove a
     // webhook could hide its later calls from the receiver.
+    // W25-13: a token cannot change the SIEM sinks, for the same reason.
     let rule = || match &policy_lock {
         Some(lock) if !admin::policy_keeps_owners(coord, lock, &request.name)? => {
             Ok(Some(apitoken::Refusal::Owners))
         }
         Some(lock) if !admin::policy_keeps_webhooks(coord, lock, &request.name)? => {
             Ok(Some(apitoken::Refusal::Webhooks))
+        }
+        Some(lock) if !admin::policy_keeps_sinks(coord, lock, &request.name)? => {
+            Ok(Some(apitoken::Refusal::Sinks))
         }
         _ => Ok(None),
     };
@@ -844,6 +848,52 @@ mod tests {
                     && line.contains(&format!("reason {reason} status 403"))
             })
             .count()
+    }
+
+    /// W25-13: no token adds, removes, or changes a SIEM sink.
+    #[test]
+    fn a_token_cannot_change_the_siem_sinks() {
+        let dir = std::env::temp_dir().join(format!("orblx-server-sinks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        let sinks = |list: &[&str], port: u16| {
+            let base = policy_text(&[OWNER], port);
+            format!("{{\"auditSinks\": [{}], {}", list.join(", "), &base[1..])
+        };
+        let hec = r#"{"name": "hec", "type": "https", "url": "https://siem:8088/services/collector", "format": "splunk-hec", "credentialFile": "hec.token"}"#;
+        let hec_new_url = r#"{"name": "hec", "type": "https", "url": "https://other:8088/services/collector", "format": "splunk-hec", "credentialFile": "hec.token"}"#;
+        let syslog = r#"{"name": "sys", "type": "syslog-tls", "address": "siem:6514"}"#;
+        let policy_path = dir.join("policy.hujson");
+        std::fs::write(&policy_path, sinks(&[hec], 22)).unwrap();
+        coord.set_policy_file(&policy_path).unwrap();
+        assert_eq!(coord.audit_sinks().unwrap().len(), 1);
+        let now = SystemTime::now();
+        let made = apitoken::create(
+            &coord,
+            &CreateAsk {
+                scopes: all_scopes().iter().map(|s| s.to_string()).collect(),
+                ttl_secs: 60,
+            },
+            OWNER,
+            now,
+        )
+        .unwrap();
+        let before = sha(&policy_path);
+        for list in [vec![], vec![hec, syslog], vec![hec_new_url]] {
+            let ask = call_with("admin-policy-set", &sinks(&list, 22), &made.secret);
+            let reply = dispatch_token(&coord, &ask, &made.secret, now);
+            assert_eq!(reply.status, Some(403), "{list:?}");
+        }
+        assert_eq!(sha(&policy_path), before);
+        assert_eq!(deny_count(&coord, &made.id, "sinks"), 3);
+        // The same sinks in a new policy is allowed.
+        let ask = call_with("admin-policy-set", &sinks(&[hec], 2222), &made.secret);
+        let reply = dispatch_token(&coord, &ask, &made.secret, now);
+        assert_eq!(reply.status, Some(200));
+        assert_ne!(sha(&policy_path), before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// W25-7: no token adds, removes, or changes an audit webhook URL.
