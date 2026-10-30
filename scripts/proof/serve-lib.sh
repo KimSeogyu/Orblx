@@ -13,6 +13,8 @@
 #   SERVE_OUT      First three octets of the outside network (default 172.30.42).
 #   SERVE_BIN      An orblx binary to use. Without it, the setup builds target/debug/orblx.
 #   ORBLX_NET_HOOK A root script that the setup runs after the networks start.
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 FILE="scripts/proof/compose.serve.yml"
 SERVE_PROJECT="${SERVE_PROJECT:-orblx-serve-proof}"
@@ -61,9 +63,9 @@ serve_cleanup() {
 
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -89,7 +91,7 @@ NETMAP
 wait_direct() {
   local node=$1 peer=$2 attempt
   for attempt in $(seq 1 40); do
-    if dc exec -T "$node" orblx status 2>/dev/null | grep -q "peer ${peer} overlay_ip .* path direct "; then
+    if dc exec -T "$node" orblx status 2>/dev/null | read_all grep -q "peer ${peer} overlay_ip .* path direct "; then
       return 0
     fi
     sleep 1
@@ -102,7 +104,7 @@ wait_direct() {
 wait_log() {
   local node=$1 pattern=$2 attempt
   for attempt in $(seq 1 40); do
-    if dc logs "$node" 2>/dev/null | grep -Eq -- "$pattern"; then
+    if dc logs "$node" 2>/dev/null | read_all grep -Eq -- "$pattern"; then
       return 0
     fi
     sleep 0.5
@@ -141,8 +143,8 @@ expect_get() {
   local out
   out="$(get "$@")"
   printf '%s\n' "$out"
-  echo "$out" | grep -q ' status HTTP/1.0 200 '
-  echo "$out" | grep -q 'body hello from orblx serve on node b'
+  echo "$out" | read_all grep -q ' status HTTP/1.0 200 '
+  echo "$out" | read_all grep -q 'body hello from orblx serve on node b'
 }
 
 expect_fail() {

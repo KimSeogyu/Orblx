@@ -6,6 +6,8 @@
 # The script deletes the orblx-agent-proof volumes at the start.
 # The script does not print enroll tokens, private keys, tickets, or use proofs.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -26,7 +28,11 @@ cleanup() {
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "agent-grant" "${PROOF_PROJECT:-}"
 
 dc() {
   docker compose --progress quiet -p "${PROOF_PROJECT:-orblx-agent-proof}" --profile nodes -f "$FILE" "$@"
@@ -35,7 +41,7 @@ dc() {
 resolve_name() {
   local name="$1"
   dc --profile nodes run --rm --no-deps --entrypoint getent owner ahostsv4 "$name" \
-    | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
+    | read_all awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
 }
 
 as_root() {
@@ -48,9 +54,9 @@ as_root() {
 
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -83,7 +89,7 @@ wait_log() {
   local needle="$2"
   local i
   for i in $(seq 1 60); do
-    if dc logs "$service" 2>&1 | grep -q "$needle"; then
+    if dc logs "$service" 2>&1 | read_all grep -q "$needle"; then
       return 0
     fi
     sleep 1
@@ -178,7 +184,7 @@ expect_denied() {
     echo "The connection was not denied. status ${status}" >&2
     exit 1
   fi
-  printf '%s\n' "$output" | grep -q "connect denied reason ${needle}"
+  printf '%s\n' "$output" | read_all grep -q "connect denied reason ${needle}"
 }
 
 cp "$ROOT/scripts/proof/agent.hujson" "$POLICY_FILE"
@@ -219,7 +225,7 @@ owner approve a
 owner approve b
 nodes="$(owner nodes)"
 printf '%s\n' "$nodes"
-b_ip="$(printf '%s\n' "$nodes" | awk '$1 == "node" && $2 == "b" {print $3; exit}')"
+b_ip="$(printf '%s\n' "$nodes" | read_all awk '$1 == "node" && $2 == "b" {print $3; exit}')"
 echo "b_ip ${b_ip}"
 
 for name in a b; do
@@ -235,7 +241,7 @@ dc --profile nodes up -d a b
 wait_log a 'The TUN device'
 wait_log b 'The TUN device'
 for i in $(seq 1 60); do
-  if dc exec -T a orblx status --state-dir "$STATE" 2>/dev/null | grep -q '^peer b .* path direct '; then
+  if dc exec -T a orblx status --state-dir "$STATE" 2>/dev/null | read_all grep -q '^peer b .* path direct '; then
     break
   fi
   if [[ "$i" -eq 60 ]]; then
@@ -265,7 +271,7 @@ echo "=== [C] grant 1 request: web port 8080 ttl ${TTL_SECS} ==="
 reply="$(grant_request 8080 "$TTL_SECS")"
 printf '%s\n' "$reply"
 grant1="$(printf '%s\n' "$reply" | field grant_id)"
-printf '%s\n' "$reply" | grep -qx 'grant_state pending'
+printf '%s\n' "$reply" | read_all grep -qx 'grant_state pending'
 
 echo "=== [C] grant request above 300 s is refused ==="
 if grant_request 8080 301 >"$WORK/long.txt" 2>&1; then
@@ -281,7 +287,7 @@ status=$?
 set -e
 printf '%s\n' "$pending"
 [[ "$status" -eq 3 ]]
-printf '%s\n' "$pending" | grep -qx 'grant_state pending'
+printf '%s\n' "$pending" | read_all grep -qx 'grant_state pending'
 
 echo "=== [C] owner lists and approves grant 1 ==="
 owner grants
@@ -303,8 +309,8 @@ cat "$WORK/second.txt"
 echo "=== [C] agent connects to web on b ==="
 ok_out="$(on_a agent connect --grant "$STATE/agent-g1" --send 'GET / HTTP/1.0\r\n\r\n')"
 printf '%s\n' "$ok_out"
-printf '%s\n' "$ok_out" | grep -q '^connect ok '
-printf '%s\n' "$ok_out" | grep -q '^reply HTTP/1.0 200'
+printf '%s\n' "$ok_out" | read_all grep -q '^connect ok '
+printf '%s\n' "$ok_out" | read_all grep -q '^reply HTTP/1.0 200'
 
 expect_denied "other port 5432 is refused" destination \
   --grant "$STATE/agent-g1" --to "${b_ip}:5432" --service db
@@ -347,7 +353,7 @@ echo "=== [C] coordinator records the expiry without a list call ==="
 # The script does not call "admin grants" after the end until this check is done.
 coord_line=""
 for i in $(seq 1 100); do
-  coord_line="$(dc logs coord 2>&1 | grep -m1 "coord agent grant ${grant1} expired " || true)"
+  coord_line="$(dc logs coord 2>&1 | read_all grep -m1 "coord agent grant ${grant1} expired " || true)"
   if [[ -n "$coord_line" ]]; then
     break
   fi
@@ -372,9 +378,9 @@ early_audit="$(owner audit)"
 printf '%s
 ' "$early_audit" | grep " agent-expire " || true
 printf '%s
-' "$early_audit" | grep -q " agent-expire .*${grant1}"
+' "$early_audit" | read_all grep -q " agent-expire .*${grant1}"
 printf '%s
-' "$early_audit" | grep -q '^verify ok '
+' "$early_audit" | read_all grep -q '^verify ok '
 printf '%s
 ' "$early_audit" | grep '^verify '
 
@@ -396,7 +402,7 @@ owner grant-approve "$grant3"
 grant_fetch "$grant3" "$STATE/agent-g3"
 g3_before="$(on_a agent connect --grant "$STATE/agent-g3" --send 'GET / HTTP/1.0\r\n\r\n')"
 printf '%s\n' "$g3_before"
-printf '%s\n' "$g3_before" | grep -q '^reply HTTP/1.0 200'
+printf '%s\n' "$g3_before" | read_all grep -q '^reply HTTP/1.0 200'
 
 echo "=== [C] revoke loop: revoke grant 2 only ==="
 on_a agent connect --grant "$STATE/agent-g2" --every-ms 50 --max-wait 60 >"$WORK/revoke-loop.txt" 2>&1 &
@@ -428,8 +434,8 @@ echo "guard_revoked_deny_ms ${guard_rv_ms} guard_deny_after_revoke_done_ms $(( g
 echo "=== [C] grant 3 for the same agent name still works after the revoke ==="
 g3_after="$(on_a agent connect --grant "$STATE/agent-g3" --send 'GET / HTTP/1.0\r\n\r\n')"
 printf '%s\n' "$g3_after"
-printf '%s\n' "$g3_after" | grep -q '^connect ok '
-printf '%s\n' "$g3_after" | grep -q '^reply HTTP/1.0 200'
+printf '%s\n' "$g3_after" | read_all grep -q '^connect ok '
+printf '%s\n' "$g3_after" | read_all grep -q '^reply HTTP/1.0 200'
 expect_denied "grant 2 stays refused" revoked --grant "$STATE/agent-g2"
 if dc exec -T b grep -q "agent grant ${grant3} revoked" "$STATE/guard-web.log"; then
   echo "The guard revoked grant 3." >&2
@@ -445,7 +451,7 @@ owner grant-approve "$grant4"
 grant_fetch "$grant4" "$STATE/agent-g4"
 g4_out="$(on_a agent connect --grant "$STATE/agent-g4" --send 'GET / HTTP/1.0\r\n\r\n')"
 printf '%s\n' "$g4_out"
-printf '%s\n' "$g4_out" | grep -q '^reply HTTP/1.0 200'
+printf '%s\n' "$g4_out" | read_all grep -q '^reply HTTP/1.0 200'
 echo "new_grant_same_agent status 200"
 
 echo "=== [C] the deny set holds the ticket nonce, not the agent name ==="
@@ -467,7 +473,7 @@ printf '%s\n' "$web_verify"
 db_verify="$(dc exec -T b orblx audit verify-config --file "$STATE/agent-audit-db.jsonl")"
 printf '%s\n' "$db_verify"
 for action in agent-grant agent-use agent-deny agent-expire agent-revoke; do
-  count="$(printf '%s\n' "$web_verify" | awk -v key="$action" '$1 == key {print $2; exit}')"
+  count="$(printf '%s\n' "$web_verify" | read_all awk -v key="$action" '$1 == key {print $2; exit}')"
   echo "web_chain ${action} ${count:-0}"
   if [[ -z "$count" || "$count" -eq 0 ]]; then
     echo "The web guard chain has no ${action} record." >&2
@@ -479,9 +485,9 @@ dc exec -T b grep -c '"agent-deny"' "$STATE/agent-audit-db.jsonl"
 echo "=== [C] coordinator audit chain ==="
 coord_audit="$(owner audit)"
 printf '%s\n' "$coord_audit" | grep ' agent-' || true
-printf '%s\n' "$coord_audit" | grep -q '^verify ok '
+printf '%s\n' "$coord_audit" | read_all grep -q '^verify ok '
 for action in agent-grant agent-approve agent-revoke agent-expire; do
-  if ! printf '%s\n' "$coord_audit" | grep -q " ${action} "; then
+  if ! printf '%s\n' "$coord_audit" | read_all grep -q " ${action} "; then
     echo "The coordinator chain has no ${action} record." >&2
     exit 1
   fi

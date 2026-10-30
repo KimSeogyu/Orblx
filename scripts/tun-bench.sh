@@ -5,6 +5,8 @@
 # The bench does not use WireGuard, Headscale, or DERP.
 
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proof/pipe-lib.sh"
 
 export PATH="/usr/local/cargo/bin:/usr/sbin:/sbin:${PATH:-/usr/bin}"
 export RUSTUP_HOME="${RUSTUP_HOME:-/usr/local/rustup}"
@@ -79,6 +81,6 @@ echo "host_euid=$(id -u)"
 echo "host_cap_eff=$(awk '/^CapEff:/ { print $2 }' /proc/self/status)"
 echo "host_tun=$(stat -c '%A %n' /dev/net/tun)"
 echo "host_ip_path=$(command -v ip)"
-echo "host_ip=$(ip -V 2>&1 | head -n 1)"
+echo "host_ip=$(ip -V 2>&1 | read_all head -n 1)"
 echo "tun_bench_command=scripts/tun-bench.sh"
 exec "$bin"

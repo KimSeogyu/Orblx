@@ -3,6 +3,8 @@
 # The script deletes the orblx-admin-proof volumes at the start.
 # The script does not print enroll tokens or private keys.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -15,7 +17,11 @@ cleanup() {
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "admin"
 
 dc() {
   docker compose --progress quiet --profile nodes -f "$FILE" "$@"
@@ -24,7 +30,7 @@ dc() {
 resolve_name() {
   local name="$1"
   dc --profile nodes run --rm --no-deps --entrypoint getent a ahostsv4 "$name" \
-    | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
+    | read_all awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
 }
 
 as_root() {
@@ -37,9 +43,9 @@ as_root() {
 
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -72,7 +78,7 @@ wait_bundle() {
 wait_listener() {
   local i
   for i in $(seq 1 40); do
-    if dc logs b 2>&1 | grep -q 'The TUN device'; then
+    if dc logs b 2>&1 | read_all grep -q 'The TUN device'; then
       return 0
     fi
     sleep 1
@@ -119,7 +125,7 @@ expect_ping_fail() {
     echo "The ping from a to b succeeded." >&2
     exit 1
   fi
-  printf '%s\n' "$output" | grep -q "$needle"
+  printf '%s\n' "$output" | read_all grep -q "$needle"
 }
 
 cp "$ROOT/scripts/proof/admin.hujson" "$POLICY_FILE"
@@ -209,8 +215,8 @@ ping_ok="$(run_node a ping b \
   --bundle /var/lib/orblx/bundle.pem \
   --timeout 5)"
 printf '%s\n' "$ping_ok"
-printf '%s\n' "$ping_ok" | grep -qx 'path direct'
-printf '%s\n' "$ping_ok" | grep -q '^rtt_ms '
+printf '%s\n' "$ping_ok" | read_all grep -qx 'path direct'
+printf '%s\n' "$ping_ok" | read_all grep -q '^rtt_ms '
 
 echo "=== [C] status json ==="
 status_json="$(dc exec -T b orblx status --json --state-dir /var/lib/orblx)"
@@ -221,11 +227,11 @@ printf '%s\n' "$status_json" | jq -e '.state' >/dev/null
 echo "=== [C] node metrics ==="
 node_metrics="$(dc exec -T b curl -fsS http://127.0.0.1:9464/metrics)"
 printf '%s\n' "$node_metrics"
-printf '%s\n' "$node_metrics" | grep -q '^orblx_node_packets_tx '
-printf '%s\n' "$node_metrics" | grep -q '^orblx_node_packets_rx '
-printf '%s\n' "$node_metrics" | grep -q '^orblx_node_sessions '
-tx_count="$(printf '%s\n' "$node_metrics" | awk '/^orblx_node_packets_tx /{print $2; exit}')"
-rx_count="$(printf '%s\n' "$node_metrics" | awk '/^orblx_node_packets_rx /{print $2; exit}')"
+printf '%s\n' "$node_metrics" | read_all grep -q '^orblx_node_packets_tx '
+printf '%s\n' "$node_metrics" | read_all grep -q '^orblx_node_packets_rx '
+printf '%s\n' "$node_metrics" | read_all grep -q '^orblx_node_sessions '
+tx_count="$(printf '%s\n' "$node_metrics" | read_all awk '/^orblx_node_packets_tx /{print $2; exit}')"
+rx_count="$(printf '%s\n' "$node_metrics" | read_all awk '/^orblx_node_packets_rx /{print $2; exit}')"
 if [[ -z "$tx_count" || -z "$rx_count" || "$tx_count" -eq 0 || "$rx_count" -eq 0 ]]; then
   echo "The ping left the packet counters at 0." >&2
   exit 1
@@ -255,17 +261,17 @@ netcheck="$(run_node a netcheck \
   --relay "${relay_ip}:443" \
   --timeout 3)"
 printf '%s\n' "$netcheck"
-printf '%s\n' "$netcheck" | grep -qx 'udp443 ok'
-printf '%s\n' "$netcheck" | grep -qx 'quic443 ok'
-printf '%s\n' "$netcheck" | grep -qx 'relay ok'
-printf '%s\n' "$netcheck" | grep -q '^nat '
+printf '%s\n' "$netcheck" | read_all grep -qx 'udp443 ok'
+printf '%s\n' "$netcheck" | read_all grep -qx 'quic443 ok'
+printf '%s\n' "$netcheck" | read_all grep -qx 'relay ok'
+printf '%s\n' "$netcheck" | read_all grep -q '^nat '
 
 echo "=== [C] relay metrics ==="
 relay_metrics="$(dc exec -T relay curl -fsS http://127.0.0.1:9464/metrics)"
 printf '%s\n' "$relay_metrics"
-printf '%s\n' "$relay_metrics" | grep -q '^orblx_relay_attaches '
-printf '%s\n' "$relay_metrics" | grep -q '^orblx_relay_forwards '
-printf '%s\n' "$relay_metrics" | grep -q '^orblx_relay_drops '
+printf '%s\n' "$relay_metrics" | read_all grep -q '^orblx_relay_attaches '
+printf '%s\n' "$relay_metrics" | read_all grep -q '^orblx_relay_forwards '
+printf '%s\n' "$relay_metrics" | read_all grep -q '^orblx_relay_drops '
 
 echo "=== [C] admin revoke ==="
 revoke_start="$(date +%s)"
