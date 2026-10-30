@@ -15,7 +15,7 @@ mod session;
 mod wire;
 
 pub use error::RelayError;
-pub use pipe::RelayPipe;
+pub use pipe::{RelayPipe, RelaySender};
 pub use server::{RelayServer, RelayStats, ServerConfig};
 pub use session::RelaySessionId;
 pub use wire::{

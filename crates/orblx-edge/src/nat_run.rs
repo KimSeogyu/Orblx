@@ -23,7 +23,7 @@ use orblx_datapath::{
     format_node_status, is_ipv4_packet, open_tun, NodeStatus, StatusPeer, TunConfig,
     LINUX_TUN_NAME, NODE_PID_FILE, NODE_STATUS_FILE,
 };
-use orblx_relay::{RelayPipe, RelaySessionId};
+use orblx_relay::{RelayPipe, RelaySender, RelaySessionId};
 
 use crate::birthday::{
     local_kind, peer_kind, strategy, MappingKind, RateGate, Spray, Strategy, BIRTHDAY_SOCKETS,
@@ -45,6 +45,10 @@ const HELLO_GAP: Duration = Duration::from_millis(50);
 const PUNCH_GAP: Duration = Duration::from_millis(200);
 const RELAY_ONLY_PUNCH_GAP: Duration = Duration::from_secs(2);
 const DIRECT_READ: Duration = Duration::from_millis(5);
+/// The longest time that the relay loop blocks on its socket.
+///
+/// Data frames wake the loop at once. The limit only sets the timing of the control frames and the stop check.
+const RELAY_WAIT: Duration = Duration::from_millis(20);
 /// After a renewal the node sends the new hello on each path for this time.
 const RENEW_HELLO_MS: u64 = 5_000;
 /// The gap between two hello frames after a renewal.
@@ -212,6 +216,8 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         svid_expiry: AtomicU64::new(config.svid_expiry),
         hello_until: AtomicU64::new(0),
         direct_out: Mutex::new(None),
+        relay_out: Mutex::new(None),
+        relay_broken: AtomicBool::new(false),
         peer_name: config.peer_name,
         peer_overlay: config.peer_overlay,
         peer_svid: config.peer_svid,
@@ -380,6 +386,13 @@ struct Hub {
     ///
     /// The router sends a data frame at once with this socket.
     direct_out: Mutex<Option<(UdpSocket, SocketAddr)>>,
+    /// The send handle of the relay attachment.
+    ///
+    /// The router and the relay loop send with this handle at once.
+    /// The lock keeps the frames on a TCP attachment in order.
+    relay_out: Mutex<Option<RelaySender>>,
+    /// A send on the relay handle failed. The relay loop attaches again.
+    relay_broken: AtomicBool,
     peer_name: String,
     peer_overlay: Ipv4Addr,
     peer_svid: String,
@@ -664,6 +677,44 @@ impl Hub {
     }
 
     /// Store the direct socket and the peer address for [`Hub::flush_direct`].
+    /// Send all queued relay frames now. Return false when a send fails.
+    fn flush_relay(&self) -> bool {
+        let mut out = lock(&self.relay_out);
+        let Some(sender) = out.as_mut() else {
+            return true;
+        };
+        while let Some(frame) = self.pop(OverlayPath::Relay) {
+            if sender.send_opaque(&frame).is_err() {
+                self.push_front(OverlayPath::Relay, frame);
+                *out = None;
+                self.relay_broken.store(true, Ordering::Relaxed);
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Send control frames on the relay. Return false when a send fails.
+    fn send_relay(&self, frames: Vec<Vec<u8>>) -> bool {
+        let mut out = lock(&self.relay_out);
+        let Some(sender) = out.as_mut() else {
+            return frames.is_empty();
+        };
+        for frame in frames {
+            if sender.send_opaque(&frame).is_err() {
+                *out = None;
+                self.relay_broken.store(true, Ordering::Relaxed);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn set_relay_out(&self, sender: Option<RelaySender>) {
+        *lock(&self.relay_out) = sender;
+        self.relay_broken.store(false, Ordering::Relaxed);
+    }
+
     fn set_direct_out(&self, socket: &UdpSocket, peer: SocketAddr) {
         match socket.try_clone() {
             Ok(clone) => *lock(&self.direct_out) = Some((clone, peer)),
@@ -1115,9 +1166,14 @@ fn relay_loop(hub: Arc<Hub>) {
     let mut last_probe = Instant::now() - PROBE_GAP;
     while !stopped() {
         if pipe.is_none() {
-            match connect_relay(&hub) {
-                Ok(next) => {
+            let attached = connect_relay(&hub).and_then(|next| {
+                let sender = next.sender()?;
+                Ok((next, sender))
+            });
+            match attached {
+                Ok((next, sender)) => {
                     println!("The relay transport is {}.", next.transport());
+                    hub.set_relay_out(Some(sender));
                     pipe = Some(next);
                 }
                 Err(err) => {
@@ -1126,6 +1182,11 @@ fn relay_loop(hub: Arc<Hub>) {
                     continue;
                 }
             }
+        }
+        if hub.relay_broken.load(Ordering::Relaxed) {
+            hub.set_relay_out(None);
+            pipe = None;
+            continue;
         }
         let Some(current) = pipe.as_mut() else {
             continue;
@@ -1148,34 +1209,27 @@ fn relay_loop(hub: Arc<Hub>) {
         }
         if broken {
             eprintln!("The relay path stopped. The node will attach again.");
+            hub.set_relay_out(None);
             pipe = None;
             thread::sleep(Duration::from_millis(200));
             continue;
         }
         let frames = hub.send_control(Slot::Relay, &mut last_hello, &mut last_probe);
-        let mut failed = false;
-        if let Some(current) = pipe.as_mut() {
-            for frame in frames {
-                if current.send_opaque(&frame).is_err() {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if failed {
+        if !hub.send_relay(frames) || !hub.flush_relay() {
+            hub.set_relay_out(None);
             pipe = None;
             continue;
         }
-        if !drain_relay(&hub, pipe.as_mut()) {
+        // Block until the relay socket has data, or until the next control frame is due.
+        // The router sends data frames itself. This loop does not poll for them.
+        if current.wait_readable(RELAY_WAIT).is_err() {
+            hub.set_relay_out(None);
             pipe = None;
         }
-        thread::sleep(Duration::from_millis(2));
     }
+    hub.set_relay_out(None);
 }
 
-/// Renew the leaf SVID at two thirds of its life.
-///
-/// After a renewal the node sends the new signed hello on each path.
 fn renew_loop(hub: Arc<Hub>, first_der: Vec<u8>, mut renew: RenewFn) {
     let mut der = first_der;
     let mut retry = RENEW_RETRY_MIN;
@@ -1267,22 +1321,6 @@ fn connect_relay(hub: &Hub) -> Result<RelayPipe, orblx_relay::RelayError> {
     }
 }
 
-fn drain_relay(hub: &Hub, pipe: Option<&mut RelayPipe>) -> bool {
-    let Some(pipe) = pipe else {
-        return true;
-    };
-    while !stopped() {
-        let Some(frame) = hub.pop(OverlayPath::Relay) else {
-            return true;
-        };
-        if pipe.send_opaque(&frame).is_err() {
-            hub.push_front(OverlayPath::Relay, frame);
-            return false;
-        }
-    }
-    true
-}
-
 fn router_loop(hub: Arc<Hub>, packets: std::sync::mpsc::Receiver<Vec<u8>>) {
     let mut reported: Option<OverlayPath> = None;
     let mut known = false;
@@ -1293,8 +1331,9 @@ fn router_loop(hub: Arc<Hub>, packets: std::sync::mpsc::Receiver<Vec<u8>>) {
         match packets.recv_timeout(Duration::from_millis(10)) {
             Ok(packet) => {
                 hub.enqueue(packet);
-                // Do not wait for the direct read timeout.
+                // Do not wait for the direct read timeout or the relay wait.
                 hub.flush_direct();
+                hub.flush_relay();
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
@@ -1333,6 +1372,8 @@ fn router_loop(hub: Arc<Hub>, packets: std::sync::mpsc::Receiver<Vec<u8>>) {
             }
         }
         hub.flush_hold(plan);
+        // The hold queue and the resend can put frames on the relay queue.
+        hub.flush_relay();
         if !known || next != reported {
             if let Some(path) = next {
                 println!("The path to {} is {}.", hub.peer_name, path.as_str());

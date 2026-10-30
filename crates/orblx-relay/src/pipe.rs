@@ -1,5 +1,6 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 use crate::error::io_error;
@@ -106,14 +107,53 @@ impl RelayPipe {
     /// The bytes are copied into a DATA datagram.
     /// The function does not read the bytes.
     pub fn send_opaque(&mut self, payload: &[u8]) -> Result<(), RelayError> {
-        let datagram = encode_datagram(RelayKind::Data, self.session_id, payload)?;
         match &mut self.inner {
-            Inner::Udp(socket) => send_udp(socket, &datagram),
-            Inner::Tcp { stream, .. } => {
-                let record = encode_tcp_record(&datagram)?;
-                write_all_retry(stream, &record)
-            }
+            Inner::Udp(socket) => send_data_udp(socket, self.session_id, payload),
+            Inner::Tcp { stream, .. } => send_data_tcp(stream, self.session_id, payload),
         }
+    }
+
+    /// Return a second handle that sends on the same attachment.
+    ///
+    /// A different thread can send with the handle while this pipe waits for data.
+    /// Only one thread at a time must send on a TCP attachment.
+    pub fn sender(&self) -> Result<RelaySender, RelayError> {
+        let inner = match &self.inner {
+            Inner::Udp(socket) => SenderInner::Udp(socket.try_clone().map_err(io_error)?),
+            Inner::Tcp { stream, .. } => SenderInner::Tcp(stream.try_clone().map_err(io_error)?),
+        };
+        Ok(RelaySender {
+            inner,
+            session_id: self.session_id,
+        })
+    }
+
+    /// Block until the socket has bytes to read, or until the timeout ends.
+    ///
+    /// Return true when the socket has bytes to read.
+    /// The function does not read the bytes.
+    pub fn wait_readable(&self, timeout: Duration) -> Result<bool, RelayError> {
+        let fd = match &self.inner {
+            Inner::Udp(socket) => socket.as_raw_fd(),
+            Inner::Tcp { stream, .. } => stream.as_raw_fd(),
+        };
+        wait_fds_readable(&[fd], timeout)
+    }
+
+    /// Block until the socket or `other` has bytes to read, or until the timeout ends.
+    ///
+    /// Return true when one of the two has bytes to read.
+    /// A bridge uses this to wait on its local face and on the Relay at the same time.
+    pub fn wait_readable_or<T: AsRawFd>(
+        &self,
+        other: &T,
+        timeout: Duration,
+    ) -> Result<bool, RelayError> {
+        let fd = match &self.inner {
+            Inner::Udp(socket) => socket.as_raw_fd(),
+            Inner::Tcp { stream, .. } => stream.as_raw_fd(),
+        };
+        wait_fds_readable(&[fd, other.as_raw_fd()], timeout)
     }
 
     /// Receive one opaque DATA payload.
@@ -142,6 +182,77 @@ impl RelayPipe {
             }
         }
     }
+}
+
+/// A send handle for one Relay attachment.
+///
+/// [`RelayPipe::sender`] makes the handle.
+#[derive(Debug)]
+pub struct RelaySender {
+    inner: SenderInner,
+    session_id: RelaySessionId,
+}
+
+#[derive(Debug)]
+enum SenderInner {
+    Udp(UdpSocket),
+    Tcp(TcpStream),
+}
+
+impl RelaySender {
+    /// Send one opaque payload.
+    ///
+    /// The function does not read the bytes.
+    pub fn send_opaque(&mut self, payload: &[u8]) -> Result<(), RelayError> {
+        match &mut self.inner {
+            SenderInner::Udp(socket) => send_data_udp(socket, self.session_id, payload),
+            SenderInner::Tcp(stream) => send_data_tcp(stream, self.session_id, payload),
+        }
+    }
+}
+
+fn send_data_udp(
+    socket: &UdpSocket,
+    session_id: RelaySessionId,
+    payload: &[u8],
+) -> Result<(), RelayError> {
+    let datagram = encode_datagram(RelayKind::Data, session_id, payload)?;
+    send_udp(socket, &datagram)
+}
+
+fn send_data_tcp(
+    stream: &mut TcpStream,
+    session_id: RelaySessionId,
+    payload: &[u8],
+) -> Result<(), RelayError> {
+    let datagram = encode_datagram(RelayKind::Data, session_id, payload)?;
+    let record = encode_tcp_record(&datagram)?;
+    write_all_retry(stream, &record)
+}
+
+/// Wait with poll(2) until one of the descriptors is readable.
+fn wait_fds_readable(fds: &[libc::c_int], timeout: Duration) -> Result<bool, RelayError> {
+    let millis = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+    let mut entries: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let count = libc::nfds_t::try_from(entries.len()).unwrap_or(0);
+    // SAFETY: `entries` holds `count` valid pollfd values for the whole call.
+    let rc = unsafe { libc::poll(entries.as_mut_ptr(), count, millis) };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(io_error(err));
+    }
+    // An error or a hang-up also wakes the caller. The next read reports it.
+    Ok(rc > 0 && entries.iter().any(|entry| entry.revents != 0))
 }
 
 fn bind_addr(relay: SocketAddr) -> SocketAddr {
