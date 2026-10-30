@@ -136,13 +136,16 @@ pub enum Refusal {
     /// The call would add, remove, or change an audit webhook URL (403, W25-7).
     /// Only an owner SVID (mTLS) can change the audit webhooks.
     Webhooks,
+    /// The call would add, remove, or change a SIEM sink (403, W25-13).
+    /// Only an owner SVID (mTLS) can change the sinks.
+    Sinks,
 }
 
 impl Refusal {
     /// The HTTP-style status code.
     pub fn status(self) -> u16 {
         match self {
-            Self::Scope | Self::Owners | Self::Webhooks => 403,
+            Self::Scope | Self::Owners | Self::Webhooks | Self::Sinks => 403,
             _ => 401,
         }
     }
@@ -156,6 +159,7 @@ impl Refusal {
             Self::Scope => "scope",
             Self::Owners => "owners",
             Self::Webhooks => "webhooks",
+            Self::Sinks => "sinks",
         }
     }
 
@@ -171,6 +175,9 @@ impl Refusal {
             }
             Self::Webhooks => {
                 "An API token cannot change the audit webhooks. Only an owner SVID can do this."
+            }
+            Self::Sinks => {
+                "An API token cannot change the SIEM sinks. Only an owner SVID can do this."
             }
         }
     }

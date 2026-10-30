@@ -12,8 +12,8 @@ The unit tests are REAL. The network results are [C].
 |---|---|
 | New OIDC user (`oidc:SUBJECT`), first enroll | The coordinator adds the user as `pending` and refuses the enroll: `The user waits for owner approval.` No node, no SVID, no IP. |
 | Pending user, enroll again | Refused with the same text. The pending record does not change. |
-| `orblx admin user-approve oidc:SUBJECT` | The user is `approved`. 1 audit record `user-approve` (code 36). The next enroll gets an SVID. |
-| `orblx admin user-reject oidc:SUBJECT` | The user is `rejected`. 1 audit record `user-reject` (code 37). Each later enroll is refused: `The owner rejected this user.` |
+| `orblx admin user-approve oidc:SUBJECT` | The user is `approved`. 1 audit record `user-approve` (code 35). The next enroll gets an SVID. |
+| `orblx admin user-reject oidc:SUBJECT` | The user is `rejected`. 1 audit record `user-reject` (code 36). Each later enroll is refused: `The owner rejected this user.` |
 | Token enroll (`--token-file`) | No user check. A token node is a node of the owner, so it never waits. |
 | User in policy `userApproval.ownerUsers` | Approved at the first enroll with 1 record (detail `policy owner user`). `user-reject` refuses an owner user. |
 | User whose verified email is in `userApproval.autoApproveDomains` | Approved at the first enroll with 1 record (detail `policy auto-approve domain D`). The list is empty by default, so auto-approve is OFF by default. A rejected user stays rejected. |

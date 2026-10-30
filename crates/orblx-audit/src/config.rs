@@ -98,6 +98,10 @@ pub enum ConfigAction {
     PacketDeny,
     /// An owner removed the SVID deny entry of one principal (W25-2 revoke undo).
     Unrevoke,
+    /// The delivery to one SIEM sink started to fail (W25-13).
+    ///
+    /// The coordinator writes one record for each run of failures, not one for each try.
+    SinkError,
     /// An owner or the policy approved one OIDC user (W25-15).
     UserApprove,
     /// An owner rejected one OIDC user (W25-15).
@@ -106,7 +110,7 @@ pub enum ConfigAction {
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 36] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -140,6 +144,7 @@ impl ConfigAction {
         Self::Unshare,
         Self::PacketDeny,
         Self::Unrevoke,
+        Self::SinkError,
         Self::UserApprove,
         Self::UserReject,
     ];
@@ -181,6 +186,7 @@ impl ConfigAction {
             Self::Unshare => "unshare",
             Self::PacketDeny => "packet-deny",
             Self::Unrevoke => "unrevoke",
+            Self::SinkError => "sink-error",
             Self::UserApprove => "user-approve",
             Self::UserReject => "user-reject",
         }
@@ -229,9 +235,9 @@ impl ConfigAction {
             Self::Unshare => 31,
             Self::PacketDeny => 32,
             Self::Unrevoke => 33,
-            // 34 and 35 stay free for open work (W25-10, W25-13).
-            Self::UserApprove => 36,
-            Self::UserReject => 37,
+            Self::SinkError => 34,
+            Self::UserApprove => 35,
+            Self::UserReject => 36,
         }
     }
 
@@ -675,6 +681,24 @@ impl ConfigExport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W25-13: the SIEM verifier script has the same action codes as the chain.
+    #[test]
+    fn the_siem_verifier_knows_each_action_code() {
+        let script = include_str!("../../../scripts/siem/orblx-siem-verify.py");
+        let start = script.find("ACTIONS = [").unwrap();
+        let end = start + script[start..].find(']').unwrap();
+        let names: Vec<&str> = script[start + "ACTIONS = [".len()..end]
+            .split(',')
+            .map(|name| name.trim().trim_matches('"'))
+            .filter(|name| !name.is_empty())
+            .collect();
+        assert_eq!(names.len(), ConfigAction::ALL.len());
+        for (at, action) in ConfigAction::ALL.iter().enumerate() {
+            assert_eq!(usize::from(action.code()), at + 1, "{}", action.as_str());
+            assert_eq!(names[at], action.as_str());
+        }
+    }
 
     struct Scratch(PathBuf);
 

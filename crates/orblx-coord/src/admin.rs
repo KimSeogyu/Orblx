@@ -484,6 +484,27 @@ pub fn policy_keeps_webhooks(
     Ok(now == want)
 }
 
+/// Return true when the policy text `text` has the same SIEM sinks as the live policy
+/// (W25-13).
+///
+/// The token rule uses this check. A token cannot add, change, or remove a sink.
+/// A text that does not compile returns true, so the normal check reports it.
+/// The caller holds the policy write lock.
+pub fn policy_keeps_sinks(
+    coord: &Coordinator,
+    _lock: &PolicyWrite,
+    text: &str,
+) -> Result<bool, CoordError> {
+    let Ok(next) = orblx_identity::Policy::from_hujson(text.as_bytes()) else {
+        return Ok(true);
+    };
+    let mut now = coord.audit_sinks()?;
+    let mut want = next.audit_sinks().to_vec();
+    now.sort_by(|a, b| a.name.cmp(&b.name));
+    want.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(now == want)
+}
+
 /// Replace the policy file (W25-3, scope `policy:write`).
 ///
 /// The coordinator checks the text first. A bad text does not change the file.
