@@ -555,7 +555,10 @@ async fn run_mesh_inner(
         // at most 100 ms after the node writes the new list (W25-1).
         // The node lock check stays at each 10 s (each 100 ticks).
         let mut tick = tokio::time::interval(Duration::from_millis(100));
+        // The node applies the list only when the file text changes. Thus the
+        // tick does not touch the endpoint or the links when nothing changed.
         let mut ticks: u64 = 0;
+        let mut last_text: Option<Vec<u8>> = None;
         loop {
             tokio::select! {
                 changed = deny_shutdown.changed() => {
@@ -564,9 +567,16 @@ async fn run_mesh_inner(
                     }
                 }
                 _ = tick.tick() => {
-                    if let Some(deny) = read_deny_file(&deny_dir) {
-                        close_denied_links(&lock_mesh, &deny);
-                        deny_endpoint.replace_deny(deny);
+                    if let Ok(bytes) = fs::read(deny_dir.join("deny.json")) {
+                        if last_text.as_deref() != Some(bytes.as_slice()) {
+                            if let Some(deny) = parse_deny(&bytes) {
+                                // Replace first, so a session that starts now uses the new list.
+                                // Then close the open sessions of the denied peers.
+                                deny_endpoint.replace_deny(deny.clone());
+                                close_denied_links(&lock_mesh, &deny);
+                                last_text = Some(bytes);
+                            }
+                        }
                     }
                     if ticks.is_multiple_of(100) {
                         apply_lock_allow(&lock_mesh);
@@ -855,10 +865,9 @@ fn close_denied_links(mesh: &Mesh, deny: &DenySet) {
     }
 }
 
-fn read_deny_file(dir: &Path) -> Option<DenySet> {
-    let bytes = fs::read(dir.join("deny.json")).ok()?;
+fn parse_deny(bytes: &[u8]) -> Option<DenySet> {
     let mut deny = DenySet::empty();
-    match deny.apply_json(&bytes) {
+    match deny.apply_json(bytes) {
         Ok(_) => Some(deny),
         Err(_) => None,
     }

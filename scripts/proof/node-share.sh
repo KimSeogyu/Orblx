@@ -6,6 +6,7 @@
 # Checks:
 #   1. g connects to b:8080.
 #   2. The netmap of g holds only b and g2. A connect from g to node a fails.
+#      Node a counts the TCP and UDP bytes from g and g2 on port 7070: 0 bytes.
 #   3. A connect from a to g fails. The acl a -> g does not cross the tenant.
 #   4. The script removes the share with one rename of the policy file.
 #      g -> b:8080 is denied within LIMIT_MS. The script prints the ms.
@@ -322,6 +323,11 @@ for name in a b g g2; do
   dc exec -d "$name" python3 -m http.server 8080 --bind 0.0.0.0
   dc exec -T "$name" sh -c "cat > /tmp/share-get.py" <"$ROOT/scripts/proof/share-get.py"
   dc exec -T "$name" sh -c "cat > /tmp/probe.py" <"$ROOT/scripts/proof/revoke-probe.py"
+  dc exec -T "$name" sh -c "cat > /tmp/share-sink.py" <"$ROOT/scripts/proof/share-sink.py"
+done
+# Byte counters for gate 2: TCP and UDP 7070 on node a (other owner node) and on g2 (control).
+for name in a g2; do
+  dc exec -d "$name" python3 /tmp/share-sink.py serve 7070 /tmp/sink-7070.txt
 done
 dc exec -d b python3 -m http.server 9090 --bind 0.0.0.0
 sleep 1
@@ -331,6 +337,29 @@ expect_ok "g -> b:8080" g "$b_ip" 8080
 expect_ok "g2 -> b:8080" g2 "$b_ip" 8080
 echo "=== [C] gate 2: the guest does not reach the other node of the owner ==="
 expect_fail "g -> a:8080" g "$a_ip" 8080
+expect_fail "g2 -> a:8080" g2 "$a_ip" 8080
+# Each guest node sends 65536 bytes on TCP and 65536 bytes on UDP to a:7070.
+# The control sends the same from g to g2:7070 (same tenant), so the counter works.
+for name in g g2; do
+  dc exec -T "$name" python3 /tmp/share-sink.py send "$a_ip" 7070 65536 0.8
+done
+dc exec -T g python3 /tmp/share-sink.py send "$g2_ip" 7070 65536 0.8
+sleep 1
+sink_bytes() {
+  dc exec -T "$1" cat /tmp/sink-7070.txt | awk -v src="$2" '$1 == src {n += $2} END {print n + 0}'
+}
+a_from_g="$(sink_bytes a "$g_ip")"
+a_from_g2="$(sink_bytes a "$g2_ip")"
+g2_from_g="$(sink_bytes g2 "$g_ip")"
+echo "gate2_bytes a_from_g ${a_from_g} a_from_g2 ${a_from_g2} control_g2_from_g ${g2_from_g}"
+if (( a_from_g != 0 || a_from_g2 != 0 )); then
+  echo "Node a got bytes from a guest node." >&2
+  exit 1
+fi
+if (( g2_from_g == 0 )); then
+  echo "The control counter got no bytes, so the counter does not work." >&2
+  exit 1
+fi
 echo "=== [C] gate 3: the owner does not reach the guest nodes ==="
 expect_fail "a -> g:8080" a "$g_ip" 8080
 expect_fail "a -> g2:8080" a "$g2_ip" 8080
@@ -451,5 +480,5 @@ hits="$(grep -cF 'PRIVATE KEY' "$WORK/all-logs.log" || true)"
 echo "secret_grep tokens 0 id_tokens 0 'PRIVATE KEY' ${hits}"
 [[ "$hits" -eq 0 ]]
 
-echo "summary guest oidc:bob shared spiffe://orblx.local/node/b:8080 unshare_deny_ms ${deny_ms} limit_ms ${LIMIT_MS} other_access_failures 0 share_records ${share_records} unshare_records ${unshare_records} coord_verify ok share_again_restore_ms ${reshare} port_checks ${port_results[*]}"
+echo "summary guest oidc:bob shared spiffe://orblx.local/node/b:8080 gate2_bytes_to_a ${a_from_g}+${a_from_g2} unshare_deny_ms ${deny_ms} limit_ms ${LIMIT_MS} other_access_failures 0 share_records ${share_records} unshare_records ${unshare_records} coord_verify ok share_again_restore_ms ${reshare} port_checks ${port_results[*]}"
 echo "proof_ok"

@@ -74,7 +74,7 @@ The brief scope is the policy, coordinator, and sharing files. These files are o
 | File | Change | Why |
 |---|---|---|
 | `crates/orblx-audit/src/config.rs` | Adds the actions `share` (27) and `unshare` (28). | Gate 5 needs one record of each kind. |
-| `crates/orblx-datapath/src/node.rs` | The deny tick is 100 ms (was 10 s). The node lock check stays at 10 s. New `close_denied_links`: at each tick, the node closes each open session whose peer SPIFFE ID is in the deny list. | Session control, not the packet path. The per-frame check denies only ticket nonces. Without this, an open session stays after the unshare (proof run 1 failed for this reason). The dial task tries again, so a share again restores the session with no restart. |
+| `crates/orblx-datapath/src/node.rs` | The deny tick is 100 ms (was 10 s). The node lock check stays at 10 s. The node applies the deny list only when the text of `deny.json` changes. Then it replaces the endpoint deny list and closes each open session whose peer SPIFFE ID is in the list (new `close_denied_links`). | Session control, not the packet path. The per-frame check denies only ticket nonces. Without this, an open session stays after the unshare (proof run 1 failed for this reason). The dial task tries again, so a share again restores the session with no restart. |
 | `crates/orblx-cli/src/up.rs` | The deny fetch starts each 500 ms. The fetch time is not added to the interval. | With the fetch time added, one run took 1120 ms (run 5) and failed the 1 s gate. |
 
 The packet path (`payload_from_data`, the packet filter of track A) is not changed.
@@ -93,13 +93,16 @@ The packet path (`payload_from_data`, the packet filter of track A) is not chang
 ## Proof [C]
 
 Script: `scripts/proof/node-share.sh`. Compose project `orblx-w25a-node-share` (`scripts/proof/compose.node-share.yml`).
-Policy: `scripts/proof/node-share.hujson`. HTTP helper: `scripts/proof/share-get.py`. The script prints `proof_ok` at the end.
+Policy: `scripts/proof/node-share.hujson`. HTTP helper: `scripts/proof/share-get.py`. Byte counter: `scripts/proof/share-sink.py`. The script prints `proof_ok` at the end.
 
 Setup: the [C] test OIDC issuer, the coordinator with `[oidc]`, owner nodes `owner`, `a`, `b` (token enroll), and guest nodes `g`, `g2` (OIDC enroll, subject `bob`).
 Nodes b and g2 serve HTTP on TCP 8080 and 9090. Node g serves TCP 8080.
 
 1. g connects to b:8080.
-2. The netmap of g has only b and g2. g -> a:8080 is refused.
+2. The netmap of g has only b and g2. g -> a:8080 and g2 -> a:8080 are refused.
+   Node a counts the bytes from each source on TCP and UDP 7070 (`scripts/proof/share-sink.py`).
+   g and g2 each send 65536 bytes on TCP and 65536 bytes on UDP to a:7070. Node a must count 0 bytes from g and g2.
+   A control send from g to g2:7070 (same tenant) must count more than 0 bytes, so the counter works.
 3. The netmap of a has only b (not g or g2). a -> g:8080 and a -> g2:8080 are refused, although the ACL has a -> g:*.
 4. The script removes the share with one rename of the policy file. A probe on g runs g -> b:8080 each 50 ms (timeout 0.2 s) until the first failure.
    Hold probes run a -> b:8080 and g -> g2:8080 each 100 ms for 8 s. deny_ms = the time from the rename to the end of the first failed GET (an upper limit). Limit 1000 ms.
