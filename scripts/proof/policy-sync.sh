@@ -11,6 +11,9 @@
 # Gate 3: 50 load identities run `orblx coord netmap --watch` (the same `policy-wait` client).
 #         The script measures the coordinator CPU with no change, and with one change each 10 s.
 #         Each coordinator CPU value must be less than 5% of one core.
+# Gate 4: b enrolls and starts after a and the router run. Node a must reach b (ICMP) in
+#         LIMIT_MS or less after b starts (late_peer_reachable_ms). Node a and the router
+#         do not restart.
 # The script deletes the proof containers at the start and at the end.
 # The script does not print enroll tokens or private keys.
 set -euo pipefail
@@ -28,6 +31,7 @@ export SYNC_COORD_STATE="$WORK/coord"
 export SYNC_POLICY_DIR="$WORK/policy"
 export SYNC_ROUTER_STATE="$WORK/router"
 export SYNC_A_STATE="$WORK/a"
+export SYNC_B_STATE="$WORK/b"
 COORD="172.30.126.2:443"
 LIMIT_MS=2000
 DROP_LIMIT_MS=1000
@@ -51,7 +55,7 @@ trap cleanup EXIT
 
 fail() {
   echo "$1" >&2
-  dc --profile nodes logs a router coord >&2 || true
+  dc --profile nodes logs a b router coord >&2 || true
   exit 1
 }
 
@@ -265,6 +269,44 @@ echo "policy_change_to_new_answer_ms remove ${remove_ms} add ${add_ms} (limit ${
 [[ "$remove_ms" -le "$LIMIT_MS" && "$add_ms" -le "$LIMIT_MS" ]] || fail "A policy change took more than ${LIMIT_MS} ms."
 echo "[C] gate1 ok"
 
+echo "=== Gate 4 [C]: b enrolls later, a reaches b with no restart ==="
+router_start0="$(restarts router)"
+a_start2="$(restarts a)"
+enroll_ms="$(date +%s%3N)"
+b_out="$(enroll b 172.30.126.5)"
+echo "$b_out"
+b_ip="$(awk '$1 == "overlay_ip" {print $2; exit}' <<<"$b_out")"
+[[ -n "$b_ip" ]] || fail "The enroll of b did not print an overlay address."
+# Ping each 100 ms. -D prints the receive time of each reply as UNIX seconds.
+dc exec -d a sh -c "ping -D -n -i 0.1 -W 1 -c 100 ${b_ip} >/tmp/ping-b.log 2>&1"
+b_up_ms="$(date +%s%3N)"
+dc --profile nodes up -d b
+b_started_ms="$(date +%s%3N)"
+first_reply=""
+for _ in $(seq 1 60); do
+  first_reply="$(dc exec -T a sh -c 'grep -m1 "bytes from" /tmp/ping-b.log' 2>/dev/null \
+    | sed -E 's/^\[([0-9]+)\.([0-9]{3}).*/\1\2/' || true)"
+  [[ "$first_reply" =~ ^[0-9]+$ ]] && break
+  first_reply=""
+  sleep 0.5
+done
+[[ -n "$first_reply" ]] || fail "Node a did not reach b."
+wait_log a 'The node adds the peer b from the new netmap.'
+from_enroll=$((first_reply - enroll_ms))
+from_up=$((first_reply - b_up_ms))
+from_started=$((first_reply - b_started_ms))
+(( from_started < 0 )) && from_started=0
+router_start1="$(restarts router)"
+a_start3="$(restarts a)"
+echo "node a container start before [${a_start2}] after [${a_start3}]"
+echo "router container start before [${router_start0}] after [${router_start1}]"
+[[ "$a_start2" == "$a_start3" && "$router_start0" == "$router_start1" ]] || fail "A node restarted."
+sleep 3
+dc exec -T a sh -c 'tail -n 2 /tmp/ping-b.log'
+echo "late_peer_reachable_ms from_compose_up ${from_up} from_container_started ${from_started} from_enroll_start ${from_enroll} (limit ${LIMIT_MS} ms from compose up)"
+[[ "$from_up" -le "$LIMIT_MS" ]] || fail "The late peer took more than ${LIMIT_MS} ms."
+echo "[C] gate4 ok"
+
 echo "=== Gate 3 [C]: ${LOAD_NODES} policy-wait clients, coordinator CPU ==="
 dc exec -T coord sh -c "for i in \$(seq 1 ${LOAD_NODES}); do orblx coord token create --state /var/lib/orblx --out /var/lib/orblx/tokens/load\$i --ttl 3600 >/dev/null || exit 1; done"
 dc --profile load up -d load
@@ -351,5 +393,5 @@ hits="$(grep -cF 'PRIVATE KEY' "$WORK/all-logs.out" || true)"
 echo "secret_grep 'PRIVATE KEY' ${hits}"
 [[ "$hits" -eq 0 ]] || fail "A log holds a private key."
 
-echo "summary policy_change_to_new_answer_ms remove ${remove_ms} add ${add_ms} limit_ms ${LIMIT_MS} revoke_drop_ms ${drop_ms} limit_ms ${DROP_LIMIT_MS} restarts 0 manual_fetch 0"
+echo "summary policy_change_to_new_answer_ms remove ${remove_ms} add ${add_ms} limit_ms ${LIMIT_MS} revoke_drop_ms ${drop_ms} limit_ms ${DROP_LIMIT_MS} late_peer_reachable_ms ${from_up} restarts 0 manual_fetch 0"
 echo "proof_ok"

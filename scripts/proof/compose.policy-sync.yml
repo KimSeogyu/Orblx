@@ -128,6 +128,25 @@ services:
       proof:
         ipv4_address: 172.30.126.4
 
+  # Gate 4: b enrolls and starts after a and the router run.
+  b:
+    <<: *node
+    volumes:
+      - ${SYNC_B_STATE:?set SYNC_B_STATE}:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.126.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+    networks:
+      proof:
+        ipv4_address: 172.30.126.5
+
 networks:
   proof:
     driver: bridge
