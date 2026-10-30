@@ -31,7 +31,6 @@ PROOF_LOCK_OWN=()
 PROOF_LOCK_SAMPLER=""
 PROOF_LOCK_SAMPLES=""
 PROOF_LOCK_TICKET=""
-PROOF_LOCK_TICKET_MS=""
 # The keeper runs this file, so it needs the full path.
 PROOF_LOCK_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 # The ticket line that tells the keeper that a waiter uses the W25-19 protocol.
@@ -171,7 +170,6 @@ proof_lock_queue_join() {
     chmod 1777 "$dir" 2>/dev/null || true
   fi
   PROOF_LOCK_TICKET="$(date +%s%N)-$$"
-  PROOF_LOCK_TICKET_MS="$(proof_lock_ms)"
   printf 'label=%s\n%s\n' "$PROOF_LOCK_LABEL" "$PROOF_LOCK_PROTO" >"${dir}/${PROOF_LOCK_TICKET}" 2>/dev/null || PROOF_LOCK_TICKET=""
 }
 
@@ -360,7 +358,6 @@ proof_lock_take() {
         (umask 000 && : >>"$extra")
       fi
     done
-    waited_from="$(proof_lock_ms)"
     proof_lock_queue_join "$file"
   fi
   proof_context queued
@@ -370,6 +367,8 @@ proof_lock_take() {
     echo "proof_lock ${PROOF_LOCK_LABEL} no flock on this host, the proof runs without the lock"
   else
     eval "exec ${PROOF_LOCK_FD}>>\"\${file}.fifo\""
+    # The wait time counts from here, as in W25-14 (after the queued proof_context line).
+    waited_from="$(proof_lock_ms)"
     proof_lock_queue_wait "$file" "$note" "$waited_from"
     PROOF_LOCK_OWNER=1
     export ORBLX_PROOF_LOCK_HELD="$$"
