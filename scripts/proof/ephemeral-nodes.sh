@@ -180,6 +180,21 @@ load_peers() {
   lab_cat "$1/netmap.json" | jq -r '.peers[].name' | awk '/^load/ {n++} END {print n + 0}'
 }
 
+# In a container the node is pid 1. A pid file from the last run names pid 1, and the new
+# run sees pid 1 alive ("The node is already running."). Delete the stale file of a
+# stopped container before the start. This is a test step only; the node code is not changed.
+clear_stale_pid() {
+  local state
+  state="$(dc --profile nodes ps -a --format '{{.State}}' "$1")"
+  [[ "$state" != running ]] || fail "The container $1 still runs."
+  if as_root test -e "$EPH_LAB/$1/orblxd.pid"; then
+    echo "$1 stale pid file: yes (deleted before the start)"
+    as_root rm -f "$EPH_LAB/$1/orblxd.pid"
+  else
+    echo "$1 stale pid file: no"
+  fi
+}
+
 ip_of() {
   store_nodes | awk -v n="$1" '$1 == n {ip = $3} END {print ip}'
 }
@@ -286,6 +301,7 @@ lab_cat coord/deny.json | jq -r '.revoked_uris[]' | has_line '^spiffe://orblx.lo
 
 echo "---- [C] e1 starts again with its old SVID ----"
 renew_fail0="$(dc --profile nodes logs --no-color e1 2>&1 | grep -c 'The SVID renewal failed' || true)"
+clear_stale_pid e1
 dc --profile nodes start e1 >/dev/null
 for _ in $(seq 1 $((EPH_SVID_TTL + 15))); do
   got="$(dc --profile nodes logs --no-color e1 2>&1 | grep -c 'The SVID renewal failed' || true)"
@@ -341,6 +357,7 @@ for _ in $(seq 1 300); do
 done
 echo "e2 offline_ms_at_restart ${off} (T ${T_MS}) stop_to_restart_ms $(( $(now_ms) - e2_stop_ms ))"
 [[ "$off" =~ ^[0-9]+$ ]] && (( off >= T_MS / 2 && off < T_MS )) || fail "e2 did not reach T/2 offline."
+clear_stale_pid e2
 dc --profile nodes start e2 >/dev/null
 max_off=0
 for _ in $(seq 1 $((EPH_T * 3 * 10))); do
@@ -352,7 +369,9 @@ for _ in $(seq 1 30); do
   dc exec -T a ping -n -c 1 -W 1 "$e2_ip" >/dev/null 2>&1 && break
   sleep 1
 done
-dc exec -T a ping -n -c 5 -i 0.2 -W 1 "$e2_ip" | tail -n 2
+e2_ping="$(dc exec -T a ping -n -c 5 -i 0.2 -W 1 "$e2_ip" 2>&1 || true)"
+printf '%s\n' "$e2_ping" | tail -n 2
+[[ "$(printf '%s\n' "$e2_ping" | awk '/packets transmitted/ {print $4}')" -gt 0 ]] || fail "e2 did not answer after the start."
 echo "e2 in_store $(in_store e2 && echo yes || echo no) node-remove $(remove_count e2) max_offline_ms ${max_off}"
 in_store e2 || fail "The coordinator removed e2."
 [[ "$(remove_count e2)" -eq 0 ]] || fail "The chain has a removal of e2."
