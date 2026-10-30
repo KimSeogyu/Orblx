@@ -46,13 +46,18 @@ dc() {
   as_root docker compose -p "$PROJECT" --env-file "$ENV_FILE" --progress quiet -f "$FILE" "$@"
 }
 
+# W25-5: one box proof at a time. The lock waits.
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$ROOT/scripts/proof/proof-lock.sh"
+
 cleanup() {
   if [[ "${ORBLX_HA_KEEP:-0}" == 1 ]]; then
     echo "ORBLX_HA_KEEP=1: the proof keeps the containers and ${WORK}" >&2
-    return
+  else
+    dc --profile nodes --profile tool down -v --remove-orphans >/dev/null 2>&1 || true
+    as_root rm -rf "$WORK" >/dev/null 2>&1 || rm -rf "$WORK" >/dev/null 2>&1 || true
   fi
-  dc --profile nodes --profile tool down -v --remove-orphans >/dev/null 2>&1 || true
-  as_root rm -rf "$WORK" >/dev/null 2>&1 || rm -rf "$WORK" >/dev/null 2>&1 || true
+  proof_lock_end || true
 }
 trap cleanup EXIT
 
@@ -255,6 +260,7 @@ restore_router() {
   wait_direct client "$router" 120 || fail "${router} did not come back."
 }
 
+proof_lock_take "ha-routers:${PROJECT}" "${PROJECT}-"
 echo "=== W25-10 HA subnet routers proof. All gates are [C] (Docker on one Linux host). ==="
 echo "project ${PROJECT} image ${IMAGE} runs ${RUNS} limit_ms ${LIMIT_MS} target_ms ${TARGET_MS} tcp_limit_ms ${TCP_LIMIT_MS} watch_secs ${WATCH_SECS}"
 echo "route ${CIDR} on router-a (lan ${LAN_IP[router-a]}) and router-b (lan ${LAN_IP[router-b]}); target ${TARGET}; nameserver ${NAMESERVER}"
