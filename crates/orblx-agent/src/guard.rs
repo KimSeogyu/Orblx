@@ -20,7 +20,9 @@ use orblx_identity::{DenySet, SpiffeId, TicketVerifier, TrustBundle};
 
 use crate::grant::AgentGrant;
 use crate::hex::encode_hex;
-use crate::proof::{open_use, unix_millis, Admitted, Refused, UseTarget, UseTrust};
+use crate::proof::{
+    open_use, unix_millis, Admitted, Refused, UseTarget, UseTrust, PROOF_WINDOW_SECS,
+};
 use crate::AgentError;
 
 const MAX_LINE: usize = 32 * 1024;
@@ -87,6 +89,21 @@ struct CoreState {
     deny_ok_at: Option<SystemTime>,
     audit: ConfigLog,
     known: BTreeMap<String, Known>,
+    /// Seen request nonces: (ticket hash, nonce) to the proof stamp.
+    seen: BTreeMap<([u8; 16], [u8; 16]), u64>,
+}
+
+/// Extra checks for one request after the proof check.
+///
+/// The HTTP gateway uses this for the path scope and the replay check.
+pub struct RequestCheck<'a> {
+    /// The request nonce. The core refuses a second use with `replay`.
+    pub nonce: Option<[u8; 16]>,
+    /// The scope check. It returns the reason token on failure.
+    pub scope: &'a dyn Fn(&AgentGrant) -> Result<(), &'static str>,
+    /// Text for the audit detail and the log, for example the method and the path.
+    /// It must not hold a token.
+    pub note: &'a str,
 }
 
 /// Shared guard checks and the grant audit chain.
@@ -124,6 +141,7 @@ impl GuardCore {
                 deny_ok_at: None,
                 audit,
                 known: BTreeMap::new(),
+                seen: BTreeMap::new(),
             }),
         })
     }
@@ -214,6 +232,34 @@ impl GuardCore {
         peer: SocketAddr,
         now: SystemTime,
     ) -> Result<GuardDecision, AgentError> {
+        let scope = |_: &AgentGrant| Ok(());
+        let check = RequestCheck {
+            nonce: None,
+            scope: &scope,
+            note: "",
+        };
+        self.admit_request(line, service, port, extra, &check, peer, now)
+    }
+
+    /// Check one proof line, then the request checks, and record the decision.
+    ///
+    /// The order is: deny freshness, proof, replay, scope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_request(
+        &self,
+        line: &str,
+        service: &str,
+        port: u16,
+        extra: &[u8],
+        check: &RequestCheck<'_>,
+        peer: SocketAddr,
+        now: SystemTime,
+    ) -> Result<GuardDecision, AgentError> {
+        let note = if check.note.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", check.note)
+        };
         let mut state = self.lock()?;
         let fresh = state
             .deny_ok_at
@@ -221,8 +267,9 @@ impl GuardCore {
             .is_some_and(|age| age <= self.stale_after);
         let at_ms = unix_millis(now)?;
         if !fresh {
-            let detail =
-                format!("reason stale service {service} port {port} peer {peer} at_ms {at_ms}");
+            let detail = format!(
+                "reason stale service {service} port {port}{note} peer {peer} at_ms {at_ms}"
+            );
             append(
                 &mut state,
                 "unknown",
@@ -231,7 +278,7 @@ impl GuardCore {
                 EMPTY_DIGEST,
                 &detail,
             )?;
-            println!("agent deny reason stale service {service} port {port} at_ms {at_ms}");
+            println!("agent deny reason stale service {service} port {port}{note} at_ms {at_ms}");
             return Ok(GuardDecision::Refuse("stale"));
         }
         let target = UseTarget {
@@ -246,11 +293,39 @@ impl GuardCore {
             netmap_public: &self.netmap_public,
             deny: &state.deny,
         };
-        match open_use(line, target, trust, extra, now) {
+        let opened = open_use(line, target, trust, extra, now);
+        let opened = match opened {
+            Ok(admitted) => match self.request_checks(&mut state, &admitted, check, now) {
+                Ok(()) => Ok(admitted),
+                Err(reason) => {
+                    // The grant is valid, so the core knows it for expiry and revoke.
+                    self.note_grant(&mut state, &admitted.grant, admitted.nonce, &admitted.agent)?;
+                    let actor = admitted.agent.as_uri().to_string();
+                    let detail = format!(
+                        "reason {reason} service {service} port {port}{note} peer {peer} at_ms {at_ms}"
+                    );
+                    append(
+                        &mut state,
+                        &actor,
+                        ConfigAction::AgentDeny,
+                        &admitted.grant.id,
+                        EMPTY_DIGEST,
+                        &detail,
+                    )?;
+                    println!(
+                        "agent deny reason {reason} grant {} service {service} port {port}{note} at_ms {at_ms}",
+                        admitted.grant.id
+                    );
+                    return Ok(GuardDecision::Refuse(reason));
+                }
+            },
+            Err(refused) => Err(refused),
+        };
+        match opened {
             Ok(admitted) => {
                 self.note_grant(&mut state, &admitted.grant, admitted.nonce, &admitted.agent)?;
                 let detail = format!(
-                    "service {service} port {port} peer {peer} ticket_hash {} at_ms {at_ms}",
+                    "service {service} port {port}{note} peer {peer} ticket_hash {} at_ms {at_ms}",
                     encode_hex(&admitted.ticket_hash)
                 );
                 let actor = admitted.agent.as_uri().to_string();
@@ -263,16 +338,77 @@ impl GuardCore {
                     EMPTY_DIGEST,
                     &detail,
                 )?;
-                println!("agent use grant {id} service {service} port {port} at_ms {at_ms}");
+                println!("agent use grant {id} service {service} port {port}{note} at_ms {at_ms}");
                 Ok(GuardDecision::Admit(Box::new(admitted)))
             }
             Err(refused) => {
                 let reason = refused.reason.as_str();
-                record_refused(&mut state, &refused, service, port, peer, at_ms)?;
-                println!("agent deny reason {reason} service {service} port {port} at_ms {at_ms}");
+                record_refused(&mut state, &refused, service, port, &note, peer, at_ms)?;
+                println!(
+                    "agent deny reason {reason} service {service} port {port}{note} at_ms {at_ms}"
+                );
                 Ok(GuardDecision::Refuse(reason))
             }
         }
+    }
+
+    fn request_checks(
+        &self,
+        state: &mut CoreState,
+        admitted: &Admitted,
+        check: &RequestCheck<'_>,
+        now: SystemTime,
+    ) -> Result<(), &'static str> {
+        let Some(nonce) = check.nonce else {
+            return (check.scope)(&admitted.grant);
+        };
+        let now_secs = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        // A proof stamp outside the window fails the proof check, so older
+        // entries cannot come back.
+        let keep_after = now_secs.saturating_sub(2 * PROOF_WINDOW_SECS);
+        state.seen.retain(|_, stamp| *stamp >= keep_after);
+        let key = (admitted.ticket_hash, nonce);
+        if state.seen.contains_key(&key) {
+            return Err("replay");
+        }
+        state.seen.insert(key, admitted.stamp);
+        (check.scope)(&admitted.grant)
+    }
+
+    /// Record one request that the gateway refused before the proof check.
+    ///
+    /// `note` must not hold a token.
+    pub fn record_early_deny(
+        &self,
+        reason: &str,
+        service: &str,
+        port: u16,
+        note: &str,
+        peer: SocketAddr,
+        now: SystemTime,
+    ) -> Result<(), AgentError> {
+        let at_ms = unix_millis(now)?;
+        let mut state = self.lock()?;
+        let note = if note.is_empty() {
+            String::new()
+        } else {
+            format!(" {note}")
+        };
+        let detail = format!(
+            "reason {reason} service {service} port {port}{note} peer {peer} at_ms {at_ms}"
+        );
+        append(
+            &mut state,
+            "unknown",
+            ConfigAction::AgentDeny,
+            "none",
+            EMPTY_DIGEST,
+            &detail,
+        )?;
+        println!("agent deny reason {reason} service {service} port {port}{note} at_ms {at_ms}");
+        Ok(())
     }
 
     fn note_grant(
@@ -329,6 +465,7 @@ fn record_refused(
     refused: &Refused,
     service: &str,
     port: u16,
+    note: &str,
     peer: SocketAddr,
     at_ms: u64,
 ) -> Result<(), AgentError> {
@@ -341,7 +478,7 @@ fn record_refused(
         .clone()
         .unwrap_or_else(|| "none".to_string());
     let detail = format!(
-        "reason {} service {service} port {port} peer {peer} at_ms {at_ms}",
+        "reason {} service {service} port {port}{note} peer {peer} at_ms {at_ms}",
         refused.reason.as_str()
     );
     append(
@@ -386,22 +523,7 @@ pub fn run_guard(config: GuardConfig, fetch: DenyFetch) -> Result<(), AgentError
     let core = Arc::new(GuardCore::new(&config)?);
     let listener =
         TcpListener::bind(config.listen).map_err(|err| AgentError::Io(err.to_string()))?;
-    let poll_core = Arc::clone(&core);
-    let poll = config.poll;
-    thread::spawn(move || loop {
-        match fetch() {
-            Ok(text) => {
-                if let Err(err) = poll_core.apply_deny(&text, SystemTime::now()) {
-                    eprintln!("agent guard deny apply failed. {err}");
-                }
-            }
-            Err(err) => eprintln!("agent guard deny fetch failed. {err}"),
-        }
-        if let Err(err) = poll_core.tick(SystemTime::now()) {
-            eprintln!("agent guard tick failed. {err}");
-        }
-        thread::sleep(poll);
-    });
+    spawn_poll(Arc::clone(&core), fetch, config.poll);
     println!(
         "agent guard service {} listen {} target {}",
         config.service, config.listen, config.target
@@ -422,6 +544,24 @@ pub fn run_guard(config: GuardConfig, fetch: DenyFetch) -> Result<(), AgentError
         });
     }
     Ok(())
+}
+
+/// Start the thread that reads the deny document and records expired grants.
+pub(crate) fn spawn_poll(core: Arc<GuardCore>, fetch: DenyFetch, poll: Duration) {
+    thread::spawn(move || loop {
+        match fetch() {
+            Ok(text) => {
+                if let Err(err) = core.apply_deny(&text, SystemTime::now()) {
+                    eprintln!("agent guard deny apply failed. {err}");
+                }
+            }
+            Err(err) => eprintln!("agent guard deny fetch failed. {err}"),
+        }
+        if let Err(err) = core.tick(SystemTime::now()) {
+            eprintln!("agent guard tick failed. {err}");
+        }
+        thread::sleep(poll);
+    });
 }
 
 fn serve_one(
