@@ -17,6 +17,8 @@
 #   ORBLX_NET_HOOK  A root script that the script runs after the network starts.
 #   PROOF_LOG       The log file of this run. The secret check also reads this file.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -27,6 +29,11 @@ EXPIRY_LIMIT_MS=1000
 REVOKE_LIMIT_MS=1000
 WORK="$(mktemp -d)"
 ENV_FILE="$WORK/env"
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap proof_lock_end EXIT
+proof_lock_take "api-tokens" "$TOKENS_PROJECT"
 printf 'TOKENS_IMAGE=%s\n' "$TOKENS_IMAGE" > "$ENV_FILE"
 
 as_root() {
@@ -45,7 +52,8 @@ cleanup() {
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the cleanup runs first, then the lock is released.
+trap 'cleanup; proof_lock_end' EXIT
 
 # A pipe into head or grep -q can stop the writer early (SIGPIPE). With pipefail, the
 # pipe then fails at random. So the script keeps each output in a variable first.
@@ -78,7 +86,7 @@ client_call() {
       --coord "$COORD" --bundle /coord-state/trust-bundle.pem 2>&1)"
   fi
   set -e
-  status="$(printf '%s\n' "$out" | awk '/^status /{print $2; exit}')"
+  status="$(printf '%s\n' "$out" | read_all awk '/^status /{print $2; exit}')"
   printf '%s\n' "${status:-none}"
 }
 
@@ -111,7 +119,7 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 dc exec -T coord test -s /var/lib/orblx/trust-bundle.pem || fail "no trust bundle"
-coord_ip="$(dc exec -T client getent ahostsv4 coord | awk '{print $1; exit}')"
+coord_ip="$(dc exec -T client getent ahostsv4 coord | read_all awk '{print $1; exit}')"
 COORD="${coord_ip}:443"
 echo "coord ${COORD}"
 

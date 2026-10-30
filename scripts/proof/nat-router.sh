@@ -16,7 +16,7 @@ NODE_IP="$3"
 MODE="$4"
 
 iface_for() {
-  ip -o -4 addr show | awk -v ip="$1/" 'index($4, ip) == 1 {print $2; exit}'
+  ip -o -4 addr show | awk -v ip="$1/" '!found && index($4, ip) == 1 {print $2; found = 1}'
 }
 
 WAN="$(iface_for "$WAN_IP")"

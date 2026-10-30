@@ -4,12 +4,18 @@
 # The containers stand in for other hosts. The outside network stands in for a public network.
 # The script does not print private keys, tickets, SVID proofs, or WebSocket keys.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"/pipe-lib.sh
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 # shellcheck source=serve-lib.sh
 source "$ROOT/scripts/proof/serve-lib.sh"
-trap serve_cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'serve_cleanup; proof_lock_end' EXIT
+proof_lock_take "serve-websocket" "${SERVE_PROJECT:-orblx-serve-proof}"
 
 WS_PORT=8090
 COUNT="${ORBLX_WS_COUNT:-100}"

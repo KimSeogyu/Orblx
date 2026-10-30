@@ -3,6 +3,8 @@
 # The containers stand in for other hosts.
 # The script does not print private keys, tickets, or SVID proofs.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -31,13 +33,17 @@ cleanup() {
   dc down --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "ssh"
 
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -82,7 +88,7 @@ wait_direct() {
   local peer=$2
   local attempt
   for attempt in $(seq 1 40); do
-    if dc exec -T "$node" orblx status 2>/dev/null | grep -q "peer ${peer} overlay_ip .* path direct "; then
+    if dc exec -T "$node" orblx status 2>/dev/null | read_all grep -q "peer ${peer} overlay_ip .* path direct "; then
       return 0
     fi
     sleep 1
@@ -95,7 +101,7 @@ wait_listen() {
   local node=$1
   local attempt
   for attempt in $(seq 1 40); do
-    if dc logs "$node" 2>/dev/null | grep -q 'ssh_listen '; then
+    if dc logs "$node" 2>/dev/null | read_all grep -q 'ssh_listen '; then
       return 0
     fi
     sleep 1
@@ -241,7 +247,7 @@ grep -q "\"kind\":\"record\".*\"recording_sha256\":\"${rec_sha}\"" "$WORK/b/ssh-
 echo "chain_has_recording_sha256 yes"
 b_audit="$(dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl)"
 printf '%s\n' "$b_audit"
-echo "$b_audit" | grep -qx 'record 1'
+echo "$b_audit" | read_all grep -qx 'record 1'
 
 echo "=== [C] one changed byte in the recording fails verify ==="
 cp "$rec_file" "$WORK/recording.orig"
@@ -251,9 +257,9 @@ if bad="$(dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.j
   exit 1
 fi
 printf 'verify_failed %s\n' "$bad"
-echo "$bad" | grep -q 'recording check failed'
+echo "$bad" | read_all grep -q 'recording check failed'
 cp "$WORK/recording.orig" "$rec_file"
-dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl | grep -qx ok
+dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl | read_all grep -qx ok
 echo "verify_after_restore ok"
 
 echo "=== [C] read-only recording directory on node c fails closed ==="
@@ -298,8 +304,8 @@ pty_out="$(
     --shell
 )"
 printf '%s\n' "$pty_out" | tr -d '\r' | grep -E '^(pty-42|got-10)$'
-printf '%s\n' "$pty_out" | tr -d '\r' | grep -qx 'pty-42'
-printf '%s\n' "$pty_out" | tr -d '\r' | grep -qx 'got-10'
+printf '%s\n' "$pty_out" | tr -d '\r' | read_all grep -qx 'pty-42'
+printf '%s\n' "$pty_out" | tr -d '\r' | read_all grep -qx 'got-10'
 shopt -s nullglob
 rec_files=("$WORK"/b/recordings/*.cast)
 shopt -u nullglob
@@ -348,7 +354,7 @@ grep -q "\"kind\":\"record\".*\"recording_sha256\":\"${pty_sha}\"" "$WORK/b/ssh-
 echo "chain_has_pty_recording_sha256 yes"
 b_audit="$(dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl)"
 printf '%s\n' "$b_audit"
-echo "$b_audit" | grep -qx 'record 2'
+echo "$b_audit" | read_all grep -qx 'record 2'
 
 echo "=== [C] one changed byte in the PTY recording fails verify ==="
 cp "$pty_file" "$WORK/pty.orig"
@@ -359,9 +365,9 @@ if bad="$(dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.j
   exit 1
 fi
 printf 'verify_failed %s\n' "$bad"
-echo "$bad" | grep -q 'recording check failed'
+echo "$bad" | read_all grep -q 'recording check failed'
 cp "$WORK/pty.orig" "$pty_file"
-dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl | grep -qx ok
+dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl | read_all grep -qx ok
 echo "verify_after_restore ok"
 
 echo "=== [C] PTY shell with a read-only recording directory on node c fails closed ==="
@@ -374,8 +380,8 @@ if c_out="$(printf 'echo leaked\nexit\n' | dc exec -T node-a orblx ssh rec@c \
   exit 1
 fi
 printf '%s\n' "$c_out"
-echo "$c_out" | grep -q 'The SSH shell was refused.'
-if echo "$c_out" | grep -q leaked; then
+echo "$c_out" | read_all grep -q 'The SSH shell was refused.'
+if echo "$c_out" | read_all grep -q leaked; then
   echo "The refused shell ran input." >&2
   exit 1
 fi
@@ -420,13 +426,13 @@ echo "revoke_seconds ${elapsed}"
 echo "=== [C] audit chain on node b ==="
 b_audit="$(dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl)"
 printf '%s\n' "$b_audit"
-echo "$b_audit" | grep -q '^ok$'
-echo "$b_audit" | grep -Eq '^start [1-9]'
-echo "$b_audit" | grep -Eq '^end [1-9]'
-echo "$b_audit" | grep -Eq '^deny [1-9]'
+echo "$b_audit" | read_all grep -q '^ok$'
+echo "$b_audit" | read_all grep -Eq '^start [1-9]'
+echo "$b_audit" | read_all grep -Eq '^end [1-9]'
+echo "$b_audit" | read_all grep -Eq '^deny [1-9]'
 echo "=== [C] audit chain on node c ==="
 c_audit="$(dc exec -T node-c orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl)"
 printf '%s\n' "$c_audit"
-echo "$c_audit" | grep -Eq '^deny [1-9]'
+echo "$c_audit" | read_all grep -Eq '^deny [1-9]'
 
 echo "proof_ok"

@@ -3,6 +3,8 @@
 # The host is REAL. Every extra host is a [C] container.
 # The script prints proof_ok and the path kind for each case.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -29,7 +31,7 @@ as_root() {
 # The NAT routers must receive the frame by MAC.
 open_legacy_forward() {
   if command -v iptables-legacy >/dev/null 2>&1; then
-    if as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP'; then
+    if as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP'; then
       echo "=== REAL set iptables-legacy FORWARD ACCEPT ==="
       as_root iptables-legacy -P FORWARD ACCEPT
     fi
@@ -111,7 +113,7 @@ status_text() {
 }
 
 path_of() {
-  printf '%s\n' "$1" | awk '/^peer / {print $6; exit}'
+  printf '%s\n' "$1" | read_all awk '/^peer / {print $6; exit}'
 }
 
 wait_path() {
@@ -121,7 +123,7 @@ wait_path() {
   local i text kind
   for i in $(seq 1 45); do
     text="$(status_text "$container")"
-    if printf '%s\n' "$text" | grep -q "^peer ${peer} "; then
+    if printf '%s\n' "$text" | read_all grep -q "^peer ${peer} "; then
       kind="$(path_of "$text")"
       if [[ -n "$kind" && "$kind" != "down" && "$kind" != "starting" ]]; then
         if [[ "$want" == "any" || "$kind" == "$want" ]]; then
@@ -192,23 +194,28 @@ mapping_ports() {
 }
 
 port_of_mapping() {
-  printf '%s\n' "$1" | awk -v dest="$2" '$2 == "mapping" && $5 == dest {n = split($7, a, ":"); print a[n]; exit}'
+  printf '%s\n' "$1" | read_all awk -v dest="$2" '$2 == "mapping" && $5 == dest {n = split($7, a, ":"); print a[n]; exit}'
 }
 
 ip_of_mapping() {
-  printf '%s\n' "$1" | awk -v dest="$2" '$2 == "mapping" && $5 == dest {split($7, a, ":"); print a[1]; exit}'
+  printf '%s\n' "$1" | read_all awk -v dest="$2" '$2 == "mapping" && $5 == dest {split($7, a, ":"); print a[1]; exit}'
 }
 
 now_s() {
   date +%s.%N
 }
 
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "nat"
+
 echo "=== REAL cargo test tampered candidate ==="
 cargo test -p orblx-edge --lib signed::tests::tampered_candidate_signature_is_rejected -- --nocapture
 
 echo "=== [C] remove old proof volumes ==="
 cleanup
-trap cleanup EXIT
 open_legacy_forward
 
 echo "=== [C] build image ==="
@@ -230,7 +237,7 @@ dc logs --no-log-prefix router-4 | sed -n '1,40p'
 
 echo "=== [C] no hairpin and no LAN to LAN forward ==="
 for router in router-1 router-2 router-3 router-4; do
-  wan="$(dc logs --no-log-prefix "$router" | awk '/^router wan / {print $3; exit}')"
+  wan="$(dc logs --no-log-prefix "$router" | read_all awk '/^router wan / {print $3; exit}')"
   nat_rules="$(dc exec -T "$router" iptables -t nat -S)"
   # A hairpin needs a DNAT rule that matches a packet from the LAN side.
   hairpin="$(printf '%s\n' "$nat_rules" | grep -E -- '-j DNAT' | grep -v -- "-i ${wan} " || true)"
@@ -301,7 +308,7 @@ overlay_of() {
   local gateway="$2"
   dc --profile nodes run --rm --no-deps --entrypoint /bin/sh "$service" -c \
     "ip route replace default via ${gateway} && orblx coord netmap --coord ${COORD} --bundle /coord-state/trust-bundle.pem --state /var/lib/orblx" \
-    | awk '/^overlay_ip /{print $2; exit}'
+    | read_all awk '/^overlay_ip /{print $2; exit}'
 }
 
 echo "=== [C] overlay addresses ==="
@@ -325,7 +332,7 @@ done
 LAN_REACH="$(dc --profile nodes run --rm --no-deps --entrypoint /bin/sh node-x -c \
   "ip route replace default via 10.19.1.2; for ip in 10.19.2.10 10.19.3.10 10.19.4.10 10.19.2.2 10.19.3.2; do if ping -c 1 -W 1 \$ip >/dev/null 2>&1; then echo lan_reach \$ip yes; else echo lan_reach \$ip no; fi; done")"
 printf '%s\n' "$LAN_REACH"
-if printf '%s\n' "$LAN_REACH" | grep -q ' yes$'; then
+if printf '%s\n' "$LAN_REACH" | read_all grep -q ' yes$'; then
   echo "node-x can reach another LAN without NAT." >&2
   exit 1
 fi
@@ -362,8 +369,8 @@ fi
 echo "=== [C] case 2 direct path evidence ==="
 docker logs orblx-nat-x 2>&1 | grep -E '^The (reflexive endpoint|candidate for|hole punch reached)' | sort -u | sed 's/^/node-x: /'
 docker logs orblx-nat-y 2>&1 | grep -E '^The (reflexive endpoint|candidate for|hole punch reached)' | sort -u | sed 's/^/node-y: /'
-CASE2_X_REACHED="$(docker logs orblx-nat-x 2>&1 | awk '/^The hole punch reached / {sub(/\.$/, "", $5); print $5; exit}')"
-CASE2_Y_REACHED="$(docker logs orblx-nat-y 2>&1 | awk '/^The hole punch reached / {sub(/\.$/, "", $5); print $5; exit}')"
+CASE2_X_REACHED="$(docker logs orblx-nat-x 2>&1 | read_all awk '/^The hole punch reached / {sub(/\.$/, "", $5); print $5; exit}')"
+CASE2_Y_REACHED="$(docker logs orblx-nat-y 2>&1 | read_all awk '/^The hole punch reached / {sub(/\.$/, "", $5); print $5; exit}')"
 echo "case2 node-x punch_peer ${CASE2_X_REACHED:-none}"
 echo "case2 node-y punch_peer ${CASE2_Y_REACHED:-none}"
 if [[ "$CASE2_PATH" == "direct" ]]; then
@@ -404,7 +411,7 @@ T_DIRECT=""
 for _ in $(seq 1 100); do
   text="$(status_text orblx-nat-x)"
   kind="$(path_of "$text")"
-  if printf '%s\n' "$text" | grep -q "^peer node-z " && [[ "$kind" == "direct" ]]; then
+  if printf '%s\n' "$text" | read_all grep -q "^peer node-z " && [[ "$kind" == "direct" ]]; then
     CASE3_RETURN="direct"
     T_DIRECT="$(now_s)"
     printf '%s\n' "$text"
@@ -487,7 +494,7 @@ if [[ "$CASE5_PATH" != "relay" || "$CASE5_PATH_W" != "relay" ]]; then
   echo "Case 5 did not use the relay." >&2
   exit 1
 fi
-if docker logs orblx-nat-y 2>&1 | grep -q '^The hole punch reached'; then
+if docker logs orblx-nat-y 2>&1 | read_all grep -q '^The hole punch reached'; then
   echo "Case 5 reported a hole punch between two symmetric NATs." >&2
   exit 1
 fi
@@ -504,13 +511,13 @@ if [[ "$CASE4_CODE" -eq 0 ]]; then
   echo "The tampered candidate was accepted." >&2
   exit 1
 fi
-if ! printf '%s\n' "$CASE4" | grep -q "The candidate signature for node-a was rejected."; then
+if ! printf '%s\n' "$CASE4" | read_all grep -q "The candidate signature for node-a was rejected."; then
   echo "The rejection log line is missing." >&2
   exit 1
 fi
 echo "case4 rejected true"
 
-if dc logs coord | grep -q "PRIVATE KEY"; then
+if dc logs coord | read_all grep -q "PRIVATE KEY"; then
   echo "The coordinator log contains a private key." >&2
   exit 1
 fi

@@ -10,6 +10,8 @@
 # The script deletes the orblx-agent-proof volumes at the start.
 # The script does not print enroll tokens, private keys, tickets, or use proofs.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -30,7 +32,11 @@ cleanup() {
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "agent-gateway" "${PROOF_PROJECT:-}"
 
 dc() {
   docker compose --progress quiet -p "${PROOF_PROJECT:-orblx-agent-proof}" --profile nodes -f "$FILE" "$@"
@@ -39,7 +45,7 @@ dc() {
 resolve_name() {
   local name="$1"
   dc --profile nodes run --rm --no-deps --entrypoint getent owner ahostsv4 "$name" \
-    | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
+    | read_all awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
 }
 
 as_root() {
@@ -52,9 +58,9 @@ as_root() {
 
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -87,7 +93,7 @@ wait_log() {
   local needle="$2"
   local i
   for i in $(seq 1 60); do
-    if dc logs "$service" 2>&1 | grep -q "$needle"; then
+    if dc logs "$service" 2>&1 | read_all grep -q "$needle"; then
       return 0
     fi
     sleep 1
@@ -196,7 +202,7 @@ owner approve a
 owner approve b
 nodes="$(owner nodes)"
 printf '%s\n' "$nodes"
-b_ip="$(printf '%s\n' "$nodes" | awk '$1 == "node" && $2 == "b" {print $3; exit}')"
+b_ip="$(printf '%s\n' "$nodes" | read_all awk '$1 == "node" && $2 == "b" {print $3; exit}')"
 echo "b_ip ${b_ip}"
 
 for name in a b; do
@@ -212,7 +218,7 @@ dc --profile nodes up -d a b
 wait_log a 'The TUN device'
 wait_log b 'The TUN device'
 for i in $(seq 1 60); do
-  if dc exec -T a orblx status --state-dir "$STATE" 2>/dev/null | grep -q '^peer b .* path direct '; then
+  if dc exec -T a orblx status --state-dir "$STATE" 2>/dev/null | read_all grep -q '^peer b .* path direct '; then
     break
   fi
   if [[ "$i" -eq 60 ]]; then
@@ -255,7 +261,7 @@ expect_http() {
   shift 2
   local output
   output="$(http "$label" "$@" || true)"
-  if ! printf '%s\n' "$output" | grep -q -- "$needle"; then
+  if ! printf '%s\n' "$output" | read_all grep -q -- "$needle"; then
     echo "The request did not give: ${needle}" >&2
     exit 1
   fi
@@ -264,10 +270,11 @@ expect_http() {
 # Print the PID of the api gateway on b. The image has no pgrep.
 gateway_pid() {
   dc exec -T b sh -c 'for d in /proc/[0-9]*; do
+    # pipe-ok: this runs in the container sh, which has no pipefail.
     if tr "\0" " " <"$d/cmdline" 2>/dev/null | grep -q "^orblx gateway .*--service api "; then
       basename "$d"
     fi
-  done' | head -n1
+  done' | read_all head -n1
 }
 
 echo "=== [C] start the upstream and the gateways on b ==="
@@ -317,7 +324,7 @@ grant1="$(printf '%s\n' "$reply" | field grant_id)"
 owner grant-approve "$grant1"
 fetched="$(grant_fetch "$grant1" "$STATE/agent-g1")"
 printf '%s\n' "$fetched"
-printf '%s\n' "$fetched" | grep -qx 'grant_path /api'
+printf '%s\n' "$fetched" | read_all grep -qx 'grant_path /api'
 expires1_ms="$(printf '%s\n' "$fetched" | field grant_expires_ms)"
 G="$STATE/agent-g1"
 
@@ -346,8 +353,8 @@ db_count="$(grep -c '^http attempt ' "$WORK/db.txt")"
 
 echo "=== [C] replay: the same request bytes two times ==="
 replay="$(http "replay" --grant "$G" --path /api/items --repeat 2 || true)"
-printf '%s\n' "$replay" | grep -q '^http attempt 1 status 200 '
-printf '%s\n' "$replay" | grep -q '^http attempt 2 status 403 reason replay '
+printf '%s\n' "$replay" | read_all grep -q '^http attempt 1 status 200 '
+printf '%s\n' "$replay" | read_all grep -q '^http attempt 2 status 403 reason replay '
 
 echo "=== [C] loop until the end time ==="
 ttl_out="$(http "TTL loop" --grant "$G" --path /api/items --every-ms 50 --max-wait 60)"
@@ -401,7 +408,7 @@ sleep 1
 restart_out="$(http "restart replay: the saved bytes again" --to "${b_ip}:8080" \
   --send-file "$STATE/saved-request.bin" || true)"
 replay_ms="$(date +%s%3N)"
-printf '%s\n' "$restart_out" | grep -q '^http attempt 1 status 403 reason replay '
+printf '%s\n' "$restart_out" | read_all grep -q '^http attempt 1 status 403 reason replay '
 restart_gap=$(( replay_ms - first_ms ))
 echo "restart_replay_after_first_ms ${restart_gap} result refused replay"
 if (( restart_gap >= 60000 )); then
@@ -426,8 +433,8 @@ api_verify="$(dc exec -T b orblx audit verify-config --file "$STATE/gateway-audi
 printf '%s\n' "$api_verify"
 db_verify="$(dc exec -T b orblx audit verify-config --file "$STATE/gateway-audit-db.jsonl")"
 printf '%s\n' "$db_verify"
-printf '%s\n' "$api_verify" | grep -qx ok
-printf '%s\n' "$db_verify" | grep -qx ok
+printf '%s\n' "$api_verify" | read_all grep -qx ok
+printf '%s\n' "$db_verify" | read_all grep -qx ok
 count_of() {
   awk -v key="$2" '$1 == key {print $2; exit}' <<<"$1"
 }
@@ -495,7 +502,7 @@ for i in $(seq 1 50); do
   sleep 0.1
 done
 [[ -z "$(gateway_pid)" ]]
-dc exec -T b orblx audit verify-config --file "$STATE/gateway-audit-api.jsonl" | grep -qx ok
+dc exec -T b orblx audit verify-config --file "$STATE/gateway-audit-api.jsonl" | read_all grep -qx ok
 dc exec -T b rm "$STATE/gateway-audit-api.jsonl"
 if dc exec -T b test -e "$STATE/gateway-audit-api.jsonl"; then
   echo "The audit chain file is still there." >&2
@@ -515,7 +522,7 @@ sleep 1
 nf_out="$(http "W24-B replay after restart without the audit file" --to "${b_ip}:8080" \
   --send-file "$STATE/saved-request-3.bin" || true)"
 nf_replay_ms="$(date +%s%3N)"
-printf '%s\n' "$nf_out" | grep -q '^http attempt 1 status 403 reason replay '
+printf '%s\n' "$nf_out" | read_all grep -q '^http attempt 1 status 403 reason replay '
 nf_gap=$(( nf_replay_ms - nf_first_ms ))
 echo "noaudit_replay_after_first_ms ${nf_gap} result refused replay"
 (( nf_gap < 60000 ))
@@ -523,7 +530,7 @@ expect_http "a new request with grant 3 after the restart is forwarded" "status 
   --grant "$G3" --path /api/items
 new_verify="$(dc exec -T b orblx audit verify-config --file "$STATE/gateway-audit-api.jsonl")"
 printf '%s\n' "$new_verify"
-printf '%s\n' "$new_verify" | grep -qx ok
+printf '%s\n' "$new_verify" | read_all grep -qx ok
 new_replay="$(dc exec -T b grep -c 'reason replay ' "$STATE/gateway-audit-api.jsonl")"
 echo "new_chain_replay_records ${new_replay}"
 [[ "$new_replay" -eq 1 ]]
@@ -534,7 +541,7 @@ echo "nonce_file_lines_after $(wc -l <"$WORK/nonces.txt")"
 echo "=== [C] coordinator audit chain ==="
 coord_audit="$(owner audit)"
 printf '%s\n' "$coord_audit" | grep ' agent-' || true
-printf '%s\n' "$coord_audit" | grep -q '^verify ok '
+printf '%s\n' "$coord_audit" | read_all grep -q '^verify ok '
 printf '%s\n' "$coord_audit" | grep '^verify '
 
 echo "=== [C] logs hold no key, ticket, or use proof ==="
