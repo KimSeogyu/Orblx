@@ -19,6 +19,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::share::{compile_guests, compile_shares, Share, ShareFile};
 use crate::spiffe::{SpiffeId, WorkloadKind};
 
 const MAX_POLICY_BYTES: usize = 256 * 1024;
@@ -38,7 +39,7 @@ pub struct PolicyError {
 }
 
 impl PolicyError {
-    fn new(sentence: impl Into<String>) -> Self {
+    pub(crate) fn new(sentence: impl Into<String>) -> Self {
         Self {
             sentence: sentence.into(),
         }
@@ -249,6 +250,10 @@ pub struct Policy {
     owners: Vec<SpiffeId>,
     ssh: Vec<SshGrant>,
     ssh_tests: Vec<StoredSshTest>,
+    /// Guest OIDC owners, as `oidc:SUBJECT` (W25-1).
+    guests: BTreeSet<String>,
+    /// Node shares (W25-1).
+    shares: Vec<Share>,
     split_dns: Vec<SplitDnsZone>,
 }
 
@@ -280,6 +285,8 @@ impl std::fmt::Debug for Policy {
             .field("node_approval", &self.node_approval)
             .field("owners", &self.owners.len())
             .field("ssh", &self.ssh.len())
+            .field("guests", &self.guests.len())
+            .field("shares", &self.shares.len())
             .field("split_dns", &self.split_dns.len())
             .finish()
     }
@@ -300,8 +307,30 @@ impl Policy {
             owners: Vec::new(),
             ssh: Vec::new(),
             ssh_tests: Vec::new(),
+            guests: BTreeSet::new(),
+            shares: Vec::new(),
             split_dns: Vec::new(),
         }
+    }
+
+    /// Return the node shares (W25-1).
+    #[must_use]
+    pub fn shares(&self) -> &[Share] {
+        &self.shares
+    }
+
+    /// Return true when the policy names guest users (W25-1).
+    #[must_use]
+    pub fn has_guests(&self) -> bool {
+        !self.guests.is_empty()
+    }
+
+    /// Return true when a node with this store owner is a guest node (W25-1).
+    ///
+    /// The store owner of an OIDC node is `oidc:SUBJECT`.
+    #[must_use]
+    pub fn is_guest_owner(&self, owner: &str) -> bool {
+        self.guests.contains(owner)
     }
 
     /// Return the split DNS zones from `splitDns` (W24-F).
@@ -591,6 +620,10 @@ struct PolicyFile {
     ssh: Vec<SshRuleFile>,
     #[serde(default, rename = "sshTests")]
     ssh_tests: Vec<SshTestFile>,
+    #[serde(default)]
+    guests: Vec<String>,
+    #[serde(default)]
+    shares: Vec<ShareFile>,
     #[serde(default, rename = "splitDns")]
     split_dns: BTreeMap<String, Vec<String>>,
 }
@@ -746,6 +779,8 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
     for test in &file.ssh_tests {
         ssh_tests.push(compile_ssh_test(&catalog, test)?);
     }
+    let guests = compile_guests(&file.guests)?;
+    let shares = compile_shares(&guests, &file.shares)?;
     let split_dns = compile_split_dns(&file.split_dns)?;
     Ok(Policy {
         grants,
@@ -756,6 +791,8 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
         owners,
         ssh,
         ssh_tests,
+        guests,
+        shares,
         split_dns,
     })
 }
@@ -1313,7 +1350,7 @@ fn safe_label(text: &str) -> String {
     trimmed
 }
 
-fn parse_proto(text: &str) -> Result<u8, PolicyError> {
+pub(crate) fn parse_proto(text: &str) -> Result<u8, PolicyError> {
     match text {
         "tcp" => Ok(PROTO_TCP),
         "udp" => Ok(PROTO_UDP),
@@ -1329,7 +1366,7 @@ fn proto_name(proto: u8) -> &'static str {
     }
 }
 
-fn split_target(text: &str) -> Result<(&str, &str), PolicyError> {
+pub(crate) fn split_target(text: &str) -> Result<(&str, &str), PolicyError> {
     let bytes = text.as_bytes();
     let mut index = bytes.len();
     while index > 0 {
@@ -1361,7 +1398,7 @@ fn is_port_spec(text: &str) -> bool {
     })
 }
 
-fn parse_port_spec(text: &str) -> Result<Vec<(u16, u16)>, PolicyError> {
+pub(crate) fn parse_port_spec(text: &str) -> Result<Vec<(u16, u16)>, PolicyError> {
     if text == "*" {
         return Ok(vec![(1, 65535)]);
     }
@@ -1403,7 +1440,7 @@ fn parse_port(text: &str) -> Result<u16, ()> {
     u16::try_from(value).map_err(|_| ())
 }
 
-fn hujson_to_json(text: &str) -> Result<String, PolicyError> {
+pub(crate) fn hujson_to_json(text: &str) -> Result<String, PolicyError> {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::new();
     let mut index = 0;
