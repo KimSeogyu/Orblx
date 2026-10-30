@@ -3,6 +3,15 @@
 # The script deletes the orblx-coord-proof volumes at the start.
 # The script does not print enroll tokens or private keys.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
+# W25-14: this proof needs root. It stops at once without root.
+require_root "$@"
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap proof_lock_end EXIT
+proof_lock_take "coord-enroll"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -14,7 +23,7 @@ dc() {
 
 resolve_coord() {
   dc --profile nodes run --rm --no-deps --entrypoint getent node-a ahostsv4 coord \
-    | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
+    | read_all awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
 }
 
 # Docker on this host can leave iptables-legacy FORWARD policy DROP.
@@ -22,9 +31,9 @@ resolve_coord() {
 # iptables-nft already accepts the same traffic.
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   if [[ "$(id -u)" -eq 0 ]]; then
@@ -74,11 +83,11 @@ dc exec -T coord orblx coord token create --state /var/lib/orblx --ttl 3600 --ou
 echo "=== [C] token server-b ==="
 dc exec -T coord orblx coord token create --state /var/lib/orblx --ttl 3600 --out /var/lib/orblx/tokens/server-b
 
-if dc exec -T coord cat /var/lib/orblx/nodes.json | grep -q 'ge1\.'; then
+if dc exec -T coord cat /var/lib/orblx/nodes.json | read_all grep -q 'ge1\.'; then
   echo "The node store contains an enroll token." >&2
   exit 1
 fi
-if dc exec -T coord cat /var/lib/orblx/nodes.json | grep -q 'PRIVATE KEY'; then
+if dc exec -T coord cat /var/lib/orblx/nodes.json | read_all grep -q 'PRIVATE KEY'; then
   echo "The node store contains a private key." >&2
   exit 1
 fi
@@ -124,8 +133,8 @@ echo "=== [C] netmap after restart ==="
 after="$(dc --profile nodes run --rm node-a coord netmap --coord ${coord_ip}:443 --bundle /coord-state/trust-bundle.pem --state /var/lib/orblx)"
 printf '%s\n' "$after"
 
-ip_before="$(printf '%s\n' "$before" | awk '/^overlay_ip /{print $2; exit}')"
-ip_after="$(printf '%s\n' "$after" | awk '/^overlay_ip /{print $2; exit}')"
+ip_before="$(printf '%s\n' "$before" | read_all awk '/^overlay_ip /{print $2; exit}')"
+ip_after="$(printf '%s\n' "$after" | read_all awk '/^overlay_ip /{print $2; exit}')"
 peer_before="$(printf '%s\n' "$before" | awk '/^peer /{print $2, $3}')"
 peer_after="$(printf '%s\n' "$after" | awk '/^peer /{print $2, $3}')"
 if [[ "$ip_before" != "$ip_after" || -z "$ip_before" || "$peer_before" != "$peer_after" ]]; then
@@ -145,7 +154,7 @@ if [[ "$code" -eq 0 ]]; then
   echo "The reused enroll token was accepted." >&2
   exit 1
 fi
-if ! printf '%s\n' "$reuse" | grep -q 'already used'; then
+if ! printf '%s\n' "$reuse" | read_all grep -q 'already used'; then
   echo "The rejection text is missing." >&2
   exit 1
 fi
@@ -165,11 +174,11 @@ if [[ "$up_code" -eq 0 ]]; then
   echo "orblx up started without the capability ticket." >&2
   exit 1
 fi
-if printf '%s\n' "$up_out" | grep -q 'The netmap is not valid'; then
+if printf '%s\n' "$up_out" | read_all grep -q 'The netmap is not valid'; then
   echo "orblx up rejected the coordinator netmap." >&2
   exit 1
 fi
-if ! printf '%s\n' "$up_out" | grep -q 'ticket.bin'; then
+if ! printf '%s\n' "$up_out" | read_all grep -q 'ticket.bin'; then
   echo "orblx up did not accept the netmap." >&2
   exit 1
 fi

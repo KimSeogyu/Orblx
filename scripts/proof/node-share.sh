@@ -23,6 +23,8 @@
 # The script deletes the orblx-w25a-node-share volumes at the start.
 # The script does not print enroll tokens, ID tokens, private keys, or tickets.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -39,6 +41,11 @@ LIMIT_MS=1000
 STATE=/var/lib/orblx
 PORT_GATE="${ORBLX_SHARE_PORT_GATE:-1}"
 POLICY_SRC="${ORBLX_SHARE_POLICY:-$ROOT/scripts/proof/node-share.hujson}"
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap proof_lock_end EXIT
+proof_lock_take "node-share"
 mkdir -p "$POLICY_DIR"
 : >"$IDP_CA_FILE"
 
@@ -70,13 +77,14 @@ cleanup() {
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the cleanup runs first, then the lock is released.
+trap 'cleanup; proof_lock_end' EXIT
 
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -111,7 +119,7 @@ idp() {
 wait_log() {
   local service="$1" needle="$2" i
   for i in $(seq 1 60); do
-    if dc logs "$service" 2>&1 | grep -q -- "$needle"; then
+    if dc logs "$service" 2>&1 | read_all grep -q -- "$needle"; then
       return 0
     fi
     sleep 1
@@ -136,7 +144,7 @@ wait_path() {
   local from="$1" to="$2" i
   for i in $(seq 1 60); do
     if dc exec -T "$from" orblx status --state-dir "$STATE" 2>/dev/null \
-      | grep -q "^peer ${to} .* path direct "; then
+      | read_all grep -q "^peer ${to} .* path direct "; then
       echo "path ${from} ${to} direct"
       return 0
     fi
@@ -262,7 +270,7 @@ for name in owner a b; do
 done
 
 coord_ip="$(dc run --rm --no-deps --entrypoint getent owner ahostsv4 coord \
-  | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}')"
+  | read_all awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}')"
 if [[ -z "$coord_ip" ]]; then
   echo "The coordinator address did not resolve." >&2
   exit 1
@@ -289,7 +297,7 @@ wait_log coord "oidc accept sub bob"
 nodes="$(owner nodes)"
 printf '%s\n' "$nodes"
 ip_of() {
-  printf '%s\n' "$nodes" | awk -v name="$1" '$1 == "node" && $2 == name {print $3; exit}'
+  printf '%s\n' "$nodes" | read_all awk -v name="$1" '$1 == "node" && $2 == name {print $3; exit}'
 }
 a_ip="$(ip_of a)"
 b_ip="$(ip_of b)"

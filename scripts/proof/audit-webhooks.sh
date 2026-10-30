@@ -24,6 +24,8 @@
 #   ORBLX_NET_HOOK  A root script that the script runs after the network starts.
 #   PROOF_LOG       The log file of this run. The secret check also reads this file.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -40,6 +42,11 @@ DEAD_URL="http://192.0.2.1:9000/hook"
 LIMIT_MS=2000
 WORK="$(mktemp -d)"
 ENV_FILE="$WORK/env"
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap proof_lock_end EXIT
+proof_lock_take "audit-webhooks" "$HOOKS_PROJECT"
 printf 'HOOKS_IMAGE=%s\n' "$HOOKS_IMAGE" > "$ENV_FILE"
 
 as_root() {
@@ -58,7 +65,8 @@ cleanup() {
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the cleanup runs first, then the lock is released.
+trap 'cleanup; proof_lock_end' EXIT
 
 # No pipe into head or grep -q: with pipefail, an early reader can fail the pipe (SIGPIPE).
 # The script keeps each output in a variable or a file, then checks it.
@@ -265,7 +273,7 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 dc exec -T coord test -s /var/lib/orblx/trust-bundle.pem || fail "no trust bundle"
-coord_ip="$(dc exec -T client getent ahostsv4 coord | awk '{print $1; exit}')"
+coord_ip="$(dc exec -T client getent ahostsv4 coord | read_all awk '{print $1; exit}')"
 COORD="${coord_ip}:443"
 ADMIN=(--coord "$COORD" --state /var/lib/orblx --bundle /var/lib/orblx/bundle.pem)
 echo "coord ${COORD}"
@@ -416,7 +424,7 @@ echo "events_waiting $((g4_mid - g4_lo))"
 dc kill -s SIGKILL coord >/dev/null
 dc start coord >/dev/null
 # The start can give the coordinator a new address.
-coord_ip="$(dc exec -T client getent ahostsv4 coord | awk '{print $1; exit}')"
+coord_ip="$(dc exec -T client getent ahostsv4 coord | read_all awk '{print $1; exit}')"
 COORD="${coord_ip}:443"
 ADMIN=(--coord "$COORD" --state /var/lib/orblx --bundle /var/lib/orblx/bundle.pem)
 for _ in $(seq 1 60); do

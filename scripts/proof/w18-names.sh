@@ -5,17 +5,16 @@
 # On node a, c and c.lab.orblx are NXDOMAIN.
 # Node b still resolves and answers.
 # W24: the datapath on c also drops TCP from a (the ACL has no rule for it).
-# The script skips the proof when it is not root.
+# The script stops with exit 1 when it is not root.
 # The script needs Docker and a built orblx binary.
 
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
+# W25-14: this proof needs root. It stops at once without root.
+require_root "$@"
 
 export PATH="/usr/local/cargo/bin:/usr/sbin:/sbin:/usr/bin:/bin:${PATH:-}"
-
-if [[ "$(id -u)" -ne 0 ]]; then
-  echo "The W18 name proof needs root. The script skips the proof."
-  exit 0
-fi
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "The W18 name proof needs Docker. The script skips the proof."
@@ -27,12 +26,18 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap proof_lock_end EXIT
+proof_lock_take "w18-names"
+
 # Docker on this host can leave iptables-legacy FORWARD policy DROP.
 # That policy drops UDP on a user-defined bridge.
 # iptables-nft already accepts the same traffic.
 if command -v iptables-legacy >/dev/null 2>&1; then
-  if iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP'; then
-    if ! command -v iptables-nft >/dev/null 2>&1 || iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT'; then
+  if iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP'; then
+    if ! command -v iptables-nft >/dev/null 2>&1 || iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT'; then
       echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
       iptables-legacy -P FORWARD ACCEPT
     fi
@@ -62,7 +67,8 @@ cleanup() {
     rm -rf "$work"
   fi
 }
-trap cleanup EXIT
+# W25-14: the cleanup runs first, then the lock is released.
+trap 'cleanup; proof_lock_end' EXIT
 
 if [[ ! -x "$bin" ]]; then
   cargo build -p orblx-cli --bin orblx --manifest-path "$root/Cargo.toml"
@@ -135,7 +141,7 @@ wait_direct() {
   local peer=$2
   local attempt
   for attempt in $(seq 1 40); do
-    if docker compose -f "$compose_file" exec -T "$node" orblx status 2>/dev/null | grep -q "peer ${peer} overlay_ip .* path direct "; then
+    if docker compose -f "$compose_file" exec -T "$node" orblx status 2>/dev/null | read_all grep -q "peer ${peer} overlay_ip .* path direct "; then
       return 0
     fi
     sleep 1
@@ -154,7 +160,7 @@ ping_name() {
       local out
       out=$(docker compose -f "$compose_file" exec -T "$node" ping -c 3 -W 2 "$host")
       printf '%s\n' "$out"
-      if printf '%s\n' "$out" | grep -q 'DUP!'; then
+      if printf '%s\n' "$out" | read_all grep -q 'DUP!'; then
         echo "The ping from ${node} to ${host} got duplicate replies."
         return 1
       fi

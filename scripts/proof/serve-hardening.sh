@@ -4,12 +4,18 @@
 # The containers stand in for other hosts. The outside network stands in for a public network.
 # The script does not print private keys, tickets, or SVID proofs.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 # shellcheck source=serve-lib.sh
 source "$ROOT/scripts/proof/serve-lib.sh"
-trap serve_cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'serve_cleanup; proof_lock_end' EXIT
+proof_lock_take "serve-hardening" "${SERVE_PROJECT:-orblx-serve-proof}"
 
 LIMIT=10485760
 A_ALLOW="serve_allow spiffe://orblx.local/node/a from ${A_OVERLAY}"
@@ -20,7 +26,7 @@ expect_post() {
   shift 2
   out="$(post "$@")"
   printf '%s\n' "$out"
-  if ! echo "$out" | grep -q " status HTTP/1.1 ${want} "; then
+  if ! echo "$out" | read_all grep -q " status HTTP/1.1 ${want} "; then
     echo "The POST ${label} did not get ${want}." >&2
     return 1
   fi
@@ -32,7 +38,7 @@ check_app_line() {
   local size=$1 line sent
   line="$(cat "$WORK/last-post.txt")"
   sent="$(echo "$line" | sed -E 's/.* sent_sum ([0-9]+) .*/\1/')"
-  echo "$line" | grep -q "app got ${size} te none cl ${size} sum ${sent}\$"
+  echo "$line" | read_all grep -q "app got ${size} te none cl ${size} sum ${sent}\$"
   echo "app_body_ok size ${size} sum ${sent}"
 }
 
@@ -67,7 +73,7 @@ echo "=== [C] forged peer address: the outside host uses source ${A_OVERLAY} (no
 # This is the worst case: the forger also gets the replies. Only the TUN ingress check stops it.
 dc exec -T outside ip addr add "${A_OVERLAY}/32" dev eth0
 dc exec -T outside ip route replace 100.64.0.0/10 via "$B_OUTSIDE" src "$A_OVERLAY"
-tun_route="$(dc exec -T node-b ip route show "${A_OVERLAY}/32" | head -n 1)"
+tun_route="$(dc exec -T node-b ip route show "${A_OVERLAY}/32" | read_all head -n 1)"
 echo "node b route before: ${tun_route}"
 dc exec -T node-b ip route replace "${A_OVERLAY}/32" via "$OUTSIDE_IP"
 dc exec -T node-b ip route show "${A_OVERLAY}/32"
@@ -131,7 +137,7 @@ echo "=== [C] serve and funnel lines in the node b log ==="
 dc logs --no-log-prefix node-b 2>/dev/null | grep -E '^(serve|funnel)_' || true
 
 echo "=== [C] no key material in the node logs ==="
-if dc logs 2>/dev/null | grep -Eq 'PRIVATE KEY|BEGIN CERTIFICATE'; then
+if dc logs 2>/dev/null | read_all grep -Eq 'PRIVATE KEY|BEGIN CERTIFICATE'; then
   echo "A node log has PEM data." >&2
   exit 1
 fi

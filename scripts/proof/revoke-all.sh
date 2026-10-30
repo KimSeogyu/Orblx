@@ -19,6 +19,8 @@
 # The script deletes the orblx-w24d-revoke-all volumes at the start.
 # The script does not print enroll tokens, private keys, tickets, or SVID proofs.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -61,13 +63,17 @@ cleanup() {
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "revoke-all"
 
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -100,7 +106,7 @@ wait_log() {
   local needle="$2"
   local i
   for i in $(seq 1 60); do
-    if dc logs "$service" 2>&1 | grep -q "$needle"; then
+    if dc logs "$service" 2>&1 | read_all grep -q "$needle"; then
       return 0
     fi
     sleep 1
@@ -130,7 +136,7 @@ wait_path() {
   local i
   for i in $(seq 1 60); do
     if dc exec -T "$from" orblx status --state-dir "$STATE" 2>/dev/null \
-      | grep -q "^peer ${to} .* path direct "; then
+      | read_all grep -q "^peer ${to} .* path direct "; then
       echo "path ${from} ${to} direct"
       return 0
     fi
@@ -282,7 +288,7 @@ for name in owner a b c; do
 done
 
 coord_ip="$(dc run --rm --no-deps --entrypoint getent owner ahostsv4 coord \
-  | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}')"
+  | read_all awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}')"
 if [[ -z "$coord_ip" ]]; then
   echo "The coordinator address did not resolve." >&2
   exit 1
@@ -300,7 +306,7 @@ for name in a b c; do
 done
 nodes="$(owner nodes)"
 printf '%s\n' "$nodes"
-b_ip="$(printf '%s\n' "$nodes" | awk '$1 == "node" && $2 == "b" {print $3; exit}')"
+b_ip="$(printf '%s\n' "$nodes" | read_all awk '$1 == "node" && $2 == "b" {print $3; exit}')"
 echo "b_ip ${b_ip}"
 
 for name in a b c; do
@@ -393,6 +399,7 @@ surface_cmds() {
   local grant
   for grant in "${grants[@]}"; do
     # A run is good only with an HTTP reply. A connect with no reply (read timeout) fails (W24).
+    # pipe-ok: the probe command runs in the container sh, which has no pipefail.
     probe "$name" "$mode" "${name}-grant-${grant}" "$secs" "$every" \
       sh -c 'out="$(orblx agent connect --grant "$1" --send "$2" 2>&1)"; code=$?; printf "%s\n" "$out"; [ "$code" -eq 0 ] && printf "%s\n" "$out" | grep -q "^reply HTTP"' \
       sh "$STATE/agent-${grant}" "$GET"
@@ -420,9 +427,9 @@ revoke_out="$(owner revoke-all a)"
 printf '%s\n' "$revoke_out"
 revoke_start="$(printf '%s\n' "$revoke_out" | field revoke_start_ms)"
 revoke_done="$(printf '%s\n' "$revoke_out" | field revoke_done_ms)"
-printf '%s\n' "$revoke_out" | grep -qx 'revoked_all spiffe://orblx.local/node/a'
-printf '%s\n' "$revoke_out" | grep -qx 'grants_revoked 3'
-printf '%s\n' "$revoke_out" | grep -qx 'grant_nonces_denied 2'
+printf '%s\n' "$revoke_out" | read_all grep -qx 'revoked_all spiffe://orblx.local/node/a'
+printf '%s\n' "$revoke_out" | read_all grep -qx 'grants_revoked 3'
+printf '%s\n' "$revoke_out" | read_all grep -qx 'grant_nonces_denied 2'
 
 failed=0
 for pid in "${pids[@]}"; do
@@ -436,7 +443,7 @@ deny_ms grant-a2 "$WORK/probe-a-grant-a2.out" 'connect denied reason revoked' ov
 deny_ms svid "$WORK/probe-a-svid.out" 'deny_output'
 deny_ms ssh "$WORK/probe-a-ssh.out" 'The SSH session was refused' overlay
 deny_ms file "$WORK/probe-a-file.out" 'reply deny identity' overlay
-dc logs --no-log-prefix b 2>&1 | grep -m1 -e 'The peer a is in the deny list.' -e 'The node ended the session with a.' || true
+dc logs --no-log-prefix b 2>&1 | read_all grep -m1 -e 'The peer a is in the deny list.' -e 'The node ended the session with a.' || true
 
 echo "=== [C] probes of c during and after the revoke ==="
 for label in c-grant-c1 c-svid c-ssh c-file; do
@@ -462,7 +469,7 @@ grep -q "^grant ${grant_a2} revoked " "$WORK/grants-after.txt"
 grep -q "^grant ${grant_a3} revoked " "$WORK/grants-after.txt"
 grep -q "^grant ${grant_c1} issued " "$WORK/grants-after.txt"
 c_after="$(dc exec -T c orblx agent connect --grant "$STATE/agent-c1" --send "$GET")"
-printf '%s\n' "$c_after" | grep -q '^reply HTTP/1.0 200'
+printf '%s\n' "$c_after" | read_all grep -q '^reply HTTP/1.0 200'
 echo "c grant c1 after revoke 200"
 dc exec -T c orblx ssh root@b --identity /tmp/sshid --netmap "$STATE/netmap.json" \
   --peer-cert /tmp/b-cert.pem --command 'echo ssh_ok'
