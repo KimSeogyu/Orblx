@@ -86,6 +86,35 @@ services:
       orblx:
         ipv4_address: 172.28.18.13
 
+  # W25-54 (row 54): one node with systemd as PID 1. The unit is scripts/orblxd.service.
+  # The proof starts this service only in its systemd phase (profile systemd).
+  node-s:
+    image: orblx-w18:local
+    profiles:
+      - systemd
+    privileged: true
+    cgroup: private
+    entrypoint:
+      - /lib/systemd/systemd
+    command: []
+    environment:
+      container: docker
+    tmpfs:
+      - /run
+      - /run/lock
+    stop_signal: SIGRTMIN+3
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    volumes:
+      - ${W18_STATE_S:-/nonexistent}:/var/lib/orblx
+      - ${W18_NETMAP_S:-/nonexistent}:/etc/orblx/netmap.json:ro
+      - ${W18_UNIT:-/nonexistent}:/etc/systemd/system/orblxd.service:ro
+    stop_grace_period: 20s
+    networks:
+      orblx:
+        ipv4_address: 172.28.18.14
+
 networks:
   orblx:
     driver: bridge
