@@ -1,0 +1,117 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    steps:
+      - name: Get the repository
+        uses: actions/checkout@v7
+
+      - name: Install the stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Check the tag against the workspace version
+        id: version
+        shell: bash
+        run: |
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          if [[ "v${version}" != "${GITHUB_REF_NAME}" ]]; then
+            echo "The tag ${GITHUB_REF_NAME} is not v${version}." >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Build orblx
+        run: cargo build --release --locked -p orblx-cli --bin orblx --target ${{ matrix.target }}
+
+      - name: Make the tarball
+        run: >-
+          scripts/release/package.sh
+          "${{ steps.version.outputs.version }}"
+          "${{ matrix.target }}"
+          "target/${{ matrix.target }}/release/orblx"
+          dist
+
+      - name: Keep the tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: orblx-${{ matrix.target }}
+          path: dist/orblx-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: sign and publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # Write the GitHub release.
+      contents: write
+      # Get a GitHub OIDC token for the keyless cosign signature.
+      id-token: write
+    steps:
+      - name: Get the repository
+        uses: actions/checkout@v7
+
+      - name: Get the tarballs
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: orblx-*
+          merge-multiple: true
+
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum orblx-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Sign SHA256SUMS
+        working-directory: dist
+        # The signature is keyless. Fulcio binds the GitHub OIDC identity of this workflow to a short-lived certificate.
+        # The repository has no signing secret.
+        run: cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+
+      - name: Check the signature
+        working-directory: dist
+        run: >-
+          cosign verify-blob
+          --bundle SHA256SUMS.sigstore.json
+          --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}"
+          --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}"
+          --verify-tag
+          --title "${GITHUB_REF_NAME}"
+          --notes "Install: curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/install.sh | sh"
+          dist/orblx-*.tar.gz dist/SHA256SUMS dist/SHA256SUMS.sigstore.json scripts/install.sh
