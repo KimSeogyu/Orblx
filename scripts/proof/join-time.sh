@@ -70,6 +70,10 @@ proof_lock_take "join-time:${BASE}" "${BASE}-"
 . "$ROOT/scripts/proof/compose-clean.sh"
 
 [[ "$N" =~ ^[1-9][0-9]*$ ]] || { echo "JOIN_N must be a whole number of 1 or more."; exit 2; }
+# Clean the compose project of every join of this run before any start. Each join cleans its
+# own project again before its first "up" and after it ends.
+mapfile -t JOIN_PROJECTS < <(seq -f "${BASE}-j%g" 1 "$N")
+proof_compose_clean "${JOIN_PROJECTS[@]}" || exit 1
 if [[ "$BREAK_AT" != 0 ]]; then
   echo "TEST ONLY: ORBLX_JOIN_BREAK_AT=${BREAK_AT}. Join ${BREAK_AT} must fail, and the proof must fail."
 fi
