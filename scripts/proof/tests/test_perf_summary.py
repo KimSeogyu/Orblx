@@ -125,18 +125,26 @@ class PerfSummaryTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("sym_sym_relay: throughput None", summary["runs"][0]["ci_failures"][0])
 
-    def test_a_throughput_below_300_mbit_fails(self):
+    def test_a_throughput_below_200_mbit_fails(self):
         text = synthetic().replace("throughput prc_prc_direct bytes 883294208 seconds 5.003 mbit_s 1412.29",
-                                   "throughput prc_prc_direct bytes 175500000 seconds 5.000 mbit_s 280.83")
+                                   "throughput prc_prc_direct bytes 124500000 seconds 5.000 mbit_s 199.20")
         code, summary, _ = run_summary([(text, 0)])
         self.assertEqual(code, 1)
-        self.assertIn("prc_prc_direct: throughput 280.83 Mbit/s is below the floor 300.0 Mbit/s",
+        self.assertIn("prc_prc_direct: throughput 199.2 Mbit/s is below the floor 200.0 Mbit/s",
                       summary["runs"][0]["ci_failures"])
 
-    def test_a_throughput_of_300_mbit_passes(self):
-        text = synthetic().replace("mbit_s 1412.29", "mbit_s 300.00")
+    def test_a_throughput_of_200_mbit_passes(self):
+        text = synthetic().replace("mbit_s 1412.29", "mbit_s 200.00")
         code, summary, _ = run_summary([(text, 0)])
         self.assertEqual(code, 0)
+
+    def test_the_lowest_ci_throughput_of_256_mbit_passes(self):
+        text = synthetic().replace("mbit_s 1412.29", "mbit_s 256.39")
+        code, summary, _ = run_summary([(text, 0)])
+        self.assertEqual(code, 0)
+        lines = perf_summary.throughput_lines(summary)
+        self.assertTrue(lines[0].startswith("cpu_model "))
+        self.assertIn("prc_prc_direct run1 256.39 Mbit/s floor 200 PASS", lines)
 
     def test_a_log_without_ping_rtts_fails(self):
         code, summary, _ = run_summary([(RUN1, 0)])
