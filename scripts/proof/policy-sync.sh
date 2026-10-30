@@ -22,6 +22,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$ROOT/scripts/proof/pipe-lib.sh"
 cd "$ROOT"
 FILE="scripts/proof/compose.policy-sync.yml"
 export PROOF_PROJECT="${PROOF_PROJECT:-orblx-w256-sync-proof}"
@@ -78,9 +80,9 @@ as_root() {
 # Docker on this host can leave iptables-legacy FORWARD policy DROP.
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -204,10 +206,10 @@ echo "=== [C] start a ==="
 dc --profile nodes up -d a
 wait_log a 'The path to router is direct.'
 for _ in $(seq 1 30); do
-  dc exec -T a ip route show dev orblx0 2>/dev/null | grep -q '10.88.26.0/24' && break
+  dc exec -T a ip route show dev orblx0 2>/dev/null | read_all grep -q '10.88.26.0/24' && break
   sleep 1
 done
-dc exec -T a ip route show dev orblx0 | grep -q '10.88.26.0/24' || fail "Node a has no route to 10.88.26.0/24."
+dc exec -T a ip route show dev orblx0 | read_all grep -q '10.88.26.0/24' || fail "Node a has no route to 10.88.26.0/24."
 a_ip="$(jq -r '.self.overlay_ip' "$SYNC_A_STATE/netmap.json")"
 router_ip="$(jq -r '.peers[] | select(.name=="router") | .overlay_ip' "$SYNC_A_STATE/netmap.json")"
 [[ -n "$a_ip" && -n "$router_ip" ]] || fail "The netmap did not include the overlay addresses."
