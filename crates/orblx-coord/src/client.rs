@@ -530,6 +530,65 @@ pub fn fetch_deny_wait_blocking(
     })
 }
 
+/// One `policy-wait` reply (W25-6).
+pub struct PolicySync {
+    /// The signed netmap and grants. The client checked the signatures with the pinned key.
+    pub view: NetmapView,
+    /// The deny list text of this node.
+    pub deny: String,
+    /// The ETag to send with the next wait.
+    pub etag: String,
+}
+
+/// Wait for a new netmap, grant set, or deny list of this node (W25-6).
+///
+/// The coordinator replies at once when the ETag of the three is not `etag`. Otherwise it
+/// holds the request until one of them changes, or for at most [`DENY_WAIT_HOLD`].
+/// The client checks the netmap and grant signatures with the netmap key from enrollment.
+/// The function does not write files. An old coordinator returns an error.
+pub fn fetch_policy_wait_blocking(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+    etag: Option<&str>,
+) -> Result<PolicySync, CoordError> {
+    block_on(async {
+        let material = read_node_material(state_dir)?;
+        let pinned = material.netmap_public;
+        let request = Request {
+            op: "policy-wait".to_string(),
+            name: material.name.clone(),
+            token: None,
+            id_token: None,
+            nonce: None,
+            endpoints: Vec::new(),
+            routes: Vec::new(),
+            exit_node: false,
+            grant: None,
+            api_token: None,
+            deny_etag: etag.map(str::to_string),
+            expect_sha256: None,
+        };
+        let limit = DENY_WAIT_HOLD + std::time::Duration::from_secs(10);
+        let mut response = tokio::time::timeout(
+            limit,
+            authed_response(coord, coord_name, bundle_pem, material, request),
+        )
+        .await
+        .map_err(|_| CoordError::Tls("The policy wait timed out.".to_string()))??;
+        let invalid = || CoordError::Protocol("The coordinator request failed.".to_string());
+        let deny = response.detail.take().ok_or_else(invalid)?;
+        let etag = response.policy_etag.take().ok_or_else(invalid)?;
+        let result = enroll_from_response(response, bundle_pem, Some(pinned), false)?;
+        Ok(PolicySync {
+            view: view_from_result(result),
+            deny,
+            etag,
+        })
+    })
+}
+
 /// The longest time that the coordinator holds one `deny-wait` request.
 pub const DENY_WAIT_HOLD: std::time::Duration = std::time::Duration::from_secs(20);
 

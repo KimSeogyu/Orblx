@@ -9,6 +9,8 @@
 # when a switch gap is more than 1 second, or when svid_expiry is unknown.
 # The script also fails when the direct ping RTT is more than RTT_LIMIT_MS above
 # the plain container RTT, or when a renewed SVID does not reach the peer line.
+# W25-14: the script also fails when the max RTT of a steady ping run is more than
+# STEADY_MAX_MS (ORBLX_NATR_STEADY_MAX_MS, default 100 ms).
 # W21: the script also fails when the relay ping RTT avg is more than RELAY_SLACK_MS
 # above the direct ping RTT avg, when a relay ping is lost, or when an idle orblx
 # process uses more than IDLE_CPU_PCT percent CPU.
@@ -20,12 +22,8 @@
 # The script prints proof_ok.
 set -euo pipefail
 
-# Exit 0 when a line of stdin matches the ERE $1. It reads all of stdin.
-# Do not use grep -q, grep -m, head or awk with exit on a pipe: the reader exits early,
-# the writer gets SIGPIPE (exit 141), and set -o pipefail fails the pipe (W24-E4b, W25-3).
-has_line() {
-  awk -v re="$1" '$0 ~ re {found = 1} END {exit !found}'
-}
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -54,6 +52,8 @@ WAN_D="${PUB}.14"
 PINGS=50
 MAX_LOSS=1
 MAX_GAP_MS=1000
+# W25-14: the most max RTT of a steady ping run on a stable path.
+STEADY_MAX_MS="${ORBLX_NATR_STEADY_MAX_MS:-100}"
 SPRAY_MAX=2048
 # The direct overlay RTT may be at most this much above the plain container RTT.
 RTT_LIMIT_MS="${ORBLX_RTT_LIMIT_MS:-5}"
@@ -364,15 +364,10 @@ steady_pings() {
   local label="$1"
   local container="$2"
   local ip="$3"
-  local out received
+  local out
   out="$(docker exec "$container" ping -n -i 0.2 -c "$PINGS" -W 1 "$ip" | tail -2)"
   printf '%s\n' "$out"
-  received="$(printf '%s\n' "$out" | awk '/packets transmitted/ {print $4}')"
-  echo "${label} steady lost $((PINGS - received))/${PINGS}"
-  if (( PINGS - received > MAX_LOSS )); then
-    echo "${label} lost too many pings on a stable path." >&2
-    exit 1
-  fi
+  printf '%s\n' "$out" | steady_ping_gate "$label" "$PINGS" "$MAX_LOSS" "$STEADY_MAX_MS" || exit 1
 }
 
 # Print the avg value of one ping run.
@@ -626,7 +621,7 @@ check_renewal() {
         echo "${label} path is ${kind}, not ${want}." >&2
         exit 1
       fi
-      docker logs "$other" 2>&1 | grep -E '^The node renewed the SVID' | sed "s/^/${other}: /"
+      docker logs "$other" 2>&1 | show_matching -E '^The node renewed the SVID' | sed "s/^/${other}: /"
       SUMMARY+=("renew ${label} path ${kind} peer_svid_expiry ${before} to ${after}")
       return 0
     fi
@@ -744,7 +739,8 @@ port_of_mapping() {
 }
 
 echo "=== REAL cargo test signed hello and birthday bounds ==="
-cargo test -p orblx-edge --lib -- nat_path:: birthday:: 2>&1 | grep -E '^test |test result'
+# W25-14: the log keeps the full cargo output, so a failure shows its cause.
+cargo test -p orblx-edge --lib -- nat_path:: birthday:: 2>&1
 
 echo "=== [C] remove old proof stack ==="
 cleanup
@@ -901,7 +897,7 @@ bulk prc_prc_relay ${NATR_PREFIX}a ${NATR_PREFIX}b "$IP_B"
 idle_cpu prc_prc_relay ${NATR_PREFIX}a ${NATR_PREFIX}b
 echo "=== [C] switch prc_prc relay to direct (restore UDP) ==="
 measure_switch "switch prc_prc relay_to_direct" ${NATR_PREFIX}a node-b "$IP_B" direct open_ab
-docker logs ${NATR_PREFIX}a 2>&1 | grep -E '^The (path to|node sent|relay also)' | sed "s/^/${NATR_PREFIX}a: /"
+docker logs ${NATR_PREFIX}a 2>&1 | show_matching -E '^The (path to|node sent|relay also)' | sed "s/^/${NATR_PREFIX}a: /"
 stop_node ${NATR_PREFIX}a
 stop_node ${NATR_PREFIX}b
 

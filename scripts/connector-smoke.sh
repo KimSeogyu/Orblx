@@ -4,6 +4,8 @@
 # The proof does not open a TUN device.
 
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proof/pipe-lib.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
@@ -13,7 +15,7 @@ printf '%s\n' "$out"
 
 need_line() {
   local pattern=$1
-  if ! printf '%s\n' "$out" | grep -Eq "$pattern"; then
+  if ! printf '%s\n' "$out" | read_all grep -Eq "$pattern"; then
     echo "The smoke output does not match ${pattern}."
     exit 1
   fi

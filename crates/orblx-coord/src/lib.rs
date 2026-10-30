@@ -32,6 +32,7 @@ mod server;
 mod share;
 #[cfg(test)]
 mod share_test;
+mod sink;
 mod state;
 mod store;
 mod ticket;
@@ -50,8 +51,9 @@ pub use client::{
     admin_blocking, admin_token_blocking, admin_token_expect_blocking, advertise_exit_blocking,
     advertise_routes_blocking, agent_grant_fetch_blocking, agent_grant_request_blocking,
     enroll_with_oidc_blocking, enroll_with_token_blocking, fetch_deny_blocking,
-    fetch_deny_wait_blocking, fetch_netmap_blocking, netmap_json, publish_candidates_blocking,
-    renew_svid_blocking, AdminReply, GrantFetch, OidcEnroll, DENY_WAIT_HOLD,
+    fetch_deny_wait_blocking, fetch_netmap_blocking, fetch_policy_wait_blocking, netmap_json,
+    publish_candidates_blocking, renew_svid_blocking, AdminReply, GrantFetch, OidcEnroll,
+    PolicySync, DENY_WAIT_HOLD,
 };
 pub use config::{CoordConfig, OidcSection};
 pub use error::CoordError;
@@ -332,6 +334,101 @@ mod tests {
         );
         assert!(changed.contains("spiffe://orblx.local/node/wait-b"));
         assert_ne!(super::deny_etag(&changed), super::deny_etag(&first));
+        handle.abort();
+    }
+
+    /// W25-6: `policy-wait` replies at once for a new ETag. For a known ETag it holds the
+    /// request until the netmap or the deny list changes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn policy_wait_replies_when_the_netmap_or_the_deny_list_changes() {
+        let scratch = Scratch::new();
+        let node = Scratch::new();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let (addr, handle) =
+            super::server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .unwrap();
+        let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+        let enroll = |name: &'static str| {
+            let token = coord.create_token(Duration::from_secs(600)).unwrap();
+            let bundle = bundle.clone();
+            async move {
+                super::client::enroll_with_token(
+                    addr,
+                    "coord",
+                    &bundle,
+                    name,
+                    &token.secret,
+                    &[format!("{name}:443")],
+                    &[],
+                )
+                .await
+                .unwrap()
+            }
+        };
+        enroll("sync-a").await.write_state(&node.0).unwrap();
+        let wait = |etag: Option<String>| {
+            let (dir, bundle) = (node.0.clone(), bundle.clone());
+            tokio::task::spawn_blocking(move || {
+                super::client::fetch_policy_wait_blocking(
+                    addr,
+                    "coord",
+                    &bundle,
+                    &dir,
+                    etag.as_deref(),
+                )
+            })
+        };
+        let started = std::time::Instant::now();
+        let first = wait(None).await.unwrap().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(first.view.signed_netmap.netmap.self_node.name, "sync-a");
+        assert!(first.view.signed_netmap.netmap.peers.is_empty());
+        // The same state gives the same ETag, so the coordinator holds the request.
+        let waiter = wait(Some(first.etag.clone()));
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the coordinator did not hold the request"
+        );
+        enroll("sync-b").await;
+        let joined_at = std::time::Instant::now();
+        // An enroll writes more than one state file. A reply can show a part of the
+        // enroll (for example the endpoints first). The next request gets the rest.
+        let mut joined = waiter.await.unwrap().unwrap();
+        while !joined
+            .view
+            .signed_netmap
+            .netmap
+            .peers
+            .iter()
+            .any(|peer| peer.name == "sync-b")
+        {
+            assert!(joined_at.elapsed() < Duration::from_secs(1));
+            joined = wait(Some(joined.etag.clone())).await.unwrap().unwrap();
+        }
+        assert!(
+            joined_at.elapsed() < Duration::from_secs(1),
+            "the peer came {:?} after the enroll",
+            joined_at.elapsed()
+        );
+        assert_ne!(joined.etag, first.etag);
+        let waiter = wait(Some(joined.etag.clone()));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let owner = orblx_identity::SpiffeId::node("owner").unwrap();
+        super::revoke_all(&coord, "sync-b", owner.as_uri(), SystemTime::now()).unwrap();
+        let revoked_at = std::time::Instant::now();
+        let mut revoked = waiter.await.unwrap().unwrap();
+        while !revoked.deny.contains("spiffe://orblx.local/node/sync-b") {
+            assert!(revoked_at.elapsed() < Duration::from_secs(1));
+            revoked = wait(Some(revoked.etag.clone())).await.unwrap().unwrap();
+        }
+        assert!(
+            revoked_at.elapsed() < Duration::from_secs(1),
+            "the deny list came {:?} after the revoke",
+            revoked_at.elapsed()
+        );
+        assert_ne!(revoked.etag, joined.etag);
         handle.abort();
     }
 

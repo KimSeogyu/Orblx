@@ -4,6 +4,8 @@
 # The check does not use the data path.
 
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proof/pipe-lib.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
@@ -20,7 +22,7 @@ printf '%s\n' "$verify"
 need_line() {
   local text=$1
   local pattern=$2
-  if ! printf '%s\n' "$text" | grep -Eq "$pattern"; then
+  if ! printf '%s\n' "$text" | read_all grep -Eq "$pattern"; then
     echo "The audit output does not match ${pattern}."
     exit 1
   fi

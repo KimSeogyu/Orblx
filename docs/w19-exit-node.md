@@ -228,6 +228,8 @@ FORWARD was already ACCEPT.
 
 ## W25: the TCP Relay step after the NAT traversal change
 
+Release note: "Fixed: exit node over TCP Relay failed since #45 (present in rc.2)."
+
 Marks: [C] is a run on Docker on one Linux host. REAL is `cargo test`.
 
 From #45 (5d3e607) to #85, `exit-node.sh` stopped at `wait for the TCP Relay`.

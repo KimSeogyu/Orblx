@@ -142,6 +142,60 @@ async fn deny_wait(
     }
 }
 
+/// Reply with the signed netmap, the signed grants, and the deny list of one node (W25-6).
+///
+/// The reply comes at once when the ETag of the three is not `known`.
+/// Otherwise the request waits like `deny-wait`: until an input file changes and the ETag
+/// changes, or until [`crate::DENY_WAIT_HOLD`] ends.
+async fn policy_wait(
+    coord: &Coordinator,
+    name: &str,
+    known: Option<&str>,
+    mut stamp: watch::Receiver<u64>,
+) -> Result<Response, CoordError> {
+    let deadline = tokio::time::Instant::now() + crate::DENY_WAIT_HOLD;
+    loop {
+        stamp.borrow_and_update();
+        let view = coord.netmap_for(name)?;
+        let deny = admin::deny_json_for(coord, name, SystemTime::now())?;
+        let etag = policy_etag(&view, &deny)?;
+        let changed = known != Some(etag.as_str());
+        if changed
+            || !matches!(
+                tokio::time::timeout_at(deadline, stamp.changed()).await,
+                Ok(Ok(()))
+            )
+        {
+            let mut response = netmap_response(&view);
+            response.detail = Some(deny);
+            response.policy_etag = Some(etag);
+            return Ok(response);
+        }
+    }
+}
+
+/// The SHA-256 of the signed netmap, the signed grants, the endpoints, the routes, and the
+/// deny list ETag, in hex (W25-6).
+///
+/// Ed25519 signatures are deterministic, so the same view gives the same ETag.
+fn policy_etag(view: &crate::state::NetmapView, deny: &str) -> Result<String, CoordError> {
+    use sha2::{Digest, Sha256};
+    let invalid = || CoordError::Protocol("The netmap is not valid.".to_string());
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(&view.signed_netmap).map_err(|_| invalid())?);
+    hasher.update(b"\0");
+    hasher.update(serde_json::to_vec(&view.signed_grants).map_err(|_| invalid())?);
+    hasher.update(b"\0");
+    hasher.update(serde_json::to_vec(&view.endpoints).map_err(|_| invalid())?);
+    hasher.update(b"\0");
+    hasher.update(view.approved_routes.join(",").as_bytes());
+    hasher.update(b"\0");
+    hasher.update(view.advertised_routes.join(",").as_bytes());
+    hasher.update([u8::from(view.exit_approved), 0]);
+    hasher.update(admin::deny_etag(deny).as_bytes());
+    Ok(encode_hex(&hasher.finalize()))
+}
+
 async fn warm_jwks(coord: &Coordinator) {
     let Some(client_id) = coord.google_client_id_for_fetch().ok().flatten() else {
         return;
@@ -353,6 +407,13 @@ async fn dispatch(
                 ..Response::default()
             })
         }
+        "policy-wait" => {
+            let peer = peer_node(coord, connection)?;
+            if peer != request.name {
+                return Err(CoordError::Peer);
+            }
+            policy_wait(coord, &request.name, request.deny_etag.as_deref(), stamp).await
+        }
         "agent-grant" => {
             let peer = peer_node(coord, connection)?;
             if peer != request.name {
@@ -464,12 +525,16 @@ fn dispatch_token(
     // write use the same lock.
     // W25-7: a token cannot change the audit webhooks. A token that could remove a
     // webhook could hide its later calls from the receiver.
+    // W25-13: a token cannot change the SIEM sinks, for the same reason.
     let rule = || match &policy_lock {
         Some(lock) if !admin::policy_keeps_owners(coord, lock, &request.name)? => {
             Ok(Some(apitoken::Refusal::Owners))
         }
         Some(lock) if !admin::policy_keeps_webhooks(coord, lock, &request.name)? => {
             Ok(Some(apitoken::Refusal::Webhooks))
+        }
+        Some(lock) if !admin::policy_keeps_sinks(coord, lock, &request.name)? => {
+            Ok(Some(apitoken::Refusal::Sinks))
         }
         _ => Ok(None),
     };
@@ -844,6 +909,52 @@ mod tests {
                     && line.contains(&format!("reason {reason} status 403"))
             })
             .count()
+    }
+
+    /// W25-13: no token adds, removes, or changes a SIEM sink.
+    #[test]
+    fn a_token_cannot_change_the_siem_sinks() {
+        let dir = std::env::temp_dir().join(format!("orblx-server-sinks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        let sinks = |list: &[&str], port: u16| {
+            let base = policy_text(&[OWNER], port);
+            format!("{{\"auditSinks\": [{}], {}", list.join(", "), &base[1..])
+        };
+        let hec = r#"{"name": "hec", "type": "https", "url": "https://siem:8088/services/collector", "format": "splunk-hec", "credentialFile": "hec.token"}"#;
+        let hec_new_url = r#"{"name": "hec", "type": "https", "url": "https://other:8088/services/collector", "format": "splunk-hec", "credentialFile": "hec.token"}"#;
+        let syslog = r#"{"name": "sys", "type": "syslog-tls", "address": "siem:6514"}"#;
+        let policy_path = dir.join("policy.hujson");
+        std::fs::write(&policy_path, sinks(&[hec], 22)).unwrap();
+        coord.set_policy_file(&policy_path).unwrap();
+        assert_eq!(coord.audit_sinks().unwrap().len(), 1);
+        let now = SystemTime::now();
+        let made = apitoken::create(
+            &coord,
+            &CreateAsk {
+                scopes: all_scopes().iter().map(|s| s.to_string()).collect(),
+                ttl_secs: 60,
+            },
+            OWNER,
+            now,
+        )
+        .unwrap();
+        let before = sha(&policy_path);
+        for list in [vec![], vec![hec, syslog], vec![hec_new_url]] {
+            let ask = call_with("admin-policy-set", &sinks(&list, 22), &made.secret);
+            let reply = dispatch_token(&coord, &ask, &made.secret, now);
+            assert_eq!(reply.status, Some(403), "{list:?}");
+        }
+        assert_eq!(sha(&policy_path), before);
+        assert_eq!(deny_count(&coord, &made.id, "sinks"), 3);
+        // The same sinks in a new policy is allowed.
+        let ask = call_with("admin-policy-set", &sinks(&[hec], 2222), &made.secret);
+        let reply = dispatch_token(&coord, &ask, &made.secret, now);
+        assert_eq!(reply.status, Some(200));
+        assert_ne!(sha(&policy_path), before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// W25-7: no token adds, removes, or changes an audit webhook URL.

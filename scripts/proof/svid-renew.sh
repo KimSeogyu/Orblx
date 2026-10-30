@@ -3,11 +3,10 @@
 # The script pings once per second and reports loss.
 # The script skips the proof when it is not root or when Docker is absent.
 set -euo pipefail
-
-if [[ "$(id -u)" -ne 0 ]]; then
-  echo "The SVID renewal proof needs root. The script skips the proof."
-  exit 0
-fi
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
+# W25-14: this proof needs root. It stops at once without root.
+require_root "$@"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "The SVID renewal proof needs Docker. The script skips the proof."
@@ -51,7 +50,7 @@ require_toolchain() {
     exit 1
   fi
   rustc_ver=$(rustc --version | awk '{ print $2 }')
-  oldest=$(printf '%s\n%s\n' "$msrv" "$rustc_ver" | sort -V | head -n 1)
+  oldest=$(printf '%s\n%s\n' "$msrv" "$rustc_ver" | sort -V | read_all head -n 1)
   if [[ "$oldest" != "$msrv" ]]; then
     echo "rustc ${rustc_ver} is older than the crate MSRV ${msrv}."
     exit 1
@@ -78,13 +77,17 @@ cleanup() {
   fi
   rm -rf "$work"
 }
-trap cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "svid-renew"
 
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   iptables-legacy -P FORWARD ACCEPT
@@ -208,7 +211,7 @@ wait_direct() {
   local peer=$2
   local attempt
   for attempt in $(seq 1 40); do
-    if compose exec -T "$node" orblx status | grep -q "peer ${peer} overlay_ip .* path direct "; then
+    if compose exec -T "$node" orblx status | read_all grep -q "peer ${peer} overlay_ip .* path direct "; then
       return 0
     fi
     sleep 1
@@ -242,7 +245,7 @@ while IFS= read -r line; do
 done <"$ping_log"
 
 mapfile -t expiry_lines < <(compose logs node-a | awk '/The node renewed the SVID/ { print $NF }' | sed 's/\.$//')
-end_expiry=$(compose exec -T node-a orblx status | awk '/^svid_expiry / { print $2; exit }')
+end_expiry=$(compose exec -T node-a orblx status | read_all awk '/^svid_expiry / { print $2; exit }')
 
 echo "ping_seconds ${ping_count}"
 echo "sent ${sent}"

@@ -4,6 +4,8 @@
 # The script does not print enroll tokens or private keys.
 # The Mac steps stay in docs/w18-policy.md. This script does not run them.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -15,7 +17,11 @@ cleanup() {
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "policy"
 
 dc() {
   docker compose --progress quiet -f "$FILE" "$@"
@@ -23,7 +29,7 @@ dc() {
 
 resolve_coord() {
   dc --profile nodes run --rm --no-deps --entrypoint getent mac ahostsv4 coord \
-    | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
+    | read_all awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
 }
 
 # Docker on this host can leave iptables-legacy FORWARD policy DROP.
@@ -39,9 +45,9 @@ as_root() {
 
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -110,7 +116,7 @@ box_enroll="$(dc --profile nodes run --rm box \
   --state /var/lib/orblx \
   --endpoint box:443)"
 printf '%s\n' "$box_enroll"
-box_ip="$(printf '%s\n' "$box_enroll" | awk '/^overlay_ip /{print $2; exit}')"
+box_ip="$(printf '%s\n' "$box_enroll" | read_all awk '/^overlay_ip /{print $2; exit}')"
 if [[ -z "$box_ip" ]]; then
   echo "The box overlay address is missing." >&2
   exit 1
@@ -136,9 +142,9 @@ dc --profile nodes run --rm box \
 echo "=== [C] grants on box ==="
 grants_before="$(dc --profile nodes run --rm --entrypoint cat box /var/lib/orblx/grants.json)"
 printf '%s\n' "$grants_before"
-printf '%s\n' "$grants_before" | grep -q 'spiffe://orblx.local/node/mac'
-printf '%s\n' "$grants_before" | grep -q '"port_start":22'
-if printf '%s\n' "$grants_before" | grep -q '5432'; then
+printf '%s\n' "$grants_before" | read_all grep -q 'spiffe://orblx.local/node/mac'
+printf '%s\n' "$grants_before" | read_all grep -q '"port_start":22'
+if printf '%s\n' "$grants_before" | read_all grep -q '5432'; then
   echo "The grants allow TCP 5432." >&2
   exit 1
 fi
@@ -156,8 +162,8 @@ dc --profile nodes run --rm box \
 echo "=== [C] audit verify ==="
 verify="$(dc --profile nodes run --rm box audit verify --file /var/lib/orblx/audit.jsonl)"
 printf '%s\n' "$verify"
-printf '%s\n' "$verify" | grep -qx 'deny 1'
-printf '%s\n' "$verify" | grep -qx 'ok'
+printf '%s\n' "$verify" | read_all grep -qx 'deny 1'
+printf '%s\n' "$verify" | read_all grep -qx 'ok'
 
 echo "=== [C] failing policy ==="
 cat >"$POLICY_FILE" <<'EOF'

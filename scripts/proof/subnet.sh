@@ -7,6 +7,8 @@
 # The script does not print enroll tokens or private keys.
 # The Mac steps stay in docs/w18-subnet.md. This script does not run them.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -31,7 +33,11 @@ cleanup() {
     sudo -n rm -rf "$WORK" >/dev/null 2>&1 || rm -rf "$WORK" >/dev/null 2>&1 || true
   fi
 }
-trap cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "subnet"
 
 dc() {
   docker compose --progress quiet -f "$FILE" "$@"
@@ -50,9 +56,9 @@ as_root() {
 # iptables-nft already accepts the same traffic.
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -164,8 +170,8 @@ if ! grep -q '10.88.0.0/24' "$SUBNET_CLIENT_NETMAP"; then
   exit 1
 fi
 
-router_ip="$(sed -n 's/.*"name":"router","overlay_ip":"\([^"]*\)".*/\1/p' "$SUBNET_CLIENT_NETMAP" | head -n 1)"
-client_ip="$(sed -n 's/.*"name":"client","overlay_ip":"\([^"]*\)".*/\1/p' "$SUBNET_ROUTER_NETMAP" | head -n 1)"
+router_ip="$(sed -n 's/.*"name":"router","overlay_ip":"\([^"]*\)".*/\1/p' "$SUBNET_CLIENT_NETMAP" | read_all head -n 1)"
+client_ip="$(sed -n 's/.*"name":"client","overlay_ip":"\([^"]*\)".*/\1/p' "$SUBNET_ROUTER_NETMAP" | read_all head -n 1)"
 if [[ -z "$router_ip" || -z "$client_ip" ]]; then
   echo "The netmap did not include both overlay addresses." >&2
   exit 1
@@ -186,7 +192,7 @@ dc --profile nodes up -d lan router client
 echo "=== [C] wait for the overlay path ==="
 ready=0
 for _ in $(seq 1 40); do
-  if dc logs client 2>/dev/null | grep -q 'The path to router is direct.'; then
+  if dc logs client 2>/dev/null | read_all grep -q 'The path to router is direct.'; then
     ready=1
     break
   fi
@@ -197,7 +203,7 @@ if [[ "$ready" -ne 1 ]]; then
   dc logs router client >&2 || true
   exit 1
 fi
-if ! dc logs router 2>/dev/null | grep -q 'The node forwards 10.88.0.0/24'; then
+if ! dc logs router 2>/dev/null | read_all grep -q 'The node forwards 10.88.0.0/24'; then
   echo "The router did not enable forwarding." >&2
   dc logs router >&2 || true
   exit 1
@@ -208,22 +214,22 @@ dc exec -T client ip route
 echo "=== [C] routes on orblx0 ==="
 dc exec -T client ip route show dev orblx0
 route_text="$(dc exec -T client ip route show dev orblx0)"
-if ! printf '%s\n' "$route_text" | grep -q '10.88.0.0/24'; then
+if ! printf '%s\n' "$route_text" | read_all grep -q '10.88.0.0/24'; then
   echo "The approved route is not installed." >&2
   exit 1
 fi
-if printf '%s\n' "$route_text" | grep -q '10.99.0.0/24'; then
+if printf '%s\n' "$route_text" | read_all grep -q '10.99.0.0/24'; then
   echo "The unapproved route is installed." >&2
   exit 1
 fi
-if printf '%s\n' "$route_text" | grep -q '0.0.0.0/0'; then
+if printf '%s\n' "$route_text" | read_all grep -q '0.0.0.0/0'; then
   echo "The exit route is installed on the TUN device." >&2
   exit 1
 fi
 echo "=== [C] path for 1.1.1.1 ==="
 dc exec -T client ip route get 1.1.1.1
 inet_path="$(dc exec -T client ip route get 1.1.1.1)"
-if printf '%s\n' "$inet_path" | grep -q 'orblx0'; then
+if printf '%s\n' "$inet_path" | read_all grep -q 'orblx0'; then
   echo "Internet traffic entered the TUN device." >&2
   exit 1
 fi
@@ -234,7 +240,7 @@ dc exec -T client ping -c 3 -W 2 10.88.0.5
 echo "=== [C] HTTP to the LAN device ==="
 lan_body="$(dc exec -T client bash -c 'exec 3<>/dev/tcp/10.88.0.5/80; printf "GET / HTTP/1.0\r\n\r\n" >&3; dd bs=1024 count=4 <&3 2>/dev/null')"
 printf '%s\n' "$lan_body"
-if ! printf '%s\n' "$lan_body" | grep -q 'lan-ok'; then
+if ! printf '%s\n' "$lan_body" | read_all grep -q 'lan-ok'; then
   echo "The client did not read the LAN page." >&2
   exit 1
 fi
