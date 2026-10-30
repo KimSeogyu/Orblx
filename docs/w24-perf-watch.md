@@ -21,8 +21,7 @@ This document has no target numbers. Each number is a measured value from a log 
   A run fails when one of these is true:
   - the relay ping median is more than the direct ping median + 1 ms (prc relay path and sym relay path),
   - a ping is lost on a path (prc direct, prc direct at 0.23 s, prc relay, sym relay),
-  - the TCP throughput of a path is missing or not more than the floor. The floor is the nat-realism floor:
-    `tcp-bulk.py` must finish with a result (more than 0 Mbit/s, `ORBLX_PERF_MIN_MBIT`). This PR adds no new number,
+  - the TCP throughput of a path is missing or below 300 Mbit/s (W24-E3, `ORBLX_PERF_MIN_MBIT`),
   - more than 3 of 50 pings on a path are above 10 ms (`ORBLX_PERF_MAX_SPIKES`, `ORBLX_PERF_SPIKE_MS`).
 - The job always reports, for each path and run: the ping median, p99 (linear interpolation), max,
   and the spike count (pings above 10 ms). It also reports the box avg gate (relay avg <= direct avg + 1 ms)
@@ -143,5 +142,7 @@ The job keeps checking it on each push to main (`outlier` in `perf-watch.json`).
   and about 1200 Mbit/s on the local 8 vCPU host. Compare a runner number only with other runner numbers.
 - **Runner noise.** Each push gets a new runner VM. The CPU model and the neighbors can change.
 - **[C] only.** All overlay numbers are containers on one host. There is no number for a real network.
-- **Throughput floor.** The only floor is the nat-realism floor (the transfer must finish with a result).
-  A higher floor can be set after the job has a history of runner numbers.
+- **Throughput floor (W24-E3).** The CI floor is 300 Mbit/s on each path. The PO set this number.
+  REAL runner history: on an AMD EPYC 7763 runner (main run 41049508256, 130fe357) the prc direct TCP was
+  256.39, 277.43 and 280.83 Mbit/s. That run passed with the old floor. It would fail with the 300 Mbit/s floor.
+  On EPYC 9V45 and Xeon 8573C runners the lowest path was 473.53 Mbit/s (runs 41048025969, 41044075380).
