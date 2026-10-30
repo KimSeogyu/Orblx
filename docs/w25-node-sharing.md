@@ -112,7 +112,36 @@ Nodes b and g2 serve HTTP on TCP 8080 and 9090. Node g serves TCP 8080.
 
 ### Results [C]
 
-RESULTS_PLACEHOLDER
+Head `a4d899d` (branch `w25-node-sharing` with main `76c90ac`). Debug build. Log: `/workspace/orblx-w18-proof/w25a-node-share-branch-a4d899d.log`.
+
+| Gate | Result [C] |
+|---|---|
+| 1. The guest reaches the shared node and port | g -> b:8080 and g2 -> b:8080: `HTTP/1.0 200 OK`. |
+| 2. The guest reaches no other node | g -> a:8080 and g2 -> a:8080 refused. Node a counted **0 bytes from g and 0 bytes from g2** (65536 TCP + 65536 UDP each). Control g -> g2:7070: 131072 bytes. The netmap of g is `b,g2`. |
+| 3. The owner nodes do not reach the guest nodes | a -> g:8080 and a -> g2:8080 refused. The netmap of a is `b,owner`. Node `owner` is enrolled but does not run in the proof, so a is the other running owner node. |
+| 4. The share is audited | Unshare: 1 `unshare` record. Share again: 1 `share` record. 0 `policy-replace`. `verify ok`. |
+| 5. Unshare blocks access within 1 s | **unshare_deny_ms 791** (limit 1000). Hold probes a -> b:8080 and g -> g2:8080: 0 failures. |
+| Share again | g -> b:8080 works again after 1498 ms, with no restart. |
+| Secrets | 0 enroll tokens, 0 ID tokens, 0 `PRIVATE KEY` in the logs. |
+
+Earlier runs of the same proof: head `2c69734` deny 604 ms, restore 1334 ms (`w25a-node-share-branch-2c69734.log`); head `34b2753` deny 411 ms, restore 3220 ms.
+
+W23-4 performance gates (release nat-realism, `scripts/proof/nat-realism.sh`, prefix `orblx-w25a-natr-`).
+The runs alternate between this branch and main `76c90ac` in the same time window. Other workers ran 15 to 29 proof containers on the same host at that time.
+Logs: `/workspace/orblx-w18-proof/w25a-{branch-a4d899d,base-main-76c90ac}-run{1,2,3}-release-nat-realism.log`.
+
+| Value (Mbit/s or ms) | Branch run 1 / 2 / 3 | Branch median | main median (same window) | W22 |
+|---|---|---|---|---|
+| Direct throughput (prc_prc) | 1126.04 / 1093.16 / 1193.02 | **1126.04** | 826.27 | 1094 |
+| Relay throughput (prc_prc) | 1028.94 / 1173.07 / 1159.23 | **1159.23** | 1004.54 | 1128 |
+| Relay throughput (sym_sym) | 1056.05 / 895.20 / 1103.68 | **1056.05** | 1043.09 | 1113 |
+| Relay RTT avg prc / direct avg | 0.957/0.505, 0.837/1.105, 0.814/0.584 | | | relay <= direct + 1 |
+| Relay RTT avg sym / direct avg | 0.896/0.505, 0.991/1.105, 0.827/0.584 | | | relay <= direct + 1 |
+| Lost pings | 0/50 in each relay RTT check | | | 0/50 |
+
+The relay RTT gate and the loss gate pass in each run. The direct and prc relay medians are above W22.
+The sym relay median (1056.05) is below W22 (1113). The main median in the same window is 1043.09, also below W22. The branch does not change the packet path. Thus the difference comes from the host load, not from this change.
+One branch run (run 2) had a ping max of 28.867 ms, with 15 other proof containers running.
 
 ## Run the proof
 
