@@ -22,8 +22,8 @@ use orblx_coord::{
 use orblx_crypto::{mac_input, ticket_mac};
 use orblx_datapath::{
     read_status_text, remove_link_resolver, run_node, running_pid, AllowPeers, HelloConfig, Netmap,
-    NetmapPeer, NodeRequest, PeerVisibility, RenewedLeaf, SvidRenewer, DEFAULT_UDP_PORT,
-    LINUX_TUN_NAME,
+    NetmapPeer, NodeRequest, PacketFilter, PeerVisibility, RenewedLeaf, SvidRenewer,
+    DEFAULT_UDP_PORT, LINUX_TUN_NAME, PACKET_AUDIT_FILE,
 };
 use orblx_identity::{
     sign_ticket, DenySet, MiniCa, Policy, SpiffeId, TicketClaims, TicketFlags, TicketSigner,
@@ -396,7 +396,16 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
     let (netmap_path, forward_routes, forward_exit) = publish_routes(&options)?;
     let netmap = locked_netmap(&options.state_dir, &netmap_path)?;
     let config = load_config(&options.state_dir)?;
-    let visibility = load_visibility(&options.state_dir, &netmap.self_node.name)?;
+    let overlay: Ipv4Addr = netmap
+        .self_node
+        .overlay_ip
+        .parse()
+        .map_err(|_| "The overlay address is not valid.".to_string())?;
+    let (visibility, filter) = load_grants(&options.state_dir, &netmap.self_node.name, overlay)?;
+    if let Some(filter) = &filter {
+        // W24-A: a packet to a subnet route that this node forwards needs a subnet grant.
+        filter.set_routes(&forward_routes);
+    }
     let ssh_state = options.state_dir.clone();
     let serve_netmap = netmap_path.clone();
     spawn_deny_refresh(&options);
@@ -425,6 +434,7 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
             orblx_serve::spawn_serve(&ssh_state, &serve_netmap, overlay);
         })),
         metrics: options.metrics,
+        filter,
     })
     .map_err(|err| err.to_string())
 }
@@ -966,17 +976,51 @@ fn login_name_ok(name: &str) -> bool {
         })
 }
 
-fn load_visibility(dir: &Path, self_name: &str) -> Result<Arc<dyn PeerVisibility>, String> {
+/// The peer visibility and the packet filter from the signed grants.
+pub(crate) type GrantState = (Arc<dyn PeerVisibility>, Option<Arc<PacketFilter>>);
+
+/// Read the signed grants for DNS visibility and for the packet filter (W24).
+///
+/// Without a grant file, the node shows every peer and has no packet filter.
+/// With a grant file, a thread reads the file again each second.
+/// The filter drops packets only when the signed grants set `filter`.
+pub(crate) fn load_grants(
+    dir: &Path,
+    self_name: &str,
+    overlay: Ipv4Addr,
+) -> Result<GrantState, String> {
     let path = dir.join("grants.signed.json");
     if !path.exists() {
-        return Ok(Arc::new(AllowPeers));
+        return Ok((Arc::new(AllowPeers), None));
     }
-    let live = LiveGrants::open(&path, dir, self_name)?;
+    let live = Arc::new(LiveGrants::open(&path, dir, self_name, overlay)?);
     println!(
         "The DNS responder uses the signed grants. This node can reach {} peers.",
         live.reach_len()
     );
-    Ok(Arc::new(live))
+    let filter = live.filter.clone();
+    if let Some(filter) = &filter {
+        print_filter_state(filter.active());
+        let watcher = Arc::clone(&live);
+        let spawned = std::thread::Builder::new()
+            .name("orblx-grants".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                watcher.refresh();
+            });
+        if let Err(err) = spawned {
+            return Err(format!("The grant reload thread did not start. {err}"));
+        }
+    }
+    Ok((live, filter))
+}
+
+fn print_filter_state(active: bool) {
+    if active {
+        println!("The packet filter is on. The node drops packets that no grant allows.");
+    } else {
+        println!("The packet filter is off. The policy has no ACL list.");
+    }
 }
 
 /// Signed grants that the node reads again after a renewal.
@@ -988,10 +1032,11 @@ struct LiveGrants {
     seen: Mutex<Vec<u8>>,
     revision: AtomicU64,
     error: Mutex<String>,
+    filter: Option<Arc<PacketFilter>>,
 }
 
 impl LiveGrants {
-    fn open(path: &Path, dir: &Path, self_name: &str) -> Result<Self, String> {
+    fn open(path: &Path, dir: &Path, self_name: &str, overlay: Ipv4Addr) -> Result<Self, String> {
         let bytes = fs::read(path)
             .map_err(|err| format!("The file {} did not open. {err}", path.display()))?;
         let signed = parse_grants(&bytes)?;
@@ -1003,7 +1048,9 @@ impl LiveGrants {
         if signed.grants.receiver != receiver.as_uri() {
             return Err("The grant receiver does not match the node.".to_string());
         }
+        let filter = PacketFilter::new(overlay, &signed.grants, Some(dir.join(PACKET_AUDIT_FILE)));
         Ok(Self {
+            filter: Some(filter),
             path: path.to_path_buf(),
             public,
             receiver: receiver.as_uri().to_string(),
@@ -1045,6 +1092,13 @@ impl LiveGrants {
         if signed.grants.receiver != self.receiver {
             self.keep_previous(bytes, "The grant receiver does not match the node.");
             return;
+        }
+        if let Some(filter) = &self.filter {
+            let was = filter.active();
+            filter.replace(&signed.grants);
+            if was != filter.active() {
+                print_filter_state(filter.active());
+            }
         }
         let count = signed.grants.reach.len();
         *self.reach.lock().unwrap_or_else(|err| err.into_inner()) =
@@ -1519,7 +1573,10 @@ mod tests {
         ])
         .unwrap())
         .unwrap();
-        let visibility = super::load_visibility(&dir.join("a"), "a").unwrap();
+        let (visibility, filter) =
+            super::load_grants(&dir.join("a"), "a", Ipv4Addr::new(100, 64, 0, 1)).unwrap();
+        // The policy has an ACL list, so the packet filter is on (W24).
+        assert!(filter.expect("filter").active());
         let peer_b = orblx_datapath::NetmapPeer {
             name: "b".to_string(),
             overlay_ip: "100.64.0.2".to_string(),
@@ -1539,7 +1596,7 @@ mod tests {
         let mut signed = fs::read_to_string(dir.join("a").join("grants.signed.json")).unwrap();
         signed.push('x');
         fs::write(dir.join("a").join("grants.signed.json"), signed).unwrap();
-        assert!(super::load_visibility(&dir.join("a"), "a").is_err());
+        assert!(super::load_grants(&dir.join("a"), "a", Ipv4Addr::new(100, 64, 0, 1)).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1557,7 +1614,9 @@ mod tests {
         .unwrap();
         let peer = grant_peer("b");
         write_reach(&dir, &key, vec![peer.svid.clone()]);
-        let visibility = super::load_visibility(&dir, "a").unwrap();
+        let visibility = super::load_grants(&dir, "a", Ipv4Addr::new(100, 64, 0, 1))
+            .unwrap()
+            .0;
         assert!(visibility.is_visible(&peer));
         let first = visibility.revision();
         write_reach(&dir, &key, Vec::new());
@@ -1587,6 +1646,8 @@ mod tests {
             receiver: "spiffe://orblx.local/node/a".to_string(),
             grants: Vec::new(),
             reach,
+            filter: false,
+            subnets: Vec::new(),
         };
         let signed = key.sign_grants(&grants).unwrap();
         let text = serde_json::to_string(&signed).unwrap();

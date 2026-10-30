@@ -23,6 +23,19 @@
       "proto": "tcp",
       "dst": ["spiffe://orblx.local/node/b:8080"],
     },
+    {
+      // W24: the datapath drops ICMP that no rule allows. The proof pings a to b, b to a, and c to b.
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a", "spiffe://orblx.local/node/c"],
+      "proto": "icmp",
+      "dst": ["spiffe://orblx.local/node/b:*"],
+    },
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/b"],
+      "proto": "icmp",
+      "dst": ["spiffe://orblx.local/node/a:*"],
+    },
   ],
   "tests": [
     {

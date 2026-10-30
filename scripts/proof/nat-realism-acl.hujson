@@ -1,0 +1,27 @@
+{
+  // NAT realism proof with the datapath ACL (W24).
+  // Each node may reach each other node with ICMP and on TCP 5201 (the bulk port).
+  // The nodes drop all other packets. The RTT gate and the bulk runs use only these flows.
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/node-a", "spiffe://orblx.local/node/node-b", "spiffe://orblx.local/node/node-c", "spiffe://orblx.local/node/node-d", "spiffe://orblx.local/node/node-e", "spiffe://orblx.local/node/node-f", "spiffe://orblx.local/node/node-g", "spiffe://orblx.local/node/node-h"],
+      "proto": "icmp",
+      "dst": ["spiffe://orblx.local/node/node-a:*", "spiffe://orblx.local/node/node-b:*", "spiffe://orblx.local/node/node-c:*", "spiffe://orblx.local/node/node-d:*", "spiffe://orblx.local/node/node-e:*", "spiffe://orblx.local/node/node-f:*", "spiffe://orblx.local/node/node-g:*", "spiffe://orblx.local/node/node-h:*"],
+    },
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/node-a", "spiffe://orblx.local/node/node-b", "spiffe://orblx.local/node/node-c", "spiffe://orblx.local/node/node-d", "spiffe://orblx.local/node/node-e", "spiffe://orblx.local/node/node-f", "spiffe://orblx.local/node/node-g", "spiffe://orblx.local/node/node-h"],
+      "proto": "tcp",
+      "dst": ["spiffe://orblx.local/node/node-a:5201", "spiffe://orblx.local/node/node-b:5201", "spiffe://orblx.local/node/node-c:5201", "spiffe://orblx.local/node/node-d:5201", "spiffe://orblx.local/node/node-e:5201", "spiffe://orblx.local/node/node-f:5201", "spiffe://orblx.local/node/node-g:5201", "spiffe://orblx.local/node/node-h:5201"],
+    },
+  ],
+  "tests": [
+    {
+      "src": "spiffe://orblx.local/node/node-a",
+      "proto": "tcp",
+      "accept": ["spiffe://orblx.local/node/node-b:5201"],
+      "deny": ["spiffe://orblx.local/node/node-b:5202"],
+    },
+  ],
+}

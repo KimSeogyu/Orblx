@@ -6,6 +6,12 @@
       "src": ["spiffe://orblx.local/node/laptop"],
       "proto": "udp",
       "dst": ["spiffe://orblx.local/node/srv:*"]
+    },
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/laptop"],
+      "proto": "icmp",
+      "dst": ["spiffe://orblx.local/node/srv:*"]
     }
   ]
 }

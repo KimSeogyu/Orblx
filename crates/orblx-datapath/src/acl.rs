@@ -139,6 +139,8 @@ mod tests {
                 port_end: 22,
             }],
             reach: Vec::new(),
+            filter: false,
+            subnets: Vec::new(),
         }
     }
 

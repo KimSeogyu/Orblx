@@ -17,6 +17,14 @@
       "proto": "tcp",
       "dst": ["tag:exit:80"],
     },
+    {
+      // W24: the policy has an ACL list, so the datapath on the exit node drops packets that no rule allows.
+      // The client sends DNS to the DNS responder of the exit node on UDP 53.
+      "action": "accept",
+      "src": ["group:humans"],
+      "proto": "udp",
+      "dst": ["tag:exit:53"],
+    },
   ],
   "autoApprovers": {
     "exitNode": ["tag:exit"],

@@ -4,6 +4,7 @@
 # The policy denies node a to node c.
 # On node a, c and c.lab.orblx are NXDOMAIN.
 # Node b still resolves and answers.
+# W24: the datapath on c also drops TCP from a (the ACL has no rule for it).
 # The script skips the proof when it is not root.
 # The script needs Docker and a built orblx binary.
 
@@ -250,7 +251,13 @@ start_http node-b 100.64.0.2
 start_http node-c 100.64.0.3
 wait_http node-a 100.64.0.2
 wait_http node-b 100.64.0.1
-wait_http node-a 100.64.0.3
+wait_http node-b 100.64.0.3
+# W24: the policy has an ACL list, so the datapath on c drops TCP from a.
+if docker compose -f "$compose_file" exec -T node-a curl -fsS --max-time 3 "http://100.64.0.3:8080/orblx-name.txt" >/dev/null 2>&1; then
+  echo "Node a reached the HTTP server on c. The datapath must drop it."
+  exit 1
+fi
+echo "[C] node-a to http://100.64.0.3:8080 dropped by the datapath"
 
 echo "---- [C] ping ----"
 ping_name node-a b
