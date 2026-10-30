@@ -31,11 +31,10 @@ jobs:
       - name: Check the shell syntax of the release and proof scripts
         run: |
           sh -n scripts/install.sh
-          bash -n scripts/release/package.sh scripts/proof/release.sh scripts/proof/release-real.sh
-          bash -n scripts/proof/agent-grant.sh scripts/proof/agent-gateway.sh scripts/proof/agent-python-sdk.sh
-          bash -n scripts/proof/nat-realism.sh scripts/proof/perf-watch.sh scripts/proof/proof-lock.sh scripts/proof/serial-rtt.sh
-          bash -n scripts/proof/api-tokens.sh scripts/proof/token-no-escalation.sh scripts/proof/audit-webhooks.sh
-          bash -n scripts/proof/docker-image.sh
+          # bash -n reads only its first file, so check each script alone.
+          for script in scripts/release/*.sh scripts/proof/*.sh scripts/*.sh; do
+            bash -n "$script"
+          done
           sh -n docker/entrypoint.sh
 
       - name: Run the perf watch summary tests
