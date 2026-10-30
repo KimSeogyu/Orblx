@@ -12,6 +12,8 @@
 # Run as root, or with sudo -n available for docker.
 # The script does not print enroll tokens, keys, or certificates.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -23,6 +25,11 @@ PINGS="${ORBLX_DIMG_PINGS:-20}"
 NET="${PREFIX}-net"
 STATE=/var/lib/orblx
 WORK="$(mktemp -d)"
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap proof_lock_end EXIT
+proof_lock_take "docker-image"
 chmod 700 "$WORK"
 
 docker() {
@@ -48,7 +55,8 @@ cleanup() {
   teardown
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the cleanup runs first, then the lock is released.
+trap 'cleanup; proof_lock_end' EXIT
 
 die() {
   echo "FAIL: $*" >&2
@@ -76,7 +84,7 @@ log_count() {
 status_field() {
   local name="$1" field="$2"
   docker exec "$name" orblx status --state-dir "$STATE" 2>/dev/null \
-    | awk -v f="$field" '$1 == f {print $2; exit}'
+    | read_all awk -v f="$field" '$1 == f {print $2; exit}'
 }
 
 wait_status() {

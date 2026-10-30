@@ -113,6 +113,18 @@ fn a_guest_sees_only_the_shared_node_and_each_share_change_writes_one_record() {
         ),
         (6, 8080, 8080)
     );
+    // W25-1b: each node guards the peers of another tenant that it sees.
+    // Their packets need a grant also when the policy has no `acls` list.
+    let uri = |name: &str| format!("spiffe://orblx.local/node/{name}");
+    assert_eq!(b_grants.guarded, vec![uri("g"), uri("g2")]);
+    assert_eq!(g_grants.guarded, vec![uri("b")]);
+    assert!(coord
+        .netmap_for("a")
+        .unwrap()
+        .signed_grants
+        .grants
+        .guarded
+        .is_empty());
     // Gate 3: the acl a -> g gives no grant, because g is not shared with a.
     // The acl g -> g2 stays, because g and g2 are in the same tenant.
     let g2_grants = coord.netmap_for("g2").unwrap().signed_grants.grants;
@@ -157,6 +169,13 @@ fn a_guest_sees_only_the_shared_node_and_each_share_change_writes_one_record() {
     assert!(!denied(&b_deny, "a"));
     assert!(!denied(&deny_for(&coord, "g"), "g2"));
     assert_eq!(peers(&coord, "g"), vec!["g2"]);
+    assert!(coord
+        .netmap_for("g")
+        .unwrap()
+        .signed_grants
+        .grants
+        .guarded
+        .is_empty());
     let checked = verify_config_file(&path).unwrap();
     assert_eq!(checked.records.len(), before + 1);
     let unshare = &checked.records.last().unwrap().event;

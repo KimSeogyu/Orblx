@@ -5,6 +5,8 @@
 # The script deletes the orblx-audit-proof volumes at the start and at the end.
 # The script does not print enroll tokens or private keys.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -16,7 +18,11 @@ cleanup() {
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "config-audit"
 
 dc() {
   docker compose --progress quiet --profile nodes -f "$FILE" "$@"
@@ -25,7 +31,7 @@ dc() {
 resolve_name() {
   local name="$1"
   dc run --rm --no-deps --entrypoint getent a ahostsv4 "$name" \
-    | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
+    | read_all awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
 }
 
 build_image() {
@@ -178,7 +184,7 @@ if [[ "$enroll_count" -ne 3 ]]; then
   echo "The audit has ${enroll_count} enroll records. The proof expects 3." >&2
   exit 1
 fi
-printf '%s\n' "$audit_text" | grep -q '^verify ok records 13 tip [0-9a-f]\{64\}$'
+printf '%s\n' "$audit_text" | read_all grep -q '^verify ok records 13 tip [0-9a-f]\{64\}$'
 
 echo "=== [C] admin audit --json --since ${start_unix} ==="
 audit_json="$(admin audit --json --since "$start_unix" 2>"$WORK/json.err")"
@@ -219,7 +225,7 @@ if [[ "$tamper_status" -eq 0 ]]; then
   echo "The chain check passed after the change." >&2
   exit 1
 fi
-printf '%s\n' "$tamper_out" | grep -q '^verify failed: The hash check failed at index'
+printf '%s\n' "$tamper_out" | read_all grep -q '^verify failed: The hash check failed at index'
 
 echo "=== [C] audit verify-config after the change ==="
 set +e
@@ -232,6 +238,6 @@ if [[ "$file_status" -eq 0 ]]; then
   echo "The file check passed after the change." >&2
   exit 1
 fi
-printf '%s\n' "$file_out" | grep -q 'The hash check failed at index'
+printf '%s\n' "$file_out" | read_all grep -q 'The hash check failed at index'
 
 echo "proof_ok"

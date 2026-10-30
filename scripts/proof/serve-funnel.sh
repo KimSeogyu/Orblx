@@ -4,12 +4,18 @@
 # serve-lib.sh has the setup and the optional SERVE_* environment values.
 # The script does not print private keys, tickets, or SVID proofs.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 # shellcheck source=serve-lib.sh
 source "$ROOT/scripts/proof/serve-lib.sh"
-trap serve_cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'serve_cleanup; proof_lock_end' EXIT
+proof_lock_take "serve-funnel" "${SERVE_PROJECT:-orblx-serve-proof}"
 
 serve_setup http.server
 
@@ -59,11 +65,11 @@ dc logs --no-log-prefix node-b 2>/dev/null | grep -E '^(serve|funnel)_' || true
 echo "=== [C] audit chain on node b ==="
 audit="$(dc exec -T node-b orblx audit verify-config --file /var/lib/orblx/serve-audit.jsonl)"
 printf '%s\n' "$audit"
-echo "$audit" | grep -qx 'ok'
-echo "$audit" | grep -qx 'serve 1'
-echo "$audit" | grep -qx 'funnel-on 1'
-echo "$audit" | grep -qx 'funnel-off 1'
-echo "$audit" | grep -qx 'records 3'
+echo "$audit" | read_all grep -qx 'ok'
+echo "$audit" | read_all grep -qx 'serve 1'
+echo "$audit" | read_all grep -qx 'funnel-on 1'
+echo "$audit" | read_all grep -qx 'funnel-off 1'
+echo "$audit" | read_all grep -qx 'records 3'
 
 echo "=== [C] a changed record breaks the chain ==="
 as_root cp "$WORK/b/serve-audit.jsonl" "$WORK/tampered.jsonl"
@@ -75,7 +81,7 @@ fi
 echo "tampered_chain rejected"
 
 echo "=== [C] no key material in the node logs ==="
-if dc logs 2>/dev/null | grep -Eq 'PRIVATE KEY|BEGIN CERTIFICATE'; then
+if dc logs 2>/dev/null | read_all grep -Eq 'PRIVATE KEY|BEGIN CERTIFICATE'; then
   echo "A node log has PEM data." >&2
   exit 1
 fi

@@ -1,0 +1,267 @@
+"""W24-E4b and W25-14: no shell script in the repo may end a pipe reader early.
+
+Under set -o pipefail, a reader that exits before the end of its input (grep -q, grep -m,
+head, awk with exit, sed with q) makes the writer get SIGPIPE (exit 141), and the pipe fails.
+- In an assignment, the script stops (main perf-watch run 41070530507, run2).
+- In "if WRITER | grep -q BAD; then fail", the condition is false, so a leak, hole punch
+  or deny check passes when it must fail.
+The fix is scripts/proof/pipe-lib.sh: read_all reads all of stdin first, and has_line is an awk
+reader that reads all of stdin. A line inside a string that runs in a container sh (no pipefail)
+has a "# pipe-ok:" comment on the line above.
+
+The negative tests take the reader from the real script line, put the bad line first in a
+large input (so that an early reader stops the writer), and check that the check finds it.
+"""
+
+import os
+import re
+import subprocess
+import time
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+PIPE_LIB = os.path.join(REPO, "scripts", "proof", "pipe-lib.sh")
+SKIP_DIRS = {".git", "target", "node_modules"}
+READER = re.compile(r"(?<![|])\|(?![|])(\s*)(grep|head|awk|sed)\b")
+
+
+def shell_files():
+    out = []
+    for top, dirs, files in os.walk(REPO):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        out += [os.path.join(top, f) for f in files if f.endswith(".sh")]
+    return sorted(out)
+
+
+def early(cmd, rest):
+    if cmd == "head":
+        return True
+    if cmd == "grep":
+        for tok in rest.split():
+            if not tok.startswith("-") or tok == "--":
+                return False
+            if tok.startswith("--"):
+                if tok.startswith(("--max-count", "--quiet", "--silent")):
+                    return True
+            elif re.search("[qm]", tok[1:]):
+                return True
+        return False
+    m = re.match(r"\s*((-\S+\s+(\S+\s+)?)*)'([^']*)'", rest)
+    body = m.group(4) if m else rest
+    if cmd == "awk":
+        return re.search(r"\bexit\b", body) is not None
+    return re.search(r"(^|[;}\s/])q\b", body) is not None  # sed
+
+
+def allowed(lines, i):
+    j = i - 1
+    while j >= 0 and lines[j].rstrip().endswith("\\"):
+        j -= 1
+    return (j >= 0 and "pipe-ok:" in lines[j]) or (i > 0 and "pipe-ok:" in lines[i - 1])
+
+
+def early_readers(path):
+    found = []
+    with open(path, errors="replace") as f:
+        lines = f.read().split("\n")
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("#") or allowed(lines, i):
+            continue
+        for m in READER.finditer(line):
+            if early(m.group(2), line[m.end():]):
+                found.append("%s:%d: %s" % (os.path.relpath(path, REPO), i + 1, line.strip()))
+                break
+    return found
+
+
+def bash(script, env=None):
+    full = dict(os.environ, **(env or {}))
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=full)
+
+
+def line_of(rel, needle):
+    with open(os.path.join(REPO, rel)) as f:
+        hits = [l for l in f if needle in l and not l.lstrip().startswith("#")]
+    assert len(hits) == 1, (rel, needle, hits)
+    return hits[0].strip()
+
+
+def reader_of(line):
+    """Return the reader command of a check line: the text after "| read_all " or "| "has_line."""
+    m = re.search(r"\|\s*(read_all\s+.*|has_line\s+.*)$", line)
+    assert m, line
+    cmd = m.group(1)
+    cmd = re.split(r";\s*then\b|\s\|\|\s|\s&&\s", cmd)[0]
+    return cmd.rstrip(" \\")
+
+
+# The checks that find a bad line and then fail the proof: "if WRITER | READER; then fail".
+# Before W24-E4b / W25-14 each one could pass when it must fail. (file, text of the line, bad line)
+SILENT_PASS_CHECKS = [
+    ("scripts/proof/coord-enroll.sh", "grep -q 'ge1\\.'", '{"token":"ge1.fake-token"}', "leak"),
+    ("scripts/proof/coord-enroll.sh", "nodes.json | read_all grep -q 'PRIVATE KEY'", "-----BEGIN PRIVATE KEY-----", "leak"),
+    ("scripts/proof/coord-enroll.sh", "The netmap is not valid", "The netmap is not valid.", "gate"),
+    ("scripts/proof/custom-oidc.sh", "dc logs 2>&1 | read_all grep -qF", "token eyJfake.sigpart end", "leak"),
+    ("scripts/proof/custom-oidc.sh", "nodes.json | read_all grep -qF", "token eyJfake.sigpart end", "leak"),
+    ("scripts/proof/custom-oidc.sh", "dc logs 2>&1 | read_all grep -q 'PRIVATE KEY'", "-----BEGIN PRIVATE KEY-----", "leak"),
+    ("scripts/proof/nat.sh", "grep -q '^The hole punch reached'", "The hole punch reached 172.29.20.13:4000.", "hole punch"),
+    ("scripts/proof/nat.sh", 'dc logs coord | read_all grep -q "PRIVATE KEY"', "-----BEGIN PRIVATE KEY-----", "leak"),
+    ("scripts/proof/node-lock.sh", "netmap_peers \"$name\" | read_all grep -qw arogue", "peer arogue 100.64.0.9", "deny"),
+    ("scripts/proof/policy.sh", "grep -q '5432'", '{"port_start":5432}', "deny"),
+    ("scripts/proof/serve-funnel.sh", "PRIVATE KEY|BEGIN CERTIFICATE", "-----BEGIN CERTIFICATE-----", "leak"),
+    ("scripts/proof/serve-hardening.sh", "PRIVATE KEY|BEGIN CERTIFICATE", "-----BEGIN PRIVATE KEY-----", "leak"),
+    ("scripts/proof/split-dns.sh", "if dc exec -T c ip route show dev orblx0", "10.88.24.0/24 dev orblx0 scope link", "deny"),
+    ("scripts/proof/split-dns.sh", "-e '10.88.24.20' -e '192.0.2.1'", "db.corp.lan 10.88.24.20", "deny"),
+    ("scripts/proof/ssh.sh", "grep -q leaked", "leaked", "deny"),
+    ("scripts/proof/subnet.sh", "\"$route_text\" | read_all grep -q '10.99.0.0/24'", "10.99.0.0/24 dev orblx0", "deny"),
+    ("scripts/proof/subnet.sh", "grep -q '0.0.0.0/0'", "0.0.0.0/0 dev orblx0", "deny"),
+    ("scripts/proof/subnet.sh", "\"$inet_path\" | read_all grep -q 'orblx0'", "1.1.1.1 dev orblx0 src 100.64.0.2", "deny"),
+    ("scripts/proof/w18-names.sh", "grep -q 'DUP!'", "64 bytes from 100.64.0.2: icmp_seq=3 (DUP!)", "gate"),
+    ("scripts/proof/nat-realism.sh", "has_line '^The hole punch reached'", "The hole punch reached 172.29.20.13:4000.", "hole punch"),
+    ("scripts/proof/nat-realism.sh", 'docker logs "$name" 2>&1 | has_line "PRIVATE KEY"', "-----BEGIN PRIVATE KEY-----", "leak"),
+    ("scripts/proof/nat-realism.sh", 'dc logs coord relay 2>&1 | has_line "PRIVATE KEY"', "-----BEGIN PRIVATE KEY-----", "leak"),
+]
+
+# Audit verify and deny count checks: "WRITER | read_all grep -q GOOD || fail" (or set -e).
+# The bad output has no good line, so the reader must return 1. (file, text of the line, good line)
+AUDIT_CHECKS = [
+    ("scripts/proof/agent-gateway.sh", '"$api_verify" | read_all grep -qx ok', "ok"),
+    ("scripts/proof/agent-gateway.sh", '"$db_verify" | read_all grep -qx ok', "ok"),
+    ("scripts/proof/agent-gateway.sh", "gateway-audit-api.jsonl\" | read_all grep -qx ok", "ok"),
+    ("scripts/proof/agent-gateway.sh", '"$new_verify" | read_all grep -qx ok', "ok"),
+    ("scripts/proof/agent-gateway.sh", "\"$coord_audit\" | read_all grep -q '^verify ok '", "verify ok records 9 tip ab"),
+    ("scripts/proof/agent-grant.sh", "\"$early_audit\" | read_all grep -q '^verify ok '", "verify ok records 9 tip ab"),
+    ("scripts/proof/agent-grant.sh", "\"$coord_audit\" | read_all grep -q '^verify ok '", "verify ok records 9 tip ab"),
+    ("scripts/proof/agent-python-sdk.sh", '"$api_verify" | read_all grep -qx ok', "ok"),
+    ("scripts/proof/agent-python-sdk.sh", "\"$coord_audit\" | read_all grep -q '^verify ok '", "verify ok records 9 tip ab"),
+    ("scripts/proof/config-audit.sh", "verify ok records 13 tip", "verify ok records 13 tip " + "a" * 64),
+    ("scripts/proof/node-lock.sh", "\"$audit\" | read_all grep -q '^verify ok '", "verify ok records 9 tip ab"),
+    ("scripts/proof/policy.sh", "grep -qx 'deny 1'", "deny 1"),
+    ("scripts/proof/policy.sh", "\"$verify\" | read_all grep -qx 'ok'", "ok"),
+    ("scripts/proof/split-dns.sh", "packet-audit.jsonl | read_all grep -qx ok", "ok"),
+    ("scripts/proof/serve-funnel.sh", "echo \"$audit\" | read_all grep -qx 'ok'", "ok"),
+    ("scripts/proof/ssh.sh", "echo \"$b_audit\" | read_all grep -q '^ok$'", "ok"),
+    ("scripts/proof/ssh.sh", "echo \"$b_audit\" | read_all grep -Eq '^deny [1-9]'", "deny 2"),
+    ("scripts/proof/ssh.sh", "echo \"$c_audit\" | read_all grep -Eq '^deny [1-9]'", "deny 1"),
+]
+
+GEN = r'{ printf "%s\n" "$BAD_LINE"; awk "BEGIN {for (i = 0; i < 300000; i++) print \"clean line\"}"; }'
+ENV = {"sig_part": "eyJfake.sigpart"}
+
+
+class NoEarlyPipeReaderTest(unittest.TestCase):
+    def test_no_shell_script_has_an_early_pipe_reader(self):
+        files = shell_files()
+        self.assertGreater(len(files), 40)
+        found = [hit for path in files for hit in early_readers(path)]
+        self.assertEqual(found, [])
+
+    def test_the_guard_finds_each_kind_of_early_reader(self):
+        lines = [
+            "x | grep -q a", "x | grep -qx -- a", "x | grep -Eq a", "x | grep -m1 a", "x | head -n 1",
+            "x | awk '/a/ {print; exit}'", "x | sed -n '1p;q'", "x | grep --quiet a",
+        ]
+        for line in lines:
+            m = READER.search(line)
+            self.assertTrue(m and early(m.group(2), line[m.end():]), line)
+        for line in ["x | grep -c a", "x | grep -v a", "x | awk '{print $1}'", "x || grep -q a f"]:
+            m = READER.search(line)
+            self.assertFalse(m and early(m.group(2), line[m.end():]), line)
+
+    def test_read_all_keeps_the_bytes_and_the_exit_code(self):
+        res = subprocess.run(["bash", "-c", '. "$0"; set -euo pipefail; printf "a\\n\\nb\\n" | read_all cat; '
+                              'printf "" | read_all grep -q x || echo "rc $?"; '
+                              'seq 1 300000 | read_all grep -qx 2 && echo found', PIPE_LIB],
+                             capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "a\n\nb\nrc 1\nfound\n")
+
+    def _run(self, reader, bad, old=False):
+        prefix = "" if old else ". \"$0\"; "
+        if old:
+            reader = re.sub(r"^read_all\s+", "", reader)
+            reader = re.sub(r"^has_line\s+", "grep -Eq ", reader)
+        script = prefix + "set -euo pipefail; " + GEN + " | " + reader
+        env = dict(ENV, BAD_LINE=bad)
+        return subprocess.run(["bash", "-c", script, PIPE_LIB], capture_output=True, text=True,
+                              env=dict(os.environ, **env)).returncode
+
+    def test_each_silent_pass_check_fails_on_a_bad_line(self):
+        for rel, needle, bad, kind in SILENT_PASS_CHECKS:
+            with self.subTest(rel=rel, check=needle, kind=kind):
+                reader = reader_of(line_of(rel, needle))
+                # The bad line is found: the "if" is true and the proof fails.
+                self.assertEqual(self._run(reader, bad), 0, reader)
+                # Without the bad line the check passes.
+                self.assertEqual(self._run(reader, "clean line"), 1, reader)
+                # The old reader stops early: the writer gets SIGPIPE, so the old check missed it.
+                self.assertEqual(self._run(reader, bad, old=True), 141, reader)
+
+    def test_each_audit_and_deny_check_fails_on_bad_output(self):
+        for rel, needle, good in AUDIT_CHECKS:
+            with self.subTest(rel=rel, check=needle):
+                reader = reader_of(line_of(rel, needle))
+                self.assertEqual(self._run(reader, good), 0, reader)
+                self.assertEqual(self._run(reader, "verify failed: The hash check failed at index 2"), 1, reader)
+
+
+ROOT_PROOFS = ["coord-enroll.sh", "split-dns.sh", "svid-renew.sh", "w18-names.sh"]
+PROOFS_WITH_OWN_LOCK = sorted(
+    f for f in os.listdir(os.path.join(REPO, "scripts", "proof"))
+    if f.endswith(".sh") and f not in {
+        "proof-lock.sh", "pipe-lib.sh", "serve-lib.sh", "stage-image.sh", "entrypoint.sh", "nat-router.sh"}
+)
+
+
+class ProofHardeningTest(unittest.TestCase):
+    def test_each_proof_takes_the_lock_before_its_first_docker_or_cargo_command(self):
+        paths = [os.path.join(REPO, "scripts", "proof", f) for f in PROOFS_WITH_OWN_LOCK]
+        paths.append(os.path.join(REPO, "examples", "policy-gitops", "proof", "proof.sh"))
+        for path in paths:
+            with self.subTest(proof=os.path.relpath(path, REPO)):
+                with open(path) as f:
+                    lines = f.read().split("\n")
+                take = [i for i, l in enumerate(lines) if re.match(r"\s*proof_lock_take ", l)]
+                self.assertTrue(take, "no proof_lock_take")
+                self.assertEqual(lines[take[0]], lines[take[0]].lstrip(), "proof_lock_take is indented")
+                in_function = False
+                depth = 0
+                for i, l in enumerate(lines[: take[0]]):
+                    s = l.strip()
+                    if re.match(r"^[a-z_][a-z0-9_]*\(\) \{", l):
+                        in_function = not l.rstrip().endswith("}")
+                        continue
+                    if in_function:
+                        in_function = l != "}"
+                        continue
+                    if s.startswith("#"):
+                        continue
+                    # The lock must not be inside an if, a loop, or a case.
+                    # A line that ends with ":" is Python code in a string, not shell.
+                    if s.endswith(":"):
+                        continue
+                    if re.match(r"(if|for|while|until|case)\b", s) and not re.search(r"\b(fi|done|esac)$", s):
+                        depth += 1
+                    elif re.match(r"(fi|done|esac)\b", s):
+                        depth -= 1
+                    self.assertIsNone(re.match(r"(docker|dc|cargo|compose|iptables\S*|ip|sudo|as_root)\b", s),
+                                      "line %d runs before the lock: %s" % (i + 1, s))
+                self.assertEqual(depth, 0, "proof_lock_take is inside an if, a loop, or a case")
+
+    @unittest.skipIf(os.geteuid() == 0, "the test runs as root")
+    def test_a_root_proof_without_root_stops_in_one_second(self):
+        for name in ROOT_PROOFS:
+            with self.subTest(proof=name):
+                start = time.monotonic()
+                res = subprocess.run([os.path.join(REPO, "scripts", "proof", name)],
+                                     capture_output=True, text=True, timeout=10, cwd=REPO)
+                took = time.monotonic() - start
+                self.assertEqual(res.returncode, 1)
+                self.assertIn("run as root: sudo -n ", res.stderr)
+                self.assertEqual(res.stdout, "")
+                self.assertLess(took, 1.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

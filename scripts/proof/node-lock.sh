@@ -10,6 +10,8 @@
 # The script deletes the orblx-w23a-node-lock volumes at the start.
 # The script does not print enroll tokens, owner private keys, or signatures.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -22,6 +24,11 @@ TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 STATE=/var/lib/orblx
 KEYS=/var/lib/orblx/owner-keys
 NODES=(a ak2 arogue b c)
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap proof_lock_end EXIT
+proof_lock_take "node-lock"
 mkdir -p "$PUB_DIR"
 
 cleanup() {
@@ -32,7 +39,8 @@ cleanup() {
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the cleanup runs first, then the lock is released.
+trap 'cleanup; proof_lock_end' EXIT
 
 dc() {
   docker compose --progress quiet --profile nodes -f "$FILE" "$@"
@@ -41,7 +49,7 @@ dc() {
 resolve_name() {
   local name="$1"
   dc run --rm --no-deps --entrypoint getent owner ahostsv4 "$name" \
-    | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
+    | read_all awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
 }
 
 as_root() {
@@ -54,9 +62,9 @@ as_root() {
 
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -89,7 +97,7 @@ wait_log() {
   local needle="$2"
   local i
   for i in $(seq 1 60); do
-    if dc logs "$service" 2>&1 | grep -q "$needle"; then
+    if dc logs "$service" 2>&1 | read_all grep -q "$needle"; then
       return 0
     fi
     sleep 1
@@ -152,7 +160,7 @@ wait_path() {
   local i
   for i in $(seq 1 60); do
     if dc exec -T "$from" orblx status --state-dir "$STATE" 2>/dev/null \
-      | grep -q "^peer ${to} .* path direct "; then
+      | read_all grep -q "^peer ${to} .* path direct "; then
       echo "path ${from} ${to} direct"
       return 0
     fi
@@ -167,7 +175,7 @@ no_path() {
   local from="$1"
   local to="$2"
   if dc exec -T "$from" orblx status --state-dir "$STATE" 2>/dev/null \
-    | grep -q "^peer ${to} .* path direct "; then
+    | read_all grep -q "^peer ${to} .* path direct "; then
     echo "The node ${from} has a direct path to ${to}." >&2
     exit 1
   fi
@@ -269,7 +277,7 @@ nodes_out="$(owner nodes)"
 printf '%s\n' "$nodes_out"
 declare -A ips
 for name in "${NODES[@]}"; do
-  ips[$name]="$(printf '%s\n' "$nodes_out" | awk -v n="$name" '$1 == "node" && $2 == n {print $3; exit}')"
+  ips[$name]="$(printf '%s\n' "$nodes_out" | read_all awk -v n="$name" '$1 == "node" && $2 == n {print $3; exit}')"
   echo "overlay ${name} ${ips[$name]}"
 done
 
@@ -316,7 +324,7 @@ for name in a ak2 b c; do
 done
 echo "netmap_peers arogue $(netmap_peers arogue)"
 for name in a ak2 b c; do
-  if netmap_peers "$name" | grep -qw arogue; then
+  if netmap_peers "$name" | read_all grep -qw arogue; then
     echo "The node ${name} kept arogue in the netmap." >&2
     exit 1
   fi
@@ -422,7 +430,7 @@ echo "after_restart refused_ak2_total ${after_refused_ak2} refused_arogue_total 
 echo "=== [C] coordinator audit chain ==="
 audit="$(owner audit)"
 printf '%s\n' "$audit" | grep ' lock-' || true
-printf '%s\n' "$audit" | grep -q '^verify ok '
+printf '%s\n' "$audit" | read_all grep -q '^verify ok '
 declare -A lock_counts
 for action in lock-init lock-sign lock-rotate lock-remove; do
   lock_counts[$action]="$(printf '%s\n' "$audit" | grep -c " ${action} " || true)"

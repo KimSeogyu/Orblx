@@ -8,6 +8,8 @@
 # The script deletes the orblx-agent-proof volumes at the start.
 # The script does not print enroll tokens, private keys, tickets, or use proofs.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -28,7 +30,11 @@ cleanup() {
   dc down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+# W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+trap 'cleanup; proof_lock_end' EXIT
+proof_lock_take "agent-python-sdk" "${PROOF_PROJECT:-}"
 
 dc() {
   docker compose --progress quiet -p "${PROOF_PROJECT:-orblx-agent-proof}" --profile nodes -f "$FILE" "$@"
@@ -37,7 +43,7 @@ dc() {
 resolve_name() {
   local name="$1"
   dc --profile nodes run --rm --no-deps --entrypoint getent owner ahostsv4 "$name" \
-    | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
+    | read_all awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}'
 }
 
 as_root() {
@@ -50,9 +56,9 @@ as_root() {
 
 open_legacy_forward() {
   command -v iptables-legacy >/dev/null 2>&1 || return 0
-  as_root iptables-legacy -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP' || return 0
+  as_root iptables-legacy -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD DROP' || return 0
   if command -v iptables-nft >/dev/null 2>&1; then
-    as_root iptables-nft -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD ACCEPT' || return 0
+    as_root iptables-nft -S FORWARD 2>/dev/null | read_all grep -qx -- '-P FORWARD ACCEPT' || return 0
   fi
   echo "=== [C] set iptables-legacy FORWARD ACCEPT ==="
   as_root iptables-legacy -P FORWARD ACCEPT
@@ -85,7 +91,7 @@ wait_log() {
   local needle="$2"
   local i
   for i in $(seq 1 60); do
-    if dc logs "$service" 2>&1 | grep -q "$needle"; then
+    if dc logs "$service" 2>&1 | read_all grep -q "$needle"; then
       return 0
     fi
     sleep 1
@@ -194,7 +200,7 @@ owner approve a
 owner approve b
 nodes="$(owner nodes)"
 printf '%s\n' "$nodes"
-b_ip="$(printf '%s\n' "$nodes" | awk '$1 == "node" && $2 == "b" {print $3; exit}')"
+b_ip="$(printf '%s\n' "$nodes" | read_all awk '$1 == "node" && $2 == "b" {print $3; exit}')"
 echo "b_ip ${b_ip}"
 
 for name in a b; do
@@ -210,7 +216,7 @@ dc --profile nodes up -d a b
 wait_log a 'The TUN device'
 wait_log b 'The TUN device'
 for i in $(seq 1 60); do
-  if dc exec -T a orblx status --state-dir "$STATE" 2>/dev/null | grep -q '^peer b .* path direct '; then
+  if dc exec -T a orblx status --state-dir "$STATE" 2>/dev/null | read_all grep -q '^peer b .* path direct '; then
     break
   fi
   if [[ "$i" -eq 60 ]]; then
@@ -294,11 +300,11 @@ for i in $(seq 1 120); do
 done
 agent_out="$(dc exec -T a cat "$STATE/sdk-agent.log")"
 printf '%s\n' "$agent_out"
-printf '%s\n' "$agent_out" | grep -qx 'sdk_exit 0'
-printf '%s\n' "$agent_out" | grep -qx 'sdk agent_ok'
-printf '%s\n' "$agent_out" | grep -q '^sdk call status 200 '
-printf '%s\n' "$agent_out" | grep -q '^sdk post status 200 .*body_len 9'
-printf '%s\n' "$agent_out" | grep -q '^sdk out_of_scope status 403 reason path$'
+printf '%s\n' "$agent_out" | read_all grep -qx 'sdk_exit 0'
+printf '%s\n' "$agent_out" | read_all grep -qx 'sdk agent_ok'
+printf '%s\n' "$agent_out" | read_all grep -q '^sdk call status 200 '
+printf '%s\n' "$agent_out" | read_all grep -q '^sdk post status 200 .*body_len 9'
+printf '%s\n' "$agent_out" | read_all grep -q '^sdk out_of_scope status 403 reason path$'
 expiry_line="$(printf '%s\n' "$agent_out" | grep '^sdk expiry ')"
 ttl_delta="$(awk '{for (i = 1; i < NF; i++) if ($i == "deny_after_end_ms") print $(i + 1)}' <<<"$expiry_line")"
 ttl_reason="$(awk '{print $NF}' <<<"$expiry_line")"
@@ -316,7 +322,7 @@ echo "=== [C] gateway log and audit chain ==="
 dc exec -T b cat "$STATE/gateway-api.log"
 api_verify="$(dc exec -T b orblx audit verify-config --file "$STATE/gateway-audit-api.jsonl")"
 printf '%s\n' "$api_verify"
-printf '%s\n' "$api_verify" | grep -qx ok
+printf '%s\n' "$api_verify" | read_all grep -qx ok
 for reason in path expired; do
   hits="$(dc exec -T b grep -c "reason ${reason} " "$STATE/gateway-audit-api.jsonl" || true)"
   echo "api_chain_deny ${reason} ${hits}"
@@ -329,8 +335,8 @@ echo "api_chain_use ${use_hits}"
 echo "=== [C] coordinator audit chain ==="
 coord_audit="$(owner audit)"
 printf '%s\n' "$coord_audit" | grep ' agent-' || true
-printf '%s\n' "$coord_audit" | grep -q " agent-approve ${grant1} actor spiffe://orblx.local/node/owner "
-printf '%s\n' "$coord_audit" | grep -q '^verify ok '
+printf '%s\n' "$coord_audit" | read_all grep -q " agent-approve ${grant1} actor spiffe://orblx.local/node/owner "
+printf '%s\n' "$coord_audit" | read_all grep -q '^verify ok '
 printf '%s\n' "$coord_audit" | grep '^verify '
 
 echo "=== [C] logs hold no key, ticket, or use proof ==="

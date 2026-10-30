@@ -58,7 +58,7 @@ else
   [ -s "$token_file" ] || fail "The enroll token file is empty or missing."
   endpoint="${ORBLX_ENDPOINT:-}"
   if [ -z "$endpoint" ]; then
-    ip4="$(ip -4 -o addr show scope global | awk '{split($4, a, "/"); print a[1]; exit}')"
+    ip4="$(ip -4 -o addr show scope global | awk '!found {split($4, a, "/"); print a[1]; found = 1}')"
     [ -n "$ip4" ] || fail "The container has no IPv4 address. Set ORBLX_ENDPOINT."
     endpoint="${ip4}:443"
   fi
