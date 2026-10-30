@@ -398,10 +398,9 @@ echo "revoke_drop_ms ${drop_ms} (last datagram from a at the router minus revoke
 echo "[C] gate2 ok"
 
 echo "=== [C] logs hold no key or enroll token ==="
-dc --profile nodes --profile load logs >"$WORK/all-logs.out" 2>&1 || true
-hits="$(grep -cF 'PRIVATE KEY' "$WORK/all-logs.out" || true)"
-echo "secret_grep 'PRIVATE KEY' ${hits}"
-[[ "$hits" -eq 0 ]] || fail "A log holds a private key."
+# W25-14: a failed or empty log read fails the scan. Before, "|| true" let the scan pass.
+dc --profile nodes --profile load logs >"$WORK/all-logs.out" 2>&1 || fail "docker compose logs failed."
+secret_scan "$WORK/all-logs.out" || fail "A log holds a private key or an enroll token, or the log is empty."
 
 echo "summary policy_change_to_new_answer_ms remove ${remove_ms} add ${add_ms} limit_ms ${LIMIT_MS} revoke_drop_ms ${drop_ms} limit_ms ${DROP_LIMIT_MS} late_peer_reachable_ms ${from_up} restarts 0 manual_fetch 0"
 echo "proof_ok"

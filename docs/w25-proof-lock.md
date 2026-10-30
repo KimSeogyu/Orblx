@@ -165,7 +165,30 @@ The table has the `sym_sym_relay` TCP throughput (one 5 s sample for each run) a
 - Attempt 1: 9 values, median 1000.54 Mbit/s (contended).
 - Attempt 2: 10 values, median 959.45 Mbit/s (contended). Values from 199.49 to 1340.55 Mbit/s.
 
-Both medians are below 1113 Mbit/s, but every run was contended (max load1 up to 20.10). No run was alone on the box, so these values do not show a regression. The PO asked for this check in serial idle runs on main. Those runs come after the merge, and their result is reported apart from this document.
+Both medians are below 1113 Mbit/s, but every run was contended (max load1 up to 20.10). No run was alone on the box, so these values do not show a regression. The PO asked for this check in serial idle runs on main. See the serial runs on main below.
+
+### Serial runs on main after the merge
+
+22:43:49 to 23:36:40 KST on main `d0ddf7f` (the #78 merge commit), with the same command and output directory `/workspace/orblx-w18-proof/w25f-main`. The lock waited 33.7 s for another proof (`orblx-w25ha`, with `flock` on the same file). Logs: `/workspace/orblx-w18-proof/w25f-main-serial.log`, `w25f-main/runN.log`, `w25f-main/runN.samples.tsv`.
+
+| Run | Result | Max ping ms (path) | Median direct | Median direct 0.23 s | Median prc relay | Median sym relay | Lost | Sym relay Mbit/s | Max load1 | Contention | Max ping vs nearest SVID renewal | Start | All paths |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | ok | 3.090 (prc_prc_relay) | 0.601 | 0.636 | 0.464 | 0.821 | 0/200 | 1145.67 | 17.02 | contended (max 10 other, 171/176 samples) | -165.0 s (orblx-w25f-natr1-a, 4 renewals) | 2026-10-30T22:43:49.807+0900 load 11.93/4.68/4.24 other 7 | yes |
+| 2 | ok | 1.820 (prc_prc_relay) | 0.640 | 0.701 | 1.010 | 0.978 | 0/200 | 1042.89 | 1.49 | alone (max 0 other, 0/152 samples) | -168.2 s (orblx-w25f-natr1-a, 4 renewals) | 2026-10-30T22:49:54.289+0900 load 0.94/3.41/4.08 other 0 | yes |
+| 3 | ok | 4.390 (prc_prc_direct_i0.23) | 0.623 | 0.623 | 0.896 | 0.914 | 0/200 | 966.36 | 2.35 | alone (max 0 other, 0/153 samples) | -214.1 s (orblx-w25f-natr1-a, 4 renewals) | 2026-10-30T22:55:03.507+0900 load 0.68/1.66/3.12 other 0 | yes |
+| 4 | ok | 3.250 (sym_sym_relay) | 0.558 | 0.629 | 0.972 | 0.951 | 0/200 | 1216.13 | 6.41 | alone (max 0 other, 0/156 samples) | -78.6 s (orblx-w25f-natr1-a, 4 renewals) | 2026-10-30T23:00:15.729+0900 load 1.26/1.53/2.65 other 0 | yes |
+| 5 | ok | 3.110 (prc_prc_relay) | 0.629 | 0.597 | 1.070 | 0.974 | 0/200 | 916.39 | 4.00 | alone (max 0 other, 0/152 samples) | -162.3 s (orblx-w25f-natr1-a, 4 renewals) | 2026-10-30T23:05:35.052+0900 load 4.00/2.72/2.81 other 0 | yes |
+| 6 | ok | 1.820 (prc_prc_relay) | 0.579 | 0.657 | 1.060 | 0.978 | 0/200 | 1054.21 | 2.89 | alone (max 0 other, 0/153 samples) | -170.1 s (orblx-w25f-natr1-a, 4 renewals) | 2026-10-30T23:10:45.685+0900 load 1.81/1.97/2.44 other 0 | yes |
+| 7 | ok | 2.450 (prc_prc_relay) | 0.659 | 0.680 | 0.853 | 1.125 | 0/200 | 981.26 | 2.74 | alone (max 0 other, 0/153 samples) | -170.7 s (orblx-w25f-natr1-a, 4 renewals) | 2026-10-30T23:15:56.824+0900 load 1.11/1.51/2.12 other 0 | yes |
+| 8 | ok | 8.980 (prc_prc_relay) | 0.565 | 0.682 | 0.773 | 1.105 | 0/200 | 1306.48 | 1.23 | alone (max 0 other, 0/152 samples) | -172.2 s (orblx-w25f-natr1-a, 4 renewals) | 2026-10-30T23:21:09.755+0900 load 0.89/1.25/1.85 other 0 | yes |
+| 9 | ok | 1.670 (sym_sym_relay) | 0.667 | 0.647 | 0.990 | 1.060 | 0/200 | 1197.09 | 1.51 | alone (max 0 other, 0/153 samples) | -74.7 s (orblx-w25f-natr1-a, 4 renewals) | 2026-10-30T23:26:19.117+0900 load 0.68/0.89/1.52 other 0 | yes |
+| 10 | ok | 2.040 (sym_sym_relay) | 0.702 | 0.683 | 1.080 | 0.992 | 0/200 | 1179.55 | 1.28 | alone (max 0 other, 0/153 samples) | -71.9 s (orblx-w25f-natr1-b, 4 renewals) | 2026-10-30T23:31:29.774+0900 load 0.63/0.82/1.31 other 0 | yes |
+
+sym_sym_relay throughput all runs: 10 values, median 1099.94 Mbit/s, BELOW the W22 floor 1113; alone runs: 9 values, median 1054.21 Mbit/s, BELOW the W22 floor 1113
+
+`serial_rtt gate ok: 10 runs, every max ping below 20.0 ms, 0 lost`. Run 1 was contended (max 10 other orblx containers). Runs 2 to 10 were alone on the box: every sample saw 0 other orblx containers. No run had a ping above 20 ms, so the KILL condition did not occur. In every run, the 4 SVID renewals came in the renewal case at the end of the proof, 71.9 s to 214.1 s after the max ping.
+
+The sym relay values are one 5 s sample for each run. The median of the 9 alone runs (1054.21 Mbit/s) is below the W22 value 1113 Mbit/s. W25-12 measures this again with 30 s samples (see [W25-12 sym relay throughput](w25-sym-throughput.md)).
 
 ## Gate 3: no datapath code change (REAL)
 

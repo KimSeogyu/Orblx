@@ -33,7 +33,7 @@ for i in $(seq 1 "$RUNS"); do
   code=$?
   echo "$code" >"$OUT/run${i}.exit"
   echo "=== serial run ${i}/${RUNS} end $(proof_lock_now) exit ${code} ==="
-  python3 "$ROOT/scripts/proof/serial-rtt-table.py" "$OUT" --upto "$i" | tail -1
+  python3 "$ROOT/scripts/proof/serial-rtt-table.py" "$OUT" --upto "$i" --last-row
   python3 "$ROOT/scripts/proof/serial-rtt-table.py" "$OUT" --upto "$i" --kill-check
   case $? in
     0) ;;
