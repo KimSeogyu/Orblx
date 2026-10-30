@@ -104,14 +104,14 @@ The script uses the names `orblx-w25h-dimg-*` (containers, volumes, one network)
 It runs the coordinator from the same image with `ORBLX_SVID_TTL=60`.
 It does not print enroll tokens, keys, or certificates.
 
-Log: `/workspace/orblx-w18-proof/w25-h-docker-image-05f4be21.log` (branch, commit `05f4be2`, on main `38b1638`).
+Log: `/workspace/orblx-w18-proof/w25-h-docker-image-ecb00bfa.log` (branch commit `ecb00bf`, on main `1dbbec6`).
 
 | Gate | Label | Result |
 | --- | --- | --- |
 | 1. Multi-stage build, slim runtime, at most 60 MB | REAL | `size_bytes 40259589` (40.3 MB), 1 layer. The stripped release binary is 14964872 bytes (15.0 MB). |
-| 2. Only a token, `NET_ADMIN`, and `/dev/net/tun`: enroll, SVID, overlay ping | [C] | `b` used a token file. `a` used a token env var (`--env-file`). `privileged false cap_add [CAP_NET_ADMIN] devices 1` for both. Overlay `a 100.64.0.2`, `b 100.64.0.1`. `ping a->b`: 20/20, 0% loss, avg 0.813 ms. The `orblx up` process has 0 `ORBLX_ENROLL_TOKEN*` variables. 0 temp token files. |
-| 3. Restart with the state volume: same overlay IP, no new enroll | [C] | `a overlay before 100.64.0.2 after 100.64.0.2 enrolled_lines 1 no_enroll_lines 1`. `ping a->b after restart`: 20/20, 0% loss. |
-| 4. SVID renew in the container, short life | [C] | `ORBLX_SVID_TTL=60`. `The node renewed the SVID. The new expiry is 1793362591.` `svid_expiry before 1793362551 after 1793362591`. Ping after renew: 20/20, 0% loss. |
+| 2. Only a token, `NET_ADMIN`, and `/dev/net/tun`: enroll, SVID, overlay ping | [C] | `b` used a token file. `a` used a token env var (`--env-file`). `privileged false cap_add [CAP_NET_ADMIN] devices 1` for both. Overlay `a 100.64.0.2`, `b 100.64.0.1`. `ping a->b`: 20/20, 0% loss, avg 1.736 ms, max 6.010 ms. The `orblx up` process has 0 `ORBLX_ENROLL_TOKEN*` variables. 0 temp token files. `resolvectl` missing: 1 line, the node continues. |
+| 3. Restart with the state volume: same overlay IP, no new enroll | [C] | `a overlay before 100.64.0.2 after 100.64.0.2 enrolled_lines 1 no_enroll_lines 1`. `ping a->b after restart`: 20/20, 0% loss, avg 0.620 ms. |
+| 4. SVID renew in the container, short life | [C] | `ORBLX_SVID_TTL=60`. `The node renewed the SVID. The new expiry is 1793363346.` `svid_expiry before 1793363306 after 1793363346` (+40 s). Ping after renew: 20/20, 0% loss, avg 1.075 ms. |
 | 5. No token, key, or PEM in the image | REAL | `docker history --no-trunc`: 6 lines, 0 hits (the two tokens, `BEGIN`, `ORBLX_ENROLL_TOKEN=`). `Config.Env` has only `PATH`. Scan: `layers 1 files 206 needles 2 hits 0`. |
 | 5. Control | REAL | An image from this image with a planted fake PEM block and a planted string: `control history hit 1`, scan `hits 3` (the string in the layer and in the config, the PEM block in `etc/planted.pem`). |
 | 6. CI builds the image on each PR, no push | REAL | The CI job builds the image, checks the size, checks the history, scans the image, runs the control, and runs `orblx --version`. |
@@ -123,8 +123,32 @@ The `orblx` binary has PEM label strings, but no PEM body. A label alone is not 
 
 ## 4. W23-4 gates
 
-NAT_REALISM_PLACEHOLDER
+Script: `scripts/proof/nat-realism.sh` with `ORBLX_NATR_PROFILE=release`, names `orblx-w25h-natr-*`,
+subnets `172.29.127.0/24` and `10.127.21.0/24` to `10.127.24.0/24`. Branch commit `05f4be2` on main `38b1638`.
+Main `1dbbec6` changed only the perf watch files, so the Rust code and this script are the same.
+
+Log: `/workspace/orblx-w18-proof/w25-h-nat-realism.log`. Result: `proof_ok` [C].
+
+| Check | Result |
+| --- | --- |
+| Direct RTT | `rtt plain_avg_ms 0.044 direct_avg_ms 0.316`, `rtt limit_ms 5 ok` |
+| prc_prc relay gate | relay avg 0.685 ms, direct avg 0.316 ms, slack 1 ms, 0/50 lost, `relay_gate ok` |
+| sym_sym relay gate | relay avg 0.910 ms, direct avg 0.316 ms, slack 1 ms, 0/50 lost, `relay_gate ok` |
+| Switch direct to relay | detect 439 ms, 0/50 lost, max gap 468 ms |
+| Switch relay to direct | detect 459 ms, 0/50 lost, max gap 210 ms |
+| Throughput | prc_prc direct 816.80 Mbit/s, prc_prc relay 716.13 Mbit/s |
+| SVID renew | direct and relay peers see the new peer expiry |
 
 ## 5. CI
 
-CI_PLACEHOLDER
+The job `Docker image build, size, and secrets scan` runs on `ubuntu-latest` for each PR and each push to main. It does these steps:
+
+1. `docker build -f docker/Dockerfile -t orblx-ci:local .`
+2. It fails when the image is more than 60000000 bytes.
+3. It fails when `docker history --no-trunc` has `BEGIN` or `ORBLX_ENROLL_TOKEN=`.
+4. It runs `image-secrets-scan.py` on `docker save`. A hit fails the job.
+5. Control: it builds an image with a planted fake PEM block. The scan must find it (`--expect-hit`).
+6. It runs `orblx --version` in the image.
+
+The job has no registry login and no `docker push`.
+The `rust` job also checks the shell syntax of `docker/entrypoint.sh` and `scripts/proof/docker-image.sh`.
