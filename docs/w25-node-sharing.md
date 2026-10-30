@@ -77,15 +77,28 @@ The brief scope is the policy, coordinator, and sharing files. These files are o
 | `crates/orblx-datapath/src/node.rs` | The deny tick is 100 ms (was 10 s). The node lock check stays at 10 s. The node applies the deny list only when the text of `deny.json` changes. Then it replaces the endpoint deny list and closes each open session whose peer SPIFFE ID is in the list (new `close_denied_links`). | Session control, not the packet path. The per-frame check denies only ticket nonces. Without this, an open session stays after the unshare (proof run 1 failed for this reason). The dial task tries again, so a share again restores the session with no restart. |
 | `crates/orblx-cli/src/up.rs` | The deny fetch starts each 500 ms. The fetch time is not added to the interval. | With the fetch time added, one run took 1120 ms (run 5) and failed the 1 s gate. |
 
-The packet path (`payload_from_data`, the packet filter of track A) is not changed.
+W25-1 did not change the packet path (`payload_from_data`). W25-1b (below) changes the packet filter of W24-A.
+
+## W25-1b: The share scope follows the port ACL
+
+Before W25-1b, a guest node got the share ports only in the signed grants. The W24-A packet filter (`crates/orblx-datapath/src/filter.rs`) is on only when the policy has an `acls` list.
+Without `acls`, guest node g reached b:9090 (not shared), and shared node b reached guest node g.
+
+W25-1b uses the W24-A filter for each peer in another tenant. **The policy format does not change.**
+
+| Part | Change |
+|---|---|
+| Signed grants (`ReceiverGrants`) | New field `guarded`: the SPIFFE IDs of the peers in another tenant that the node sees through a share. The coordinator sets it in `filtered_grants`. The field is not written when it is empty, so a policy without `guests` gives the same grants as before. The grant check refuses a `guarded` entry that is not a SPIFFE ID or that repeats. |
+| Packet filter | The filter is on when `filter` is true or `guarded` is not empty. With `filter` false (no `acls`), the filter checks only the packets from a `guarded` peer. Peers in the same tenant pass as before. A packet from a `guarded` peer needs a grant (the share ports). A packet from a `guarded` peer to an address that is not the overlay address of the node (a route) needs a subnet grant. Replies to the flows that the node opened still pass. |
+| Audit | A dropped packet writes a `packet-deny` record (code 32) to `packet-audit.jsonl`, with the W24-A rate limits (1 record for each source, proto and port in 10 s; 5 records each second). Actor = the source SPIFFE ID. Target = `tcp/PORT` or `udp/PORT`. |
+| `orblx up` | The log line is `The packet filter is on for shared peers. ...` when only `guarded` turns the filter on. A grants refresh prints the line again when the state changes. |
+
+Both directions are closed. The shared node b has the guest nodes in `guarded` and allows only the share ports. Each guest node has b in `guarded` and has no grant for b, so b -> g is dropped.
+
+Compatibility: `ReceiverGrants` refuses unknown fields. A node from before W25-1b refuses grants with `guarded`. This occurs only when the policy has `guests` and a share, so update the nodes before the coordinator when a policy has shares.
 
 ## Limits
 
-- **Port enforcement needs track A.** The coordinator gives the shared node a grant for TCP 8080 only. Before the W24-A packet filter (track A, not merged) is in main, the datapath does not use these grants.
-  Thus guest node g reaches b:9090 (not shared), and shared node b reaches guest node g. The proof prints both as `port_check ... reached`.
-  The proof gates them when `ORBLX_SHARE_PORT_GATE=1`. Run it with that value after track A merges.
-- Gate 3 is met for the other owner nodes (a -> g is refused: g is not in the netmap of a and is on its deny list).
-  For the shared node b, the grants do not allow b -> g, but the datapath enforces this only with track A.
 - A guest in another trust domain is refused (see above).
 - The share records use the coordinator as actor, not the owner, because the policy file has no signer.
 - Each node deny fetch makes the coordinator reload the node store and the policy file. W25-2 measures the cost at 50 nodes.
@@ -96,7 +109,7 @@ Script: `scripts/proof/node-share.sh`. Compose project `orblx-w25a-node-share` (
 Policy: `scripts/proof/node-share.hujson`. HTTP helper: `scripts/proof/share-get.py`. Byte counter: `scripts/proof/share-sink.py`. The script prints `proof_ok` at the end.
 
 Setup: the [C] test OIDC issuer, the coordinator with `[oidc]`, owner nodes `owner`, `a`, `b` (token enroll), and guest nodes `g`, `g2` (OIDC enroll, subject `bob`).
-Nodes b and g2 serve HTTP on TCP 8080 and 9090. Node g serves TCP 8080.
+Nodes a, b, g, and g2 serve HTTP on TCP 8080. Node b also runs a byte counter on TCP and UDP 9090.
 
 1. g connects to b:8080.
 2. The netmap of g has only b and g2. g -> a:8080 and g2 -> a:8080 are refused.
@@ -109,8 +122,31 @@ Nodes b and g2 serve HTTP on TCP 8080 and 9090. Node g serves TCP 8080.
 5. The unshare writes exactly 1 record. The share again writes exactly 1 record. The script checks `audit share 1 unshare 1 policy_replace 0`, then `orblx audit --verify`.
    Then it measures the time until g -> b:8080 works again, with no restart.
 6. The logs have no enroll token, no ID token, and no `PRIVATE KEY`.
+7. (W25-1b) Port scope: node b counts the bytes from each source on TCP and UDP 9090 (not shared). g sends 65536 bytes on TCP and on UDP to b:9090. Node b must count 0 bytes from g.
+   A control send from a (same tenant) to b:9090 must count more than 0 bytes. b's `packet-audit.jsonl` must have exactly 1 `packet-deny` record with actor g and target `tcp/9090`, and `orblx audit verify-config` must print `ok` for it.
+   `g -> b:9090` and `b -> g:8080` must be refused. `ORBLX_SHARE_PORT_GATE=0` turns off these gates.
 
-### Results [C]
+`ORBLX_SHARE_POLICY` selects the policy file. `scripts/proof/node-share.hujson` (default) has an `acls` list. `scripts/proof/node-share-noacl.hujson` has no `acls` list, so only `guarded` turns on the filter.
+
+### Results W25-1b [C]
+
+Head `80a507f` (branch `w25-share-port-acl` with main `372138c`). Debug build. Two runs, one for each policy:
+`/workspace/orblx-w18-proof/w25a1b-node-share-branch-80a507f-acl.log` (`node-share.hujson`, with `acls`) and
+`/workspace/orblx-w18-proof/w25a1b-node-share-branch-80a507f-noacl.log` (`node-share-noacl.hujson`, no `acls`).
+
+| Gate | With `acls` [C] | No `acls` [C] |
+|---|---|---|
+| 1. A shared user reaches only the shared ports | g -> b:8080 and g2 -> b:8080 `200 OK`. g -> b:9090 refused. g -> a:8080 refused. | Same. |
+| 2. g -> b:9090: 0 bytes, 1 `packet-deny` record | **0 bytes** from g (65536 TCP + 65536 UDP sent). Control a -> b:9090: 65536 bytes (TCP; the ACL a -> b allows TCP only). **1** record actor g, target `tcp/9090` (also 1 for `udp/9090`). `verify-config ok`. | **0 bytes** from g. Control a -> b:9090: 131072 bytes. **1** record actor g, target `tcp/9090` (also 1 for `udp/9090`). `verify-config ok`. |
+| Shared node to guest | b -> g:8080 refused. | b -> g:8080 refused. |
+| 3. Unshare blocks access in <= 1000 ms | **unshare_deny_ms 516**. Hold probes: 0 failures. Share again: 1354 ms, no restart. | **unshare_deny_ms 457**. Hold probes: 0 failures. Share again: 1727 ms, no restart. |
+| 4. Secrets and audit chain | 0 enroll tokens, 0 ID tokens, 0 `PRIVATE KEY`. Coordinator chain `verify ok`; share 1, unshare 1, policy-replace 0. | Same. Coordinator chain `verify ok` (8 records). |
+
+Unit tests (REAL, `cargo test`): `filter_tests::guarded_peer_gets_only_its_grants_without_an_acl_list` and `share_test` (the `guarded` lists of b, g, and a, before and after the unshare).
+
+NATR_RESULTS
+
+### Results W25-1 [C]
 
 Head `a4d899d` (branch `w25-node-sharing` with main `76c90ac`). Debug build. Log: `/workspace/orblx-w18-proof/w25a-node-share-branch-a4d899d.log`.
 
@@ -147,7 +183,7 @@ One branch run (run 2) had a ping max of 28.867 ms, with 15 other proof containe
 
 ```sh
 ORBLX_PROOF_NET_HOOK=/path/to/fix-container-egress.sh ./scripts/proof/node-share.sh
-ORBLX_SHARE_PORT_GATE=1 ./scripts/proof/node-share.sh   # after track A merges
+ORBLX_SHARE_POLICY=$PWD/scripts/proof/node-share-noacl.hujson ./scripts/proof/node-share.sh
 ```
 
 The script uses `sudo -n` for Docker when the user is not root. `PROOF_KEEP=1` keeps the containers for debug.

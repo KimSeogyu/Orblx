@@ -324,7 +324,7 @@ done
 dc exec -T g cat "$STATE/grants.signed.json" 2>/dev/null \
   | jq -c '{reach: .grants.reach}' 2>/dev/null || true
 
-echo "=== [C] web servers: b on 8080 and 9090, a, g, and g2 on 8080 ==="
+echo "=== [C] web servers: a, b, g, and g2 on 8080 ==="
 for name in a b g g2; do
   dc exec -d "$name" python3 -m http.server 8080 --bind 0.0.0.0
   dc exec -T "$name" sh -c "cat > /tmp/share-get.py" <"$ROOT/scripts/proof/share-get.py"
