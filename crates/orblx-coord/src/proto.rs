@@ -23,6 +23,9 @@ pub struct Request {
     pub exit_node: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant: Option<GrantAsk>,
+    /// A scoped admin API token (W25-3). The caller then needs no client certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token: Option<String>,
 }
 
 /// One agent grant request.
@@ -47,6 +50,9 @@ pub struct GrantAsk {
 #[derive(Serialize, Deserialize, Default)]
 pub struct Response {
     pub ok: bool,
+    /// The HTTP-style status of an admin call: 200, 400, 401, or 403 (W25-3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,6 +98,7 @@ impl std::fmt::Debug for Response {
         formatter
             .debug_struct("Response")
             .field("ok", &self.ok)
+            .field("status", &self.status)
             .field("error", &self.error)
             .field("private_key_pem", &"[elided]")
             .finish()

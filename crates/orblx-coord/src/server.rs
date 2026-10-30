@@ -6,6 +6,7 @@ use rustls::pki_types::CertificateDer;
 
 use crate::admin;
 use crate::agent;
+use crate::apitoken;
 use crate::error::CoordError;
 use crate::http_util::{fetch_google_jwks, https_get};
 use crate::netmap::encode_hex;
@@ -300,21 +301,9 @@ async fn dispatch(
                 }
             }
         }
-        "admin-nodes"
-        | "admin-users"
-        | "admin-approve"
-        | "admin-revoke"
-        | "admin-revoke-all"
-        | "admin-expire"
-        | "admin-routes"
-        | "admin-audit"
-        | "admin-grants"
-        | "admin-grant-approve"
-        | "admin-grant-revoke"
-        | "admin-lock"
-        | "admin-lock-init"
-        | "admin-lock-sign"
-        | "admin-lock-update" => dispatch_admin(coord, connection, &request, now),
+        op if apitoken::admin_ops().contains(&op) => {
+            dispatch_admin(coord, connection, &request, now)
+        }
         _ => Err(CoordError::Protocol(
             "The request is not valid.".to_string(),
         )),
@@ -327,47 +316,16 @@ fn dispatch_admin(
     request: &Request,
     now: SystemTime,
 ) -> Result<Response, CoordError> {
+    if let Some(secret) = request.api_token.as_deref() {
+        return Ok(dispatch_token(coord, request, secret, now));
+    }
     let caller = peer_id(coord, connection)?;
     if !coord.caller_is_owner(&caller)? {
         return Err(CoordError::Protocol(
             "The caller is not an owner.".to_string(),
         ));
     }
-    let value = match request.op.as_str() {
-        "admin-nodes" => admin::nodes(coord)?,
-        "admin-users" => admin::users(coord)?,
-        "admin-approve" => admin::approve(coord, &request.name, caller.as_uri())?,
-        "admin-revoke" => admin::revoke(coord, &request.name, caller.as_uri(), now)?,
-        "admin-revoke-all" => admin::revoke_all(coord, &request.name, caller.as_uri(), now)?,
-        "admin-expire" => admin::expire(coord, &request.name, caller.as_uri())?,
-        "admin-routes" => admin::routes(coord)?,
-        "admin-audit" => admin::audit(coord, parse_since(&request.name)?)?,
-        "admin-grants" => agent::list(coord, now)?,
-        "admin-grant-approve" => agent::approve(coord, &request.name, caller.as_uri(), now)?,
-        "admin-grant-revoke" => agent::revoke(coord, &request.name, caller.as_uri(), now)?,
-        "admin-lock" => coord.lock_show()?,
-        "admin-lock-init" => {
-            let ask: LockInitAsk = lock_json(&request.name)?;
-            coord.lock_init(&ask.keys, caller.as_uri())?
-        }
-        "admin-lock-sign" => {
-            let ask: LockSignAsk = lock_json(&request.name)?;
-            let sig = orblx_datapath::NodeLockSig {
-                key_id: ask.key_id,
-                sig: ask.sig,
-            };
-            coord.lock_sign(&ask.name, sig, caller.as_uri())?
-        }
-        "admin-lock-update" => {
-            let update: orblx_datapath::LockUpdate = lock_json(&request.name)?;
-            coord.lock_update(update, caller.as_uri())?
-        }
-        _ => {
-            return Err(CoordError::Protocol(
-                "The request is not valid.".to_string(),
-            ))
-        }
-    };
+    let value = run_admin(coord, request, Caller::Owner(caller.as_uri()), now)?;
     let detail = serde_json::to_string(&value)
         .map_err(|_| CoordError::Protocol("The request is not valid.".to_string()))?;
     println!("admin {}", request.op.trim_start_matches("admin-"));
@@ -376,6 +334,153 @@ fn dispatch_admin(
         detail: Some(detail),
         ..Response::default()
     })
+}
+
+/// Who makes an admin call.
+#[derive(Clone, Copy)]
+enum Caller<'a> {
+    /// An owner SVID (mTLS). The text is the SPIFFE URI.
+    Owner(&'a str),
+    /// A scoped API token. The text is the audit actor `api-token:ID`.
+    Token(&'a str),
+}
+
+impl Caller<'_> {
+    fn actor(&self) -> &str {
+        match self {
+            Self::Owner(actor) | Self::Token(actor) => actor,
+        }
+    }
+}
+
+/// Run one admin call with an API token (W25-3).
+///
+/// The token decides the caller. A client certificate on the same connection
+/// does not add rights. Each call writes one `token-use` or `token-deny` record.
+fn dispatch_token(
+    coord: &Coordinator,
+    request: &Request,
+    secret: &str,
+    now: SystemTime,
+) -> Response {
+    let op = request.op.trim_start_matches("admin-");
+    let checked = match apitoken::check(coord, secret, &request.op, now) {
+        Ok(checked) => checked,
+        Err(err) => {
+            println!("admin token check failed op {op}: {}", err.public_text());
+            return status_response(500, "The coordinator request failed.".to_string());
+        }
+    };
+    if let Err(refusal) = checked.result {
+        println!(
+            "admin token deny {} op {op} reason {} status {}",
+            checked.id,
+            refusal.reason(),
+            refusal.status()
+        );
+        return status_response(refusal.status(), refusal.text().to_string());
+    }
+    let actor = apitoken::actor_of(&checked.id);
+    let value = match run_admin(coord, request, Caller::Token(&actor), now) {
+        Ok(value) => value,
+        Err(err) => {
+            println!("admin token use {} op {op} status 400", checked.id);
+            return status_response(400, err.public_text());
+        }
+    };
+    let Ok(detail) = serde_json::to_string(&value) else {
+        return status_response(500, "The coordinator request failed.".to_string());
+    };
+    println!("admin token use {} op {op} status 200", checked.id);
+    Response {
+        ok: true,
+        status: Some(200),
+        detail: Some(detail),
+        ..Response::default()
+    }
+}
+
+fn status_response(status: u16, error: String) -> Response {
+    Response {
+        ok: false,
+        status: Some(status),
+        error: Some(error),
+        ..Response::default()
+    }
+}
+
+fn run_admin(
+    coord: &Coordinator,
+    request: &Request,
+    caller: Caller<'_>,
+    now: SystemTime,
+) -> Result<serde_json::Value, CoordError> {
+    let actor = caller.actor();
+    let owner_only = || match caller {
+        Caller::Owner(_) => Ok(()),
+        Caller::Token(_) => Err(CoordError::Protocol(
+            "The caller is not an owner.".to_string(),
+        )),
+    };
+    let value = match request.op.as_str() {
+        "admin-nodes" => admin::nodes(coord)?,
+        "admin-users" => admin::users(coord)?,
+        "admin-approve" => admin::approve(coord, &request.name, actor)?,
+        "admin-revoke" => admin::revoke(coord, &request.name, actor, now)?,
+        "admin-revoke-all" => admin::revoke_all(coord, &request.name, actor, now)?,
+        "admin-expire" => admin::expire(coord, &request.name, actor)?,
+        "admin-routes" => admin::routes(coord)?,
+        "admin-audit" => admin::audit(coord, parse_since(&request.name)?)?,
+        "admin-grants" => agent::list(coord, now)?,
+        "admin-grant-approve" => agent::approve(coord, &request.name, actor, now)?,
+        "admin-grant-revoke" => agent::revoke(coord, &request.name, actor, now)?,
+        "admin-lock" => coord.lock_show()?,
+        "admin-lock-init" => {
+            let ask: LockInitAsk = lock_json(&request.name)?;
+            coord.lock_init(&ask.keys, actor)?
+        }
+        "admin-lock-sign" => {
+            let ask: LockSignAsk = lock_json(&request.name)?;
+            let sig = orblx_datapath::NodeLockSig {
+                key_id: ask.key_id,
+                sig: ask.sig,
+            };
+            coord.lock_sign(&ask.name, sig, actor)?
+        }
+        "admin-lock-update" => {
+            let update: orblx_datapath::LockUpdate = lock_json(&request.name)?;
+            coord.lock_update(update, actor)?
+        }
+        "admin-policy" => admin::policy_show(coord)?,
+        "admin-policy-set" => admin::policy_set(coord, &request.name)?,
+        "admin-token-create" => {
+            owner_only()?;
+            let ask: apitoken::CreateAsk = serde_json::from_str(&request.name)
+                .map_err(|_| CoordError::Protocol("The token request is not valid.".to_string()))?;
+            let made = apitoken::create(coord, &ask, actor, now)?;
+            serde_json::json!({
+                "op": "token-create",
+                "id": made.id,
+                "token": made.secret,
+                "scopes": made.scopes,
+                "expires_unix_ms": made.expires_unix_ms
+            })
+        }
+        "admin-token-list" => {
+            owner_only()?;
+            apitoken::list(coord, now)?
+        }
+        "admin-token-revoke" => {
+            owner_only()?;
+            apitoken::revoke(coord, request.name.trim(), actor, now)?
+        }
+        _ => {
+            return Err(CoordError::Protocol(
+                "The request is not valid.".to_string(),
+            ))
+        }
+    };
+    Ok(value)
 }
 
 fn detail_response(value: &serde_json::Value) -> Result<Response, CoordError> {
@@ -488,4 +593,84 @@ fn peer_id(
         return Err(CoordError::Peer);
     }
     Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use super::{dispatch_token, Request};
+    use crate::apitoken::{self, admin_ops, all_scopes, scope_of, CreateAsk};
+    use crate::state::{Coordinator, OidcConfig};
+
+    fn call(op: &str, secret: &str) -> Request {
+        Request {
+            op: op.to_string(),
+            name: String::new(),
+            token: None,
+            id_token: None,
+            nonce: None,
+            endpoints: Vec::new(),
+            routes: Vec::new(),
+            exit_node: false,
+            grant: None,
+            api_token: Some(secret.to_string()),
+        }
+    }
+
+    /// The W25-3 kill check: no token runs an operation outside its scope.
+    #[test]
+    fn a_token_gets_403_for_every_operation_outside_its_scope() {
+        let dir = std::env::temp_dir().join(format!("orblx-server-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        let now = SystemTime::now();
+        for scope in all_scopes() {
+            let ask = CreateAsk {
+                scopes: vec![scope.to_string()],
+                ttl_secs: 60,
+            };
+            let made =
+                apitoken::create(&coord, &ask, "spiffe://orblx.local/node/owner", now).unwrap();
+            for op in admin_ops() {
+                let reply = dispatch_token(&coord, &call(op, &made.secret), &made.secret, now);
+                let status = reply.status.unwrap();
+                if scope_of(op) == Some(scope) {
+                    assert!(status == 200 || status == 400, "{scope} {op} {status}");
+                } else {
+                    assert_eq!(status, 403, "{scope} {op}");
+                    assert!(!reply.ok);
+                    assert!(reply.detail.is_none());
+                }
+            }
+        }
+        let made = apitoken::create(
+            &coord,
+            &CreateAsk {
+                scopes: vec!["nodes:read".to_string()],
+                ttl_secs: 60,
+            },
+            "spiffe://orblx.local/node/owner",
+            now,
+        )
+        .unwrap();
+        let reply = dispatch_token(
+            &coord,
+            &call("admin-nodes", &made.secret),
+            &made.secret,
+            now,
+        );
+        assert_eq!(reply.status, Some(200));
+        assert!(reply.detail.unwrap().contains("\"op\":\"nodes\""));
+        let reply = dispatch_token(
+            &coord,
+            &call("admin-nodes", "orblx-at1.x"),
+            "orblx-at1.x",
+            now,
+        );
+        assert_eq!(reply.status, Some(401));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

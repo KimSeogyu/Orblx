@@ -13,6 +13,7 @@
 
 mod admin;
 mod agent;
+mod apitoken;
 mod client;
 mod config;
 mod error;
@@ -36,11 +37,15 @@ mod tlsutil;
 pub use admin::{
     approve, audit, deny_json, deny_set, expire, nodes, revoke, revoke_all, routes, users,
 };
+pub use apitoken::{
+    admin_ops, all_scopes, parse_scopes, parse_ttl as parse_api_token_ttl, scope_of,
+    API_TOKEN_FILE, API_TOKEN_PREFIX, MAX_API_TOKEN_TTL_SECS, OWNER_ONLY_OPS,
+};
 pub use client::{
-    admin_blocking, advertise_exit_blocking, advertise_routes_blocking, agent_grant_fetch_blocking,
-    agent_grant_request_blocking, enroll_with_oidc_blocking, enroll_with_token_blocking,
-    fetch_deny_blocking, fetch_netmap_blocking, netmap_json, publish_candidates_blocking,
-    renew_svid_blocking, GrantFetch, OidcEnroll,
+    admin_blocking, admin_token_blocking, advertise_exit_blocking, advertise_routes_blocking,
+    agent_grant_fetch_blocking, agent_grant_request_blocking, enroll_with_oidc_blocking,
+    enroll_with_token_blocking, fetch_deny_blocking, fetch_netmap_blocking, netmap_json,
+    publish_candidates_blocking, renew_svid_blocking, AdminReply, GrantFetch, OidcEnroll,
 };
 pub use config::{CoordConfig, OidcSection};
 pub use error::CoordError;
