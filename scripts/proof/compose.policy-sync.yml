@@ -60,7 +60,8 @@ services:
       - ${SYNC_WORK:?set SYNC_WORK}:/work
       - ${SYNC_COORD_STATE:?set SYNC_COORD_STATE}:/coord-state:ro
     networks:
-      - proof
+      proof:
+        ipv4_address: 172.30.126.9
 
   sysdns:
     image: ${ORBLX_SYNC_IMAGE:-orblx-w256-sync:local}

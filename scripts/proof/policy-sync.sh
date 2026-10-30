@@ -9,6 +9,8 @@
 #         from the same `policy-wait` reply. The last datagram from a reaches the router
 #         1000 ms or less after revoke_done_ms (revoke_drop_ms).
 # Gate 3: 50 load identities run `orblx coord netmap --watch` (the same `policy-wait` client).
+#         Enroll needs an endpoint. Each load identity gives 172.30.126.9 (the load container)
+#         and its own port. No datapath runs there.
 #         The script measures the coordinator CPU with no change, and with one change each 10 s.
 #         Each coordinator CPU value must be less than 5% of one core.
 # Gate 4: b enrolls and starts after a and the router run. Node a must reach b (ICMP) in
@@ -314,7 +316,7 @@ echo "[C] gate4 ok"
 echo "=== Gate 3 [C]: ${LOAD_NODES} policy-wait clients, coordinator CPU ==="
 dc exec -T coord sh -c "for i in \$(seq 1 ${LOAD_NODES}); do orblx coord token create --state /var/lib/orblx --out /var/lib/orblx/tokens/load\$i --ttl 3600 >/dev/null || exit 1; done"
 dc --profile load up -d load
-dc --profile load exec -T load sh -c "mkdir -p /tmp/load; for i in \$(seq 1 ${LOAD_NODES}); do orblx coord enroll --name load\$i --coord ${COORD} --bundle /coord-state/trust-bundle.pem --token-file /coord-state/tokens/load\$i --state /tmp/load/\$i >/dev/null || exit 1; done"
+dc --profile load exec -T load sh -c "mkdir -p /tmp/load; for i in \$(seq 1 ${LOAD_NODES}); do orblx coord enroll --name load\$i --coord ${COORD} --bundle /coord-state/trust-bundle.pem --token-file /coord-state/tokens/load\$i --state /tmp/load/\$i --endpoint 172.30.126.9:\$((20000 + i)) >/dev/null || exit 1; done"
 echo "load_enrolled ${LOAD_NODES}"
 dc --profile load exec -d load sh -c "for i in \$(seq 1 ${LOAD_NODES}); do orblx coord netmap --coord ${COORD} --bundle /tmp/load/\$i/bundle.pem --state /tmp/load/\$i --watch >/tmp/load/\$i.log 2>&1 & done; wait"
 for _ in $(seq 1 60); do
