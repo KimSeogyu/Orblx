@@ -81,7 +81,20 @@ Script: `scripts/proof/agent-python-sdk.sh`. It prints `proof_ok` at the end.
 | [C] Coordinator chain | `verify ok`, with the owner `agent-approve` record |
 | [C] Log grep (coordinator, nodes, gateway, upstream, agent output, SDK debug log) | ticket 0, key 0, `PRIVATE KEY` 0, `T0JMWEFHVDE` 0, `ge1.` 0, `orblx-agent-proof` 0, POST body text 0 |
 
-The values of the run on main are in the PR report.
+### Result on main (2026-10-30 13:20 KST, log `w22-4-main.log`)
+
+| Check | Result |
+|---|---|
+| [C] After the approval | `GET /api/items` 200, `POST` 200 |
+| [C] Outside the scope (`/admin`) | 403 `path` |
+| [C] After the end | 403 `expired`, 161 ms after the end (limit 1000 ms) |
+| [C] Gateway chain | `ok`, 139 `agent-use`, deny `path` 1, deny `expired` 1 |
+| [C] Coordinator chain | `verify ok`, 10 records |
+| [C] Log grep | ticket 0, key 0, `PRIVATE KEY` 0, `T0JMWEFHVDE` 0, `ge1.` 0, `orblx-agent-proof` 0, POST body text 0 |
+| [C] End | `proof_ok` |
+
+The time from the end of the grant to the first `expired` deny was 82 ms in `w22-4-try2.log`, 137 ms in `w22-4-try1.log`, and 161 ms on main.
+All three runs are below the 1000 ms limit.
 
 ## Caveats
 
