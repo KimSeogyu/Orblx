@@ -527,6 +527,181 @@ async fn a_dial_to_a_peer_that_listens_late_ends_soon_after_it_listens() {
     );
 }
 
+/// W25-6b: node `a` dials peer `b`, and `b` starts `late` after the dial task of `a` starts.
+///
+/// The delay is the test condition: it puts the listener of `b` after the first dial of `a`.
+/// The function returns the time from the start of node `b` (before its UDP bind)
+/// to the first packet from `a` at `b`, or `None` when no packet came in `late` + 8 s.
+async fn late_listener_case(tag: &str, late: Duration) -> Option<Duration> {
+    let scratch = Scratch::new(&format!("lateL-{tag}"));
+    let node_a = Scratch::new(&format!("lateL-{tag}-a"));
+    let node_b = Scratch::new(&format!("lateL-{tag}-b"));
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    let (addr, handle) = server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+    let port_a = free_port();
+    let port_b = free_port();
+    let mut enrolled = Vec::new();
+    for (name, port) in [("a", port_a), ("b", port_b)] {
+        let token = coord.create_token(Duration::from_secs(600)).unwrap();
+        let result = client::enroll_with_token(
+            addr,
+            "coord",
+            &bundle,
+            name,
+            &token.secret,
+            &[format!("127.0.0.1:{port}")],
+            &[],
+        )
+        .await
+        .unwrap();
+        enrolled.push(result);
+    }
+    enrolled[0].write_state(&node_a.0).unwrap();
+    enrolled[1].write_state(&node_b.0).unwrap();
+    let trust = TrustBundle::from_pem(&bundle).unwrap();
+    let signer = TicketSigner::generate();
+    let mac_key = [0x47; 32];
+    let now = SystemTime::now();
+    let ticket_key = TicketKey::new(
+        signer.verifier(),
+        mac_key,
+        now - Duration::from_secs(60),
+        now + Duration::from_secs(3_600),
+    )
+    .unwrap();
+    let ring = TicketRing::single(ticket_key, &[10; 32]).unwrap();
+    let config_a = leaf_config(&enrolled[0], &trust, &signer, &mac_key, &ring, now);
+    let config_b = leaf_config(&enrolled[1], &trust, &signer, &mac_key, &ring, now);
+    let map_a = netmap("a", "100.64.0.1", "b", "100.64.0.2", port_b);
+    let map_b = netmap("b", "100.64.0.2", "a", "100.64.0.1", port_a);
+
+    let (stop_tx, stop_a) = watch::channel(false);
+    let stop_b = stop_a.clone();
+    let (a_in_tx, a_in_rx) = mpsc::channel(64);
+    let (a_out_tx, _a_out_rx) = mpsc::channel(64);
+    let (_b_in_tx, b_in_rx) = mpsc::channel(64);
+    let (b_out_tx, mut b_out_rx) = mpsc::channel(64);
+    let task_a = tokio::spawn(run_memory_node(
+        node_request(
+            config_a,
+            map_a,
+            port_a,
+            node_a.0.clone(),
+            renewer(addr, bundle.clone(), node_a.0.clone()),
+            stop_a,
+        ),
+        MemoryDevice {
+            from_tun: a_in_rx,
+            to_tun: a_out_tx,
+        },
+    ));
+    tokio::time::sleep(late).await;
+    let started_b = Instant::now();
+    let task_b = tokio::spawn(run_memory_node(
+        node_request(
+            config_b,
+            map_b,
+            port_b,
+            node_b.0.clone(),
+            renewer(addr, bundle.clone(), node_b.0.clone()),
+            stop_b,
+        ),
+        MemoryDevice {
+            from_tun: b_in_rx,
+            to_tun: b_out_tx,
+        },
+    ));
+    let mut reached = None;
+    while started_b.elapsed() < Duration::from_secs(8) {
+        let _ = a_in_tx
+            .send(
+                ipv4_packet(
+                    Ipv4Addr::new(100, 64, 0, 1),
+                    Ipv4Addr::new(100, 64, 0, 2),
+                    b"late",
+                )
+                .unwrap(),
+            )
+            .await;
+        if let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(50), b_out_rx.recv()).await
+        {
+            reached = Some(started_b.elapsed());
+            break;
+        }
+    }
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(3), task_a).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), task_b).await;
+    handle.abort();
+    reached
+}
+
+/// W25-6b: a peer that starts to listen 0 s, 1.5 s, or 4.5 s after the first dial is reachable
+/// in 2 s or less after it starts.
+///
+/// With one QUIC attempt for each dial (the path before W25-6b), the 1.5 s and 4.5 s cases
+/// wait for the next dial after the 3 s attempt limit and a 1 s pause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_listener_is_reachable_in_two_seconds_after_it_starts() {
+    let mut results = Vec::new();
+    for late_ms in [0u64, 1_500, 4_500] {
+        let reached =
+            late_listener_case(&late_ms.to_string(), Duration::from_millis(late_ms)).await;
+        println!(
+            "late_listener late_ms {late_ms} reach_after_start_ms {}",
+            reached.map_or("none".to_string(), |time| time.as_millis().to_string())
+        );
+        results.push((late_ms, reached));
+    }
+    for (late_ms, reached) in results {
+        let reached = reached.unwrap_or_else(|| panic!("late {late_ms} ms: no packet in 8 s"));
+        assert!(
+            reached <= Duration::from_secs(2),
+            "late {late_ms} ms: the peer was reachable {} ms after it started",
+            reached.as_millis()
+        );
+    }
+}
+
+/// W25-6b soak: `ORBLX_LATE_SOAK_RUNS` runs (default 50) with delays from 0 s to 5 s, spread evenly.
+///
+/// Run it with `cargo test -p orblx-coord --lib -- --ignored --nocapture late_listener_soak`.
+/// Each run must reach the peer 2 s or less after it starts. The test runs all cases first and then
+/// fails if one or more cases failed, so the output has the full table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "soak: about 50 node pairs, run it on demand"]
+async fn late_listener_soak() {
+    let runs: u64 = std::env::var("ORBLX_LATE_SOAK_RUNS")
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(50)
+        .max(2);
+    let mut failures = 0;
+    for run in 0..runs {
+        let late_ms = run * 5_000 / (runs - 1);
+        let reached =
+            late_listener_case(&format!("soak{run}"), Duration::from_millis(late_ms)).await;
+        let ok = reached.is_some_and(|time| time <= Duration::from_secs(2));
+        if !ok {
+            failures += 1;
+        }
+        println!(
+            "late_soak run {} late_ms {late_ms} reach_after_start_ms {} result {}",
+            run + 1,
+            reached.map_or("none".to_string(), |time| time.as_millis().to_string()),
+            if ok { "ok" } else { "FAIL" }
+        );
+    }
+    println!("late_soak runs {runs} failures {failures}");
+    assert_eq!(
+        failures, 0,
+        "{failures} of {runs} late listener runs failed"
+    );
+}
+
 fn note_gap(last: &mut Option<Instant>, max_gap: &mut Duration) {
     let now = Instant::now();
     if let Some(prev) = *last {

@@ -120,14 +120,14 @@ Other checks on the branch:
 ## 4. First dial to a late peer (W25-6b)
 
 A peer can enroll, and so be in the netmap of node `a`, before its UDP listener is up.
+`orblx up` enrolls first and then starts the listener, so a real user can hit this order.
 Node `a` dials the new peer at once. Before this change, one QUIC attempt had a 3 s limit,
 and QUIC sends the Initial packet of an attempt again only after about 1 s and then 2 s more.
 When the peer started to listen more than about 1 s after the dial, the attempt timed out,
-the node waited 1 s, and then it started a new attempt. The peer was not reachable for about 4 s
-or more. The unit test `a_peer_that_enrolls_later_is_reachable_in_two_seconds` measured
-2852 ms in CI and 5560 ms in a soak.
+the node waited 1 s, and then it started a new attempt. The unit test
+`a_peer_that_enrolls_later_is_reachable_in_two_seconds` measured 2852 ms in CI and 5560 ms in a soak.
 
-The fix is in the dial path of the node:
+The fix is in the dial path and the accept path of the node:
 
 - For 10 s after a dial task starts, and after a session ends (`FAST_DIAL_WINDOW`), one dial
   attempt starts a new QUIC attempt each 250 ms (`FAST_DIAL_PROBE`), with at most 12 attempts.
@@ -135,17 +135,33 @@ The fix is in the dial path of the node:
   The first session or the first error ends the dial attempt.
 - In this window, the node waits 250 ms after a failed dial attempt. After the window, the node
   uses one QUIC attempt at a time and waits 1 s, as before.
-- The 3 s limit of one dial attempt and the 2 s limit of the test did not change.
+- The accept loop does not pause after an error of one connection. Before, it paused 200 ms
+  after each failed handshake. When the dialer stopped its 12 attempts at the 3 s limit, the
+  listener paused 12 times (2.4 s) before it accepted the next attempt.
+- The 3 s limit of one dial attempt and the 2 s limit of the tests did not change.
+
+New tests (in `crates/orblx-coord/src/renew_test.rs`):
+
+- `a_late_listener_is_reachable_in_two_seconds_after_it_starts`: node `a` runs and dials `b`.
+  Node `b` starts 0 ms, 1500 ms, and 4500 ms later. The delay is the test condition.
+  Each case must reach `b` 2 s or less after `b` starts (the time includes the start of `b`).
+- `late_listener_soak` (ignored, run with `--ignored`): 50 runs with delays from 0 ms to 5000 ms,
+  spread evenly (step 102 ms). The test prints one line for each run and fails when one run fails.
+- `a_dial_to_a_peer_that_listens_late_ends_soon_after_it_listens`: `connect_probed` alone.
 
 Measurements (REAL: `cargo test` on the Linux host, debug build, 127.0.0.1, rustc 1.99.1):
 
-| Check | Label | Result |
-|---|---|---|
-| One QUIC attempt, the peer listens 1.2 s after the dial starts | REAL | ends at 3028 ms, 1826 ms after the peer listens |
-| Probed dial, same order (`a_dial_to_a_peer_that_listens_late_ends_soon_after_it_listens`) | REAL | ends at 1282 ms, 79 ms after the peer listens |
-| `a_peer_that_enrolls_later_is_reachable_in_two_seconds`, 20 runs in a loop | REAL | 20 of 20 pass, 290 ms to 818 ms |
+| Check | Label | Old dial path | New dial path |
+|---|---|---|---|
+| `a_late_listener_is_reachable_in_two_seconds_after_it_starts`, 0 / 1500 / 4500 ms late | REAL | FAIL: 58 / 2567 / 571 ms | pass: 59 / 59 / 58 ms |
+| `late_listener_soak`, 50 runs, 0 ms to 5000 ms late | REAL | 11 of 50 FAIL (1020 ms to 2040 ms late, 2011 ms to 3031 ms) | 0 of 50 FAIL, max 571 ms, mean 199 ms |
+| One QUIC attempt, the peer listens 1.2 s after the dial starts | REAL | ends at 3028 ms, 1826 ms after the peer listens | - |
+| `a_dial_to_a_peer_that_listens_late_ends_soon_after_it_listens` | REAL | - | ends at 1282 ms, 79 ms after the peer listens |
+| `a_peer_that_enrolls_later_is_reachable_in_two_seconds`, 20 runs in a loop | REAL | - | 20 of 20 pass, 296 ms to 577 ms |
 
-The one-attempt row is a temporary test that the change does not keep.
+"Old dial path" is `node.rs` from main `ce1dcb79` with the new tests. The one-attempt row is a temporary
+test that the change does not keep. A first version of the fix without the accept loop change
+had 3 of 50 soak failures (2755 ms to 2959 ms late, up to 2728 ms). The accept loop change removed them.
 
 ## 5. Limits
 

@@ -1056,10 +1056,10 @@ async fn accept_loop(mut mesh: Mesh) {
                         });
                     }
                     Err(HelloError::EndpointClosed) => return,
-                    Err(err) => {
-                        eprintln!("The node did not accept a peer. {err}");
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                    }
+                    // The error is for one connection only. The next accept waits for a new
+                    // connection, so the loop does not spin. A pause here would delay each
+                    // connection behind it, for example after a peer stops its extra dial attempts.
+                    Err(err) => eprintln!("The node did not accept a peer. {err}"),
                 }
             }
         }
