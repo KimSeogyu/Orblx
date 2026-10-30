@@ -86,29 +86,33 @@ The proof uses a release build. With a debug build on a loaded host, the overlay
 
 ### Results [C]
 
-Branch head c33d30a (main c32d46f), release build, 5 runs.
-Log: `/workspace/orblx-w18-proof/w25ha-routers-full4.log` (03:09:21 to 03:14:42 KST, 31 Oct 2026). Other orblx proof containers: 0 at the start, 0 at the end.
+Branch head 8ead8fa (main 015f930), release build, 5 runs (full run 8).
+Log: `/workspace/orblx-w18-proof/w25ha-routers-full8-8ead8fa4.log` (lock 06:18:53 to 06:24:46 KST, 31 Oct 2026). Other orblx proof containers: 0 at the start, 0 at the end.
 
 | Gate | Result [C] |
 |---|---|
 | 1. Both routes need approval | Only router-a approved: router-b got 0 FORWARD bytes, and the target got 0 datagrams while router-a was down. After both approvals, the client netmap has both routers for `10.88.125.0/24`. |
-| 2. Failover (limit 5000 ms, target 2000 ms) | 1015, 1028, 1012, 1000, 992 ms. 5/5 at or below 2000 ms. |
-| 2. Max gap of the UDP stream (10 ms interval) | 982, 1001, 987, 976, 964 ms |
-| 2. Ping loss (`ping -i 0.05`, 9 s) | 17/171, 17/169, 17/168, 17/171, 17/171 |
-| 2. Audit | +1 `route-failover` record for each kill. Example: `{"actor":"spiffe://orblx.local/node/client","target":"10.88.125.0/24","action":"route-failover","detail":"from router-a to router-b old_silent_ms 1001"}`. The chain verifies. |
-| 3. Failback | router-a came back. 0 route changes and 0 records in 60 s. All 5892 datagrams came through router-b. |
+| 2. Failover (limit 5000 ms, target 2000 ms) | 1030, 982, 1033, 1017, 1011 ms. 5/5 at or below 2000 ms. |
+| 2. Max gap of the UDP stream (10 ms interval) | 1005, 963, 1002, 994, 984 ms |
+| 2. Ping loss (`ping -i 0.05`, 9 s) | 17/170, 17/170, 17/170, 18/171, 17/169 |
+| 2. Audit | +1 `route-failover` record for each kill. Example: `{"actor":"spiffe://orblx.local/node/client","target":"10.88.125.0/24","action":"route-failover","detail":"from router-a to router-b old_silent_ms 1003"}`. The chain verifies. |
+| 3. Failback | router-a came back. 0 route changes and 0 records in 60 s. All 5911 datagrams came through router-b. |
 | 4. Port ACL on router-b | TCP 8080 allowed. TCP 8081 and UDP 9001 (no rule): 0 FORWARD bytes, 3 packet-deny records. Guest TCP 8080: timeout. |
 | 4. UDP 53 on router-b | With the rule: 1 answer (`10.88.24.20`), 57 bytes. Without the rule: no answer, 0 bytes, 0 queries at the nameserver, 1 deny record. |
-| 5. TCP flow | The flow does not survive. It reconnected 1107 ms after the kill (the read timed out at 1105 ms). |
-| 6. Secrets | 0 lines in all container logs with a token value, a key line, or `PRIVATE KEY` (19 patterns, 403 log lines). |
+| 5. TCP flow | The flow does not survive. It reconnected 1124 ms after the kill (the read timed out at 1122 ms). |
+| 6. Secrets | 0 lines in all container logs with a token value, a key line, or `PRIVATE KEY` (19 patterns, 406 log lines). |
 | Leak | 0 packets from the client and the guest to `10.88.125.0/24` on the underlay interface. |
-| Ping before the kills | max 2.117 ms. Baseline 0/95 lost, RTT avg 1.098 ms. |
+| Ping before the kills | max 1.819 ms. Baseline 0/97 lost, RTT avg 1.172 ms. |
 
 The failover time is about `HA_DEAD_AFTER` (1000 ms): the client moves the route at the first packet after 1000 ms with no frame from the active router.
 
-A run on head b145e54 (after the merge of #96 and #99, `route-failover` is code 35) also passed: failover 1067, 993, 1013, 1086, 1020 ms; max gap 991, 970, 990, 1013, 992 ms; ping loss 17 of 160 to 169 in each run; 0 route changes in 60 s; TCP reconnect 1087 ms; leak 0; secret lines 0 (log `w25ha-routers-full5-b145e542.log`, 04:23:37 to 04:28:55 KST). Its 5 s baseline ping lost 1 of 96 packets.
+Earlier full runs with the same result:
 
-An earlier run on head f2887a7 (before the merge of #92) had the same result: failover 989 to 1074 ms, TCP reconnect 1125 ms (log `w25ha-routers-full3.log`).
+- Run 7, head 3ec6cb1 (log `w25ha-routers-full7-3ec6cb1.log`, lock 05:45:29 to 05:51:01 KST): failover 1017, 1026, 1030, 1046, 1025 ms; max gap 991 to 1004 ms; ping loss 17 of 158 to 171; 0 route changes in 60 s; TCP reconnect 1118 ms; leak 0; secret lines 0.
+- Run 6, head 9ff0e829, stopped at the start of gate 4 with no FAIL line. Failover run 1 was 1027 ms, and gate 5 passed. The cause was in the proof script: `grep` with no match under `pipefail` and `set -e`. Head 3ec6cb1 counts 0 matches with `count_matching` (`grep -c`), and a failed `docker ps` now fails the proof.
+- Run 5, head b145e54 (log `w25ha-routers-full5-b145e542.log`): failover 1067, 993, 1013, 1086, 1020 ms; TCP reconnect 1087 ms. Its 5 s baseline ping lost 1 of 96 packets.
+- Run 4, head c33d30a (log `w25ha-routers-full4.log`): failover 1015, 1028, 1012, 1000, 992 ms; TCP reconnect 1107 ms.
+- Run 3, head f2887a7 (before the merge of #92): failover 989 to 1074 ms; TCP reconnect 1125 ms.
 
 
 ### W23-4 gates [C]
