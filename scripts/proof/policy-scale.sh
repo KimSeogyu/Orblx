@@ -62,6 +62,10 @@ cleanup() {
 . "$ROOT/scripts/proof/proof-lock.sh"
 trap 'cleanup; proof_lock_end' EXIT
 proof_lock_take "policy-scale:${PROOF_PROJECT}" "${PROOF_PROJECT}-"
+# W25-14b (#114): start from a clean state. Old containers, volumes, and networks of the project make the proof fail.
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
+proof_compose_clean "${PROOF_PROJECT}" || exit 1
 
 fail() {
   echo "$1" >&2
