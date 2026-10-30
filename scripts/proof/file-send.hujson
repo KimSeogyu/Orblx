@@ -1,0 +1,33 @@
+{
+  // File send proof (W23-3).
+  // Node a may send files to node b on TCP 4243.
+  // Node c may reach node b only on TCP 8080. Node c may not send files.
+  // The file receiver on b checks the signed grants for TCP 4243.
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a"],
+      "proto": "tcp",
+      "dst": ["spiffe://orblx.local/node/b:4243", "spiffe://orblx.local/node/b:8080"],
+    },
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/c"],
+      "proto": "tcp",
+      "dst": ["spiffe://orblx.local/node/b:8080"],
+    },
+  ],
+  "tests": [
+    {
+      "src": "spiffe://orblx.local/node/a",
+      "proto": "tcp",
+      "accept": ["spiffe://orblx.local/node/b:4243"],
+    },
+    {
+      "src": "spiffe://orblx.local/node/c",
+      "proto": "tcp",
+      "accept": ["spiffe://orblx.local/node/b:8080"],
+      "deny": ["spiffe://orblx.local/node/b:4243"],
+    },
+  ],
+}

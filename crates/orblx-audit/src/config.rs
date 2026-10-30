@@ -76,11 +76,15 @@ pub enum ConfigAction {
     LockRotate,
     /// An owner key removed one owner key.
     LockRemove,
+    /// A node stored a file from an allowed sender (W23-3).
+    FileReceive,
+    /// A node refused a file or the file failed its checks (W23-3).
+    FileDeny,
 }
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 25] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -104,6 +108,8 @@ impl ConfigAction {
         Self::LockSign,
         Self::LockRotate,
         Self::LockRemove,
+        Self::FileReceive,
+        Self::FileDeny,
     ];
 
     /// Return the stable action token.
@@ -133,6 +139,8 @@ impl ConfigAction {
             Self::LockSign => "lock-sign",
             Self::LockRotate => "lock-rotate",
             Self::LockRemove => "lock-remove",
+            Self::FileReceive => "file-receive",
+            Self::FileDeny => "file-deny",
         }
     }
 
@@ -169,6 +177,8 @@ impl ConfigAction {
             Self::LockSign => 21,
             Self::LockRotate => 22,
             Self::LockRemove => 23,
+            Self::FileReceive => 24,
+            Self::FileDeny => 25,
         }
     }
 
