@@ -82,12 +82,13 @@ The proof takes the W25-5 box proof lock (`scripts/proof/proof-lock.sh`).
 
 The routers masquerade. Thus the target sees the LAN address of the router, and the proof knows which router carried each datagram.
 The proof kills a router with `docker kill` (SIGKILL, no clean stop).
+The proof uses a release build. With a debug build on a loaded host, the overlay queued the replies (ping RTT avg 21 ms, bursts of up to 3.8 s) before and after the kill. With the release build, the RTT avg was 0.63 ms.
 
 @@RESULTS@@
 
 ## Limits
 
-- The client reads the route table at start. A new approval or a new router needs a restart of the client (the proof restarts the client after it approves router-b).
+- Since W25-6 (#92), the node applies a new netmap with no restart, and it prints the new HA routes. The proof still restarts the client after it approves router-b. Thus the proof does not show the HA change with no restart.
 - An old client rejects a netmap with two routers for one route (`RouterError::Ambiguous`). Update the clients before you approve a second router.
 - An old router sends a keepalive each 1 s. With such a router, an idle link can be older than 1000 ms, and the client can move the route. Update the routers and the clients together.
 - No failback. After a failover, the route stays on the new router until that router fails.

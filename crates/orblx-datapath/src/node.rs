@@ -480,7 +480,7 @@ async fn run_mesh_inner(
     let node = Arc::new(view);
     let peers = Arc::new(Mutex::new(initial_peers(&request.netmap)));
     let links = Arc::new(Mutex::new(HashMap::<String, LiveLink>::new()));
-    let router = Arc::new(router);
+    let (router_tx, tun_router) = watch::channel(router);
     publish(&state_dir, &node, &peers, "up");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -492,27 +492,18 @@ async fn run_mesh_inner(
     });
 
     let tun_shutdown = shutdown_rx.clone();
-    let tun_router = Arc::clone(&router);
     let tun_links = Arc::clone(&links);
     let tun_counters = Arc::clone(&counters);
     let tun_peers = Arc::clone(&peers);
     let accept_routes = request.accept_routes;
-    let ha_routes = if accept_routes {
-        router.ha_routes()
-    } else {
-        Vec::new()
-    };
-    let tun_audit = if ha_routes.is_empty() {
-        RouteAudit::off()
-    } else {
+    // The netmap watch can add an HA route later (W25-6), so each node that accepts
+    // routes has the audit writer. The writer opens the file at the first record.
+    let tun_audit = if accept_routes {
+        print_ha_routes(&tun_router.borrow());
         RouteAudit::spawn(state_dir.join(ROUTE_AUDIT_FILE), node.svid.clone())
+    } else {
+        RouteAudit::off()
     };
-    for (cidr, routers) in ha_routes {
-        println!(
-            "The HA route {cidr} has the routers {}.",
-            routers.join(", ")
-        );
-    }
     let exit_node = request.exit_node.clone();
     let relay = request.relay;
     tasks.push(tokio::spawn(async move {
@@ -629,20 +620,21 @@ async fn run_mesh_inner(
     }));
 
     for peer in netmap.peers.iter() {
-        if we_dial(&node.name, &peer.name) {
-            let dial_mesh = mesh.clone();
-            let peer = peer.clone();
-            tasks.push(tokio::spawn(async move {
-                dial_peer(dial_mesh, peer).await;
-            }));
-        } else if mesh.relay.is_some() {
-            let accept_mesh = mesh.clone();
-            let peer = peer.clone();
-            tasks.push(tokio::spawn(async move {
-                accept_relay(accept_mesh, peer).await;
-            }));
+        if let Some(task) = spawn_peer_link(&mesh, peer) {
+            tasks.push(task);
         }
     }
+    let peer_tasks = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
+    let peer_watch = PeerWatch {
+        mesh: mesh.clone(),
+        router: router_tx,
+        accept_routes,
+        interface: interface.clone(),
+        tasks: Arc::clone(&peer_tasks),
+    };
+    tasks.push(tokio::spawn(async move {
+        watch_netmap_peers(peer_watch).await;
+    }));
 
     if let Some(renewer) = request.renew {
         let renew_mesh = mesh.clone();
@@ -697,6 +689,7 @@ async fn run_mesh_inner(
     drop(resolver);
     endpoint.close();
     tokio::time::sleep(Duration::from_millis(200)).await;
+    tasks.extend(std::mem::take(&mut *lock(&peer_tasks)));
     for task in &tasks {
         task.abort();
     }
@@ -813,8 +806,19 @@ async fn external_stop(external: Option<watch::Receiver<bool>>) {
     }
 }
 
+/// Print each HA route (W25) and its routers.
+fn print_ha_routes(table: &RouterTable) {
+    for (cidr, routers) in table.ha_routes() {
+        println!(
+            "The HA route {cidr} has the routers {}.",
+            routers.join(", ")
+        );
+    }
+}
+
 struct TunRoutes {
-    router: Arc<RouterTable>,
+    /// The router table. The netmap watch (W25-6) replaces it.
+    router: watch::Receiver<RouterTable>,
     links: Arc<Mutex<HashMap<String, LiveLink>>>,
     peers: Arc<Mutex<Vec<PeerView>>>,
     selector: RouteSelector,
@@ -830,9 +834,10 @@ impl TunRoutes {
     /// An HA route (W25) uses the selector and the session health.
     fn peer_for(&self, packet: &[u8]) -> Option<String> {
         let dest = ipv4_destination(packet)?;
-        let Some(found) = self.router.lookup_match(dest, self.accept_routes) else {
+        let table = self.router.borrow();
+        let Some(found) = table.lookup_match(dest, self.accept_routes) else {
             return route_packet(
-                &self.router,
+                &table,
                 packet,
                 self.accept_routes,
                 self.exit_node.as_deref(),
@@ -905,6 +910,7 @@ async fn read_tun(
                 let Some(packet) = packet else {
                     return;
                 };
+                // peer_for drops the guard of the router table before the await.
                 let Some(peer) = routes.peer_for(&packet) else {
                     continue;
                 };
@@ -918,6 +924,147 @@ async fn read_tun(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Start the link task for one peer: a dial when this node dials, else a Relay accept.
+fn spawn_peer_link(mesh: &Mesh, peer: &NetmapPeer) -> Option<JoinHandle<()>> {
+    if we_dial(&mesh.node.name, &peer.name) {
+        let dial_mesh = mesh.clone();
+        let peer = peer.clone();
+        Some(tokio::spawn(async move {
+            dial_peer(dial_mesh, peer).await;
+        }))
+    } else if mesh.relay.is_some() {
+        let accept_mesh = mesh.clone();
+        let peer = peer.clone();
+        Some(tokio::spawn(async move {
+            accept_relay(accept_mesh, peer).await;
+        }))
+    } else {
+        None
+    }
+}
+
+/// The node reads the netmap file at this interval to find new peers (W25-6).
+const PEER_WATCH_TICK: Duration = Duration::from_millis(250);
+
+struct PeerWatch {
+    mesh: Mesh,
+    router: watch::Sender<RouterTable>,
+    accept_routes: bool,
+    interface: Option<String>,
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+/// Apply a new netmap file without a restart (W25-6).
+///
+/// The policy sync of `orblx up --coord` writes the netmap file when the coordinator
+/// netmap changes. This task reads the file each 250 ms. When the text changes, the
+/// task replaces the router table, installs the kernel routes of the new prefixes,
+/// adds the new peers to the status, and starts a link task for each new peer.
+/// A peer that leaves the netmap loses its routes. The deny list and the node lock
+/// stop its sessions, as before.
+async fn watch_netmap_peers(watch: PeerWatch) {
+    let mut last = fs::read(&watch.mesh.netmap_path).ok();
+    let mut started: HashSet<String> = watch
+        .mesh
+        .netmap
+        .peers
+        .iter()
+        .map(|peer| peer.name.clone())
+        .collect();
+    let mut installed: HashSet<String> = watch
+        .router
+        .borrow()
+        .install_cidrs(watch.accept_routes)
+        .into_iter()
+        .collect();
+    let mut shutdown = watch.mesh.shutdown.clone();
+    let mut tick = tokio::time::interval(PEER_WATCH_TICK);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+            _ = tick.tick() => {
+                let Ok(bytes) = fs::read(&watch.mesh.netmap_path) else {
+                    continue;
+                };
+                if last.as_deref() == Some(bytes.as_slice()) {
+                    continue;
+                }
+                last = Some(bytes.clone());
+                let Ok(netmap) = Netmap::from_slice(&bytes) else {
+                    eprintln!("The node did not apply the new netmap. The file is not valid.");
+                    continue;
+                };
+                apply_peer_netmap(&watch, &netmap, &mut started, &mut installed);
+            }
+        }
+    }
+}
+
+fn apply_peer_netmap(
+    watch: &PeerWatch,
+    netmap: &Netmap,
+    started: &mut HashSet<String>,
+    installed: &mut HashSet<String>,
+) {
+    let node = &watch.mesh.node;
+    if netmap.self_node.name != node.name || netmap.self_node.overlay_ip != node.overlay_ip {
+        eprintln!("The node did not apply the new netmap. The self entry changed.");
+        return;
+    }
+    let table = match RouterTable::from_netmap(netmap) {
+        Ok(table) => table,
+        Err(err) => {
+            eprintln!("The node did not apply the new netmap. {err}");
+            return;
+        }
+    };
+    let added: Vec<String> = table
+        .install_cidrs(watch.accept_routes)
+        .into_iter()
+        .filter(|cidr| !installed.contains(cidr))
+        .collect();
+    if let (Some(interface), false) = (&watch.interface, added.is_empty()) {
+        if let Err(err) = prepare_link(interface, &added) {
+            eprintln!("The node did not install the new routes. {err}");
+        }
+    }
+    for cidr in &added {
+        println!("The node installs route {cidr}.");
+    }
+    installed.extend(added);
+    if watch.accept_routes && watch.router.borrow().ha_routes() != table.ha_routes() {
+        print_ha_routes(&table);
+    }
+    watch.router.send_replace(table);
+    let new_peers: Vec<&NetmapPeer> = netmap
+        .peers
+        .iter()
+        .filter(|peer| !started.contains(&peer.name))
+        .collect();
+    if new_peers.is_empty() {
+        return;
+    }
+    {
+        let mut views = lock(&watch.mesh.peers);
+        for view in initial_peers(netmap) {
+            if !started.contains(&view.name) && !views.iter().any(|old| old.name == view.name) {
+                views.push(view);
+            }
+        }
+    }
+    for peer in new_peers {
+        println!("The node adds the peer {} from the new netmap.", peer.name);
+        started.insert(peer.name.clone());
+        if let Some(task) = spawn_peer_link(&watch.mesh, peer) {
+            lock(&watch.tasks).push(task);
         }
     }
 }
@@ -1958,20 +2105,34 @@ async fn watch_netmap_dns(mut watch_state: DnsWatch) {
                 if next != grant_revision {
                     grant_revision = next;
                     let table = watch_state.tables.borrow().clone();
-                    refresh_resolver(
-                        &watch_state.interface,
-                        watch_state.overlay,
-                        &table,
-                        watch_state.visibility.as_ref(),
-                        &watch_state.armed,
-                        watch_state.capture_all,
-                    );
+                    refresh_resolver_in_background(&watch_state, table);
                     println!("The DNS answers follow the new grants.");
                 }
                 reload_dns_file(&watch_state, &mut last, &mut last_error);
             }
         }
     }
+}
+
+/// Update the host resolver on a blocking thread (W25-6).
+///
+/// The host commands can wait for seconds. The DNS watch keeps its one second tick.
+fn refresh_resolver_in_background(watch_state: &DnsWatch, table: DnsTable) {
+    let interface = watch_state.interface.clone();
+    let overlay = watch_state.overlay;
+    let visibility = Arc::clone(&watch_state.visibility);
+    let armed = Arc::clone(&watch_state.armed);
+    let capture_all = watch_state.capture_all;
+    tokio::task::spawn_blocking(move || {
+        refresh_resolver(
+            &interface,
+            overlay,
+            &table,
+            visibility.as_ref(),
+            &armed,
+            capture_all,
+        );
+    });
 }
 
 fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut String) {
@@ -1982,15 +2143,10 @@ fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut 
                 last.clone_from(&bytes);
                 last_error.clear();
                 let table = DnsTable::from_netmap(&map);
-                refresh_resolver(
-                    &watch_state.interface,
-                    watch_state.overlay,
-                    &table,
-                    watch_state.visibility.as_ref(),
-                    &watch_state.armed,
-                    watch_state.capture_all,
-                );
-                let _ = watch_state.tables.send(table);
+                // W25-6: the responder uses the new table first. A slow host resolver command
+                // (up to COMMAND_WAIT for each call) must not hold the new answers.
+                let _ = watch_state.tables.send(table.clone());
+                refresh_resolver_in_background(watch_state, table);
                 println!("The DNS answers follow the new netmap.");
             }
             Ok(_) => {

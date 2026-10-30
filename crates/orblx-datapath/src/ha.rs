@@ -171,16 +171,21 @@ impl RouteAudit {
 }
 
 fn audit_loop(path: &Path, rx: &Receiver<ConfigEvent>) {
-    let mut log = match ConfigLog::open(path) {
-        Ok(log) => log,
-        Err(err) => {
-            eprintln!("The route audit chain did not open. {err}");
-            return;
-        }
-    };
+    let mut log: Option<ConfigLog> = None;
     while let Ok(event) = rx.recv() {
-        if let Err(err) = log.append(event) {
-            eprintln!("The route audit record was not written. {err}");
+        if log.is_none() {
+            match ConfigLog::open(path) {
+                Ok(opened) => log = Some(opened),
+                Err(err) => {
+                    eprintln!("The route audit chain did not open. {err}");
+                    continue;
+                }
+            }
+        }
+        if let Some(log) = log.as_mut() {
+            if let Err(err) = log.append(event) {
+                eprintln!("The route audit record was not written. {err}");
+            }
         }
     }
 }
