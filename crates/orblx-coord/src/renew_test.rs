@@ -218,6 +218,11 @@ async fn session_stays_up_for_three_svid_lifetimes() {
         },
     ));
 
+    // The stall probe shares the runtime with the nodes and the coordinator. A late tick
+    // shows that the runtime thread did not run, so the gap is not in the datapath.
+    let max_stall = Arc::new(Mutex::new(Duration::ZERO));
+    let stall_probe = tokio::spawn(stall_probe(Arc::clone(&max_stall)));
+
     let mut last_ab: Option<Instant> = None;
     let mut last_ba: Option<Instant> = None;
     let mut max_gap = Duration::ZERO;
@@ -286,13 +291,16 @@ async fn session_stays_up_for_three_svid_lifetimes() {
             break;
         }
     }
+    stall_probe.abort();
+    let max_stall = *max_stall.lock().unwrap();
     let renewals = renewals.lock().unwrap().clone();
     let renew_gap = renewal_max_gap(&gaps, &renewals);
     println!(
-        "renew_gap_summary probe_ms {PROBE_MS} ab {got_ab} ba {got_ba} max_gap_ms {} renewals {} renewal_max_gap_ms {} expiries {}",
+        "renew_gap_summary probe_ms {PROBE_MS} ab {got_ab} ba {got_ba} max_gap_ms {} renewals {} renewal_max_gap_ms {} runtime_max_stall_ms {} expiries {}",
         max_gap.as_millis(),
         renewals.len(),
         renew_gap.as_millis(),
+        max_stall.as_millis(),
         expiries.len()
     );
 
@@ -344,6 +352,31 @@ fn renewal_max_gap(gaps: &[(Instant, Instant)], renewals: &[Instant]) -> Duratio
         .map(|(prev, now)| now.saturating_duration_since(*prev))
         .max()
         .unwrap_or(Duration::ZERO)
+}
+
+/// Tick every 5 ms and keep the largest delay of a tick. Trace a delay over 100 ms.
+async fn stall_probe(max_stall: Arc<Mutex<Duration>>) {
+    let step = Duration::from_millis(5);
+    let mut last = Instant::now();
+    loop {
+        tokio::time::sleep(step).await;
+        let now = Instant::now();
+        let late = now.saturating_duration_since(last).saturating_sub(step);
+        if late > Duration::from_millis(100) {
+            let ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            eprintln!("trace {ms} test stall ms={}", late.as_millis());
+        }
+        {
+            let mut max = max_stall.lock().unwrap();
+            if late > *max {
+                *max = late;
+            }
+        }
+        last = now;
+    }
 }
 
 fn note_gap(
