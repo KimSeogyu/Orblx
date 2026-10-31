@@ -35,6 +35,7 @@ REACH_LIMIT_MS="${ORBLX_UA_REACH_LIMIT_MS:-2000}"
 STATE=/var/lib/orblx
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$PROOF_LIB_DIR/proof-lock.sh"
+PROOF_MIN_FREE_GIB=12  # reason: the floor (PROOF_DISK_FLOOR_GIB): one build output and one proof image. No bigger measure for this proof.
 trap proof_lock_end EXIT
 proof_lock_take "user-approval"
 mkdir -p "$POLICY_DIR"

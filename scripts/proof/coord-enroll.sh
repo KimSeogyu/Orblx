@@ -10,6 +10,7 @@ require_root "$@"
 # W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$PROOF_LIB_DIR/proof-lock.sh"
+PROOF_MIN_FREE_GIB=12  # reason: the biggest build output (11 GiB, a worktree target/ at 16:42 KST 2026-10-31) + the biggest proof image (0.55 GiB) + the stage copy (0.25 GiB), rounded up.
 # W25-14b: start from a clean compose state (all profiles, all volumes), under the lock.
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
@@ -29,29 +30,7 @@ cleanup() {
   dc --profile nodes down -v --remove-orphans >/dev/null 2>&1 || true
 }
 # W25-14b: the build is a proof step. A build that stops on a full disk is a FAIL.
-# So the run stops before the lock and before any proof step when free space is low.
-# The limit: the biggest build output seen on this box (11 GiB, a worktree target/ at
-# 16:42 KST 2026-10-31), plus the biggest proof image (0.55 GiB), plus the image stage
-# copy (0.25 GiB), rounded up to 12 GiB.
-COORD_ENROLL_MIN_FREE_GIB=12
-free_gib_at() {
-  local kib
-  kib="$(df -Pk "$1" | awk 'NR == 2 { print $4 }')" || return 1
-  [[ "$kib" =~ ^[0-9]+$ ]] || return 1
-  echo $((kib / 1048576))
-}
-for disk_dir in "$ROOT" /var/lib/docker; do
-  [[ -d "$disk_dir" ]] || continue
-  if ! free_gib="$(free_gib_at "$disk_dir")"; then
-    echo "proof_infra_abort coord-enroll reason=disk_unknown dir=$disk_dir. No proof step ran." >&2
-    exit 3
-  fi
-  if (( free_gib < COORD_ENROLL_MIN_FREE_GIB )); then
-    echo "proof_infra_abort coord-enroll reason=disk_low free_gib=$free_gib min_gib=$COORD_ENROLL_MIN_FREE_GIB dir=$disk_dir. No proof step ran." >&2
-    exit 3
-  fi
-done
-
+# proof_lock_take runs proof_disk_check (proof-lock.sh) before the lock and before the build.
 trap 'cleanup; proof_lock_end' EXIT
 proof_lock_take "coord-enroll" "orblx-coord-proof-"
 proof_compose_clean "orblx-coord-proof" || exit 1

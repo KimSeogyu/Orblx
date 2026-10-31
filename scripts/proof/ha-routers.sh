@@ -49,6 +49,7 @@ dc() {
 # W25-5: one box proof at a time. The lock waits.
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$ROOT/scripts/proof/proof-lock.sh"
+PROOF_MIN_FREE_GIB=12  # reason: the floor (PROOF_DISK_FLOOR_GIB): one build output and one proof image. No bigger measure for this proof.
 # shellcheck source=scripts/proof/pipe-lib.sh
 . "$ROOT/scripts/proof/pipe-lib.sh"
 

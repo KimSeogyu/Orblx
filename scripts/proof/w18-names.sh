@@ -29,6 +29,7 @@ fi
 # W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$PROOF_LIB_DIR/proof-lock.sh"
+PROOF_MIN_FREE_GIB=12  # reason: the floor (PROOF_DISK_FLOOR_GIB): one build output and one proof image. No bigger measure for this proof.
 trap proof_lock_end EXIT
 proof_lock_take "w18-names"
 # W25-14b: start from a clean compose state (all profiles, all volumes).

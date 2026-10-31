@@ -341,7 +341,54 @@ proof_lock_queue_leave() {
   fi
 }
 
+# W25-14b: free disk space before the lock and before any build (proof_disk_check).
+# A build or an image step that stops on a full disk is a FAIL, so a proof does not start
+# with low free space. Each proof script sets PROOF_MIN_FREE_GIB in the script, with its reason.
+# PROOF_DISK_FLOOR_GIB is the lowest value that a script can set. The reason: the biggest build
+# output seen on this box (11 GiB, a worktree target/ at 16:42 KST 2026-10-31), plus the
+# biggest proof image (0.55 GiB), plus the image stage copy (0.25 GiB), rounded up to 12 GiB.
+# Below the minimum, or when the free space is not known, the function prints
+#   proof_infra_abort LABEL reason=... dir=DIR. No proof step ran.
+# and stops the script with exit status 4 (PROOF_INFRA_ABORT_EXIT). Status 3 stays
+# proof_contention_invalid. An infra abort is not a PASS, a FAIL, or an INVALID run.
+PROOF_DISK_FLOOR_GIB=12
+PROOF_INFRA_ABORT_EXIT=4
+PROOF_DISK_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+proof_free_gib_at() {
+  local kib
+  kib="$(df -Pk "$1" 2>/dev/null | awk 'NR == 2 { print $4 }')" || return 1
+  [[ "$kib" =~ ^[0-9]+$ ]] || return 1
+  echo $((kib / 1048576))
+}
+
+proof_infra_abort() {
+  echo "proof_infra_abort $1 $2. No proof step ran." >&2
+  exit "$PROOF_INFRA_ABORT_EXIT"
+}
+
+proof_disk_check() {
+  local label="$1" min="${PROOF_MIN_FREE_GIB:-}" dir free
+  if ! [[ "$min" =~ ^[0-9]+$ ]]; then
+    proof_infra_abort "$label" "reason=min_unset dir=none"
+  fi
+  if (( min < PROOF_DISK_FLOOR_GIB )); then
+    proof_infra_abort "$label" "reason=min_below_floor min_gib=$min floor_gib=$PROOF_DISK_FLOOR_GIB dir=none"
+  fi
+  for dir in "$PROOF_DISK_REPO" /var/lib/docker; do
+    [[ -d "$dir" ]] || continue
+    if ! free="$(proof_free_gib_at "$dir")"; then
+      proof_infra_abort "$label" "reason=disk_unknown dir=$dir"
+    fi
+    if (( free < min )); then
+      proof_infra_abort "$label" "reason=disk_low free_gib=$free min_gib=$min dir=$dir"
+    fi
+  done
+}
+
 proof_lock_take() {
+  # The disk check runs before the lock, also when the script ran it before its build.
+  proof_disk_check "$1"
   PROOF_LOCK_LABEL="$1"
   shift
   PROOF_LOCK_OWN=("$@")

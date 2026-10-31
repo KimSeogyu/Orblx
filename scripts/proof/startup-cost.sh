@@ -23,6 +23,7 @@ rm -f "$build_json" "$log"
 
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$ROOT/scripts/proof/proof-lock.sh"
+PROOF_MIN_FREE_GIB=12  # reason: the floor (PROOF_DISK_FLOOR_GIB): one build output and one proof image. No bigger measure for this proof.
 trap proof_lock_end EXIT
 proof_lock_take "startup-cost" "orblx-startup-cost-"
 
