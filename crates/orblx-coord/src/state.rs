@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orblx_audit::{ConfigAction, ConfigEvent, ConfigLog, ConfigRecord, EMPTY_DIGEST};
 use orblx_datapath::{Netmap, NetmapPeer, NetmapSelf, SplitDns};
@@ -134,6 +134,8 @@ struct Inner {
     store: NodeStore,
     ca: MiniCa,
     coord_svid: IssuedSvid,
+    /// Life of the coordinator leaf. The maximum is [`MAX_USER_TTL`] (W25-33).
+    coord_svid_ttl: Duration,
     netmap_key: NetmapKey,
     oidc: OidcState,
     /// Life of a node leaf. The maximum is [`MAX_USER_TTL`].
@@ -297,6 +299,7 @@ impl Coordinator {
                 store,
                 ca,
                 coord_svid,
+                coord_svid_ttl: MAX_USER_TTL,
                 netmap_key,
                 oidc,
                 svid_ttl: MAX_USER_TTL,
@@ -605,6 +608,48 @@ impl Coordinator {
             println!("held exit node {name}");
         }
         Ok(view)
+    }
+
+    /// Set the life of the coordinator leaf and issue a new leaf now (W25-33 test hook).
+    ///
+    /// The value is a whole number of seconds from 1 through the user maximum.
+    /// The value cannot make the life longer than [`MAX_USER_TTL`].
+    #[cfg(test)]
+    pub(crate) fn set_coord_svid_ttl(&self, ttl: Duration) -> Result<(), CoordError> {
+        if ttl.is_zero() || ttl.subsec_nanos() != 0 || ttl > MAX_USER_TTL {
+            return Err(CoordError::Protocol(
+                "The coordinator SVID life is not valid.".to_string(),
+            ));
+        }
+        let mut inner = self.lock()?;
+        inner.coord_svid_ttl = ttl;
+        issue_coord_svid(&mut inner, SystemTime::now())
+    }
+
+    /// Issue a new coordinator leaf when two thirds of the life of the live leaf have passed.
+    ///
+    /// The new leaf comes from the same CA and has the same SPIFFE ID and the same life.
+    /// The function returns the new end time when it issued a leaf (W25-33).
+    pub(crate) fn renew_coord_svid_if_due(
+        &self,
+        now: SystemTime,
+    ) -> Result<Option<u64>, CoordError> {
+        let mut inner = self.lock()?;
+        let due = coord_renew_unix(inner.coord_svid.not_before, inner.coord_svid.not_after);
+        let now_unix = now
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| CoordError::State)?
+            .as_secs();
+        if now_unix < due {
+            return Ok(None);
+        }
+        issue_coord_svid(&mut inner, now)?;
+        Ok(Some(inner.coord_svid.not_after))
+    }
+
+    /// The end time of the live coordinator leaf.
+    pub(crate) fn coord_svid_not_after(&self) -> Result<u64, CoordError> {
+        Ok(self.lock()?.coord_svid.not_after)
     }
 
     pub fn tls_material(&self) -> Result<TlsMaterial, CoordError> {
@@ -2012,6 +2057,24 @@ impl NetmapView {
             &self.endpoints,
         )
     }
+}
+
+/// Issue the coordinator leaf with the normal issue path and keep it as the live leaf.
+fn issue_coord_svid(inner: &mut Inner, now: SystemTime) -> Result<(), CoordError> {
+    let coord_id = SpiffeId::coord(&inner.coord_name)?;
+    let svid = inner
+        .ca
+        .issue(&coord_id, now, inner.coord_svid_ttl, &DenySet::empty())?;
+    inner.coord_svid = svid;
+    Ok(())
+}
+
+/// The unix second when the coordinator renews its leaf: two thirds of the life.
+///
+/// This is the same rule that the node uses for its own leaf.
+fn coord_renew_unix(not_before: u64, not_after: u64) -> u64 {
+    let life = not_after.saturating_sub(not_before);
+    not_before.saturating_add(life.saturating_mul(2) / 3)
 }
 
 fn write_view(
