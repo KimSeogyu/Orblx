@@ -38,7 +38,8 @@ ACTIONS = [
     "serve", "serve-off", "funnel-on", "funnel-off", "lock-init",
     "lock-sign", "lock-rotate", "lock-remove", "file-receive", "file-deny",
     "token-create", "token-use", "token-deny", "token-revoke", "share",
-    "unshare", "packet-deny", "unrevoke", "sink-error", "route-failover",
+    "unshare", "packet-deny", "unrevoke", "sink-error", "user-approve",
+    "user-reject", "route-failover",
 ]
 
 SYSLOG_HEAD = re.compile(
