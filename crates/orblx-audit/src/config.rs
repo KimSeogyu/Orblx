@@ -119,12 +119,13 @@ pub enum ConfigAction {
 
 impl ConfigAction {
     /// Codes that no action in this build uses. Code 37 is reserved for `node-remove` (W25-18).
-    /// Codes 39 and 40 are reserved for other open work items. W25-34 takes code 41.
+    /// Code 40 is reserved for another open work item. W25-31 takes code 39 (`ssh-cert`) and
+    /// W25-34 takes code 41.
     /// The SIEM verifier has the placeholder `reserved-N` for each of these codes.
-    pub const RESERVED_CODES: [u8; 3] = [37, 39, 40];
+    pub const RESERVED_CODES: [u8; 2] = [37, 40];
 
     /// Every action in code order.
-    pub const ALL: [Self; 38] = [
+    pub const ALL: [Self; 39] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,

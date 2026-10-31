@@ -345,12 +345,15 @@ uname -s
 uname -m
 open_legacy_forward
 
-echo "=== [C] build image ==="
-cargo build -p orblx-cli --bin orblx -p orblx-test-idp --bin orblx-test-idp --locked
+echo "=== [C] build image (release) ==="
+# The PO rule of 19:50 KST: an acceptance run with a latency or gap gate uses a release build.
+# The log keeps the rustc version and the cargo profile line ("Finished `release` profile").
+rustc --version
+cargo build --release -p orblx-cli --bin orblx -p orblx-test-idp --bin orblx-test-idp --locked
 # shellcheck source=stage-image.sh
 source "$ROOT/scripts/proof/stage-image.sh"
-IMAGE_DIR="$(stage_proof_image "$ROOT" "$TARGET_DIR/debug/orblx")"
-cp "$TARGET_DIR/debug/orblx-test-idp" "$IMAGE_DIR/orblx-test-idp"
+IMAGE_DIR="$(stage_proof_image "$ROOT" "$TARGET_DIR/release/orblx")"
+cp "$TARGET_DIR/release/orblx-test-idp" "$IMAGE_DIR/orblx-test-idp"
 {
   printf '%s\n' 'COPY orblx-test-idp /usr/local/bin/orblx-test-idp'
   # [C] openssh-client for the foreign CA gate only. The node does not run sshd.
