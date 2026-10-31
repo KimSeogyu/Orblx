@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import unittest
 
-from fake_docker import with_fake_docker
+from fake_docker import fake_cargo_home, with_fake_docker
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SWEEP = os.path.join(HERE, "..", "release-sweep.sh")
@@ -99,6 +99,8 @@ class ReleaseSweepTest(unittest.TestCase):
             "ORBLX_PROOF_LOCK": os.path.join(self.tmp, "proof.lock"),
             "ORBLX_SWEEP_TIMEOUT": "60",
             "ORBLX_SWEEP_MIN_FREE_GB": "0",
+            # release-sweep.sh sets PATH for each proof; its first dir is "$CARGO_HOME/bin".
+            "CARGO_HOME": fake_cargo_home(),
         })
         if only is not None:
             env["ORBLX_SWEEP_ONLY"] = only

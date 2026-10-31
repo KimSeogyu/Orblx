@@ -28,3 +28,20 @@ def with_fake_docker(env, docker=EMPTY, sudo=None):
             f.write(body)
         os.chmod(path, 0o755)
     return dict(env, PATH=bin_dir + os.pathsep + env.get("PATH", ""))
+
+
+def fake_cargo_home(docker=EMPTY):
+    """Return a temp CARGO_HOME with the stand-in docker in its bin dir.
+
+    release-sweep.sh sets PATH to "$CARGO_HOME/bin" and the system dirs for each proof, so the
+    stand-in in PATH is not used there. Its bin dir is first in that PATH. The sweep does not run
+    cargo in test mode.
+    """
+    home = tempfile.mkdtemp()
+    bin_dir = os.path.join(home, "bin")
+    os.mkdir(bin_dir)
+    path = os.path.join(bin_dir, "docker")
+    with open(path, "w") as f:
+        f.write(docker)
+    os.chmod(path, 0o755)
+    return home
