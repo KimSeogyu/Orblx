@@ -18,6 +18,11 @@
 #                          that this pid is the pid in the holder file and that it runs.
 # The lock uses flock(1). Without flock (macOS), the proof runs without the lock and says so.
 # The script must call proof_lock_end in its EXIT trap.
+# W25-19: a proof from an old checkout takes the lock file with a plain flock. While a FIFO
+# proof runs or waits first in the queue, a keeper process holds that flock, so the old
+# proof cannot pass the queue. The FIFO proofs take turns on a second lock, "${file}.fifo".
+# A proof that runs under a plain flock of the lock file (for example "flock FILE proof.sh")
+# stops at once with a message: it must use proof_lock_take.
 
 # W25-27: the lab-ticket guard (ticket-guard.sh) comes with the lock.
 # shellcheck source=scripts/proof/ticket-guard.sh
@@ -30,6 +35,10 @@ PROOF_LOCK_OWN=()
 PROOF_LOCK_SAMPLER=""
 PROOF_LOCK_SAMPLES=""
 PROOF_LOCK_TICKET=""
+# The keeper runs this file, so it needs the full path.
+PROOF_LOCK_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+# The ticket line that tells the keeper that a waiter uses the W25-19 protocol.
+PROOF_LOCK_PROTO="proto=fifo-keeper"
 
 proof_lock_file() {
   if [[ -n "${ORBLX_PROOF_LOCK:-}" ]]; then
@@ -124,10 +133,11 @@ proof_lock_sample_loop() {
 }
 
 # W25-14: first come, first served. Each waiter writes a ticket file in "${file}.queue".
-# Only the waiter with the oldest live ticket tries flock. A ticket is live while its pid runs.
+# Only the waiter with the oldest live ticket tries the lock. A ticket is live while its pid runs.
 # While it waits, the waiter prints "waiting for lock, N s, position P, holder X"
-# every NOTE seconds. A proof from an older checkout without the queue can still take the
-# lock between two waiters; the queue then continues after it.
+# every NOTE seconds.
+# W25-19: the ticket is made before the first proof_context line, so the arrival time is the
+# time of the proof_lock_take call (docker ps in proof_context can take a long time).
 proof_lock_queue_first() {
   local dir="$1" t pid
   for t in $(ls "$dir" 2>/dev/null | LC_ALL=C sort); do
@@ -164,23 +174,149 @@ proof_lock_queue_join() {
     chmod 1777 "$dir" 2>/dev/null || true
   fi
   PROOF_LOCK_TICKET="$(date +%s%N)-$$"
-  printf 'label=%s\n' "$PROOF_LOCK_LABEL" >"${dir}/${PROOF_LOCK_TICKET}" 2>/dev/null || PROOF_LOCK_TICKET=""
+  printf 'label=%s\n%s\n' "$PROOF_LOCK_LABEL" "$PROOF_LOCK_PROTO" >"${dir}/${PROOF_LOCK_TICKET}" 2>/dev/null || PROOF_LOCK_TICKET=""
+}
+
+# True when the oldest live ticket is from a W25-19 waiter. A W25-14 waiter (an older
+# checkout) takes the lock file itself, so the keeper must free it for that waiter.
+proof_lock_fifo_first_waits() {
+  local dir="$1" first
+  first="$(proof_lock_queue_first "$dir")" || return 1
+  grep -qx "$PROOF_LOCK_PROTO" "${dir}/${first}" 2>/dev/null
+}
+
+# The inode of the lock file, for the lock lines in /proc/PID/fdinfo.
+proof_lock_inode() {
+  stat -c '%i' "$1" 2>/dev/null || stat -f '%i' "$1" 2>/dev/null
+}
+
+# True when process $1 holds a flock on inode $2. It reads /proc/PID/fdinfo, because
+# /proc/locks does not list a lock after the flock(1) process that took it ends.
+# When the fdinfo of the process cannot be read (another user), a live process counts.
+proof_lock_pid_holds() {
+  local pid="$1" ino="$2" state
+  [[ -n "$ino" && -d "/proc/${pid}" ]] || return 1
+  state="$(sed -n 's/^State:[[:space:]]*\(.\).*/\1/p' "/proc/${pid}/status" 2>/dev/null)"
+  [[ "$state" != "Z" ]] || return 1
+  if ! ls "/proc/${pid}/fdinfo" >/dev/null 2>&1; then
+    return 0
+  fi
+  grep -qs "^lock:.*FLOCK.*WRITE.*:${ino} " "/proc/${pid}/fdinfo/"* 2>/dev/null
+}
+
+# True when the keeper holds the lock file now.
+proof_lock_keeper_holds() {
+  local file="$1" pid
+  pid="$(sed -n 's/^pid=//p' "${file}.keeper" 2>/dev/null)"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  if [[ -d /proc/self/fdinfo ]]; then
+    proof_lock_pid_holds "$pid" "$(proof_lock_inode "$file")"
+  else
+    kill -0 "$pid" 2>/dev/null
+  fi
+}
+
+# Start a keeper. It is not a job of the proof shell, it is in its own session (a timeout
+# that stops the process group of the proof does not stop it), and it closes the proof fds.
+proof_lock_keeper_start() {
+  local file="$1"
+  if command -v setsid >/dev/null 2>&1; then
+    eval "( setsid bash -c '. \"\$1\"; proof_lock_keeper \"\$2\"' orblx-proof-lock-keeper \"\$PROOF_LOCK_LIB\" \"\$file\" </dev/null >/dev/null 2>&1 & ) ${PROOF_LOCK_FD}>&-"
+  else
+    eval "( bash -c '. \"\$1\"; proof_lock_keeper \"\$2\"' orblx-proof-lock-keeper \"\$PROOF_LOCK_LIB\" \"\$file\" </dev/null >/dev/null 2>&1 & ) ${PROOF_LOCK_FD}>&-"
+  fi
+}
+
+# The keeper holds the lock file (the flock that old checkouts use) while a FIFO proof runs
+# or while the oldest live ticket is from a FIFO waiter. Only one keeper runs.
+# It stops when "${file}.fifo" is free and the oldest live ticket is not from a FIFO waiter
+# (or no ticket is left). It checks this under the fifo lock, so no FIFO proof can start
+# while it stops. The holder also stops it with TERM in proof_lock_end.
+proof_lock_keeper() {
+  local file="$1" dir="${1}.queue" lib_keeper="${1}.keeper"
+  exec 7>>"${file}.keeper.lock" || exit 0
+  flock -n 7 || exit 0
+  exec 8>>"$file" || exit 0
+  flock 8 || exit 0
+  exec 6>>"${file}.fifo" || exit 0
+  trap 'rm -f "$lib_keeper"; exit 0' TERM
+  printf 'pid=%s\nsince=%s\n' "$$" "$(proof_lock_now)" >"${lib_keeper}.$$" 2>/dev/null || exit 0
+  chmod 0666 "${lib_keeper}.$$" 2>/dev/null || true
+  mv -f "${lib_keeper}.$$" "$lib_keeper" || exit 0
+  while :; do
+    # The sleep must not keep the lock fds open after the keeper ends.
+    sleep 0.2 6>&- 7>&- 8>&- &
+    wait $! || true
+    if flock -n 6; then
+      if ! proof_lock_fifo_first_waits "$dir"; then
+        rm -f "$lib_keeper"
+        exit 0
+      fi
+      flock -u 6
+    fi
+  done
+}
+
+# Stop the keeper and wait until it frees the lock file (at most 3 s). Call it with the fifo lock.
+proof_lock_keeper_stop() {
+  local file="$1" pid ino i
+  pid="$(sed -n 's/^pid=//p' "${file}.keeper" 2>/dev/null)"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  kill -TERM "$pid" 2>/dev/null || return 0
+  ino="$(proof_lock_inode "$file")"
+  for ((i = 0; i < 60; i++)); do
+    proof_lock_pid_holds "$pid" "$ino" || return 0
+    sleep 0.05
+  done
+}
+
+# W25-19: print "PID COMMAND" when this shell or a parent process holds a flock on the lock
+# file. Then the proof runs under a plain flock and not in the FIFO queue.
+proof_lock_plain_parent() {
+  local file="$1" ino pid cmd
+  [[ -d /proc/self/fdinfo && -e "$file" ]] || return 1
+  ino="$(proof_lock_inode "$file")"
+  pid="$$"
+  while [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )); do
+    # One grep per process, not one per fd: an ancestor such as a CI runner can have
+    # hundreds of fds, and one grep per fd made the check take 0.7 s or more.
+    if grep -qs "^lock:.*FLOCK.*WRITE.*:${ino} " "/proc/${pid}/fdinfo/"* 2>/dev/null; then
+      cmd="$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null)"
+      printf '%s %s\n' "$pid" "${cmd% }"
+      return 0
+    fi
+    pid="$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/${pid}/status" 2>/dev/null)"
+  done
+  return 1
 }
 
 proof_lock_queue_wait() {
-  local file="$1" note="$2" from="$3" dir first next_note
+  local file="$1" note="$2" from="$3" dir first next_note have_fifo=0 next_keeper=0 now
   dir="${file}.queue"
   if [[ -z "${PROOF_LOCK_TICKET:-}" ]]; then
     proof_lock_queue_join "$file"
   fi
   next_note=0
   while :; do
-    first="$(proof_lock_queue_first "$dir" || true)"
-    if [[ -z "$PROOF_LOCK_TICKET" || "$first" == "$PROOF_LOCK_TICKET" ]] && flock -w 1 "$PROOF_LOCK_FD"; then
-      break
+    if [[ "$have_fifo" == "0" ]]; then
+      first="$(proof_lock_queue_first "$dir" || true)"
+      if [[ -z "$PROOF_LOCK_TICKET" || "$first" == "$PROOF_LOCK_TICKET" ]] && flock -w 1 "$PROOF_LOCK_FD"; then
+        have_fifo=1
+      elif [[ -z "$PROOF_LOCK_TICKET" || "$first" != "$PROOF_LOCK_TICKET" ]]; then
+        sleep 1
+      fi
     fi
-    if [[ -z "$PROOF_LOCK_TICKET" || "$first" != "$PROOF_LOCK_TICKET" ]]; then
-      sleep 1
+    if [[ "$have_fifo" == "1" ]]; then
+      # The turn is ours. The lock file must be held by the keeper before the proof starts.
+      if proof_lock_keeper_holds "$file"; then
+        break
+      fi
+      now="$(proof_lock_ms)"
+      if (( now >= next_keeper )); then
+        proof_lock_keeper_start "$file"
+        next_keeper=$(( now + 1000 ))
+      fi
+      sleep 0.1
     fi
     local waited=$(( ($(proof_lock_ms) - from) / 1000 ))
     if (( waited >= next_note )); then
@@ -204,25 +340,38 @@ proof_lock_take() {
   PROOF_LOCK_LABEL="$1"
   shift
   PROOF_LOCK_OWN=("$@")
-  local file waited_from note
+  local file waited_from note plain mode=lock
   file="$(proof_lock_file)"
   note="${ORBLX_PROOF_LOCK_NOTE_SECS:-30}"
-  # W25-14: take the queue ticket first. proof_context runs docker ps, which can take
-  # seconds; a ticket taken after it lets a later proof go first.
-  if command -v flock >/dev/null 2>&1 && ! proof_lock_parent_holds "$file"; then
-    proof_lock_queue_join "$file"
-  fi
-  proof_context queued
   if proof_lock_parent_holds "$file"; then
-    echo "proof_lock ${PROOF_LOCK_LABEL} held by the parent proof, file ${file}"
+    mode=parent
   elif ! command -v flock >/dev/null 2>&1; then
-    echo "proof_lock ${PROOF_LOCK_LABEL} no flock on this host, the proof runs without the lock"
+    mode=none
+  elif plain="$(proof_lock_plain_parent "$file")"; then
+    echo "proof_lock ${PROOF_LOCK_LABEL} FAIL: process ${plain} holds ${file} with a plain flock, not with the FIFO queue. Do not wrap a proof in flock. Use proof_lock_take from scripts/proof/proof-lock.sh (W25-19)." >&2
+    PROOF_LOCK_LABEL=""
+    exit 1
   else
-    # The lock file must be writable by every user that runs a proof.
+    # The lock files must be writable by every user that runs a proof.
     if [[ ! -e "$file" ]]; then
       (umask 000 && : >>"$file")
     fi
-    eval "exec ${PROOF_LOCK_FD}>>\"\$file\""
+    local extra
+    for extra in "${file}.fifo" "${file}.keeper.lock"; do
+      if [[ ! -e "$extra" ]]; then
+        (umask 000 && : >>"$extra")
+      fi
+    done
+    proof_lock_queue_join "$file"
+  fi
+  proof_context queued
+  if [[ "$mode" == "parent" ]]; then
+    echo "proof_lock ${PROOF_LOCK_LABEL} held by the parent proof, file ${file}"
+  elif [[ "$mode" == "none" ]]; then
+    echo "proof_lock ${PROOF_LOCK_LABEL} no flock on this host, the proof runs without the lock"
+  else
+    eval "exec ${PROOF_LOCK_FD}>>\"\${file}.fifo\""
+    # The wait time counts from here, as in W25-14 (after the queued proof_context line).
     waited_from="$(proof_lock_ms)"
     proof_lock_queue_wait "$file" "$note" "$waited_from"
     PROOF_LOCK_OWNER=1
@@ -269,6 +418,11 @@ proof_lock_end() {
     PROOF_LOCK_SAMPLES=""
   fi
   if [[ "$PROOF_LOCK_OWNER" == "1" ]]; then
+    # W25-19: when no FIFO waiter is next, stop the keeper before the fifo lock is free, so
+    # the lock file is free when this function returns.
+    if ! proof_lock_fifo_first_waits "$(proof_lock_file).queue"; then
+      proof_lock_keeper_stop "$(proof_lock_file)"
+    fi
     flock -u "$PROOF_LOCK_FD" 2>/dev/null || true
     eval "exec ${PROOF_LOCK_FD}>&-"
     PROOF_LOCK_OWNER=0
