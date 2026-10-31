@@ -7,13 +7,19 @@
 #  1. Each node crosses TR_ENDS or more ticket ends + MAX_SKEW in a row.
 #  2. 0 refusals ("capability ticket check rejected", "leaf check failed", "The end time has passed").
 #  3. 0 lost peers: each status sample shows all 3 peers with path direct.
-#  4. The largest gap between two replies of a pair is TR_GAP_MS or less.
-#     The proof prints one gap line for each ticket end of each node (ticket_end ...).
+#  4. The largest gap between two replies of a pair is TR_GAP_MS or less, in the whole run
+#     and in the window [end - 2 s, end + 2 s] of each ticket end. The proof prints one gap
+#     line for each ticket end of each node (ticket_end ...), and one line for each reply gap
+#     above TR_GAP_MS with its place (renewal, ticket end, or elsewhere).
 #  5. No restart: same container start time, restart count 0, same orblxd pid.
 #  6. A new handshake (a to b) after the ticket ends passes.
 #  7. (TR_REVOKE=1) A revoked node gets no new ticket, and its peers stop it in TR_REVOKE_MS.
+#  8. 0 contended samples: the proof-lock sampler saw no other orblx container (and no
+#     unknown sample) while the proof held the lock. The proof also prints the host load.
+# Gates 3, 4 and 8 do not stop the proof at once. Gates 5, 6 and 7 run first, then the
+# proof fails if one of gates 3, 4 or 8 failed.
 # The proof reads MAX_SKEW and MAX_USER_TTL from clock.rs.
-# The waits are a schedule. The proof does not retry a check. A failed check stops the proof.
+# The waits are a schedule. The proof does not retry a check.
 # The script does not print tokens, keys, tickets, or bundles.
 set -euo pipefail
 # shellcheck source=scripts/proof/pipe-lib.sh
@@ -292,7 +298,10 @@ while (( $(date +%s) < RUN_END )); do
   for name in "${NODES[@]}"; do
     st="$(status_of "$name")"
     e="$(printf '%s\n' "$st" | awk '$1 == "svid_expiry" && !f {print $2; f = 1}')"
-    [[ -z "$e" ]] || EXPIRIES[$name]="$(printf '%s\n%s\n' "${EXPIRIES[$name]:-}" "$e" | awk 'NF' | sort -u | tr '\n' ' ')"
+    # One entry for each ticket end: the list holds each svid_expiry once.
+    if [[ -n "$e" && " ${EXPIRIES[$name]:-} " != *" ${e} "* ]]; then
+      EXPIRIES[$name]="${EXPIRIES[$name]:+${EXPIRIES[$name]} }${e}"
+    fi
     n="$(printf '%s\n' "$st" | awk '$1 == "peer" && $6 == "direct" {n++} END {print n + 0}')"
     samples=$((samples + 1))
     if [[ "$n" -ne 3 ]]; then
@@ -354,17 +363,19 @@ done
 echo "max_gap_ms_all_pairs ${worst} limit_ms ${TR_GAP_MS}"
 
 # W25-26 PO gate: one gap line for each ticket end of each node.
-# The window starts 1 s before the renewal that replaced that ticket and ends 5 s after
-# the ticket end + MAX_SKEW. The gap is the largest time between two replies in the window
-# on a pair that has the node at one end.
+# The window is [end - 2 s, end + 2 s]. The gap is the largest time between two replies
+# that touch the window, on a pair that has the node at one end.
 echo "=== gate 4b: reply gap at each ticket end, per node ==="
+declare -A RENEWS
 end_lines=0
 end_fail=0
 for name in "${NODES[@]}"; do
   renews=""
   for ts in $(dc logs -t --no-log-prefix "$name" 2>&1 | read_all awk '/The node renewed the SVID/ {print $1}'); do
-    renews="${renews} $(date -u -d "$ts" +%s.%N)"
+    renews="${renews:+${renews} }$(date -u -d "$ts" +%s.%N)"
   done
+  RENEWS[$name]="$renews"
+  echo "node ${name} renewals_unix ${renews:-none}"
   files=()
   for other in "${NODES[@]}"; do
     [[ "$other" == "$name" ]] && continue
@@ -374,16 +385,10 @@ for name in "${NODES[@]}"; do
     if (( e + SKEW >= RUN_END )); then
       continue
     fi
-    r="$(printf '%s\n' $renews | awk -v e="$e" 'NF && $1 + 0 < e + 0 && $1 + 0 > m + 0 {m = $1} END {printf "%.3f", m + 0}')"
-    if awk -v r="$r" 'BEGIN {exit !(r + 0 == 0)}'; then
-      echo "ticket_end node ${name} end_unix ${e} renew_at none"
-      end_fail=$((end_fail + 1))
-      continue
-    fi
-    ws="$(awk -v r="$r" 'BEGIN {printf "%.3f", r - 1}')"
-    we=$(( e + SKEW + 5 ))
+    ws=$(( e - 2 ))
+    we=$(( e + 2 ))
     g="$(awk -v a="$ws" -v b="$we" 'FNR == 1 {p = ""} /bytes from/ {ts = $1; gsub(/[\[\]]/, "", ts); if (p != "" && ts + 0 >= a + 0 && p + 0 <= b + 0) {d = (ts - p) * 1000; if (d > m) m = d}; p = ts} END {printf "%.0f", m + 0}' "${files[@]}")"
-    echo "ticket_end node ${name} end_unix ${e} renew_at ${r} renew_before_end_s $(awk -v e="$e" -v r="$r" 'BEGIN {printf "%.1f", e - r}') window ${ws}-${we} max_gap_ms ${g} limit_ms ${TR_GAP_MS}"
+    echo "ticket_end node ${name} end_unix ${e} window ${ws}-${we} max_gap_ms ${g} limit_ms ${TR_GAP_MS}"
     end_lines=$((end_lines + 1))
     if (( g > TR_GAP_MS )); then
       end_fail=$((end_fail + 1))
@@ -391,9 +396,33 @@ for name in "${NODES[@]}"; do
   done
 done
 echo "ticket_end_lines ${end_lines} ticket_end_gaps_above_limit ${end_fail}"
-(( lost == 0 )) || fail "${lost} status samples show a lost peer."
-(( end_fail == 0 )) || fail "${end_fail} ticket ends have a reply gap above ${TR_GAP_MS} ms or no renewal."
-(( worst <= TR_GAP_MS )) || fail "A reply gap of ${worst} ms is above ${TR_GAP_MS} ms."
+
+# Each reply gap above the limit, with its place. "renewal": a renewal of the src or dst
+# node is in [gap start - 2 s, gap end + 2 s]. "ticket_end": an end or an end + MAX_SKEW of
+# the src or dst node is in that range. "elsewhere": none of them.
+echo "=== gate 4c: place of each reply gap above ${TR_GAP_MS} ms ==="
+big=0
+for src in "${NODES[@]}"; do
+  for dst in "${NODES[@]}"; do
+    [[ "$src" == "$dst" ]] && continue
+    marks="$(for n in "$src" "$dst"; do
+      for r in ${RENEWS[$n]}; do echo "renewal $n $r"; done
+      for e in ${EXPIRIES[$n]}; do echo "ticket_end $n $e"; echo "ticket_end_skew $n $((e + SKEW))"; done
+    done)"
+    while read -r p ts d; do
+      [[ -n "$p" ]] || continue
+      place="$(printf '%s\n' "$marks" | awk -v a="$p" -v b="$ts" 'NF == 3 && $3 + 0 >= a - 2 && $3 + 0 <= b + 2 {printf "%s%s:%s@%s", (n++ ? "," : ""), $1, $2, $3} END {if (!n) printf "elsewhere"}')"
+      echo "big_gap pair ${src}->${dst} from ${p} to ${ts} gap_ms ${d} place ${place}"
+      big=$((big + 1))
+    done < <(awk -v l="$TR_GAP_MS" '/bytes from/ {ts = $1; gsub(/[\[\]]/, "", ts); if (p != "") {d = (ts - p) * 1000; if (d > l) printf "%s %s %.0f\n", p, ts, d}; p = ts}' "$WORK/ping-${src}-${dst}.txt")
+  done
+done
+echo "big_gaps ${big}"
+
+LATE_FAIL=()
+(( lost == 0 )) || LATE_FAIL+=("${lost} status samples show a lost peer.")
+(( end_fail == 0 )) || LATE_FAIL+=("${end_fail} ticket ends have a reply gap above ${TR_GAP_MS} ms.")
+(( worst <= TR_GAP_MS )) || LATE_FAIL+=("A reply gap of ${worst} ms (whole run) is above ${TR_GAP_MS} ms.")
 
 echo "=== gate 5: no restart ==="
 for name in "${NODES[@]}"; do
@@ -453,4 +482,20 @@ fi
 dc logs > "$WORK/stack.log" 2>&1
 secret_scan "$WORK/stack.log"
 
+echo "=== gate 8: contention while the proof held the lock ==="
+if [[ -n "${PROOF_LOCK_SAMPLES:-}" && -f "$PROOF_LOCK_SAMPLES" ]]; then
+  read -r cs_n cs_busy cs_unknown cs_maxc cs_maxl < <(awk '{n++; if ($2 < 0) u++; if ($2 > 0) b++; if ($2 > c) c = $2; if ($3 > l) l = $3} END {printf "%d %d %d %d %s\n", n, b + 0, u + 0, c + 0, (n ? l : "-")}' "$PROOF_LOCK_SAMPLES")
+  echo "contention samples ${cs_n} contended_samples ${cs_busy} unknown_samples ${cs_unknown} max_other_orblx_containers ${cs_maxc} max_load1 ${cs_maxl} cpus $(nproc)"
+  (( cs_n > 0 )) || LATE_FAIL+=("The proof-lock sampler has no sample.")
+  (( cs_busy == 0 && cs_unknown == 0 )) || LATE_FAIL+=("${cs_busy} contended and ${cs_unknown} unknown samples. The run does not count.")
+else
+  LATE_FAIL+=("No proof-lock samples. The run does not count.")
+fi
+
+if (( ${#LATE_FAIL[@]} > 0 )); then
+  for msg in "${LATE_FAIL[@]}"; do
+    echo "late_fail ${msg}"
+  done
+  fail "${LATE_FAIL[0]}"
+fi
 echo "proof_ok"
