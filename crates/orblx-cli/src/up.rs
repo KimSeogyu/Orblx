@@ -723,6 +723,8 @@ fn spawn_deny_refresh(options: &UpOptions) {
         let mut wait_after = Instant::now();
         let mut policy_etag: Option<String> = None;
         let mut policy_after = Instant::now();
+        // W25-16: one waiter keeps one QUIC connection for all policy waits.
+        let mut waiter = orblx_coord::PolicyWaiter::new(coord, &name).ok();
         loop {
             let start = Instant::now();
             let Ok(bundle) = fs::read_to_string(state.join(BUNDLE_FILE)) else {
@@ -730,13 +732,17 @@ fn spawn_deny_refresh(options: &UpOptions) {
                 continue;
             };
             if start >= policy_after {
-                match orblx_coord::fetch_policy_wait_blocking(
-                    coord,
-                    &name,
-                    &bundle,
-                    &state,
-                    policy_etag.as_deref(),
-                ) {
+                let synced = match waiter.as_mut() {
+                    Some(waiter) => waiter.wait(&bundle, &state, policy_etag.as_deref()),
+                    None => orblx_coord::fetch_policy_wait_blocking(
+                        coord,
+                        &name,
+                        &bundle,
+                        &state,
+                        policy_etag.as_deref(),
+                    ),
+                };
+                match synced {
                     Ok(sync) => {
                         if policy_etag.as_deref() != Some(sync.etag.as_str()) {
                             apply_policy_sync(&state, &sync, policy_etag.is_some());
