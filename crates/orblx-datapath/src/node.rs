@@ -368,6 +368,13 @@ fn write_status(path: &Path, text: &str) {
 struct NodeCounters {
     tx: AtomicU64,
     rx: AtomicU64,
+    /// Sessions and frames that the identity, ticket, or deny check refused (W25-38).
+    refused: AtomicU64,
+}
+
+/// True when the identity, the ticket, or the deny check refused a session or a frame.
+fn is_refusal(err: &HelloError) -> bool {
+    matches!(err, HelloError::Identity(_) | HelloError::Ticket(_))
 }
 
 #[derive(Clone)]
@@ -696,6 +703,7 @@ async fn run_mesh_inner(
     let counters = Arc::new(NodeCounters {
         tx: AtomicU64::new(0),
         rx: AtomicU64::new(0),
+        refused: AtomicU64::new(0),
     });
 
     let tun_shutdown = shutdown_rx.clone();
@@ -764,7 +772,7 @@ async fn run_mesh_inner(
                 .count();
             let sessions = u64::try_from(sessions).unwrap_or(u64::MAX);
             format!(
-                "{}{}{}",
+                "{}{}{}{}",
                 orblx_audit::sample_line(
                     "orblx_node_packets_tx",
                     "counter",
@@ -776,6 +784,11 @@ async fn run_mesh_inner(
                     metrics_counters.rx.load(Ordering::Relaxed)
                 ),
                 orblx_audit::sample_line("orblx_node_sessions", "gauge", sessions),
+                orblx_audit::sample_line(
+                    "orblx_node_refused",
+                    "counter",
+                    metrics_counters.refused.load(Ordering::Relaxed)
+                ),
             )
         }) {
             Ok(bound) => println!("metrics {bound}"),
@@ -1393,7 +1406,12 @@ async fn accept_loop(mut mesh: Mesh) {
                     // The error is for one connection only. The next accept waits for a new
                     // connection, so the loop does not spin. A pause here would delay each
                     // connection behind it, for example after a peer stops its extra dial attempts.
-                    Err(err) => eprintln!("The node did not accept a peer. {err}"),
+                    Err(err) => {
+                        if is_refusal(&err) {
+                            mesh.counters.refused.fetch_add(1, Ordering::Relaxed);
+                        }
+                        eprintln!("The node did not accept a peer. {err}");
+                    }
                 }
             }
         }
@@ -1981,6 +1999,9 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                         tr!("{label} rx_end");
                     }
                     Err(err) => {
+                        if is_refusal(&err) {
+                            counters.refused.fetch_add(1, Ordering::Relaxed);
+                        }
                         tr!("{label} session_end reason=recv_err {err}");
                         return;
                     }

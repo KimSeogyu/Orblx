@@ -9,11 +9,6 @@ Marks: **[C]** = shown in the container proof. **REAL** = shown on real hosts.
 The results in this file come from `cargo test` only. This change has no [C] result and no REAL result yet.
 The [C] proof `scripts/proof/w25-38-deny-damage.sh` is ready. Run it on the merge commit.
 
-## Release note
-
-The enroll reply now has the deny list of the node. A node of this version does not enroll with an older coordinator.
-**Upgrade the coordinator and all nodes together.**
-
 ## Rules on the node
 
 | State of `deny.json` | Node enrolled (`node-name` exists) | Node never enrolled |
@@ -49,9 +44,21 @@ Each long-running reader (SSH server, file receiver, datapath) keeps one `DenyCa
 4. A valid file with a lower version does not change the set. A stale set stays stale. So a damaged file followed by an old file cannot move the list back.
 5. The reader never uses an empty set in place of a bad file. An empty set comes only from "missing, never enrolled".
 
+### What makes the datapath deny set stale
+
+Only a local read, parse, or check failure of `deny.json` makes the set stale. The age of a valid list never makes it stale. No deny code reads a clock.
+
+- `crates/orblx-identity/src/deny_file.rs:243` `DenyCache::stale` is the only function that marks a reader set stale. It calls `DenySet::mark_stale` (`crates/orblx-identity/src/deny.rs:72`).
+- `crates/orblx-identity/src/deny_file.rs:224` calls it when `read_deny_file` fails (cannot read, or missing after enroll).
+- `crates/orblx-identity/src/deny_file.rs:239` calls it when `DenySet::apply_json` refuses the text (not valid JSON, unknown fields, or a value that is not valid).
+- The datapath calls `DenyCache::reload` each 100 ms (`crates/orblx-datapath/src/node.rs:807-850`). A failed blocking read task also counts as "cannot read".
+
+The coordinator being offline does not change `deny.json`. The deny refresh of `orblx up` writes the file only after a good fetch. So a valid list stays current for as long as the coordinator is offline.
+The "stale" path kind in `orblx status` (`crates/orblx-datapath/src/node.rs:60-63`) is a different thing. It shows that a peer sent no frame in the last 2 s. It does not gate frames and does not touch the deny set.
+
 ## Write
 
-`orblx_identity::store_deny_file` is the only node writer. `orblx up`, `orblx ping --coord`, and enroll use it.
+`orblx_identity::store_deny_file` is the only node writer. `orblx up`, `orblx ping --coord`, and the first deny fetch after enroll use it.
 
 1. It parses the text. It refuses text that is not a valid deny document and keeps the old file.
 2. It does not write when the text is the same as the file (`DenyStore::Same`).
@@ -66,15 +73,33 @@ The callers do not ignore the result. `orblx up` prints each error and each `Kep
 A crash before the rename leaves the temp file and the old `deny.json`. The reader uses the old file.
 A crash before the first rename after enroll leaves no `deny.json`. The reader refuses.
 
-## Enroll
+## Enroll: refuse-all until the first mutual TLS deny fetch
 
-The coordinator puts the deny list of the node in the `detail` field of the enroll reply.
+The enroll reply has no deny list. Enroll is not mutual TLS, because the node has no certificate before enroll. So the node takes its deny list only from a mutual TLS request with its new SVID.
 
-- The list comes only on the enroll connection to the coordinator. The node verifies the coordinator certificate with the trust bundle. Enroll is not mutual TLS, because the node has no certificate before enroll. There is no new key and no new crypto. The list is not signed (W25-37).
-- `write_state` writes the list with `store_deny_file`, so the version rule above applies.
-- A coordinator before this change sends no list. The enroll then fails with:
-  `Version mismatch: the coordinator did not send a deny list at enroll. Upgrade the coordinator and all nodes together.`
-- A list that is not valid fails the enroll.
+1. `write_state` writes `node-name`. From this point, `deny.json` is "missing after enroll", and each reader refuses each peer.
+2. Right after `write_state`, `orblx coord enroll` and `orblx login` call `orblx_coord::fetch_first_deny_blocking`. It opens a new mutual TLS connection with the new SVID, sends the `deny` request, and writes the reply with `store_deny_file`. There is no wait for a poll tick.
+3. The command prints `deny_list ready_ms N`. N is the refuse-all window, from before `write_state` to the first valid `deny.json`.
+4. When the fetch fails (for example, the coordinator is not reachable), the command prints this error and `deny_list pending`, and the enroll stays done:
+   `The node is enrolled, but it did not get its deny list from the coordinator. <error> The node refuses SSH logins, file receive, new sessions, and ping until it gets the list. `orblx up` gets the list when the coordinator is reachable.`
+5. The node then stays refuse-all. The deny refresh of `orblx up` tries `policy-wait`, then `deny-wait`, then a `deny` fetch each 500 ms. Each fetch has a limit of 10 s (`DENY_FETCH_LIMIT`), so a stopped coordinator does not hold a fetch for the QUIC idle timeout (60 s). When the coordinator comes back, the node gets the list with no manual step.
+
+This change needs no coordinator change. The `deny` request exists since W25-2. A node of this version enrolls with an older coordinator.
+
+### Refuse-all window (`cargo test`, debug build, local coordinator)
+
+`w25_38_enroll_test::w25_38_refuse_all_window_after_enroll_is_two_seconds_or_less`, 10 enrolls, gate 2000 ms or less:
+
+| Run | Values (ms) | Max (ms) |
+|---|---|---|
+| 1 | 173, 208, 182, 210, 265, 200, 205, 180, 172, 171 | 265 |
+
+The [C] proof gate 4 measures the same window with the release binary in containers.
+
+### Coordinator not reachable after enroll (`cargo test`)
+
+- `w25_38_enroll_test::w25_38_unreachable_coordinator_after_enroll_keeps_the_node_refuse_all`: the first fetch fails after the 10 s limit (10002 ms), and each reader still refuses.
+- `up::tests::w25_38_node_recovers_its_deny_list_when_the_coordinator_comes_back_after_enroll`: the node is refuse-all with no coordinator. The deny refresh of `orblx up` runs. The coordinator starts on the same address. The node gets the valid list in 1079 ms with no manual step. The revoked peer is refused and the good peer is accepted.
 
 ## Gate tests (`cargo test`)
 
@@ -100,9 +125,10 @@ The coordinator puts the deny list of the node in the `detail` field of the enro
 | New QUIC sessions (4 kinds), valid file traffic | `hello_tests::w25_38_new_quic_sessions_refuse_when_the_deny_file_is_corrupt_truncated_missing_or_unreadable` | pass |
 | `orblx up` start (4 kinds) | `up::tests::w25_38_new_sessions_refuse_when_the_deny_file_is_corrupt_truncated_missing_or_unreadable` | pass |
 | Ping (4 kinds) | `ping::tests::w25_38_ping_refuses_when_the_deny_file_is_corrupt_truncated_missing_or_unreadable` | pass |
-| Enroll list never moves back | `w25_38_enroll_test::w25_38_enroll_deny_list_never_moves_back` | pass |
-| Old coordinator: version mismatch | `w25_38_enroll_test::w25_38_enroll_with_an_old_coordinator_fails_closed_with_version_mismatch` | pass |
-| Enroll writes `deny.json` | `tests::two_nodes_keep_ips_after_restart` (orblx-coord) | pass |
+| After enroll, each reader refuses until the first mutual TLS fetch; then the valid list is used | `w25_38_enroll_test::w25_38_after_enroll_every_reader_refuses_until_the_first_mtls_deny_fetch` | pass |
+| Refuse-all window, 10 enrolls, 2000 ms or less | `w25_38_enroll_test::w25_38_refuse_all_window_after_enroll_is_two_seconds_or_less` | pass |
+| Coordinator not reachable after enroll: refuse-all, clear error | `w25_38_enroll_test::w25_38_unreachable_coordinator_after_enroll_keeps_the_node_refuse_all` | pass |
+| Coordinator comes back: recovery with no manual step | `up::tests::w25_38_node_recovers_its_deny_list_when_the_coordinator_comes_back_after_enroll` | pass |
 | renew_test (assertions not changed) | `renew_test::*` | pass |
 
 Each 4-kind test uses corrupt, truncated, missing after enroll, and unreadable (a directory in place of the file), and counts 0 accepted.
@@ -113,14 +139,16 @@ Each 4-kind test uses corrupt, truncated, missing after enroll, and unreadable (
 
 1. Nodes a, b, and c enroll. With a valid `deny.json` on b, a and c can SSH to b and ping b.
 2. The owner revokes a. a is refused. c is still accepted (traffic with a valid file does not change).
-3. The coordinator stops, so b cannot get a new list. For each kind (corrupt, truncated, missing, unreadable), the proof takes `ORBLX_DENY_SAMPLES` (default 3) samples. Each sample is one SSH login and one ping from a to b. Each must be refused. The proof checks that the file is still damaged and that b still runs.
-4. The coordinator starts again. b gets a valid list. c is accepted again and a is still refused.
+3. Gate 3 (merge blocker): the coordinator stops for `ORBLX_DENY_OFFLINE_SECS` (default 600 s) and `deny.json` on b stays valid. Node a stops, so its dial attempts do not count. c sends ICMP to the overlay IP of b each 0.5 s, and each 30 s c makes one SSH login and one `orblx ping` (a new QUIC session) to b. Pass: 0 ICMP loss, each probe accepted, the b counter `orblx_node_refused` (new in this change: sessions and frames that the identity, ticket, or deny check refused) does not change, no new deny file error in the b log, and the same valid deny version. The proof prints `summary w25_38_gate3 ... refused_frames 0`.
+4. The coordinator stays stopped, so b cannot get a new list. For each kind (corrupt, truncated, missing, unreadable), the proof takes `ORBLX_DENY_SAMPLES` (default 3) samples. Each sample is one SSH login and one ping from a to b. Each must be refused. The proof checks that the file is still damaged and that b still runs.
+5. The coordinator starts again. b gets a valid list. c is accepted again and a is still refused.
+6. Gate 4: `ORBLX_DENY_WINDOW_ENROLLS` (default 10) more enrolls. Each prints `deny_list ready_ms N`. Each N must be 2000 ms or less. The proof prints `summary w25_38_window ... over 0`.
 
 Pass: `summary ... samples N accepted 0 unknown 0` with N >= 1, then `proof_ok`, and a `proof_contention` line with `unknown_samples 0`.
 
 ## Known limits
 
-- The coordinator writes its own `deny.json` with temp file, `fsync`, and rename, but without a directory `fsync`. This item does not change it.
-- A crash can leave `.deny.json.tmp.*` files. The reader ignores them.
+- The coordinator writes its own `deny.json` with temp file, `fsync`, and rename, but without a directory `fsync`. This item does not change it. The directory `fsync` on the coordinator moves to W25-37 (deny signing).
+- A crash can leave `.deny.json.tmp.*` files on the node. The reader ignores them. This item does not remove them.
 - A stale set also stops open SSH sessions and datapath frames. The datapath does not close the open links when the set goes stale, but it refuses each frame.
-- Enroll uses server-verified TLS with the trust bundle, not mutual TLS.
+- After enroll, the node refuses each peer until its first deny fetch over mutual TLS. When the coordinator is not reachable, this time has no upper limit. The node does not use a list from the enroll reply.

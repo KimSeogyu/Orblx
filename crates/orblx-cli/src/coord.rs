@@ -218,9 +218,19 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
                 }
             }
             .map_err(|err| err.to_string())?;
+            let start = std::time::Instant::now();
             result.write_state(&state).map_err(|err| err.to_string())?;
+            let first = first_deny(
+                coord,
+                &coord_name,
+                &bundle_pem,
+                &state,
+                &result.first_deny,
+                start,
+            );
             remember_coord(&state, coord, &coord_name)?;
             print_enrolled(&result);
+            print_first_deny(&first);
             Ok(())
         }
         Command::Advertise {
@@ -702,6 +712,52 @@ A waiting or rejected user gets no SVID.
 --wait-approval SECS tries the enroll again each 250 ms while the user waits, up to SECS (1 to 3600).
 "
     .to_string()
+}
+
+/// Check the first deny list after enroll (W25-38).
+///
+/// The enroll reply has no deny list. The enroll client fetches the list over mutual TLS
+/// with the new SVID right after the reply, and `write_state` writes it last. When that
+/// fetch failed, this function tries one more fetch from the state directory. Until
+/// `deny.json` is valid, each reader of the node refuses each peer. `start` is the time
+/// before `write_state`. The result is the refuse-all window (from the SVID to a valid
+/// `deny.json`), or the error text.
+pub(crate) fn first_deny(
+    coord: std::net::SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state: &std::path::Path,
+    first: &orblx_coord::FirstDeny,
+    start: std::time::Instant,
+) -> Result<std::time::Duration, String> {
+    let begin = match first {
+        orblx_coord::FirstDeny::Fetched { cert_at, .. } => return Ok(cert_at.elapsed()),
+        orblx_coord::FirstDeny::Failed { cert_at, .. } => *cert_at,
+        orblx_coord::FirstDeny::NotFetched => start,
+    };
+    match orblx_coord::fetch_first_deny_blocking(coord, coord_name, bundle_pem, state) {
+        Ok(_) => Ok(begin.elapsed()),
+        Err(err) => Err(match first {
+            orblx_coord::FirstDeny::Failed { error, .. } => format!("{error} {err}"),
+            _ => err.to_string(),
+        }),
+    }
+}
+
+/// Print the result of [`first_deny`]. A failure does not stop enroll: the node is
+/// enrolled, refuses each peer, and `orblx up` fetches the deny list again.
+pub(crate) fn print_first_deny(first: &Result<std::time::Duration, String>) {
+    match first {
+        Ok(window) => println!("deny_list ready_ms {}", window.as_millis()),
+        Err(err) => {
+            eprintln!(
+                "The node is enrolled, but it did not get its deny list from the coordinator. {err} \
+The node refuses SSH logins, file receive, new sessions, and ping until it gets the list. \
+`orblx up` gets the list when the coordinator is reachable."
+            );
+            println!("deny_list pending");
+        }
+    }
 }
 
 #[cfg(test)]

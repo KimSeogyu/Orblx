@@ -1,14 +1,17 @@
-//! W25-38: the enroll reply has the deny list of the node.
+//! W25-38: the enroll reply has no deny list. The node refuses each peer after enroll
+//! until its first deny fetch over mutual TLS with the new node SVID. The enroll client
+//! starts that fetch right after it gets the SVID.
 
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
-use orblx_identity::{load_deny_file, DenySet, DENY_FILE};
+use orblx_identity::{
+    load_deny_file, DenyCache, DenyFileError, DenyReload, DenyStore, SpiffeId, DENY_FILE,
+};
 
-use crate::proto::{self, Request};
-use crate::state::{Coordinator, OidcConfig};
+use crate::state::{Coordinator, EnrollResult, FirstDeny, OidcConfig};
 
 struct Scratch(PathBuf);
 
@@ -30,114 +33,151 @@ impl Drop for Scratch {
     }
 }
 
-fn deny_text(version: u64) -> String {
-    format!(
-        r#"{{"version":{version},"generated_at":1,"revoked_uris":["spiffe://orblx.local/node/old"],"revoked_ticket_nonces":[]}}"#
+async fn enroll(coord: &Coordinator, addr: SocketAddr, bundle: &str, name: &str) -> EnrollResult {
+    let token = coord.create_token(Duration::from_secs(600)).unwrap();
+    crate::client::enroll_with_token(
+        addr,
+        "coord",
+        bundle,
+        name,
+        &token.secret,
+        &[format!("{name}:443")],
+        &[],
     )
+    .await
+    .unwrap()
 }
 
-/// The deny list of an enroll reply uses the same version rule as a deny reload.
-/// The list in `deny.json` never moves back.
+async fn first_fetch(
+    addr: SocketAddr,
+    bundle: &str,
+    dir: &Path,
+) -> Result<DenyStore, crate::CoordError> {
+    let bundle = bundle.to_string();
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::client::fetch_first_deny_blocking(addr, "coord", &bundle, &dir)
+    })
+    .await
+    .unwrap()
+}
+
+/// Each reader of the node (SSH login and recheck, file receive, the datapath, `orblx up`,
+/// and `orblx ping`) reads `deny.json` with `read_deny_file` (through `DenyCache` or
+/// `load_deny_file`). The test checks both paths.
+fn assert_refuses_each_peer(dir: &Path, peers: &[&SpiffeId]) {
+    assert!(matches!(
+        load_deny_file(dir),
+        Err(DenyFileError::MissingAfterEnroll(_))
+    ));
+    let mut cache = DenyCache::new();
+    assert!(matches!(cache.reload(dir), DenyReload::Stale { .. }));
+    for peer in peers {
+        assert!(cache.set().reject_uri(peer).is_err(), "{}", peer.as_uri());
+    }
+    assert!(cache.set().reject_nonce(&[7u8; 16]).is_err());
+}
+
+/// After enroll and before the first mutual TLS deny fetch, each reader refuses. After the
+/// fetch, the readers use the valid list of the coordinator.
 #[tokio::test]
-async fn w25_38_enroll_deny_list_never_moves_back() {
+async fn w25_38_after_enroll_every_reader_refuses_until_the_first_mtls_deny_fetch() {
     let scratch = Scratch::new();
-    let node = Scratch::new();
     let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
-    let token = coord.create_token(Duration::from_secs(600)).unwrap();
     let (addr, handle) = crate::server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .await
         .unwrap();
     let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
-    let result = crate::client::enroll_with_token(
-        addr,
-        "coord",
-        &bundle,
-        "seq-a",
-        &token.secret,
-        &["seq-a:443".to_string()],
-        &[],
-    )
-    .await
-    .unwrap();
-    handle.abort();
-    let sent = result
-        .deny
-        .clone()
-        .expect("the enroll reply has a deny list");
-    let sent_version = DenySet::from_json(sent.as_bytes())
-        .unwrap()
-        .version()
-        .unwrap();
+    let _ = enroll(&coord, addr, &bundle, "revoked-a").await;
+    let _ = enroll(&coord, addr, &bundle, "good-b").await;
+    crate::admin::revoke(&coord, "revoked-a", "test", SystemTime::now()).unwrap();
+    let revoked = SpiffeId::node("revoked-a").unwrap();
+    let good = SpiffeId::node("good-b").unwrap();
 
+    let node = Scratch::new();
+    let mut result = enroll(&coord, addr, &bundle, "new-c").await;
+    // The enroll client fetched the list over mutual TLS right after the enroll reply.
+    let FirstDeny::Fetched { text, .. } = &result.first_deny else {
+        panic!("no first deny fetch: {:?}", result.first_deny);
+    };
+    assert!(text.contains(revoked.as_uri()));
+    // The state between the enroll reply and the first fetch: no deny list.
+    result.first_deny = FirstDeny::NotFetched;
     result.write_state(&node.0).unwrap();
-    assert_eq!(fs::read_to_string(node.0.join(DENY_FILE)).unwrap(), sent);
+    assert!(!node.0.join(DENY_FILE).exists(), "enroll wrote a deny file");
+    assert_refuses_each_peer(&node.0, &[&revoked, &good]);
 
-    // The node already has a higher version. The enroll list does not replace it.
-    let newer = deny_text(sent_version + 100);
-    fs::write(node.0.join(DENY_FILE), &newer).unwrap();
-    result.write_state(&node.0).unwrap();
-    assert_eq!(fs::read_to_string(node.0.join(DENY_FILE)).unwrap(), newer);
     assert_eq!(
-        load_deny_file(&node.0).unwrap().version(),
-        Some(sent_version + 100)
+        first_fetch(addr, &bundle, &node.0).await.unwrap(),
+        DenyStore::Written
     );
-
-    // A deny file that is not valid does not block the enroll list.
-    fs::write(node.0.join(DENY_FILE), b"not json {").unwrap();
-    result.write_state(&node.0).unwrap();
-    assert_eq!(fs::read_to_string(node.0.join(DENY_FILE)).unwrap(), sent);
+    let deny = load_deny_file(&node.0).unwrap();
+    assert!(!deny.refuses_all());
+    assert!(deny.version().is_some());
+    assert!(deny.reject_uri(&revoked).is_err());
+    assert!(deny.reject_uri(&good).is_ok());
+    let mut cache = DenyCache::new();
+    assert_eq!(cache.reload(&node.0), DenyReload::Changed);
+    assert!(cache.set().reject_uri(&revoked).is_err());
+    assert!(cache.set().reject_uri(&good).is_ok());
+    handle.abort();
 }
 
-/// A new node and a coordinator before W25-38: the enroll reply has no deny list.
-/// The enroll fails closed with a version mismatch error.
+/// The refuse-all window from enroll (`node-name` written) to the first valid deny list.
+/// Gate: each of 10 enrolls is 2 s or less.
 #[tokio::test]
-async fn w25_38_enroll_with_an_old_coordinator_fails_closed_with_version_mismatch() {
+async fn w25_38_refuse_all_window_after_enroll_is_two_seconds_or_less() {
     let scratch = Scratch::new();
     let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
-    let token = coord.create_token(Duration::from_secs(600)).unwrap();
-    let material = coord.tls_material().unwrap();
-    let endpoint =
-        crate::tlsutil::server_endpoint(&material, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .unwrap();
-    let addr = endpoint.local_addr().unwrap();
-    let old = coord.clone();
-    let server = tokio::spawn(async move {
-        let connection = endpoint.accept().await.unwrap().await.unwrap();
-        let (mut send, mut recv) = connection.accept_bi().await.unwrap();
-        let request: Request = proto::read_json(&mut recv).await.unwrap();
-        let result = old
-            .enroll_token(
-                &request.name,
-                request.token.as_deref().unwrap(),
-                &request.endpoints,
-                &request.routes,
-                SystemTime::now(),
-            )
-            .unwrap();
-        // The enroll reply of a coordinator before W25-38: no deny list.
-        let reply = crate::server::leaf_response(result);
-        assert!(reply.detail.is_none());
-        proto::write_json(&mut send, &reply).await.unwrap();
-        let _ = send.finish();
-        let _ = tokio::time::timeout(Duration::from_secs(5), connection.closed()).await;
-    });
+    let (addr, handle) = crate::server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
     let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
-    let err = crate::client::enroll_with_token(
-        addr,
-        "coord",
-        &bundle,
-        "old-a",
-        &token.secret,
-        &["old-a:443".to_string()],
-        &[],
-    )
-    .await
-    .unwrap_err()
-    .to_string();
-    server.await.unwrap();
-    assert!(err.contains("Version mismatch"), "{err}");
+    let mut windows = Vec::new();
+    for i in 0..10 {
+        let node = Scratch::new();
+        let result = enroll(&coord, addr, &bundle, &format!("win-{i}")).await;
+        result.write_state(&node.0).unwrap();
+        let FirstDeny::Fetched { cert_at, .. } = &result.first_deny else {
+            panic!("no first deny fetch: {:?}", result.first_deny);
+        };
+        // From the SVID to a valid deny.json on disk.
+        let ms = cert_at.elapsed().as_millis();
+        assert!(!load_deny_file(&node.0).unwrap().refuses_all());
+        println!("w25_38_refuse_all_window enroll {i} ms {ms}");
+        windows.push(ms);
+    }
+    handle.abort();
+    println!("w25_38_refuse_all_window all_ms {windows:?}");
+    assert!(windows.iter().all(|ms| *ms <= 2000), "{windows:?}");
+}
+
+/// The coordinator is not reachable after enroll: the first fetch fails with a clear error
+/// and the node stays refuse-all.
+#[tokio::test]
+async fn w25_38_unreachable_coordinator_after_enroll_keeps_the_node_refuse_all() {
+    let scratch = Scratch::new();
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    let (addr, handle) = crate::server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+    let node = Scratch::new();
+    let mut result = enroll(&coord, addr, &bundle, "lost-d").await;
+    handle.abort();
+    let _ = handle.await;
+    result.first_deny = FirstDeny::NotFetched;
+    result.write_state(&node.0).unwrap();
+    let start = Instant::now();
+    let err = first_fetch(addr, &bundle, &node.0).await.unwrap_err();
+    let spent = start.elapsed();
+    println!("w25_38_unreachable ms {} error {err}", spent.as_millis());
     assert!(
-        err.contains("Upgrade the coordinator and all nodes together."),
-        "{err}"
+        spent <= crate::client::DENY_FETCH_LIMIT + Duration::from_secs(5),
+        "{spent:?}"
     );
+    assert!(err.to_string().contains("coordinator"), "{err}");
+    assert!(!node.0.join(DENY_FILE).exists());
+    let peer = SpiffeId::node("any-e").unwrap();
+    assert_refuses_each_peer(&node.0, &[&peer]);
 }

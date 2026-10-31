@@ -1723,6 +1723,109 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// W25-38: the coordinator is not reachable after enroll. The first deny fetch fails
+    /// with a clear error and the node refuses each peer. When the coordinator comes back,
+    /// the deny refresh of `orblx up` gets the list with no manual step.
+    #[test]
+    fn w25_38_node_recovers_its_deny_list_when_the_coordinator_comes_back_after_enroll() {
+        use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+        use std::time::{Duration, Instant, SystemTime};
+
+        let root = std::env::temp_dir().join(format!(
+            "orblx-w25-38-recover-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let coord_dir = root.join("coord");
+        let node = root.join("node");
+        fs::create_dir_all(&coord_dir).unwrap();
+        let coord =
+            orblx_coord::Coordinator::open(&coord_dir, "coord", orblx_coord::OidcConfig::TokenOnly)
+                .unwrap();
+        let now = SystemTime::now();
+        let token = coord.create_token(Duration::from_secs(600)).unwrap();
+        let _ = coord
+            .enroll_token(
+                "gone-a",
+                &token.secret,
+                &["gone-a:443".to_string()],
+                &[],
+                now,
+            )
+            .unwrap();
+        orblx_coord::revoke_all(&coord, "gone-a", "test", now).unwrap();
+        let token = coord.create_token(Duration::from_secs(600)).unwrap();
+        let result = coord
+            .enroll_token(
+                "late-b",
+                &token.secret,
+                &["late-b:443".to_string()],
+                &[],
+                now,
+            )
+            .unwrap();
+        // A free port with no coordinator on it.
+        let addr: SocketAddr = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let start = Instant::now();
+        result.write_state(&node).unwrap();
+        let bundle = fs::read_to_string(node.join(super::BUNDLE_FILE)).unwrap();
+        let first =
+            crate::coord::first_deny(addr, "coord", &bundle, &node, &result.first_deny, start);
+        let err = first.unwrap_err();
+        println!("w25_38_first_deny_error {err}");
+        assert!(err.contains("coordinator"), "{err}");
+        let gone = orblx_identity::SpiffeId::node("gone-a").unwrap();
+        let config = super::load_config(&node).unwrap();
+        assert!(config.deny.refuses_all());
+        assert!(config.deny.reject_uri(&gone).is_err());
+
+        let options = match parse_up(&[
+            "--state-dir".to_string(),
+            node.to_string_lossy().to_string(),
+            "--coord".to_string(),
+            addr.to_string(),
+            "--coord-name".to_string(),
+            "coord".to_string(),
+            "--metrics".to_string(),
+            "off".to_string(),
+        ])
+        .unwrap()
+        {
+            Command::Up(options) => options,
+            _ => panic!("not up"),
+        };
+        super::spawn_deny_refresh(&options);
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(super::load_config(&node).unwrap().deny.refuses_all());
+
+        let back = Instant::now();
+        let serve = coord.clone();
+        std::thread::spawn(move || {
+            let _ = orblx_coord::serve_blocking(&serve, addr);
+        });
+        let limit = Duration::from_secs(120);
+        loop {
+            let config = super::load_config(&node).unwrap();
+            if !config.deny.refuses_all() {
+                assert!(config.deny.reject_uri(&gone).is_err());
+                let good = orblx_identity::SpiffeId::node("late-b").unwrap();
+                assert!(config.deny.reject_uri(&good).is_ok());
+                break;
+            }
+            assert!(back.elapsed() < limit, "no recovery in {limit:?}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        println!("w25_38_recovery_ms {}", back.elapsed().as_millis());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn node_issue_writes_a_user_svid_and_one_agent_ticket() {
         let dir = std::env::temp_dir().join(format!("orblx-w19-issue-{}", std::process::id()));

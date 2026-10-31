@@ -5,13 +5,23 @@
 #
 # Gate 0: with a valid deny.json on b, c can SSH to b and ping b (the traffic does not
 #   change), and a is refused after `admin revoke-all a`.
-# Gate 1: the coordinator stops, so b cannot get a new deny list. For each damage kind
+# Gate 3 (W25-38 merge blocker): the coordinator stops for OFFLINE_SECS (default 600 s)
+#   and deny.json on b stays valid. A valid list never goes stale with age. During the
+#   whole time, c sends ICMP to b over the mesh with no loss, and each probe (orblx ping,
+#   a new QUIC session, and an SSH login) from c to b is accepted. The counter
+#   orblx_node_refused of b does not change (0 refused sessions and frames).
+#   Node a (revoked) stops during gate 3, so its dial attempts do not change the counter.
+# Gate 1: the coordinator stays stopped, so b cannot get a new deny list. For each damage kind
 #   (corrupt, truncated, missing, unreadable), the proof takes SAMPLES samples. Each sample
 #   is one SSH login and one ping (a new QUIC session) from a to b. Each must be refused.
 #   The file on b must still be damaged after the samples.
 #   With a fallback to an empty deny list, a would be accepted.
 # Gate 2: the coordinator starts again. b gets a valid deny.json again. c can SSH to b
 #   again, and a is still refused.
+# Gate 4: the refuse-all window after enroll. The enroll reply has no deny list, and the
+#   node fetches its first deny list over mutual TLS right after enroll. `orblx coord
+#   enroll` prints `deny_list ready_ms N`. WINDOW_ENROLLS (default 10) more enrolls run,
+#   and each window must be 2000 ms or less.
 #
 # Result rules: accepted 0, unknown 0, and samples >= 1 for each kind.
 # The proof takes the box proof lock (proof-lock.sh). The proof_contention line must
@@ -30,12 +40,23 @@ export COORD_ADDR="127.0.0.1:443"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 PROFILE="${ORBLX_PROOF_PROFILE:-release}"
 SAMPLES="${ORBLX_DENY_SAMPLES:-3}"
+OFFLINE_SECS="${ORBLX_DENY_OFFLINE_SECS:-600}"
+WINDOW_ENROLLS="${ORBLX_DENY_WINDOW_ENROLLS:-10}"
+WINDOW_MAX_MS=2000
 STATE=/var/lib/orblx
 DENY="$STATE/deny.json"
 KINDS="corrupt truncated missing unreadable"
 
 if ! [[ "$SAMPLES" =~ ^[0-9]+$ ]] || [[ "$SAMPLES" -lt 1 ]]; then
   echo "ORBLX_DENY_SAMPLES must be 1 or more." >&2
+  exit 2
+fi
+if ! [[ "$OFFLINE_SECS" =~ ^[0-9]+$ ]] || [[ "$OFFLINE_SECS" -lt 60 ]]; then
+  echo "ORBLX_DENY_OFFLINE_SECS must be 60 or more." >&2
+  exit 2
+fi
+if ! [[ "$WINDOW_ENROLLS" =~ ^[0-9]+$ ]] || [[ "$WINDOW_ENROLLS" -lt 1 ]]; then
+  echo "ORBLX_DENY_WINDOW_ENROLLS must be 1 or more." >&2
   exit 2
 fi
 
@@ -133,8 +154,19 @@ owner() {
   run_node owner admin "$@" --coord "${coord_ip}:443" --state "$STATE" --bundle "$STATE/bundle.pem"
 }
 
+# Print the refuse-all window of one enroll output file, or "pending".
+window_of() {
+  local out="$1"
+  if grep -q '^deny_list pending' "$out"; then
+    echo pending
+    return
+  fi
+  read_all awk '/^deny_list ready_ms /{print $3; exit}' <"$out"
+}
+
 enroll_node() {
   local name="$1"
+  local out="$WORK/enroll-${name}.out"
   echo "=== [C] enroll ${name} ==="
   run_node "$name" \
     coord enroll \
@@ -143,7 +175,20 @@ enroll_node() {
     --bundle /coord-state/trust-bundle.pem \
     --token-file "/coord-state/tokens/${name}" \
     --state "$STATE" \
-    --endpoint "${name}:443"
+    --endpoint "${name}:443" >"$out" 2>&1
+  grep -E '^(enrolled|name |overlay_ip |deny_list )' "$out"
+  echo "enroll ${name} deny_window_ms $(window_of "$out")"
+}
+
+# Print the orblx_node_refused counter of node b.
+refused_count() {
+  dc exec -T b curl -fsS "http://127.0.0.1:9464/metrics" \
+    | read_all awk '/^orblx_node_refused /{print $2; exit}' | tr -d '\r\n '
+}
+
+# Print the count of deny file error lines in the log of node b.
+deny_error_lines() {
+  { dc logs b 2>&1 || true; } | read_all grep -c 'The deny file' || true
 }
 
 ssh_cmd() {
@@ -301,8 +346,72 @@ expect "ssh c after revoke (valid file)" accepted "$(ssh_try c)"
 expect "ping c after revoke (valid file)" accepted "$(ping_try c)"
 dc exec -T b cp "$DENY" /tmp/deny.good
 
-echo "=== [C] gate 1: stop the coordinator, so b cannot get a new deny list ==="
+echo "=== [C] gate 3: coordinator offline ${OFFLINE_SECS} s, valid deny.json, mesh traffic ==="
+b_overlay="$(read_all awk '/^overlay_ip /{print $2; exit}' <"$WORK/enroll-b.out")"
+if [[ -z "$b_overlay" ]]; then
+  echo "The overlay IP of b is not known." >&2
+  exit 1
+fi
+echo "b overlay_ip ${b_overlay}"
+dc stop a >/dev/null
+sleep 2
+refused_before="$(refused_count)"
+errors_before="$(deny_error_lines)"
+version_before="$(dc exec -T b jq -r .version "$DENY" | tr -d '\r\n')"
+echo "gate3 b refused_before ${refused_before} deny_error_lines_before ${errors_before} deny_version ${version_before}"
+[[ -n "$refused_before" ]]
 dc stop coord >/dev/null
+offline_start="$(date +%s)"
+icmp_count=$(( OFFLINE_SECS * 2 ))
+dc exec -T c ping -n -i 0.5 -W 2 -c "$icmp_count" "$b_overlay" >"$WORK/gate3-icmp.out" 2>&1 &
+icmp_pid=$!
+g3_probes=0
+g3_accepted=0
+g3_unknown=0
+while (( $(date +%s) - offline_start < OFFLINE_SECS - 20 )); do
+  for probe in ssh ping; do
+    if [[ "$probe" == ssh ]]; then
+      got="$(ssh_try c)"
+    else
+      got="$(ping_try c)"
+    fi
+    g3_probes=$(( g3_probes + 1 ))
+    case "$got" in
+      accepted) g3_accepted=$(( g3_accepted + 1 )) ;;
+      refused) ;;
+      *) g3_unknown=$(( g3_unknown + 1 )) ;;
+    esac
+    echo "gate3 t $(( $(date +%s) - offline_start )) s probe ${probe} peer c result ${got}"
+  done
+  sleep 30
+done
+icmp_status=0
+wait "$icmp_pid" || icmp_status=$?
+while (( $(date +%s) - offline_start < OFFLINE_SECS )); do
+  sleep 1
+done
+offline_secs_done=$(( $(date +%s) - offline_start ))
+icmp_line="$(grep -E 'packets transmitted' "$WORK/gate3-icmp.out" || true)"
+echo "gate3 icmp ${icmp_line} status ${icmp_status}"
+icmp_tx="$(printf '%s\n' "$icmp_line" | read_all awk '{print $1}')"
+icmp_rx="$(printf '%s\n' "$icmp_line" | read_all awk '{print $4}')"
+refused_after="$(refused_count)"
+errors_after="$(deny_error_lines)"
+g3_state="$(deny_state)"
+version_after="$(dc exec -T b jq -r .version "$DENY" | tr -d '\r\n')"
+g3_refused=$(( refused_after - refused_before ))
+echo "summary w25_38_gate3 offline_s ${offline_secs_done} icmp_tx ${icmp_tx} icmp_rx ${icmp_rx} probes ${g3_probes} accepted ${g3_accepted} unknown ${g3_unknown} refused_frames ${g3_refused} deny_error_lines ${errors_before}->${errors_after} deny_state ${g3_state} deny_version ${version_before}->${version_after}"
+if [[ "$offline_secs_done" -lt "$OFFLINE_SECS" || -z "$icmp_tx" || "$icmp_tx" -lt 1 \
+  || "$icmp_rx" != "$icmp_tx" || "$g3_probes" -lt 2 || "$g3_accepted" -ne "$g3_probes" \
+  || "$g3_unknown" -ne 0 || "$g3_refused" -ne 0 || "$errors_after" != "$errors_before" \
+  || "$g3_state" != valid || "$version_after" != "$version_before" ]]; then
+  echo "The gate 3 (coordinator offline, valid deny.json) failed." >&2
+  exit 1
+fi
+dc start a >/dev/null
+wait_log a 'The TUN device'
+
+echo "=== [C] gate 1: the coordinator stays stopped, so b cannot get a new deny list ==="
 accepted=0
 unknown=0
 total=0
@@ -372,6 +481,39 @@ expect "ssh a after restore" refused "$(ssh_try a)"
 expect "ping a after restore" refused "$(ping_try a)"
 expect "ssh c after restore" accepted "$(ssh_try c)"
 expect "ping c after restore" accepted "$(ping_try c)"
+
+echo "=== [C] gate 4: refuse-all window after enroll, ${WINDOW_ENROLLS} enrolls ==="
+windows=()
+for i in $(seq 1 "$WINDOW_ENROLLS"); do
+  name="w${i}"
+  dc exec -T coord orblx coord token create \
+    --state "$STATE" \
+    --ttl 600 \
+    --out "$STATE/tokens/${name}" >/dev/null
+  # The owner service enrolls into a temp state directory of a new container.
+  run_node owner \
+    coord enroll \
+    --name "$name" \
+    --coord "${coord_ip}:443" \
+    --bundle /coord-state/trust-bundle.pem \
+    --token-file "/coord-state/tokens/${name}" \
+    --state "/tmp/${name}" \
+    --endpoint "${name}:443" >"$WORK/enroll-${name}.out" 2>&1
+  w="$(window_of "$WORK/enroll-${name}.out")"
+  echo "window enroll ${name} deny_window_ms ${w}"
+  windows+=("$w")
+done
+window_bad=0
+for w in "${windows[@]}"; do
+  if ! [[ "$w" =~ ^[0-9]+$ ]] || [[ "$w" -gt "$WINDOW_MAX_MS" ]]; then
+    window_bad=$(( window_bad + 1 ))
+  fi
+done
+echo "summary w25_38_window enrolls ${WINDOW_ENROLLS} ms ${windows[*]} max_ms ${WINDOW_MAX_MS} over ${window_bad}"
+if [[ "$window_bad" -ne 0 ]]; then
+  echo "The refuse-all window gate failed." >&2
+  exit 1
+fi
 
 echo "=== [C] logs hold no key or enroll token ==="
 {
