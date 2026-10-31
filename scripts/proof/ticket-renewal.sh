@@ -17,6 +17,17 @@
 #  8. 0 contended samples while the proof held the lock: the proof-lock sampler saw no
 #     other orblx container, no unknown sample, and no host load1 above TR_LOAD_MAX
 #     (default: the CPU count).
+#  9. Host stall check (W25-26 PO rule). scripts/proof/host-sampler.py writes /proc/stat
+#     steal and iowait and /proc/pressure (cpu, io, memory) deltas every 100 ms. A sample is a
+#     host stall window when steal_ms >= TR_STALL_STEAL_MS, iowait_ms >= TR_STALL_IOWAIT_MS,
+#     cpu some >= TR_STALL_CPU_MS, io full >= TR_STALL_IO_FULL_MS or memory some >=
+#     TR_STALL_MEM_MS (all per 100 ms sample, over all CPUs). Each reply gap above
+#     TR_GAP_MS gets "class host_stall" when a stall window touches the gap, else
+#     "class quiet_host". The gap gate does not change: each gap above TR_GAP_MS fails
+#     the run. When one gap is host_stall, the run is INVALID (not a PASS): it prints
+#     proof_invalid and exits 3. The run gets 1 clean rerun.
+# The nodes run with ORBLX_TRACE_RENEW=1. TR_OUT_DIR keeps the host samples, the ping
+# files and the node trace lines after the run.
 # Gates 3, 4 and 8 do not stop the proof at once. Gates 5, 6 and 7 run first, then the
 # proof fails if one of gates 3, 4 or 8 failed.
 # The proof reads MAX_SKEW and MAX_USER_TTL from clock.rs.
@@ -41,6 +52,19 @@ TR_PING_I="${TR_PING_I:-0.05}"
 TR_REVOKE="${TR_REVOKE:-1}"
 TR_REVOKE_MS="${TR_REVOKE_MS:-1000}"
 TR_BIN="${TR_BIN:-}"
+TR_OUT_DIR="${TR_OUT_DIR:-}"
+# Host stall limits per 100 ms sample. Baseline: 3000 samples (300 s, 15:29:40-15:34:40 KST
+# 2026-10-31, load1 0.7-2.0, 8 CPUs, no proof container of this run). Baseline max: steal
+# 100 ms, iowait 80 ms (both summed over 8 CPUs, 10 ms steps), cpu some 72.7 ms, io full
+# 52.4 ms, memory some 0.8 ms. Limits: steal and iowait 2x the baseline max; cpu some and
+# io full 90 ms (a PSI value cannot pass 100 ms in a 100 ms sample, so 2x is not possible);
+# memory some 10 ms. No baseline sample is at or above a limit.
+TR_STALL_STEAL_MS="${TR_STALL_STEAL_MS:-200}"
+TR_STALL_IOWAIT_MS="${TR_STALL_IOWAIT_MS:-160}"
+TR_STALL_CPU_MS="${TR_STALL_CPU_MS:-90}"
+TR_STALL_IO_FULL_MS="${TR_STALL_IO_FULL_MS:-90}"
+TR_STALL_MEM_MS="${TR_STALL_MEM_MS:-10}"
+SAMPLER_PID=""
 COORD="${TR_NET}.10:443"
 NODES=(owner a b c)
 declare -A NODE_IP=([owner]="${TR_NET}.20" [a]="${TR_NET}.11" [b]="${TR_NET}.12" [c]="${TR_NET}.13")
@@ -59,6 +83,7 @@ cleanup() {
   for pid in "${PING_PIDS[@]}"; do
     kill "$pid" >/dev/null 2>&1 || true
   done
+  [[ -z "$SAMPLER_PID" ]] || kill "$SAMPLER_PID" >/dev/null 2>&1 || true
   if [[ "$status" -ne 0 ]]; then
     echo "---- docker logs, last 80 lines per service (the proof failed) ----"
     dc logs -t --tail 80 2>&1 | sed 's/[A-Za-z0-9_-]\{40,\}/<redacted>/g' || true
@@ -280,6 +305,23 @@ RUN_END=$(( max_e0 + (TR_ENDS - 1) * PERIOD + SKEW + 5 ))
 PING_SECS=$(( RUN_END - $(date +%s) + 3 ))
 echo "renew_period_s ${PERIOD} run_end_unix ${RUN_END} ping_s ${PING_SECS}"
 
+OUTD="${TR_OUT_DIR:-$WORK/out}"
+mkdir -p "$OUTD"
+echo "=== [C] host sampler every 100 ms to ${OUTD}/host-samples.txt ==="
+cg_args=()
+for name in "${NODES[@]}"; do
+  cid="$(dc ps -q "$name")"
+  for d in "/sys/fs/cgroup/docker/${cid}" "/sys/fs/cgroup/system.slice/docker-${cid}.scope"; do
+    if [[ -n "$cid" && -d "$d" ]]; then
+      cg_args+=("${name}=${d}")
+      break
+    fi
+  done
+done
+python3 "$ROOT/scripts/proof/host-sampler.py" --out "$OUTD/host-samples.txt" --interval 0.1 "${cg_args[@]}" &
+SAMPLER_PID="$!"
+echo "host_sampler pid ${SAMPLER_PID} cgroups ${#cg_args[@]}"
+
 echo "=== [C] ping each pair every ${TR_PING_I} s for ${PING_SECS} s ==="
 for src in "${NODES[@]}"; do
   for dst in "${NODES[@]}"; do
@@ -322,6 +364,9 @@ for pid in "${PING_PIDS[@]}"; do
   wait "$pid" || true
 done
 PING_PIDS=()
+kill "$SAMPLER_PID" >/dev/null 2>&1 || true
+wait "$SAMPLER_PID" 2>/dev/null || true
+SAMPLER_PID=""
 check_refusals
 echo "refusals 0"
 echo "status_samples ${samples} lost_peer_samples ${lost}"
@@ -414,11 +459,29 @@ for src in "${NODES[@]}"; do
       [[ -n "$p" ]] || continue
       place="$(printf '%s\n' "$marks" | awk -v a="$p" -v b="$ts" 'NF == 3 && $3 + 0 >= a - 2 && $3 + 0 <= b + 2 {printf "%s%s:%s@%s", (n++ ? "," : ""), $1, $2, $3} END {if (!n) printf "elsewhere"}')"
       echo "big_gap pair ${src}->${dst} from ${p} to ${ts} gap_ms ${d} place ${place}"
+      echo "${src} ${dst} ${p} ${ts} ${d}" >> "$WORK/big-gaps.txt"
       big=$((big + 1))
     done < <(awk -v l="$TR_GAP_MS" '/bytes from/ {ts = $1; gsub(/[\[\]]/, "", ts); if (p != "") {d = (ts - p) * 1000; if (d > l) printf "%s %s %.0f\n", p, ts, d}; p = ts}' "$WORK/ping-${src}-${dst}.txt")
   done
 done
 echo "big_gaps ${big}"
+
+echo "=== gate 9: host stall check for each reply gap above ${TR_GAP_MS} ms ==="
+touch "$WORK/big-gaps.txt"
+: > "$OUTD/traces.txt"
+for name in "${NODES[@]}"; do
+  dc logs --no-log-prefix "$name" 2>&1 | read_all awk -v n="$name" '$1 == "trace" {$1 = n; print}' >> "$OUTD/traces.txt" || true
+done
+cp "$WORK"/ping-*.txt "$WORK/big-gaps.txt" "$OUTD/" 2>/dev/null || true
+host_out="$(python3 "$ROOT/scripts/proof/host-sampler.py" analyze --samples "$OUTD/host-samples.txt" \
+  --gaps "$WORK/big-gaps.txt" --traces "$OUTD/traces.txt" \
+  --steal-ms "$TR_STALL_STEAL_MS" --iowait-ms "$TR_STALL_IOWAIT_MS" --cpu-some-ms "$TR_STALL_CPU_MS" \
+  --io-full-ms "$TR_STALL_IO_FULL_MS" --mem-some-ms "$TR_STALL_MEM_MS")"
+printf '%s\n' "$host_out"
+printf '%s\n' "$host_out" > "$OUTD/host-analysis.txt"
+host_gaps="$(printf '%s\n' "$host_out" | awk '$1 == "gap_class" {print $3}')"
+unknown_gaps="$(printf '%s\n' "$host_out" | awk '$1 == "gap_host" && $NF == "unknown" {n++} END {print n + 0}')"
+[[ -n "$host_gaps" ]] || fail "The host stall check printed no result."
 
 LATE_FAIL=()
 (( lost == 0 )) || LATE_FAIL+=("${lost} status samples show a lost peer.")
@@ -496,10 +559,16 @@ else
   LATE_FAIL+=("No proof-lock samples. The run does not count.")
 fi
 
+(( unknown_gaps == 0 )) || LATE_FAIL+=("${unknown_gaps} reply gaps have no host sample. The run does not count.")
 if (( ${#LATE_FAIL[@]} > 0 )); then
   for msg in "${LATE_FAIL[@]}"; do
     echo "late_fail ${msg}"
   done
+  if (( host_gaps > 0 )); then
+    echo "proof_invalid host_stall_gaps ${host_gaps}: a host stall touches a reply gap. The run is INVALID, not a PASS."
+    echo "FAIL: ${LATE_FAIL[0]}" >&2
+    exit 3
+  fi
   fail "${LATE_FAIL[0]}"
 fi
 echo "proof_ok"

@@ -15,6 +15,9 @@ x-node: &node
     net.ipv4.conf.default.rp_filter: "0"
   depends_on:
     - coord
+  environment:
+    # Node renew trace lines ("trace <epoch_ms> ...") for gate 9 of the proof.
+    ORBLX_TRACE_RENEW: "1"
 
 x-up: &up
   - up
