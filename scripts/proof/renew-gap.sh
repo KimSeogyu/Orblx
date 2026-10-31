@@ -57,7 +57,7 @@ finish() {
   down
   proof_lock_end
 }
-trap finish EXIT
+trap 'finish' EXIT
 
 require_root "$@"
 proof_lock_take "renew-gap:${PROJECT}" "${PROJECT}-"
