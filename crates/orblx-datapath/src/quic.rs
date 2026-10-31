@@ -539,6 +539,19 @@ impl HelloSender {
         Ok(())
     }
 
+    /// End the send stream after the frames already written (W25-11).
+    ///
+    /// The returned future completes when the peer has all the stream data,
+    /// or when the stream or the connection fails.
+    /// The peer reads the end as [`HelloError::StreamClosed`].
+    pub(crate) fn finish(&mut self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let _ = self.send.finish();
+        let acked = self.send.stopped();
+        async move {
+            let _ = acked.await;
+        }
+    }
+
     /// Send one CTRL frame.
     ///
     /// `flags` may include [`FLAG_REKEY_REQ`].
