@@ -99,7 +99,7 @@ services:
     networks:
       - proof
 
-  c:
+  allowed:
     image: orblx-w25-38-deny:w25
     profiles: ["nodes"]
     cap_add:
@@ -126,7 +126,7 @@ services:
       - coord
     volumes:
       - orblx-w25-38-dd-store:/coord-state:ro
-      - orblx-w25-38-dd-c:/var/lib/orblx
+      - orblx-w25-38-dd-allowed:/var/lib/orblx
     networks:
       - proof
 
@@ -135,7 +135,7 @@ volumes:
   orblx-w25-38-dd-owner:
   orblx-w25-38-dd-a:
   orblx-w25-38-dd-b:
-  orblx-w25-38-dd-c:
+  orblx-w25-38-dd-allowed:
 
 networks:
   proof:

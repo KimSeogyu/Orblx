@@ -137,11 +137,11 @@ Each 4-kind test uses corrupt, truncated, missing after enroll, and unreadable (
 
 `scripts/proof/w25-38-deny-damage.sh` with `compose.w25-38-deny-damage.yml` and `w25-38-deny-damage.hujson`.
 
-1. Nodes a, b, and c enroll. With a valid `deny.json` on b, a and c can SSH to b and ping b.
-2. The owner revokes a. a is refused. c is still accepted (traffic with a valid file does not change).
-3. Gate 3 (merge blocker): the coordinator stops for `ORBLX_DENY_OFFLINE_SECS` (default 600 s) and `deny.json` on b stays valid. Node a stops, so its dial attempts do not count. c sends ICMP to the overlay IP of b each 0.5 s, and each 30 s c makes one SSH login and one `orblx ping` (a new QUIC session) to b. Pass: 0 ICMP loss, each probe accepted, the b counter `orblx_node_refused` (new in this change: sessions and frames that the identity, ticket, or deny check refused) does not change, no new deny file error in the b log, and the same valid deny version. The proof prints `summary w25_38_gate3 ... refused_frames 0`.
+1. Nodes a, b, and allowed enroll. With a valid `deny.json` on b, a and allowed can SSH to b and ping b. The name `allowed` sorts before `b`, so b accepts its new QUIC sessions (the node with the lower name dials).
+2. The owner revokes a. a is refused. allowed is still accepted (traffic with a valid file does not change).
+3. Gate 3 (merge blocker): the coordinator stops for `ORBLX_DENY_OFFLINE_SECS` (default 600 s) and `deny.json` on b stays valid. Node a stops, so its dial attempts do not count. allowed sends ICMP to the overlay IP of b each 0.5 s, and each 30 s allowed makes one SSH login and one `orblx ping` (a new QUIC session) to b. Pass: 0 ICMP loss, each probe accepted, the b counter `orblx_node_refused` (new in this change: sessions and frames that the identity, ticket, or deny check refused) does not change, no new deny file error in the b log, and the same valid deny version. The proof prints `summary w25_38_gate3 ... refused_frames 0`.
 4. The coordinator stays stopped, so b cannot get a new list. For each kind (corrupt, truncated, missing, unreadable), the proof takes `ORBLX_DENY_SAMPLES` (default 3) samples. Each sample is one SSH login and one ping from a to b. Each must be refused. The proof checks that the file is still damaged and that b still runs.
-5. The coordinator starts again. b gets a valid list. c is accepted again and a is still refused.
+5. The coordinator starts again. b gets a valid list. allowed is accepted again and a is still refused.
 6. Gate 4: `ORBLX_DENY_WINDOW_ENROLLS` (default 10) more enrolls. Each prints `deny_list ready_ms N`. Each N must be 2000 ms or less. The proof prints `summary w25_38_window ... over 0`.
 
 Pass: `summary ... samples N accepted 0 unknown 0` with N >= 1, then `proof_ok`, and a `proof_contention` line with `unknown_samples 0`.

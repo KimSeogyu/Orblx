@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # W25-38 deny damage proof. Run it on the merge commit.
-# Node a is a revoked peer. Node c is a peer that is not revoked. Node b runs `orblx up`
+# Node a is a revoked peer. Node allowed is a peer that is not revoked. Its name sorts
+# before b, so node b accepts its new QUIC sessions (the node with the lower name dials).
+# Node b runs `orblx up`
 # with the SSH server and the datapath. The proof damages deny.json on b.
 #
-# Gate 0: with a valid deny.json on b, c can SSH to b and ping b (the traffic does not
+# Gate 0: with a valid deny.json on b, allowed can SSH to b and ping b (the traffic does not
 #   change), and a is refused after `admin revoke-all a`.
 # Gate 3 (W25-38 merge blocker): the coordinator stops for OFFLINE_SECS (default 600 s)
 #   and deny.json on b stays valid. A valid list never goes stale with age. During the
-#   whole time, c sends ICMP to b over the mesh with no loss, and each probe (orblx ping,
-#   a new QUIC session, and an SSH login) from c to b is accepted. The counter
+#   whole time, allowed sends ICMP to b over the mesh with no loss, and each probe (orblx ping,
+#   a new QUIC session, and an SSH login) from allowed to b is accepted. The counter
 #   orblx_node_refused of b does not change (0 refused sessions and frames).
 #   Node a (revoked) stops during gate 3, so its dial attempts do not change the counter.
 # Gate 1: the coordinator stays stopped, so b cannot get a new deny list. For each damage kind
@@ -16,7 +18,7 @@
 #   is one SSH login and one ping (a new QUIC session) from a to b. Each must be refused.
 #   The file on b must still be damaged after the samples.
 #   With a fallback to an empty deny list, a would be accepted.
-# Gate 2: the coordinator starts again. b gets a valid deny.json again. c can SSH to b
+# Gate 2: the coordinator starts again. b gets a valid deny.json again. allowed can SSH to b
 #   again, and a is still refused.
 # Gate 4: the refuse-all window after enroll. The enroll reply has no deny list, and the
 #   node fetches its first deny list over mutual TLS right after enroll. `orblx coord
@@ -275,7 +277,7 @@ echo "=== [C] start coordinator ==="
 dc up -d coord
 wait_bundle
 
-for name in owner a b c; do
+for name in owner a b allowed; do
   dc exec -T coord orblx coord token create \
     --state "$STATE" \
     --ttl 3600 \
@@ -292,10 +294,10 @@ fi
 echo "coord_ip ${coord_ip}"
 export COORD_ADDR="${coord_ip}:443"
 
-for name in owner a b c; do
+for name in owner a b allowed; do
   enroll_node "$name"
 done
-for name in a b c; do
+for name in a b allowed; do
   run_node "$name" coord netmap \
     --coord "${coord_ip}:443" --bundle "$STATE/bundle.pem" --state "$STATE" >/dev/null
   echo "netmap ${name} written"
@@ -303,16 +305,16 @@ done
 dc run --rm --no-deps --entrypoint sh -T b -c "cat > $STATE/policy.hujson" <"$POLICY_FILE"
 echo "policy b written"
 
-echo "=== [C] start nodes a, b, and c ==="
-dc up -d a b c
-for name in a b c; do
+echo "=== [C] start nodes a, b, and allowed ==="
+dc up -d a b allowed
+for name in a b allowed; do
   wait_log "$name" 'The TUN device'
 done
 wait_log b 'ssh_listen '
 
-echo "=== [C] SSH identity and peer certificate on a and c ==="
+echo "=== [C] SSH identity and peer certificate on a and allowed ==="
 dc exec -T b cat "$STATE/cert.pem" >"$WORK/b-cert.pem"
-for name in a c; do
+for name in a allowed; do
   dc exec -T "$name" sh -c "cat > /tmp/b-cert.pem" <"$WORK/b-cert.pem"
   dc exec -T "$name" sh -c "rm -rf /tmp/sshid && mkdir -p /tmp/sshid && cp $STATE/cert.pem $STATE/key.pem $STATE/bundle.pem /tmp/sshid/"
 done
@@ -321,8 +323,8 @@ echo "=== [C] gate 0: valid deny.json on b, before the revoke ==="
 expect "b deny.json" valid "$(deny_state)"
 expect "ssh a before revoke" accepted "$(ssh_try a)"
 expect "ping a before revoke" accepted "$(ping_try a)"
-expect "ssh c before revoke" accepted "$(ssh_try c)"
-expect "ping c before revoke" accepted "$(ping_try c)"
+expect "ssh allowed before revoke" accepted "$(ssh_try allowed)"
+expect "ping allowed before revoke" accepted "$(ping_try allowed)"
 
 echo "=== [C] gate 0: revoke a ==="
 owner revoke-all a | read_all grep -x 'revoked_all spiffe://orblx.local/node/a'
@@ -342,8 +344,8 @@ echo "b deny.json revokes a, version $(dc exec -T b jq -r .version "$DENY" | tr 
 sleep 1
 expect "ssh a after revoke (valid file)" refused "$(ssh_try a)"
 expect "ping a after revoke (valid file)" refused "$(ping_try a)"
-expect "ssh c after revoke (valid file)" accepted "$(ssh_try c)"
-expect "ping c after revoke (valid file)" accepted "$(ping_try c)"
+expect "ssh allowed after revoke (valid file)" accepted "$(ssh_try allowed)"
+expect "ping allowed after revoke (valid file)" accepted "$(ping_try allowed)"
 dc exec -T b cp "$DENY" /tmp/deny.good
 
 echo "=== [C] gate 3: coordinator offline ${OFFLINE_SECS} s, valid deny.json, mesh traffic ==="
@@ -363,7 +365,7 @@ echo "gate3 b refused_before ${refused_before} deny_error_lines_before ${errors_
 dc stop coord >/dev/null
 offline_start="$(date +%s)"
 icmp_count=$(( OFFLINE_SECS * 2 ))
-dc exec -T c ping -n -i 0.5 -W 2 -c "$icmp_count" "$b_overlay" >"$WORK/gate3-icmp.out" 2>&1 &
+dc exec -T allowed ping -n -i 0.5 -W 2 -c "$icmp_count" "$b_overlay" >"$WORK/gate3-icmp.out" 2>&1 &
 icmp_pid=$!
 g3_probes=0
 g3_accepted=0
@@ -371,9 +373,9 @@ g3_unknown=0
 while (( $(date +%s) - offline_start < OFFLINE_SECS - 20 )); do
   for probe in ssh ping; do
     if [[ "$probe" == ssh ]]; then
-      got="$(ssh_try c)"
+      got="$(ssh_try allowed)"
     else
-      got="$(ping_try c)"
+      got="$(ping_try allowed)"
     fi
     g3_probes=$(( g3_probes + 1 ))
     case "$got" in
@@ -381,7 +383,7 @@ while (( $(date +%s) - offline_start < OFFLINE_SECS - 20 )); do
       refused) ;;
       *) g3_unknown=$(( g3_unknown + 1 )) ;;
     esac
-    echo "gate3 t $(( $(date +%s) - offline_start )) s probe ${probe} peer c result ${got}"
+    echo "gate3 t $(( $(date +%s) - offline_start )) s probe ${probe} peer allowed result ${got}"
   done
   sleep 30
 done
@@ -444,8 +446,8 @@ for kind in $KINDS; do
   done
   # A peer that is not revoked is also refused: the node fails closed, it does not use
   # the old list without a check.
-  c_ssh="$(ssh_try c)"
-  echo "sample kind ${kind} probe ssh peer c result ${c_ssh}"
+  c_ssh="$(ssh_try allowed)"
+  echo "sample kind ${kind} probe ssh peer allowed result ${c_ssh}"
   after="$(deny_state)"
   echo "damage ${kind} deny_state_after ${after}"
   # The refusals must come from the running node b, not from a stopped node.
@@ -457,7 +459,7 @@ for kind in $KINDS; do
     echo "The deny.json of b became valid during the ${kind} samples." >&2
     exit 1
   fi
-  echo "kind ${kind} samples ${k_samples} accepted ${k_accepted} unknown ${k_unknown} peer_c_ssh ${c_ssh}"
+  echo "kind ${kind} samples ${k_samples} accepted ${k_accepted} unknown ${k_unknown} peer_allowed_ssh ${c_ssh}"
   rows+=("${kind}:${k_samples}/${k_accepted}/${k_unknown}")
   total=$(( total + k_samples ))
   accepted=$(( accepted + k_accepted ))
@@ -479,8 +481,8 @@ sleep 3
 expect "b deny.json after coord start" valid "$(deny_state)"
 expect "ssh a after restore" refused "$(ssh_try a)"
 expect "ping a after restore" refused "$(ping_try a)"
-expect "ssh c after restore" accepted "$(ssh_try c)"
-expect "ping c after restore" accepted "$(ping_try c)"
+expect "ssh allowed after restore" accepted "$(ssh_try allowed)"
+expect "ping allowed after restore" accepted "$(ping_try allowed)"
 
 echo "=== [C] gate 4: refuse-all window after enroll, ${WINDOW_ENROLLS} enrolls ==="
 windows=()
