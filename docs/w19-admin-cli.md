@@ -38,6 +38,8 @@ The script does not print enroll tokens or private keys.
 ```bash
 orblx admin nodes --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin users --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin user-approve USER --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin user-reject USER --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin approve NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin revoke NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin expire NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
@@ -51,6 +53,8 @@ orblx relay --metrics 127.0.0.1:9464
 
 `--metrics off` leaves the metrics port closed.
 The admin caller certificate must be an owner in the policy.
+W25-15: `users` prints `user SUBJECT STATE nodes N`, then `users N` and `users_pending N`.
+The user commands are in [w25-user-approval.md](w25-user-approval.md).
 `orblx ping` prints `path direct` or `path relay` and `rtt_ms`.
 A pending peer is absent from the netmap, so the ping sends no packet.
 A revoked peer fails the ping before the packet is sent.

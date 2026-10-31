@@ -1,0 +1,9 @@
+{
+  // User approval proof (W25-15).
+  // owner and srv are token nodes of the owner. The OIDC users are in the owner tenant.
+  // oidc:olivia is an owner user, so she never waits. autoApproveDomains is empty (off).
+  "owners": ["spiffe://orblx.local/node/owner"],
+  "userApproval": {
+    "ownerUsers": ["oidc:olivia"],
+  },
+}

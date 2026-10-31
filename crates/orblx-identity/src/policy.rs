@@ -22,6 +22,7 @@ use serde::Deserialize;
 use crate::share::{compile_guests, compile_shares, Share, ShareFile};
 use crate::sink::{compile_audit_sinks, AuditSink, AuditSinkFile};
 use crate::spiffe::{SpiffeId, WorkloadKind};
+use crate::user_approval::{compile_user_approval, UserApproval, UserApprovalFile};
 
 const MAX_POLICY_BYTES: usize = 256 * 1024;
 const MAX_GRANTS: usize = 4096;
@@ -356,6 +357,8 @@ pub struct Policy {
     audit_sinks: Vec<AuditSink>,
     /// True when the policy file has an `acls` list.
     acl_set: bool,
+    /// OIDC user approval (W25-15).
+    user_approval: UserApproval,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -391,6 +394,8 @@ impl std::fmt::Debug for Policy {
             .field("split_dns", &self.split_dns.len())
             .field("audit_webhooks", &self.audit_webhooks.len())
             .field("audit_sinks", &self.audit_sinks.len())
+            .field("owner_users", &self.user_approval.owner_users_len())
+            .field("auto_approve", &self.user_approval.auto_approve_on())
             .finish()
     }
 }
@@ -417,7 +422,16 @@ impl Policy {
             audit_webhooks: Vec::new(),
             audit_sinks: Vec::new(),
             acl_set: false,
+            user_approval: UserApproval::default(),
         }
+    }
+
+    /// Return the OIDC user approval rules from `userApproval` (W25-15).
+    ///
+    /// The default has no owner users and no auto-approve domain.
+    #[must_use]
+    pub fn user_approval(&self) -> &UserApproval {
+        &self.user_approval
     }
 
     /// Return the audit webhook URLs from `auditWebhooks` (W25-7).
@@ -779,6 +793,8 @@ struct PolicyFile {
     audit_webhooks: Vec<String>,
     #[serde(default, rename = "auditSinks")]
     audit_sinks: Vec<AuditSinkFile>,
+    #[serde(default, rename = "userApproval")]
+    user_approval: UserApprovalFile,
 }
 
 #[derive(Deserialize)]
@@ -969,6 +985,7 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
     let split_dns = compile_split_dns(&file.split_dns)?;
     let audit_webhooks = compile_audit_webhooks(&file.audit_webhooks)?;
     let audit_sinks = compile_audit_sinks(&file.audit_sinks)?;
+    let user_approval = compile_user_approval(&file.user_approval)?;
     Ok(Policy {
         grants,
         subnet_grants,
@@ -985,6 +1002,7 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
         audit_webhooks,
         audit_sinks,
         acl_set: file.acls.is_some(),
+        user_approval,
     })
 }
 
