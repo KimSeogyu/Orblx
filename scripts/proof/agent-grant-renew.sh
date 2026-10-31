@@ -66,6 +66,13 @@ cleanup() {
 . "$PROOF_LIB_DIR/proof-lock.sh"
 trap 'cleanup; proof_lock_end' EXIT
 proof_lock_take "agent-grant-renew" "$PROJECT"
+# Fail closed before any build if the disk has less than 15G free (checked under the lock).
+free_kb="$(df -Pk /workspace | awk 'NR == 2 {print $4}')"
+echo "free_space_kb ${free_kb} (need 15728640)"
+if [ "${free_kb:-0}" -lt 15728640 ]; then
+  echo "The disk has less than 15G free. The run stops before the build." >&2
+  exit 3
+fi
 # W25-14b: start from a clean compose state (all profiles, all volumes).
 # as_root and dc are defined above, so a docker failure is not a false clean.
 # shellcheck source=scripts/proof/compose-clean.sh
@@ -90,10 +97,11 @@ open_legacy_forward() {
 
 build_image() {
   local image_dir
-  cargo build -p orblx-cli --bin orblx --locked
+  # W25-41 rule: every latency or gap acceptance run uses a release build.
+  cargo build --release -p orblx-cli --bin orblx --locked
   # shellcheck source=stage-image.sh
   source "$ROOT/scripts/proof/stage-image.sh"
-  image_dir="$(stage_proof_image "$ROOT" "$TARGET_DIR/debug/orblx")"
+  image_dir="$(stage_proof_image "$ROOT" "$TARGET_DIR/release/orblx")"
   docker build -q -t "$ORBLX_AGENT_IMAGE" "$image_dir"
   rm -rf "$image_dir"
 }
@@ -318,7 +326,8 @@ echo "=== [C] start one agent loop (no restart until the end) ==="
 dc exec -T a sh -c "orblx agent connect --grant $GRANT_DIR --every-ms $EVERY_MS \
   --max-wait $max_wait --trace-file $STATE/agent-loop-trace.txt >$STATE/agent-loop.log 2>&1; echo \"loop_exit \$?\" >>$STATE/agent-loop.log" &
 loop_pid=$!
-echo "loop_started_ms $(now_ms) (one process for the whole run)"
+loop_window_start="$(now_ms)"
+echo "loop_started_ms ${loop_window_start} (one process for the whole run)"
 
 for n in $(seq 1 "$ENDS"); do
   end_ms="$(awk -v n="$n" 'NR == n {print $4}' "$WORK/grants.txt")"
@@ -332,6 +341,11 @@ for n in $(seq 1 "$ENDS"); do
 done
 
 wait "$loop_pid" || true
+loop_window_end="$(now_ms)"
+# W25-39 (B): the load and the contention in the measured loop window (gate at the end).
+loop_window_ok=1
+loop_window="$(proof_window_contention loop "$loop_window_start" "$loop_window_end")" || loop_window_ok=0
+echo "$loop_window"
 echo "=== [C] agent loop output ==="
 dc exec -T a cat "$STATE/agent-loop.log" | tee "$WORK/loop.txt"
 
@@ -462,7 +476,8 @@ gate_wait=$(( (gate_end - $(now_ms)) / 1000 + 20 ))
 dc exec -T a sh -c "orblx agent connect --grant $GATE_DIR --every-ms $EVERY_MS \
   --max-wait $gate_wait >$STATE/agent-gate.log 2>&1; echo \"loop_exit \$?\" >>$STATE/agent-gate.log" &
 gate_pid=$!
-echo "gate_loop_started_ms $(now_ms) grant ${gate_id} expires_ms ${gate_end} max_wait_s ${gate_wait}"
+gate_window_start="$(now_ms)"
+echo "gate_loop_started_ms ${gate_window_start} grant ${gate_id} expires_ms ${gate_end} max_wait_s ${gate_wait}"
 sleep 3
 
 echo "=== [C] gate: a newer grant with another scope (port 8082) to the same directory ==="
@@ -508,6 +523,10 @@ stage_to_gate
 echo "gate revoked_set_written ${late_id} at_ms $(now_ms)"
 
 wait "$gate_pid" || true
+gate_window_end="$(now_ms)"
+gate_window_ok=1
+gate_window="$(proof_window_contention gate "$gate_window_start" "$gate_window_end")" || gate_window_ok=0
+echo "$gate_window"
 echo "=== [C] gate loop output ==="
 dc exec -T a cat "$STATE/agent-gate.log" | tee "$WORK/gate-loop.txt"
 dc exec -T b cat "$STATE/guard-web.log" >"$WORK/guard-all.txt"
@@ -570,6 +589,15 @@ if ! awk -v v="$request_p99" -v lim="$REQUEST_P99_LIMIT_MS" 'BEGIN {exit !(v != 
   exit 1
 fi
 echo "request_p99_ok ${request_p99} limit_ms ${REQUEST_P99_LIMIT_MS}"
+
+echo "=== [C] W25-39 (B) gate: no contention and a known count in the measured windows ==="
+echo "$loop_window"
+echo "$gate_window"
+if [[ "$loop_window_ok" != 1 || "$gate_window_ok" != 1 ]]; then
+  echo "A measured window has no sample, an unknown sample, or a contended sample." >&2
+  exit 1
+fi
+echo "window_contention_ok loop gate"
 
 echo "summary gate loop_exit ${gate_exit} deny_reason ${gate_reason} switches ${gate_switches} kept_scope ${kept_scope} kept_revoked ${kept_revoked} revoked_before_fetch_refused 1"
 echo "summary ends_crossed ${ends_crossed} ttl_s ${TTL_SECS} attempts ${attempts} ok_attempts ${ok_attempts} lost 0 worst_switch_gap_ms ${worst} loop_max_ok_gap_ms ${max_gap} limit_ms ${GAP_LIMIT_MS} switches ${switches} restarts 0 request_p99_ms ${request_p99}"

@@ -405,6 +405,39 @@ proof_lock_take() {
   rm -f "$pid_file"
 }
 
+# W25-39 (B): proof_window_contention NAME START_MS END_MS
+# Prints one proof_window line for the sampler rows in the measured window (START_MS to END_MS,
+# both included): the samples, the contended and unknown samples, and the load1 minimum, mean
+# and maximum in the window, not only for the whole lock. The status is 1 (fail closed) when the
+# window has no sample, an unknown sample, or a contended sample.
+proof_window_contention() {
+  local name="$1" start_ms="$2" end_ms="$3"
+  if [[ -z "${PROOF_LOCK_SAMPLES:-}" || ! -f "$PROOF_LOCK_SAMPLES" ]]; then
+    echo "proof_window ${name} start_ms ${start_ms} end_ms ${end_ms} samples 0 contended_samples 0 unknown_samples 0 max_other_orblx_containers 0 load1_min - load1_mean - load1_max - result invalid"
+    return 1
+  fi
+  awk -v name="$name" -v s="$start_ms" -v e="$end_ms" '
+    $1 + 0 >= s + 0 && $1 + 0 <= e + 0 {
+      n++
+      if ($2 < 0) unknown++
+      if ($2 > 0) busy++
+      if ($2 > maxc) maxc = $2
+      if (n == 1 || $3 < minl) minl = $3
+      if (n == 1 || $3 > maxl) maxl = $3
+      sum += $3
+    }
+    END {
+      ok = (n > 0 && unknown + 0 == 0 && busy + 0 == 0)
+      if (n > 0) {
+        printf "proof_window %s start_ms %s end_ms %s samples %d contended_samples %d unknown_samples %d max_other_orblx_containers %d load1_min %s load1_mean %.2f load1_max %s result %s\n", name, s, e, n, busy + 0, unknown + 0, maxc + 0, minl, sum / n, maxl, (ok ? "valid" : "invalid")
+      } else {
+        printf "proof_window %s start_ms %s end_ms %s samples 0 contended_samples 0 unknown_samples 0 max_other_orblx_containers 0 load1_min - load1_mean - load1_max - result invalid\n", name, s, e
+      }
+      exit !ok
+    }
+  ' "$PROOF_LOCK_SAMPLES"
+}
+
 # Call in the EXIT trap. It prints the end context and the sampler maximum, then releases the lock.
 proof_lock_end() {
   [[ -n "$PROOF_LOCK_LABEL" ]] || return 0

@@ -400,8 +400,7 @@ pub fn connect_timed(
     timing.tcp_us = unix_micros_now();
     timing.local_port = stream.local_addr().map(|addr| addr.port()).unwrap_or(0);
     stream.set_read_timeout(Some(timeout)).map_err(failed)?;
-    stream.write_all(line.as_bytes()).map_err(failed)?;
-    stream.write_all(b"\n").map_err(failed)?;
+    send_request(&mut stream, &line).map_err(failed)?;
     timing.sent_us = unix_micros_now();
     let reply = read_reply(&stream).map_err(failed)?;
     timing.reply_us = unix_micros_now();
@@ -416,6 +415,25 @@ pub fn connect_timed(
             "The guard reply is not valid.".to_string(),
         )),
     }
+}
+
+/// Send the use proof line and its newline in one write, with Nagle off (W25-39).
+///
+/// The line is longer than one TCP segment. With Nagle on, the kernel holds the last part of the
+/// line until the peer acknowledges the first segment. A separate newline write adds one more
+/// round trip.
+fn send_request(stream: &mut TcpStream, line: &str) -> std::io::Result<()> {
+    stream.set_nodelay(true)?;
+    write_request(stream, line)
+}
+
+/// Write `line` and a newline to `writer` with one `write_all` call.
+fn write_request(writer: &mut impl Write, line: &str) -> std::io::Result<()> {
+    let mut bytes = Vec::with_capacity(line.len() + 1);
+    bytes.extend_from_slice(line.as_bytes());
+    bytes.push(b'\n');
+    writer.write_all(&bytes)?;
+    writer.flush()
 }
 
 fn read_reply(stream: &TcpStream) -> std::io::Result<String> {
@@ -435,4 +453,52 @@ fn read_reply(stream: &TcpStream) -> std::io::Result<String> {
         raw.push(byte);
     }
     Ok(String::from_utf8_lossy(&raw).trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// Records each write call.
+    #[derive(Default)]
+    struct WriteLog {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl Write for WriteLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes.push(buf.to_vec());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_request_line_and_its_newline_go_in_one_write() {
+        let line = "x".repeat(1628);
+        let mut log = WriteLog::default();
+        write_request(&mut log, &line).unwrap();
+        assert_eq!(log.writes.len(), 1);
+        let mut expected = line.into_bytes();
+        expected.push(b'\n');
+        assert_eq!(log.writes[0], expected);
+    }
+
+    #[test]
+    fn the_request_socket_has_nagle_off_and_the_peer_reads_the_full_line() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let line = "y".repeat(1628);
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        send_request(&mut client, &line).unwrap();
+        assert!(client.nodelay().unwrap());
+        let mut got = String::new();
+        BufReader::new(server).read_line(&mut got).unwrap();
+        assert_eq!(got, format!("{line}\n"));
+    }
 }

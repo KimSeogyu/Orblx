@@ -488,3 +488,88 @@ fn fixture_with_other_signer(ttl: u64, id: &str) -> (GrantFiles, String) {
     };
     (files, fixture.nonce_hex)
 }
+
+fn percentile_line(name: &str, values: &mut [f64]) -> String {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let pick = |p: f64| {
+        let index = ((p / 100.0) * values.len() as f64).ceil() as usize;
+        values[index.clamp(1, values.len()) - 1]
+    };
+    format!(
+        "admit_cost {name}_ms p50 {:.3} p90 {:.3} p99 {:.3} max {:.3} n {}",
+        pick(50.0),
+        pick(90.0),
+        pick(99.0),
+        values[values.len() - 1],
+        values.len()
+    )
+}
+
+/// W25-39 diagnostic: the cost of each part of one guard admit, in this build profile.
+///
+/// Run: `ORBLX_ADMIT_COST_DIR=DIR cargo test [--release] -p orblx-agent --test guard admit_cost -- --ignored --nocapture`.
+/// DIR must be on the disk under test. The test deletes only its own files in DIR.
+#[test]
+#[ignore = "diagnostic measurement"]
+fn admit_cost() {
+    const ROUNDS: usize = 300;
+    let base = std::env::var_os("ORBLX_ADMIT_COST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("orblx-admit-cost-{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let fixture = fixture(30);
+    let core = core(&fixture, base.join("agent-audit.jsonl"));
+    let at = after(&fixture, 1000);
+    core.apply_deny(EMPTY_DENY, at).unwrap();
+    let (mut seal_ms, mut open_ms, mut admit_ms, mut sync_data_ms, mut sync_all_ms) =
+        (vec![], vec![], vec![], vec![], vec![]);
+    let ms = |start: std::time::Instant| start.elapsed().as_secs_f64() * 1000.0;
+    for _ in 0..ROUNDS {
+        let start = std::time::Instant::now();
+        let line = seal(&fixture, "web", PORT, at);
+        seal_ms.push(ms(start));
+        let start = std::time::Instant::now();
+        open(&fixture, &line, "web", PORT, &DenySet::empty(), at).unwrap();
+        open_ms.push(ms(start));
+        let start = std::time::Instant::now();
+        let decision = core.admit(&line, "web", PORT, &[], peer(), at).unwrap();
+        admit_ms.push(ms(start));
+        assert!(matches!(decision, GuardDecision::Admit(_)));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(base.join("sync-probe"))
+        .unwrap();
+    for _ in 0..ROUNDS {
+        use std::io::Write as _;
+        file.write_all(&[b'x'; 200]).unwrap();
+        let start = std::time::Instant::now();
+        file.sync_data().unwrap();
+        sync_data_ms.push(ms(start));
+        file.write_all(&[b'y'; 200]).unwrap();
+        let start = std::time::Instant::now();
+        file.sync_all().unwrap();
+        sync_all_ms.push(ms(start));
+    }
+    let thirds: Vec<String> = admit_ms
+        .chunks(ROUNDS / 3)
+        .map(|part| format!("{:.3}", part.iter().sum::<f64>() / part.len() as f64))
+        .collect();
+    println!("admit_cost admit_mean_ms_by_third {}", thirds.join(" "));
+    println!(
+        "admit_cost profile {}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
+    println!("{}", percentile_line("seal", &mut seal_ms));
+    println!("{}", percentile_line("open_use", &mut open_ms));
+    println!("{}", percentile_line("admit", &mut admit_ms));
+    println!("{}", percentile_line("sync_data", &mut sync_data_ms));
+    println!("{}", percentile_line("sync_all", &mut sync_all_ms));
+    std::fs::remove_dir_all(&base).unwrap();
+}
