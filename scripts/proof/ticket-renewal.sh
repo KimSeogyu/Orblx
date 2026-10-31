@@ -29,6 +29,8 @@
 #     "class quiet_host". The gap gate does not change: each gap above TR_GAP_MS fails
 #     the run. When one gap is host_stall, the run is INVALID (not a PASS): it prints
 #     proof_invalid and exits 3. The run gets 1 clean rerun.
+# The proof builds orblx with the release profile (TR_PROFILE, default release). A
+# latency or gap acceptance run must use the release build.
 # The nodes run with ORBLX_TRACE_RENEW=1. TR_OUT_DIR keeps the host samples, the ping
 # files and the node trace lines after the run.
 # Gates 3, 4 and 8 do not stop the proof at once. Gates 5, 6 and 7 run first, then the
@@ -55,6 +57,7 @@ TR_PING_I="${TR_PING_I:-0.05}"
 TR_REVOKE="${TR_REVOKE:-1}"
 TR_REVOKE_MS="${TR_REVOKE_MS:-1000}"
 TR_BIN="${TR_BIN:-}"
+TR_PROFILE="${TR_PROFILE:-release}"
 TR_OUT_DIR="${TR_OUT_DIR:-}"
 # Host stall limits per 100 ms sample. Baseline: 3000 samples (300 s, 15:29:40-15:34:40 KST
 # 2026-10-31, load1 0.7-2.0, 8 CPUs, no proof container of this run). Baseline max: steal
@@ -132,8 +135,22 @@ open_legacy_forward() {
 build_image() {
   local image_dir bin="$TR_BIN"
   if [[ -z "$bin" ]]; then
-    cargo build -p orblx-cli --bin orblx --locked
-    bin="$ROOT/target/debug/orblx"
+    # W25-26 PO rule: a latency or gap acceptance run uses a release build.
+    # TR_PROFILE=debug is for local checks only.
+    case "$TR_PROFILE" in
+      release)
+        cargo build --release -p orblx-cli --bin orblx --locked 2>&1
+        bin="$ROOT/target/release/orblx"
+        ;;
+      debug)
+        cargo build -p orblx-cli --bin orblx --locked 2>&1
+        bin="$ROOT/target/debug/orblx"
+        ;;
+      *) fail "TR_PROFILE must be release or debug, not ${TR_PROFILE}." ;;
+    esac
+    echo "build_profile ${TR_PROFILE} rustc $(rustc -V)"
+  else
+    echo "build_profile prebuilt TR_BIN (not an acceptance run)"
   fi
   [[ -x "$bin" ]] || fail "The orblx binary ${bin} is missing."
   echo "orblx_bin_sha256 $(sha256sum "$bin" | awk '{print $1}')"
