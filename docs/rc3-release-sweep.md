@@ -46,7 +46,7 @@ does not stop the sweep. `ORBLX_SWEEP_ONLY` runs some proofs only; such a run ne
 | Exit | Meaning |
 |---|---|
 | 0 | Every row passed: each of its proofs gave its pass line. |
-| 1 | A proof failed, a shipped row has no proof, or a row is INVALID (its contention probe did not report `unknown_samples 0`). The summary lines `Failed rows: ...` and `Invalid rows ...: ...` name the rows. |
+| 1 | A proof failed, a shipped row has no proof, a row is INVALID (its contention probe did not report `unknown_samples 0`), or a row is ABORT (`proof_infra_abort`). The summary lines `Failed rows: ...`, `Invalid rows ...: ...` and `Aborted rows ...: ...` name the rows. |
 | 2 | Setup, manifest or build error. |
 | 3 | `ORBLX_SWEEP_ONLY` run with no failure. It does not count. |
 
@@ -133,6 +133,7 @@ it is in the manifest. The sweep does not hide this row.
 | `FAIL (exit 0, no pass line RE)` | A proof with its own pass line ended with exit 0 but without that line. |
 | `FAIL (exit 124, timeout ...)` | The proof ran longer than `ORBLX_SWEEP_TIMEOUT`. |
 | `FAIL: no proof for this shipped row` | The manifest row has `-`. |
+| `ABORT (infrastructure, reason=R, exit N): LINE` | The proof stopped with `proof_infra_abort` before any proof step (see "Infrastructure abort (ABORT) in the sweep (W25-27)"). It is not a pass and not a FAIL. The row stays open. |
 | `INVALID: proof_ok but REASON` | The proof passed, but its contention probe did not report `unknown_samples 0` (see "Contention probe: unknown_samples 0 (W25-27)"). The row does not count. |
 
 The summary has one line for each row and proof: row, feature, proof, result, log path, time
@@ -218,6 +219,11 @@ caller is not root, so it never asks for a password.
 - less free disk than `ORBLX_SWEEP_MIN_FREE_GB` stops the run with exit 2 before any proof;
 - a `steady_warn` rate over 1% prints the root-cause line and does not fail the sweep;
 - the real manifest has every shipped row, and each proof it names is defined;
+- ABORT, INVALID and FAIL are separate results: `proof_infra_abort` with `reason=disk_low`
+  (exit 3) and `reason=disk_unknown` (exit 4) is ABORT, and the summary names each reason; an
+  abort line after the proof's own lock, with an exit that is not an abort code, or with a
+  different reason is FAIL; a pass with `unknown_samples` 2 is INVALID; an ABORT alone makes
+  the sweep exit 1;
 - contention rule: `unknown_samples 0` passes; `unknown_samples` over 0 (a fake `docker` that
   fails, or a proof's own probe line) makes the row INVALID and the sweep exit 1; a missing
   wrapper line, a wrapper line with `samples 0`, or a line with no `unknown_samples` field is
@@ -398,3 +404,32 @@ logic in `proof-lock.sh` or in `release-sweep.sh`, so the rules are in this docu
 - An abort counts as infrastructure only if the log shows that no proof step started.
 - An abort after the first proof step is a FAIL.
 - If the log is empty, nothing proves that no proof step started. Thus the run is a FAIL.
+
+## Infrastructure abort (ABORT) in the sweep (W25-27)
+
+PO rule (2026-10-31 18:55 KST). A proof can stop before its own lock and before any build. Then
+it prints this line and exits:
+
+```
+proof_infra_abort PROOF reason=disk_low free_gib=N min_gib=N dir=DIR. No proof step ran.
+proof_infra_abort PROOF reason=disk_unknown dir=DIR. No proof step ran.
+```
+
+The sweep gives this run the result ABORT. ABORT is not a pass, not a FAIL and not INVALID.
+
+- The exit code must be an abort code. `coord-enroll.sh` (branch `w25nb-coord-enroll`) uses
+  exit 3. The check in `proof-lock.sh` can use a distinct code (4). The sweep accepts both.
+  `ORBLX_SWEEP_ABORT_CODES` sets the list (default `3 4`).
+- The reason must be `disk_low` or `disk_unknown`. `disk_unknown` is an ABORT too.
+- The `proof_infra_abort` line must come before the proof's own `proof_lock` or
+  `proof_context` lines and before any cargo `Compiling` line. The sweep wrapper's own lines
+  (`rc3-sweep:PROOF`) do not count, because taking the proof lock is not a proof step.
+- If one of these conditions is false, the run is a FAIL, and the result gives the reason.
+- The sweep checks for ABORT before the pass line and the contention probe. Thus an abort with
+  exit 3 is not taken for the W25-35 probe exit.
+
+The summary line `Aborted rows (...): ...` names each aborted row with its proofs and reasons,
+for example `33 (coord-enroll: disk_unknown)`. The line `Aborted proofs: N` gives the count.
+An aborted row stays open until a clean run of its proofs passes. The sweep exits 1 when a row
+is aborted, the same as for a failed or INVALID row. Free disk space and run the sweep again.
+

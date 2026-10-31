@@ -30,8 +30,8 @@
 # be shipped for rc.3: a shipped claim for them in either file is exit 2 (PO, 2026-10-31).
 # A proof_ok row counts only when its contention probe reports unknown_samples 0 (see
 # contention_verdict); else the row is INVALID. --contention-check LOG NAME checks one log.
-# Exit: 0 every row passed; 1 a proof failed, a row has no proof, or a row is INVALID (the
-# summary names the rows); 2 setup, manifest or build error; 3 ORBLX_SWEEP_ONLY run with no failure (a partial
+# Exit: 0 every row passed; 1 a proof failed, a row has no proof, a row is INVALID, or a row
+# is ABORT (proof_infra_abort; the row stays open) (the summary names the rows); 2 setup, manifest or build error; 3 ORBLX_SWEEP_ONLY run with no failure (a partial
 # run never counts).
 #
 # The proofs need root and Docker. The script runs git as the caller and runs the build and
@@ -248,6 +248,47 @@ if [[ -n "$CHECK_LOG" ]]; then
   echo "contention_check $CHECK_NAME INVALID: $v ($CHECK_LOG)"
   exit 1
 fi
+
+# W25-27 (PO rule 2026-10-31 18:55 KST): a proof can stop with an infrastructure abort. It
+# prints "proof_infra_abort PROOF reason=REASON ..." before its own lock and before any build,
+# and exits with an abort code (3 now; a distinct code, 4, may come with the proof-lock.sh
+# check; ORBLX_SWEEP_ABORT_CODES, default "3 4"). The result is ABORT: not PASS, not FAIL, not
+# INVALID. The row stays open until a clean run passes.
+# abort_verdict LOG RC prints the reason (exit 0) when the run is an ABORT. It prints why not
+# (exit 1) when the log has a proof_infra_abort line but the run is not an ABORT, and prints
+# nothing (exit 2) when the log has no proof_infra_abort line.
+# Taking the proof lock is not a proof step, but the abort line must come before the proof's
+# own proof_lock or proof_context lines and before any cargo "Compiling" line: else a proof
+# step can have started, and the run is a FAIL.
+ABORT_CODES="${ORBLX_SWEEP_ABORT_CODES:-3 4}"
+abort_verdict() {
+  local log="$1" rc="$2" name="$3" out code ok=0
+  out="$(awk -v mine="rc3-sweep:$name" '
+    /^proof_infra_abort / && !line { line = $0; next }
+    !line && ($1 == "proof_lock" || $1 == "proof_context") && $2 != mine { step = 1 }
+    !line && /^ *Compiling / { step = 1 }
+    END {
+      if (!line) exit 2
+      r = ""
+      if (match(line, / reason=[^ .]*/)) r = substr(line, RSTART + 8, RLENGTH - 8)
+      if (step) { print "proof_infra_abort after the proof took its lock or started a build"; exit 1 }
+      if (r != "disk_low" && r != "disk_unknown") { print "proof_infra_abort with reason \"" r "\" (only disk_low and disk_unknown)"; exit 1 }
+      print r
+    }' "$log")" || {
+    code=$?
+    [[ "$code" -eq 2 ]] && return 2
+    echo "$out"
+    return 1
+  }
+  for code in $ABORT_CODES; do
+    [[ "$rc" == "$code" ]] && ok=1
+  done
+  if [[ "$ok" -ne 1 ]]; then
+    echo "proof_infra_abort but exit $rc (abort codes: $ABORT_CODES)"
+    return 1
+  fi
+  echo "$out"
+}
 
 contention_of() {
   local log="$1" name="$2" c
@@ -723,13 +764,13 @@ for pin in $OLD_PINS; do
 done
 
 # 5. Run each proof once.
-P_RESULT=(); P_LOG=(); P_TIME=(); P_CONT=()
+P_RESULT=(); P_LOG=(); P_TIME=(); P_CONT=(); P_ABORT=()
 for i in "${!P_NAME[@]}"; do
   P_RESULT+=("pending"); P_LOG+=("-"); P_TIME+=("-"); P_CONT+=("-")
 done
 
 write_table() {
-  local r p i failed_rows="" invalid_rows="" res
+  local r p i failed_rows="" invalid_rows="" aborted_rows="" res why
   {
     echo "# Proof sweep $SHORT"
     echo
@@ -744,24 +785,33 @@ write_table() {
         continue
       fi
       res=ok
+      why=""
       for p in ${R_PROOFS[$r]}; do
         i="$(proof_index "$p")"
         echo "| $(row_label "$r") | $(cell "${R_FEAT[$r]}") | $p | ${P_RESULT[$i]} | ${P_LOG[$i]} | ${P_TIME[$i]} | ${P_CONT[$i]} |"
         [[ "${P_RESULT[$i]}" == FAIL* ]] && res=fail
-        [[ "$res" == ok && "${P_RESULT[$i]}" == INVALID* ]] && res=invalid
+        [[ "$res" != fail && "${P_RESULT[$i]}" == INVALID* ]] && res=invalid
+        if [[ "${P_RESULT[$i]}" == ABORT* ]]; then
+          [[ "$res" == ok ]] && res=abort
+          why="${why:+$why, }$p: ${P_ABORT[$i]:-}"
+        fi
       done
       if [[ "$res" == fail ]]; then
         failed_rows="${failed_rows:+$failed_rows, }${R_ID[$r]}"
       elif [[ "$res" == invalid ]]; then
         invalid_rows="${invalid_rows:+$invalid_rows, }${R_ID[$r]}"
+      elif [[ "$res" == abort ]]; then
+        aborted_rows="${aborted_rows:+$aborted_rows, }${R_ID[$r]} ($why)"
       fi
     done
     echo
     echo "Failed rows: ${failed_rows:-none}."
     echo "Invalid rows (the contention probe did not report unknown_samples 0; they do not count): ${invalid_rows:-none}."
+    echo "Aborted rows (proof_infra_abort before any proof step; the row stays open until a clean run passes): ${aborted_rows:-none}."
   } >"$TABLE"
   FAILED_ROWS="$failed_rows"
   INVALID_ROWS="$invalid_rows"
+  ABORTED_ROWS="$aborted_rows"
 }
 
 LOCK_MODE="${ORBLX_SWEEP_LOCK_MODE:-proof}"
@@ -781,10 +831,12 @@ esac
 
 FAILED_ROWS=""
 INVALID_ROWS=""
+ABORTED_ROWS=""
 STEADY_RUNS=0
 STEADY_WARNED=0
 failed=0
 invalid=0
+aborted=0
 ran=0
 not_run=0
 skipped=0
@@ -865,7 +917,17 @@ for i in "${!P_NAME[@]}"; do
   if [[ "$rc" -eq 3 ]] && has_line '^proof_contention_invalid ' <"$log"; then
     probe_exit=1
   fi
-  if [[ "$rc" -eq 0 || "$probe_exit" -eq 1 ]] && has_line "$ok_re" <"$log" \
+  abort_rc=0
+  abort_why="$(abort_verdict "$log" "$rc" "$name")" || abort_rc=$?
+  P_ABORT[$i]=""
+  if [[ "$abort_rc" -eq 0 ]]; then
+    result="ABORT (infrastructure, reason=$abort_why, exit $rc): $(awk '/^proof_infra_abort / {print; exit}' "$log")"
+    P_ABORT[$i]="$abort_why"
+    aborted=$((aborted + 1))
+  elif [[ "$abort_rc" -eq 1 ]]; then
+    failed=$((failed + 1))
+    result="FAIL (exit $rc): $abort_why"
+  elif [[ "$rc" -eq 0 || "$probe_exit" -eq 1 ]] && has_line "$ok_re" <"$log" \
     && ! verdict="$(contention_verdict "$log" "$name")"; then
     result="INVALID: proof_ok but $verdict"
     invalid=$((invalid + 1))
@@ -905,7 +967,7 @@ cleanup_worktree
 write_table
 total=$(( $(date +%s) - SWEEP_START ))
 {
-  echo "Proofs run: $ran. Failed proofs: $failed. Invalid proofs: $invalid. Not run: $not_run. Skipped (rows file mark): $skipped. Total time: ${total} s ($((total / 60)) min $((total % 60)) s). Ended $(date '+%Y-%m-%d %H:%M:%S %Z')."
+  echo "Proofs run: $ran. Failed proofs: $failed. Invalid proofs: $invalid. Aborted proofs: $aborted. Not run: $not_run. Skipped (rows file mark): $skipped. Total time: ${total} s ($((total / 60)) min $((total % 60)) s). Ended $(date '+%Y-%m-%d %H:%M:%S %Z')."
   if [[ "$not_run" -gt 0 ]]; then
     echo "Partial run (ORBLX_SWEEP_ONLY): it does not count."
   fi
@@ -919,9 +981,9 @@ total=$(( $(date +%s) - SWEEP_START ))
     echo "steady_warn: no nat-realism run in this sweep."
   fi
 } >>"$TABLE"
-note "end $(now) proofs $ran failed $failed invalid $invalid invalid_rows ${INVALID_ROWS:-none} not_run $not_run failed_rows ${FAILED_ROWS:-none} total_secs $total table $TABLE"
+note "end $(now) proofs $ran failed $failed invalid $invalid invalid_rows ${INVALID_ROWS:-none} aborted $aborted aborted_rows ${ABORTED_ROWS:-none} not_run $not_run failed_rows ${FAILED_ROWS:-none} total_secs $total table $TABLE"
 cat "$TABLE"
-if [[ -n "$FAILED_ROWS" || -n "$INVALID_ROWS" ]]; then
+if [[ -n "$FAILED_ROWS" || -n "$INVALID_ROWS" || -n "$ABORTED_ROWS" ]]; then
   exit 1
 fi
 if [[ "$not_run" -gt 0 ]]; then

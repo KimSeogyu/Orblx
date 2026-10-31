@@ -37,6 +37,12 @@ PROOFS = {
     "slow.sh": "sleep 1\necho proof_ok\n",
     "ownbad.sh": "sleep 1\necho 'proof_contention ownbad samples 3 contended_samples 0 unknown_samples 2 "
                  "max_other_orblx_containers 0 max_load1 0.1'\necho proof_ok\n",
+    "abortlow.sh": "echo 'proof_infra_abort abortlow reason=disk_low free_gib=3 min_gib=12 dir=/w. No proof step ran.' >&2\nexit 3\n",
+    "abortunk.sh": "echo 'proof_infra_abort abortunk reason=disk_unknown dir=/var/lib/docker. No proof step ran.' >&2\nexit 4\n",
+    "abortlate.sh": "echo 'proof_lock abortlate held by the parent proof, file /x'\n"
+                    "echo 'proof_infra_abort abortlate reason=disk_low free_gib=3 min_gib=12 dir=/w.' >&2\nexit 3\n",
+    "abortrc.sh": "echo 'proof_infra_abort abortrc reason=disk_low free_gib=3 min_gib=12 dir=/w.' >&2\nexit 1\n",
+    "abortwhy.sh": "echo 'proof_infra_abort abortwhy reason=net_down.' >&2\nexit 3\n",
     "loud.sh": "seq 1 100000\necho 'to stderr' >&2\nprintf 'no newline at end'\necho\necho proof_ok\n",
 }
 
@@ -584,6 +590,50 @@ class ReleaseSweepTest(unittest.TestCase):
             self.assertEqual(out.returncode, 1, want + out.stdout + out.stderr)
             self.assertTrue(out.stdout.startswith("contention_check p INVALID: "), out.stdout)
             self.assertIn(want, out.stdout)
+
+
+    def test_abort_invalid_and_fail_are_separate_results(self):
+        manifest = (
+            "row|1|Low disk|abortlow\nproof|abortlow|scripts/proof/abortlow.sh|-|-\n"
+            "row|2|Unknown disk|abortunk\nproof|abortunk|scripts/proof/abortunk.sh|-|-\n"
+            "row|3|Probe|ownbad\nproof|ownbad|scripts/proof/ownbad.sh|ORBLX_PROOF_SAMPLE_SECS=0.2|-\n"
+            "row|4|Late abort|abortlate\nproof|abortlate|scripts/proof/abortlate.sh|-|-\n"
+            "row|5|Abort exit 1|abortrc\nproof|abortrc|scripts/proof/abortrc.sh|-|-\n"
+            "row|6|Abort reason|abortwhy\nproof|abortwhy|scripts/proof/abortwhy.sh|-|-\n"
+            "row|7|Fail|fail\nproof|fail|scripts/proof/fail.sh|-|-\n"
+            "row|8|Mesh|ok\nproof|ok|scripts/proof/ok.sh|-|-\n"
+        )
+        out = self.run_sweep(manifest)
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        rows = self.rows()
+        # ABORT: exit 3 (now) and exit 4 (a distinct code), reason disk_low and disk_unknown.
+        self.assertTrue(rows[("1", "abortlow")][3].startswith(
+            "ABORT (infrastructure, reason=disk_low, exit 3): proof_infra_abort abortlow reason=disk_low"),
+            rows[("1", "abortlow")][3])
+        self.assertTrue(rows[("2", "abortunk")][3].startswith(
+            "ABORT (infrastructure, reason=disk_unknown, exit 4): proof_infra_abort abortunk"),
+            rows[("2", "abortunk")][3])
+        # INVALID: the proof passed, but its probe line has unknown_samples 2.
+        self.assertEqual(rows[("3", "ownbad")][3], "INVALID: proof_ok but unknown_samples 2 in proof_contention ownbad")
+        # FAIL: the abort line after the proof's own lock, an exit that is not an abort code, a
+        # reason that is not disk_low or disk_unknown, and a plain failure.
+        self.assertEqual(rows[("4", "abortlate")][3],
+                         "FAIL (exit 3): proof_infra_abort after the proof took its lock or started a build")
+        self.assertEqual(rows[("5", "abortrc")][3], "FAIL (exit 1): proof_infra_abort but exit 1 (abort codes: 3 4)")
+        self.assertEqual(rows[("6", "abortwhy")][3],
+                         'FAIL (exit 3): proof_infra_abort with reason "net_down" (only disk_low and disk_unknown)')
+        self.assertTrue(rows[("7", "fail")][3].startswith("FAIL (exit 3): error: the peer did not answer"))
+        self.assertEqual(rows[("8", "ok")][3], "proof_ok")
+        table = self.table()
+        self.assertIn("Failed rows: 4, 5, 6, 7.", table)
+        self.assertIn("they do not count): 3.", table)
+        self.assertIn("Aborted rows (proof_infra_abort before any proof step; the row stays open until a clean run "
+                      "passes): 1 (abortlow: disk_low), 2 (abortunk: disk_unknown).", table)
+        self.assertIn("Aborted proofs: 2.", table)
+        # An ABORT alone still keeps the sweep from passing.
+        out = self.run_sweep("row|1|Low disk|abortlow\nproof|abortlow|scripts/proof/abortlow.sh|-|-\n")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("Failed rows: none.", self.table())
 
 
 if __name__ == "__main__":
