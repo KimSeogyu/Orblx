@@ -12,8 +12,10 @@ The sampler stops on SIGTERM or after --secs seconds.
 Usage: host-sampler.py --out FILE [--interval 0.1] [--secs N] [name=cgroup_dir ...]
        host-sampler.py analyze --samples FILE --gaps FILE [--traces FILE] [thresholds]
 
-analyze: a sample is a host stall window when one of these values is at or above its
-threshold: steal_ms, iowait_ms, cpu_some_ms, io_full_ms, mem_some_ms. For each line
+analyze: a sample is a host stall window when one host-level value is at or above its
+threshold: steal_ms, iowait_ms, io_full_ms, mem_some_ms. cpu_some_ms and the per-container
+cpu pressure are reported values only (Orblx itself can raise them), so they never make a
+stall window. For each line
 "src dst from_s to_s gap_ms" in --gaps, it prints the largest value of each field in the
 samples whose window [epoch_ms - dt_ms, epoch_ms] touches [from, to], and "class
 host_stall" if one of these samples is a stall window, else "class quiet_host".
@@ -65,7 +67,7 @@ def snapshot(cgroups):
 
 
 FIELDS = ["steal_ms", "iowait_ms", "cpu_some_ms", "io_some_ms", "io_full_ms", "mem_some_ms", "mem_full_ms"]
-STALL_KEYS = ["steal_ms", "iowait_ms", "cpu_some_ms", "io_full_ms", "mem_some_ms"]
+STALL_KEYS = ["steal_ms", "iowait_ms", "io_full_ms", "mem_some_ms"]
 
 
 def read_samples(path):

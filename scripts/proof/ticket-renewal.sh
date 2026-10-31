@@ -19,9 +19,12 @@
 #     (default: the CPU count).
 #  9. Host stall check (W25-26 PO rule). scripts/proof/host-sampler.py writes /proc/stat
 #     steal and iowait and /proc/pressure (cpu, io, memory) deltas every 100 ms. A sample is a
-#     host stall window when steal_ms >= TR_STALL_STEAL_MS, iowait_ms >= TR_STALL_IOWAIT_MS,
-#     cpu some >= TR_STALL_CPU_MS, io full >= TR_STALL_IO_FULL_MS or memory some >=
-#     TR_STALL_MEM_MS (all per 100 ms sample, over all CPUs). Each reply gap above
+#     host stall window when one host-level value is at or above its limit: steal_ms >=
+#     TR_STALL_STEAL_MS, iowait_ms >= TR_STALL_IOWAIT_MS, io full >= TR_STALL_IO_FULL_MS or
+#     memory some >= TR_STALL_MEM_MS (all per 100 ms sample, steal and iowait over all
+#     CPUs). Host cpu some and the cpu pressure of each node container are reported
+#     values only: Orblx itself can raise them, so they never make a stall window. A gap
+#     with only high cpu pressure is "class quiet_host" (FAIL), and its renew trace is printed. Each reply gap above
 #     TR_GAP_MS gets "class host_stall" when a stall window touches the gap, else
 #     "class quiet_host". The gap gate does not change: each gap above TR_GAP_MS fails
 #     the run. When one gap is host_stall, the run is INVALID (not a PASS): it prints
@@ -56,12 +59,11 @@ TR_OUT_DIR="${TR_OUT_DIR:-}"
 # Host stall limits per 100 ms sample. Baseline: 3000 samples (300 s, 15:29:40-15:34:40 KST
 # 2026-10-31, load1 0.7-2.0, 8 CPUs, no proof container of this run). Baseline max: steal
 # 100 ms, iowait 80 ms (both summed over 8 CPUs, 10 ms steps), cpu some 72.7 ms, io full
-# 52.4 ms, memory some 0.8 ms. Limits: steal and iowait 2x the baseline max; cpu some and
-# io full 90 ms (a PSI value cannot pass 100 ms in a 100 ms sample, so 2x is not possible);
-# memory some 10 ms. No baseline sample is at or above a limit.
+# 52.4 ms, memory some 0.8 ms. Limits: steal and iowait 2x the baseline max; io full 90 ms
+# (a PSI value cannot pass 100 ms in a 100 ms sample, so 2x is not possible); memory some
+# 10 ms. No baseline sample is at or above a limit. cpu some has no limit (reported only).
 TR_STALL_STEAL_MS="${TR_STALL_STEAL_MS:-200}"
 TR_STALL_IOWAIT_MS="${TR_STALL_IOWAIT_MS:-160}"
-TR_STALL_CPU_MS="${TR_STALL_CPU_MS:-90}"
 TR_STALL_IO_FULL_MS="${TR_STALL_IO_FULL_MS:-90}"
 TR_STALL_MEM_MS="${TR_STALL_MEM_MS:-10}"
 SAMPLER_PID=""
@@ -475,7 +477,7 @@ done
 cp "$WORK"/ping-*.txt "$WORK/big-gaps.txt" "$OUTD/" 2>/dev/null || true
 host_out="$(python3 "$ROOT/scripts/proof/host-sampler.py" analyze --samples "$OUTD/host-samples.txt" \
   --gaps "$WORK/big-gaps.txt" --traces "$OUTD/traces.txt" \
-  --steal-ms "$TR_STALL_STEAL_MS" --iowait-ms "$TR_STALL_IOWAIT_MS" --cpu-some-ms "$TR_STALL_CPU_MS" \
+  --steal-ms "$TR_STALL_STEAL_MS" --iowait-ms "$TR_STALL_IOWAIT_MS" \
   --io-full-ms "$TR_STALL_IO_FULL_MS" --mem-some-ms "$TR_STALL_MEM_MS")"
 printf '%s\n' "$host_out"
 printf '%s\n' "$host_out" > "$OUTD/host-analysis.txt"
