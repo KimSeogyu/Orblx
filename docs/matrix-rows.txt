@@ -43,8 +43,8 @@
 37|partial|Tailnet Lock
 38|shipped|Node sharing
 39|missing|Admin roles
-40|partial|Tailscale SSH
-41|partial|SSH session recording
+40|partial|Tailscale SSH|not in rc.3 sweep: no coordinator SSH certs
+41|partial|SSH session recording|not in rc.3 sweep: no coordinator SSH certs
 42|missing|SSH console (browser)
 43|partial|Serve
 44|partial|Funnel

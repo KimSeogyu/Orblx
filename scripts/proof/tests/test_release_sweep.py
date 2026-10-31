@@ -30,6 +30,7 @@ PROOFS = {
     "gatefail.sh": "echo proof_ok\necho 'gate_x failed: median low'\n",
     "natr.sh": "echo 'steady_warn prc_prc sample 140 ms over 100 ms'\necho proof_ok\n",
     "natrq.sh": "echo 'prc_prc steady lost 0/20 max_ms 40 limit_ms 1000'\necho proof_ok\n",
+    "ssh.sh": "echo 'proof_ticket_guard FAIL ssh: the manifest proof makes lab tickets'\nexit 1\n",
     "loud.sh": "seq 1 100000\necho 'to stderr' >&2\nprintf 'no newline at end'\necho\necho proof_ok\n",
 }
 
@@ -69,6 +70,15 @@ proof|nat-realism|scripts/proof/natr.sh|-|-
 proof|steps|scripts/proof/steps.sh|-|-|^gate_x ok: |target/st/run*.log
 """
 
+SKIP_MARK = "not in rc.3 sweep: no coordinator SSH certs"
+
+# W25-27 PO ruling 2026-10-31: the SSH rows stay partial for rc.3. The fake ssh proof fails
+# like the real one does (the lab-ticket guard), so a run that does not skip it fails.
+SSH = GOOD + """partial|40|Tailscale SSH|ssh
+partial|41|SSH session recording|ssh
+proof|ssh|scripts/proof/ssh.sh|-|-
+"""
+
 SWEEP_LINE = re.compile(r"^(proof_(lock|context|contention) |release_sweep: )")
 
 
@@ -86,14 +96,18 @@ class ReleaseSweepTest(unittest.TestCase):
         shutil.rmtree(self.tmp)
 
     @staticmethod
-    def rows_for(manifest):
-        """The rows file that matches MANIFEST: each row line shipped, each partial line partial."""
+    def rows_for(manifest, notes=None):
+        """The rows file that matches MANIFEST: each row line shipped, each partial line partial.
+        NOTES maps a row id to its 4th field."""
+        notes = notes or {}
         out = []
         for line in manifest.splitlines():
             kind = line.split("|")[0]
             if kind in ("row", "partial"):
                 status = "shipped" if kind == "row" else "partial"
-                out.append("%s|%s|%s" % (line.split("|")[1], status, line.split("|")[2]))
+                rid = line.split("|")[1]
+                cells = [rid, status, line.split("|")[2]] + ([notes[rid]] if rid in notes else [])
+                out.append("|".join(cells))
         return "# test rows\n" + "\n".join(out) + "\n"
 
     def run_sweep(self, manifest, only=None, mode=None, plan=False, min_free_gb=None, rows=None):
@@ -337,6 +351,73 @@ class ReleaseSweepTest(unittest.TestCase):
         self.assertIn("Failed rows: 3, 29.", self.table())
         # A partial row with no proof is not a sweep row.
         self.assertEqual(self.run_sweep(GOOD + "partial|28|Key expiry|-\n").returncode, 2)
+
+
+    def test_the_ssh_proof_is_skipped_only_when_the_rows_file_has_the_mark(self):
+        marked = self.rows_for(SSH, {"40": SKIP_MARK, "41": SKIP_MARK})
+        for plan in (True, False):  # the run last: its summary is read below
+            shutil.rmtree(self.out, ignore_errors=True)
+            out = self.run_sweep(SSH, rows=marked, plan=plan)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertIn("release_sweep skip: proof ssh (rows 40 41 ): " + SKIP_MARK, out.stdout)
+            self.assertFalse(os.path.exists(os.path.join(self.out, "rc3-sweep-testsha-ssh.log")))
+        rows = self.rows()
+        for row in ("40 (partial)", "41 (partial)"):
+            self.assertEqual(rows[(row, "ssh")][3], "skipped (%s)" % SKIP_MARK)
+        self.assertEqual(rows[("1", "ok")][3], "proof_ok")
+        self.assertIn("Failed rows: none.", self.table())
+        self.assertIn("Skipped (rows file mark): 1.", self.table())
+
+    def test_negative_without_the_mark_the_ssh_proof_runs_and_fails(self):
+        cases = [
+            self.rows_for(SSH),                       # no mark
+            self.rows_for(SSH, {"40": SKIP_MARK}),    # the mark on one of the two rows only
+        ]
+        for rows in cases:
+            shutil.rmtree(self.out, ignore_errors=True)
+            out = self.run_sweep(SSH, rows=rows)
+            self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+            self.assertNotIn("skip: proof ssh", out.stdout)
+            self.assertTrue(os.path.exists(os.path.join(self.out, "rc3-sweep-testsha-ssh.log")))
+            self.assertIn("Failed rows: 40, 41.", self.table())
+
+    def test_negative_ssh_row_40_or_41_claiming_shipped_stops_the_sweep(self):
+        marked = {"40": SKIP_MARK, "41": SKIP_MARK}
+        for row in ("40", "41"):
+            # The rows file claims shipped (the manifest still says partial).
+            rows = self.rows_for(SSH, marked).replace(row + "|partial|", row + "|shipped|")
+            rows = rows.replace("|" + SKIP_MARK, "")
+            for plan in (False, True):
+                out = self.run_sweep(SSH, rows=rows, plan=plan)
+                self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+                self.assertIn("rows: row %s (SSH) claims shipped" % row, out.stderr)
+            # Both files claim shipped.
+            manifest = SSH.replace("partial|%s|" % row, "row|%s|" % row)
+            out = self.run_sweep(manifest, rows=self.rows_for(manifest))
+            self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+            self.assertIn("(SSH) claims shipped", out.stderr)
+            # Only the manifest claims shipped.
+            out = self.run_sweep(manifest, rows=self.rows_for(SSH, marked))
+            self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+            self.assertIn("manifest: row %s (SSH) claims shipped" % row, out.stderr)
+            self.assertFalse(os.path.exists(os.path.join(self.out, "rc3-sweep-testsha-ok.log")))
+
+    def test_negative_a_bad_4th_field_or_the_mark_on_a_shipped_row_is_a_setup_error(self):
+        out = self.run_sweep(SSH, rows=self.rows_for(SSH, {"40": "skip me", "41": SKIP_MARK}))
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("rows: row 40 has an unknown 4th field", out.stderr)
+        out = self.run_sweep(SSH, rows=self.rows_for(SSH, {"1": SKIP_MARK, "40": SKIP_MARK, "41": SKIP_MARK}))
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("rows: row 1 is shipped and has the skip mark", out.stderr)
+
+    def test_the_real_rows_file_marks_both_ssh_rows(self):
+        with open(REAL_ROWS) as f:
+            lines = [l.rstrip("\n").split("|") for l in f if l.strip() and not l.startswith("#")]
+        marked = sorted(c[0] for c in lines if len(c) > 3)
+        self.assertEqual(marked, ["40", "41"])
+        for c in lines:
+            if c[0] in ("40", "41"):
+                self.assertEqual(c[1:], ["partial", c[2], SKIP_MARK])
 
 
 if __name__ == "__main__":

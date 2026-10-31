@@ -18,12 +18,16 @@
 #   4. Write the summary $ORBLX_SWEEP_OUT/rc3-sweep-<sha>.md: one line for each row and proof
 #      with the row, the result, the log path, the time and the proof_contention line.
 #   5. Remove the images of each proof and, at the end, the worktree and its target.
-# There is no retry and no skip: each proof runs once, and a failed proof does not stop the
-# sweep. A shipped row with no proof is a FAIL.
+# There is no retry, and no skip except the rows-file mark below: each proof runs once, and a
+# failed proof does not stop the sweep. A shipped row with no proof is a FAIL.
 # W25-27: the row status has ONE source, docs/matrix-rows.txt (ID|STATUS|FEATURE, copied
 # from the gap matrix Page). The "row" lines of the manifest must be exactly the shipped rows
 # of that file, and each "partial" line must name a partial row of it. Any difference stops
 # the sweep (exit 2) before a proof runs, in --plan and in a run, and names the rows.
+# A partial row may carry a 4th field, the skip mark (exactly SKIP_MARK below). A proof whose
+# rows all carry the mark does not run: the summary shows it as skipped with the mark. Any
+# other 4th field, or the mark on a shipped row, is exit 2. The SSH rows (40 and 41) can not
+# be shipped for rc.3: a shipped claim for them in either file is exit 2 (PO, 2026-10-31).
 # Exit: 0 every row passed; 1 a proof failed or a row has no proof (the summary names the
 # rows); 2 setup, manifest or build error; 3 ORBLX_SWEEP_ONLY run with no failure (a partial
 # run never counts).
@@ -266,15 +270,35 @@ else
 fi
 # Row ids are numbers, so plain (sparse) arrays keyed by the id work in bash 3.2 (macOS).
 ROW_STATUS=()
+ROW_NOTE=()
+SKIP_MARK='not in rc.3 sweep: no coordinator SSH certs'
+SSH_ROWS="40 41"
 while IFS= read -r line || [[ -n "$line" ]]; do
   [[ -n "$line" && "$line" != \#* ]] || continue
-  IFS='|' read -r rid rstatus _ <<<"$line"
+  IFS='|' read -r rid rstatus _ rnote <<<"$line"
   [[ "$rid" =~ ^[0-9]+$ ]] || die "rows: bad line: $line"
   case "$rstatus" in shipped|partial|missing) ;; *) die "rows: bad status in line: $line" ;; esac
   [[ -z "${ROW_STATUS[$rid]:-}" ]] || die "rows: row $rid is listed twice"
+  if [[ -n "$rnote" && "$rnote" != "$SKIP_MARK" ]]; then
+    die "rows: row $rid has an unknown 4th field '$rnote' (the only one is '$SKIP_MARK')"
+  fi
+  if [[ -n "$rnote" && "$rstatus" != partial ]]; then
+    die "rows: row $rid is $rstatus and has the skip mark; only a partial row can be skipped"
+  fi
   ROW_STATUS[$rid]="$rstatus"
+  ROW_NOTE[$rid]="$rnote"
 done <"$ROWS_TMP"
 [[ "${#ROW_STATUS[@]}" -gt 0 ]] || die "rows: $ROWS_SRC has no rows"
+for id in $SSH_ROWS; do
+  if [[ "${ROW_STATUS[$id]:-}" == shipped ]]; then
+    die "rows: row $id (SSH) claims shipped in $ROWS_SRC; the SSH rows stay partial for rc.3 (no coordinator SSH certs)"
+  fi
+done
+for r in "${!R_ID[@]}"; do
+  if [[ "${R_KIND[$r]}" == row && " $SSH_ROWS " == *" ${R_ID[$r]} "* ]]; then
+    die "manifest: row ${R_ID[$r]} (SSH) claims shipped ($MANIFEST_SRC); the SSH rows stay partial for rc.3 (no coordinator SSH certs)"
+  fi
+done
 mismatch=""
 MAN_ROW=()
 for r in "${!R_ID[@]}"; do
@@ -346,6 +370,23 @@ done
 for i in "${!P_NAME[@]}"; do
   [[ "${P_USED[$i]}" == 1 ]] || die "manifest: proof ${P_NAME[$i]} backs no row and no gate"
 done
+
+# W25-27: a proof is skipped only when every row that names it has the skip mark in the rows
+# file. A proof that also backs a row without the mark (or a gate) runs.
+P_SKIP=()
+for i in "${!P_NAME[@]}"; do
+  skip=1
+  for r in "${!R_ID[@]}"; do
+    [[ " ${R_PROOFS[$r]} " == *" ${P_NAME[$i]} "* ]] || continue
+    if [[ "${R_KIND[$r]}" == gate || "${ROW_NOTE[${R_ID[$r]}]:-}" != "$SKIP_MARK" ]]; then
+      skip=0
+    fi
+  done
+  P_SKIP+=("$skip")
+  if [[ "$skip" == 1 ]]; then
+    note "skip: proof ${P_NAME[$i]} (rows $(for r in "${!R_ID[@]}"; do [[ " ${R_PROOFS[$r]} " == *" ${P_NAME[$i]} "* ]] && printf '%s ' "${R_ID[$r]}"; done)): $SKIP_MARK"
+  fi
+done
 for want in $ONLY; do
   proof_index "$want" >/dev/null || die "unknown proof $want"
 done
@@ -393,7 +434,9 @@ if [[ "$PLAN" == 1 ]]; then
       fi
       for p in ${R_PROOFS[$r]}; do
         i="$(proof_index "$p")"
-        if script_at "${P_PATH[$i]}"; then
+        if [[ "${P_SKIP[$i]}" == 1 ]]; then
+          have="skipped: $SKIP_MARK"
+        elif script_at "${P_PATH[$i]}"; then
           have="${P_PATH[$i]}"
         else
           have="FAIL: no ${P_PATH[$i]}"
@@ -567,10 +610,17 @@ STEADY_WARNED=0
 failed=0
 ran=0
 not_run=0
+skipped=0
 write_table
 for i in "${!P_NAME[@]}"; do
   name="${P_NAME[$i]}"
   path="${P_PATH[$i]}"
+  if [[ "${P_SKIP[$i]}" == 1 ]]; then
+    P_RESULT[$i]="skipped ($SKIP_MARK)"
+    skipped=$((skipped + 1))
+    note "proof $name skipped: $SKIP_MARK"
+    continue
+  fi
   if [[ -n "$ONLY" && " $ONLY " != *" $name "* ]]; then
     P_RESULT[$i]="not run (ORBLX_SWEEP_ONLY)"
     not_run=$((not_run + 1))
@@ -659,7 +709,7 @@ cleanup_worktree
 write_table
 total=$(( $(date +%s) - SWEEP_START ))
 {
-  echo "Proofs run: $ran. Failed proofs: $failed. Not run: $not_run. Total time: ${total} s ($((total / 60)) min $((total % 60)) s). Ended $(date '+%Y-%m-%d %H:%M:%S %Z')."
+  echo "Proofs run: $ran. Failed proofs: $failed. Not run: $not_run. Skipped (rows file mark): $skipped. Total time: ${total} s ($((total / 60)) min $((total % 60)) s). Ended $(date '+%Y-%m-%d %H:%M:%S %Z')."
   if [[ "$not_run" -gt 0 ]]; then
     echo "Partial run (ORBLX_SWEEP_ONLY): it does not count."
   fi
