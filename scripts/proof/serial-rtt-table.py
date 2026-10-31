@@ -15,6 +15,10 @@ One row per run: the max ping, the median ping and the lost pings over the W23-4
   on the box (no other orblx container).
 --last-row: print only the row of the last run (serial-rtt.sh prints it after each run).
 --kill-check: exit 3 when the last run has a ping above the limit and no other orblx container ran.
+--probe-context: W25-16. Print the host probe rows (runN.hostprobe.tsv of host-probe.py) within
+  ORBLX_PROBE_CONTEXT_S (default 3) seconds of the max gate ping of the last run. Report only:
+  the output does not classify the ping and no gate reads it.
+The "Sym relay pps" column is the measured packet rate of the sym_sym relay bulk (bulk_pps line).
 Every number comes from a log line. A missing value is printed as "-".
 Each run also gets runN.samples.tsv: every gate ping sample with its time and the nearest SVID
 renewal (svid_renewal lines, nat-realism.sh prints them before cleanup). The "Renewal" column
@@ -46,6 +50,9 @@ CONTENTION_RE = re.compile(
     r"max_other_orblx_containers (\d+) max_load1 (\S+)$",
     re.M,
 )
+PPS_RE = re.compile(r"^bulk_pps sym_sym_relay .* pps (\d+) client_tx_pps", re.M)
+PROBE_CONTEXT_S = float(os.environ.get("ORBLX_PROBE_CONTEXT_S", "3"))
+KST = datetime.timezone(datetime.timedelta(hours=9))
 TIMES_RE = re.compile(r"^ping_times (relay_ping|direct_ping) (\S+) (\S+)$", re.M)
 RTTS_RE = re.compile(r"^ping_rtts (relay_ping|direct_ping) (\S+) sent \S+ received \S+ ms (\S+)$", re.M)
 RENEW_RE = re.compile(r"^svid_renewal (\S+) (\S+)$", re.M)
@@ -122,6 +129,8 @@ def run_row(out_dir, i):
     row["sent"] = sent
     row["complete"] = len(row["paths"]) == len(GATE_PATHS)
     row["sym_mbit"] = run["throughput"].get("sym_sym_relay")
+    pps = PPS_RE.search(text)
+    row["sym_pps"] = int(pps.group(1)) if pps else None
     secs = SYM_SECS_RE.search(text)
     row["sym_secs"] = float(secs.group(1)) if secs else None
     m = CONTENTION_RE.findall(text)
@@ -132,6 +141,7 @@ def run_row(out_dir, i):
     row["renewals"] = len(renewals)
     row["renewal_near_max"] = None
     row["has_times"] = bool(smp)
+    row["max_sample"] = max(smp, key=lambda x: x[2]) if smp else None
     row["renewal_scan"] = "svid_renewal_scan done" in text
     if smp:
         try:
@@ -172,10 +182,49 @@ def fmt_row(row):
     else:
         renew = "-"
     sym = "-" if row.get("sym_mbit") is None else "%.2f" % row["sym_mbit"]
-    return "| %d | %s | %s | %s | %s | %s | %s | %d/%d | %s | %s | %s | %s | %s | %s |" % (
+    pps = "-" if row.get("sym_pps") is None else "%d" % row["sym_pps"]
+    return "| %d | %s | %s | %s | %s | %s | %s | %d/%d | %s | %s | %s | %s | %s | %s | %s |" % (
         row["run"], "ok" if row["proof_ok"] else "exit %s" % row["exit"], mx,
         med("prc_prc_direct"), med("prc_prc_direct_i0.23"), med("prc_prc_relay"), med("sym_sym_relay"), row["lost"], row["sent"],
-        sym, "-" if c is None else c[4], cont, renew, start, "yes" if row["complete"] else "no")
+        sym, "-" if c is None else c[4], cont, renew, start, "yes" if row["complete"] else "no", pps)
+
+
+def probe_context(out_dir, row):
+    """W25-16: the host probe rows around the max gate ping of one run. Report only."""
+    i = row["run"]
+    top = row.get("max_sample")
+    if top is None:
+        print("host_probe_context run %d none (no ping samples)" % i)
+        return
+    path, seq, ms, at = top
+    when = datetime.datetime.fromtimestamp(at, KST).isoformat(timespec="milliseconds")
+    print("host_probe_context run %d max_ping %.3f ms path %s seq %d at %s epoch %.6f above_limit %s window_s %.1f"
+          % (i, ms, path, seq, when, at, "yes" if ms > LIMIT_MS else "no", PROBE_CONTEXT_S))
+    probe = os.path.join(out_dir, "run%d.hostprobe.tsv" % i)
+    try:
+        with open(probe) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        print("host_probe_context run %d none (no run%d.hostprobe.tsv)" % (i, i))
+        return
+    if not lines:
+        print("host_probe_context run %d none (empty run%d.hostprobe.tsv)" % (i, i))
+        return
+    head = lines[0].split("\t")
+    col = head.index("epoch") if "epoch" in head else None
+    print("host_probe_row " + lines[0])
+    n = 0
+    for line in lines[1:]:
+        p = line.split("\t")
+        try:
+            t = float(p[col])
+        except (TypeError, ValueError, IndexError):
+            continue
+        # A row covers the interval that ends at its time, so keep one interval after the window.
+        if at - PROBE_CONTEXT_S <= t <= at + PROBE_CONTEXT_S + 1:
+            print("host_probe_row " + line)
+            n += 1
+    print("host_probe_context run %d rows %d" % (i, n))
 
 
 def median(values):
@@ -233,6 +282,10 @@ def main(argv):
         if last and last["max"] and last["max"][0] > LIMIT_MS and contended(last) is False:
             return 3
         return 0
+    if "--probe-context" in argv:
+        if rows:
+            probe_context(out_dir, rows[-1])
+        return 0
     if "--sym-gate" in argv:
         return sym_gate(rows)
     if "--gate" in argv:
@@ -244,8 +297,9 @@ def main(argv):
         print("serial_rtt gate ok: %d runs, every max ping below %s ms, 0 lost" % (len(rows), LIMIT_MS))
         return 0
     print("| Run | Result | Max ping ms (path) | Median direct | Median direct 0.23 s | Median prc relay | Median sym relay | "
-          "Lost | Sym relay Mbit/s | Max load1 | Contention | Max ping vs nearest SVID renewal | Start | All paths |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+          "Lost | Sym relay Mbit/s | Max load1 | Contention | Max ping vs nearest SVID renewal | Start | All paths | "
+          "Sym relay pps |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for row in rows:
         print(fmt_row(row))
     print()
