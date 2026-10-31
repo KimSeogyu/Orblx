@@ -64,7 +64,7 @@ proof|revoke-followup|scripts/proof/revoke-followup.sh|ORBLX_PROOF_PROFILE=relea
 proof|api-tokens|scripts/proof/api-tokens.sh|ATPROOF_BIN=@BIN@ ATPROOF_PROJECT=orblx-rc3sw-tokens ATPROOF_IMAGE=orblx-rc3sw-tokens:local|orblx-rc3sw-tokens:local
 proof|token-no-escalation|scripts/proof/token-no-escalation.sh|ESC_BIN=@BIN@ ESC_PROJECT=orblx-rc3sw-escalation ESC_IMAGE=orblx-rc3sw-escalation:local|orblx-rc3sw-escalation:local
 proof|node-share|scripts/proof/node-share.sh|-|orblx-w25a-share:w25
-proof|user-approval|scripts/proof/user-approval.sh|-|orblx-w25o-users:old orblx-w25o-users:new
+proof|user-approval|scripts/proof/user-approval.sh|OLD_ORBLX=@OLD:d9704cfb2f63bebbd3890f5b1accff30b2cace1f@|orblx-w25o-users:old orblx-w25o-users:new
 proof|ssh|scripts/proof/ssh.sh|-|orblx-ssh:local
 proof|file-send|scripts/proof/file-send.sh|-|orblx-w23a-file:w23
 proof|config-audit|scripts/proof/config-audit.sh|-|orblx-audit:w20
