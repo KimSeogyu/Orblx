@@ -101,7 +101,8 @@ def reader_of(line):
 SILENT_PASS_CHECKS = [
     ("scripts/proof/coord-enroll.sh", "grep -q 'ge1\\.'", '{"token":"ge1.fake-token"}', "leak"),
     ("scripts/proof/coord-enroll.sh", "nodes.json | read_all grep -q 'PRIVATE KEY'", "-----BEGIN PRIVATE KEY-----", "leak"),
-    ("scripts/proof/coord-enroll.sh", "The netmap is not valid", "The netmap is not valid.", "gate"),
+    ("scripts/proof/coord-enroll.sh", "\"$up_out\" | read_all grep -q 'The netmap is not valid'", "The netmap is not valid.", "gate"),
+    ("scripts/proof/coord-enroll.sh", "\"$ready_out\" | read_all grep -q 'The netmap is not valid'", "The netmap is not valid.", "gate"),
     ("scripts/proof/custom-oidc.sh", "dc logs 2>&1 | read_all grep -qF", "token eyJfake.sigpart end", "leak"),
     ("scripts/proof/custom-oidc.sh", "nodes.json | read_all grep -qF", "token eyJfake.sigpart end", "leak"),
     ("scripts/proof/custom-oidc.sh", "dc logs 2>&1 | read_all grep -q 'PRIVATE KEY'", "-----BEGIN PRIVATE KEY-----", "leak"),
@@ -523,3 +524,64 @@ class SiemStreamingTest(unittest.TestCase):
         self.assertEqual((old.returncode, old.stdout.strip()), (0, "0"))
         new = subprocess.run(["sh", "-c", "set -e; test -d /no/such/dir; wc -l < /dev/null"], capture_output=True, text=True)
         self.assertNotEqual(new.returncode, 0)
+
+
+# compose-clean.sh (#114) is a library. It removes containers and starts none.
+COMPOSE_PROOF_LIBS = {"serve-lib.sh", "stage-image.sh", "pipe-lib.sh", "proof-lock.sh", "compose-clean.sh"}
+
+
+class ComposeCleanupTest(unittest.TestCase):
+    """W25-14b: a proof that starts compose containers removes them on each exit (port 443 leak)."""
+
+    def test_each_compose_proof_has_a_down_in_its_exit_trap(self):
+        proof_dir = os.path.join(REPO, "scripts", "proof")
+        bad = []
+        for name in sorted(os.listdir(proof_dir)):
+            if not name.endswith(".sh") or name in COMPOSE_PROOF_LIBS:
+                continue
+            with open(os.path.join(proof_dir, name)) as f:
+                src = f.read()
+            if not re.search(r"docker compose|\bdc\(\)|\bcompose\(\)", src):
+                continue
+            trap = re.search(r"^\s*trap '([^']*)' EXIT", src, re.M)
+            if not trap:
+                bad.append("%s: no exit trap with cleanup" % name)
+                continue
+            funcs = re.findall(r"\b([a-z_]+)\b", trap.group(1))
+            bodies = "".join(re.findall(r"^%s\(\) \{\n(.*?)^\}" % fn, src, re.M | re.S)[0]
+                             for fn in funcs if re.search(r"^%s\(\) \{" % fn, src, re.M))
+            if not re.search(r"\bdown\b", bodies):
+                bad.append("%s: the exit trap does not run compose down" % name)
+        self.assertEqual(bad, [])
+
+    def test_coord_enroll_up_check_needs_a_real_tun_and_a_bad_netmap_fails(self):
+        with open(os.path.join(REPO, "scripts", "proof", "coord-enroll.sh")) as f:
+            src = f.read()
+        with open(os.path.join(REPO, "scripts", "proof", "compose.coord.yml")) as f:
+            compose = f.read()
+        self.assertIn("/dev/net/tun:/dev/net/tun", compose)
+        self.assertIn("NET_ADMIN", compose)
+        for text in ("orblx up did not accept the netmap.", "orblx up rejected the coordinator netmap.",
+                     "orblx up reported success without a TUN device.",
+                     "orblx up changed the node state when the TUN device did not open.",
+                     "orblx up did not reject the changed netmap.", 'grep -qx "The overlay IP is ${self_ip}."'):
+            self.assertIn(text, src)
+        self.assertNotIn("sleep", src[src.index("orblx up reads netmap.json"):])
+        self.assertLess(src.index("trap 'cleanup; proof_lock_end' EXIT"), src.index('proof_lock_take "coord-enroll"'))
+        # W25-14b: the free-space check runs before the lock and before any proof step.
+        self.assertIn("COORD_ENROLL_MIN_FREE_GIB=12", src)
+        self.assertLess(src.index("proof_infra_abort coord-enroll reason=disk_low"), src.index('proof_lock_take "coord-enroll"'))
+        self.assertLess(src.index("proof_infra_abort coord-enroll reason=disk_low"), src.index("cargo build"))
+        # Without "--profile nodes", "down -v" keeps the node volumes (and an old ticket.bin).
+        self.assertIn("dc --profile nodes down -v --remove-orphans", src)
+        self.assertNotRegex(src, r"(?m)^dc down -v")
+        self.assertIn("orblx-coord-proof_orblx-node-a", src)
+        # PO gate 2c: a stale ticket.bin with no netmap must make up fail.
+        self.assertIn("orblx up did not stop on a stale ticket.bin with no netmap", src)
+        self.assertIn("orblx up reported ready with a stale ticket.bin and no netmap.", src)
+        # PO: wait_bundle has a hard deadline and a timeout on each read.
+        body = src[src.index("wait_bundle() {"):src.index("echo \"=== [C] remove old proof volumes")]
+        self.assertIn("WAIT_BUNDLE_SECS=90", src)
+        self.assertIn("SECONDS < deadline", body)
+        self.assertIn("timeout 10 ", body)
+        self.assertIn("return 1", body)
