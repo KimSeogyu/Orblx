@@ -38,6 +38,11 @@ def main():
     ap.add_argument("--secs", type=float, required=True)
     ap.add_argument("targets", nargs="+")
     a = ap.parse_args()
+    try:
+        with open("/proc/self/comm", "w") as f:
+            f.write("orblx-hprobe")
+    except OSError:
+        pass
     sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
     sock.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
     ident = (os.getpid() ^ 0x5A5A) & 0xFFFF

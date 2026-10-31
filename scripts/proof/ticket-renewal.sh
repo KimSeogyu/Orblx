@@ -59,6 +59,12 @@ TR_OUT_DIR="${TR_OUT_DIR:-}"
 # W25-42 diagnostic mode (not a gate change): node diag files, ping -O, host probers,
 # docker events and dmesg in TR_OUT_DIR.
 TR_DIAG="${TR_DIAG:-0}"
+# TR_DIAG=2 adds the W25-42 step 2 scheduler sampler (sched-sampler.py) to TR_DIAG=1.
+TR_DIAG_SCHED=0
+if [[ "$TR_DIAG" == "2" ]]; then
+  TR_DIAG=1
+  TR_DIAG_SCHED=1
+fi
 if [[ "$TR_DIAG" == "1" ]]; then
   export TR_DIAG_FILE=/var/lib/orblx/diag.txt
 fi
@@ -95,6 +101,9 @@ cleanup() {
   [[ -z "$SAMPLER_PID" ]] || kill "$SAMPLER_PID" >/dev/null 2>&1 || true
   for pid in "${DIAG_PIDS[@]}"; do
     kill "$pid" >/dev/null 2>&1 || true
+  done
+  for pid in "${DIAG_PIDS[@]}"; do
+    wait "$pid" 2>/dev/null || true
   done
   if [[ "$TR_DIAG" == "1" && -n "${OUTD:-}" ]]; then
     local n
@@ -359,6 +368,17 @@ if [[ "$TR_DIAG" == "1" ]]; then
     echo "diag_prober ${src} netns_pid ${npid} targets ${targets[*]}"
   done
 fi
+if [[ "$TR_DIAG" == "1" ]]; then
+  # The exact host prober path: source netns, route, source address, interface.
+  for src in "${NODES[@]}"; do
+    npid="$(docker inspect -f '{{.State.Pid}}' "$(dc ps -q "$src")")"
+    for dst in "${NODES[@]}"; do
+      [[ "$src" == "$dst" ]] && continue
+      echo "prober_path ${src} netns_pid ${npid} $(nsenter --net="/proc/${npid}/ns/net" ip -o route get "${OVERLAY[$dst]}" | head -1)"
+    done
+    echo "prober_iface ${src} $(nsenter --net="/proc/${npid}/ns/net" ip -o -4 addr show dev orblx0 | awk '{print $2, $4}')"
+  done | tee "$OUTD/prober-path.txt"
+fi
 PING_OPT=()
 [[ "$TR_DIAG" == "1" ]] && PING_OPT=(-O)
 
@@ -371,6 +391,21 @@ for src in "${NODES[@]}"; do
     PING_PIDS+=("$!")
   done
 done
+if [[ "$TR_DIAG_SCHED" == "1" ]]; then
+  sched_args=()
+  for i in "${!NODES[@]}"; do
+    n="${NODES[$i]}"
+    sched_args+=(--node "${n}=$(docker inspect -f '{{.State.Pid}}' "$(dc ps -q "$n")")")
+  done
+  # DIAG_PIDS = docker events, then one prober per node in NODES order.
+  for i in "${!NODES[@]}"; do
+    sched_args+=(--prober "${NODES[$i]}=${DIAG_PIDS[$((i + 1))]}")
+  done
+  python3 "$ROOT/scripts/proof/sched-sampler.py" --dir "$OUTD" --secs "$PING_SECS" --trace "${sched_args[@]}" \
+    > "$OUTD/sched-sampler.out" 2>&1 &
+  DIAG_PIDS+=("$!")
+  echo "sched_sampler pid $! ${sched_args[*]}"
+fi
 
 echo "=== [C] sample the status of each node every 2 s ==="
 lost=0
