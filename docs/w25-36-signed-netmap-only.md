@@ -49,3 +49,13 @@ The tests write valid files, then change the bytes on disk. [C]
   a TUN device (root), so CI does not run it.
 - [C] A local user who can delete all coordinator files can also change every other state file.
   This change does not defend against that user.
+
+## Release notes
+
+- A local user who deletes all 4 enrollment markers (`node.crt.pem`, `netmap.signed.json`,
+  `coord-addr`, `node-name`) can make the node read `netmap.json`. This is outside the threat model.
+
+## Open gate
+
+- OPEN: a REAL run with a full TUN node (root) that tampers with both netmap files while the node
+  runs, with 0 accepted. W25-36 does not close before this run passes.
