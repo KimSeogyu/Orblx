@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
 use orblx_agent::{
-    open_use, seal_use, sign_grant, AgentGrant, GrantFiles, GuardConfig, GuardCore, GuardDecision,
-    SignedAgentGrant, UseTarget, UseTrust, GRANT_VERSION,
+    open_use, seal_use, sign_grant, AgentGrant, GrantDir, GrantFiles, GrantRefresh, GuardConfig,
+    GuardCore, GuardDecision, SignedAgentGrant, UseTarget, UseTrust, GRANT_VERSION,
 };
 use orblx_audit::{verify_config_file, ConfigAction, DenyReason};
 use orblx_identity::{
@@ -333,4 +333,65 @@ fn a_stale_deny_set_refuses_each_use() {
     let line = seal(&fixture, "web", PORT, later);
     let decision = core.admit(&line, "web", PORT, &[], peer(), later).unwrap();
     assert!(matches!(decision, GuardDecision::Refuse("stale")));
+}
+
+/// One grant set with a new id and, when given, a new service.
+fn grant_set(ttl: u64, id: &str, service: Option<&str>) -> GrantFiles {
+    let fixture = fixture(ttl);
+    let mut grant = fixture.files.grant.grant.clone();
+    grant.id = id.to_string();
+    if let Some(service) = service {
+        grant.service = service.to_string();
+    }
+    GrantFiles {
+        grant: sign_grant(&fixture.netmap, &grant).unwrap(),
+        ..fixture.files
+    }
+}
+
+#[test]
+fn a_grant_dir_takes_only_a_complete_newer_grant_with_the_same_scope() {
+    let dir = temp_path("grant-dir").with_file_name("grant");
+    let first = grant_set(30, "00000000000000a1", None);
+    first.write(&dir).unwrap();
+    let mut grants = GrantDir::open(&dir).unwrap();
+    assert_eq!(grants.refresh(), GrantRefresh::Same);
+
+    // A newer grant with the same scope replaces the current grant.
+    let second = grant_set(60, "00000000000000a2", None);
+    second.write(&dir).unwrap();
+    assert_eq!(
+        grants.refresh(),
+        GrantRefresh::Switched {
+            from: "00000000000000a1".to_string(),
+            to: "00000000000000a2".to_string(),
+        }
+    );
+    assert_eq!(grants.refresh(), GrantRefresh::Same);
+
+    // A mixed set (a write that is not complete) does not replace it.
+    let third = grant_set(90, "00000000000000a3", None);
+    third.write(&dir).unwrap();
+    std::fs::write(dir.join("ticket.bin"), &second.ticket).unwrap();
+    assert_eq!(grants.refresh(), GrantRefresh::Kept("incomplete"));
+    assert!(GrantFiles::load(&dir).is_err());
+    third.write(&dir).unwrap();
+    std::fs::write(dir.join("agent.key.pem"), &second.key_pem).unwrap();
+    assert_eq!(grants.refresh(), GrantRefresh::Kept("incomplete"));
+    assert_eq!(grants.files().grant.grant.id, "00000000000000a2");
+
+    // When the write is complete, the agent takes the grant.
+    third.write(&dir).unwrap();
+    assert!(matches!(grants.refresh(), GrantRefresh::Switched { .. }));
+    assert_eq!(grants.files().grant.grant.id, "00000000000000a3");
+
+    // Another scope or an earlier end does not replace the current grant.
+    grant_set(120, "00000000000000b1", Some("db"))
+        .write(&dir)
+        .unwrap();
+    assert_eq!(grants.refresh(), GrantRefresh::Kept("scope"));
+    grant_set(40, "00000000000000b2", None).write(&dir).unwrap();
+    assert_eq!(grants.refresh(), GrantRefresh::Kept("older"));
+    assert_eq!(grants.files().grant.grant.id, "00000000000000a3");
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
 }

@@ -22,7 +22,7 @@ mod hex;
 mod nonce_store;
 mod proof;
 
-pub use client::{connect, ConnectError, GrantFiles};
+pub use client::{connect, ConnectError, GrantDir, GrantFiles, GrantRefresh};
 pub use gateway::{
     check_request, forward_bytes, header_block, http_extra, new_nonce, parse_request,
     path_in_scope, plain_http_request, request_header, run_gateway, seal_http_request, send_http,

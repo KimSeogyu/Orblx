@@ -3,12 +3,16 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use orblx_identity::SpiffeId;
+use ed25519_dalek::SigningKey;
+use orblx_identity::{
+    ed25519_public_key_from_certificate_pem, ed25519_seed_from_private_pem, ticket_hash, SpiffeId,
+};
 
-use crate::grant::SignedAgentGrant;
+use crate::grant::{AgentGrant, SignedAgentGrant};
+use crate::hex::encode_hex;
 use crate::proof::{seal_use, UseTarget};
 use crate::AgentError;
 
@@ -46,19 +50,45 @@ impl std::fmt::Debug for GrantFiles {
 
 impl GrantFiles {
     /// Read the grant files from `dir`.
+    ///
+    /// The function reads `grant.json` before and after the other files.
+    /// `fetch` writes `grant.json` last. The function refuses a mixed set:
+    /// the two `grant.json` reads must match, the ticket must match the
+    /// ticket hash of the grant, and the key must match the certificate.
     pub fn load(dir: &Path) -> Result<Self, AgentError> {
         let io = |err: std::io::Error| AgentError::Io(err.to_string());
+        let before = fs::read(dir.join(GRANT_FILE)).map_err(io)?;
         let cert_pem = fs::read_to_string(dir.join(CERT_FILE)).map_err(io)?;
         let key_pem = fs::read_to_string(dir.join(KEY_FILE)).map_err(io)?;
         let ticket = fs::read(dir.join(TICKET_FILE)).map_err(io)?;
-        let text = fs::read_to_string(dir.join(GRANT_FILE)).map_err(io)?;
-        let grant = serde_json::from_str(&text).map_err(|_| AgentError::Grant)?;
-        Ok(Self {
+        let after = fs::read(dir.join(GRANT_FILE)).map_err(io)?;
+        if before != after {
+            return Err(AgentError::Grant);
+        }
+        let grant: SignedAgentGrant =
+            serde_json::from_slice(&after).map_err(|_| AgentError::Grant)?;
+        let files = Self {
             cert_pem,
             key_pem,
             ticket,
             grant,
-        })
+        };
+        files.check_set()?;
+        Ok(files)
+    }
+
+    /// Check that the four files come from one issue.
+    fn check_set(&self) -> Result<(), AgentError> {
+        if encode_hex(&ticket_hash(&self.ticket)) != self.grant.grant.ticket_hash {
+            return Err(AgentError::Grant);
+        }
+        let seed = ed25519_seed_from_private_pem(&self.key_pem).map_err(|_| AgentError::Key)?;
+        let cert_key =
+            ed25519_public_key_from_certificate_pem(&self.cert_pem).map_err(|_| AgentError::Key)?;
+        if SigningKey::from_bytes(&seed).verifying_key().to_bytes() != cert_key {
+            return Err(AgentError::Key);
+        }
+        Ok(())
     }
 
     /// Write the grant files to `dir`.
@@ -74,6 +104,99 @@ impl GrantFiles {
         write_file(&dir.join(GRANT_FILE), grant.as_bytes(), 0o644)?;
         Ok(())
     }
+}
+
+/// The result of one [`GrantDir::refresh`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantRefresh {
+    /// The directory holds the current grant.
+    Same,
+    /// The directory holds a new grant with the same scope and a later end.
+    /// The fields are the old and the new grant id.
+    Switched {
+        /// The grant id before the switch.
+        from: String,
+        /// The grant id after the switch.
+        to: String,
+    },
+    /// The directory holds a new grant that the agent does not use.
+    /// The text is a short reason: `incomplete`, `scope`, or `older`.
+    Kept(&'static str),
+}
+
+/// A grant directory that a long-running agent reads again.
+///
+/// A grant is single-use and ends at its end time. To keep access, the agent
+/// requests a new grant, the owner approves it, and `orblx agent grant fetch`
+/// writes it to the same directory before the current grant ends.
+/// [`GrantDir::refresh`] then takes the new grant with no restart.
+/// The grant policy, the grant check, and the proof do not change.
+#[derive(Debug)]
+pub struct GrantDir {
+    dir: PathBuf,
+    files: GrantFiles,
+    raw: Vec<u8>,
+}
+
+impl GrantDir {
+    /// Read the grant files from `dir`.
+    pub fn open(dir: &Path) -> Result<Self, AgentError> {
+        let raw = fs::read(dir.join(GRANT_FILE)).map_err(|err| AgentError::Io(err.to_string()))?;
+        let files = GrantFiles::load(dir)?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            files,
+            raw,
+        })
+    }
+
+    /// The grant files in use.
+    #[must_use]
+    pub fn files(&self) -> &GrantFiles {
+        &self.files
+    }
+
+    /// Read the directory again and take a newer grant.
+    ///
+    /// The function takes the new grant only when the set is complete,
+    /// the scope is the same, and the new grant ends later.
+    /// In each other case the current grant stays in use.
+    pub fn refresh(&mut self) -> GrantRefresh {
+        let Ok(raw) = fs::read(self.dir.join(GRANT_FILE)) else {
+            return GrantRefresh::Kept("incomplete");
+        };
+        if raw == self.raw {
+            return GrantRefresh::Same;
+        }
+        let Ok(files) = GrantFiles::load(&self.dir) else {
+            return GrantRefresh::Kept("incomplete");
+        };
+        let (old, new) = (&self.files.grant.grant, &files.grant.grant);
+        // A complete set is read one time only. The next refresh reads it
+        // again only when `grant.json` changes.
+        if !same_scope(old, new) {
+            self.raw = raw;
+            return GrantRefresh::Kept("scope");
+        }
+        if new.expires <= old.expires {
+            self.raw = raw;
+            return GrantRefresh::Kept("older");
+        }
+        let from = old.id.clone();
+        let to = new.id.clone();
+        self.raw = raw;
+        self.files = files;
+        GrantRefresh::Switched { from, to }
+    }
+}
+
+fn same_scope(old: &AgentGrant, new: &AgentGrant) -> bool {
+    old.agent == new.agent
+        && old.node == new.node
+        && old.addr == new.addr
+        && old.service == new.service
+        && old.port == new.port
+        && old.path_prefix == new.path_prefix
 }
 
 fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), AgentError> {
