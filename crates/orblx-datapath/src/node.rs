@@ -25,6 +25,8 @@ use crate::dns::{
     refresh_resolver, serve_dns, DnsTable, ExitNodeForwarder, LinkResolverGuard, PeerVisibility,
     QueryForwarder, ResolvConfForwarder, DNS_PORT,
 };
+use crate::ha::{RouteAudit, RouteSelector, HA_DEAD_AFTER, ROUTE_AUDIT_FILE};
+use crate::ipv4::ipv4_destination;
 use crate::ipv4::{inbound_action, InboundAction};
 #[cfg(target_os = "macos")]
 use crate::netmap::{ipv4_mask, parse_cidr};
@@ -57,7 +59,9 @@ const PATH_STALE: &str = "stale";
 const PATH_DOWN: &str = "down";
 /// A session with no received frame for this long is `stale`.
 const STALE_AFTER: Duration = Duration::from_secs(2);
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+/// W25 HA subnet routers: a short interval lets a client see a failed router in
+/// [`crate::HA_DEAD_AFTER`] (four intervals). The frame is the same control frame.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(250);
 
 static LINK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -457,6 +461,11 @@ pub fn read_status_text(state_dir: &Path) -> Result<String, HelloError> {
 #[must_use]
 pub fn running_pid(state_dir: &Path) -> Option<u32> {
     let pid = read_pid(state_dir)?;
+    // A killed container leaves its pid file. The restarted node can get the same pid
+    // (pid 1 in a container). That pid file is stale (W25 HA router restart).
+    if pid == std::process::id() {
+        return None;
+    }
     if process_is_running(pid) {
         Some(pid)
     } else {
@@ -700,17 +709,31 @@ async fn run_mesh_inner(
     let tun_shutdown = shutdown_rx.clone();
     let tun_links = Arc::clone(&links);
     let tun_counters = Arc::clone(&counters);
+    let tun_peers = Arc::clone(&peers);
     let accept_routes = request.accept_routes;
+    // The netmap watch can add an HA route later (W25-6), so each node that accepts
+    // routes has the audit writer. The writer opens the file at the first record.
+    let tun_audit = if accept_routes {
+        print_ha_routes(&tun_router.borrow());
+        RouteAudit::spawn(state_dir.join(ROUTE_AUDIT_FILE), node.svid.clone())
+    } else {
+        RouteAudit::off()
+    };
     let exit_node = request.exit_node.clone();
     let relay = request.relay;
     tasks.push(tokio::spawn(async move {
         read_tun(
             from_tun,
-            tun_router,
-            tun_links,
+            TunRoutes {
+                router: tun_router,
+                links: tun_links,
+                peers: tun_peers,
+                selector: RouteSelector::new(),
+                audit: tun_audit,
+                accept_routes,
+                exit_node,
+            },
             tun_shutdown,
-            accept_routes,
-            exit_node,
             tun_counters,
         )
         .await;
@@ -994,13 +1017,97 @@ async fn external_stop(external: Option<watch::Receiver<bool>>) {
     }
 }
 
-async fn read_tun(
-    mut from_tun: mpsc::Receiver<Vec<u8>>,
+/// Print each HA route (W25) and its routers.
+fn print_ha_routes(table: &RouterTable) {
+    for (cidr, routers) in table.ha_routes() {
+        println!(
+            "The HA route {cidr} has the routers {}.",
+            routers.join(", ")
+        );
+    }
+}
+
+struct TunRoutes {
+    /// The router table. The netmap watch (W25-6) replaces it.
     router: watch::Receiver<RouterTable>,
     links: Arc<Mutex<HashMap<String, LiveLink>>>,
-    mut shutdown: watch::Receiver<bool>,
+    peers: Arc<Mutex<Vec<PeerView>>>,
+    selector: RouteSelector,
+    audit: RouteAudit,
     accept_routes: bool,
     exit_node: Option<String>,
+}
+
+impl TunRoutes {
+    /// Return the peer for one outbound packet.
+    ///
+    /// A route with one owner uses the router table only.
+    /// An HA route (W25) uses the selector and the session health.
+    fn peer_for(&self, packet: &[u8]) -> Option<String> {
+        let dest = ipv4_destination(packet)?;
+        let table = self.router.borrow();
+        let Some(found) = table.lookup_match(dest, self.accept_routes) else {
+            return route_packet(
+                &table,
+                packet,
+                self.accept_routes,
+                self.exit_node.as_deref(),
+            )
+            .map(str::to_string);
+        };
+        if !found.is_ha() {
+            return found.peers.first().cloned();
+        }
+        let cidr = format!("{}/{}", found.prefix, found.prefix_len);
+        let now = Instant::now();
+        let (peer, change) = self
+            .selector
+            .pick(&cidr, found.peers, |name| self.healthy(name, now));
+        if let Some(change) = change {
+            match &change.from {
+                Some(from) => {
+                    let silent = self.silent_ms(from, now);
+                    println!(
+                        "The HA route {} uses {}. The router before was {from}.",
+                        change.cidr, change.to
+                    );
+                    self.audit.record(&change, silent);
+                }
+                None => println!("The HA route {} uses {}.", change.cidr, change.to),
+            }
+        }
+        peer
+    }
+
+    /// The time since the last frame from `name`. `None` when it has no session.
+    fn silent_ms(&self, name: &str, now: Instant) -> Option<u128> {
+        lock(&self.peers)
+            .iter()
+            .find(|peer| peer.name == name && peer.session)
+            .and_then(|peer| peer.last_rx)
+            .map(|then| now.saturating_duration_since(then).as_millis())
+    }
+
+    /// A router is healthy when it has a live link and sent a frame in the last
+    /// [`HA_DEAD_AFTER`].
+    fn healthy(&self, name: &str, now: Instant) -> bool {
+        if !lock(&self.links).contains_key(name) {
+            return false;
+        }
+        lock(&self.peers).iter().any(|peer| {
+            peer.name == name
+                && peer.session
+                && peer
+                    .last_rx
+                    .is_some_and(|then| now.saturating_duration_since(then) <= HA_DEAD_AFTER)
+        })
+    }
+}
+
+async fn read_tun(
+    mut from_tun: mpsc::Receiver<Vec<u8>>,
+    routes: TunRoutes,
+    mut shutdown: watch::Receiver<bool>,
     counters: Arc<NodeCounters>,
 ) {
     loop {
@@ -1014,17 +1121,12 @@ async fn read_tun(
                 let Some(packet) = packet else {
                     return;
                 };
-                // The guard of the router table must not live across an await.
-                let peer = {
-                    let table = router.borrow();
-                    route_packet(&table, &packet, accept_routes, exit_node.as_deref())
-                        .map(str::to_string)
-                };
-                let Some(peer) = peer else {
+                // peer_for drops the guard of the router table before the await.
+                let Some(peer) = routes.peer_for(&packet) else {
                     continue;
                 };
                 let tx = {
-                    let map = lock(&links);
+                    let map = lock(&routes.links);
                     map.get(&peer).map(|link| link.tx.clone())
                 };
                 if let Some(tx) = tx {
@@ -1152,6 +1254,9 @@ fn apply_peer_netmap(
         println!("The node installs route {cidr}.");
     }
     installed.extend(added);
+    if watch.accept_routes && watch.router.borrow().ha_routes() != table.ha_routes() {
+        print_ha_routes(&table);
+    }
     watch.router.send_replace(table);
     let new_peers: Vec<&NetmapPeer> = netmap
         .peers

@@ -8,6 +8,7 @@ mod exit_route;
 mod filter;
 mod framing;
 mod gate;
+mod ha;
 mod ipv4;
 mod netmap;
 mod node;
@@ -36,6 +37,7 @@ pub use exit_route::{plan_exit_routes, underlay_addresses, ExitRoutePlan};
 pub use filter::{FilterStats, PacketFilter, PACKET_AUDIT_FILE};
 pub use framing::{decode_length_prefixed, encode_length_prefixed, MAX_FRAME_LEN};
 pub use gate::PeerGate;
+pub use ha::{RouteAudit, RouteChange, RouteSelector, HA_DEAD_AFTER, ROUTE_AUDIT_FILE};
 pub use ipv4::{ipv4_destination, ipv4_packet, is_icmp_echo_reply, is_ipv4_packet};
 pub use netmap::{
     valid_split_domain, valid_split_nameserver, LockUpdate, Netmap, NetmapError, NetmapPeer,
@@ -50,7 +52,7 @@ pub use quic::{
     measure_hello_rtt, prove_hello_socket, HelloConfig, HelloEndpoint, HelloReceiver, HelloSender,
     HelloSession, HelloSocketRole,
 };
-pub use router::{route_packet, RouterError, RouterTable};
+pub use router::{route_packet, RouteMatch, RouterError, RouterTable};
 pub use run::{run_hello, HelloRequest, HelloRole};
 pub use tun_bench::{run_local_tun_bench, TunBenchOutcome, TunBenchReport};
 pub use tun_dev::{
