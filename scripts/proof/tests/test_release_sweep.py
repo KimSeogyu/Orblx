@@ -32,6 +32,9 @@ PROOFS = {
     "natrq.sh": "echo 'prc_prc steady lost 0/20 max_ms 40 limit_ms 1000'\necho proof_ok\n",
     "ssh.sh": "echo 'proof_ticket_guard FAIL ssh: the manifest proof makes lab tickets'\nexit 1\n",
     "old.sh": 'OLD_ORBLX="${OLD_ORBLX:?set OLD_ORBLX}"\necho "old=$OLD_ORBLX"\necho proof_ok\n',
+    "slow.sh": "sleep 1\necho proof_ok\n",
+    "ownbad.sh": "sleep 1\necho 'proof_contention ownbad samples 3 contended_samples 0 unknown_samples 2 "
+                 "max_other_orblx_containers 0 max_load1 0.1'\necho proof_ok\n",
     "loud.sh": "seq 1 100000\necho 'to stderr' >&2\nprintf 'no newline at end'\necho\necho proof_ok\n",
 }
 
@@ -83,12 +86,27 @@ proof|ssh|scripts/proof/ssh.sh|-|-
 PIN = "d9704cfb2f63bebbd3890f5b1accff30b2cace1f"
 OLD = GOOD + "row|32|User approval|old\nproof|old|scripts/proof/old.sh|OLD_ORBLX=@OLD:%s@|-\n"
 
+# W25-27 contention rule: the probe samples every 0.2 s, and the proofs run 1 s.
+PROBE = """
+row|1|Mesh|slow
+proof|slow|scripts/proof/slow.sh|ORBLX_PROOF_SAMPLE_SECS=0.2|-
+"""
+
 SWEEP_LINE = re.compile(r"^(proof_(lock|context|contention) |release_sweep: )")
 
 
 class ReleaseSweepTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        # A fake docker first on the sweep tool PATH ($CARGO_HOME/bin): "docker ps" works (no
+        # containers), so the contention probe has unknown_samples 0, unless the file
+        # docker-fails exists (then docker ps fails and each sample is unknown).
+        self.cargo_home = os.path.join(self.tmp, "cargo")
+        os.makedirs(os.path.join(self.cargo_home, "bin"))
+        docker = os.path.join(self.cargo_home, "bin", "docker")
+        with open(docker, "w") as f:
+            f.write('#!/bin/sh\n[ -f "%s" ] && exit 1\nexit 0\n' % os.path.join(self.tmp, "docker-fails"))
+        os.chmod(docker, 0o755)
         self.root = os.path.join(self.tmp, "root")
         self.out = os.path.join(self.tmp, "out")
         os.makedirs(os.path.join(self.root, "scripts", "proof"))
@@ -133,6 +151,7 @@ class ReleaseSweepTest(unittest.TestCase):
             "ORBLX_SWEEP_MIN_FREE_GB": "0",
         })
         env.pop("OLD_ORBLX", None)
+        env["CARGO_HOME"] = self.cargo_home
         env["ORBLX_SWEEP_WORK"] = os.path.join(self.tmp, "work")
         env.update(extra_env or {})
         if only is not None:
@@ -481,6 +500,66 @@ class ReleaseSweepTest(unittest.TestCase):
             line = [l.rstrip("\n") for l in f if l.startswith("proof|user-approval|")]
         self.assertEqual(len(line), 1)
         self.assertEqual(line[0].split("|")[3], "OLD_ORBLX=@OLD:%s@" % PIN)
+
+
+    def contention(self, log, name):
+        return subprocess.run(["bash", SWEEP, "--contention-check", log, name], capture_output=True, text=True)
+
+    def test_contention_unknown_samples_0_passes(self):
+        out = self.run_sweep(PROBE)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        cells = self.rows()[("1", "slow")]
+        self.assertEqual(cells[3], "proof_ok")
+        m = re.search(r"samples (\d+) contended_samples \d+ unknown_samples 0 ", cells[6])
+        self.assertTrue(m, cells[6])
+        self.assertGreater(int(m.group(1)), 0)
+        self.assertIn("Invalid rows (the contention probe did not report unknown_samples 0; they do not count): none.",
+                      self.table())
+
+    def test_negative_contention_unknown_samples_over_0_makes_the_row_invalid(self):
+        open(os.path.join(self.tmp, "docker-fails"), "w").close()
+        out = self.run_sweep(PROBE + "row|3|Lock|ok\nproof|ok|scripts/proof/ok.sh|-|-\n")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        res = self.rows()[("1", "slow")][3]
+        self.assertRegex(res, r"^INVALID: proof_ok but unknown_samples [1-9]\d* in proof_contention rc3-sweep:slow$")
+        self.assertIn("Failed rows: none.", self.table())
+        self.assertIn("they do not count): 1", self.table())
+        self.assertIn("Invalid proofs: ", self.table())
+        # A proof's own probe line with unknown_samples over 0 makes the row invalid too.
+        os.remove(os.path.join(self.tmp, "docker-fails"))
+        out = self.run_sweep("row|1|Mesh|ownbad\nproof|ownbad|scripts/proof/ownbad.sh|ORBLX_PROOF_SAMPLE_SECS=0.2|-\n")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertEqual(self.rows()[("1", "ownbad")][3],
+                         "INVALID: proof_ok but unknown_samples 2 in proof_contention ownbad")
+        # A FAIL stays a FAIL.
+        open(os.path.join(self.tmp, "docker-fails"), "w").close()
+        out = self.run_sweep("row|1|Mesh|fail\nproof|fail|scripts/proof/fail.sh|-|-\n")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertTrue(self.rows()[("1", "fail")][3].startswith("FAIL"))
+
+    def test_negative_contention_a_missing_line_is_invalid(self):
+        def log(text):
+            path = os.path.join(self.tmp, "p.log")
+            with open(path, "w") as f:
+                f.write(text)
+            return path
+        good = "proof_contention rc3-sweep:p samples 4 contended_samples 0 unknown_samples 0 max_other_orblx_containers 0 max_load1 0.5\n"
+        out = self.contention(log("step\nproof_ok\n" + good), "p")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("contention_check p ok: unknown_samples 0", out.stdout)
+        cases = [
+            ("step\nproof_ok\n", "no proof_contention rc3-sweep:p line with unknown_samples"),
+            # Only the proof's own line: the sweep wrapper line is missing.
+            (good.replace("rc3-sweep:p", "p"), "no proof_contention rc3-sweep:p line"),
+            # A line with no unknown_samples field.
+            ("proof_contention rc3-sweep:p samples 4 contended_samples 0\n", "has no unknown_samples field"),
+            (good.replace("unknown_samples 0", "unknown_samples 3"), "unknown_samples 3 in proof_contention rc3-sweep:p"),
+        ]
+        for text, want in cases:
+            out = self.contention(log(text), "p")
+            self.assertEqual(out.returncode, 1, want + out.stdout + out.stderr)
+            self.assertTrue(out.stdout.startswith("contention_check p INVALID: "), out.stdout)
+            self.assertIn(want, out.stdout)
 
 
 if __name__ == "__main__":

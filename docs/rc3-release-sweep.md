@@ -46,7 +46,7 @@ does not stop the sweep. `ORBLX_SWEEP_ONLY` runs some proofs only; such a run ne
 | Exit | Meaning |
 |---|---|
 | 0 | Every row passed: each of its proofs gave its pass line. |
-| 1 | A proof failed, or a shipped row has no proof. The summary line `Failed rows: ...` names the rows. |
+| 1 | A proof failed, a shipped row has no proof, or a row is INVALID (its contention probe did not report `unknown_samples 0`). The summary lines `Failed rows: ...` and `Invalid rows ...: ...` name the rows. |
 | 2 | Setup, manifest or build error. |
 | 3 | `ORBLX_SWEEP_ONLY` run with no failure. It does not count. |
 
@@ -133,11 +133,12 @@ it is in the manifest. The sweep does not hide this row.
 | `FAIL (exit 0, no pass line RE)` | A proof with its own pass line ended with exit 0 but without that line. |
 | `FAIL (exit 124, timeout ...)` | The proof ran longer than `ORBLX_SWEEP_TIMEOUT`. |
 | `FAIL: no proof for this shipped row` | The manifest row has `-`. |
+| `INVALID: proof_ok but REASON` | The proof passed, but its contention probe did not report `unknown_samples 0` (see "Contention probe: unknown_samples 0 (W25-27)"). The row does not count. |
 
 The summary has one line for each row and proof: row, feature, proof, result, log path, time
 (`T s (run R s, lock wait W s)`) and the `proof_contention` line of the proof (samples,
 contended samples, the most other orblx containers, the most load). Then `Failed rows: ...`,
-and the proof count and the total time.
+`Invalid rows (...): ...`, and the proof count and the total time.
 
 The log of a proof (`/workspace/orblx-w18-proof/rc3-sweep-<sha>-<proof>.log`) is the full
 stdout and stderr of the proof, with no filter and no cut. The sweep adds only its own lines
@@ -216,7 +217,12 @@ caller is not root, so it never asks for a password.
 - `--plan` lists every row and proof and prints the estimate;
 - less free disk than `ORBLX_SWEEP_MIN_FREE_GB` stops the run with exit 2 before any proof;
 - a `steady_warn` rate over 1% prints the root-cause line and does not fail the sweep;
-- the real manifest has every shipped row, and each proof it names is defined.
+- the real manifest has every shipped row, and each proof it names is defined;
+- contention rule: `unknown_samples 0` passes; `unknown_samples` over 0 (a fake `docker` that
+  fails, or a proof's own probe line) makes the row INVALID and the sweep exit 1; a missing
+  wrapper line or a line with no `unknown_samples` field is INVALID (`--contention-check`).
+  The tests put a fake `docker` first on the sweep tool PATH (`$CARGO_HOME/bin`), so the probe
+  result does not depend on the host.
 
 `scripts/proof/tests/test_no_early_pipe_reader.py` checks the script for early pipe readers.
 
@@ -333,3 +339,41 @@ the parent of the W25-15 merge (#102, `538b154`), so it has no user approval.
 - Exit 2 in `--plan` and in a run: a proof whose script needs `OLD_ORBLX` (`OLD_ORBLX:?`) with no
   pin, a pin that is not 40 lowercase hex digits, a pin that is not the value of `OLD_ORBLX`,
   and (with git) a pin that is not a commit or not an ancestor of `COMMIT`.
+
+## Contention probe: unknown_samples 0 (W25-27)
+
+PO rule (2026-10-31 14:23 KST): a proof row counts only when its contention probe reports
+`unknown_samples 0`. The probe is the sampler in `scripts/proof/proof-lock.sh`
+(`proof_lock_take` starts it, `proof_lock_end` prints the line). It runs `docker ps` every
+`ORBLX_PROOF_SAMPLE_SECS` (2 s); a sample where `docker ps` fails is unknown. The line is:
+
+```
+proof_contention LABEL samples N contended_samples N unknown_samples N max_other_orblx_containers N max_load1 X
+```
+
+The sweep does not change the probe (W25-35 fixes the probe). After a proof gives its pass
+line, the sweep reads its log:
+
+- the log must have the sweep wrapper line, `proof_contention rc3-sweep:PROOF ...`. The wrapper
+  takes the lock (or the parent lock in lock mode `sweep`), so the line is there in both lock
+  modes;
+- every `proof_contention` line in the log (the wrapper's and the proof's own) must have an
+  `unknown_samples` field, and it must be 0.
+
+Else the result is `INVALID: proof_ok but REASON`, where REASON is
+`unknown_samples N in proof_contention LABEL`, `no proof_contention rc3-sweep:PROOF line with
+unknown_samples`, or `proof_contention LABEL has no unknown_samples field`. An INVALID row
+does not count: the summary line `Invalid rows (...): ...` names it and the sweep exits 1 (as
+for `Failed rows`). A FAIL stays a FAIL. A skipped proof is not checked.
+
+To check one log by hand:
+
+```
+scripts/proof/release-sweep.sh --contention-check LOG PROOF
+```
+
+It prints `contention_check PROOF ok: unknown_samples 0 (LOG)` (exit 0) or
+`contention_check PROOF INVALID: REASON (LOG)` (exit 1).
+
+Limit: the rule checks `unknown_samples` only. A proof that ends before the first sample has
+`samples 0 ... unknown_samples 0` and passes the rule.

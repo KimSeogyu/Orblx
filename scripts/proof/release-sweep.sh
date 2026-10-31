@@ -28,8 +28,10 @@
 # rows all carry the mark does not run: the summary shows it as skipped with the mark. Any
 # other 4th field, or the mark on a shipped row, is exit 2. The SSH rows (40 and 41) can not
 # be shipped for rc.3: a shipped claim for them in either file is exit 2 (PO, 2026-10-31).
-# Exit: 0 every row passed; 1 a proof failed or a row has no proof (the summary names the
-# rows); 2 setup, manifest or build error; 3 ORBLX_SWEEP_ONLY run with no failure (a partial
+# A proof_ok row counts only when its contention probe reports unknown_samples 0 (see
+# contention_verdict); else the row is INVALID. --contention-check LOG NAME checks one log.
+# Exit: 0 every row passed; 1 a proof failed, a row has no proof, or a row is INVALID (the
+# summary names the rows); 2 setup, manifest or build error; 3 ORBLX_SWEEP_ONLY run with no failure (a partial
 # run never counts).
 #
 # The proofs need root and Docker. The script runs git as the caller and runs the build and
@@ -71,9 +73,17 @@ set -euo pipefail
 
 usage() {
   echo "usage: $0 [--plan] COMMIT" >&2
+  echo "       $0 --contention-check LOG PROOF_NAME" >&2
   exit 2
 }
 PLAN=0
+CHECK_LOG=""
+if [[ "${1:-}" == "--contention-check" ]]; then
+  [[ $# -eq 3 && -f "$2" && -n "$3" ]] || usage
+  CHECK_LOG="$2"
+  CHECK_NAME="$3"
+  set -- check
+fi
 if [[ "${1:-}" == "--plan" ]]; then
   PLAN=1
   shift
@@ -197,6 +207,38 @@ log_times() {
   fi
   printf ' \n'
 }
+
+# W25-27 (PO rule 2026-10-31): a proof row counts only when its contention probe reports
+# unknown_samples 0. contention_verdict LOG NAME prints "ok" (exit 0) or the reason (exit 1):
+# the log must have the sweep wrapper line "proof_contention rc3-sweep:NAME ... unknown_samples
+# N ...", and every proof_contention line in the log (the wrapper's and the proof's own) must
+# have unknown_samples 0. The probe itself is in proof-lock.sh.
+contention_verdict() {
+  local log="$1" name="$2"
+  awk -v want="rc3-sweep:$name" '
+    index($0, "proof_contention ") == 1 {
+      label = $2; u = ""
+      for (k = 3; k < NF; k++) if ($k == "unknown_samples") u = $(k + 1)
+      if (u !~ /^[0-9]+$/) { bad = bad ? bad : "proof_contention " label " has no unknown_samples field"; next }
+      if (label == want) seen = 1
+      if (u + 0 > 0 && !bad) bad = "unknown_samples " u " in proof_contention " label
+    }
+    END {
+      if (!seen && !bad) bad = "no proof_contention " want " line with unknown_samples"
+      if (bad) { print bad; exit 1 }
+      print "ok"
+    }
+  ' "$log"
+}
+
+if [[ -n "$CHECK_LOG" ]]; then
+  if v="$(contention_verdict "$CHECK_LOG" "$CHECK_NAME")"; then
+    echo "contention_check $CHECK_NAME ok: unknown_samples 0 ($CHECK_LOG)"
+    exit 0
+  fi
+  echo "contention_check $CHECK_NAME INVALID: $v ($CHECK_LOG)"
+  exit 1
+fi
 
 contention_of() {
   local log="$1" name="$2" c
@@ -678,7 +720,7 @@ for i in "${!P_NAME[@]}"; do
 done
 
 write_table() {
-  local r p i failed_rows="" res
+  local r p i failed_rows="" invalid_rows="" res
   {
     echo "# Proof sweep $SHORT"
     echo
@@ -697,15 +739,20 @@ write_table() {
         i="$(proof_index "$p")"
         echo "| $(row_label "$r") | $(cell "${R_FEAT[$r]}") | $p | ${P_RESULT[$i]} | ${P_LOG[$i]} | ${P_TIME[$i]} | ${P_CONT[$i]} |"
         [[ "${P_RESULT[$i]}" == FAIL* ]] && res=fail
+        [[ "$res" == ok && "${P_RESULT[$i]}" == INVALID* ]] && res=invalid
       done
       if [[ "$res" == fail ]]; then
         failed_rows="${failed_rows:+$failed_rows, }${R_ID[$r]}"
+      elif [[ "$res" == invalid ]]; then
+        invalid_rows="${invalid_rows:+$invalid_rows, }${R_ID[$r]}"
       fi
     done
     echo
     echo "Failed rows: ${failed_rows:-none}."
+    echo "Invalid rows (the contention probe did not report unknown_samples 0; they do not count): ${invalid_rows:-none}."
   } >"$TABLE"
   FAILED_ROWS="$failed_rows"
+  INVALID_ROWS="$invalid_rows"
 }
 
 LOCK_MODE="${ORBLX_SWEEP_LOCK_MODE:-proof}"
@@ -724,9 +771,11 @@ case "$LOCK_MODE" in
 esac
 
 FAILED_ROWS=""
+INVALID_ROWS=""
 STEADY_RUNS=0
 STEADY_WARNED=0
 failed=0
+invalid=0
 ran=0
 not_run=0
 skipped=0
@@ -802,6 +851,10 @@ for i in "${!P_NAME[@]}"; do
   ok_re="${P_OK[$i]}"
   if [[ "$rc" -eq 0 ]] && has_line "$ok_re" <"$log"; then
     result="proof_ok"
+    if ! verdict="$(contention_verdict "$log" "$name")"; then
+      result="INVALID: proof_ok but $verdict"
+      invalid=$((invalid + 1))
+    fi
   else
     failed=$((failed + 1))
     if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
@@ -836,7 +889,7 @@ cleanup_worktree
 write_table
 total=$(( $(date +%s) - SWEEP_START ))
 {
-  echo "Proofs run: $ran. Failed proofs: $failed. Not run: $not_run. Skipped (rows file mark): $skipped. Total time: ${total} s ($((total / 60)) min $((total % 60)) s). Ended $(date '+%Y-%m-%d %H:%M:%S %Z')."
+  echo "Proofs run: $ran. Failed proofs: $failed. Invalid proofs: $invalid. Not run: $not_run. Skipped (rows file mark): $skipped. Total time: ${total} s ($((total / 60)) min $((total % 60)) s). Ended $(date '+%Y-%m-%d %H:%M:%S %Z')."
   if [[ "$not_run" -gt 0 ]]; then
     echo "Partial run (ORBLX_SWEEP_ONLY): it does not count."
   fi
@@ -850,9 +903,9 @@ total=$(( $(date +%s) - SWEEP_START ))
     echo "steady_warn: no nat-realism run in this sweep."
   fi
 } >>"$TABLE"
-note "end $(now) proofs $ran failed $failed not_run $not_run failed_rows ${FAILED_ROWS:-none} total_secs $total table $TABLE"
+note "end $(now) proofs $ran failed $failed invalid $invalid invalid_rows ${INVALID_ROWS:-none} not_run $not_run failed_rows ${FAILED_ROWS:-none} total_secs $total table $TABLE"
 cat "$TABLE"
-if [[ -n "$FAILED_ROWS" ]]; then
+if [[ -n "$FAILED_ROWS" || -n "$INVALID_ROWS" ]]; then
   exit 1
 fi
 if [[ "$not_run" -gt 0 ]]; then
