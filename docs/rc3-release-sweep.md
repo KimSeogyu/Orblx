@@ -111,11 +111,12 @@ it is in the manifest. The sweep does not hide this row.
    30 GB free disk. It exits 0. A run that failed from a full disk never counts.
 2. Row 54 (Linux client) counts for rc.3 on the commit build proof (`up`, `down`, `status` and
    systemd), not on a published artifact. Coverage today: the sweep proof `w18-linux-daemon`
-   runs `orblx up` in [C] containers and checks `orblx status`. No sweep proof runs
-   `orblx down` or starts the systemd unit. `scripts/proof/release.sh` (not in the manifest)
+   runs `orblx up` in [C] containers and checks `orblx status`. W25-54: it also runs the
+   unit `scripts/orblxd.service` under systemd as PID 1 in [C] `node-s`: start, stop, restart,
+   and `orblx down` (see `docs/w18-linux-daemon.md`). `scripts/proof/release.sh` (not in the manifest)
    builds the release tarball at the commit, installs it in a clean [C] container with `--service`, and checks
    that the installer writes `/etc/systemd/system/orblxd.service`. The `down` and systemd start
-   parts are open items for the PO.
+   parts are in `w18-linux-daemon` since W25-54.
 3. After the rc.3 artifact is published, run `scripts/proof/release-real.sh` again on the
    published rc.3 artifact. Nobody announces rc.3 before that run passes.
 4. The real sweep records the run times of the proofs that have no measure in the plan today:
@@ -189,7 +190,7 @@ caller is not root, so it never asks for a password.
 - `nat-realism`: `ORBLX_NATR_PROFILE=release`, own names `orblx-rc3sw-natr`.
 - `revoke-followup`: `ORBLX_PROOF_PROFILE=release` (its default).
 - `api-tokens`, `token-no-escalation`, `audit-webhooks`, `policy-gitops`, `siem-streaming`: the
-  release binary (`TOKENS_BIN`, `ESC_BIN`, `HOOKS_BIN`, `GITOPS_BIN`, `SIEM_BIN`) and own
+  release binary (`ATPROOF_BIN`, `ESC_BIN`, `HOOKS_BIN`, `GITOPS_BIN`, `SIEM_BIN`) and own
   `orblx-rc3sw-*` project and image names.
 - `split-dns`, `policy-sync`: own `orblx-rc3sw-*` project and image names; `policy-sync` uses
   `ORBLX_SYNC_PROFILE=release` (its default). Linux only.
