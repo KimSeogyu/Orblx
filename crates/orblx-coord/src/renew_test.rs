@@ -1562,6 +1562,7 @@ async fn nodes_renew_across_coordinator_cert_ends() {
     let mut last_ab: Option<Instant> = None;
     let mut last_ba: Option<Instant> = None;
     let mut max_gap = Duration::ZERO;
+    let mut gaps = Vec::new();
     let (mut got_ab, mut got_ba, mut got_ca, mut got_ac) = (0u64, 0u64, 0u64, 0u64);
     let (mut late_ab, mut late_ba) = (0u64, 0u64);
     let (mut probes, mut probe_fail) = (0u64, 0u64);
@@ -1598,7 +1599,7 @@ async fn nodes_renew_across_coordinator_cert_ends() {
                 tokio::time::timeout(Duration::from_millis(20), outputs[1].recv()).await
             {
                 if packet.ends_with(b"ab") {
-                    note_gap(&mut last_ab, &mut max_gap);
+                    note_gap("ab", &mut last_ab, &mut max_gap, &mut gaps);
                     got_ab += 1;
                     late_ab += u64::from(late);
                 }
@@ -1607,7 +1608,7 @@ async fn nodes_renew_across_coordinator_cert_ends() {
                 tokio::time::timeout(Duration::from_millis(20), outputs[0].recv()).await
             {
                 if packet.ends_with(b"ba") {
-                    note_gap(&mut last_ba, &mut max_gap);
+                    note_gap("ba", &mut last_ba, &mut max_gap, &mut gaps);
                     got_ba += 1;
                     late_ba += u64::from(late);
                 } else if packet.ends_with(b"ca") {
