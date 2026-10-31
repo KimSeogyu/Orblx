@@ -553,7 +553,8 @@ old_bin_of() { echo "$WORK/old-orblx/$1/orblx"; }
 old_label_of() {
   local sha tag
   sha="$(git -C "$REPO" rev-parse --verify -q "$1^{commit}" 2>/dev/null)" || sha="$1"
-  tag="$(git -C "$REPO" tag --points-at "$sha" 2>/dev/null | head -n 1)" || tag=""
+  tag="$(git -C "$REPO" tag --points-at "$sha" 2>/dev/null)" || tag=""
+  tag="${tag%%$'\n'*}"
   echo "commit $sha tag ${tag:-none}"
 }
 old_step_of() {
