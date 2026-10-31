@@ -497,7 +497,6 @@ fn check_private_path(path: &Path, euid: u32, sticky_ok: bool) -> Result<(), Str
 ///
 /// With a node lock file, the function writes the netmap file again without the peers
 /// that no trusted owner key signed. The accept path reads that file.
-/// Read the start netmap and apply the node lock.
 ///
 /// The result has the netmap and the file text that gave it (W25-34). The policy sync starts
 /// after this read, so the text is the text that the netmap watcher starts from.
@@ -923,7 +922,7 @@ fn apply_policy_sync(state: &Path, sync: &orblx_coord::PolicySync, announce: boo
 }
 
 /// The shortest time between two `deny-wait` requests (W25-2).
-const DENY_WAIT_GAP: Duration = Duration::from_millis(100);
+const DENY_WAIT_GAP: Duration = orblx_coord::POLICY_WAIT_GAP;
 
 /// The time before the node tries `deny-wait` again after it failed (W25-2).
 const DENY_WAIT_RETRY: Duration = Duration::from_secs(30);

@@ -593,6 +593,11 @@ fn unknown_op_is_old_coordinator(err: CoordError) -> CoordError {
 /// The longest time that the coordinator holds one `deny-wait` request.
 pub const DENY_WAIT_HOLD: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// The shortest time between two `deny-wait` or `policy-wait` requests of a node (W25-2).
+///
+/// It is the poll interval of the node policy loop in `orblx up`.
+pub const POLICY_WAIT_GAP: std::time::Duration = std::time::Duration::from_millis(100);
+
 async fn admin_call(
     coord: SocketAddr,
     coord_name: &str,
