@@ -2126,6 +2126,7 @@ fn counted_renewer(
         Ok(RenewedLeaf {
             certificate_pem: result.certificate_pem,
             private_key_pem: result.private_key_pem,
+            ticket: None,
         })
     })
 }
