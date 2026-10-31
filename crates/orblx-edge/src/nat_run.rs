@@ -38,6 +38,7 @@ use crate::nat_path::{
 };
 use crate::punch::{decode_punch, encode_punch, exchange_same_ip, PunchKind, PunchToken};
 use crate::signed::{encode_hex, verify_signed_candidate, SignedCandidate};
+use crate::status_file::StatusFile;
 use crate::{EdgeError, StunClient, DIRECT_ATTEMPT_BUDGET, DIRECT_QUIC_PORT};
 
 const HOLD_LIMIT: usize = 64;
@@ -209,7 +210,7 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
 
     let hub = Arc::new(Hub {
         filter: config.filter,
-        state_dir: config.state_dir,
+        status: StatusFile::new(&config.state_dir, NODE_STATUS_FILE),
         name: config.name,
         overlay: config.overlay,
         svid: config.svid,
@@ -247,7 +248,13 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         tun_lane: Mutex::new(TunLane::default()),
         tun_ready: Condvar::new(),
     });
-    hub.write_status(None);
+    // The first status is on the disk before the threads start.
+    hub.status.write_now(&hub.status_text(None));
+    let status_hub = Arc::clone(&hub);
+    thread::Builder::new()
+        .name("orblx-nat-status".to_string())
+        .spawn(move || status_hub.status.run(stopped))
+        .map_err(|err| EdgeError::Io(err.to_string()))?;
 
     let publish_hub = Arc::clone(&hub);
     let mut reflexive_text = vec![reflexive.to_string()];
@@ -391,7 +398,8 @@ fn gather_alt(client: &StunClient, server: SocketAddr) -> Option<SocketAddr> {
 struct Hub {
     /// The receiver packet filter. `None` keeps the old datapath.
     filter: Option<Arc<PacketFilter>>,
-    state_dir: PathBuf,
+    /// The status file. The status thread writes it, so the router thread does not wait for the disk.
+    status: StatusFile,
     name: String,
     overlay: Ipv4Addr,
     svid: String,
@@ -895,7 +903,12 @@ impl Hub {
         }
     }
 
+    /// Post the status for the status thread. The call does not touch the disk (W25-29).
     fn write_status(&self, path: Option<OverlayPath>) {
+        self.status.post(self.status_text(path));
+    }
+
+    fn status_text(&self, path: Option<OverlayPath>) -> String {
         let path_text = match path {
             Some(path) => path.as_str(),
             None => "down",
@@ -917,12 +930,7 @@ impl Hub {
                 svid_expiry: peer_expiry,
             }],
         };
-        let text = format_node_status(&status);
-        let path = self.state_dir.join(NODE_STATUS_FILE);
-        let tmp = self.state_dir.join("status.txt.tmp");
-        if fs::write(&tmp, text.as_bytes()).is_ok() {
-            let _ = fs::rename(&tmp, &path);
-        }
+        format_node_status(&status)
     }
 }
 
