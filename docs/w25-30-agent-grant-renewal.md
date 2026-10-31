@@ -104,3 +104,22 @@ The PO approved a run before #117, because the agent path does not use the node 
 - Guard use gaps in run 3: 1827 gaps, p50 149 ms, p99 201 ms, max 238 ms, 21 gaps above 200 ms. The client `loop max_ok_gap_ms` was 287 ms (client send times, not guard times).
 - The run 3 log has no per-attempt client times. Thus the trace above was added before the next run.
 - The PO approved the switch gap method. The 200 ms limit did not change.
+
+## Run 4 (infrastructure abort)
+
+The image build failed with `No space left on device`. No proof step ran.
+
+## Run 5 (FAIL, 2026-10-31 18:18 to 18:24 KST)
+
+- Head e507126 (main merged, CI green). `rustc 1.99.1` (`RUSTUP_TOOLCHAIN=stable`). Disk before: 48G free. Exit 1.
+- `proof_contention agent-grant-renew samples 163 contended_samples 0 unknown_samples 0 max_other_orblx_containers 0 max_load1 12.21`
+- Loop: exit 3, 1757 of 1757 attempts ok, 0 failed, 0 denies, 6 switches, 0 restarts, `loop_max_ok_gap_ms` 284.
+- Switch gaps (last use of the old grant to first use of the new grant), limit 200 ms: 156, 151, 152, 186, 179, **206** ms. Switch 6 fails. The script stopped there. Thus phase 2 (gate), chain verify and the secret grep did not run.
+- Trace split (1757 attempts, all ok, trace and guard uses match 1:1):
+  - request (send to reply): p50 102, p90 133, p99 183, max 234 ms
+  - to guard: p50 62, p99 110, max 178 ms. From guard: p50 38, p99 89, max 124 ms
+  - directory read: p50 0, max 11 ms (11 ms at a switch). Sleep: p50 50, p99 53, max 106 ms
+- Gaps above 200 ms: 78 guard gaps, 75 client gaps. In each one, the sleep is 50 to 54 ms and the directory read is 0 to 11 ms. The extra time is in the request (to guard and from guard).
+- Switch 6: 206 = from guard 62 + sleep 50 + directory read 11 + to guard 83. A normal gap is about 38 + 50 + 0 + 62 = 150.
+- The slow requests increase late in the run (25 of 165 requests above 150 ms in the 210 to 240 s window, 0 in the first 30 s). The host load also increased (max load1 12.21). The PO rule does not let us exclude a host stall.
+- Verdict: the gaps above 200 ms come from the agent request path in the product (connect, overlay, guard), not from the probe loop. The trace does not show which part of the request is slow. W25-30 stays open. The request latency becomes a new item with a 200 ms gate on the agent path.
