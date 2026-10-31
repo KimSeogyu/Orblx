@@ -190,6 +190,9 @@ def main():
     print(f"split_rows agent {len(rows)} probe {len(probes)} req_pkts_2plus {sum(1 for r in rows if r.get('req_pkts', 0) >= 2)}")
     for n in names:
         summary(n, [r.get(n) for r in rows])
+    # The gate value: the p99 of the request time (W25-39). The shell reads this line by name.
+    request = [r["request"] for r in rows]
+    print(f"split_gate request_p99_ms {'na' if not request else f'{pct(request, .99):.1f}'}")
     for n in ("probe_total", "probe_connect", "probe_rtt"):
         summary(n, [r[n] for r in probes])
     for n in ("dp_syn", "dp_synack", "dp_req_max", "dp_reply", "dp_crit"):

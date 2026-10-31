@@ -351,7 +351,8 @@ if [[ -n "${LATENCY_KEEP_DIR:-}" ]]; then
 fi
 python3 "$ROOT/scripts/proof/agent-latency-split.py" "$WORK/trace.txt" "$WORK/guard-timing.txt" \
   "$WORK/dp-a.txt" "$WORK/dp-b.txt" "$WORK/probe.txt" | tee "$WORK/latency-split.txt"
-request_p99="$(awk '$1 == "split" && $2 == "request_ms" {print $6}' "$WORK/latency-split.txt")"
+# W25-39 fix: read the p99 value by name (the split_gate line), not by column.
+request_p99="$(awk '$1 == "split_gate" && $2 == "request_p99_ms" {print $3}' "$WORK/latency-split.txt")"
 echo "request_p99_ms ${request_p99} limit_ms ${REQUEST_P99_LIMIT_MS} (gate at the end)"
 
 echo "=== [C] containers after the loop ==="

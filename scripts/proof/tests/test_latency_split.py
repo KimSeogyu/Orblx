@@ -34,7 +34,46 @@ DP_B = (
 PROBE = "probe n 1 start_us 2000000 connect_us 2001000 reply_us 2002000 port 41000 result ok\n"
 
 
+def run_split(tmp, trace, guard=GUARD, dp_a=DP_A, dp_b=DP_B, probe=PROBE):
+    paths = []
+    for name, text in (("t", trace), ("g", guard), ("a", dp_a), ("b", dp_b), ("p", probe)):
+        path = os.path.join(tmp, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        paths.append(path)
+    return subprocess.run(
+        [sys.executable, SCRIPT, *paths], check=True, capture_output=True, text=True
+    ).stdout
+
+
+def gate_value(out):
+    """The same read as agent-grant-renew.sh: the split_gate line by name."""
+    script = '$1 == "split_gate" && $2 == "request_p99_ms" {print $3}'
+    return subprocess.run(["awk", script], input=out, check=True, capture_output=True, text=True).stdout.strip()
+
+
 class LatencySplitTest(unittest.TestCase):
+    def test_the_gate_reads_the_p99_and_not_the_p90(self):
+        # 100 requests of 1..100 ms: p90 is 91 ms and p99 is 100 ms.
+        lines = []
+        for i in range(1, 101):
+            send = 1_000_000 * i
+            lines.append(
+                f"trace attempt {i} start_ms 1 send_ms 1 done_ms 1 result ok grant g1 send_us {send} "
+                f"seal_us {send} tcp_us {send} sent_us {send} reply_us {send + 1000 * i} port {40000 + i}\n"
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            out = run_split(tmp, "".join(lines), guard="", dp_a="", dp_b="", probe="")
+        self.assertIn("split request_ms p50 51.0 p90 91.0 p99 100.0 max 100.0 n 100", out)
+        self.assertEqual(gate_value(out), "100.0")
+
+    def test_the_renew_script_reads_the_gate_line_by_name(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "agent-grant-renew.sh")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn('$1 == "split_gate" && $2 == "request_p99_ms" {print $3}', text)
+        self.assertNotIn('$2 == "request_ms" {print $6}', text)
+
     def test_one_request_gives_each_part(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = []
