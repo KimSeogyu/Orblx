@@ -5,7 +5,7 @@ name: orblx-api-tokens-proof
 
 services:
   coord:
-    image: ${TOKENS_IMAGE:?set TOKENS_IMAGE}
+    image: ${ATPROOF_IMAGE:?set ATPROOF_IMAGE}
     command:
       - coord
       - serve
@@ -25,7 +25,7 @@ services:
       - proof
 
   owner:
-    image: ${TOKENS_IMAGE:?set TOKENS_IMAGE}
+    image: ${ATPROOF_IMAGE:?set ATPROOF_IMAGE}
     profiles: ["nodes"]
     entrypoint: ["orblx"]
     volumes:
@@ -36,7 +36,7 @@ services:
       - proof
 
   a:
-    image: ${TOKENS_IMAGE:?set TOKENS_IMAGE}
+    image: ${ATPROOF_IMAGE:?set ATPROOF_IMAGE}
     profiles: ["nodes"]
     entrypoint: ["orblx"]
     volumes:
@@ -47,7 +47,7 @@ services:
       - proof
 
   client:
-    image: ${TOKENS_IMAGE:?set TOKENS_IMAGE}
+    image: ${ATPROOF_IMAGE:?set ATPROOF_IMAGE}
     profiles: ["nodes"]
     entrypoint: ["sleep", "infinity"]
     volumes:

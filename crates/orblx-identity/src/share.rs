@@ -215,24 +215,26 @@ fn parse_share_guest(guests: &BTreeSet<String>, text: &str) -> Result<ShareGuest
 }
 
 fn parse_oidc_guest(text: &str) -> Result<String, PolicyError> {
-    let Some(subject) = text.strip_prefix(OIDC_PREFIX) else {
-        return Err(PolicyError::new(format!(
-            "The guest {} is not oidc:SUBJECT.",
-            safe(text)
-        )));
-    };
-    // The same rule as the coordinator store uses for an OIDC owner.
-    if subject.is_empty()
-        || subject.len() > MAX_SUBJECT
-        || subject.contains([':', '\n'])
-        || subject.chars().any(char::is_control)
-    {
+    if !oidc_user_ok(text) {
         return Err(PolicyError::new(format!(
             "The guest {} is not oidc:SUBJECT.",
             safe(text)
         )));
     }
     Ok(text.to_string())
+}
+
+/// Return true when `text` is `oidc:SUBJECT` with a valid subject.
+///
+/// The same rule as the coordinator store uses for an OIDC owner.
+pub(crate) fn oidc_user_ok(text: &str) -> bool {
+    let Some(subject) = text.strip_prefix(OIDC_PREFIX) else {
+        return false;
+    };
+    !(subject.is_empty()
+        || subject.len() > MAX_SUBJECT
+        || subject.contains([':', '\n'])
+        || subject.chars().any(char::is_control))
 }
 
 /// Return the policy rules as JSON text without the `shares` list.
@@ -247,7 +249,7 @@ pub fn rules_without_shares(bytes: &[u8]) -> Option<String> {
     serde_json::to_string(&value).ok()
 }
 
-fn safe(text: &str) -> String {
+pub(crate) fn safe(text: &str) -> String {
     text.chars()
         .filter(|ch| !ch.is_control())
         .take(160)

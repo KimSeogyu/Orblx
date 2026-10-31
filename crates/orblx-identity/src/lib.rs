@@ -41,6 +41,7 @@ mod share;
 mod sink;
 mod spiffe;
 mod ticket;
+mod user_approval;
 
 pub use ca::{IssuedSvid, MiniCa};
 pub use cert::{
@@ -95,6 +96,7 @@ pub use ticket::{
     Ipv4Destination, SignedTicket, TicketClaims, TicketFlags, TicketSigner, TicketVerifier,
     VerifiedTicket, FLAG_AGENT_JIT, FLAG_ONE_SHOT,
 };
+pub use user_approval::UserApproval;
 
 /// This function returns the name of this crate.
 pub fn crate_name() -> &'static str {

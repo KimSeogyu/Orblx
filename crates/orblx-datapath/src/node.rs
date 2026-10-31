@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_identity::{decode_certificate_pem, extract_spiffe_id, leaf_validity, DenySet, SpiffeId};
@@ -33,6 +33,15 @@ use crate::quic::{HelloEndpoint, SessionEvent};
 use crate::router::{route_packet, RouterTable};
 use crate::tun_dev::{open_tun, TunConfig};
 use crate::{HelloConfig, HelloError, HelloSender, HelloSession, FLAG_REKEY_REQ};
+
+macro_rules! tr {
+    ($($a:tt)*) => {
+        if std::env::var_os("ORBLX_TRACE_RENEW").is_some() {
+            let ms = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+            eprintln!("trace {ms} {}", format!($($a)*));
+        }
+    };
+}
 
 /// The node record file in the state directory.
 pub const NODE_RECORD_FILE: &str = "node.json";
@@ -238,6 +247,120 @@ struct LiveLink {
     ask_rekey: watch::Sender<u64>,
 }
 
+/// A link that a newer session for the same peer replaced (W25-11).
+///
+/// The link gets no new packets. It sends the packets in its queue, ends its send
+/// stream, and reads until the peer ends its send stream. `cancel` stops it at once.
+struct RetiredLink {
+    peer: String,
+    cancel: watch::Sender<bool>,
+}
+
+/// The status file writer (W25-11).
+///
+/// One OS thread writes the newest status text. A slow disk thus does not stop the
+/// runtime that moves the packets. A newer text replaces a text that is not written yet.
+struct StatusFile {
+    path: PathBuf,
+    next: Mutex<StatusSlot>,
+    wake: Condvar,
+    writer: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+#[derive(Default)]
+struct StatusSlot {
+    text: Option<String>,
+    closed: bool,
+}
+
+impl StatusFile {
+    fn start(path: PathBuf) -> Arc<Self> {
+        let status = Arc::new(Self {
+            path,
+            next: Mutex::new(StatusSlot::default()),
+            wake: Condvar::new(),
+            writer: Mutex::new(None),
+        });
+        let worker = Arc::clone(&status);
+        // Without the thread, put writes the file at once, as before W25-11.
+        let handle = std::thread::Builder::new()
+            .name("orblx-status".to_string())
+            .spawn(move || worker.run())
+            .ok();
+        *lock(&status.writer) = handle;
+        status
+    }
+
+    fn put(&self, text: String) {
+        if lock(&self.writer).is_none() {
+            if !lock(&self.next).closed {
+                write_status(&self.path, &text);
+            }
+            return;
+        }
+        let mut slot = lock(&self.next);
+        if slot.closed {
+            return;
+        }
+        slot.text = Some(text);
+        self.wake.notify_one();
+    }
+
+    fn run(&self) {
+        loop {
+            let text = {
+                let mut slot = lock(&self.next);
+                loop {
+                    if let Some(text) = slot.text.take() {
+                        break Some(text);
+                    }
+                    if slot.closed {
+                        break None;
+                    }
+                    slot = self
+                        .wake
+                        .wait(slot)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            };
+            match text {
+                Some(text) => write_status(&self.path, &text),
+                None => return,
+            }
+        }
+    }
+
+    /// Stop the thread after it writes the text it has. Then write `last`, if any.
+    fn close(&self, last: Option<String>) {
+        {
+            let mut slot = lock(&self.next);
+            slot.closed = true;
+            self.wake.notify_one();
+        }
+        if let Some(handle) = lock(&self.writer).take() {
+            let _ = handle.join();
+        }
+        if let Some(text) = last {
+            write_status(&self.path, &text);
+        }
+    }
+}
+
+/// Stops the status writer when the node function returns, also on an error.
+struct StatusGuard(Arc<StatusFile>);
+
+impl Drop for StatusGuard {
+    fn drop(&mut self) {
+        self.0.close(None);
+    }
+}
+
+fn write_status(path: &Path, text: &str) {
+    if let Err(err) = write_atomic(path, text.as_bytes()) {
+        eprintln!("The node did not write the status file. {err}");
+    }
+}
+
 struct NodeCounters {
     tx: AtomicU64,
     rx: AtomicU64,
@@ -251,11 +374,14 @@ struct Mesh {
     netmap_path: PathBuf,
     node: Arc<NodeView>,
     links: Arc<Mutex<HashMap<String, LiveLink>>>,
+    /// Replaced links that still drain, by generation (W25-11).
+    retired: Arc<Mutex<HashMap<u64, RetiredLink>>>,
     peers: Arc<Mutex<Vec<PeerView>>>,
     counters: Arc<NodeCounters>,
     to_tun: mpsc::Sender<Vec<u8>>,
     overlay: Ipv4Addr,
     state_dir: Arc<PathBuf>,
+    status: Arc<StatusFile>,
     relay: Option<SocketAddr>,
     shutdown: watch::Receiver<bool>,
     rekey_tx: watch::Sender<u64>,
@@ -547,11 +673,13 @@ async fn run_mesh_inner(
         });
     }
     let state_dir = Arc::new(request.state_dir);
+    let status = StatusFile::start(state_dir.join(NODE_STATUS_FILE));
+    let _status_guard = StatusGuard(Arc::clone(&status));
     let node = Arc::new(view);
     let peers = Arc::new(Mutex::new(initial_peers(&request.netmap)));
     let links = Arc::new(Mutex::new(HashMap::<String, LiveLink>::new()));
     let (router_tx, tun_router) = watch::channel(router);
-    publish(&state_dir, &node, &peers, "up");
+    publish(&status, &node, &peers, "up");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (rekey_tx, rekey_rx) = watch::channel(0u64);
@@ -590,11 +718,13 @@ async fn run_mesh_inner(
         netmap_path: netmap_path.clone(),
         node: Arc::clone(&node),
         links: Arc::clone(&links),
+        retired: Arc::new(Mutex::new(HashMap::new())),
         peers: Arc::clone(&peers),
         counters: Arc::clone(&counters),
         to_tun: to_tun.clone(),
         overlay,
         state_dir: Arc::clone(&state_dir),
+        status: Arc::clone(&status),
         relay,
         shutdown: shutdown_rx,
         rekey_tx,
@@ -651,7 +781,11 @@ async fn run_mesh_inner(
                     }
                 }
                 _ = tick.tick() => {
-                    if let Ok(bytes) = fs::read(deny_dir.join("deny.json")) {
+                    // The read runs on a blocking thread, so a slow disk does not stop
+                    // the packet runtime (W25-11).
+                    let path = deny_dir.join("deny.json");
+                    let read = tokio::task::spawn_blocking(move || fs::read(path)).await;
+                    if let Ok(Ok(bytes)) = read {
                         if last_text.as_deref() != Some(bytes.as_slice()) {
                             if let Some(deny) = parse_deny(&bytes) {
                                 // Replace first, so a session that starts now uses the new list.
@@ -710,7 +844,7 @@ async fn run_mesh_inner(
                     }
                 }
                 _ = tick.tick() => {
-                    publish(&status_mesh.state_dir, &status_mesh.node, &status_mesh.peers, "up");
+                    publish(&status_mesh.status, &status_mesh.node, &status_mesh.peers, "up");
                 }
             }
         }
@@ -752,7 +886,7 @@ async fn run_mesh_inner(
     for task in tasks {
         let _ = task.await;
     }
-    publish(&state_dir, &node, &peers, "down");
+    status.close(Some(status_text(&node, &peers, "down")));
     println!("The node is down.");
     drop(to_tun);
     Ok(())
@@ -958,7 +1092,10 @@ async fn watch_netmap_peers(watch: PeerWatch) {
                 }
             }
             _ = tick.tick() => {
-                let Ok(bytes) = fs::read(&watch.mesh.netmap_path) else {
+                // W25-11: read the file on a blocking thread. A slow disk must not stop the
+                // runtime that moves the packets.
+                let path = watch.mesh.netmap_path.clone();
+                let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || fs::read(path)).await else {
                     continue;
                 };
                 if last.as_deref() == Some(bytes.as_slice()) {
@@ -1082,6 +1219,18 @@ fn close_denied_links(mesh: &Mesh, deny: &DenySet) {
             let _ = link.cancel.send(true);
         }
     }
+    drop(links);
+    for retired in lock(&mesh.retired).values() {
+        let Some(svid) = svids.get(retired.peer.as_str()) else {
+            continue;
+        };
+        let Ok(id) = SpiffeId::parse(svid) else {
+            continue;
+        };
+        if deny.reject_uri(&id).is_err() {
+            let _ = retired.cancel.send(true);
+        }
+    }
 }
 
 fn parse_deny(bytes: &[u8]) -> Option<DenySet> {
@@ -1103,6 +1252,7 @@ async fn accept_loop(mut mesh: Mesh) {
             accepted = mesh.endpoint.accept_one() => {
                 match accepted {
                     Ok(session) => {
+                        tr!("{} accepted {}", mesh.node.name, session.peer_id().as_uri());
                         let netmap = fresh_netmap(&mesh);
                         let peer_name = netmap.peers.iter().find(|peer| peer.svid == session.peer_id().as_uri()).map(|peer| peer.name.clone());
                         let Some(peer_name) = peer_name else {
@@ -1158,13 +1308,15 @@ async fn dial_peer(mut mesh: Mesh, peer: NetmapPeer) {
                     if changed.is_err() || stopped(&mesh) {
                         return;
                     }
-                    reconnect(&mut mesh, &peer, &remote_tx, &mut task).await;
+                    tr!("{} reconnect cause=local_renew peer={}", mesh.node.name, peer.name);
+                    reconnect(&mut mesh, &peer, &remote_tx, &mut remote_rx, &mut task).await;
                 }
                 changed = remote_rx.changed() => {
                     if changed.is_err() || stopped(&mesh) {
                         return;
                     }
-                    reconnect(&mut mesh, &peer, &remote_tx, &mut task).await;
+                    tr!("{} reconnect cause=peer_rekey_req peer={}", mesh.node.name, peer.name);
+                    reconnect(&mut mesh, &peer, &remote_tx, &mut remote_rx, &mut task).await;
                 }
             }
         }
@@ -1188,11 +1340,29 @@ async fn reconnect(
     mesh: &mut Mesh,
     peer: &NetmapPeer,
     remote_tx: &watch::Sender<u64>,
+    remote_rx: &mut watch::Receiver<u64>,
     task: &mut JoinHandle<()>,
 ) {
+    // The new handshake uses the identity of both nodes as of now. Earlier renew signals
+    // of either node need no second session (W25-11).
+    mesh.rekey_rx.borrow_and_update();
+    remote_rx.borrow_and_update();
+    let t0 = Instant::now();
     let Some((session, relay_face)) = dial_once(mesh, peer, false).await else {
+        tr!(
+            "{} dial_failed peer={} ms={}",
+            mesh.node.name,
+            peer.name,
+            t0.elapsed().as_millis()
+        );
         return;
     };
+    tr!(
+        "{} dial_done peer={} ms={}",
+        mesh.node.name,
+        peer.name,
+        t0.elapsed().as_millis()
+    );
     let next = spawn_link(
         mesh,
         session,
@@ -1200,13 +1370,8 @@ async fn reconnect(
         remote_tx.clone(),
         relay_face,
     );
-    let mut old = std::mem::replace(task, next);
-    if tokio::time::timeout(Duration::from_secs(2), &mut old)
-        .await
-        .is_err()
-    {
-        old.abort();
-    }
+    // The old link drains and then stops (see `drive_session`). Do not wait for it here.
+    drop(std::mem::replace(task, next));
 }
 
 async fn dial_ready(
@@ -1445,6 +1610,12 @@ async fn run_link(
             println!("The node ended the session with {name}. The deny list revokes the peer.");
             return;
         }
+        tr!(
+            "{} link_up peer={} gen={}",
+            mesh.node.name,
+            name,
+            generation
+        );
         if let Some(old) = map.insert(
             name.clone(),
             LiveLink {
@@ -1454,15 +1625,29 @@ async fn run_link(
                 ask_rekey: ask_tx,
             },
         ) {
-            let _ = old.cancel.send(true);
+            // Make before break (W25-11): the new session carries new packets now.
+            // The old link drains. Its queue closes when `old.tx` drops here.
+            tr!(
+                "{} link_retire_old peer={} old_gen={}",
+                mesh.node.name,
+                name,
+                old.generation
+            );
+            lock(&mesh.retired).insert(
+                old.generation,
+                RetiredLink {
+                    peer: name.clone(),
+                    cancel: old.cancel,
+                },
+            );
         }
     }
     set_session(&mesh.peers, &name, true, Some(expiry));
-    publish(&mesh.state_dir, &mesh.node, &mesh.peers, "up");
+    publish(&mesh.status, &mesh.node, &mesh.peers, "up");
     let peer_svid = session.peer_id().as_uri().to_string();
     let (sender, receiver) = session.split();
     let peers = Arc::clone(&mesh.peers);
-    let state_dir = Arc::clone(&mesh.state_dir);
+    let status = Arc::clone(&mesh.status);
     let node = Arc::clone(&mesh.node);
     let peer_name = name.clone();
     drive_session(
@@ -1478,10 +1663,14 @@ async fn run_link(
             counters: Arc::clone(&mesh.counters),
             filter: mesh.filter.clone(),
             peer_svid,
+            links: Arc::clone(&mesh.links),
+            peer: name.clone(),
+            label: format!("{} peer={} gen={}", mesh.node.name, name, generation),
         },
-        move || note_rx(&peers, &state_dir, &node, &peer_name),
+        move || note_rx(&peers, &status, &node, &peer_name),
     )
     .await;
+    lock(&mesh.retired).remove(&generation);
     let removed = {
         let mut map = lock(&mesh.links);
         if map.get(&name).map(|link| link.generation) == Some(generation) {
@@ -1493,7 +1682,7 @@ async fn run_link(
     };
     if removed {
         set_session(&mesh.peers, &name, false, None);
-        publish(&mesh.state_dir, &mesh.node, &mesh.peers, "up");
+        publish(&mesh.status, &mesh.node, &mesh.peers, "up");
     }
 }
 
@@ -1509,12 +1698,43 @@ struct SessionIo {
     counters: Arc<NodeCounters>,
     filter: Option<Arc<crate::PacketFilter>>,
     peer_svid: String,
+    /// The live links. A draining link sends its replies on the current link.
+    links: Arc<Mutex<HashMap<String, LiveLink>>>,
+    peer: String,
+    label: String,
+}
+
+type NextEvent = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = (crate::HelloReceiver, Result<SessionEvent, HelloError>)>
+            + Send,
+    >,
+>;
+
+/// Read one frame to the end.
+///
+/// The future owns the receiver, so `select!` can poll it again after another branch
+/// wins. A dropped read would lose the bytes it already took from the stream (W25-11).
+fn next_event(mut receiver: crate::HelloReceiver) -> NextEvent {
+    Box::pin(async move {
+        let event = receiver.recv_event().await;
+        (receiver, event)
+    })
+}
+
+async fn poll_slot<T>(
+    slot: &mut Option<std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>>,
+) -> T {
+    match slot {
+        Some(future) => future.await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
     let SessionIo {
         mut sender,
-        mut receiver,
+        receiver,
         mut packets,
         mut cancel,
         to_tun,
@@ -1524,71 +1744,131 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
         counters,
         filter,
         peer_svid,
+        links,
+        peer,
+        label,
     } = io;
+    let mut first_rx = true;
+    let mut first_tx = true;
+    // The queue is open while this link is the live link for the peer.
+    let mut tx_open = true;
+    let mut tx_end: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> = None;
+    let mut tx_done = false;
+    let mut ask_open = true;
+    let mut rx_next: Option<NextEvent> = Some(next_event(receiver));
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     loop {
+        if tx_done && rx_next.is_none() {
+            tr!("{label} session_end reason=drained");
+            return;
+        }
         tokio::select! {
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
+                    tr!("{label} session_end reason=cancel");
                     return;
                 }
             }
-            changed = ask_rekey.changed() => {
+            changed = ask_rekey.changed(), if tx_open && ask_open => {
                 if changed.is_err() {
-                    return;
+                    // The link was replaced. The new link sends the rekey requests.
+                    ask_open = false;
+                    continue;
                 }
+                tr!("{label} send_rekey_req");
                 if sender.send_ctrl(FLAG_REKEY_REQ).await.is_err() {
+                    tr!("{label} session_end reason=send_rekey_err");
                     return;
                 }
             }
-            _ = keepalive.tick() => {
+            _ = keepalive.tick(), if tx_open => {
                 if sender.send_ctrl(0).await.is_err() {
                     return;
                 }
             }
-            packet = packets.recv() => {
+            packet = packets.recv(), if tx_open => {
                 let Some(packet) = packet else {
-                    return;
+                    // A newer link replaced this one, and the queue is empty.
+                    tx_open = false;
+                    tr!("{label} tx_end");
+                    tx_end = Some(Box::pin(sender.finish()));
+                    continue;
                 };
                 if let Some(filter) = &filter {
                     filter.note_outbound(&packet);
                 }
+                if first_tx {
+                    tr!("{label} first_tx");
+                    first_tx = false;
+                }
                 if sender.send_ipv4(&packet).await.is_err() {
+                    tr!("{label} session_end reason=send_err");
                     return;
                 }
                 counters.tx.fetch_add(1, Ordering::Relaxed);
             }
-            incoming = receiver.recv_event() => {
+            () = poll_slot(&mut tx_end), if tx_end.is_some() => {
+                tx_end = None;
+                tx_done = true;
+            }
+            (receiver, incoming) = poll_slot(&mut rx_next), if rx_next.is_some() => {
+                rx_next = None;
                 match incoming {
-                    Ok(SessionEvent::Packet(packet)) => {
-                        on_rx();
-                        counters.rx.fetch_add(1, Ordering::Relaxed);
-                        if let Some(filter) = &filter {
-                            if !filter.allow_inbound(&peer_svid, &packet) {
-                                continue;
-                            }
-                        }
-                        match inbound_action(&packet, overlay) {
-                            InboundAction::Reply(reply) => {
-                                if sender.send_ipv4(&reply).await.is_err() {
-                                    return;
+                    Ok(event) => {
+                        rx_next = Some(next_event(receiver));
+                        match event {
+                            SessionEvent::Packet(packet) => {
+                                if first_rx {
+                                    tr!("{label} first_rx");
+                                    first_rx = false;
                                 }
-                                counters.tx.fetch_add(1, Ordering::Relaxed);
-                            }
-                            InboundAction::Forward => {
-                                if to_tun.send(packet).await.is_err() {
-                                    return;
+                                on_rx();
+                                counters.rx.fetch_add(1, Ordering::Relaxed);
+                                if let Some(filter) = &filter {
+                                    if !filter.allow_inbound(&peer_svid, &packet) {
+                                        continue;
+                                    }
                                 }
+                                match inbound_action(&packet, overlay) {
+                                    InboundAction::Reply(reply) if tx_open => {
+                                        if sender.send_ipv4(&reply).await.is_err() {
+                                            return;
+                                        }
+                                        counters.tx.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    InboundAction::Reply(reply) => {
+                                        // This send stream ended. The live link carries the reply.
+                                        let live = lock(&links).get(&peer).map(|link| link.tx.clone());
+                                        if let Some(live) = live {
+                                            if live.try_send(reply).is_ok() {
+                                                counters.tx.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                    }
+                                    InboundAction::Forward => {
+                                        if to_tun.send(packet).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            SessionEvent::Keepalive => on_rx(),
+                            SessionEvent::Rekey => {
+                                tr!("{label} got_rekey_req");
+                                on_rx();
+                                let next = remote_rekey.borrow().saturating_add(1);
+                                let _ = remote_rekey.send(next);
                             }
                         }
                     }
-                    Ok(SessionEvent::Keepalive) => on_rx(),
-                    Ok(SessionEvent::Rekey) => {
-                        on_rx();
-                        let next = remote_rekey.borrow().saturating_add(1);
-                        let _ = remote_rekey.send(next);
+                    Err(HelloError::StreamClosed) => {
+                        // The peer replaced this session and sent all its frames on it.
+                        tr!("{label} rx_end");
                     }
-                    Err(_) => return,
+                    Err(err) => {
+                        tr!("{label} session_end reason=recv_err {err}");
+                        return;
+                    }
                 }
             }
         }
@@ -1608,7 +1888,7 @@ fn set_session(peers: &Mutex<Vec<PeerView>>, name: &str, session: bool, expiry: 
     }
 }
 
-fn note_rx(peers: &Mutex<Vec<PeerView>>, dir: &Path, node: &NodeView, name: &str) {
+fn note_rx(peers: &Mutex<Vec<PeerView>>, status: &StatusFile, node: &NodeView, name: &str) {
     let changed = {
         let mut peers = lock(peers);
         let Some(peer) = peers.iter_mut().find(|peer| peer.name == name) else {
@@ -1620,7 +1900,7 @@ fn note_rx(peers: &Mutex<Vec<PeerView>>, dir: &Path, node: &NodeView, name: &str
         before != after
     };
     if changed {
-        publish(dir, node, peers, "up");
+        publish(status, node, peers, "up");
     }
 }
 
@@ -1641,7 +1921,12 @@ fn path_kind(session: bool, age: Option<Duration>) -> &'static str {
     }
 }
 
-fn publish(dir: &Path, node: &NodeView, peers: &Mutex<Vec<PeerView>>, state: &str) {
+/// Give the newest status text to the status writer. This does no file I/O (W25-11).
+fn publish(status: &StatusFile, node: &NodeView, peers: &Mutex<Vec<PeerView>>, state: &str) {
+    status.put(status_text(node, peers, state));
+}
+
+fn status_text(node: &NodeView, peers: &Mutex<Vec<PeerView>>, state: &str) -> String {
     let now = Instant::now();
     let peers = {
         let mut peers = lock(peers);
@@ -1672,10 +1957,7 @@ fn publish(dir: &Path, node: &NodeView, peers: &Mutex<Vec<PeerView>>, state: &st
             })
             .collect(),
     };
-    let text = format_node_status(&status);
-    if let Err(err) = write_atomic(&dir.join(NODE_STATUS_FILE), text.as_bytes()) {
-        eprintln!("The node did not write the status file. {err}");
-    }
+    format_node_status(&status)
 }
 
 async fn renew_loop(mut mesh: Mesh, renewer: SvidRenewer) {
@@ -1703,6 +1985,7 @@ async fn renew_loop(mut mesh: Mesh, renewer: SvidRenewer) {
             if stopped(&mesh) {
                 return;
             }
+            tr!("{} renew_start", mesh.node.name);
             let renewer = renewer.clone();
             let fetched = tokio::task::spawn_blocking(move || renewer.renew()).await;
             let leaf = match fetched {
@@ -1729,8 +2012,9 @@ async fn renew_loop(mut mesh: Mesh, renewer: SvidRenewer) {
             };
             match apply_leaf(&mesh, &leaf) {
                 Ok(expiry) => {
+                    tr!("{} renew_applied signal_rekey", mesh.node.name);
                     signal_rekey(&mesh);
-                    publish(&mesh.state_dir, &mesh.node, &mesh.peers, "up");
+                    publish(&mesh.status, &mesh.node, &mesh.peers, "up");
                     println!("The node renewed the SVID. The new expiry is {expiry}.");
                     break;
                 }
@@ -1973,9 +2257,19 @@ fn tun_device_name() -> Option<String> {
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), HelloError> {
+    let started = Instant::now();
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, bytes).map_err(|err| HelloError::Node(err.to_string()))?;
-    fs::rename(&tmp, path).map_err(|err| HelloError::Node(err.to_string()))
+    let done = fs::rename(&tmp, path).map_err(|err| HelloError::Node(err.to_string()));
+    let ms = started.elapsed().as_millis();
+    if ms >= 20 {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("-");
+        tr!("slow_io op=write_atomic file={name} ms={ms}");
+    }
+    done
 }
 
 #[cfg(target_os = "linux")]
