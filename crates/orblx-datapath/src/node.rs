@@ -844,13 +844,15 @@ async fn run_mesh_inner(
         }
     }
     let peer_tasks = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
+    // W25-43: the peer watcher and the DNS watcher both start from the start netmap text.
+    let start_text = request.netmap_text.take();
     let peer_watch = PeerWatch {
         mesh: mesh.clone(),
         router: router_tx,
         accept_routes,
         interface: interface.clone(),
         tasks: Arc::clone(&peer_tasks),
-        start_text: request.netmap_text.take(),
+        start_text: start_text.clone(),
     };
     tasks.push(tokio::spawn(async move {
         watch_netmap_peers(peer_watch).await;
@@ -894,6 +896,7 @@ async fn run_mesh_inner(
                 visibility,
                 shutdown: dns_shutdown,
                 exit_dns,
+                start_text,
             },
             &netmap,
         )
@@ -2459,6 +2462,8 @@ struct DnsSpawn {
     visibility: Arc<dyn PeerVisibility>,
     shutdown: watch::Receiver<bool>,
     exit_dns: Option<ExitDns>,
+    /// The file text that gave the start netmap, from [`NodeRequest::netmap_text`] (W25-43).
+    start_text: Option<Vec<u8>>,
 }
 
 fn exit_dns_target(netmap: &Netmap, exit_node: Option<&str>) -> Option<ExitDns> {
@@ -2522,6 +2527,7 @@ async fn spawn_overlay_dns(
     let armed = guard.armed_flag();
     tasks.push(tokio::spawn(async move {
         watch_netmap_dns(DnsWatch {
+            start_text: dns.start_text,
             path: dns.netmap_path,
             node_name: dns.node_name,
             node_overlay: dns.node_overlay,
@@ -2539,6 +2545,8 @@ async fn spawn_overlay_dns(
 }
 
 struct DnsWatch {
+    /// The file text that gave the start DNS table (W25-43).
+    start_text: Option<Vec<u8>>,
     path: PathBuf,
     node_name: String,
     node_overlay: String,
@@ -2552,7 +2560,7 @@ struct DnsWatch {
 }
 
 async fn watch_netmap_dns(mut watch_state: DnsWatch) {
-    let mut last = fs::read(&watch_state.path).unwrap_or_default();
+    let mut last = dns_start_text(watch_state.start_text.take(), &watch_state.path);
     let mut last_error = String::new();
     let mut grant_revision = watch_state.visibility.revision();
     loop {
@@ -2597,19 +2605,48 @@ fn refresh_resolver_in_background(watch_state: &DnsWatch, table: DnsTable) {
     });
 }
 
+/// The text that the DNS watcher compares the netmap file with at its start (W25-43).
+///
+/// `orblx up --coord` can write a new file after it read the start netmap and before this
+/// task starts. The start text is the text of the start netmap, so the first tick applies
+/// that change. `None`: the file text at the start.
+fn dns_start_text(start_text: Option<Vec<u8>>, path: &Path) -> Vec<u8> {
+    start_text.unwrap_or_else(|| fs::read(path).unwrap_or_default())
+}
+
 fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut String) {
-    match fs::read(&watch_state.path) {
-        Ok(bytes) if bytes == *last => {}
+    let Some(map) = changed_dns_netmap(
+        &watch_state.path,
+        &watch_state.node_name,
+        &watch_state.node_overlay,
+        last,
+        last_error,
+    ) else {
+        return;
+    };
+    let table = DnsTable::from_netmap(&map);
+    // W25-6: the responder uses the new table first. A slow host resolver command
+    // (up to COMMAND_WAIT for each call) must not hold the new answers.
+    let _ = watch_state.tables.send(table.clone());
+    refresh_resolver_in_background(watch_state, table);
+    println!("The DNS answers follow the new netmap.");
+}
+
+/// Read the netmap file. Return the new netmap for the DNS table when the file changed.
+fn changed_dns_netmap(
+    path: &Path,
+    node_name: &str,
+    node_overlay: &str,
+    last: &mut Vec<u8>,
+    last_error: &mut String,
+) -> Option<Netmap> {
+    match fs::read(path) {
+        Ok(bytes) if bytes == *last => None,
         Ok(bytes) => match Netmap::from_slice(&bytes) {
-            Ok(map) if self_matches(&map, &watch_state.node_name, &watch_state.node_overlay) => {
+            Ok(map) if self_matches(&map, node_name, node_overlay) => {
                 last.clone_from(&bytes);
                 last_error.clear();
-                let table = DnsTable::from_netmap(&map);
-                // W25-6: the responder uses the new table first. A slow host resolver command
-                // (up to COMMAND_WAIT for each call) must not hold the new answers.
-                let _ = watch_state.tables.send(table.clone());
-                refresh_resolver_in_background(watch_state, table);
-                println!("The DNS answers follow the new netmap.");
+                Some(map)
             }
             Ok(_) => {
                 *last = bytes;
@@ -2618,6 +2655,7 @@ fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut 
                     eprintln!("The node keeps the current DNS answers. {text}");
                     *last_error = text;
                 }
+                None
             }
             Err(err) => {
                 *last = bytes;
@@ -2626,6 +2664,7 @@ fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut 
                     eprintln!("The node did not load the netmap for DNS. {text}");
                     *last_error = text;
                 }
+                None
             }
         },
         Err(err) => {
@@ -2634,6 +2673,7 @@ fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut 
                 eprintln!("The node did not read the netmap for DNS. {text}");
                 *last_error = text;
             }
+            None
         }
     }
 }
@@ -2678,7 +2718,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        format_node_status, load_state, read_status_text, store_record, NodeStatus, StatusPeer,
+        changed_dns_netmap, dns_start_text, format_node_status, load_state, read_status_text,
+        store_record, NodeStatus, StatusPeer,
     };
     use crate::netmap::Netmap;
 
@@ -2698,6 +2739,27 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// W25-43 (Datapath review): the policy sync can write a new netmap file after `orblx up`
+    /// read the start netmap and before the DNS watcher starts. The first DNS tick must give
+    /// the new table, with the new peer name.
+    #[test]
+    fn the_dns_watcher_applies_a_netmap_file_written_before_it_starts() {
+        let dir = test_dir("dns-start-race");
+        let path = dir.join("netmap.json");
+        let start =
+            br#"{"version": 1, "self": {"name": "a", "overlay_ip": "100.64.0.1"}, "peers": []}"#;
+        let new = br#"{"version": 1, "self": {"name": "a", "overlay_ip": "100.64.0.1"}, "peers": [{"name": "b", "overlay_ip": "100.64.0.2", "owner": "lab", "svid": "spiffe://orblx.local/node/b", "endpoints": ["172.28.18.12:443"], "routes": []}]}"#;
+        fs::write(&path, new).unwrap();
+        let mut last = dns_start_text(Some(start.to_vec()), &path);
+        let mut last_error = String::new();
+        let map = changed_dns_netmap(&path, "a", "100.64.0.1", &mut last, &mut last_error)
+            .expect("the first DNS tick did not apply the netmap file that changed before the DNS watcher started");
+        assert!(map.peers.iter().any(|peer| peer.name == "b"));
+        assert_eq!(last, new.to_vec());
+        assert!(changed_dns_netmap(&path, "a", "100.64.0.1", &mut last, &mut last_error).is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
