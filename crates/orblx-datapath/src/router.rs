@@ -2,6 +2,11 @@
 //!
 //! Each outbound TUN packet uses the destination address.
 //! The longest matching prefix selects the peer.
+//!
+//! W25 HA subnet routers: two or more peers can own the same subnet prefix.
+//! The table keeps all of them as candidates, sorted by name.
+//! [`crate::RouteSelector`] picks the active candidate from the session health.
+//! An overlay `/32` address always has one owner.
 
 use std::net::Ipv4Addr;
 
@@ -11,9 +16,32 @@ use crate::netmap::{ipv4_mask, parse_cidr, parse_ipv4, Netmap, NetmapError};
 /// One destination prefix that a peer owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Route {
-    peer: String,
+    /// The peers that own the prefix, sorted by name.
+    /// An overlay `/32` route has one peer.
+    peers: Vec<String>,
     prefix: Ipv4Addr,
     prefix_len: u8,
+    /// True when the prefix is the overlay address of a peer.
+    overlay: bool,
+}
+
+/// The peers that can carry one destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteMatch<'a> {
+    /// The matched prefix, for example `10.88.0.0/24`.
+    pub prefix: Ipv4Addr,
+    /// The matched prefix length.
+    pub prefix_len: u8,
+    /// The candidate peers, sorted by name. The list is not empty.
+    pub peers: &'a [String],
+}
+
+impl RouteMatch<'_> {
+    /// Return true when two or more peers own the prefix (an HA route).
+    #[must_use]
+    pub fn is_ha(&self) -> bool {
+        self.peers.len() > 1
+    }
 }
 
 /// The routes from one netmap.
@@ -28,7 +56,8 @@ pub struct RouterTable {
 pub enum RouterError {
     /// The netmap check failed.
     Netmap(NetmapError),
-    /// Two peers own the same prefix.
+    /// Two peers own the same overlay address,
+    /// or a subnet route covers exactly the overlay address of another peer.
     Ambiguous {
         /// The CIDR that two peers own.
         cidr: String,
@@ -68,7 +97,7 @@ impl RouterTable {
         };
         for peer in &map.peers {
             let overlay = parse_ipv4(&peer.overlay_ip).map_err(RouterError::Netmap)?;
-            table.insert(&peer.name, overlay, 32, &format!("{overlay}/32"))?;
+            table.insert(&peer.name, overlay, 32, &format!("{overlay}/32"), true)?;
             if peer.exit_node {
                 table.exits.push(peer.name.clone());
             }
@@ -77,7 +106,7 @@ impl RouterTable {
                 if prefix_len == 0 {
                     continue;
                 }
-                table.insert(&peer.name, prefix, prefix_len, route)?;
+                table.insert(&peer.name, prefix, prefix_len, route, false)?;
             }
         }
         Ok(table)
@@ -121,8 +150,25 @@ impl RouterTable {
         accept_routes: bool,
         exit: Option<&str>,
     ) -> Option<&str> {
+        if let Some(found) = self.lookup_match(dest, accept_routes) {
+            return found.peers.first().map(String::as_str);
+        }
+        let name = exit?;
+        if self.is_exit(name) {
+            Some(self.exits.iter().find(|peer| *peer == name)?.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// Return the longest prefix that owns `dest`, with all its candidate peers.
+    ///
+    /// The function skips a prefix of length 0.
+    /// A subnet prefix is active only when `accept_routes` is true.
+    #[must_use]
+    pub fn lookup_match(&self, dest: Ipv4Addr, accept_routes: bool) -> Option<RouteMatch<'_>> {
         let dest_bits = u32::from(dest);
-        let mut best: Option<(u8, &str)> = None;
+        let mut best: Option<&Route> = None;
         for route in &self.routes {
             if !route_is_active(route.prefix_len, accept_routes) {
                 continue;
@@ -132,22 +178,33 @@ impl RouterTable {
                 continue;
             }
             let replace = match best {
-                Some((len, _)) => route.prefix_len > len,
+                Some(current) => route.prefix_len > current.prefix_len,
                 None => true,
             };
             if replace {
-                best = Some((route.prefix_len, route.peer.as_str()));
+                best = Some(route);
             }
         }
-        if let Some((_, peer)) = best {
-            return Some(peer);
-        }
-        let name = exit?;
-        if self.is_exit(name) {
-            Some(self.exits.iter().find(|peer| *peer == name)?.as_str())
-        } else {
-            None
-        }
+        best.map(|route| RouteMatch {
+            prefix: route.prefix,
+            prefix_len: route.prefix_len,
+            peers: &route.peers,
+        })
+    }
+
+    /// Return each prefix that two or more peers own, with the peers.
+    #[must_use]
+    pub fn ha_routes(&self) -> Vec<(String, Vec<String>)> {
+        self.routes
+            .iter()
+            .filter(|route| route.peers.len() > 1)
+            .map(|route| {
+                (
+                    format!("{}/{}", route.prefix, route.prefix_len),
+                    route.peers.clone(),
+                )
+            })
+            .collect()
     }
 
     /// Return the CIDRs that the kernel should send into the TUN device.
@@ -176,23 +233,32 @@ impl RouterTable {
         prefix: Ipv4Addr,
         prefix_len: u8,
         cidr: &str,
+        overlay: bool,
     ) -> Result<(), RouterError> {
         if let Some(existing) = self
             .routes
-            .iter()
+            .iter_mut()
             .find(|route| route.prefix == prefix && route.prefix_len == prefix_len)
         {
-            if existing.peer != peer {
+            if existing.peers.iter().any(|name| name == peer) {
+                existing.overlay |= overlay;
+                return Ok(());
+            }
+            // An overlay address has one owner. Only subnet routes can have two routers.
+            if existing.overlay || overlay {
                 return Err(RouterError::Ambiguous {
                     cidr: cidr.to_string(),
                 });
             }
+            existing.peers.push(peer.to_string());
+            existing.peers.sort();
             return Ok(());
         }
         self.routes.push(Route {
-            peer: peer.to_string(),
+            peers: vec![peer.to_string()],
             prefix,
             prefix_len,
+            overlay,
         });
         Ok(())
     }
@@ -387,11 +453,49 @@ mod tests {
     }
 
     #[test]
-    fn two_peers_cannot_own_one_prefix() {
-        let err =
-            RouterTable::from_netmap(&map_with("\"10.9.0.0/24\"", "\"10.9.0.0/24\"")).unwrap_err();
+    fn two_peers_can_own_one_subnet_prefix() {
+        let table =
+            RouterTable::from_netmap(&map_with("\"10.9.0.0/24\"", "\"10.9.0.0/24\"")).unwrap();
+        let found = table
+            .lookup_match(Ipv4Addr::new(10, 9, 0, 7), true)
+            .unwrap();
+        assert!(found.is_ha());
+        assert_eq!(found.peers, ["b".to_string(), "c".to_string()]);
+        assert_eq!(found.prefix_len, 24);
+        assert_eq!(
+            table.lookup_for(Ipv4Addr::new(10, 9, 0, 7), true),
+            Some("b")
+        );
+        assert_eq!(table.lookup_for(Ipv4Addr::new(10, 9, 0, 7), false), None);
+        let installed = table
+            .install_cidrs(true)
+            .into_iter()
+            .filter(|cidr| cidr == "10.9.0.0/24")
+            .count();
+        assert_eq!(installed, 1);
+        assert_eq!(
+            table.ha_routes(),
+            vec![(
+                "10.9.0.0/24".to_string(),
+                vec!["b".to_string(), "c".to_string()]
+            )]
+        );
+        let single = table
+            .lookup_match(Ipv4Addr::new(100, 64, 0, 2), true)
+            .unwrap();
+        assert!(!single.is_ha());
+    }
+
+    #[test]
+    fn a_subnet_route_cannot_take_an_overlay_address() {
+        let err = RouterTable::from_netmap(&map_with("\"100.64.0.3/32\"", "")).unwrap_err();
         match err {
-            RouterError::Ambiguous { cidr } => assert_eq!(cidr, "10.9.0.0/24"),
+            RouterError::Ambiguous { cidr } => assert_eq!(cidr, "100.64.0.3/32"),
+            RouterError::Netmap(err) => panic!("the router returned a netmap error: {err}"),
+        }
+        let err = RouterTable::from_netmap(&map_with("", "\"100.64.0.2/32\"")).unwrap_err();
+        match err {
+            RouterError::Ambiguous { cidr } => assert_eq!(cidr, "100.64.0.2/32"),
             RouterError::Netmap(err) => panic!("the router returned a netmap error: {err}"),
         }
     }
