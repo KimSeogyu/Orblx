@@ -356,7 +356,9 @@ cp "$TARGET_DIR/debug/orblx-test-idp" "$IMAGE_DIR/orblx-test-idp"
   # [C] openssh-client for the foreign CA gate only. The node does not run sshd.
   printf '%s\n' 'RUN apt-get update && apt-get install -y --no-install-recommends openssh-client && rm -rf /var/lib/apt/lists/*'
 } >>"$IMAGE_DIR/Dockerfile"
-as_root docker build -q -t orblx-ssh:local "$IMAGE_DIR" >/dev/null
+# --no-cache: the build does not use cached layers. Run 5 failed when a cached layer was
+# removed during the build ("No such image").
+as_root docker build --no-cache -q -t orblx-ssh:local "$IMAGE_DIR" >/dev/null
 rm -rf "$IMAGE_DIR"
 
 echo "=== [C] test issuer and coordinator ==="
