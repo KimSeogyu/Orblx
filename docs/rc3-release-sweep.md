@@ -301,3 +301,14 @@ State at the merge of this PR (18 of 21 proofs done; `config-audit`, `audit-webh
 - The proofs with no binary setting use a debug binary, not the release binary.
 - The "first error line" is a text match. A proof that prints an expected error before its real failure gives the expected line. The exit code and the log path are in the row.
 - The sweep is Linux only (`flock`, `timeout`, Docker). On a host with no `timeout` (macOS CI), a proof runs with no time limit; with no `flock`, it runs without the lock. The unit test runs on both.
+
+## Rows that the rc.3 sweep skips (W25-27)
+
+`docs/matrix-rows.txt` is the one source of row status. A partial row may have a 4th field, and
+the only accepted value is `not in rc.3 sweep: no coordinator SSH certs`. A proof is skipped only
+when every row that names it has this mark; the summary shows `skipped (<mark>)` and the plan
+shows `skipped: <mark>`. Without the mark the proof runs. Rows 40 (Tailscale SSH) and 41 (SSH
+session recording) have the mark, so the `ssh` proof does not run in the rc.3 sweep: it makes lab
+tickets, and the lab-ticket guard fails it. The sweep exits 2 when row 40 or row 41 claims
+shipped in the rows file or the manifest, when a 4th field is not the mark, and when a shipped
+row has the mark. The release notes draft (`docs/rc3-release-notes.md`) says so for users.
