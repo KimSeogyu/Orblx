@@ -17,7 +17,7 @@ use crate::files::{create_private_dir, read_text, write_bytes, write_text};
 use crate::netmap::{
     decode_hex_32, verify_signed_endpoint, NetmapKey, SignedEndpoint, SignedGrants, SignedNetmap,
 };
-use crate::store::{CreatedToken, NodeStore, StoredNode};
+use crate::store::{CreatedToken, NodeStore, StoredNode, StoredUser, UserState};
 use crate::ticket::{self, IssuedTicket};
 
 const COORD_NAME_FILE: &str = "coord-name";
@@ -528,9 +528,89 @@ impl Coordinator {
         let _ = SpiffeId::node(name)?;
         let mut inner = self.lock()?;
         reload(&mut inner)?;
-        let owner = owner_from_oidc(&inner.oidc, id_token, nonce, now)?;
-        let plan = inner.store.begin_oidc(name, &owner, endpoints, routes)?;
+        let login = owner_from_oidc(&inner.oidc, id_token, nonce, now)?;
+        // W25-15: a user that is not approved gets no plan, no overlay address, and no SVID.
+        admit_user(&mut inner, &login, now)?;
+        let plan = inner
+            .store
+            .begin_oidc(name, &login.subject, endpoints, routes)?;
         finish_enroll(&mut inner, plan, now)
+    }
+
+    /// Return the OIDC users and their nodes (W25-15).
+    pub fn user_list(&self) -> Result<(Vec<StoredUser>, Vec<StoredNode>), CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        Ok((inner.store.users(), inner.store.nodes()))
+    }
+
+    /// Approve one OIDC user for `actor` and write one config record (W25-15).
+    ///
+    /// `user` is `oidc:SUBJECT`. An unknown user gets an approved record, so an owner
+    /// can approve a user before the first sign-in.
+    pub fn approve_user_by(
+        &self,
+        user: &str,
+        actor: &str,
+        now: SystemTime,
+    ) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        if inner.store.user(user).map(|stored| stored.state) == Some(UserState::Approved) {
+            return Err(CoordError::Protocol(
+                "The user is already approved.".to_string(),
+            ));
+        }
+        set_user_recorded(
+            &mut inner,
+            user,
+            UserState::Approved,
+            actor,
+            ConfigAction::UserApprove,
+            "owner",
+            now,
+        )
+    }
+
+    /// Reject one OIDC user for `actor` and write one config record (W25-15).
+    ///
+    /// The user gets no SVID. An owner user cannot be rejected.
+    /// An approved user cannot be rejected. Expire or revoke the user nodes.
+    pub fn reject_user_by(
+        &self,
+        user: &str,
+        actor: &str,
+        now: SystemTime,
+    ) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        if inner.policy.user_approval().is_owner_user(user) {
+            return Err(CoordError::Protocol(
+                "The user is an owner user. An owner user cannot be rejected.".to_string(),
+            ));
+        }
+        match inner.store.user(user).map(|stored| stored.state) {
+            Some(UserState::Approved) => {
+                return Err(CoordError::Protocol(
+                    "The user is approved. Expire or revoke the user nodes.".to_string(),
+                ))
+            }
+            Some(UserState::Rejected) => {
+                return Err(CoordError::Protocol(
+                    "The user is already rejected.".to_string(),
+                ))
+            }
+            Some(UserState::Pending) | None => {}
+        }
+        set_user_recorded(
+            &mut inner,
+            user,
+            UserState::Rejected,
+            actor,
+            ConfigAction::UserReject,
+            "owner",
+            now,
+        )
     }
 
     /// Return the SPIFFE IDs that node `name` does not see, and the config record count (W25-1).
@@ -869,6 +949,7 @@ impl Coordinator {
                 &sentence,
             )?;
         }
+        record_user_migration(&mut inner, &actor)?;
         Ok(())
     }
 
@@ -1214,6 +1295,10 @@ fn reload(inner: &mut Inner) -> Result<(), CoordError> {
     inner.nodes_loaded = None;
     inner.store = NodeStore::open(&inner.state_dir.join(STORE_FILE))?;
     refresh_policy(inner);
+    if inner.audit.is_some() && !inner.store.migration_unrecorded().is_empty() {
+        let actor = coord_actor_of(inner)?;
+        record_user_migration(inner, &actor)?;
+    }
     Ok(())
 }
 
@@ -1972,22 +2057,156 @@ fn published_routes(policy: &Policy, svid: &str, routes: &[String]) -> Vec<Strin
         .collect()
 }
 
+/// The checked OIDC sign-in.
+struct OidcLogin {
+    subject: String,
+    email: Option<String>,
+    email_verified: bool,
+}
+
+impl OidcLogin {
+    fn subject_only(subject: String) -> Self {
+        Self {
+            subject,
+            email: None,
+            email_verified: false,
+        }
+    }
+
+    fn user(&self) -> String {
+        format!("oidc:{}", self.subject)
+    }
+}
+
+/// Let an approved OIDC user enroll, or refuse the user (W25-15).
+///
+/// - An owner user in `userApproval.ownerUsers` is never pending.
+/// - A rejected user is refused.
+/// - A verified email in `userApproval.autoApproveDomains` is approved. The list is empty by default.
+/// - Each other new user is stored as pending and refused.
+///
+/// Each approval that this function makes writes one `user-approve` record.
+fn admit_user(inner: &mut Inner, login: &OidcLogin, now: SystemTime) -> Result<(), CoordError> {
+    let user = login.user();
+    if crate::store::check_user(&user).is_err() {
+        return Err(CoordError::Oidc);
+    }
+    let state = inner.store.user(&user).map(|stored| stored.state);
+    if state == Some(UserState::Approved) {
+        return Ok(());
+    }
+    let approval = inner.policy.user_approval();
+    let reason = if approval.is_owner_user(&user) {
+        Some("policy owner user".to_string())
+    } else if state == Some(UserState::Rejected) {
+        println!("user refused {user} rejected");
+        return Err(CoordError::UserRejected);
+    } else {
+        approval
+            .auto_domain(login.email.as_deref(), login.email_verified)
+            .map(|domain| format!("policy auto-approve domain {domain}"))
+    };
+    if let Some(reason) = reason {
+        let actor = coord_actor_of(inner)?;
+        return set_user_recorded(
+            inner,
+            &user,
+            UserState::Approved,
+            &actor,
+            ConfigAction::UserApprove,
+            &reason,
+            now,
+        );
+    }
+    let email = login.email.as_deref().filter(|_| login.email_verified);
+    if inner.store.add_pending(&user, email, now)? {
+        println!("user pending {user}");
+    } else {
+        println!("user refused {user} pending");
+    }
+    Err(CoordError::UserPending)
+}
+
+/// Write one `user-approve` record for each user that the store migration approved (W25-15).
+///
+/// The store migration runs when the store opens. When the chain is not open yet, the store
+/// keeps a mark, and the function runs again when the chain opens. Then each approval has a record.
+fn record_user_migration(inner: &mut Inner, actor: &str) -> Result<(), CoordError> {
+    for user in inner.store.migration_unrecorded() {
+        let after = user_digest(inner.store.user(&user).as_ref());
+        record(
+            inner,
+            actor,
+            ConfigAction::UserApprove,
+            &user,
+            EMPTY_DIGEST,
+            after,
+            "store migration",
+        )?;
+        inner.store.set_migration_recorded(&user)?;
+    }
+    Ok(())
+}
+
+/// Change one user state and write one config record (W25-15).
+///
+/// The change needs the config chain. When the record write fails, the state goes back.
+fn set_user_recorded(
+    inner: &mut Inner,
+    user: &str,
+    state: UserState,
+    actor: &str,
+    action: ConfigAction,
+    detail: &str,
+    now: SystemTime,
+) -> Result<(), CoordError> {
+    if inner.audit.is_none() {
+        return Err(CoordError::Protocol(
+            "The config audit chain is off. A user change needs a record.".to_string(),
+        ));
+    }
+    let old = inner.store.user(user);
+    let before = user_digest(old.as_ref());
+    inner.store.set_user_state(user, state, now)?;
+    let after = user_digest(inner.store.user(user).as_ref());
+    if let Err(err) = record(inner, actor, action, user, before, after, detail) {
+        let _ = match old {
+            Some(old) => inner.store.set_user_state(user, old.state, now),
+            None => inner.store.remove_user(user),
+        };
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn user_digest(user: Option<&StoredUser>) -> [u8; 32] {
+    let Some(user) = user else {
+        return EMPTY_DIGEST;
+    };
+    let value = serde_json::json!({
+        "user": user.user,
+        "state": user.state.as_str(),
+    });
+    sha256(value.to_string().as_bytes())
+}
+
 fn owner_from_oidc(
     oidc: &OidcState,
     id_token: &str,
     nonce: Option<&str>,
     now: SystemTime,
-) -> Result<String, CoordError> {
+) -> Result<OidcLogin, CoordError> {
     match oidc {
         OidcState::TokenOnly => Err(CoordError::Oidc),
         OidcState::Mock(gate) => gate
             .owner_subject(id_token, nonce, now)
+            .map(OidcLogin::subject_only)
             .map_err(|_| CoordError::Oidc),
         OidcState::Google { client_id, jwks } => {
             let jwks = jwks.as_ref().ok_or(CoordError::Oidc)?;
             let nonce = nonce.ok_or(CoordError::Oidc)?;
             jwks.verify(id_token, client_id, nonce, now)
-                .map(|claims| claims.subject)
+                .map(|claims| OidcLogin::subject_only(claims.subject))
                 .map_err(|_| CoordError::Oidc)
         }
         OidcState::Issuer(cache) => {
@@ -1998,7 +2217,11 @@ fn owner_from_oidc(
             match jwks.verify(id_token, &cache.issuer, nonce, now) {
                 Ok(claims) => {
                     println!("oidc accept sub {}", claims.subject);
-                    Ok(claims.subject)
+                    Ok(OidcLogin {
+                        subject: claims.subject,
+                        email: claims.email,
+                        email_verified: claims.email_verified,
+                    })
                 }
                 Err(reason) => {
                     println!("oidc reject {reason}");
