@@ -46,6 +46,7 @@ class ProofLockTest(unittest.TestCase):
         self.env = dict(os.environ)
         self.env.update(
             LOCK_SH=LOCK_SH,
+            PROOF_MIN_FREE_GIB="15",
             ORBLX_PROOF_LOCK=os.path.join(self.dir, "proof.lock"),
             ORBLX_PROOF_LOCK_NOTE_SECS="1",
             ORBLX_PROOF_SAMPLE_SECS="1",

@@ -375,6 +375,8 @@ fi
 # Free disk space. A proof that fails from a full disk is a box failure, and such a run never
 # counts. So the run does not start with less than ORBLX_SWEEP_MIN_FREE_GB free.
 MIN_FREE_GB="${ORBLX_SWEEP_MIN_FREE_GB:-30}"
+# proof_lock_take checks this minimum (exported for the lock of each proof).
+export PROOF_MIN_FREE_GIB=28  # reason: 30 GB (the sweep minimum above) is 27.9 GiB, rounded up.
 [[ "$MIN_FREE_GB" =~ ^[0-9]+$ ]] || die "ORBLX_SWEEP_MIN_FREE_GB must be a whole number of GB"
 free_gb_of() {
   local dir="$1" text
