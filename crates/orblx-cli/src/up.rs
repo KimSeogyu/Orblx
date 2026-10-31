@@ -394,7 +394,7 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
 fn run_up(mut options: UpOptions) -> Result<(), String> {
     apply_saved_exit(&mut options)?;
     let (netmap_path, forward_routes, forward_exit) = publish_routes(&options)?;
-    let netmap = locked_netmap(&options.state_dir, &netmap_path)?;
+    let (netmap, netmap_text) = locked_netmap(&options.state_dir, &netmap_path)?;
     let config = load_config(&options.state_dir)?;
     let overlay: Ipv4Addr = netmap
         .self_node
@@ -426,6 +426,7 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
         underlay,
         relay: options.relay,
         netmap_path,
+        netmap_text: Some(netmap_text),
         visibility,
         on_ready: Some(Box::new(move |overlay| {
             if let Err(err) = orblx_ssh::spawn_overlay_server(&ssh_state, overlay) {
@@ -444,20 +445,30 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
 ///
 /// With a node lock file, the function writes the netmap file again without the peers
 /// that no trusted owner key signed. The accept path reads that file.
-fn locked_netmap(state_dir: &Path, netmap_path: &Path) -> Result<Netmap, String> {
-    let mut netmap = Netmap::from_path(netmap_path).map_err(|err| err.to_string())?;
+///
+/// The result has the netmap and the file text that gave it (W25-43). The policy sync starts
+/// after this read, so the text is the text that the netmap watcher starts from.
+fn locked_netmap(state_dir: &Path, netmap_path: &Path) -> Result<(Netmap, Vec<u8>), String> {
+    let mut text = fs::read(netmap_path).map_err(|err| {
+        format!(
+            "The netmap file {} was not read. {err}",
+            netmap_path.display()
+        )
+    })?;
+    let mut netmap = Netmap::from_slice(&text).map_err(|err| err.to_string())?;
     let report = orblx_coord::nodelock::apply_node_lock(state_dir, &mut netmap)
         .map_err(|err| format!("Node lock refused the netmap. {err}"))?;
     if let Some(report) = report {
         orblx_coord::nodelock::print_report(&report);
         if !report.dropped.is_empty() {
-            let text = serde_json::to_string(&netmap)
+            let json = serde_json::to_string(&netmap)
                 .map_err(|_| "The netmap is not valid.".to_string())?;
-            fs::write(netmap_path, text.as_bytes())
+            fs::write(netmap_path, json.as_bytes())
                 .map_err(|err| format!("The netmap file was not written. {err}"))?;
+            text = json.into_bytes();
         }
     }
-    Ok(netmap)
+    Ok((netmap, text))
 }
 
 fn push_ipv4(extra: &mut Vec<Ipv4Addr>, addr: Option<SocketAddr>) {
