@@ -46,7 +46,7 @@ does not stop the sweep. `ORBLX_SWEEP_ONLY` runs some proofs only; such a run ne
 | Exit | Meaning |
 |---|---|
 | 0 | Every row passed: each of its proofs gave its pass line. |
-| 1 | A proof failed, or a shipped row has no proof. The summary line `Failed rows: ...` names the rows. |
+| 1 | A proof failed, a shipped row has no proof, a row is INVALID (its contention probe did not report `unknown_samples 0`), or a row is ABORT (`proof_infra_abort`). The summary lines `Failed rows: ...`, `Invalid rows ...: ...` and `Aborted rows ...: ...` name the rows. |
 | 2 | Setup, manifest or build error. |
 | 3 | `ORBLX_SWEEP_ONLY` run with no failure. It does not count. |
 
@@ -133,11 +133,13 @@ it is in the manifest. The sweep does not hide this row.
 | `FAIL (exit 0, no pass line RE)` | A proof with its own pass line ended with exit 0 but without that line. |
 | `FAIL (exit 124, timeout ...)` | The proof ran longer than `ORBLX_SWEEP_TIMEOUT`. |
 | `FAIL: no proof for this shipped row` | The manifest row has `-`. |
+| `ABORT (infrastructure, reason=R, exit N): LINE` | The proof stopped with `proof_infra_abort` before any proof step (see "Infrastructure abort (ABORT) in the sweep (W25-27)"). It is not a pass and not a FAIL. The row stays open. |
+| `INVALID: proof_ok but REASON` | The proof passed, but its contention probe did not report `unknown_samples 0` (see "Contention probe: unknown_samples 0 (W25-27)"). The row does not count. |
 
 The summary has one line for each row and proof: row, feature, proof, result, log path, time
 (`T s (run R s, lock wait W s)`) and the `proof_contention` line of the proof (samples,
 contended samples, the most other orblx containers, the most load). Then `Failed rows: ...`,
-and the proof count and the total time.
+`Invalid rows (...): ...`, and the proof count and the total time.
 
 The log of a proof (`/workspace/orblx-w18-proof/rc3-sweep-<sha>-<proof>.log`) is the full
 stdout and stderr of the proof, with no filter and no cut. The sweep adds only its own lines
@@ -216,7 +218,18 @@ caller is not root, so it never asks for a password.
 - `--plan` lists every row and proof and prints the estimate;
 - less free disk than `ORBLX_SWEEP_MIN_FREE_GB` stops the run with exit 2 before any proof;
 - a `steady_warn` rate over 1% prints the root-cause line and does not fail the sweep;
-- the real manifest has every shipped row, and each proof it names is defined.
+- the real manifest has every shipped row, and each proof it names is defined;
+- ABORT, INVALID and FAIL are separate results: `proof_infra_abort` with `reason=disk_low`
+  (exit 3) and `reason=disk_unknown` (exit 4) is ABORT, and the summary names each reason; an
+  abort line after the proof's own lock, with an exit that is not an abort code, or with a
+  different reason is FAIL; a pass with `unknown_samples` 2 is INVALID; an ABORT alone makes
+  the sweep exit 1;
+- contention rule: `unknown_samples 0` passes; `unknown_samples` over 0 (a fake `docker` that
+  fails, or a proof's own probe line) makes the row INVALID and the sweep exit 1; a missing
+  wrapper line, a wrapper line with `samples 0`, or a line with no `unknown_samples` field is
+  INVALID, and a proof's own line with `samples 0` is not (`--contention-check`).
+  The tests put a fake `docker` first on the sweep tool PATH (`$CARGO_HOME/bin`), so the probe
+  result does not depend on the host.
 
 `scripts/proof/tests/test_no_early_pipe_reader.py` checks the script for early pipe readers.
 
@@ -301,3 +314,127 @@ State at the merge of this PR (18 of 21 proofs done; `config-audit`, `audit-webh
 - The proofs with no binary setting use a debug binary, not the release binary.
 - The "first error line" is a text match. A proof that prints an expected error before its real failure gives the expected line. The exit code and the log path are in the row.
 - The sweep is Linux only (`flock`, `timeout`, Docker). On a host with no `timeout` (macOS CI), a proof runs with no time limit; with no `flock`, it runs without the lock. The unit test runs on both.
+
+## Rows that the rc.3 sweep skips (W25-27)
+
+`docs/matrix-rows.txt` is the one source of row status. A partial row may have a 4th field, and
+the only accepted value is `not in rc.3 sweep: no coordinator SSH certs`. A proof is skipped only
+when every row that names it has this mark; the summary shows `skipped (<mark>)` and the plan
+shows `skipped: <mark>`. Without the mark the proof runs. Rows 40 (Tailscale SSH) and 41 (SSH
+session recording) have the mark, so the `ssh` proof does not run in the rc.3 sweep: it makes lab
+tickets, and the lab-ticket guard fails it. The sweep exits 2 when row 40 or row 41 claims
+shipped in the rows file or the manifest, when a 4th field is not the mark, and when a shipped
+row has the mark. The release notes draft (`docs/rc3-release-notes.md`) says so for users.
+
+## Old binaries (W25-27)
+
+Some proofs need an orblx from before a change: `user-approval` (row 32) runs a coordinator from
+before W25-15 for its migration phase (`OLD_ORBLX`). Row 32: upgrade from rc.2 tag b9cae9c (tcp
+and udp only). The manifest pins it by full commit SHA in the proof ENV field:
+`OLD_ORBLX=@OLD:b9cae9c103c04d29bb08be10c7d982ec9cffc65c@`. That commit is the `v0.1.0-rc.2` tag.
+It is an ancestor of the W25-15 merge (#102, `538b154`), so it has no user approval. The proof
+still checks that the old image has 0 `user-approve` help lines.
+
+- The sweep labels an old build from git: `git rev-parse` and the tag name (`git tag
+  --points-at`), for example `commit b9cae9c1... tag v0.1.0-rc.2`. It never uses
+  `orblx --version`, because a dev build can print a release version.
+- In a run, after the main build, the sweep builds `orblx` (debug, `--locked`) at the pin in a
+  temp git worktree `$ORBLX_SWEEP_WORK/old-<sha12>-wt` with its own target dir
+  `$ORBLX_SWEEP_WORK/old-<sha12>-target`, copies the binary to the cache
+  `$ORBLX_SWEEP_WORK/old-orblx/<sha>/orblx`, and deletes the worktree and the target (also when
+  the build fails). The default `ORBLX_SWEEP_WORK` is `/workspace/orblx-rc3-sweep-work`. A cached
+  binary is reused. A failed old build is exit 2, with the log
+  `rc3-sweep-<sha>-old-<sha12>-build.log`.
+- When `OLD_ORBLX` is set in the caller's environment, the sweep uses it and builds nothing. It
+  must be an executable file (else exit 2).
+- `--plan` shows the step for each pinned proof (build, cached, or from the environment).
+- Exit 2 in `--plan` and in a run: a proof whose script needs `OLD_ORBLX` (`OLD_ORBLX:?`) with no
+  pin, a pin that is not 40 lowercase hex digits, a pin that is not the value of `OLD_ORBLX`,
+  and (with git) a pin that is not a commit or not an ancestor of `COMMIT`.
+
+## Contention probe: unknown_samples 0 (W25-27)
+
+PO rule (2026-10-31 14:23 KST): a proof row counts only when its contention probe reports
+`unknown_samples 0`. The probe is the sampler in `scripts/proof/proof-lock.sh`
+(`proof_lock_take` starts it, `proof_lock_end` prints the line). It runs `docker ps` every
+`ORBLX_PROOF_SAMPLE_SECS` (2 s); a sample where `docker ps` fails is unknown. The line is:
+
+```
+proof_contention LABEL samples N contended_samples N unknown_samples N max_other_orblx_containers N max_load1 X
+```
+
+The sweep does not change the probe (W25-35 fixes the probe). After a proof gives its pass
+line, the sweep reads its log:
+
+- the log must have the sweep wrapper line, `proof_contention rc3-sweep:PROOF ...`. The wrapper
+  takes the lock (or the parent lock in lock mode `sweep`), so the line is there in both lock
+  modes;
+- every `proof_contention` line in the log (the wrapper's and the proof's own) must have an
+  `unknown_samples` field, and it must be 0;
+- the wrapper line must also have `samples` 1 or more (Eng Lead, 2026-10-31 14:49 KST).
+  `samples 0` means the probe took no sample, so there is no contention evidence. This rule is
+  for the wrapper line only: a proof's own `proof_contention` lines may have `samples 0`.
+
+Else the result is `INVALID: proof_ok but REASON`, where REASON is
+`unknown_samples N in proof_contention LABEL`, `samples 0 in proof_contention LABEL (no
+contention evidence)`, `no proof_contention rc3-sweep:PROOF line with unknown_samples`,
+`proof_contention LABEL has no unknown_samples field`, or `proof_contention LABEL has no samples
+field`. The first problem in the log is the reason. An INVALID row
+does not count: the summary line `Invalid rows (...): ...` names it and the sweep exits 1 (as
+for `Failed rows`). A FAIL stays a FAIL. A skipped proof is not checked.
+
+Since W25-35 (#132), `proof_lock_end` also prints `proof_contention_invalid LABEL ...` and
+exits 3 when `unknown_samples` is more than 0. When the proof gave its pass line and the
+wrapper exit is 3 with that line in the log, the sweep marks the row INVALID, not FAIL.
+
+To check one log by hand:
+
+```
+scripts/proof/release-sweep.sh --contention-check LOG PROOF
+```
+
+It prints `contention_check PROOF ok: unknown_samples 0 (LOG)` (exit 0) or
+`contention_check PROOF INVALID: REASON (LOG)` (exit 1).
+
+## Infrastructure abort or FAIL (W25-27)
+
+PO ruling (2026-10-31 17:20 KST). Use these rules when a proof run aborts. There is no abort
+logic in `proof-lock.sh` or in `release-sweep.sh`, so the rules are in this document.
+
+- Taking the proof lock is NOT a proof step.
+- The first proof step is the first step that builds, runs `cargo test`, starts a container,
+  or runs product code.
+- For `nat-realism`, the first proof step is the `proof_compose_clean` step at
+  `scripts/proof/nat-realism.sh:48`.
+- An abort counts as infrastructure only if the log shows that no proof step started.
+- An abort after the first proof step is a FAIL.
+- If the log is empty, nothing proves that no proof step started. Thus the run is a FAIL.
+
+## Infrastructure abort (ABORT) in the sweep (W25-27)
+
+PO rule (2026-10-31 18:55 KST). A proof can stop before its own lock and before any build. Then
+it prints this line and exits:
+
+```
+proof_infra_abort PROOF reason=disk_low free_gib=N min_gib=N dir=DIR. No proof step ran.
+proof_infra_abort PROOF reason=disk_unknown dir=DIR. No proof step ran.
+```
+
+The sweep gives this run the result ABORT. ABORT is not a pass, not a FAIL and not INVALID.
+
+- The exit code must be an abort code. `coord-enroll.sh` (branch `w25nb-coord-enroll`) uses
+  exit 3. The check in `proof-lock.sh` can use a distinct code (4). The sweep accepts both.
+  `ORBLX_SWEEP_ABORT_CODES` sets the list (default `3 4`).
+- The reason must be `disk_low` or `disk_unknown`. `disk_unknown` is an ABORT too.
+- The `proof_infra_abort` line must come before the proof's own `proof_lock` or
+  `proof_context` lines and before any cargo `Compiling` line. The sweep wrapper's own lines
+  (`rc3-sweep:PROOF`) do not count, because taking the proof lock is not a proof step.
+- If one of these conditions is false, the run is a FAIL, and the result gives the reason.
+- The sweep checks for ABORT before the pass line and the contention probe. Thus an abort with
+  exit 3 is not taken for the W25-35 probe exit.
+
+The summary line `Aborted rows (...): ...` names each aborted row with its proofs and reasons,
+for example `33 (coord-enroll: disk_unknown)`. The line `Aborted proofs: N` gives the count.
+An aborted row stays open until a clean run of its proofs passes. The sweep exits 1 when a row
+is aborted, the same as for a failed or INVALID row. Free disk space and run the sweep again.
+

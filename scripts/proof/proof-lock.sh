@@ -29,6 +29,10 @@
 # A proof that runs under a plain flock of the lock file (for example "flock FILE proof.sh")
 # stops at once with a message: it must use proof_lock_take.
 
+# W25-27: the lab-ticket guard (ticket-guard.sh) comes with the lock.
+# shellcheck source=scripts/proof/ticket-guard.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ticket-guard.sh"
+
 PROOF_LOCK_FD=9
 PROOF_LOCK_OWNER=0
 PROOF_LOCK_LABEL=""
@@ -342,6 +346,8 @@ proof_lock_queue_leave() {
 }
 
 proof_lock_take() {
+  # W25-27: a manifest proof that makes lab tickets fails before it waits for the lock.
+  proof_lab_ticket_static_guard "$0" || exit 1
   PROOF_LOCK_LABEL="$1"
   shift
   PROOF_LOCK_OWN=("$@")
