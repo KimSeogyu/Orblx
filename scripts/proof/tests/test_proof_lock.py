@@ -13,6 +13,8 @@ import tempfile
 import time
 import unittest
 
+from fake_docker import FAILS, SUDO, SUDO_FAILS, with_fake_docker
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOCK_SH = os.path.join(os.path.dirname(HERE), "proof-lock.sh")
 
@@ -49,6 +51,8 @@ class ProofLockTest(unittest.TestCase):
             ORBLX_PROOF_SAMPLE_SECS="1",
         )
         self.env.pop("ORBLX_PROOF_LOCK_HELD", None)
+        # W25-35: the sampler uses this docker stand-in, which prints no names.
+        self.env = with_fake_docker(self.env)
 
     def tearDown(self):
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -108,6 +112,48 @@ bash -c "$CHILD"
             ["bash", "-c", CHILD], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30
         ).stdout
         self.assertIn("proof_lock child acquired", out)
+
+    def run_holder(self, env, label, hold):
+        env = dict(env, LABEL=label, HOLD=str(hold))
+        return subprocess.run(["bash", "-c", HOLDER], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, timeout=60)
+
+    def test_a_run_with_unknown_samples_fails_and_says_it_is_not_valid(self):
+        # W25-35: docker ps fails and sudo -n fails, so the sampler cannot count the containers.
+        env = with_fake_docker(self.env, docker=FAILS, sudo=SUDO_FAILS)
+        res = self.run_holder(env, "blind", 1.5)
+        self.assertEqual(res.returncode, 3, res.stdout)
+        found = re.search(r"^proof_contention blind samples (\d+) contended_samples 0 unknown_samples (\d+) ", res.stdout, re.M)
+        self.assertIsNotNone(found, res.stdout)
+        samples, unknown = int(found.group(1)), int(found.group(2))
+        self.assertGreater(unknown, 0, res.stdout)
+        self.assertEqual(unknown, samples, res.stdout)
+        self.assertRegex(res.stdout, rf"(?m)^proof_contention_invalid blind unknown_samples {unknown} samples {samples}$")
+        self.assertIn("other_orblx_containers unknown", res.stdout)
+        # The lock is released before the script stops.
+        self.assertIn("proof_lock blind released", res.stdout)
+        free = subprocess.run(["flock", "-n", self.env["ORBLX_PROOF_LOCK"], "true"])
+        self.assertEqual(free.returncode, 0)
+
+    @unittest.skipIf(os.geteuid() == 0, "the sudo fallback is for a user that is not root")
+    def test_the_sampler_uses_sudo_when_the_user_cannot_use_docker(self):
+        # W25-35: the root cause. The proof user is not in the docker group, but sudo -n docker works.
+        docker = '#!/bin/sh\n[ -n "$FAKE_VIA_SUDO" ] || exit 1\necho orblx-other-1\necho other-project\n'
+        env = with_fake_docker(self.env, docker=docker, sudo=SUDO)
+        res = self.run_holder(env, "seen", 1.5)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        found = re.search(r"^proof_contention seen samples (\d+) contended_samples (\d+) unknown_samples 0 "
+                          r"max_other_orblx_containers 1 ", res.stdout, re.M)
+        self.assertIsNotNone(found, res.stdout)
+        self.assertEqual(found.group(1), found.group(2), res.stdout)
+        self.assertNotIn("proof_contention_invalid", res.stdout)
+        self.assertRegex(res.stdout, r"proof_context seen phase start time \S+ load \S+ other_orblx_containers 1 groups orblx-other:1")
+
+    def test_a_run_with_known_samples_has_no_invalid_line(self):
+        res = self.run_holder(self.env, "clear", 1.5)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertRegex(res.stdout, r"(?m)^proof_contention clear samples [1-9]\d* contended_samples 0 unknown_samples 0 ")
+        self.assertNotIn("proof_contention_invalid", res.stdout)
 
     def test_the_lock_is_free_after_the_holder_ends(self):
         first = self.start("one", 0.1)
