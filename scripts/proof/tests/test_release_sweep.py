@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 import unittest
 
+from fake_docker import fake_cargo_home, with_fake_docker
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SWEEP = os.path.join(HERE, "..", "release-sweep.sh")
 REAL_MANIFEST = os.path.join(HERE, "..", "sweep-manifest.txt")
@@ -123,7 +125,8 @@ class ReleaseSweepTest(unittest.TestCase):
         os.makedirs(os.path.join(self.root, "docs"), exist_ok=True)
         with open(os.path.join(self.root, "docs", "matrix-rows.txt"), "w") as f:
             f.write(self.rows_for(manifest))
-        env = dict(os.environ)
+        # W25-35: the sampler of the proof lock uses a docker stand-in, which prints no names.
+        env = with_fake_docker(dict(os.environ))
         env.update({
             "ORBLX_SWEEP_TEST_ROOT": self.root,
             "ORBLX_SWEEP_OUT": self.out,
@@ -131,6 +134,8 @@ class ReleaseSweepTest(unittest.TestCase):
             "ORBLX_PROOF_LOCK": os.path.join(self.tmp, "proof.lock"),
             "ORBLX_SWEEP_TIMEOUT": "60",
             "ORBLX_SWEEP_MIN_FREE_GB": "0",
+            # release-sweep.sh sets PATH for each proof; its first dir is "$CARGO_HOME/bin".
+            "CARGO_HOME": fake_cargo_home(),
         })
         env.pop("OLD_ORBLX", None)
         env["ORBLX_SWEEP_WORK"] = os.path.join(self.tmp, "work")
