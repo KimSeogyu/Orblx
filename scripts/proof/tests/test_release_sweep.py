@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 import unittest
 
+from fake_docker import with_fake_docker
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SWEEP = os.path.join(HERE, "..", "release-sweep.sh")
 REAL_MANIFEST = os.path.join(HERE, "..", "sweep-manifest.txt")
@@ -88,7 +90,8 @@ class ReleaseSweepTest(unittest.TestCase):
         path = os.path.join(self.tmp, "manifest.txt")
         with open(path, "w") as f:
             f.write(manifest)
-        env = dict(os.environ)
+        # W25-35: the sampler of the proof lock uses a docker stand-in, which prints no names.
+        env = with_fake_docker(dict(os.environ))
         env.update({
             "ORBLX_SWEEP_TEST_ROOT": self.root,
             "ORBLX_SWEEP_OUT": self.out,

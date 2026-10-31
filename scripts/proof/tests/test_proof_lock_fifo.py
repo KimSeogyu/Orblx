@@ -20,6 +20,8 @@ import tempfile
 import time
 import unittest
 
+from fake_docker import with_fake_docker
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 LIB = os.path.join(REPO, "scripts", "proof", "proof-lock.sh")
@@ -44,6 +46,8 @@ class ProofLockFairnessTest(unittest.TestCase):
         self.env = dict(os.environ, ORBLX_PROOF_LOCK=self.lock, ORBLX_PROOF_LOCK_NOTE_SECS="1",
                         ORBLX_PROOF_SAMPLE_SECS="1")
         self.env.pop("ORBLX_PROOF_LOCK_HELD", None)
+        # W25-35: the sampler uses a docker stand-in, which prints no names.
+        self.env = with_fake_docker(self.env)
         self.procs = []
 
     def tearDown(self):
