@@ -18,6 +18,8 @@ mod client;
 mod config;
 mod error;
 
+#[cfg(test)]
+mod dial_test;
 mod files;
 mod http_util;
 mod ippool;

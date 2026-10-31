@@ -320,15 +320,33 @@ impl HelloEndpoint {
         peer: SocketAddr,
         probe_every: Duration,
     ) -> Result<HelloSession, HelloError> {
+        self.connect_probed_limited(peer, probe_every, || true)
+            .await
+    }
+
+    /// Connect to `peer` as [`Self::connect_probed`] does, but ask `allow` before each attempt.
+    ///
+    /// When `allow` returns false, the function does not start the attempt and asks again
+    /// after `probe_every`. A node uses this to share one probe budget between its peers (W25-28).
+    pub async fn connect_probed_limited(
+        self: &Arc<Self>,
+        peer: SocketAddr,
+        probe_every: Duration,
+        mut allow: impl FnMut() -> bool,
+    ) -> Result<HelloSession, HelloError> {
         let mut attempts = tokio::task::JoinSet::new();
         let mut next = tokio::time::Instant::now();
+        let mut started = 0usize;
         loop {
-            if attempts.len() < MAX_CONNECT_PROBES && tokio::time::Instant::now() >= next {
-                let endpoint = Arc::clone(self);
-                attempts.spawn(async move { endpoint.connect_one(peer).await });
+            if started < MAX_CONNECT_PROBES && tokio::time::Instant::now() >= next {
+                if allow() {
+                    let endpoint = Arc::clone(self);
+                    attempts.spawn(async move { endpoint.connect_one(peer).await });
+                    started += 1;
+                }
                 next += probe_every;
             }
-            let more = attempts.len() < MAX_CONNECT_PROBES;
+            let more = started < MAX_CONNECT_PROBES;
             tokio::select! {
                 Some(done) = attempts.join_next() => match done {
                     Ok(result) => return result,
