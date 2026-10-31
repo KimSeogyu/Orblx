@@ -329,6 +329,52 @@ pub fn connect(
     service: &str,
     timeout: Duration,
 ) -> Result<TcpStream, ConnectError> {
+    connect_timed(
+        files,
+        to,
+        node,
+        service,
+        timeout,
+        &mut ConnectTiming::default(),
+    )
+}
+
+/// The time of each step of one guarded connection (W25-39).
+///
+/// Each value is the Unix time in microseconds. A value of 0 means that the step did not occur.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnectTiming {
+    /// The use proof is signed.
+    pub seal_us: u64,
+    /// The TCP connection to the guard is open.
+    pub tcp_us: u64,
+    /// The use proof line is written to the socket.
+    pub sent_us: u64,
+    /// The guard reply line is read.
+    pub reply_us: u64,
+    /// The local TCP port of the connection. 0 if no connection is open.
+    pub local_port: u16,
+}
+
+/// Unix time now in microseconds.
+pub fn unix_micros_now() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| u64::try_from(value.as_micros()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Open one guarded TCP connection and record the time of each step in `timing`.
+///
+/// The behavior is the same as [`connect`].
+pub fn connect_timed(
+    files: &GrantFiles,
+    to: SocketAddr,
+    node: &SpiffeId,
+    service: &str,
+    timeout: Duration,
+    timing: &mut ConnectTiming,
+) -> Result<TcpStream, ConnectError> {
     let IpAddr::V4(addr) = to.ip() else {
         return Err(ConnectError::Failed("The target is not IPv4.".to_string()));
     };
@@ -348,12 +394,17 @@ pub fn connect(
         SystemTime::now(),
     )
     .map_err(|err| ConnectError::Failed(err.to_string()))?;
+    timing.seal_us = unix_micros_now();
     let failed = |err: std::io::Error| ConnectError::Failed(err.to_string());
     let mut stream = TcpStream::connect_timeout(&to, timeout).map_err(failed)?;
+    timing.tcp_us = unix_micros_now();
+    timing.local_port = stream.local_addr().map(|addr| addr.port()).unwrap_or(0);
     stream.set_read_timeout(Some(timeout)).map_err(failed)?;
     stream.write_all(line.as_bytes()).map_err(failed)?;
     stream.write_all(b"\n").map_err(failed)?;
+    timing.sent_us = unix_micros_now();
     let reply = read_reply(&stream).map_err(failed)?;
+    timing.reply_us = unix_micros_now();
     stream.set_read_timeout(None).map_err(failed)?;
     if reply == "orblx-ok" {
         return Ok(stream);

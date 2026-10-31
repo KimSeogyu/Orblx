@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use orblx_agent::{
-    connect, new_nonce, plain_http_request, run_gateway, run_guard, seal_http_request, send_http,
-    unix_millis, ConnectError, GrantDir, GrantFiles, GrantRefresh, GuardConfig, NodeDeny,
+    connect_timed, new_nonce, plain_http_request, run_gateway, run_guard, seal_http_request,
+    send_http, unix_micros_now, unix_millis, ConnectError, ConnectTiming, GrantDir, GrantFiles,
+    GrantRefresh, GuardConfig, NodeDeny,
 };
 use orblx_coord::{
     agent_grant_fetch_blocking, agent_grant_request_blocking, decode_hex_32, fetch_deny_blocking,
@@ -470,7 +471,14 @@ fn run_connect(command: Connect) -> Result<i32, String> {
     let node = SpiffeId::parse(&grant.node).map_err(|err| err.to_string())?;
     let Some(every) = command.every else {
         let started = now_ms();
-        return match one_connect(&files, to, &node, &service, &command) {
+        return match one_connect(
+            &files,
+            to,
+            &node,
+            &service,
+            &command,
+            &mut ConnectTiming::default(),
+        ) {
             Ok(reply) => {
                 println!("connect ok to {to} service {service} at_ms {started}");
                 if let Some(line) = reply {
@@ -501,16 +509,17 @@ fn run_connect(command: Connect) -> Result<i32, String> {
         let start = now_ms();
         refresh_grant(&mut dir, &mut stats);
         let at = now_ms();
+        let at_us = unix_micros_now();
         attempts += 1;
-        let result = one_connect(dir.files(), to, &node, &service, &command);
+        let mut timing = ConnectTiming::default();
+        let result = one_connect(dir.files(), to, &node, &service, &command, &mut timing);
         let done = now_ms();
         trace.line(
             attempts,
-            start,
-            at,
-            done,
+            (start, at, done),
             &result,
             &dir.files().grant.grant.id,
+            (at_us, &timing),
         );
         match result {
             Ok(_) => {
@@ -567,15 +576,18 @@ impl AttemptTrace {
             .map_err(|err| format!("The trace file {} cannot be opened: {err}", path.display()))
     }
 
+    /// `ms` holds the loop start, send and done times in ms.
+    /// `steps` holds the send time in microseconds and the step times of the connection (W25-39).
     fn line<T>(
         &mut self,
         attempt: u64,
-        start: u64,
-        send: u64,
-        done: u64,
+        ms: (u64, u64, u64),
         result: &Result<T, ConnectError>,
         grant: &str,
+        steps: (u64, &ConnectTiming),
     ) {
+        let (start, send, done) = ms;
+        let (send_us, timing) = steps;
         let Some(file) = self.0.as_mut() else {
             return;
         };
@@ -587,7 +599,12 @@ impl AttemptTrace {
         // A trace write error does not stop the loop. The trace is for the logs only.
         let _ = writeln!(
             file,
-            "trace attempt {attempt} start_ms {start} send_ms {send} done_ms {done} result {result} grant {grant}"
+            "trace attempt {attempt} start_ms {start} send_ms {send} done_ms {done} result {result} grant {grant} send_us {send_us} seal_us {} tcp_us {} sent_us {} reply_us {} port {}",
+            timing.seal_us,
+            timing.tcp_us,
+            timing.sent_us,
+            timing.reply_us,
+            timing.local_port
         );
     }
 }
@@ -641,8 +658,9 @@ fn one_connect(
     node: &SpiffeId,
     service: &str,
     command: &Connect,
+    timing: &mut ConnectTiming,
 ) -> Result<Option<String>, ConnectError> {
-    let mut stream = connect(files, to, node, service, command.timeout)?;
+    let mut stream = connect_timed(files, to, node, service, command.timeout, timing)?;
     let Some(text) = &command.send else {
         return Ok(None);
     };

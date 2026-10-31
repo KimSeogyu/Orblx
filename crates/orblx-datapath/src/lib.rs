@@ -12,6 +12,7 @@ mod ha;
 mod ipv4;
 mod netmap;
 mod node;
+mod pkt_trace;
 mod quic;
 mod relay_path;
 mod router;

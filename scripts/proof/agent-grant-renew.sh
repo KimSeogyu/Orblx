@@ -9,6 +9,10 @@
 # use of the old grant to the first guard use of the new grant is 200 ms or less.
 # Phase 2 (gate): a second loop must never take a next grant with another
 # scope or a revoked next grant. It stops at the grant end with deny expired.
+# W25-39: the run also records the time of each step of each request: the agent
+# steps, the TUN read and write of each TCP packet on a and b, and the guard steps.
+# A plain TCP RTT probe (python, no orblx code) runs on the same overlay pair at the
+# same time. agent-latency-split.py prints the split. Gate: request p99 <= 100 ms.
 # The script does not print enroll tokens, private keys, tickets, or use proofs.
 set -euo pipefail
 # shellcheck source=scripts/proof/pipe-lib.sh
@@ -29,6 +33,10 @@ ENDS="${RENEW_ENDS:-6}"
 LEAD_SECS="${RENEW_LEAD_SECS:-20}"
 EVERY_MS=50
 GAP_LIMIT_MS=200
+REQUEST_P99_LIMIT_MS=100
+PROBE_PORT=9090
+export ORBLX_DP_TRACE_FILE="$STATE/dp-trace.txt"
+export ORBLX_DP_TRACE_PORTS="8080,${PROBE_PORT}"
 GRANT_DIR="$STATE/agent-cur"
 GATE_DIR="$STATE/agent-gate"
 STAGE_DIR="$STATE/agent-stage"
@@ -280,7 +288,7 @@ dc exec -T a orblx status --state-dir "$STATE"
 
 echo "=== [C] start the web service and the guard on b ==="
 dc exec -d b python3 -m http.server 8081 --bind 127.0.0.1
-dc exec -d b sh -c "orblx agent guard --listen ${b_ip}:8080 --service web \
+dc exec -d b sh -c "ORBLX_AGENT_TIMING=1 orblx agent guard --listen ${b_ip}:8080 --service web \
   --target 127.0.0.1:8081 --audit $STATE/agent-audit-web.jsonl \
   --coord ${coord_ip}:443 --state $STATE --bundle $STATE/bundle.pem \
   --poll-ms 200 --stale-ms 2000 >$STATE/guard-web.log 2>&1"
@@ -294,6 +302,14 @@ first_end="$(awk 'NR == 1 {print $4}' "$WORK/grants.txt")"
 last_end=$(( first_end + (ENDS - 1) * (TTL_SECS - LEAD_SECS) * 1000 ))
 max_wait=$(( (last_end - $(now_ms)) / 1000 + 20 ))
 echo "plan ends ${ENDS} ttl_s ${TTL_SECS} lead_s ${LEAD_SECS} every_ms ${EVERY_MS} max_wait_s ${max_wait}"
+
+echo "=== [C] start the plain TCP RTT probe (echo on b ${b_ip}:${PROBE_PORT}, probe on a) ==="
+for name in a b; do
+  dc exec -T "$name" sh -c "cat >/tmp/tcp-rtt-probe.py" <"$ROOT/scripts/proof/tcp-rtt-probe.py"
+done
+dc exec -d b python3 /tmp/tcp-rtt-probe.py serve "$b_ip" "$PROBE_PORT"
+sleep 1
+dc exec -d a sh -c "python3 /tmp/tcp-rtt-probe.py probe ${b_ip} ${PROBE_PORT} ${max_wait} ${EVERY_MS} >$STATE/probe.txt 2>&1"
 
 echo "=== [C] containers before the loop ==="
 container_starts | tee "$WORK/starts-before.txt"
@@ -321,6 +337,22 @@ dc exec -T a cat "$STATE/agent-loop.log" | tee "$WORK/loop.txt"
 
 echo "=== [C] agent loop trace (one line per attempt) ==="
 dc exec -T a cat "$STATE/agent-loop-trace.txt" | tee "$WORK/trace.txt"
+
+echo "=== [C] W25-39 request time split (one line per attempt, then percentiles) ==="
+dc exec -T b cat "$STATE/guard-web.log" >"$WORK/guard-timing.txt"
+dc exec -T a cat "$STATE/dp-trace.txt" >"$WORK/dp-a.txt"
+dc exec -T b cat "$STATE/dp-trace.txt" >"$WORK/dp-b.txt"
+dc exec -T a cat "$STATE/probe.txt" >"$WORK/probe.txt"
+echo "dp_trace_lines a $(wc -l <"$WORK/dp-a.txt") b $(wc -l <"$WORK/dp-b.txt") probe_lines $(wc -l <"$WORK/probe.txt")"
+if [[ -n "${LATENCY_KEEP_DIR:-}" ]]; then
+  mkdir -p "$LATENCY_KEEP_DIR"
+  cp "$WORK/dp-a.txt" "$WORK/dp-b.txt" "$WORK/probe.txt" "$WORK/trace.txt" "$WORK/guard-timing.txt" "$LATENCY_KEEP_DIR/"
+  echo "latency_raw_kept ${LATENCY_KEEP_DIR}"
+fi
+python3 "$ROOT/scripts/proof/agent-latency-split.py" "$WORK/trace.txt" "$WORK/guard-timing.txt" \
+  "$WORK/dp-a.txt" "$WORK/dp-b.txt" "$WORK/probe.txt" | tee "$WORK/latency-split.txt"
+request_p99="$(awk '$1 == "split" && $2 == "request_ms" {print $6}' "$WORK/latency-split.txt")"
+echo "request_p99_ms ${request_p99} limit_ms ${REQUEST_P99_LIMIT_MS} (gate at the end)"
 
 echo "=== [C] containers after the loop ==="
 container_starts | tee "$WORK/starts-after.txt"
@@ -531,6 +563,13 @@ for needle in 'PRIVATE KEY' 'T0JMWEFHVDE' 'ge1.'; do
   fi
 done
 
+echo "=== [C] W25-39 gate: agent request p99 ==="
+if ! awk -v v="$request_p99" -v lim="$REQUEST_P99_LIMIT_MS" 'BEGIN {exit !(v != "" && v + 0 <= lim)}'; then
+  echo "The agent request p99 ${request_p99} ms is more than ${REQUEST_P99_LIMIT_MS} ms." >&2
+  exit 1
+fi
+echo "request_p99_ok ${request_p99} limit_ms ${REQUEST_P99_LIMIT_MS}"
+
 echo "summary gate loop_exit ${gate_exit} deny_reason ${gate_reason} switches ${gate_switches} kept_scope ${kept_scope} kept_revoked ${kept_revoked} revoked_before_fetch_refused 1"
-echo "summary ends_crossed ${ends_crossed} ttl_s ${TTL_SECS} attempts ${attempts} ok_attempts ${ok_attempts} lost 0 worst_switch_gap_ms ${worst} loop_max_ok_gap_ms ${max_gap} limit_ms ${GAP_LIMIT_MS} switches ${switches} restarts 0"
+echo "summary ends_crossed ${ends_crossed} ttl_s ${TTL_SECS} attempts ${attempts} ok_attempts ${ok_attempts} lost 0 worst_switch_gap_ms ${worst} loop_max_ok_gap_ms ${max_gap} limit_ms ${GAP_LIMIT_MS} switches ${switches} restarts 0 request_p99_ms ${request_p99}"
 echo "proof_ok"
