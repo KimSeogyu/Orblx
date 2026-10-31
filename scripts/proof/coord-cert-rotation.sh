@@ -234,9 +234,14 @@ declare -A OVERLAY START0 PID0
 for name in owner a b; do
   enroll "$name"
 done
+# Start all 3 nodes before the mesh check. A node has no direct path to a peer that is not up.
 for name in owner a b; do
   dc up -d "$name"
+done
+for name in owner a b; do
   wait_log "$name" "The TUN device" 30 || fail "The node ${name} did not start."
+done
+for name in owner a b; do
   wait_mesh "$name" 2
 done
 for name in owner a b; do
