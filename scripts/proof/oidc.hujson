@@ -1,5 +1,9 @@
 {
   // The OIDC laptop may send UDP to node srv.
+  // W25-15: the test users are owner users, so they do not wait for approval.
+  "userApproval": {
+    "ownerUsers": ["oidc:alice", "oidc:bob", "oidc:dave"],
+  },
   "acls": [
     {
       "action": "accept",

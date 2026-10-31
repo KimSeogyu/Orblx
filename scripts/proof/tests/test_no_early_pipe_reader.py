@@ -288,11 +288,22 @@ class ProofLockQueueTest(unittest.TestCase):
         lib = os.path.join(REPO, "scripts", "proof", "proof-lock.sh")
         env = dict(os.environ, ORBLX_PROOF_LOCK=lock, ORBLX_PROOF_LOCK_NOTE_SECS="1", ORBLX_PROOF_SAMPLE_SECS="1")
         procs = []
+        heads = []
         for label, hold in [("holder", "3"), ("first", "1"), ("second", "1"), ("third", "1")]:
-            procs.append(subprocess.Popen(["bash", "-c", script, lib, label, order, hold], env=env,
-                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
-            time.sleep(0.4)
-        outs = [p.communicate(timeout=60)[0] for p in procs]
+            proc = subprocess.Popen(["bash", "-c", script, lib, label, order, hold], env=env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            # W25-19: start the next proof only after this one is in the queue. The holder is in
+            # the queue when it has the lock. A waiter is in the queue when it prints its first
+            # proof_context line, because the ticket is made before that line.
+            mark = "proof_lock holder acquired" if label == "holder" else f"proof_context {label} phase queued"
+            head = ""
+            while mark not in head:
+                line = proc.stdout.readline()
+                self.assertTrue(line, f"{label} ended before {mark!r}: {head}")
+                head += line
+            procs.append(proc)
+            heads.append(head)
+        outs = [h + p.communicate(timeout=60)[0] for h, p in zip(heads, procs)]
         self.assertEqual([p.returncode for p in procs], [0, 0, 0, 0], outs)
         with open(order) as f:
             events = [l.split() for l in f.read().split("\n") if l]

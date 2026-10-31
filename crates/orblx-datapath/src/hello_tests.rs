@@ -1251,3 +1251,74 @@ async fn connector_error(server: HelloConfig, client: HelloConfig) -> HelloError
         Ok(_) => panic!("the connector accepted the ticket"),
     }
 }
+
+/// A failed `orblx up` (the TUN device does not open) does not change the state directory.
+#[test]
+fn a_failed_tun_open_leaves_the_state_directory_unchanged() {
+    let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+    if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+        eprintln!("The test runs as root. The TUN device can open, so the test does not apply.");
+        return;
+    }
+    let now = SystemTime::now();
+    let (_ca, pair) = issue_node_pair(now);
+    let listen = free_udp();
+    let dir = std::env::temp_dir().join(format!(
+        "orblx-failed-tun-{}-{}",
+        std::process::id(),
+        listen.port()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let netmap_text = br#"{
+        "version": 1,
+        "self": {"name": "b", "overlay_ip": "100.64.0.2"},
+        "peers": [{
+            "name": "a",
+            "overlay_ip": "100.64.0.1",
+            "svid": "spiffe://orblx.local/node/a",
+            "endpoints": ["127.0.0.1:1"],
+            "routes": []
+        }]
+    }"#;
+    std::fs::write(dir.join("netmap.json"), netmap_text).unwrap();
+    let snapshot = |dir: &PathBuf| {
+        let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read(&path).unwrap())
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    let before = snapshot(&dir);
+    let (_stop_tx, stop_rx) = watch::channel(true);
+    let result = crate::run_node(NodeRequest {
+        config: pair.server,
+        netmap: Netmap::from_slice(netmap_text).unwrap(),
+        listen,
+        state_dir: dir.clone(),
+        renew: None,
+        stop: Some(stop_rx),
+        accept_routes: false,
+        forward_routes: Vec::new(),
+        forward_exit: false,
+        exit_node: None,
+        allow_lan: false,
+        underlay: Vec::new(),
+        relay: None,
+        netmap_path: dir.join("netmap.json"),
+        visibility: Arc::new(AllowPeers),
+        on_ready: None,
+        on_listen: None,
+        metrics: None,
+        filter: None,
+    });
+    assert!(result.is_err(), "the TUN device opened without root");
+    let after = snapshot(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(before, after, "a failed up changed the state directory");
+}

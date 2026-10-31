@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_identity::{decode_certificate_pem, extract_spiffe_id, leaf_validity, DenySet, SpiffeId};
@@ -25,6 +25,8 @@ use crate::dns::{
     refresh_resolver, serve_dns, DnsTable, ExitNodeForwarder, LinkResolverGuard, PeerVisibility,
     QueryForwarder, ResolvConfForwarder, DNS_PORT,
 };
+use crate::ha::{RouteAudit, RouteSelector, HA_DEAD_AFTER, ROUTE_AUDIT_FILE};
+use crate::ipv4::ipv4_destination;
 use crate::ipv4::{inbound_action, InboundAction};
 #[cfg(target_os = "macos")]
 use crate::netmap::{ipv4_mask, parse_cidr};
@@ -34,8 +36,19 @@ use crate::router::{route_packet, RouterTable};
 use crate::tun_dev::{open_tun, TunConfig};
 use crate::{HelloConfig, HelloError, HelloSender, HelloSession, FLAG_REKEY_REQ};
 
+macro_rules! tr {
+    ($($a:tt)*) => {
+        if std::env::var_os("ORBLX_TRACE_RENEW").is_some() {
+            let ms = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+            eprintln!("trace {ms} {}", format!($($a)*));
+        }
+    };
+}
+
 /// The node record file in the state directory.
 pub const NODE_RECORD_FILE: &str = "node.json";
+/// The temp file for an atomic `node.json` write.
+const NODE_RECORD_TEMP_FILE: &str = ".node.json.tmp";
 
 /// The pid file in the state directory.
 pub const NODE_PID_FILE: &str = "orblxd.pid";
@@ -48,7 +61,9 @@ const PATH_STALE: &str = "stale";
 const PATH_DOWN: &str = "down";
 /// A session with no received frame for this long is `stale`.
 const STALE_AFTER: Duration = Duration::from_secs(2);
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+/// W25 HA subnet routers: a short interval lets a client see a failed router in
+/// [`crate::HA_DEAD_AFTER`] (four intervals). The frame is the same control frame.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(250);
 
 static LINK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -236,6 +251,120 @@ struct LiveLink {
     ask_rekey: watch::Sender<u64>,
 }
 
+/// A link that a newer session for the same peer replaced (W25-11).
+///
+/// The link gets no new packets. It sends the packets in its queue, ends its send
+/// stream, and reads until the peer ends its send stream. `cancel` stops it at once.
+struct RetiredLink {
+    peer: String,
+    cancel: watch::Sender<bool>,
+}
+
+/// The status file writer (W25-11).
+///
+/// One OS thread writes the newest status text. A slow disk thus does not stop the
+/// runtime that moves the packets. A newer text replaces a text that is not written yet.
+struct StatusFile {
+    path: PathBuf,
+    next: Mutex<StatusSlot>,
+    wake: Condvar,
+    writer: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+#[derive(Default)]
+struct StatusSlot {
+    text: Option<String>,
+    closed: bool,
+}
+
+impl StatusFile {
+    fn start(path: PathBuf) -> Arc<Self> {
+        let status = Arc::new(Self {
+            path,
+            next: Mutex::new(StatusSlot::default()),
+            wake: Condvar::new(),
+            writer: Mutex::new(None),
+        });
+        let worker = Arc::clone(&status);
+        // Without the thread, put writes the file at once, as before W25-11.
+        let handle = std::thread::Builder::new()
+            .name("orblx-status".to_string())
+            .spawn(move || worker.run())
+            .ok();
+        *lock(&status.writer) = handle;
+        status
+    }
+
+    fn put(&self, text: String) {
+        if lock(&self.writer).is_none() {
+            if !lock(&self.next).closed {
+                write_status(&self.path, &text);
+            }
+            return;
+        }
+        let mut slot = lock(&self.next);
+        if slot.closed {
+            return;
+        }
+        slot.text = Some(text);
+        self.wake.notify_one();
+    }
+
+    fn run(&self) {
+        loop {
+            let text = {
+                let mut slot = lock(&self.next);
+                loop {
+                    if let Some(text) = slot.text.take() {
+                        break Some(text);
+                    }
+                    if slot.closed {
+                        break None;
+                    }
+                    slot = self
+                        .wake
+                        .wait(slot)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            };
+            match text {
+                Some(text) => write_status(&self.path, &text),
+                None => return,
+            }
+        }
+    }
+
+    /// Stop the thread after it writes the text it has. Then write `last`, if any.
+    fn close(&self, last: Option<String>) {
+        {
+            let mut slot = lock(&self.next);
+            slot.closed = true;
+            self.wake.notify_one();
+        }
+        if let Some(handle) = lock(&self.writer).take() {
+            let _ = handle.join();
+        }
+        if let Some(text) = last {
+            write_status(&self.path, &text);
+        }
+    }
+}
+
+/// Stops the status writer when the node function returns, also on an error.
+struct StatusGuard(Arc<StatusFile>);
+
+impl Drop for StatusGuard {
+    fn drop(&mut self) {
+        self.0.close(None);
+    }
+}
+
+fn write_status(path: &Path, text: &str) {
+    if let Err(err) = write_atomic(path, text.as_bytes()) {
+        eprintln!("The node did not write the status file. {err}");
+    }
+}
+
 struct NodeCounters {
     tx: AtomicU64,
     rx: AtomicU64,
@@ -249,11 +378,14 @@ struct Mesh {
     netmap_path: PathBuf,
     node: Arc<NodeView>,
     links: Arc<Mutex<HashMap<String, LiveLink>>>,
+    /// Replaced links that still drain, by generation (W25-11).
+    retired: Arc<Mutex<HashMap<u64, RetiredLink>>>,
     peers: Arc<Mutex<Vec<PeerView>>>,
     counters: Arc<NodeCounters>,
     to_tun: mpsc::Sender<Vec<u8>>,
     overlay: Ipv4Addr,
     state_dir: Arc<PathBuf>,
+    status: Arc<StatusFile>,
     relay: Option<SocketAddr>,
     shutdown: watch::Receiver<bool>,
     rekey_tx: watch::Sender<u64>,
@@ -293,7 +425,7 @@ pub fn format_node_status(status: &NodeStatus) -> String {
 /// A live pid returns the status file.
 /// A stopped node returns the overlay IP from the state directory.
 pub fn read_status_text(state_dir: &Path) -> Result<String, HelloError> {
-    let record = read_record(state_dir)?;
+    let record = read_status_record(state_dir)?;
     if running_pid(state_dir).is_some() {
         let path = state_dir.join(NODE_STATUS_FILE);
         match fs::read_to_string(&path) {
@@ -315,6 +447,11 @@ pub fn read_status_text(state_dir: &Path) -> Result<String, HelloError> {
 #[must_use]
 pub fn running_pid(state_dir: &Path) -> Option<u32> {
     let pid = read_pid(state_dir)?;
+    // A killed container leaves its pid file. The restarted node can get the same pid
+    // (pid 1 in a container). That pid file is stale (W25 HA router restart).
+    if pid == std::process::id() {
+        return None;
+    }
     if process_is_running(pid) {
         Some(pid)
     } else {
@@ -347,6 +484,7 @@ pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
             .map_err(|err| HelloError::Node(err.to_string()))?,
         netmask: Ipv4Addr::new(255, 255, 255, 255),
     })?;
+    store_record_once(&mut prepared)?;
     prepare_link(&bridge.name, &install)?;
     if !prepared.request.forward_routes.is_empty() {
         crate::subnet::enable_kernel_forward(&prepared.request.forward_routes)?;
@@ -397,6 +535,7 @@ pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
 pub async fn run_memory_node(request: NodeRequest, device: MemoryDevice) -> Result<(), HelloError> {
     let entered_at = Instant::now();
     let mut prepared = prepare_node(request, entered_at)?;
+    store_record_once(&mut prepared)?;
     println!("The overlay IP is {}.", prepared.record.overlay_ip);
     println!(
         "The state directory is {}.",
@@ -416,6 +555,9 @@ struct PreparedNode {
     request: NodeRequest,
     view: NodeView,
     record: NodeRecord,
+    /// `false` until `node.json` is on disk. A new record is written only after the TUN
+    /// device opens, so a failed start leaves the state directory as it was (W25-14b).
+    record_stored: bool,
     router: RouterTable,
     _pid_guard: PidGuard,
     phases: StartPhases,
@@ -436,7 +578,7 @@ fn prepare_node(request: NodeRequest, entered_at: Instant) -> Result<PreparedNod
         .check()
         .map_err(|err| HelloError::Node(err.to_string()))?;
     let view = local_view(&request)?;
-    let record = load_or_create_state(&request.state_dir, &request.netmap)?;
+    let StateRecord { record, stored } = load_state(&request.state_dir, &request.netmap)?;
     if record.overlay_ip != view.overlay_ip || record.name != view.name {
         return Err(HelloError::Node(format!(
             "The state directory keeps overlay IP {} for node {}. The netmap has overlay IP {}.",
@@ -455,6 +597,7 @@ fn prepare_node(request: NodeRequest, entered_at: Instant) -> Result<PreparedNod
         request,
         view,
         record,
+        record_stored: stored,
         router,
         _pid_guard: pid_guard,
         phases: StartPhases {
@@ -539,11 +682,13 @@ async fn run_mesh_inner(
         });
     }
     let state_dir = Arc::new(request.state_dir);
+    let status = StatusFile::start(state_dir.join(NODE_STATUS_FILE));
+    let _status_guard = StatusGuard(Arc::clone(&status));
     let node = Arc::new(view);
     let peers = Arc::new(Mutex::new(initial_peers(&request.netmap)));
     let links = Arc::new(Mutex::new(HashMap::<String, LiveLink>::new()));
     let (router_tx, tun_router) = watch::channel(router);
-    publish(&state_dir, &node, &peers, "up");
+    publish(&status, &node, &peers, "up");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (rekey_tx, rekey_rx) = watch::channel(0u64);
@@ -556,17 +701,31 @@ async fn run_mesh_inner(
     let tun_shutdown = shutdown_rx.clone();
     let tun_links = Arc::clone(&links);
     let tun_counters = Arc::clone(&counters);
+    let tun_peers = Arc::clone(&peers);
     let accept_routes = request.accept_routes;
+    // The netmap watch can add an HA route later (W25-6), so each node that accepts
+    // routes has the audit writer. The writer opens the file at the first record.
+    let tun_audit = if accept_routes {
+        print_ha_routes(&tun_router.borrow());
+        RouteAudit::spawn(state_dir.join(ROUTE_AUDIT_FILE), node.svid.clone())
+    } else {
+        RouteAudit::off()
+    };
     let exit_node = request.exit_node.clone();
     let relay = request.relay;
     tasks.push(tokio::spawn(async move {
         read_tun(
             from_tun,
-            tun_router,
-            tun_links,
+            TunRoutes {
+                router: tun_router,
+                links: tun_links,
+                peers: tun_peers,
+                selector: RouteSelector::new(),
+                audit: tun_audit,
+                accept_routes,
+                exit_node,
+            },
             tun_shutdown,
-            accept_routes,
-            exit_node,
             tun_counters,
         )
         .await;
@@ -582,11 +741,13 @@ async fn run_mesh_inner(
         netmap_path: netmap_path.clone(),
         node: Arc::clone(&node),
         links: Arc::clone(&links),
+        retired: Arc::new(Mutex::new(HashMap::new())),
         peers: Arc::clone(&peers),
         counters: Arc::clone(&counters),
         to_tun: to_tun.clone(),
         overlay,
         state_dir: Arc::clone(&state_dir),
+        status: Arc::clone(&status),
         relay,
         shutdown: shutdown_rx,
         rekey_tx,
@@ -643,7 +804,11 @@ async fn run_mesh_inner(
                     }
                 }
                 _ = tick.tick() => {
-                    if let Ok(bytes) = fs::read(deny_dir.join("deny.json")) {
+                    // The read runs on a blocking thread, so a slow disk does not stop
+                    // the packet runtime (W25-11).
+                    let path = deny_dir.join("deny.json");
+                    let read = tokio::task::spawn_blocking(move || fs::read(path)).await;
+                    if let Ok(Ok(bytes)) = read {
                         if last_text.as_deref() != Some(bytes.as_slice()) {
                             if let Some(deny) = parse_deny(&bytes) {
                                 // Replace first, so a session that starts now uses the new list.
@@ -702,7 +867,7 @@ async fn run_mesh_inner(
                     }
                 }
                 _ = tick.tick() => {
-                    publish(&status_mesh.state_dir, &status_mesh.node, &status_mesh.peers, "up");
+                    publish(&status_mesh.status, &status_mesh.node, &status_mesh.peers, "up");
                 }
             }
         }
@@ -744,7 +909,7 @@ async fn run_mesh_inner(
     for task in tasks {
         let _ = task.await;
     }
-    publish(&state_dir, &node, &peers, "down");
+    status.close(Some(status_text(&node, &peers, "down")));
     println!("The node is down.");
     drop(to_tun);
     Ok(())
@@ -844,13 +1009,97 @@ async fn external_stop(external: Option<watch::Receiver<bool>>) {
     }
 }
 
-async fn read_tun(
-    mut from_tun: mpsc::Receiver<Vec<u8>>,
+/// Print each HA route (W25) and its routers.
+fn print_ha_routes(table: &RouterTable) {
+    for (cidr, routers) in table.ha_routes() {
+        println!(
+            "The HA route {cidr} has the routers {}.",
+            routers.join(", ")
+        );
+    }
+}
+
+struct TunRoutes {
+    /// The router table. The netmap watch (W25-6) replaces it.
     router: watch::Receiver<RouterTable>,
     links: Arc<Mutex<HashMap<String, LiveLink>>>,
-    mut shutdown: watch::Receiver<bool>,
+    peers: Arc<Mutex<Vec<PeerView>>>,
+    selector: RouteSelector,
+    audit: RouteAudit,
     accept_routes: bool,
     exit_node: Option<String>,
+}
+
+impl TunRoutes {
+    /// Return the peer for one outbound packet.
+    ///
+    /// A route with one owner uses the router table only.
+    /// An HA route (W25) uses the selector and the session health.
+    fn peer_for(&self, packet: &[u8]) -> Option<String> {
+        let dest = ipv4_destination(packet)?;
+        let table = self.router.borrow();
+        let Some(found) = table.lookup_match(dest, self.accept_routes) else {
+            return route_packet(
+                &table,
+                packet,
+                self.accept_routes,
+                self.exit_node.as_deref(),
+            )
+            .map(str::to_string);
+        };
+        if !found.is_ha() {
+            return found.peers.first().cloned();
+        }
+        let cidr = format!("{}/{}", found.prefix, found.prefix_len);
+        let now = Instant::now();
+        let (peer, change) = self
+            .selector
+            .pick(&cidr, found.peers, |name| self.healthy(name, now));
+        if let Some(change) = change {
+            match &change.from {
+                Some(from) => {
+                    let silent = self.silent_ms(from, now);
+                    println!(
+                        "The HA route {} uses {}. The router before was {from}.",
+                        change.cidr, change.to
+                    );
+                    self.audit.record(&change, silent);
+                }
+                None => println!("The HA route {} uses {}.", change.cidr, change.to),
+            }
+        }
+        peer
+    }
+
+    /// The time since the last frame from `name`. `None` when it has no session.
+    fn silent_ms(&self, name: &str, now: Instant) -> Option<u128> {
+        lock(&self.peers)
+            .iter()
+            .find(|peer| peer.name == name && peer.session)
+            .and_then(|peer| peer.last_rx)
+            .map(|then| now.saturating_duration_since(then).as_millis())
+    }
+
+    /// A router is healthy when it has a live link and sent a frame in the last
+    /// [`HA_DEAD_AFTER`].
+    fn healthy(&self, name: &str, now: Instant) -> bool {
+        if !lock(&self.links).contains_key(name) {
+            return false;
+        }
+        lock(&self.peers).iter().any(|peer| {
+            peer.name == name
+                && peer.session
+                && peer
+                    .last_rx
+                    .is_some_and(|then| now.saturating_duration_since(then) <= HA_DEAD_AFTER)
+        })
+    }
+}
+
+async fn read_tun(
+    mut from_tun: mpsc::Receiver<Vec<u8>>,
+    routes: TunRoutes,
+    mut shutdown: watch::Receiver<bool>,
     counters: Arc<NodeCounters>,
 ) {
     loop {
@@ -864,17 +1113,12 @@ async fn read_tun(
                 let Some(packet) = packet else {
                     return;
                 };
-                // The guard of the router table must not live across an await.
-                let peer = {
-                    let table = router.borrow();
-                    route_packet(&table, &packet, accept_routes, exit_node.as_deref())
-                        .map(str::to_string)
-                };
-                let Some(peer) = peer else {
+                // peer_for drops the guard of the router table before the await.
+                let Some(peer) = routes.peer_for(&packet) else {
                     continue;
                 };
                 let tx = {
-                    let map = lock(&links);
+                    let map = lock(&routes.links);
                     map.get(&peer).map(|link| link.tx.clone())
                 };
                 if let Some(tx) = tx {
@@ -950,7 +1194,10 @@ async fn watch_netmap_peers(watch: PeerWatch) {
                 }
             }
             _ = tick.tick() => {
-                let Ok(bytes) = fs::read(&watch.mesh.netmap_path) else {
+                // W25-11: read the file on a blocking thread. A slow disk must not stop the
+                // runtime that moves the packets.
+                let path = watch.mesh.netmap_path.clone();
+                let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || fs::read(path)).await else {
                     continue;
                 };
                 if last.as_deref() == Some(bytes.as_slice()) {
@@ -999,6 +1246,9 @@ fn apply_peer_netmap(
         println!("The node installs route {cidr}.");
     }
     installed.extend(added);
+    if watch.accept_routes && watch.router.borrow().ha_routes() != table.ha_routes() {
+        print_ha_routes(&table);
+    }
     watch.router.send_replace(table);
     let new_peers: Vec<&NetmapPeer> = netmap
         .peers
@@ -1074,6 +1324,18 @@ fn close_denied_links(mesh: &Mesh, deny: &DenySet) {
             let _ = link.cancel.send(true);
         }
     }
+    drop(links);
+    for retired in lock(&mesh.retired).values() {
+        let Some(svid) = svids.get(retired.peer.as_str()) else {
+            continue;
+        };
+        let Ok(id) = SpiffeId::parse(svid) else {
+            continue;
+        };
+        if deny.reject_uri(&id).is_err() {
+            let _ = retired.cancel.send(true);
+        }
+    }
 }
 
 fn parse_deny(bytes: &[u8]) -> Option<DenySet> {
@@ -1095,6 +1357,7 @@ async fn accept_loop(mut mesh: Mesh) {
             accepted = mesh.endpoint.accept_one() => {
                 match accepted {
                     Ok(session) => {
+                        tr!("{} accepted {}", mesh.node.name, session.peer_id().as_uri());
                         let netmap = fresh_netmap(&mesh);
                         let peer_name = netmap.peers.iter().find(|peer| peer.svid == session.peer_id().as_uri()).map(|peer| peer.name.clone());
                         let Some(peer_name) = peer_name else {
@@ -1150,13 +1413,15 @@ async fn dial_peer(mut mesh: Mesh, peer: NetmapPeer) {
                     if changed.is_err() || stopped(&mesh) {
                         return;
                     }
-                    reconnect(&mut mesh, &peer, &remote_tx, &mut task).await;
+                    tr!("{} reconnect cause=local_renew peer={}", mesh.node.name, peer.name);
+                    reconnect(&mut mesh, &peer, &remote_tx, &mut remote_rx, &mut task).await;
                 }
                 changed = remote_rx.changed() => {
                     if changed.is_err() || stopped(&mesh) {
                         return;
                     }
-                    reconnect(&mut mesh, &peer, &remote_tx, &mut task).await;
+                    tr!("{} reconnect cause=peer_rekey_req peer={}", mesh.node.name, peer.name);
+                    reconnect(&mut mesh, &peer, &remote_tx, &mut remote_rx, &mut task).await;
                 }
             }
         }
@@ -1180,11 +1445,29 @@ async fn reconnect(
     mesh: &mut Mesh,
     peer: &NetmapPeer,
     remote_tx: &watch::Sender<u64>,
+    remote_rx: &mut watch::Receiver<u64>,
     task: &mut JoinHandle<()>,
 ) {
+    // The new handshake uses the identity of both nodes as of now. Earlier renew signals
+    // of either node need no second session (W25-11).
+    mesh.rekey_rx.borrow_and_update();
+    remote_rx.borrow_and_update();
+    let t0 = Instant::now();
     let Some((session, relay_face)) = dial_once(mesh, peer, false).await else {
+        tr!(
+            "{} dial_failed peer={} ms={}",
+            mesh.node.name,
+            peer.name,
+            t0.elapsed().as_millis()
+        );
         return;
     };
+    tr!(
+        "{} dial_done peer={} ms={}",
+        mesh.node.name,
+        peer.name,
+        t0.elapsed().as_millis()
+    );
     let next = spawn_link(
         mesh,
         session,
@@ -1192,13 +1475,8 @@ async fn reconnect(
         remote_tx.clone(),
         relay_face,
     );
-    let mut old = std::mem::replace(task, next);
-    if tokio::time::timeout(Duration::from_secs(2), &mut old)
-        .await
-        .is_err()
-    {
-        old.abort();
-    }
+    // The old link drains and then stops (see `drive_session`). Do not wait for it here.
+    drop(std::mem::replace(task, next));
 }
 
 async fn dial_ready(
@@ -1437,6 +1715,12 @@ async fn run_link(
             println!("The node ended the session with {name}. The deny list revokes the peer.");
             return;
         }
+        tr!(
+            "{} link_up peer={} gen={}",
+            mesh.node.name,
+            name,
+            generation
+        );
         if let Some(old) = map.insert(
             name.clone(),
             LiveLink {
@@ -1446,15 +1730,29 @@ async fn run_link(
                 ask_rekey: ask_tx,
             },
         ) {
-            let _ = old.cancel.send(true);
+            // Make before break (W25-11): the new session carries new packets now.
+            // The old link drains. Its queue closes when `old.tx` drops here.
+            tr!(
+                "{} link_retire_old peer={} old_gen={}",
+                mesh.node.name,
+                name,
+                old.generation
+            );
+            lock(&mesh.retired).insert(
+                old.generation,
+                RetiredLink {
+                    peer: name.clone(),
+                    cancel: old.cancel,
+                },
+            );
         }
     }
     set_session(&mesh.peers, &name, true, Some(expiry));
-    publish(&mesh.state_dir, &mesh.node, &mesh.peers, "up");
+    publish(&mesh.status, &mesh.node, &mesh.peers, "up");
     let peer_svid = session.peer_id().as_uri().to_string();
     let (sender, receiver) = session.split();
     let peers = Arc::clone(&mesh.peers);
-    let state_dir = Arc::clone(&mesh.state_dir);
+    let status = Arc::clone(&mesh.status);
     let node = Arc::clone(&mesh.node);
     let peer_name = name.clone();
     drive_session(
@@ -1470,10 +1768,14 @@ async fn run_link(
             counters: Arc::clone(&mesh.counters),
             filter: mesh.filter.clone(),
             peer_svid,
+            links: Arc::clone(&mesh.links),
+            peer: name.clone(),
+            label: format!("{} peer={} gen={}", mesh.node.name, name, generation),
         },
-        move || note_rx(&peers, &state_dir, &node, &peer_name),
+        move || note_rx(&peers, &status, &node, &peer_name),
     )
     .await;
+    lock(&mesh.retired).remove(&generation);
     let removed = {
         let mut map = lock(&mesh.links);
         if map.get(&name).map(|link| link.generation) == Some(generation) {
@@ -1485,7 +1787,7 @@ async fn run_link(
     };
     if removed {
         set_session(&mesh.peers, &name, false, None);
-        publish(&mesh.state_dir, &mesh.node, &mesh.peers, "up");
+        publish(&mesh.status, &mesh.node, &mesh.peers, "up");
     }
 }
 
@@ -1501,12 +1803,43 @@ struct SessionIo {
     counters: Arc<NodeCounters>,
     filter: Option<Arc<crate::PacketFilter>>,
     peer_svid: String,
+    /// The live links. A draining link sends its replies on the current link.
+    links: Arc<Mutex<HashMap<String, LiveLink>>>,
+    peer: String,
+    label: String,
+}
+
+type NextEvent = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = (crate::HelloReceiver, Result<SessionEvent, HelloError>)>
+            + Send,
+    >,
+>;
+
+/// Read one frame to the end.
+///
+/// The future owns the receiver, so `select!` can poll it again after another branch
+/// wins. A dropped read would lose the bytes it already took from the stream (W25-11).
+fn next_event(mut receiver: crate::HelloReceiver) -> NextEvent {
+    Box::pin(async move {
+        let event = receiver.recv_event().await;
+        (receiver, event)
+    })
+}
+
+async fn poll_slot<T>(
+    slot: &mut Option<std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>>,
+) -> T {
+    match slot {
+        Some(future) => future.await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
     let SessionIo {
         mut sender,
-        mut receiver,
+        receiver,
         mut packets,
         mut cancel,
         to_tun,
@@ -1516,71 +1849,131 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
         counters,
         filter,
         peer_svid,
+        links,
+        peer,
+        label,
     } = io;
+    let mut first_rx = true;
+    let mut first_tx = true;
+    // The queue is open while this link is the live link for the peer.
+    let mut tx_open = true;
+    let mut tx_end: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> = None;
+    let mut tx_done = false;
+    let mut ask_open = true;
+    let mut rx_next: Option<NextEvent> = Some(next_event(receiver));
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     loop {
+        if tx_done && rx_next.is_none() {
+            tr!("{label} session_end reason=drained");
+            return;
+        }
         tokio::select! {
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
+                    tr!("{label} session_end reason=cancel");
                     return;
                 }
             }
-            changed = ask_rekey.changed() => {
+            changed = ask_rekey.changed(), if tx_open && ask_open => {
                 if changed.is_err() {
-                    return;
+                    // The link was replaced. The new link sends the rekey requests.
+                    ask_open = false;
+                    continue;
                 }
+                tr!("{label} send_rekey_req");
                 if sender.send_ctrl(FLAG_REKEY_REQ).await.is_err() {
+                    tr!("{label} session_end reason=send_rekey_err");
                     return;
                 }
             }
-            _ = keepalive.tick() => {
+            _ = keepalive.tick(), if tx_open => {
                 if sender.send_ctrl(0).await.is_err() {
                     return;
                 }
             }
-            packet = packets.recv() => {
+            packet = packets.recv(), if tx_open => {
                 let Some(packet) = packet else {
-                    return;
+                    // A newer link replaced this one, and the queue is empty.
+                    tx_open = false;
+                    tr!("{label} tx_end");
+                    tx_end = Some(Box::pin(sender.finish()));
+                    continue;
                 };
                 if let Some(filter) = &filter {
                     filter.note_outbound(&packet);
                 }
+                if first_tx {
+                    tr!("{label} first_tx");
+                    first_tx = false;
+                }
                 if sender.send_ipv4(&packet).await.is_err() {
+                    tr!("{label} session_end reason=send_err");
                     return;
                 }
                 counters.tx.fetch_add(1, Ordering::Relaxed);
             }
-            incoming = receiver.recv_event() => {
+            () = poll_slot(&mut tx_end), if tx_end.is_some() => {
+                tx_end = None;
+                tx_done = true;
+            }
+            (receiver, incoming) = poll_slot(&mut rx_next), if rx_next.is_some() => {
+                rx_next = None;
                 match incoming {
-                    Ok(SessionEvent::Packet(packet)) => {
-                        on_rx();
-                        counters.rx.fetch_add(1, Ordering::Relaxed);
-                        if let Some(filter) = &filter {
-                            if !filter.allow_inbound(&peer_svid, &packet) {
-                                continue;
-                            }
-                        }
-                        match inbound_action(&packet, overlay) {
-                            InboundAction::Reply(reply) => {
-                                if sender.send_ipv4(&reply).await.is_err() {
-                                    return;
+                    Ok(event) => {
+                        rx_next = Some(next_event(receiver));
+                        match event {
+                            SessionEvent::Packet(packet) => {
+                                if first_rx {
+                                    tr!("{label} first_rx");
+                                    first_rx = false;
                                 }
-                                counters.tx.fetch_add(1, Ordering::Relaxed);
-                            }
-                            InboundAction::Forward => {
-                                if to_tun.send(packet).await.is_err() {
-                                    return;
+                                on_rx();
+                                counters.rx.fetch_add(1, Ordering::Relaxed);
+                                if let Some(filter) = &filter {
+                                    if !filter.allow_inbound(&peer_svid, &packet) {
+                                        continue;
+                                    }
                                 }
+                                match inbound_action(&packet, overlay) {
+                                    InboundAction::Reply(reply) if tx_open => {
+                                        if sender.send_ipv4(&reply).await.is_err() {
+                                            return;
+                                        }
+                                        counters.tx.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    InboundAction::Reply(reply) => {
+                                        // This send stream ended. The live link carries the reply.
+                                        let live = lock(&links).get(&peer).map(|link| link.tx.clone());
+                                        if let Some(live) = live {
+                                            if live.try_send(reply).is_ok() {
+                                                counters.tx.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                    }
+                                    InboundAction::Forward => {
+                                        if to_tun.send(packet).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            SessionEvent::Keepalive => on_rx(),
+                            SessionEvent::Rekey => {
+                                tr!("{label} got_rekey_req");
+                                on_rx();
+                                let next = remote_rekey.borrow().saturating_add(1);
+                                let _ = remote_rekey.send(next);
                             }
                         }
                     }
-                    Ok(SessionEvent::Keepalive) => on_rx(),
-                    Ok(SessionEvent::Rekey) => {
-                        on_rx();
-                        let next = remote_rekey.borrow().saturating_add(1);
-                        let _ = remote_rekey.send(next);
+                    Err(HelloError::StreamClosed) => {
+                        // The peer replaced this session and sent all its frames on it.
+                        tr!("{label} rx_end");
                     }
-                    Err(_) => return,
+                    Err(err) => {
+                        tr!("{label} session_end reason=recv_err {err}");
+                        return;
+                    }
                 }
             }
         }
@@ -1600,7 +1993,7 @@ fn set_session(peers: &Mutex<Vec<PeerView>>, name: &str, session: bool, expiry: 
     }
 }
 
-fn note_rx(peers: &Mutex<Vec<PeerView>>, dir: &Path, node: &NodeView, name: &str) {
+fn note_rx(peers: &Mutex<Vec<PeerView>>, status: &StatusFile, node: &NodeView, name: &str) {
     let changed = {
         let mut peers = lock(peers);
         let Some(peer) = peers.iter_mut().find(|peer| peer.name == name) else {
@@ -1612,7 +2005,7 @@ fn note_rx(peers: &Mutex<Vec<PeerView>>, dir: &Path, node: &NodeView, name: &str
         before != after
     };
     if changed {
-        publish(dir, node, peers, "up");
+        publish(status, node, peers, "up");
     }
 }
 
@@ -1633,7 +2026,12 @@ fn path_kind(session: bool, age: Option<Duration>) -> &'static str {
     }
 }
 
-fn publish(dir: &Path, node: &NodeView, peers: &Mutex<Vec<PeerView>>, state: &str) {
+/// Give the newest status text to the status writer. This does no file I/O (W25-11).
+fn publish(status: &StatusFile, node: &NodeView, peers: &Mutex<Vec<PeerView>>, state: &str) {
+    status.put(status_text(node, peers, state));
+}
+
+fn status_text(node: &NodeView, peers: &Mutex<Vec<PeerView>>, state: &str) -> String {
     let now = Instant::now();
     let peers = {
         let mut peers = lock(peers);
@@ -1664,10 +2062,7 @@ fn publish(dir: &Path, node: &NodeView, peers: &Mutex<Vec<PeerView>>, state: &st
             })
             .collect(),
     };
-    let text = format_node_status(&status);
-    if let Err(err) = write_atomic(&dir.join(NODE_STATUS_FILE), text.as_bytes()) {
-        eprintln!("The node did not write the status file. {err}");
-    }
+    format_node_status(&status)
 }
 
 async fn renew_loop(mut mesh: Mesh, renewer: SvidRenewer) {
@@ -1695,6 +2090,7 @@ async fn renew_loop(mut mesh: Mesh, renewer: SvidRenewer) {
             if stopped(&mesh) {
                 return;
             }
+            tr!("{} renew_start", mesh.node.name);
             let renewer = renewer.clone();
             let fetched = tokio::task::spawn_blocking(move || renewer.renew()).await;
             let leaf = match fetched {
@@ -1721,8 +2117,9 @@ async fn renew_loop(mut mesh: Mesh, renewer: SvidRenewer) {
             };
             match apply_leaf(&mesh, &leaf) {
                 Ok(expiry) => {
+                    tr!("{} renew_applied signal_rekey", mesh.node.name);
                     signal_rekey(&mesh);
-                    publish(&mesh.state_dir, &mesh.node, &mesh.peers, "up");
+                    publish(&mesh.status, &mesh.node, &mesh.peers, "up");
                     println!("The node renewed the SVID. The new expiry is {expiry}.");
                     break;
                 }
@@ -1815,7 +2212,16 @@ fn safe_text(text: &str) -> String {
     text.to_string()
 }
 
-fn load_or_create_state(dir: &Path, netmap: &Netmap) -> Result<NodeRecord, HelloError> {
+/// The node record and whether `node.json` already has it.
+struct StateRecord {
+    record: NodeRecord,
+    stored: bool,
+}
+
+/// Read the node record from the state directory. A new node gets a record from the
+/// netmap. This function does not write `node.json` (W25-14b): `store_record` writes it
+/// after the TUN device opens.
+fn load_state(dir: &Path, netmap: &Netmap) -> Result<StateRecord, HelloError> {
     fs::create_dir_all(dir).map_err(|err| HelloError::Node(err.to_string()))?;
     let overlay = parse_ipv4(&netmap.self_node.overlay_ip)
         .map_err(|err| HelloError::Node(err.to_string()))?
@@ -1832,19 +2238,67 @@ fn load_or_create_state(dir: &Path, netmap: &Netmap) -> Result<NodeRecord, Hello
                 stored.name
             )));
         }
-        return Ok(NodeRecord {
-            name: stored.name,
-            overlay_ip: stored_ip,
+        return Ok(StateRecord {
+            record: NodeRecord {
+                name: stored.name,
+                overlay_ip: stored_ip,
+            },
+            stored: true,
         });
     }
-    let record = NodeRecord {
-        name: netmap.self_node.name.clone(),
-        overlay_ip: overlay,
-    };
+    Ok(StateRecord {
+        record: NodeRecord {
+            name: netmap.self_node.name.clone(),
+            overlay_ip: overlay,
+        },
+        stored: false,
+    })
+}
+
+fn store_record_once(prepared: &mut PreparedNode) -> Result<(), HelloError> {
+    if !prepared.record_stored {
+        store_record(&prepared.request.state_dir, &prepared.record)?;
+        prepared.record_stored = true;
+    }
+    Ok(())
+}
+
+/// Write `node.json` with a temp file, fsync, and rename. A crash leaves the old file or
+/// the new file, never a part of a file.
+fn store_record(dir: &Path, record: &NodeRecord) -> Result<(), HelloError> {
+    use std::io::Write as _;
     let text =
-        serde_json::to_string_pretty(&record).map_err(|err| HelloError::Node(err.to_string()))?;
-    write_atomic(&path, text.as_bytes())?;
-    Ok(record)
+        serde_json::to_string_pretty(record).map_err(|err| HelloError::Node(err.to_string()))?;
+    let path = dir.join(NODE_RECORD_FILE);
+    let tmp = dir.join(NODE_RECORD_TEMP_FILE);
+    let io = |err: std::io::Error| HelloError::Node(err.to_string());
+    let mut file = fs::File::create(&tmp).map_err(io)?;
+    file.write_all(text.as_bytes()).map_err(io)?;
+    file.sync_all().map_err(io)?;
+    drop(file);
+    fs::rename(&tmp, &path).map_err(io)?;
+    #[cfg(unix)]
+    fs::File::open(dir).and_then(|d| d.sync_all()).map_err(io)?;
+    Ok(())
+}
+
+/// The record for `orblx status`. Before the first good `orblx up`, the state directory
+/// has no `node.json` (W25-14b). Then the record comes from the netmap in the state
+/// directory, with the same name and overlay IP that `up` writes later.
+fn read_status_record(dir: &Path) -> Result<NodeRecord, HelloError> {
+    if dir.join(NODE_RECORD_FILE).exists() {
+        return read_record(dir);
+    }
+    let Ok(netmap) = Netmap::from_path(&dir.join("netmap.json")) else {
+        return read_record(dir);
+    };
+    let overlay_ip = parse_ipv4(&netmap.self_node.overlay_ip)
+        .map_err(|err| HelloError::Node(err.to_string()))?
+        .to_string();
+    Ok(NodeRecord {
+        name: netmap.self_node.name,
+        overlay_ip,
+    })
 }
 
 fn read_record(dir: &Path) -> Result<NodeRecord, HelloError> {
@@ -1908,9 +2362,19 @@ fn tun_device_name() -> Option<String> {
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), HelloError> {
+    let started = Instant::now();
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, bytes).map_err(|err| HelloError::Node(err.to_string()))?;
-    fs::rename(&tmp, path).map_err(|err| HelloError::Node(err.to_string()))
+    let done = fs::rename(&tmp, path).map_err(|err| HelloError::Node(err.to_string()));
+    let ms = started.elapsed().as_millis();
+    if ms >= 20 {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("-");
+        tr!("slow_io op=write_atomic file={name} ms={ms}");
+    }
+    done
 }
 
 #[cfg(target_os = "linux")]
@@ -2198,7 +2662,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use super::{format_node_status, load_or_create_state, NodeStatus, StatusPeer};
+    use super::{
+        format_node_status, load_state, read_status_text, store_record, NodeStatus, StatusPeer,
+    };
     use crate::netmap::Netmap;
 
     fn sample_map(ip: &str) -> Netmap {
@@ -2222,17 +2688,114 @@ mod tests {
     #[test]
     fn the_state_directory_keeps_the_overlay_ip() {
         let dir = test_dir("state");
-        let first = load_or_create_state(&dir, &sample_map("100.64.0.1")).unwrap();
-        assert_eq!(first.overlay_ip, "100.64.0.1");
-        let second = load_or_create_state(&dir, &sample_map("100.64.0.1")).unwrap();
-        assert_eq!(second.overlay_ip, "100.64.0.1");
-        let err = load_or_create_state(&dir, &sample_map("100.64.0.9")).unwrap_err();
+        let first = load_state(&dir, &sample_map("100.64.0.1")).unwrap();
+        assert_eq!(first.record.overlay_ip, "100.64.0.1");
+        assert!(!first.stored);
+        // W25-14b: reading the state does not write node.json.
+        assert!(!dir.join(super::NODE_RECORD_FILE).exists());
+        store_record(&dir, &first.record).unwrap();
+        let second = load_state(&dir, &sample_map("100.64.0.1")).unwrap();
+        assert_eq!(second.record.overlay_ip, "100.64.0.1");
+        assert!(second.stored);
+        let err = load_state(&dir, &sample_map("100.64.0.9")).err().unwrap();
         assert!(err.to_string().contains("100.64.0.1"));
         assert!(err.to_string().contains("100.64.0.9"));
         let stored = fs::read_to_string(dir.join(super::NODE_RECORD_FILE)).unwrap();
         assert!(stored.contains("100.64.0.1"));
         assert!(!stored.contains("100.64.0.9"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_stored_record_has_the_same_bytes_as_before() {
+        // The bytes that the old load_or_create_state wrote (serde_json pretty).
+        let dir = test_dir("record-bytes");
+        let record = load_state(&dir, &sample_map("100.64.0.1")).unwrap().record;
+        store_record(&dir, &record).unwrap();
+        let stored = fs::read_to_string(dir.join(super::NODE_RECORD_FILE)).unwrap();
+        assert_eq!(
+            stored,
+            "{\n  \"name\": \"a\",\n  \"overlay_ip\": \"100.64.0.1\"\n}"
+        );
+        assert!(!dir.join(super::NODE_RECORD_TEMP_FILE).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_works_before_the_first_good_up() {
+        let dir = test_dir("status-no-record");
+        fs::write(
+            dir.join("netmap.json"),
+            r#"{"version":1,"self":{"name":"a","overlay_ip":"100.64.0.1"},"peers":[]}"#,
+        )
+        .unwrap();
+        let text = read_status_text(&dir).unwrap();
+        assert_eq!(text, "state down\nname a\noverlay_ip 100.64.0.1\n");
+        assert!(!dir.join(super::NODE_RECORD_FILE).exists());
+        // The same text as after a good up.
+        store_record(
+            &dir,
+            &load_state(&dir, &sample_map("100.64.0.1")).unwrap().record,
+        )
+        .unwrap();
+        assert_eq!(read_status_text(&dir).unwrap(), text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Child process for the crash test. It writes the node record in a loop until the
+    /// parent kills it.
+    #[test]
+    #[ignore = "child process of a_crash_leaves_no_part_of_a_record"]
+    fn crash_test_child_writes_records() {
+        let Ok(dir) = std::env::var("ORBLX_NODE_RECORD_CRASH_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let record = load_state(&dir, &sample_map("100.64.0.1")).unwrap().record;
+        loop {
+            store_record(&dir, &record).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_crash_leaves_no_part_of_a_record() {
+        let exe = std::env::current_exe().unwrap();
+        let full = "{\n  \"name\": \"a\",\n  \"overlay_ip\": \"100.64.0.1\"\n}";
+        let mut kills_with_record = 0;
+        for round in 0..20u64 {
+            let dir = test_dir(&format!("crash-{round}"));
+            let mut child = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "node::tests::crash_test_child_writes_records",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env("ORBLX_NODE_RECORD_CRASH_DIR", &dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            // Kill at a different point in each round. SIGKILL gives the child no cleanup.
+            std::thread::sleep(Duration::from_micros(round * round * 150));
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let path = dir.join(super::NODE_RECORD_FILE);
+            // The old state (no record) or the new state (the full record), never a part.
+            if let Ok(text) = fs::read_to_string(&path) {
+                assert_eq!(text, full, "round {round}: a part of a record");
+                kills_with_record += 1;
+            }
+            // The next start recovers, also with a temp file from the killed write.
+            let state = load_state(&dir, &sample_map("100.64.0.1")).unwrap();
+            assert_eq!(state.record.overlay_ip, "100.64.0.1");
+            if !state.stored {
+                store_record(&dir, &state.record).unwrap();
+            }
+            assert_eq!(fs::read_to_string(&path).unwrap(), full);
+            let _ = fs::remove_dir_all(&dir);
+        }
+        eprintln!("crash rounds 20, kills after the first rename {kills_with_record}");
     }
 
     #[test]

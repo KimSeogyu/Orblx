@@ -7,6 +7,14 @@ The CLI commands are `orblx up`, `orblx down`, and `orblx status`.
 The default state directory is `/var/lib/orblx`.
 The flag `--state-dir` selects another directory.
 The file `node.json` in that directory stores the node name and the overlay IP.
+`orblx up` writes `node.json` only after the TUN device opens.
+The write uses a temp file, fsync, and rename, so a crash leaves the old file or the new file.
+A failed `orblx up` (for example, no TUN device) does not change the state directory.
+Before the first good `orblx up`, `orblx status` reads the node name and the overlay IP from `netmap.json`.
+
+Gate 1 ruling (W25): the earlier code wrote `node.json` before the TUN device opened.
+This is a product bug from #34 and #45, not from #41.
+#114 removed the stale compose volumes that hid the bug, and the coord-enroll proof then showed it.
 A later start reads that file.
 A netmap overlay IP that differs from the stored IP is an error.
 The process keeps the stored IP.
@@ -58,6 +66,30 @@ The script starts the compose project.
 Each node pings the other two overlay addresses.
 The script then restarts `node-b`.
 The script checks the overlay IP in `orblx status`, in `node.json`, and on `orblx0`.
+
+### systemd unit and `orblx down` (W25-54, row 54)
+
+The compose service `node-s` has the profile `systemd`.
+The default `up` does not start it.
+`node-s` runs `/lib/systemd/systemd` as PID 1 (`privileged`, `cgroup: private`, `/run` and `/run/lock` on tmpfs).
+The proof mounts `scripts/orblxd.service` at `/etc/systemd/system/orblxd.service`.
+Node s has overlay IP `100.64.0.4` and bridge address `172.28.18.14`.
+Node s has the peers a and b. Node a also has the peer s.
+After the restart check of `node-b`, the script does these steps in node s:
+
+1. Wait until `systemctl is-system-running` is `running` or `degraded`. Check that PID 1 is `systemd`.
+2. `systemctl start orblxd`. Check that the unit is `active`, that a has a direct path to s, and that s and a ping each other.
+3. `systemctl stop orblxd`. Check the stop gates.
+4. `systemctl start orblxd`, then `systemctl restart orblxd`. Check that `MainPID` changed and do the start checks again.
+5. `orblx down --state-dir /var/lib/orblx` while the unit runs. Wait 6 s (3 times `RestartSec`).
+   Read `NRestarts`. A change prints `down_triggers_restart_on_failure yes` and the proof fails.
+   Then check the stop gates.
+6. `systemctl start orblxd` and the start checks, then `systemctl stop orblxd` and the stop gates.
+
+The stop gates are: `ActiveState` is `inactive` (not `failed`), `Result` is `success`,
+no `orblx0` link, and no socket on UDP 443.
+The script prints `systemd_unit_proof passed`.
+
 The script writes an env file and prints `env_file`.
 A new shell passes that file to Compose.
 
@@ -227,6 +259,28 @@ After the restart, node b kept overlay IP `100.64.0.2`.
 The TUN address stayed `100.64.0.2/32`.
 The script printed `restart_same_ip true`.
 The script printed `W18 proof passed`.
+
+### Result: systemd unit and `orblx down` (W25-54)
+
+Run on 2026-10-31 KST, branch `w25-54-systemd-down` at `adc15970`, log
+`/workspace/orblx-w18-proof/w25t-w18-systemd-adc15970.log`. The proof held the lock 70 s.
+
+| Step | ActiveState | Result | NRestarts | MainPID | orblx0 links | UDP 443 sockets | ping s and a |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| boot | inactive | success | 0 | 0 | 0 | 0 | not run |
+| start | active | success | 0 | 163 | not read | not read | ok |
+| stop | inactive | success | 0 | 0 | 0 | 0 | not run |
+| start again | active | success | 0 | 271 | not read | not read | ok |
+| restart | active | success | 0 | 337 | not read | not read | ok |
+| `orblx down` | inactive | success | 0 | 0 | 0 | 0 | not run |
+| start after down | active | success | 0 | 460 | not read | not read | ok |
+| final stop | inactive | success | 0 | 0 | 0 | 0 | not run |
+
+`systemd_state` was `running`. PID 1 was `systemd`.
+`orblx down` took 412 ms. After it, `orblx status` printed `state down`.
+`orblx down` does not trigger `Restart=on-failure`: `NRestarts` stayed 0 and the unit stayed `inactive`.
+The reason: `orblx down` sends SIGTERM, and the node exits 0 (`ExecMainStatus=0`).
+systemd counts that exit as clean.
 
 ## Host note
 
