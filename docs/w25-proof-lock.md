@@ -60,10 +60,22 @@ proof_lock LABEL waiting at ISO, file FILE, holder: label=... pid=... user=... c
 proof_lock LABEL still waiting at ISO, holder: ...
 proof_lock LABEL acquired at ISO after MS ms, file FILE
 proof_contention LABEL samples N contended_samples M unknown_samples U max_other_orblx_containers K max_load1 L
+proof_contention_invalid LABEL unknown_samples U samples N   (only when U > 0, W25-35)
 proof_lock LABEL released at ISO
 ```
 
 A run is "contended" when any sample saw another orblx container. It is "alone" only when every sample saw 0 other containers and no sample was unknown.
+
+### W25-35: unknown samples make the run not valid
+
+A sample is unknown when `docker ps` fails. Before W25-35, the sampler ran `docker ps` as the proof user. On the box, that user (`box`) is not in the `docker` group, so each sample was unknown, and the line said `contended_samples 0`. Example: `w25ha-routers-main-1459cc27.log` has `samples 213 contended_samples 0 unknown_samples 213`. `contended_samples 0` is then not a claim that the run was alone.
+
+Since W25-35:
+
+- When `docker ps` fails and the user is not root, the sampler uses `sudo -n docker ps` (the proofs also use `sudo -n docker`).
+- When `unknown_samples` is more than 0, `proof_lock_end` prints `proof_contention_invalid LABEL unknown_samples U samples N` after the `proof_contention` line. It releases the lock and then stops the script with exit status 3. The run fails, also when it printed `proof_ok` before.
+- A parser reads `unknown_samples` from the `proof_contention` line (field after `unknown_samples`, a decimal integer), or looks for a line that starts with `proof_contention_invalid `.
+- Each report of a contention value must also give the unknown count, for example `contended 0/213, unknown 0/213`.
 
 ## Gate 1: two proofs started at the same time (REAL lock, [C] proof)
 

@@ -1,0 +1,110 @@
+# W25-26 ticket renewal proof stack.
+# The proof script sets TR_* values and ORBLX_SVID_TTL.
+# The node services use the nodes profile.
+name: ${TR_PROJECT:-orblx-w25t-tr}
+
+x-node: &node
+  image: ${TR_IMAGE:-orblx-w25t-tr:local}
+  profiles: ["nodes"]
+  cap_add:
+    - NET_ADMIN
+  devices:
+    - /dev/net/tun:/dev/net/tun
+  sysctls:
+    net.ipv4.conf.all.rp_filter: "0"
+    net.ipv4.conf.default.rp_filter: "0"
+  depends_on:
+    - coord
+  environment:
+    # Node renew trace lines ("trace <epoch_ms> ...") for gate 9 of the proof.
+    ORBLX_TRACE_RENEW: "1"
+
+x-up: &up
+  - up
+  - --state-dir
+  - /var/lib/orblx
+  - --listen
+  - 0.0.0.0:443
+  - --coord
+  - ${TR_NET:-172.28.48}.10:443
+  - --bundle
+  - /var/lib/orblx/bundle.pem
+  - --coord-name
+  - coord
+
+services:
+  coord:
+    image: ${TR_IMAGE:-orblx-w25t-tr:local}
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /var/lib/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+      ORBLX_SVID_TTL: ${TR_SVID_TTL:?set TR_SVID_TTL}
+    volumes:
+      - coord-state:/var/lib/orblx
+      - ${TR_POLICY:?set TR_POLICY}:/var/lib/orblx/policy.hujson:ro
+    networks:
+      proof:
+        ipv4_address: ${TR_NET:-172.28.48}.10
+
+  owner:
+    <<: *node
+    command: *up
+    volumes:
+      - coord-state:/coord-state:ro
+      - owner-state:/var/lib/orblx
+    networks:
+      proof:
+        ipv4_address: ${TR_NET:-172.28.48}.20
+
+  a:
+    <<: *node
+    command: *up
+    volumes:
+      - coord-state:/coord-state:ro
+      - a-state:/var/lib/orblx
+    networks:
+      proof:
+        ipv4_address: ${TR_NET:-172.28.48}.11
+
+  b:
+    <<: *node
+    command: *up
+    volumes:
+      - coord-state:/coord-state:ro
+      - b-state:/var/lib/orblx
+    networks:
+      proof:
+        ipv4_address: ${TR_NET:-172.28.48}.12
+
+  c:
+    <<: *node
+    command: *up
+    volumes:
+      - coord-state:/coord-state:ro
+      - c-state:/var/lib/orblx
+    networks:
+      proof:
+        ipv4_address: ${TR_NET:-172.28.48}.13
+
+volumes:
+  coord-state:
+  owner-state:
+  a-state:
+  b-state:
+  c-state:
+
+networks:
+  proof:
+    ipam:
+      config:
+        - subnet: ${TR_NET:-172.28.48}.0/24
