@@ -23,8 +23,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_audit::{AuditLog, SessionEvent, SessionIds};
 use orblx_identity::{
-    ed25519_public_key_from_certificate_pem, ed25519_seed_from_private_pem, DenyApply, DenySet,
-    Policy, SpiffeId, TicketVerifier, TrustBundle,
+    ed25519_seed_from_private_pem, DenyApply, DenySet, Policy, SpiffeId, TicketVerifier,
+    TrustBundle,
 };
 use russh::keys::ssh_encoding::bytes::Bytes;
 use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Session};
@@ -43,7 +43,6 @@ type CertSessions = HashMap<u64, Vec<(String, Weak<AtomicBool>)>>;
 struct Shared {
     overlay: Ipv4Addr,
     node_id: SpiffeId,
-    host_key: [u8; 32],
     bundle: TrustBundle,
     verifier: Option<TicketVerifier>,
     state_dir: PathBuf,
@@ -79,6 +78,8 @@ struct Admitted {
 #[derive(Clone)]
 struct SshHandler {
     shared: Arc<Shared>,
+    /// The public host key of this connection: the node SVID key when the connection opened.
+    host_key: [u8; 32],
     /// The TCP peer address. The certificate `source-address` must contain it.
     peer: Option<SocketAddr>,
     admitted: Option<Admitted>,
@@ -472,7 +473,7 @@ impl SshHandler {
             password,
             &self.shared.node_id,
             self.shared.overlay,
-            &self.shared.host_key,
+            &self.host_key,
             SystemTime::now(),
             &self.shared.bundle,
             &policy,
@@ -1092,25 +1093,32 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) -> Result<(), S
     // W25-31: user certificates from the coordinator SSH user CA. A plain key gets deny.
     methods.push(MethodKind::PublicKey);
     spawn_revoke_watch(&shared);
-    let seed = svid_seed(&shared)?;
-    let private = host_key_from_seed(&seed).map(|(key, _)| key)?;
-    let config = russh::server::Config {
-        methods,
-        auth_rejection_time: Duration::from_millis(20),
-        auth_rejection_time_initial: Some(Duration::from_millis(1)),
-        keys: vec![private],
-        inactivity_timeout: Some(Duration::from_secs(120)),
-        ..Default::default()
-    };
-    let config = Arc::new(config);
+    current_host_key(&shared)?;
     loop {
         let (socket, peer) = listener
             .accept()
             .await
             .map_err(|_| "The SSH server did not accept a session.".to_string())?;
-        let config = Arc::clone(&config);
+        // The SVID renewal writes a new node key. Each connection reads the current key, so
+        // the host key matches the current cert.pem that the client pins.
+        let (private, host_key) = match current_host_key(&shared) {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("{err} The SSH session is refused.");
+                continue;
+            }
+        };
+        let config = Arc::new(russh::server::Config {
+            methods: methods.clone(),
+            auth_rejection_time: Duration::from_millis(20),
+            auth_rejection_time_initial: Some(Duration::from_millis(1)),
+            keys: vec![private],
+            inactivity_timeout: Some(Duration::from_secs(120)),
+            ..Default::default()
+        });
         let handler = SshHandler {
             shared: Arc::clone(&shared),
+            host_key,
             peer: Some(peer),
             admitted: None,
             pty: None,
@@ -1192,6 +1200,11 @@ fn cert_hash(key_id: &str) -> [u8; 16] {
     out
 }
 
+/// The SSH host key from the current node SVID key file.
+fn current_host_key(shared: &Shared) -> Result<(russh::keys::PrivateKey, [u8; 32]), String> {
+    host_key_from_seed(&svid_seed(shared)?)
+}
+
 fn svid_seed(shared: &Shared) -> Result<[u8; 32], String> {
     let pem = fs::read_to_string(shared.state_dir.join("key.pem"))
         .map_err(|_| "The node SVID key did not open.".to_string())?;
@@ -1214,8 +1227,6 @@ impl Shared {
                 &DenySet::empty(),
             )
             .map_err(|_| "The node SVID is not valid.".to_string())?;
-        let host_key = ed25519_public_key_from_certificate_pem(&cert_pem)
-            .map_err(|_| "The node SVID is not valid.".to_string())?;
         let verifier = match fs::read_to_string(state_dir.join("ticket-verifier.pem")) {
             Ok(pem) => Some(
                 TicketVerifier::from_public_pem(&pem)
@@ -1226,7 +1237,6 @@ impl Shared {
         Ok(Self {
             overlay,
             node_id,
-            host_key,
             bundle,
             verifier,
             state_dir: state_dir.to_path_buf(),
@@ -1584,6 +1594,74 @@ mod tests {
         assert!(checked.metrics.start >= 1);
         assert!(checked.metrics.end >= 1);
         assert!(checked.metrics.deny >= 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_renewed_node_key_is_the_host_key_of_the_next_session() {
+        // W25-31 proof run 8: the SVID renewal writes a new node key. The client pins the key
+        // of the current cert.pem. The server must present that key on the next connection.
+        let dir = std::env::temp_dir().join(format!("orblx-ssh-renew-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        let ca = MiniCa::generate(now).unwrap();
+        let node = SpiffeId::node("box").unwrap();
+        let alice = SpiffeId::user("alice").unwrap();
+        let first = ca
+            .issue(&node, now, MAX_USER_TTL, &DenySet::empty())
+            .unwrap();
+        let issued_alice = ca
+            .issue(&alice, now, MAX_USER_TTL, &DenySet::empty())
+            .unwrap();
+        std::fs::write(dir.join("cert.pem"), &first.certificate_pem).unwrap();
+        std::fs::write(dir.join("key.pem"), &first.private_key_pem).unwrap();
+        std::fs::write(dir.join("bundle.pem"), ca.certificate_pem()).unwrap();
+        std::fs::write(
+            dir.join("policy.hujson"),
+            r#"{"ssh": [{"src": ["spiffe://orblx.local/user/alice"],
+                "dst": ["spiffe://orblx.local/node/box"], "users": ["alice"],
+                "checkPeriod": "30s"}]}"#,
+        )
+        .unwrap();
+        let alice_dir = dir.join("alice");
+        std::fs::create_dir_all(&alice_dir).unwrap();
+        std::fs::write(alice_dir.join("bundle.pem"), ca.certificate_pem()).unwrap();
+        std::fs::write(alice_dir.join("cert.pem"), &issued_alice.certificate_pem).unwrap();
+        std::fs::write(alice_dir.join("key.pem"), &issued_alice.private_key_pem).unwrap();
+        std::fs::write(dir.join("old-peer.pem"), &first.certificate_pem).unwrap();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shared = std::sync::Arc::new(Shared::load(&dir, Ipv4Addr::LOCALHOST).unwrap());
+        tokio::spawn(super::accept_loop(listener, shared));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let login = |peer: &str| SessionRequest {
+            user: "alice".to_string(),
+            addr,
+            dst: node.clone(),
+            identity_dir: alice_dir.clone(),
+            peer_cert: dir.join(peer),
+            command: "printf '%s\\n' \"$ORBLX_SSH_USER\"".to_string(),
+            cert_login: None,
+        };
+        let before = session_within(login("old-peer.pem")).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&before.stdout).trim(), "alice");
+
+        // The renewal: a new leaf with a new key, as in EnrollResult::write_state.
+        let renewed = ca
+            .issue(&node, now, MAX_USER_TTL, &DenySet::empty())
+            .unwrap();
+        assert_ne!(renewed.private_key_pem, first.private_key_pem);
+        std::fs::write(dir.join("cert.pem"), &renewed.certificate_pem).unwrap();
+        std::fs::write(dir.join("key.pem"), &renewed.private_key_pem).unwrap();
+        std::fs::write(dir.join("new-peer.pem"), &renewed.certificate_pem).unwrap();
+
+        let after = session_within(login("new-peer.pem")).await.unwrap();
+        assert_eq!(after.exit_status, 0);
+        assert_eq!(String::from_utf8_lossy(&after.stdout).trim(), "alice");
+        // The old key is no longer the host key.
+        assert!(session_within(login("old-peer.pem")).await.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
