@@ -42,6 +42,7 @@ row|61|CLI UX (login/up/down/set)|w18-linux-daemon coord-enroll exit-node
 row|62|Admin CLI / console|admin
 gate|W23-4|sym relay throughput: sym_sym median of 5 runs of 30 s >= 1113 Mbit/s (W25-12)|sym-throughput
 gate|join-time|join time: 20 late-peer joins from a clean state, each 2000 ms or less from the listener start to the first packet (enroll to first packet is report only)|join-time
+gate|W25-38|deny.json fails closed: a revoked peer stays refused after deny.json is damaged (corrupt, truncated, missing, unreadable; 0 accepted, 0 unknown); with a valid deny.json and the coordinator offline 10 min, mesh traffic has 0 refused frames; the refuse-all window after enroll is 2 s or less in each of 10 enrolls|w25-38-deny-damage
 
 proof|w18-linux-daemon|scripts/proof/w18-linux-daemon.sh|-|orblx-w18:local
 proof|coord-enroll|scripts/proof/coord-enroll.sh|-|orblx-coord:w18
@@ -58,6 +59,7 @@ proof|nat-realism|scripts/proof/nat-realism.sh|ORBLX_NATR_PROFILE=release ORBLX_
 proof|admin|scripts/proof/admin.sh|-|orblx-admin:w19
 proof|revoke-all|scripts/proof/revoke-all.sh|-|orblx-w24d-revoke:w24
 proof|revoke-followup|scripts/proof/revoke-followup.sh|ORBLX_PROOF_PROFILE=release|orblx-w25a-revoke:w25
+proof|w25-38-deny-damage|scripts/proof/w25-38-deny-damage.sh|-|orblx-w25-38-deny:w25
 proof|api-tokens|scripts/proof/api-tokens.sh|ATPROOF_BIN=@BIN@ ATPROOF_PROJECT=orblx-rc3sw-tokens ATPROOF_IMAGE=orblx-rc3sw-tokens:local|orblx-rc3sw-tokens:local
 proof|token-no-escalation|scripts/proof/token-no-escalation.sh|ESC_BIN=@BIN@ ESC_PROJECT=orblx-rc3sw-escalation ESC_IMAGE=orblx-rc3sw-escalation:local|orblx-rc3sw-escalation:local
 proof|node-share|scripts/proof/node-share.sh|-|orblx-w25a-share:w25

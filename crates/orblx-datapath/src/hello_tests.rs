@@ -549,6 +549,13 @@ fn ticket_acl_drops_bad_tickets_and_allows_a_valid_ticket() {
         ticket_failure(gate.payload_from_data(&frame, now, &deny).unwrap_err()),
         CryptoError::Identity(IdentityError::Revoked)
     );
+
+    // W25-38: the set for a deny file that failed refuses the ticket and each frame.
+    let refuse = DenySet::refuse_all();
+    assert!(gate
+        .admit_ticket(&ring, &good.bytes, &good.mac, now, &refuse)
+        .is_err());
+    assert!(gate.payload_from_data(&frame, now, &refuse).is_err());
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1321,4 +1328,142 @@ fn a_failed_tun_open_leaves_the_state_directory_unchanged() {
     let after = snapshot(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(before, after, "a failed up changed the state directory");
+}
+
+/// W25-38: the deny file of a node with a valid list, as the node reload loop reads it.
+const W25_38_VALID: &str = r#"{"version":1,"generated_at":1,"revoked_uris":["spiffe://orblx.local/user/w25-38-revoked"],"revoked_ticket_nonces":[]}"#;
+
+/// Damage the deny file in one of the four ways of the W25-38 gate.
+fn w25_38_damage(path: &std::path::Path, kind: &str) {
+    match kind {
+        "corrupt" => std::fs::write(path, b"not json {").unwrap(),
+        "truncated" => {
+            std::fs::write(path, &W25_38_VALID.as_bytes()[..W25_38_VALID.len() / 2]).unwrap()
+        }
+        "missing" => std::fs::remove_file(path).unwrap(),
+        "unreadable" => {
+            std::fs::remove_file(path).unwrap();
+            std::fs::create_dir(path).unwrap();
+        }
+        other => panic!("unknown damage kind {other}"),
+    }
+}
+
+/// Do one reload as the node reload loop does it, and apply the result to the endpoint.
+fn w25_38_reload(
+    cache: &mut orblx_identity::DenyCache,
+    dir: &std::path::Path,
+    endpoint: &HelloEndpoint,
+) -> orblx_identity::DenyReload {
+    let reload = cache.reload(dir);
+    if !matches!(reload, orblx_identity::DenyReload::Same) {
+        endpoint.replace_deny(cache.set().clone());
+    }
+    reload
+}
+
+/// W25-38 gate (datapath): a corrupt, truncated, missing (after enroll) or unreadable
+/// deny file refuses each new QUIC session. A valid deny file does not change the
+/// mesh traffic.
+#[tokio::test]
+async fn w25_38_new_quic_sessions_refuse_when_the_deny_file_is_corrupt_truncated_missing_or_unreadable(
+) {
+    tokio::time::timeout(Duration::from_secs(60), w25_38_quic_cases())
+        .await
+        .expect("the W25-38 datapath test timed out");
+}
+
+async fn w25_38_quic_cases() {
+    let dir = std::env::temp_dir().join(format!(
+        "orblx-w25-38-quic-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(orblx_identity::ENROLL_MARKER_FILE), "server\n").unwrap();
+    let path = dir.join(orblx_identity::DENY_FILE);
+    std::fs::write(&path, W25_38_VALID).unwrap();
+
+    let now = SystemTime::now();
+    let (_ca, pair) = issue_pair(now);
+    let server = Arc::new(HelloEndpoint::bind_server(pair.server.clone(), loopback(0)).unwrap());
+    let addr = server.local_addr().unwrap();
+    let mut cache = orblx_identity::DenyCache::with_set(server.deny_set());
+    assert_eq!(
+        w25_38_reload(&mut cache, &dir, &server),
+        orblx_identity::DenyReload::Changed
+    );
+
+    let mut accepted_after_damage = 0;
+    for kind in ["corrupt", "truncated", "missing", "unreadable"] {
+        // A valid deny file: the session and its traffic are as before.
+        w25_38_session_ok(&server, addr, pair.client.clone(), &pair.client_id).await;
+
+        w25_38_damage(&path, kind);
+        let reload = w25_38_reload(&mut cache, &dir, &server);
+        assert!(
+            matches!(
+                reload,
+                orblx_identity::DenyReload::Stale { first: true, .. }
+            ),
+            "{kind}: the reload did not go stale: {reload:?}"
+        );
+        assert_eq!(server.deny_set().version(), Some(1), "{kind}");
+        assert!(server.denies(&pair.client_id), "{kind}");
+        let accept = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.accept_one().await })
+        };
+        let client = HelloEndpoint::bind_client(pair.client.clone(), loopback(0)).unwrap();
+        let connect = tokio::spawn(async move { client.connect_one(addr).await });
+        match accept.await.unwrap() {
+            Ok(_) => accepted_after_damage += 1,
+            Err(err) => {
+                let text = err.to_string();
+                assert!(!text.is_empty(), "{kind}");
+            }
+        }
+        connect.abort();
+
+        // The node gets a valid deny file again. New sessions work again.
+        if path.is_dir() {
+            std::fs::remove_dir(&path).unwrap();
+        }
+        std::fs::write(&path, W25_38_VALID).unwrap();
+        assert_eq!(
+            w25_38_reload(&mut cache, &dir, &server),
+            orblx_identity::DenyReload::Changed,
+            "{kind}"
+        );
+        assert!(!server.denies(&pair.client_id), "{kind}");
+    }
+    w25_38_session_ok(&server, addr, pair.client.clone(), &pair.client_id).await;
+    assert_eq!(
+        accepted_after_damage, 0,
+        "a damaged deny file accepted a session"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+async fn w25_38_session_ok(
+    server: &Arc<HelloEndpoint>,
+    addr: SocketAddr,
+    client: HelloConfig,
+    client_id: &SpiffeId,
+) {
+    let packet = sample_packet();
+    let expected = packet.clone();
+    let accept = {
+        let server = Arc::clone(server);
+        tokio::spawn(async move {
+            let mut session = server.accept_one().await.unwrap();
+            let frame = session.recv_data_frame().await.unwrap();
+            assert_eq!(frame.payload, expected);
+            session.peer_id().clone()
+        })
+    };
+    let client = HelloEndpoint::bind_client(client, loopback(0)).unwrap();
+    let mut session = client.connect_one(addr).await.unwrap();
+    session.send_ipv4(&packet).await.unwrap();
+    assert_eq!(&accept.await.unwrap(), client_id);
 }

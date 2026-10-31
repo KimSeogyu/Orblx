@@ -1,0 +1,35 @@
+{
+  // W25-38 deny damage proof.
+  // Node a is the revoked peer. Node allowed is a peer that is not revoked.
+  // Node b has the deny.json that the proof damages.
+  "nodeApproval": false,
+  "owners": ["spiffe://orblx.local/node/owner"],
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a", "spiffe://orblx.local/node/allowed"],
+      "proto": "tcp",
+      "dst": ["spiffe://orblx.local/node/b:*"],
+    },
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a", "spiffe://orblx.local/node/allowed"],
+      "proto": "udp",
+      "dst": ["spiffe://orblx.local/node/b:*"],
+    },
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a", "spiffe://orblx.local/node/allowed"],
+      "proto": "icmp",
+      "dst": ["spiffe://orblx.local/node/b:*"],
+    },
+  ],
+  "ssh": [
+    {
+      "src": ["spiffe://orblx.local/node/a", "spiffe://orblx.local/node/allowed"],
+      "dst": ["spiffe://orblx.local/node/b"],
+      "users": ["root"],
+      "checkPeriod": "30s",
+    },
+  ],
+}

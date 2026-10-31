@@ -293,6 +293,34 @@ pub struct EnrollResult {
     pub advertised_routes: Vec<String>,
     pub exit_approved: bool,
     pub ticket: Option<IssuedTicket>,
+    /// The first deny list of the node (W25-38). The enroll reply has no deny list.
+    pub first_deny: FirstDeny,
+}
+
+/// The first deny list of a new node (W25-38).
+///
+/// The enroll reply has no deny list, because enroll is not mutual TLS. Right after the
+/// node gets its SVID, the enroll client sends one `deny` request over a new mutual TLS
+/// connection with that SVID. [`EnrollResult::write_state`] writes the list with
+/// [`orblx_identity::store_deny_file`] as the last file. Until a valid `deny.json`
+/// exists, each reader of the enrolled node refuses each peer.
+#[derive(Debug, Clone, Default)]
+pub enum FirstDeny {
+    /// No fetch (the coordinator side, renew, and a direct `enroll_token` call).
+    #[default]
+    NotFetched,
+    /// The deny list text from the mutual TLS fetch. It is a valid deny document.
+    Fetched {
+        text: String,
+        /// The time when the node got its SVID.
+        cert_at: std::time::Instant,
+    },
+    /// The mutual TLS fetch failed. The node stays refuse-all.
+    Failed {
+        error: String,
+        /// The time when the node got its SVID.
+        cert_at: std::time::Instant,
+    },
 }
 
 impl std::fmt::Debug for EnrollResult {
@@ -1786,6 +1814,7 @@ fn finish_enroll(
         advertised_routes: view.advertised_routes,
         exit_approved: view.exit_approved,
         ticket: Some(ticket),
+        first_deny: FirstDeny::NotFetched,
     })
 }
 
@@ -1833,6 +1862,7 @@ fn issue_leaf(inner: &mut Inner, name: &str, now: SystemTime) -> Result<EnrollRe
         advertised_routes: view.advertised_routes,
         exit_approved: view.exit_approved,
         ticket: Some(ticket),
+        first_deny: FirstDeny::NotFetched,
     })
 }
 
@@ -2298,6 +2328,16 @@ impl EnrollResult {
         )?;
         if let Some(ticket) = &self.ticket {
             write_ticket_files(dir, ticket)?;
+        }
+        // W25-38: the deny list goes last. Before it, `node-name` exists and `deny.json`
+        // is missing, so each reader refuses each peer.
+        if let FirstDeny::Fetched { text, .. } = &self.first_deny {
+            orblx_identity::store_deny_file(dir, text).map_err(|err| {
+                CoordError::Io(format!(
+                    "The node is enrolled, but deny.json did not write. {err} \
+The node refuses each peer until it has a valid deny list."
+                ))
+            })?;
         }
         Ok(())
     }
