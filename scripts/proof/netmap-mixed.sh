@@ -304,7 +304,7 @@ echo "GATE_PASS X1 new-coordinator-old-nodes"
 
 echo "=== [C] Gate U: nodes a, b, d to new on rc.2 state ==="
 dc --profile nodes stop c >/dev/null
-first_line="$(dc logs coord 2>&1 | grep -m1 'netmap seq first after start' | sed -E 's/^[^|]*\| //' || true)"
+first_line="$(dc logs coord 2>&1 | awk '/netmap seq first after start/ && !n { sub(/^[^|]*\| /, ""); print; n = 1 }' || true)"
 echo "coordinator (before node upgrade): ${first_line:-no netmap signed yet}"
 for node in a b d; do
   [[ ! -e "$WORK/$node/netmap.seq" ]] || fail "Gate U: ${node} has netmap.seq before the upgrade."
@@ -314,7 +314,7 @@ MIX_A_IMAGE="$NEW_IMAGE" MIX_B_IMAGE="$NEW_IMAGE" MIX_D_IMAGE="$NEW_IMAGE" \
   dc --profile nodes up -d --no-deps a b d
 wait_paths a b d
 up_ms=$(( $(now_ms) - up_start ))
-first_line="$(dc logs coord 2>&1 | grep -m1 'netmap seq first after start' | sed -E 's/^[^|]*\| //' || true)"
+first_line="$(dc logs coord 2>&1 | awk '/netmap seq first after start/ && !n { sub(/^[^|]*\| /, ""); print; n = 1 }' || true)"
 echo "coordinator: ${first_line}"
 [[ "$first_line" =~ persisted\ none\ seq\ ([0-9]+)\ issued_at_ms\ ([0-9]+) ]] \
   || fail "Gate U: no 'persisted none' first-seq line."
