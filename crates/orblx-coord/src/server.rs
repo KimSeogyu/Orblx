@@ -630,6 +630,8 @@ fn run_admin(
     let value = match request.op.as_str() {
         "admin-nodes" => admin::nodes(coord)?,
         "admin-users" => admin::users(coord)?,
+        "admin-user-approve" => admin::user_approve(coord, &request.name, actor, now)?,
+        "admin-user-reject" => admin::user_reject(coord, &request.name, actor, now)?,
         "admin-approve" => admin::approve(coord, &request.name, actor)?,
         "admin-revoke" => admin::revoke(coord, &request.name, actor, now)?,
         "admin-revoke-all" => admin::revoke_all(coord, &request.name, actor, now)?,

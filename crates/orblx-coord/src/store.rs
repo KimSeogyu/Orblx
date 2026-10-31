@@ -16,6 +16,11 @@ use crate::netmap::encode_hex;
 const STORE_VERSION: u32 = 1;
 const TOKEN_PREFIX: &str = "ge1.";
 const MAX_TOKEN_TTL: u64 = 30 * 24 * 60 * 60;
+/// The most OIDC users in the store (W25-15).
+const MAX_USERS: usize = 4096;
+/// The most pending OIDC users. A new user over the limit is refused and not stored.
+const MAX_PENDING: usize = 256;
+const MAX_EMAIL: usize = 254;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiskStore {
@@ -23,6 +28,58 @@ struct DiskStore {
     next_index: u32,
     nodes: Vec<NodeRecord>,
     tokens: Vec<TokenRecord>,
+    /// OIDC users (W25-15). A store from before W25-15 has no list.
+    /// The open step then makes the list from the node owners.
+    #[serde(default)]
+    users: Option<Vec<UserRecord>>,
+}
+
+/// The approval state of one OIDC user (W25-15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserState {
+    /// The user waits for an owner. The user gets no SVID.
+    Pending,
+    /// The user can enroll nodes.
+    Approved,
+    /// An owner refused the user. The user gets no SVID.
+    Rejected,
+}
+
+impl UserState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UserRecord {
+    /// `oidc:SUBJECT`, the same text as the node owner.
+    user: String,
+    state: UserState,
+    /// The verified email, when the token had one.
+    #[serde(default)]
+    email: Option<String>,
+    first_unix: u64,
+    #[serde(default)]
+    changed_unix: u64,
+    /// The store migration approved this user and the config chain has no record yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    migration_unrecorded: bool,
+}
+
+/// One OIDC user (W25-15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredUser {
+    pub user: String,
+    pub state: UserState,
+    pub email: Option<String>,
+    pub first_unix: u64,
+    pub changed_unix: u64,
 }
 
 fn default_approved() -> bool {
@@ -126,10 +183,19 @@ impl NodeStore {
             if text.contains("PRIVATE KEY") || text.contains(TOKEN_PREFIX) {
                 return Err(CoordError::State);
             }
-            return Ok(Self {
+            let mut store = Self {
                 path: path.to_path_buf(),
                 disk,
-            });
+            };
+            if store.disk.users.is_none() {
+                store.migrate_users();
+                store.persist()?;
+                println!(
+                    "user migration approved {}",
+                    store.disk.users.as_ref().map_or(0, Vec::len)
+                );
+            }
+            return Ok(store);
         }
         let store = Self {
             path: path.to_path_buf(),
@@ -138,10 +204,160 @@ impl NodeStore {
                 next_index: 0,
                 nodes: Vec::new(),
                 tokens: Vec::new(),
+                users: Some(Vec::new()),
             },
         };
         store.persist()?;
         Ok(store)
+    }
+
+    /// Make the user list for a store from before W25-15.
+    ///
+    /// Each OIDC owner of an enrolled node is approved, so these users need no action.
+    fn migrate_users(&mut self) {
+        let mut users: Vec<UserRecord> = Vec::new();
+        for node in &self.disk.nodes {
+            if !node.owner.starts_with("oidc:") {
+                continue;
+            }
+            if users.iter().any(|user| user.user == node.owner) {
+                continue;
+            }
+            users.push(UserRecord {
+                user: node.owner.clone(),
+                state: UserState::Approved,
+                email: None,
+                first_unix: node.enrolled_unix,
+                changed_unix: node.enrolled_unix,
+                migration_unrecorded: true,
+            });
+        }
+        self.disk.users = Some(users);
+    }
+
+    /// Return the OIDC users (W25-15).
+    pub fn users(&self) -> Vec<StoredUser> {
+        self.disk
+            .users
+            .iter()
+            .flatten()
+            .map(|user| StoredUser {
+                user: user.user.clone(),
+                state: user.state,
+                email: user.email.clone(),
+                first_unix: user.first_unix,
+                changed_unix: user.changed_unix,
+            })
+            .collect()
+    }
+
+    /// Return one OIDC user (`oidc:SUBJECT`).
+    pub fn user(&self, user: &str) -> Option<StoredUser> {
+        self.users().into_iter().find(|stored| stored.user == user)
+    }
+
+    /// Store a new pending user. A known user does not change.
+    ///
+    /// Return true when the store added the user.
+    pub fn add_pending(
+        &mut self,
+        user: &str,
+        email: Option<&str>,
+        now: SystemTime,
+    ) -> Result<bool, CoordError> {
+        check_user(user)?;
+        let now_unix = unix_now(now)?;
+        let list = self.disk.users.get_or_insert_with(Vec::new);
+        if list.iter().any(|stored| stored.user == user) {
+            return Ok(false);
+        }
+        let pending = list
+            .iter()
+            .filter(|stored| stored.state == UserState::Pending)
+            .count();
+        if pending >= MAX_PENDING || list.len() >= MAX_USERS {
+            return Err(CoordError::Protocol(
+                "The coordinator has too many waiting users.".to_string(),
+            ));
+        }
+        list.push(UserRecord {
+            user: user.to_string(),
+            state: UserState::Pending,
+            email: email
+                .filter(|text| text.len() <= MAX_EMAIL && !text.chars().any(char::is_control))
+                .map(str::to_string),
+            first_unix: now_unix,
+            changed_unix: now_unix,
+            migration_unrecorded: false,
+        });
+        self.persist()?;
+        Ok(true)
+    }
+
+    /// Remove one OIDC user record. The caller uses it to undo a change.
+    pub fn remove_user(&mut self, user: &str) -> Result<(), CoordError> {
+        if let Some(list) = self.disk.users.as_mut() {
+            list.retain(|stored| stored.user != user);
+        }
+        self.persist()
+    }
+
+    /// Set the state of one OIDC user. A new user gets a record.
+    pub fn set_user_state(
+        &mut self,
+        user: &str,
+        state: UserState,
+        now: SystemTime,
+    ) -> Result<(), CoordError> {
+        check_user(user)?;
+        let now_unix = unix_now(now)?;
+        let list = self.disk.users.get_or_insert_with(Vec::new);
+        if let Some(stored) = list.iter_mut().find(|stored| stored.user == user) {
+            stored.state = state;
+            stored.changed_unix = now_unix;
+            stored.migration_unrecorded = false;
+        } else {
+            if list.len() >= MAX_USERS {
+                return Err(CoordError::Protocol(
+                    "The coordinator has too many users.".to_string(),
+                ));
+            }
+            list.push(UserRecord {
+                user: user.to_string(),
+                state,
+                email: None,
+                first_unix: now_unix,
+                changed_unix: now_unix,
+                migration_unrecorded: false,
+            });
+        }
+        self.persist()
+    }
+
+    /// The users that the store migration approved with no config record yet.
+    pub fn migration_unrecorded(&self) -> Vec<String> {
+        self.disk
+            .users
+            .iter()
+            .flatten()
+            .filter(|user| user.migration_unrecorded)
+            .map(|user| user.user.clone())
+            .collect()
+    }
+
+    /// Mark the migration record of `user` as written.
+    pub fn set_migration_recorded(&mut self, user: &str) -> Result<(), CoordError> {
+        let Some(stored) = self
+            .disk
+            .users
+            .iter_mut()
+            .flatten()
+            .find(|stored| stored.user == user)
+        else {
+            return Ok(());
+        };
+        stored.migration_unrecorded = false;
+        self.persist()
     }
 
     pub fn nodes(&self) -> Vec<StoredNode> {
@@ -455,6 +671,25 @@ pub struct EnrollPlan {
     next_index: u32,
     /// W25-18: the node is ephemeral.
     pub ephemeral: bool,
+}
+
+/// Check `oidc:SUBJECT` with the same rule as [`NodeStore::begin_oidc`].
+pub(crate) fn check_user(user: &str) -> Result<(), CoordError> {
+    let Some(subject) = user.strip_prefix("oidc:") else {
+        return Err(CoordError::Protocol(
+            "The user is not oidc:SUBJECT.".to_string(),
+        ));
+    };
+    if subject.is_empty()
+        || subject.len() > 128
+        || subject.contains(['\n', ':'])
+        || subject.chars().any(char::is_control)
+    {
+        return Err(CoordError::Protocol(
+            "The user is not oidc:SUBJECT.".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn subnet_routes(routes: &[String]) -> Result<Vec<String>, CoordError> {

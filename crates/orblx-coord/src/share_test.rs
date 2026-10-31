@@ -82,6 +82,9 @@ fn a_guest_sees_only_the_shared_node_and_each_share_change_writes_one_record() {
     let id_token = oidc
         .issue_id_token("bob", now, Duration::from_secs(600))
         .unwrap();
+    coord
+        .approve_user_by("oidc:bob", "spiffe://orblx.local/node/owner", now)
+        .unwrap();
     for name in ["g", "g2"] {
         coord
             .enroll_oidc(name, &id_token, None, &[format!("{name}:443")], &[], now)
@@ -226,12 +229,16 @@ fn share_back_lets_one_owner_node_reach_one_guest_node() {
     let oidc = MockOidc::generate(MOCK_OIDC_ISSUER).unwrap();
     let gate = IssueGate::new(MiniCa::generate(now).unwrap(), &oidc).unwrap();
     let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::Mock(Box::new(gate))).unwrap();
+    coord.enable_config_audit().unwrap();
     let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
     coord
         .enroll_token("a", &token.secret, &["a:443".to_string()], &[], now)
         .unwrap();
     let id_token = oidc
         .issue_id_token("bob", now, Duration::from_secs(600))
+        .unwrap();
+    coord
+        .approve_user_by("oidc:bob", "spiffe://orblx.local/node/owner", now)
         .unwrap();
     for name in ["g", "g2"] {
         coord

@@ -102,13 +102,17 @@ pub enum ConfigAction {
     ///
     /// The coordinator writes one record for each run of failures, not one for each try.
     SinkError,
+    /// An owner or the policy approved one OIDC user (W25-15).
+    UserApprove,
+    /// An owner rejected one OIDC user (W25-15).
+    UserReject,
     /// The coordinator removed one ephemeral node after it stayed offline too long (W25-18).
     NodeRemove,
 }
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 37] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -143,6 +147,8 @@ impl ConfigAction {
         Self::PacketDeny,
         Self::Unrevoke,
         Self::SinkError,
+        Self::UserApprove,
+        Self::UserReject,
         Self::NodeRemove,
     ];
 
@@ -184,6 +190,8 @@ impl ConfigAction {
             Self::PacketDeny => "packet-deny",
             Self::Unrevoke => "unrevoke",
             Self::SinkError => "sink-error",
+            Self::UserApprove => "user-approve",
+            Self::UserReject => "user-reject",
             Self::NodeRemove => "node-remove",
         }
     }
@@ -232,7 +240,9 @@ impl ConfigAction {
             Self::PacketDeny => 32,
             Self::Unrevoke => 33,
             Self::SinkError => 34,
-            Self::NodeRemove => 35,
+            Self::UserApprove => 35,
+            Self::UserReject => 36,
+            Self::NodeRemove => 37,
         }
     }
 

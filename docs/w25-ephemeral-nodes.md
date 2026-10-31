@@ -48,7 +48,7 @@ One removal does these steps:
    The SVID cannot renew, and peers drop the node.
 2. The coordinator deletes the node record. The overlay address becomes free.
    The next enroll gets the lowest free address, so a new node can get the address of the removed node.
-3. The coordinator writes **1** `node-remove` config audit record (code 35): actor `coord`,
+3. The coordinator writes **1** `node-remove` config audit record (code 37): actor `coord`,
    detail `reason ephemeral offline_ms X limit_secs T deny_version V svid ... overlay_ip ...`.
    `orblx audit verify-config` and `scripts/siem/orblx-siem-verify.py` accept the new action.
 4. The deny change wakes each `policy-wait` request. Peers get the new netmap without the node.

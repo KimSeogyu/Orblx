@@ -38,6 +38,8 @@ mod state;
 mod store;
 mod ticket;
 mod tlsutil;
+#[cfg(test)]
+mod user_approval_test;
 mod webhook;
 
 pub use admin::{
@@ -57,7 +59,7 @@ pub use client::{
     PolicySync, DENY_WAIT_HOLD,
 };
 pub use config::{CoordConfig, OidcSection};
-pub use error::CoordError;
+pub use error::{CoordError, USER_PENDING_TEXT, USER_REJECTED_TEXT};
 pub use http_util::{fetch_google_jwks_blocking, post_google_token_blocking};
 pub use netmap::{
     decode_hex_32, encode_hex, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap,
@@ -69,7 +71,7 @@ pub use state::{
     oidc_config, read_node_material, Coordinator, EnrollResult, IssuerFetch, NetmapView,
     OidcConfig, CONFIG_AUDIT_FILE, ISSUER_JWKS_TTL_SECS, ISSUER_REFETCH_SECS,
 };
-pub use store::CreatedToken;
+pub use store::{CreatedToken, StoredUser, UserState};
 
 /// This function returns the name of this crate.
 pub fn crate_name() -> &'static str {
@@ -179,8 +181,25 @@ mod tests {
         let gate = IssueGate::new(MiniCa::generate(now).unwrap(), &oidc).unwrap();
         let coord =
             Coordinator::open(&scratch.0, "coord", OidcConfig::Mock(Box::new(gate))).unwrap();
+        coord.enable_config_audit().unwrap();
         let id_token = oidc
             .issue_id_token("alice", now, Duration::from_secs(600))
+            .unwrap();
+        // W25-15: a new user waits for the owner.
+        let pending = coord.enroll_oidc(
+            "laptop",
+            &id_token,
+            None,
+            &["laptop:443".to_string()],
+            &[],
+            now,
+        );
+        assert!(matches!(
+            pending.unwrap_err(),
+            super::CoordError::UserPending
+        ));
+        coord
+            .approve_user_by("oidc:alice", "spiffe://orblx.local/node/owner", now)
             .unwrap();
         let result = coord
             .enroll_oidc(

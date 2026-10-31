@@ -282,10 +282,23 @@ pub fn nodes(coord: &Coordinator) -> Result<Value, CoordError> {
     Ok(json!({"op": "nodes", "nodes": nodes}))
 }
 
+/// List the OIDC users, their state, and their nodes (W25-15).
+///
+/// A user from a node owner with no user record is `approved`. The store migration
+/// makes such a record, so the case is only a guard.
 pub fn users(coord: &Coordinator) -> Result<Value, CoordError> {
-    let list = coord.node_list()?;
-    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for node in list {
+    let (users, nodes) = coord.user_list()?;
+    let mut groups: BTreeMap<String, (String, Option<String>, Vec<String>)> = BTreeMap::new();
+    for user in users {
+        let Some(subject) = user.user.strip_prefix("oidc:") else {
+            continue;
+        };
+        groups.insert(
+            subject.to_string(),
+            (user.state.as_str().to_string(), user.email, Vec::new()),
+        );
+    }
+    for node in nodes {
         let Some(subject) = node.owner.strip_prefix("oidc:") else {
             continue;
         };
@@ -294,14 +307,53 @@ pub fn users(coord: &Coordinator) -> Result<Value, CoordError> {
         }
         groups
             .entry(subject.to_string())
-            .or_default()
+            .or_insert_with(|| ("approved".to_string(), None, Vec::new()))
+            .2
             .push(node.name);
     }
     let users: Vec<Value> = groups
         .into_iter()
-        .map(|(subject, nodes)| json!({"subject": subject, "nodes": nodes}))
+        .map(|(subject, (state, email, nodes))| {
+            json!({"subject": subject, "state": state, "email": email, "nodes": nodes})
+        })
         .collect();
     Ok(json!({"op": "users", "users": users}))
+}
+
+/// Return `oidc:SUBJECT` for `SUBJECT` or `oidc:SUBJECT`.
+fn oidc_user(target: &str) -> Result<String, CoordError> {
+    let target = target.trim();
+    let user = if target.starts_with("oidc:") {
+        target.to_string()
+    } else {
+        format!("oidc:{target}")
+    };
+    crate::store::check_user(&user)?;
+    Ok(user)
+}
+
+/// Approve one OIDC user (W25-15). One `user-approve` record.
+pub fn user_approve(
+    coord: &Coordinator,
+    target: &str,
+    actor: &str,
+    now: SystemTime,
+) -> Result<Value, CoordError> {
+    let user = oidc_user(target)?;
+    coord.approve_user_by(&user, actor, now)?;
+    Ok(json!({"op": "user-approve", "user": user, "state": "approved"}))
+}
+
+/// Reject one OIDC user (W25-15). One `user-reject` record.
+pub fn user_reject(
+    coord: &Coordinator,
+    target: &str,
+    actor: &str,
+    now: SystemTime,
+) -> Result<Value, CoordError> {
+    let user = oidc_user(target)?;
+    coord.reject_user_by(&user, actor, now)?;
+    Ok(json!({"op": "user-reject", "user": user, "state": "rejected"}))
 }
 
 pub fn routes(coord: &Coordinator) -> Result<Value, CoordError> {
