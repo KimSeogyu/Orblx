@@ -15,6 +15,9 @@
 #   the last count, must be PROJECT_LIMIT_PCT (10%) of one core or less.
 # The script also prints the UDP sockets of the load clients. With one QUIC connection for
 # each client, the count is the client count.
+# W25-34: each window also prints the coordinator eth0 bytes (rx + tx) and the bytes for
+# each node for each hour (scale_bytes). ORBLX_SCALE_BIN uses a built orblx binary (for
+# example a main build for the baseline). Then the script does not build.
 # The script deletes the proof containers at the start and at the end.
 # The script does not print enroll tokens or private keys.
 # The script takes the box proof lock (proof-lock.sh, W25-5). Proofs run one at a time.
@@ -93,15 +96,17 @@ open_legacy_forward() {
 }
 
 build_image() {
-  local image_dir
-  if [[ "$PROFILE" == release ]]; then
+  local image_dir bin="${ORBLX_SCALE_BIN:-}"
+  if [[ -n "$bin" ]]; then
+    echo "binary ${bin} sha256 $(sha256sum "$bin" | awk '{print $1}')"
+  elif [[ "$PROFILE" == release ]]; then
     cargo build --release -p orblx-cli --bin orblx --locked
   else
     cargo build -p orblx-cli --bin orblx --locked
   fi
   # shellcheck source=stage-image.sh
   source "$ROOT/scripts/proof/stage-image.sh"
-  image_dir="$(stage_proof_image "$ROOT" "$TARGET_DIR/$PROFILE/orblx")"
+  image_dir="$(stage_proof_image "$ROOT" "${bin:-$TARGET_DIR/$PROFILE/orblx}")"
   docker build -q -t "$ORBLX_SYNC_IMAGE" "$image_dir"
   rm -rf "$image_dir"
 }
@@ -157,6 +162,11 @@ load_sockets() {
     | awk '$1 ~ /^[0-9]+:$/ {n++} END {print n + 0}'
 }
 
+# Print the coordinator eth0 bytes, rx + tx (W25-34).
+coord_bytes() {
+  dc exec -T coord sh -c 'echo $(( $(cat /sys/class/net/eth0/statistics/rx_bytes) + $(cat /sys/class/net/eth0/statistics/tx_bytes) ))'
+}
+
 # Enroll the load identities FROM to TO and start their watch clients.
 add_clients() {
   local from="$1" to="$2"
@@ -168,8 +178,8 @@ add_clients() {
 # Measure one window. Print the coordinator CPU percent as the last word.
 # Arguments: label, node count, changes (0 or 1).
 cpu_window() {
-  local label="$1" nodes="$2" changes="$3" c0 l0 u0 f0 t0 c1 l1 u1 f1 t1 secs coord_pct load_pct each_pct k
-  c0="$(coord_ticks)"; l0="$(load_ticks)"; u0="$(load_updates)"; f0="$(load_failures)"; t0="$(date +%s%3N)"
+  local label="$1" nodes="$2" changes="$3" c0 l0 u0 f0 t0 c1 l1 u1 f1 t1 secs coord_pct load_pct each_pct k b0 b1 per_hour
+  c0="$(coord_ticks)"; l0="$(load_ticks)"; u0="$(load_updates)"; f0="$(load_failures)"; b0="$(coord_bytes)"; t0="$(date +%s%3N)"
   if [[ "$changes" -eq 0 ]]; then
     sleep "$SECONDS_EACH"
   else
@@ -183,11 +193,13 @@ cpu_window() {
       sleep 5
     done
   fi
-  c1="$(coord_ticks)"; l1="$(load_ticks)"; u1="$(load_updates)"; f1="$(load_failures)"; t1="$(date +%s%3N)"
+  c1="$(coord_ticks)"; l1="$(load_ticks)"; u1="$(load_updates)"; f1="$(load_failures)"; b1="$(coord_bytes)"; t1="$(date +%s%3N)"
   secs="$(awk -v a="$t0" -v b="$t1" 'BEGIN {printf "%.3f", (b - a) / 1000}')"
   coord_pct="$(awk -v t=$((c1 - c0)) -v h="$hz" -v s="$secs" 'BEGIN {printf "%.2f", 100 * t / h / s}')"
   load_pct="$(awk -v t=$((l1 - l0)) -v h="$hz" -v s="$secs" 'BEGIN {printf "%.2f", 100 * t / h / s}')"
   each_pct="$(awk -v p="$load_pct" -v n="$nodes" 'BEGIN {printf "%.4f", p / n}')"
+  per_hour="$(awk -v b=$((b1 - b0)) -v n="$nodes" -v s="$secs" 'BEGIN {printf "%.0f", b / n * 3600 / s}')"
+  echo "scale_bytes ${label} nodes ${nodes} seconds ${secs} coord_eth0_bytes $((b1 - b0)) bytes_per_node_per_hour ${per_hour}" >&2
   echo "scale_cpu ${label} nodes ${nodes} seconds ${secs} hz ${hz} coord_ticks $((c1 - c0)) coord_cpu_pct ${coord_pct} clients_ticks $((l1 - l0)) clients_cpu_pct_total ${load_pct} client_cpu_pct_each ${each_pct} policy_updates $((u1 - u0)) wait_failures $((f1 - f0)) load_udp_sockets $(load_sockets)" >&2
   if [[ "$changes" -ne 0 ]]; then
     [[ $((u1 - u0)) -ge $((nodes * (SECONDS_EACH / 10))) ]] \

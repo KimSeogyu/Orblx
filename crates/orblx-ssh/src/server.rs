@@ -8,16 +8,16 @@
 //! A client can ask for a PTY and a shell. The server records the input and
 //! the output of that shell in time order when the rule requires it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,9 +32,13 @@ use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use tokio::net::TcpListener;
 
 use crate::auth::{command_ok, open_login, overlay_listen_addr, RefusedLogin};
+use crate::cert::{check_cert, fresh_netmap, CertInput, CertRefuse};
 use crate::hostkey::host_key_from_seed;
 use crate::pty::{kill_group, PtyShell, PtySpec};
 use crate::record::{Recorder, Utf8Carry};
+
+/// The open certificate sessions: serial to (key ID, stop flag) (W25-31).
+type CertSessions = HashMap<u64, Vec<(String, Weak<AtomicBool>)>>;
 
 struct Shared {
     overlay: Ipv4Addr,
@@ -45,6 +49,18 @@ struct Shared {
     audit: Mutex<AuditLog>,
     spent: Mutex<BTreeSet<[u8; 16]>>,
     frames: AtomicU32,
+    /// The open certificate sessions by serial (W25-31). A revoked serial stops each session.
+    cert_sessions: Mutex<CertSessions>,
+}
+
+/// The certificate facts of one open session (W25-31).
+#[derive(Clone)]
+struct CertSession {
+    client_node: SpiffeId,
+    /// The watcher sets the flag when the netmap revokes the serial or the key ID.
+    stop: Arc<AtomicBool>,
+    /// The certificate has `permit-pty`.
+    pty: bool,
 }
 
 #[derive(Clone)]
@@ -55,6 +71,8 @@ struct Admitted {
     ticket_hash: [u8; 16],
     frame: u32,
     recording: bool,
+    /// Set for a certificate login (W25-31).
+    cert: Option<CertSession>,
 }
 
 #[derive(Clone)]
@@ -62,6 +80,8 @@ struct SshHandler {
     shared: Arc<Shared>,
     /// The public host key of this connection: the node SVID key when the connection opened.
     host_key: [u8; 32],
+    /// The TCP peer address. The certificate `source-address` must contain it.
+    peer: Option<SocketAddr>,
     admitted: Option<Admitted>,
     pty: Option<PtySpec>,
     shell: Option<Arc<LiveShell>>,
@@ -215,6 +235,16 @@ impl Handler for SshHandler {
         Ok(self.decide(user, password))
     }
 
+    /// W25-31: russh calls this method after it checked the validity window, the CA
+    /// signature, and the userauth signature with the certificate key.
+    async fn auth_openssh_certificate(
+        &mut self,
+        user: &str,
+        certificate: &russh::keys::ssh_key::Certificate,
+    ) -> Result<Auth, Self::Error> {
+        Ok(self.decide_cert(user, certificate))
+    }
+
     async fn channel_open_session(
         &mut self,
         _channel: Channel<Msg>,
@@ -240,6 +270,16 @@ impl Handler for SshHandler {
         if self.admitted.is_none() || self.shell.is_some() {
             let _ = session.channel_failure(channel);
             return Ok(());
+        }
+        // A certificate without `permit-pty` gets no PTY.
+        if let Some(Admitted {
+            cert: Some(cert), ..
+        }) = &self.admitted
+        {
+            if !cert.pty {
+                let _ = session.channel_failure(channel);
+                return Ok(());
+            }
         }
         self.pty = Some(PtySpec::from_request(term, col_width, row_height));
         let _ = session.channel_success(channel);
@@ -332,6 +372,85 @@ impl Handler for SshHandler {
 }
 
 impl SshHandler {
+    /// Check one user certificate (W25-31). The netmap gives the CA set and the revoked list.
+    fn decide_cert(&mut self, user: &str, cert: &russh::keys::ssh_key::Certificate) -> Auth {
+        let ticket_hash = cert_hash(cert.key_id());
+        let refuse = |handler: &Self, peer: SpiffeId, refused: CertRefuse| {
+            println!(
+                "ssh certificate refused serial {} reason {}",
+                cert.serial(),
+                refused.as_str()
+            );
+            handler.audit_refuse(&RefusedLogin {
+                peer,
+                reason: refused.audit_reason(),
+                ticket_hash,
+            });
+            Auth::reject()
+        };
+        let node_id = self.shared.node_id.clone();
+        let Some(peer) = self.peer else {
+            return refuse(self, node_id, CertRefuse::SourceAddress);
+        };
+        let now_unix = unix_now();
+        let netmap = match fresh_netmap(&self.shared.state_dir, unix_now_ms()) {
+            Ok(netmap) => netmap,
+            Err(refused) => return refuse(self, node_id, refused),
+        };
+        let policy = load_policy(&self.shared.state_dir.join("policy.hujson"));
+        let deny = load_deny(&self.shared.state_dir.join("deny.json"));
+        if deny.reject_uri(&self.shared.node_id).is_err() {
+            return refuse(self, node_id, CertRefuse::Revoked);
+        }
+        let checked = check_cert(&CertInput {
+            cert,
+            login: user,
+            peer_ip: peer.ip(),
+            now_unix,
+            ca_set: &netmap.ssh_user_ca,
+            revoked: &netmap.ssh_revoked,
+            policy: &policy,
+            node_id: &self.shared.node_id,
+            deny: &deny,
+        });
+        let admit = match checked {
+            Ok(admit) => admit,
+            Err(refused) => return refuse(self, node_id, refused),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let mut sessions = self
+                .shared
+                .cert_sessions
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            sessions
+                .entry(admit.serial)
+                .or_default()
+                .push((admit.key_id.clone(), Arc::downgrade(&stop)));
+        }
+        let frame = self.shared.frames.fetch_add(1, Ordering::Relaxed);
+        let recording = policy.ssh_recording_required(&admit.src, &self.shared.node_id, user);
+        println!(
+            "ssh certificate accepted serial {} principal {}",
+            admit.serial, admit.principal
+        );
+        self.admitted = Some(Admitted {
+            src: admit.src,
+            user: user.to_string(),
+            check_period: admit.check_period,
+            ticket_hash,
+            frame,
+            recording,
+            cert: Some(CertSession {
+                client_node: admit.client_node,
+                stop,
+                pty: admit.pty,
+            }),
+        });
+        Auth::Accept
+    }
+
     fn decide(&mut self, user: &str, password: &str) -> Auth {
         let policy = load_policy(&self.shared.state_dir.join("policy.hujson"));
         let deny = load_deny(&self.shared.state_dir.join("deny.json"));
@@ -383,6 +502,7 @@ impl SshHandler {
                     ticket_hash: admitted.ticket_hash,
                     frame,
                     recording,
+                    cert: None,
                 });
                 Auth::Accept
             }
@@ -752,6 +872,11 @@ impl DenyWatch {
 
     /// Return true when a new deny file text denies the session.
     fn denied(&mut self, shared: &Shared, admitted: &Admitted) -> bool {
+        if let Some(cert) = &admitted.cert {
+            if cert.stop.load(Ordering::Relaxed) {
+                return true;
+            }
+        }
         let now = Instant::now();
         if now < self.next {
             return false;
@@ -768,7 +893,11 @@ impl DenyWatch {
         self.last = Some(bytes);
         parsed
             && (deny.reject_uri(&admitted.src).is_err()
-                || deny.reject_uri(&shared.node_id).is_err())
+                || deny.reject_uri(&shared.node_id).is_err()
+                || admitted
+                    .cert
+                    .as_ref()
+                    .is_some_and(|cert| deny.reject_uri(&cert.client_node).is_err()))
     }
 }
 
@@ -788,6 +917,15 @@ fn recheck(shared: &Shared, admitted: &Admitted) -> Result<(), RefusedLogin> {
             reason: orblx_audit::DenyReason::Revoked,
             ticket_hash: admitted.ticket_hash,
         });
+    }
+    if let Some(cert) = &admitted.cert {
+        if cert.stop.load(Ordering::Relaxed) || deny.reject_uri(&cert.client_node).is_err() {
+            return Err(RefusedLogin {
+                peer: admitted.src.clone(),
+                reason: orblx_audit::DenyReason::Revoked,
+                ticket_hash: admitted.ticket_hash,
+            });
+        }
     }
     if policy
         .ssh_check_period(&admitted.src, &shared.node_id, &admitted.user)
@@ -952,14 +1090,17 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) -> Result<(), S
     println!("ssh_listen {local}");
     let mut methods = MethodSet::empty();
     methods.push(MethodKind::Password);
+    // W25-31: user certificates from the coordinator SSH user CA. A plain key gets deny.
+    methods.push(MethodKind::PublicKey);
+    spawn_revoke_watch(&shared);
     current_host_key(&shared)?;
     loop {
-        let (socket, _) = listener
+        let (socket, peer) = listener
             .accept()
             .await
             .map_err(|_| "The SSH server did not accept a session.".to_string())?;
-        // W25-40: the SVID renewal writes a new node key. Each connection reads the current
-        // key, so the host key matches the current cert.pem that the client pins.
+        // The SVID renewal writes a new node key. Each connection reads the current key, so
+        // the host key matches the current cert.pem that the client pins.
         let (private, host_key) = match current_host_key(&shared) {
             Ok(pair) => pair,
             Err(err) => {
@@ -978,6 +1119,7 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) -> Result<(), S
         let handler = SshHandler {
             shared: Arc::clone(&shared),
             host_key,
+            peer: Some(peer),
             admitted: None,
             pty: None,
             shell: None,
@@ -988,7 +1130,77 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) -> Result<(), S
     }
 }
 
-/// The SSH host key from the current node SVID key file (W25-40).
+/// The time between two reads of `netmap.json` for revoked certificates (W25-31).
+const REVOKE_WATCH: Duration = Duration::from_millis(100);
+
+/// Stop each open session of a revoked certificate (W25-31).
+///
+/// The thread reads `netmap.json` each [`REVOKE_WATCH`], and parses it only when the text
+/// changes. It sets the stop flag of each session whose serial or key ID is in `ssh_revoked`.
+/// The session loops then stop the command or the shell at once.
+fn spawn_revoke_watch(shared: &Arc<Shared>) {
+    let weak = Arc::downgrade(shared);
+    let _ = thread::Builder::new()
+        .name("orblx-ssh-revoke".to_string())
+        .spawn(move || {
+            let mut last: Option<Vec<u8>> = None;
+            loop {
+                thread::sleep(REVOKE_WATCH);
+                let Some(shared) = weak.upgrade() else {
+                    return;
+                };
+                let Ok(bytes) = fs::read(shared.state_dir.join("netmap.json")) else {
+                    continue;
+                };
+                if last.as_deref() == Some(bytes.as_slice()) {
+                    continue;
+                }
+                if let Ok(netmap) = orblx_datapath::Netmap::from_slice(&bytes) {
+                    stop_revoked(&shared, &netmap.ssh_revoked);
+                }
+                last = Some(bytes);
+            }
+        });
+}
+
+/// Set the stop flag of each open session with a revoked serial or key ID.
+/// Return the number of stopped sessions.
+fn stop_revoked(shared: &Shared, revoked: &[orblx_datapath::SshRevoked]) -> usize {
+    let serials: BTreeSet<u64> = revoked.iter().map(|item| item.serial).collect();
+    let key_ids: BTreeSet<&str> = revoked.iter().map(|item| item.key_id.as_str()).collect();
+    let mut stopped = 0;
+    let mut sessions = shared
+        .cert_sessions
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    for (serial, list) in sessions.iter_mut() {
+        list.retain(|(_, weak)| weak.strong_count() > 0);
+        for (key_id, weak) in list.iter() {
+            if !serials.contains(serial) && !key_ids.contains(key_id.as_str()) {
+                continue;
+            }
+            if let Some(stop) = weak.upgrade() {
+                if !stop.swap(true, Ordering::Relaxed) {
+                    stopped += 1;
+                    println!("ssh certificate revoked serial {serial}. The session stops.");
+                }
+            }
+        }
+    }
+    sessions.retain(|_, list| !list.is_empty());
+    stopped
+}
+
+/// The audit fingerprint of one certificate: the first 16 bytes of SHA-256 of the key ID.
+fn cert_hash(key_id: &str) -> [u8; 16] {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(key_id.as_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
+}
+
+/// The SSH host key from the current node SVID key file.
 fn current_host_key(shared: &Shared) -> Result<(russh::keys::PrivateKey, [u8; 32]), String> {
     host_key_from_seed(&svid_seed(shared)?)
 }
@@ -1031,6 +1243,7 @@ impl Shared {
             audit: Mutex::new(AuditLog::new()),
             spent: Mutex::new(load_spent(&state_dir.join("ssh-spent.txt"))),
             frames: AtomicU32::new(1),
+            cert_sessions: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -1124,6 +1337,13 @@ fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
 
@@ -1240,6 +1460,7 @@ mod tests {
             identity_dir: alice_dir.clone(),
             peer_cert: dir.join("peer.pem"),
             command: "printf '%s\\n' \"$ORBLX_SSH_USER\"".to_string(),
+            cert_login: None,
         })
         .await
         .unwrap();
@@ -1259,6 +1480,7 @@ mod tests {
             identity_dir: alice_dir.clone(),
             peer_cert: dir.join("peer.pem"),
             command: "printf %s\\n node".to_string(),
+            cert_login: None,
         })
         .await;
         assert!(node_revoked.is_err());
@@ -1275,6 +1497,7 @@ mod tests {
             identity_dir: alice_dir.clone(),
             peer_cert: dir.join("peer.pem"),
             command: "printf '%s\\n' \"$ORBLX_SSH_USER\"".to_string(),
+            cert_login: None,
         })
         .await
         .unwrap();
@@ -1287,6 +1510,7 @@ mod tests {
             identity_dir: mallory_dir,
             peer_cert: dir.join("peer.pem"),
             command: "printf %s\\n denied".to_string(),
+            cert_login: None,
         })
         .await;
         assert!(denied.is_err());
@@ -1298,6 +1522,7 @@ mod tests {
             identity_dir: agent_dir.clone(),
             peer_cert: dir.join("peer.pem"),
             command: "printf '%s\\n' \"$ORBLX_SSH_USER\"".to_string(),
+            cert_login: None,
         })
         .await
         .unwrap();
@@ -1309,6 +1534,7 @@ mod tests {
             identity_dir: agent_dir,
             peer_cert: dir.join("peer.pem"),
             command: "printf %s\\n replay".to_string(),
+            cert_login: None,
         })
         .await;
         assert!(replay.is_err());
@@ -1334,6 +1560,7 @@ mod tests {
             identity_dir: alice_dir.clone(),
             peer_cert: dir.join("peer.pem"),
             command: "sleep 5; printf %s\\n late".to_string(),
+            cert_login: None,
         })
         .await;
         let ended = std::time::Instant::now();
@@ -1357,6 +1584,7 @@ mod tests {
             identity_dir: dir.join("alice"),
             peer_cert: dir.join("peer.pem"),
             command: "printf %s\\n revoked".to_string(),
+            cert_login: None,
         })
         .await;
         assert!(revoked.is_err());
@@ -1371,8 +1599,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_renewed_node_key_is_the_host_key_of_the_next_session() {
-        // W25-40: the SVID renewal writes a new node key. The client pins the key of the
-        // current cert.pem. The server must present that key on the next connection.
+        // W25-31 proof run 8: the SVID renewal writes a new node key. The client pins the key
+        // of the current cert.pem. The server must present that key on the next connection.
         let dir = std::env::temp_dir().join(format!("orblx-ssh-renew-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1401,7 +1629,7 @@ mod tests {
         std::fs::write(alice_dir.join("bundle.pem"), ca.certificate_pem()).unwrap();
         std::fs::write(alice_dir.join("cert.pem"), &issued_alice.certificate_pem).unwrap();
         std::fs::write(alice_dir.join("key.pem"), &issued_alice.private_key_pem).unwrap();
-        std::fs::write(dir.join("peer-0.pem"), &first.certificate_pem).unwrap();
+        std::fs::write(dir.join("old-peer.pem"), &first.certificate_pem).unwrap();
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1415,26 +1643,25 @@ mod tests {
             identity_dir: alice_dir.clone(),
             peer_cert: dir.join(peer),
             command: "printf '%s\\n' \"$ORBLX_SSH_USER\"".to_string(),
+            cert_login: None,
         };
-        let before = session_within(login("peer-0.pem")).await.unwrap();
+        let before = session_within(login("old-peer.pem")).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&before.stdout).trim(), "alice");
 
-        // Two renewals: each writes a new leaf with a new key, as EnrollResult::write_state does.
-        for round in 1..=2 {
-            let renewed = ca
-                .issue(&node, now, MAX_USER_TTL, &DenySet::empty())
-                .unwrap();
-            std::fs::write(dir.join("cert.pem"), &renewed.certificate_pem).unwrap();
-            std::fs::write(dir.join("key.pem"), &renewed.private_key_pem).unwrap();
-            let peer = format!("peer-{round}.pem");
-            std::fs::write(dir.join(&peer), &renewed.certificate_pem).unwrap();
-            let after = session_within(login(&peer)).await.unwrap();
-            assert_eq!(after.exit_status, 0);
-            assert_eq!(String::from_utf8_lossy(&after.stdout).trim(), "alice");
-            // The key before this renewal is no longer the host key.
-            let old = format!("peer-{}.pem", round - 1);
-            assert!(session_within(login(&old)).await.is_err());
-        }
+        // The renewal: a new leaf with a new key, as in EnrollResult::write_state.
+        let renewed = ca
+            .issue(&node, now, MAX_USER_TTL, &DenySet::empty())
+            .unwrap();
+        assert_ne!(renewed.private_key_pem, first.private_key_pem);
+        std::fs::write(dir.join("cert.pem"), &renewed.certificate_pem).unwrap();
+        std::fs::write(dir.join("key.pem"), &renewed.private_key_pem).unwrap();
+        std::fs::write(dir.join("new-peer.pem"), &renewed.certificate_pem).unwrap();
+
+        let after = session_within(login("new-peer.pem")).await.unwrap();
+        assert_eq!(after.exit_status, 0);
+        assert_eq!(String::from_utf8_lossy(&after.stdout).trim(), "alice");
+        // The old key is no longer the host key.
+        assert!(session_within(login("old-peer.pem")).await.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1456,6 +1683,7 @@ mod tests {
             identity_dir: alice_dir.clone(),
             peer_cert: dir.join("peer.pem"),
             command: "printf '%s\\n' \"recorded-$ORBLX_SSH_USER\"".to_string(),
+            cert_login: None,
         };
 
         let recorded = session_within(request("rec")).await.unwrap();
@@ -1616,6 +1844,7 @@ mod tests {
             identity_dir: alice_dir.clone(),
             peer_cert: dir.join("peer.pem"),
             command: String::new(),
+            cert_login: None,
         };
         // `$((...))` makes the output differ from the echo of the input.
         let steps: [(&str, &[u8]); 4] = [
@@ -1741,6 +1970,105 @@ mod tests {
         }
         assert!(stopped, "the shell did not stop");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_certificate_login_needs_the_netmap_ca_and_the_key_and_a_revoke_ends_the_session() {
+        use crate::cert::testkit;
+        let dir = recording_fixture("cert");
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ca = testkit::key(11);
+        testkit::write_netmap(&dir, &[testkit::ca_line(&ca)], &[], now);
+        let addr = start_server(&dir).await;
+        let key = testkit::key(12);
+        let spec = testkit::Spec::user("oidc:alice", "laptop", 501, now);
+        let cert = testkit::sign(&ca, &key, &spec);
+        let request = |login: crate::client::CertLogin| SessionRequest {
+            user: "alice".to_string(),
+            addr,
+            dst: SpiffeId::node("box").unwrap(),
+            identity_dir: dir.join("alice"),
+            peer_cert: dir.join("peer.pem"),
+            command: "printf '%s\\n' \"$ORBLX_SSH_USER\"".to_string(),
+            cert_login: Some(login),
+        };
+        let login = |key: &russh::keys::PrivateKey, cert: &russh::keys::Certificate| {
+            crate::client::CertLogin {
+                key: key.clone(),
+                cert: cert.clone(),
+            }
+        };
+
+        let ok = session_within(request(login(&key, &cert))).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&ok.stdout), "alice\n");
+        assert_eq!(ok.exit_status, 0);
+        // A wrong private key for the certificate gives deny.
+        assert!(session_within(request(login(&testkit::key(13), &cert)))
+            .await
+            .is_err());
+        // A certificate from a CA that is not in the netmap gives deny.
+        let foreign = testkit::sign(&testkit::key(14), &key, &spec);
+        assert!(session_within(request(login(&key, &foreign)))
+            .await
+            .is_err());
+        // A CA that rotated out of the netmap gives deny at once.
+        testkit::write_netmap(&dir, &[testkit::ca_line(&testkit::key(15))], &[], now);
+        assert!(session_within(request(login(&key, &cert))).await.is_err());
+        testkit::write_netmap(&dir, &[testkit::ca_line(&ca)], &[], now);
+        assert!(session_within(request(login(&key, &cert))).await.is_ok());
+
+        // A revoked serial in the netmap ends the open shell session.
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&output);
+        let task = tokio::spawn(crate::client::run_shell(
+            request(login(&key, &cert)),
+            crate::client::ShellTerminal {
+                term: "xterm".to_string(),
+                cols: 80,
+                rows: 24,
+            },
+            receiver,
+            move |bytes: &[u8]| sink.lock().unwrap().extend_from_slice(bytes),
+        ));
+        sender
+            .send(b"echo ready-$((40+2))\n".to_vec())
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !String::from_utf8_lossy(&output.lock().unwrap()).contains("ready-42") {
+            assert!(Instant::now() < deadline, "the shell did not start");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let revoked = orblx_datapath::SshRevoked {
+            serial: spec.serial,
+            key_id: spec.key_id.clone(),
+        };
+        let start = Instant::now();
+        testkit::write_netmap(&dir, &[testkit::ca_line(&ca)], &[revoked], now);
+        let ended = tokio::time::timeout(Duration::from_secs(60), task).await;
+        let elapsed = start.elapsed();
+        println!("revoke to session end ms {}", elapsed.as_millis());
+        assert!(ended.is_ok(), "the session did not end in 60 s");
+        assert!(elapsed < Duration::from_secs(60));
+        drop(sender);
+        // A new login with the revoked certificate gives deny.
+        assert!(session_within(request(login(&key, &cert))).await.is_err());
+        // A stale netmap refuses a new certificate login.
+        let fresh = testkit::Spec::user("oidc:alice", "laptop", 502, now);
+        let fresh_cert = testkit::sign(&ca, &key, &fresh);
+        let ca_lines = [testkit::ca_line(&ca)];
+        testkit::write_netmap_at(&dir, &ca_lines, &[], (now - 120) * 1000);
+        assert!(session_within(request(login(&key, &fresh_cert)))
+            .await
+            .is_err());
+        let chain = std::fs::read_to_string(dir.join("ssh-audit.jsonl")).unwrap();
+        assert!(chain.contains("\"reason\":\"revoked\""), "{chain}");
+        assert!(verify_file(&dir.join("ssh-audit.jsonl")).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     async fn session_within(

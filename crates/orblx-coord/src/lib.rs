@@ -28,11 +28,17 @@ pub mod nodelock;
 mod proto;
 #[cfg(test)]
 mod renew_test;
+mod seq;
+#[cfg(test)]
+mod seq_test;
 mod server;
 mod share;
 #[cfg(test)]
 mod share_test;
 mod sink;
+pub mod sshca;
+#[cfg(test)]
+mod sshca_test;
 mod state;
 mod store;
 mod ticket;
@@ -54,21 +60,27 @@ pub use client::{
     advertise_routes_blocking, agent_grant_fetch_blocking, agent_grant_request_blocking,
     enroll_with_oidc_blocking, enroll_with_token_blocking, fetch_deny_blocking,
     fetch_deny_wait_blocking, fetch_netmap_blocking, fetch_policy_wait_blocking, netmap_json,
-    publish_candidates_blocking, renew_svid_blocking, AdminReply, GrantFetch, OidcEnroll,
-    PolicySync, PolicyWaiter, DENY_WAIT_HOLD,
+    publish_candidates_blocking, renew_svid_blocking, ssh_cert_request_blocking, AdminReply,
+    GrantFetch, OidcEnroll, PolicySync, PolicyWaiter, DENY_WAIT_HOLD, POLICY_WAIT_GAP,
 };
 pub use config::{CoordConfig, OidcSection};
 pub use error::{CoordError, USER_PENDING_TEXT, USER_REJECTED_TEXT};
 pub use http_util::{fetch_google_jwks_blocking, post_google_token_blocking};
 pub use netmap::{
-    decode_hex_32, encode_hex, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap,
-    NetmapKey, SignedEndpoint, SignedGrants, SignedNetmap,
+    decode_hex_32, encode_hex, grants_from_slice, netmap_from_slice, read_verified_netmap,
+    verify_grants_wire, verify_netmap_wire, verify_signed_endpoint, verify_signed_grants,
+    verify_signed_netmap, NetmapKey, SignedEndpoint, SignedGrants, SignedGrantsWire, SignedNetmap,
+    SignedNetmapWire,
 };
-pub use proto::GrantAsk;
+pub use proto::{GrantAsk, SshCertAsk, NODE_PROTO, VERSION_MISMATCH};
+pub use seq::{
+    read_node_seq, reset_node_seq, unix_ms, Intake, COORD_SEQ_FILE, HEARTBEAT_MS, NODE_SEQ_FILE,
+};
 pub use server::serve_blocking;
 pub use state::{
     oidc_config, read_node_material, Coordinator, EnrollResult, IssuerFetch, NetmapView,
-    OidcConfig, CONFIG_AUDIT_FILE, ISSUER_JWKS_TTL_SECS, ISSUER_REFETCH_SECS,
+    OidcConfig, SshIssueError, ViewWrite, CONFIG_AUDIT_FILE, ISSUER_JWKS_TTL_SECS,
+    ISSUER_REFETCH_SECS,
 };
 pub use store::{CreatedToken, StoredUser, UserState};
 
@@ -275,7 +287,7 @@ mod tests {
         assert_eq!(view.signed_netmap.netmap.peers[0].overlay_ip, "100.64.0.2");
         let node_text = fs::read_to_string(node_a.0.join("netmap.json")).unwrap();
         let parsed = orblx_datapath::Netmap::from_slice(node_text.as_bytes()).unwrap();
-        assert_eq!(parsed, view.signed_netmap.netmap);
+        assert_eq!(parsed, view.signed_netmap.netmap.without_stamp());
         assert!(!node_text.contains("\"sig\""));
         let reused = super::client::enroll_with_token(
             addr,
@@ -451,6 +463,69 @@ mod tests {
         handle.abort();
     }
 
+    /// W25-34 (Crypto re-review): through the real server, a held `policy-wait` with no
+    /// change replies with a new signed stamp within the heartbeat time (20 s or less).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn policy_wait_sends_a_signed_heartbeat_within_20_s() {
+        let scratch = Scratch::new();
+        let node = Scratch::new();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let (addr, handle) =
+            super::server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .unwrap();
+        let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+        let token = coord.create_token(Duration::from_secs(600)).unwrap();
+        super::client::enroll_with_token(
+            addr,
+            "coord",
+            &bundle,
+            "beat-a",
+            &token.secret,
+            &["beat-a:443".to_string()],
+            &[],
+        )
+        .await
+        .unwrap()
+        .write_state(&node.0)
+        .unwrap();
+        let wait = |etag: Option<String>| {
+            let (dir, bundle) = (node.0.clone(), bundle.clone());
+            tokio::task::spawn_blocking(move || {
+                super::client::fetch_policy_wait_blocking(
+                    addr,
+                    "coord",
+                    &bundle,
+                    &dir,
+                    etag.as_deref(),
+                )
+            })
+        };
+        let first = wait(None).await.unwrap().unwrap();
+        let first_seq = first.view.signed_netmap.netmap.seq;
+        let first_at = first.view.signed_netmap.netmap.issued_at_ms;
+        let held_at = std::time::Instant::now();
+        let beat = wait(Some(first.etag.clone())).await.unwrap().unwrap();
+        let held = held_at.elapsed();
+        assert!(
+            held <= Duration::from_millis(super::HEARTBEAT_MS + 2_000),
+            "the heartbeat came after {held:?}"
+        );
+        assert!(
+            held <= Duration::from_secs(20),
+            "the heartbeat came after {held:?}"
+        );
+        let netmap = &beat.view.signed_netmap.netmap;
+        assert!(netmap.seq > first_seq);
+        assert!(netmap.issued_at_ms >= first_at + super::HEARTBEAT_MS);
+        assert!(orblx_datapath::netmap_fresh(
+            netmap.issued_at_ms,
+            super::unix_ms(SystemTime::now())
+        ));
+        assert_ne!(beat.etag, first.etag);
+        handle.abort();
+    }
+
     /// W25-16: a `PolicyWaiter` sends each wait on the same QUIC connection. The coordinator
     /// still holds a known ETag and replies when the netmap or the deny list changes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -549,18 +624,108 @@ mod tests {
             revoked = wait(Some(etag)).await.unwrap().0;
         }
         assert!(revoked_at.elapsed() < Duration::from_secs(1));
-        // W25-16: with no change, the hold ends with a reply without the view. The waiter
-        // gives the view that it has, on the same connection.
+        // W25-16 and W25-34: with no change, the hold ends at the signed heartbeat
+        // (HEARTBEAT_MS is shorter than DENY_WAIT_HOLD). The heartbeat is a new signed view,
+        // so the reply is the full reply with a new signature, on the same connection.
         let revoked = revoked.unwrap();
         let idle_at = std::time::Instant::now();
         let (idle, idle_id) = wait(Some(revoked.etag.clone())).await.unwrap();
         let idle = idle.unwrap();
-        assert!(idle_at.elapsed() >= super::DENY_WAIT_HOLD - Duration::from_secs(1));
+        assert!(idle_at.elapsed() <= Duration::from_millis(super::HEARTBEAT_MS + 1_000));
         assert_eq!(idle_id, Some(id), "the waiter opened a new connection");
-        assert_eq!(idle.etag, revoked.etag);
+        assert_ne!(idle.etag, revoked.etag);
         assert_eq!(idle.deny, revoked.deny);
-        assert_eq!(idle.view.signed_netmap.sig, revoked.view.signed_netmap.sig);
+        assert_ne!(idle.view.signed_netmap.sig, revoked.view.signed_netmap.sig);
+        assert!(idle.view.signed_netmap.netmap.seq > revoked.view.signed_netmap.netmap.seq);
         // The waiter owns a runtime, so it drops outside of the async context.
+        tokio::task::spawn_blocking(move || drop(waiter))
+            .await
+            .unwrap();
+        handle.abort();
+    }
+
+    /// W25-34 with W25-16 (Eng Lead rule): an idle node with no input change gets a new
+    /// signed view at each heartbeat. The reply is the full reply, never the short reply.
+    /// When the coordinator signs each new stamp, the stamp that the node had is at most
+    /// HEARTBEAT_MS plus one poll old. When the checked reply is on the node, the stamp is at
+    /// most HEARTBEAT_MS plus one node poll interval ([`super::POLICY_WAIT_GAP`]) old.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_waiter_gets_a_fresh_signed_view_at_each_heartbeat() {
+        /// One poll: the coordinator change check is 100 ms.
+        const POLL_MS: u64 = 100;
+        // The node poll interval of the policy loop in `orblx up` (PO ruling (ii)).
+        let node_poll_ms = u64::try_from(super::POLICY_WAIT_GAP.as_millis()).unwrap();
+        let scratch = Scratch::new();
+        let node = Scratch::new();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let (addr, handle) =
+            super::server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .unwrap();
+        let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+        let token = coord.create_token(Duration::from_secs(600)).unwrap();
+        super::client::enroll_with_token(
+            addr,
+            "coord",
+            &bundle,
+            "idle-a",
+            &token.secret,
+            &["idle-a:443".to_string()],
+            &[],
+        )
+        .await
+        .unwrap()
+        .write_state(&node.0)
+        .unwrap();
+        let waiter = std::sync::Arc::new(std::sync::Mutex::new(
+            super::PolicyWaiter::new(addr, "coord").unwrap(),
+        ));
+        let wait = |etag: Option<String>| {
+            let (dir, bundle, waiter) = (node.0.clone(), bundle.clone(), waiter.clone());
+            tokio::task::spawn_blocking(move || {
+                let mut waiter = waiter.lock().unwrap();
+                let sync = waiter.wait(&bundle, &dir, etag.as_deref());
+                (sync, waiter.connection_id())
+            })
+        };
+        let (first, id) = wait(None).await.unwrap();
+        let mut last = first.unwrap();
+        let id = id.expect("the waiter has no connection");
+        for beat in 1..=3 {
+            let (next, next_id) = wait(Some(last.etag.clone())).await.unwrap();
+            let next = next.unwrap();
+            let now_ms = super::unix_ms(SystemTime::now());
+            let old = &last.view.signed_netmap.netmap;
+            let netmap = &next.view.signed_netmap.netmap;
+            // The age of the old stamp when the coordinator signed the new stamp.
+            let gap_ms = netmap.issued_at_ms.saturating_sub(old.issued_at_ms);
+            // The age of the old stamp when the checked reply is on the node. It also has the
+            // reply transfer and the signature checks of a debug build.
+            let age_ms = now_ms.saturating_sub(old.issued_at_ms);
+            println!(
+                "idle heartbeat {beat}: old stamp age {gap_ms} ms at the new stamp, \
+                 {age_ms} ms at the checked reply"
+            );
+            assert!(
+                gap_ms <= super::HEARTBEAT_MS + POLL_MS,
+                "heartbeat {beat}: the old stamp was {gap_ms} ms old at the new stamp"
+            );
+            assert!(
+                age_ms <= super::HEARTBEAT_MS + node_poll_ms,
+                "heartbeat {beat}: the old stamp was {age_ms} ms old at the checked reply"
+            );
+            assert_eq!(next_id, Some(id), "the waiter opened a new connection");
+            assert!(netmap.seq > old.seq, "heartbeat {beat}: no new seq");
+            assert!(netmap.issued_at_ms > old.issued_at_ms);
+            assert_ne!(
+                next.view.signed_netmap.sig, last.view.signed_netmap.sig,
+                "heartbeat {beat}: the reply had the old view"
+            );
+            assert_ne!(next.etag, last.etag);
+            // Only the stamp changed.
+            assert_eq!(netmap.peers, old.peers);
+            last = next;
+        }
         tokio::task::spawn_blocking(move || drop(waiter))
             .await
             .unwrap();

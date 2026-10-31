@@ -1,5 +1,5 @@
 # Short SVID renewal proof.
-# The proof script sets SVID_* paths and ORBLX_SVID_TTL.
+# The proof script sets the SVID_* paths and SVID_TTL (ORBLX_SVID_TTL, 60 s).
 
 name: orblx-svid
 
@@ -17,7 +17,7 @@ services:
       - coord
     environment:
       ORBLX_OIDC_MODE: google
-      ORBLX_SVID_TTL: "120"
+      ORBLX_SVID_TTL: "${SVID_TTL:?set SVID_TTL}"
     volumes:
       - ${SVID_COORD_STATE}:/var/lib/orblx
     networks:

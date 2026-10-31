@@ -16,8 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_coord::{
-    advertise_routes_blocking, decode_hex_32, encode_hex, renew_svid_blocking,
-    verify_signed_grants, NetmapKey, SignedGrants,
+    advertise_routes_blocking, decode_hex_32, encode_hex, renew_svid_blocking, verify_grants_wire,
+    NetmapKey, SignedGrantsWire,
 };
 use orblx_crypto::{mac_input, ticket_mac};
 use orblx_datapath::{
@@ -392,9 +392,12 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
 }
 
 fn run_up(mut options: UpOptions) -> Result<(), String> {
+    // SAFETY: `geteuid` has no arguments and no failure case.
+    let euid = unsafe { libc::geteuid() };
+    check_private_paths(&options.state_dir, &options.netmap, euid)?;
     apply_saved_exit(&mut options)?;
     let (netmap_path, forward_routes, forward_exit) = publish_routes(&options)?;
-    let netmap = locked_netmap(&options.state_dir, &netmap_path)?;
+    let (netmap, netmap_text) = locked_netmap(&options.state_dir, &netmap_path)?;
     let config = load_config(&options.state_dir)?;
     let overlay: Ipv4Addr = netmap
         .self_node
@@ -426,6 +429,7 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
         underlay,
         relay: options.relay,
         netmap_path,
+        netmap_text: Some(netmap_text),
         visibility,
         on_ready: Some(Box::new(move |overlay| {
             if let Err(err) = orblx_ssh::spawn_overlay_server(&ssh_state, overlay) {
@@ -440,24 +444,83 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
     .map_err(|err| err.to_string())
 }
 
+/// Refuse a state directory or a netmap path that another user can change (W25-34).
+///
+/// The node refuses to start when the state directory, the netmap file, or the directory
+/// of the netmap file is group-writable or world-writable, or has an owner that is not
+/// `euid`. A directory with the sticky bit (for example `/tmp`) can hold the netmap file.
+/// A path that does not exist yet is not checked.
+pub(crate) fn check_private_paths(
+    state_dir: &Path,
+    netmap: &Path,
+    euid: u32,
+) -> Result<(), String> {
+    check_private_path(state_dir, euid, false)?;
+    check_private_path(netmap, euid, false)?;
+    if let Some(parent) = netmap
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        if parent != state_dir {
+            check_private_path(parent, euid, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_private_path(path: &Path, euid: u32, sticky_ok: bool) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("The path {} did not open. {err}", path.display())),
+    };
+    if meta.uid() != euid {
+        return Err(format!(
+            "The node refused to start. The owner of {} is not the node user. \
+             Keep --state-dir private (0700).",
+            path.display()
+        ));
+    }
+    let sticky = sticky_ok && meta.is_dir() && meta.mode() & 0o1000 != 0;
+    if meta.mode() & 0o022 != 0 && !sticky {
+        return Err(format!(
+            "The node refused to start. Another user can write {}. \
+             Keep --state-dir private (0700).",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Read the netmap and apply node lock (W23-1).
 ///
 /// With a node lock file, the function writes the netmap file again without the peers
 /// that no trusted owner key signed. The accept path reads that file.
-fn locked_netmap(state_dir: &Path, netmap_path: &Path) -> Result<Netmap, String> {
-    let mut netmap = Netmap::from_path(netmap_path).map_err(|err| err.to_string())?;
+///
+/// The result has the netmap and the file text that gave it (W25-34). The policy sync starts
+/// after this read, so the text is the text that the netmap watcher starts from.
+fn locked_netmap(state_dir: &Path, netmap_path: &Path) -> Result<(Netmap, Vec<u8>), String> {
+    let mut text = fs::read(netmap_path).map_err(|err| {
+        format!(
+            "The netmap file {} was not read. {err}",
+            netmap_path.display()
+        )
+    })?;
+    let mut netmap = Netmap::from_slice(&text).map_err(|err| err.to_string())?;
     let report = orblx_coord::nodelock::apply_node_lock(state_dir, &mut netmap)
         .map_err(|err| format!("Node lock refused the netmap. {err}"))?;
     if let Some(report) = report {
         orblx_coord::nodelock::print_report(&report);
         if !report.dropped.is_empty() {
-            let text = serde_json::to_string(&netmap)
-                .map_err(|_| "The netmap is not valid.".to_string())?;
-            fs::write(netmap_path, text.as_bytes())
+            // W25-34: an atomic write, so a crash never leaves a part of the file.
+            orblx_coord::nodelock::write_locked_netmap(netmap_path, &netmap)
                 .map_err(|err| format!("The netmap file was not written. {err}"))?;
+            text = fs::read(netmap_path)
+                .map_err(|err| format!("The netmap file was not read. {err}"))?;
         }
     }
-    Ok(netmap)
+    Ok((netmap, text))
 }
 
 fn push_ipv4(extra: &mut Vec<Ipv4Addr>, addr: Option<SocketAddr>) {
@@ -723,6 +786,8 @@ fn spawn_deny_refresh(options: &UpOptions) {
         let mut wait_after = Instant::now();
         let mut policy_etag: Option<String> = None;
         let mut policy_after = Instant::now();
+        let mut netmap_ok = false;
+        let mut mismatch = MismatchNote::default();
         // W25-16: one waiter keeps one QUIC connection for all policy waits.
         let mut waiter = orblx_coord::PolicyWaiter::new(coord, &name).ok();
         loop {
@@ -744,14 +809,25 @@ fn spawn_deny_refresh(options: &UpOptions) {
                 };
                 match synced {
                     Ok(sync) => {
+                        mismatch.clear(&state);
                         if policy_etag.as_deref() != Some(sync.etag.as_str()) {
-                            apply_policy_sync(&state, &sync, policy_etag.is_some());
+                            netmap_ok = apply_policy_sync(&state, &sync, policy_etag.is_some());
                         }
+                        // W25-31/W25-34: the SSH server reads the signed `issued_at_ms` of
+                        // `netmap.signed.json`. The coordinator heartbeat renews it each 15 s.
                         policy_etag = Some(sync.etag);
                         thread::sleep(DENY_WAIT_GAP.saturating_sub(start.elapsed()));
                         continue;
                     }
-                    Err(_) => policy_after = Instant::now() + DENY_WAIT_RETRY,
+                    Err(err) => {
+                        mismatch.note(&state, &err.public_text());
+                        policy_after = Instant::now() + policy_wait_retry(netmap_ok);
+                        // W25-31: the next reply comes at once, so the signed netmap stamp is
+                        // renewed without a second hold time.
+                        if netmap_ok {
+                            policy_etag = None;
+                        }
+                    }
                 }
             }
             if start >= wait_after {
@@ -781,29 +857,98 @@ fn spawn_deny_refresh(options: &UpOptions) {
     });
 }
 
+/// The version mismatch state of the policy loop (W25-34).
+///
+/// When the coordinator has another version, `policy-wait` fails with a text that starts with
+/// [`orblx_coord::VERSION_MISMATCH`]. The node logs it at once and again each
+/// [`MISMATCH_LOG_EVERY`], and writes it for `orblx status`. The node keeps its mesh and
+/// its last netmap, and it gets each revoke through `deny-wait`.
+#[derive(Default)]
+struct MismatchNote {
+    last_log: Option<Instant>,
+}
+
+/// The time between two version mismatch log lines (W25-34).
+const MISMATCH_LOG_EVERY: Duration = Duration::from_secs(300);
+
+impl MismatchNote {
+    fn note(&mut self, state: &Path, text: &str) {
+        if !text.starts_with(orblx_coord::VERSION_MISMATCH) {
+            return;
+        }
+        if self
+            .last_log
+            .is_none_or(|last| last.elapsed() >= MISMATCH_LOG_EVERY)
+        {
+            eprintln!("ALERT {text} The node keeps the mesh and the last netmap. SSH certificate logins stop after 60 s.");
+            self.last_log = Some(Instant::now());
+        }
+        let path = state.join(orblx_datapath::COORD_MISMATCH_FILE);
+        let line = format!("{text}\n");
+        if fs::read_to_string(&path).is_ok_and(|old| old == line) {
+            return;
+        }
+        let temp = state.join(".coord-mismatch.tmp");
+        if fs::write(&temp, line.as_bytes()).is_ok() {
+            let _ = fs::rename(&temp, &path);
+        }
+    }
+
+    fn clear(&mut self, state: &Path) {
+        let path = state.join(orblx_datapath::COORD_MISMATCH_FILE);
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+            println!("The coordinator version matches the node again.");
+        }
+        self.last_log = None;
+    }
+}
+
 /// Write the files of one `policy-wait` reply (W25-6).
 ///
 /// The deny list goes first, so a revoke reaches the datapath before the netmap.
 /// The datapath reads `deny.json` each 100 ms. The DNS responder and the packet filter read
 /// `netmap.json` and `grants.signed.json` each second. Each writer writes a temp file and renames it.
-fn apply_policy_sync(state: &Path, sync: &orblx_coord::PolicySync, announce: bool) {
+fn apply_policy_sync(state: &Path, sync: &orblx_coord::PolicySync, announce: bool) -> bool {
     if let Err(err) = store_deny(state, &sync.deny) {
         eprintln!("The node did not write the new deny list. {err}");
     }
-    if let Err(err) = sync.view.write_state(state) {
-        eprintln!(
-            "The node did not write the new netmap. {}",
-            err.public_text()
-        );
-        return;
-    }
-    if announce {
+    let write = match sync.view.write_state_checked(state) {
+        Ok(write) => write,
+        Err(err) => {
+            eprintln!(
+                "The node did not write the new netmap. {}",
+                err.public_text()
+            );
+            return false;
+        }
+    };
+    // W25-34: a signed heartbeat changes only the stamp. The node does not announce it.
+    if announce && write == orblx_coord::ViewWrite::Content {
         println!("The node applied a new policy from the coordinator.");
+    }
+    true
+}
+
+/// The time before the node tries `policy-wait` again after it failed.
+///
+/// W25-31: a node that has a netmap from `policy-wait` tries again after
+/// [`POLICY_WAIT_RETRY_FRESH`]. Thus one failed reply does not make the netmap older than the
+/// 60 s limit of the SSH certificate login while the coordinator is up.
+/// A node with no such netmap (for example with an old coordinator) waits [`DENY_WAIT_RETRY`].
+fn policy_wait_retry(netmap_ok: bool) -> Duration {
+    if netmap_ok {
+        POLICY_WAIT_RETRY_FRESH
+    } else {
+        DENY_WAIT_RETRY
     }
 }
 
+/// The retry time of `policy-wait` for a node that has a netmap from it (W25-31).
+const POLICY_WAIT_RETRY_FRESH: Duration = Duration::from_secs(2);
+
 /// The shortest time between two `deny-wait` requests (W25-2).
-const DENY_WAIT_GAP: Duration = Duration::from_millis(100);
+const DENY_WAIT_GAP: Duration = orblx_coord::POLICY_WAIT_GAP;
 
 /// The time before the node tries `deny-wait` again after it failed (W25-2).
 const DENY_WAIT_RETRY: Duration = Duration::from_secs(30);
@@ -1133,10 +1278,10 @@ impl LiveGrants {
     fn open(path: &Path, dir: &Path, self_name: &str, overlay: Ipv4Addr) -> Result<Self, String> {
         let bytes = fs::read(path)
             .map_err(|err| format!("The file {} did not open. {err}", path.display()))?;
-        let signed = parse_grants(&bytes)?;
+        let wire = parse_grants(&bytes)?;
         let public = decode_hex_32(read_text(&dir.join("netmap.pub"))?.trim())
             .map_err(|_| "The netmap public key is not valid.".to_string())?;
-        verify_signed_grants(&signed, &public)
+        let signed = verify_grants_wire(&wire, &public)
             .map_err(|_| "The grant signature is not valid.".to_string())?;
         let receiver = SpiffeId::node(self_name).map_err(|err| err.to_string())?;
         if signed.grants.receiver != receiver.as_uri() {
@@ -1172,17 +1317,17 @@ impl LiveGrants {
                 return;
             }
         }
-        let signed = match parse_grants(&bytes) {
-            Ok(signed) => signed,
+        let wire = match parse_grants(&bytes) {
+            Ok(wire) => wire,
             Err(text) => {
                 self.keep_previous(bytes, &text);
                 return;
             }
         };
-        if verify_signed_grants(&signed, &self.public).is_err() {
+        let Ok(signed) = verify_grants_wire(&wire, &self.public) else {
             self.keep_previous(bytes, "The grant signature is not valid.");
             return;
-        }
+        };
         if signed.grants.receiver != self.receiver {
             self.keep_previous(bytes, "The grant receiver does not match the node.");
             return;
@@ -1227,7 +1372,9 @@ impl PeerVisibility for LiveGrants {
     }
 }
 
-fn parse_grants(bytes: &[u8]) -> Result<SignedGrants, String> {
+/// Parse the wire form only. The caller checks the signature over the received bytes
+/// before it parses the grants (W25-34).
+fn parse_grants(bytes: &[u8]) -> Result<SignedGrantsWire, String> {
     serde_json::from_slice(bytes).map_err(|_| "The grants are not valid.".to_string())
 }
 
@@ -1418,6 +1565,61 @@ fn unix_secs(now: SystemTime) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_failed_policy_wait_keeps_the_ssh_netmap_fresh_within_60_s() {
+        // W25-31: one heartbeat, one failed reply, one retry, and one reply at once (no ETag).
+        let heartbeat = std::time::Duration::from_millis(orblx_coord::HEARTBEAT_MS);
+        let worst = heartbeat + super::policy_wait_retry(true) + orblx_coord::DENY_WAIT_HOLD;
+        assert!(
+            worst < std::time::Duration::from_millis(orblx_datapath::NETMAP_MAX_AGE_MS),
+            "{worst:?}"
+        );
+        // The coordinator signs a new stamp each 20 s or less.
+        assert!(heartbeat <= std::time::Duration::from_secs(20));
+        // A node with no netmap from policy-wait keeps the old retry time.
+        assert_eq!(super::policy_wait_retry(false), super::DENY_WAIT_RETRY);
+    }
+
+    #[test]
+    fn start_refuses_open_state_paths() {
+        // W25-34 negative test: a group-writable or world-writable path, or a path with
+        // another owner, stops the node.
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = std::env::temp_dir().join(format!("orblx-perm-{}", std::process::id()));
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let netmap = state.join("netmap.json");
+        std::fs::write(&netmap, b"{}").unwrap();
+        std::fs::set_permissions(&netmap, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let me = std::fs::metadata(&state).unwrap().uid();
+        super::check_private_paths(&state, &netmap, me).unwrap();
+        // Another owner.
+        let err = super::check_private_paths(&state, &netmap, me.wrapping_add(1)).unwrap_err();
+        assert!(err.contains("owner"), "{err}");
+        // A group-writable netmap file.
+        std::fs::set_permissions(&netmap, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(super::check_private_paths(&state, &netmap, me).is_err());
+        std::fs::set_permissions(&netmap, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // A world-writable state directory.
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = super::check_private_paths(&state, &netmap, me).unwrap_err();
+        assert!(err.contains("Keep --state-dir private (0700)."), "{err}");
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A world-writable netmap directory with no sticky bit, then with the sticky bit.
+        let other = root.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let outside = other.join("netmap.json");
+        std::fs::write(&outside, b"{}").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(super::check_private_paths(&state, &outside, me).is_err());
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        super::check_private_paths(&state, &outside, me).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     use std::fs;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::os::unix::fs::PermissionsExt;

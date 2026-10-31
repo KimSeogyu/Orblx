@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use orblx_audit::{ConfigAction, ConfigEvent, ConfigLog, ConfigRecord, EMPTY_DIGEST};
+use orblx_audit::{
+    sha256_digest, ConfigAction, ConfigEvent, ConfigLog, ConfigRecord, EMPTY_DIGEST,
+};
 use orblx_datapath::{Netmap, NetmapPeer, NetmapSelf, SplitDns};
 use orblx_identity::{
     google_client_id_ok, DenySet, GoogleJwks, IssueGate, IssuedSvid, MiniCa, OidcIssuer, OidcJwks,
@@ -151,6 +153,15 @@ struct Inner {
     audit: Option<ConfigLog>,
     /// The digest of the last refused policy file.
     fail_hash: Option<[u8; 32]>,
+    /// The SSH user CA keys (W25-31). Not the SVID CA and not the ticket key.
+    ssh_ca: crate::sshca::SshCa,
+    /// The SSH certificate serials, the live index, and the revoked list (W25-31).
+    ssh_certs: crate::sshca::CertBook,
+    /// The single-use SSH request nonces (W25-31).
+    ssh_nonces: crate::sshca::NonceBook,
+    /// The signed netmap `seq` allocator (W25-34).
+    /// One book for each state directory in the process.
+    seq: std::sync::Arc<Mutex<crate::seq::SeqBook>>,
     /// The count of policy changes. The view cache uses it as a key (W25-16).
     policy_gen: u64,
     /// The node store file that `inner.store` holds, when no change came after the read (W25-16).
@@ -383,6 +394,9 @@ impl Coordinator {
         write_text(dir.join(TRUST_FILE).as_path(), ca.trust_bundle_pem(), 0o644)?;
         let netmap_key = load_netmap_key(dir)?;
         let store = NodeStore::open(&dir.join(STORE_FILE))?;
+        let now_unix = crate::sshca::unix_secs(now)?;
+        let ssh_ca = crate::sshca::SshCa::open(dir, now_unix)?;
+        let ssh_certs = crate::sshca::CertBook::open(dir, now_unix)?;
         let coord_id = SpiffeId::coord(coord_name)?;
         let coord_svid = ca.issue(&coord_id, now, MAX_USER_TTL, &DenySet::empty())?;
         let oidc = match oidc {
@@ -424,6 +438,10 @@ impl Coordinator {
                 saw_file: false,
                 audit: None,
                 fail_hash: None,
+                ssh_ca,
+                ssh_certs,
+                ssh_nonces: crate::sshca::NonceBook::default(),
+                seq: crate::seq::shared_book(dir)?,
                 policy_gen: 0,
                 nodes_loaded: None,
                 lock_loaded: None,
@@ -665,7 +683,11 @@ impl Coordinator {
             inner.views.inputs = Some(inputs);
         }
         if let Some(view) = inner.views.views.get(name) {
-            return Ok(Arc::clone(view));
+            // W25-34: a cached view is good only until its signed heartbeat is due. Then the
+            // coordinator signs a new view with a new stamp, also when no input changed.
+            if !heartbeat_due(&view.view, crate::seq::unix_ms(SystemTime::now())) {
+                return Ok(Arc::clone(view));
+            }
         }
         let inputs = inner.views.inputs.as_ref().ok_or(CoordError::State)?;
         let view = sign_view_with(&inner, name, inputs)?;
@@ -685,6 +707,13 @@ impl Coordinator {
             .views
             .insert(name.to_string(), Arc::clone(&cached));
         Ok(cached)
+    }
+
+    /// The time until the netmap of one node needs a signed heartbeat (W25-34).
+    pub fn netmap_heartbeat_in(&self, name: &str) -> Result<Duration, CoordError> {
+        let inner = self.lock()?;
+        let book = inner.seq.lock().map_err(|_| CoordError::State)?;
+        Ok(book.heartbeat_in(name, crate::seq::unix_ms(SystemTime::now())))
     }
 
     /// Store advertised subnet routes and return a fresh signed netmap.
@@ -967,6 +996,44 @@ impl Coordinator {
     ) -> Result<(), CoordError> {
         let mut inner = self.lock()?;
         record(&mut inner, actor, action, target, before, after, detail)
+    }
+
+    /// Set the stored netmap `seq` to the clock time after a clock-forward error (W25-34).
+    ///
+    /// The owner command `orblx admin netmap-seq-reset` calls this. It works only when the
+    /// stored `seq` is ahead of the clock, and it never sets a value below the clock time.
+    /// It writes one `netmap-seq-reset` audit record (code 41).
+    pub fn netmap_seq_reset(
+        &self,
+        actor: &str,
+        now: SystemTime,
+    ) -> Result<serde_json::Value, CoordError> {
+        let mut inner = self.lock()?;
+        let now_ms = crate::seq::unix_ms(now);
+        let (old, new) = inner
+            .seq
+            .lock()
+            .map_err(|_| CoordError::State)?
+            .reset_to_now(now_ms)?;
+        // The book forgot all stamps, so the cached views go too. Each node gets a new view.
+        inner.views.views.clear();
+        let before: [u8; 32] = Sha256::digest(format!("{old}\n").as_bytes()).into();
+        let after: [u8; 32] = Sha256::digest(format!("{new}\n").as_bytes()).into();
+        let detail = format!("from {old} to {new} now_ms {now_ms}");
+        record(
+            &mut inner,
+            actor,
+            ConfigAction::NetmapSeqReset,
+            crate::seq::COORD_SEQ_FILE,
+            before,
+            after,
+            &detail,
+        )?;
+        Ok(serde_json::json!({
+            "op": "netmap-seq-reset",
+            "from": old,
+            "to": new,
+        }))
     }
 
     /// Set up node lock with the first trusted owner keys (W23-1).
@@ -1282,6 +1349,132 @@ impl Coordinator {
     ) -> Result<orblx_agent::SignedAgentGrant, CoordError> {
         let inner = self.lock()?;
         inner.netmap_key.sign_agent_grant(grant)
+    }
+
+    /// Make one single-use SSH request nonce for one connection (W25-31).
+    pub fn ssh_nonce(&self, connection: u64) -> Result<[u8; 32], CoordError> {
+        let now_unix = crate::sshca::unix_secs(SystemTime::now())?;
+        let mut inner = self.lock()?;
+        Ok(inner.ssh_nonces.issue(connection, now_unix))
+    }
+
+    /// Decide one SSH user certificate request and write one audit record (W25-31).
+    ///
+    /// - `peer` is the SVID of the mTLS peer. Each kind of SVID gets an audit record.
+    /// - `svid_not_after` is the end of the peer leaf.
+    /// - `connection` is the stable ID of the QUIC connection that authenticated the peer.
+    /// - `exporter` is the TLS exporter of that same connection.
+    ///
+    /// The request does not name the user. The owner comes from the store.
+    pub fn ssh_issue(
+        &self,
+        peer: &SpiffeId,
+        svid_not_after: u64,
+        connection: u64,
+        exporter: &[u8; crate::sshca::SSH_EXPORTER_LEN],
+        ask: &crate::proto::SshCertAsk,
+        now: SystemTime,
+    ) -> Result<crate::sshca::IssuedCert, SshIssueError> {
+        let now_unix = crate::sshca::unix_secs(now)?;
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        let decision = ssh_decide(&mut inner, peer, connection, exporter, ask, now_unix);
+        match decision {
+            Ok((granted, key)) => {
+                let serial = inner.ssh_certs.take_serial();
+                let issued = crate::sshca::build_cert(
+                    inner.ssh_ca.current(),
+                    &key,
+                    &granted,
+                    serial,
+                    svid_not_after,
+                    now_unix,
+                )?;
+                inner.ssh_certs.add_live(
+                    crate::sshca::LiveCert {
+                        serial,
+                        key_id: issued.key_id.clone(),
+                        node: granted.node.svid.clone(),
+                        owner: granted.owner.clone(),
+                        valid_before: issued.valid_before,
+                    },
+                    now_unix,
+                );
+                let state_dir = inner.state_dir.clone();
+                inner.ssh_certs.save(&state_dir)?;
+                let detail = format!(
+                    "decision allow reason granted serial {} fp {} node {} principal {} valid_after {} valid_before {} rule {}",
+                    serial,
+                    issued.fingerprint,
+                    granted.node.svid,
+                    granted.owner,
+                    issued.valid_after,
+                    issued.valid_before,
+                    granted.rule
+                );
+                record_ssh(&mut inner, peer.as_uri(), &granted.owner, &detail)?;
+                Ok(issued)
+            }
+            Err((deny, fingerprint, owner)) => {
+                let detail = format!(
+                    "decision deny reason {} serial - fp {} node {} principal {} valid_after - valid_before - rule -",
+                    deny.as_str(),
+                    fingerprint.as_deref().unwrap_or("-"),
+                    peer.as_uri(),
+                    owner.as_deref().unwrap_or("-"),
+                );
+                record_ssh(
+                    &mut inner,
+                    peer.as_uri(),
+                    owner.as_deref().unwrap_or(peer.as_uri()),
+                    &detail,
+                )?;
+                Err(SshIssueError::Deny(deny))
+            }
+        }
+    }
+
+    /// Rotate the SSH user CA when due and move revoked live serials to the list (W25-31).
+    ///
+    /// Return true when the netmap content can change.
+    pub fn ssh_tick(&self, now: SystemTime) -> Result<bool, CoordError> {
+        let now_unix = crate::sshca::unix_secs(now)?;
+        let mut inner = self.lock()?;
+        let state_dir = inner.state_dir.clone();
+        let rotated = inner.ssh_ca.rotate_due(&state_dir, now_unix)?;
+        if rotated {
+            println!("The SSH user CA rotated. The netmap has the new CA set.");
+        }
+        let revoked_uris = crate::admin::revoked_uris_in(&state_dir)?;
+        let mut book = inner.ssh_certs.clone();
+        let changed = book.sweep(now_unix, |cert| {
+            ssh_pair_revoked(&inner, &revoked_uris, cert)
+        });
+        if changed {
+            book.save(&state_dir)?;
+            inner.ssh_certs = book;
+        }
+        Ok(rotated || changed)
+    }
+
+    /// Rotate the SSH user CA now (W25-31). Tests use it.
+    pub fn ssh_rotate(&self, now: SystemTime) -> Result<(), CoordError> {
+        let now_unix = crate::sshca::unix_secs(now)?;
+        let mut inner = self.lock()?;
+        let state_dir = inner.state_dir.clone();
+        inner.ssh_ca.rotate(&state_dir, now_unix)
+    }
+
+    /// The SSH user CA public keys: the current key and then the next key (W25-31).
+    pub fn ssh_user_ca(&self) -> Result<Vec<String>, CoordError> {
+        let inner = self.lock()?;
+        inner.ssh_ca.public_lines()
+    }
+
+    /// The live SSH serials of one (node, owner) pair (W25-31).
+    pub fn ssh_live_serials(&self, node_uri: &str, owner: &str) -> Result<Vec<u64>, CoordError> {
+        let inner = self.lock()?;
+        Ok(inner.ssh_certs.live_serials(node_uri, owner))
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>, CoordError> {
@@ -1648,6 +1841,62 @@ fn record(
     Ok(())
 }
 
+/// The error of one SSH certificate request (W25-31).
+#[derive(Debug)]
+pub enum SshIssueError {
+    /// The coordinator refused the request and wrote an audit record.
+    Deny(crate::sshca::SshDeny),
+    /// The coordinator failed.
+    Coord(CoordError),
+}
+
+impl From<CoordError> for SshIssueError {
+    fn from(err: CoordError) -> Self {
+        Self::Coord(err)
+    }
+}
+
+type SshDenyFacts = (crate::sshca::SshDeny, Option<String>, Option<String>);
+
+/// Check one SSH request in the fixed order. A deny gives the reason, the key fingerprint,
+/// and the owner when known.
+fn ssh_decide(
+    inner: &mut Inner,
+    peer: &SpiffeId,
+    connection: u64,
+    exporter: &[u8; crate::sshca::SSH_EXPORTER_LEN],
+    ask: &crate::proto::SshCertAsk,
+    now_unix: u64,
+) -> Result<(crate::sshca::Granted, ssh_key::PublicKey), SshDenyFacts> {
+    use crate::sshca::{decide, peer_kind, verify_request, IssueFacts, SshDeny};
+    peer_kind(peer).map_err(|deny| (deny, None, None))?;
+    let nonce =
+        crate::netmap::decode_hex_32(&ask.nonce).map_err(|_| (SshDeny::Nonce, None, None))?;
+    if !inner.ssh_nonces.take(connection, &nonce, now_unix) {
+        return Err((SshDeny::Nonce, None, None));
+    }
+    let key = verify_request(&ask.public_key, &ask.sshsig, exporter, &nonce)
+        .map_err(|deny| (deny, None, None))?;
+    let fingerprint = key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
+    let revoked_uris = crate::admin::revoked_uris_in(&inner.state_dir)
+        .map_err(|_| (SshDeny::NodeRevoked, Some(fingerprint.clone()), None))?;
+    let nodes = inner.store.nodes();
+    let owner = nodes
+        .iter()
+        .find(|node| node.svid == peer.as_uri())
+        .map(|node| node.owner.clone());
+    let store = &inner.store;
+    let user_state = |user: &str| store.user(user).map(|stored| stored.state);
+    let facts = IssueFacts {
+        nodes: &nodes,
+        user_state: &user_state,
+        revoked_uris: &revoked_uris,
+        policy: &inner.policy,
+    };
+    let granted = decide(peer, &facts).map_err(|deny| (deny, Some(fingerprint), owner))?;
+    Ok((granted, key))
+}
+
 fn clip_detail(detail: &str) -> String {
     let clean: String = detail
         .chars()
@@ -1836,8 +2085,70 @@ fn issue_leaf(inner: &mut Inner, name: &str, now: SystemTime) -> Result<EnrollRe
     })
 }
 
+/// True when the signed stamp of `view` is [`crate::seq::HEARTBEAT_MS`] old or older (W25-34).
+///
+/// A due view must not go out again: the coordinator signs a new view with a new stamp.
+fn heartbeat_due(view: &NetmapView, now_ms: u64) -> bool {
+    let issued = view.signed_netmap.netmap.issued_at_ms;
+    now_ms >= issued.saturating_add(crate::seq::HEARTBEAT_MS)
+}
+
 fn node_visible(node: &StoredNode) -> bool {
     node.approved && !node.expired
+}
+
+/// True when the node or the owner of one live SSH certificate lost the right (W25-31).
+fn ssh_pair_revoked(
+    inner: &Inner,
+    revoked_uris: &std::collections::BTreeSet<String>,
+    cert: &crate::sshca::LiveCert,
+) -> bool {
+    if revoked_uris.contains(&cert.node) {
+        return true;
+    }
+    match crate::sshca::owner_user_id(&cert.owner) {
+        Some(user) if revoked_uris.contains(user.as_uri()) => return true,
+        Some(_) => {}
+        None => return true,
+    }
+    let node_ok = inner
+        .store
+        .nodes()
+        .iter()
+        .any(|node| node.svid == cert.node && node.owner == cert.owner && node_visible(node));
+    let user_ok = matches!(
+        inner.store.user(&cert.owner).map(|user| user.state),
+        Some(UserState::Approved)
+    );
+    !(node_ok && user_ok)
+}
+
+/// The revoked SSH certificates for the netmap (W25-31).
+fn ssh_revoked_set(inner: &Inner) -> Result<Vec<orblx_datapath::SshRevoked>, CoordError> {
+    let now_unix = crate::sshca::unix_secs(SystemTime::now())?;
+    let revoked_uris = crate::admin::revoked_uris_in(&inner.state_dir)?;
+    Ok(inner.ssh_certs.revoked_set(now_unix, |cert| {
+        ssh_pair_revoked(inner, &revoked_uris, cert)
+    }))
+}
+
+/// Append one SSH certificate decision to the config chain (W25-31).
+fn record_ssh(
+    inner: &mut Inner,
+    peer_uri: &str,
+    target: &str,
+    detail: &str,
+) -> Result<(), CoordError> {
+    let digest = sha256_digest(detail.as_bytes());
+    record(
+        inner,
+        peer_uri,
+        ConfigAction::SshCert,
+        target,
+        EMPTY_DIGEST,
+        digest,
+        detail,
+    )
 }
 
 fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
@@ -1891,7 +2202,7 @@ fn sign_view_with(
             });
         }
     }
-    let payload = Netmap {
+    let mut payload = Netmap {
         version: 1,
         self_node: NetmapSelf {
             name: self_node.name.clone(),
@@ -1901,11 +2212,39 @@ fn sign_view_with(
         peers,
         lock: inputs.lock.updates.clone(),
         split_dns: published_split_dns(&inner.policy, self_visible),
+        ssh_user_ca: if self_visible {
+            inner.ssh_ca.public_lines()?
+        } else {
+            Vec::new()
+        },
+        ssh_revoked: ssh_revoked_set(inner)?,
+        seq: 0,
+        issued_at_ms: 0,
+        grants_sha256: String::new(),
     };
-    let signed_netmap = inner.netmap_key.sign_netmap_owned(payload)?;
     let receiver = SpiffeId::node(&self_node.name)?;
     let grants = filtered_grants(inner, &receiver, self_node, self_visible, nodes);
+    // W25-34: the same view content within the heartbeat time gets the same stamp.
+    // A change of the netmap, the grants, or the endpoints gets a new seq.
+    let invalid = || CoordError::Protocol("The netmap is not valid.".to_string());
+    let mut content = Sha256::new();
+    content.update(serde_json::to_vec(&payload).map_err(|_| invalid())?);
+    content.update(b"\0");
+    content.update(serde_json::to_vec(&grants).map_err(|_| invalid())?);
+    content.update(b"\0");
+    content.update(serde_json::to_vec(&endpoints).map_err(|_| invalid())?);
+    let (seq, issued_at_ms) = inner.seq.lock().map_err(|_| CoordError::State)?.stamp(
+        &self_node.name,
+        content.finalize().into(),
+        crate::seq::unix_ms(SystemTime::now()),
+    )?;
+    payload.seq = seq;
+    payload.issued_at_ms = issued_at_ms;
+    // W25-34 (Crypto grants binding): the signed netmap carries the SHA-256 of the signed
+    // grants bytes, so a node refuses a fresh netmap with older grants.
     let signed_grants = inner.netmap_key.sign_grants_owned(grants)?;
+    payload.grants_sha256 = signed_grants.digest_hex();
+    let signed_netmap = inner.netmap_key.sign_netmap_owned(payload)?;
     let netmap_public = inner.netmap_key.public();
     let (approved_routes, exit_approved) = inputs.published(&self_node.name);
     Ok(NetmapView {
@@ -1956,9 +2295,9 @@ impl NetmapView {
         crate::proto::Response {
             ok: true,
             netmap_pub_hex: Some(crate::netmap::encode_hex(&self.netmap_public)),
-            netmap: Some(self.signed_netmap.clone()),
+            netmap: Some(self.signed_netmap.to_wire()),
             endpoints: Some(self.endpoints.clone()),
-            grants: Some(self.signed_grants.clone()),
+            grants: Some(self.signed_grants.to_wire()),
             approved_routes: Some(self.approved_routes.clone()),
             advertised_routes: Some(self.advertised_routes.clone()),
             exit_approved: Some(self.exit_approved),
@@ -2327,7 +2666,16 @@ fn write_ticket_files(dir: &Path, ticket: &IssuedTicket) -> Result<(), CoordErro
 }
 
 impl NetmapView {
+    /// Write the view to the node state directory.
+    ///
+    /// The function sets the directory mode to `0700` again (W25-34).
     pub fn write_state(&self, dir: &Path) -> Result<(), CoordError> {
+        self.write_state_checked(dir).map(|_| ())
+    }
+
+    /// Write the view and tell what changed (W25-34).
+    pub fn write_state_checked(&self, dir: &Path) -> Result<ViewWrite, CoordError> {
+        create_private_dir(dir)?;
         write_view(
             dir,
             &self.signed_netmap,
@@ -2337,13 +2685,40 @@ impl NetmapView {
     }
 }
 
+/// What one view write changed on the node (W25-34).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewWrite {
+    /// The same `seq` and the same signed bytes. The node changed no file.
+    Same,
+    /// A new `seq`, and only the stamp changed. The datapath files did not change.
+    StampOnly,
+    /// A new `seq`, and the netmap, the grants, or the endpoints changed.
+    Content,
+}
+
 fn write_view(
     dir: &Path,
     netmap: &SignedNetmap,
     grants: &SignedGrants,
     endpoints: &[SignedEndpoint],
-) -> Result<(), CoordError> {
-    let mut local = netmap.netmap.clone();
+) -> Result<ViewWrite, CoordError> {
+    let now_ms = crate::seq::unix_ms(SystemTime::now());
+    crate::seq::check_grants_binding(netmap, grants)?;
+    let intake = crate::seq::node_intake(dir, netmap, now_ms)?;
+    let signed_path = dir.join("netmap.signed.json");
+    if intake == crate::seq::Intake::Same {
+        let on_disk = std::fs::read(&signed_path).ok();
+        let current = serde_json::to_vec(netmap).ok();
+        if on_disk.is_some() && on_disk == current {
+            return Ok(ViewWrite::Same);
+        }
+        // The node stopped after it wrote the seq and before it wrote the netmap.
+    } else {
+        // Sync the seq before the netmap files, so a restart never accepts a lower seq.
+        crate::seq::record_node_seq(dir, netmap)?;
+    }
+    // The local copy has no stamp, so a heartbeat does not change `netmap.json`.
+    let mut local = netmap.netmap.without_stamp();
     if let Some(report) = crate::nodelock::apply_node_lock(dir, &mut local)? {
         crate::nodelock::print_report(&report);
     }
@@ -2359,12 +2734,28 @@ fn write_view(
         .map_err(|_| CoordError::Protocol("The grants are not valid.".to_string()))?;
     let signed_grants = serde_json::to_string(grants)
         .map_err(|_| CoordError::Protocol("The grants are not valid.".to_string()))?;
-    write_text(&dir.join("netmap.json"), &netmap_text, 0o644)?;
-    write_text(&dir.join("netmap.signed.json"), &signed_text, 0o644)?;
-    write_text(&dir.join("grants.json"), &grant_text, 0o644)?;
-    write_text(&dir.join("grants.signed.json"), &signed_grants, 0o644)?;
-    write_text(&dir.join("endpoints.json"), &endpoint_text, 0o644)?;
-    Ok(())
+    let mut changed = false;
+    changed |= write_if_changed(&dir.join("netmap.json"), &netmap_text)?;
+    write_text(&signed_path, &signed_text, 0o644)?;
+    changed |= write_if_changed(&dir.join("grants.json"), &grant_text)?;
+    changed |= write_if_changed(&dir.join("grants.signed.json"), &signed_grants)?;
+    changed |= write_if_changed(&dir.join("endpoints.json"), &endpoint_text)?;
+    Ok(if changed {
+        ViewWrite::Content
+    } else {
+        ViewWrite::StampOnly
+    })
+}
+
+/// Write a node file only when its text changes (W25-34).
+///
+/// A file with the same text keeps its bytes and its time, so no reader reloads it.
+fn write_if_changed(path: &Path, text: &str) -> Result<bool, CoordError> {
+    if std::fs::read(path).is_ok_and(|old| old == text.as_bytes()) {
+        return Ok(false);
+    }
+    write_text(path, text, 0o644)?;
+    Ok(true)
 }
 
 pub fn read_node_material(dir: &Path) -> Result<NodeMaterial, CoordError> {
@@ -2395,5 +2786,35 @@ mod tests {
         let missing = oidc_config(orblx_identity::OidcMode::Google, None).unwrap();
         assert!(matches!(blank, OidcConfig::TokenOnly));
         assert!(matches!(missing, OidcConfig::TokenOnly));
+    }
+
+    /// W25-34 with W25-16: the view cache gives a cached view only until its heartbeat is
+    /// due. Then `netmap_cached` signs a new view with a new stamp.
+    #[test]
+    fn a_cached_view_is_due_at_the_heartbeat() {
+        let scratch = std::env::temp_dir().join(format!(
+            "orblx-w2534-due-{}-{}",
+            std::process::id(),
+            crate::seq::unix_ms(std::time::SystemTime::now())
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let coord = super::Coordinator::open(&scratch, "coord", OidcConfig::TokenOnly).unwrap();
+        let now = std::time::SystemTime::now();
+        let token = coord
+            .create_token_at(std::time::Duration::from_secs(60), now)
+            .unwrap();
+        coord
+            .enroll_token("due-a", &token.secret, &["due-a:443".to_string()], &[], now)
+            .unwrap();
+        let cached = coord.netmap_cached("due-a").unwrap();
+        let issued = cached.view.signed_netmap.netmap.issued_at_ms;
+        let beat = crate::seq::HEARTBEAT_MS;
+        assert!(!super::heartbeat_due(&cached.view, issued));
+        assert!(!super::heartbeat_due(&cached.view, issued + beat - 1));
+        assert!(super::heartbeat_due(&cached.view, issued + beat));
+        let again = coord.netmap_cached("due-a").unwrap();
+        assert!(std::sync::Arc::ptr_eq(&cached, &again));
+        drop(coord);
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

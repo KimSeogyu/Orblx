@@ -594,6 +594,20 @@ pub(crate) fn push_deny(
     Ok(file.version)
 }
 
+/// Return the revoked SPIFFE URIs in the deny file of one state directory (W25-31).
+///
+/// A file that does not open or does not parse gives an error. The caller must deny.
+pub(crate) fn revoked_uris_in(
+    state_dir: &std::path::Path,
+) -> Result<std::collections::BTreeSet<String>, CoordError> {
+    let path = state_dir.join(DENY_FILE);
+    if !path.exists() {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    let file: DenyFile = serde_json::from_str(&read_text(&path)?).map_err(|_| CoordError::State)?;
+    Ok(file.revoked_uris.into_iter().collect())
+}
+
 fn read_deny(coord: &Coordinator, now: SystemTime) -> Result<DenyFile, CoordError> {
     let path = coord.state_dir()?.join(DENY_FILE);
     if !path.exists() {

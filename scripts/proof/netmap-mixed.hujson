@@ -1,0 +1,13 @@
+{
+  // W25-34 mixed-version proof. Node a is the owner, so it can revoke c and d.
+  // Nodes a, b, c, d, and e may ping each other.
+  "owners": ["spiffe://orblx.local/node/a"],
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a", "spiffe://orblx.local/node/b", "spiffe://orblx.local/node/c", "spiffe://orblx.local/node/d", "spiffe://orblx.local/node/e"],
+      "proto": "icmp",
+      "dst": ["spiffe://orblx.local/node/a:*", "spiffe://orblx.local/node/b:*", "spiffe://orblx.local/node/c:*", "spiffe://orblx.local/node/d:*", "spiffe://orblx.local/node/e:*"],
+    },
+  ],
+}

@@ -368,6 +368,8 @@ struct SshGrant {
     user: String,
     check_period: u64,
     recording: bool,
+    /// The zero-based position of the rule in the `ssh` list (W25-31 audit rule id).
+    rule: usize,
 }
 
 #[derive(Clone)]
@@ -663,6 +665,20 @@ impl Policy {
             .iter()
             .filter(|grant| grant.src == *src && grant.dst == *dst && grant.user == user)
             .map(|grant| grant.check_period)
+            .min()
+    }
+
+    /// Return the first SSH rule that names `src` as a source (W25-31).
+    ///
+    /// The value is the zero-based position of the rule in the `ssh` list.
+    /// `None` means that no SSH rule gives `src` a grant. The coordinator then issues no SSH
+    /// user certificate.
+    #[must_use]
+    pub fn ssh_rule_for_source(&self, src: &SpiffeId) -> Option<usize> {
+        self.ssh
+            .iter()
+            .filter(|grant| grant.src == *src)
+            .map(|grant| grant.rule)
             .min()
     }
 
@@ -1162,7 +1178,7 @@ fn compile_exit_nodes(
 
 fn compile_ssh(catalog: &Catalog, rules: &[SshRuleFile]) -> Result<Vec<SshGrant>, PolicyError> {
     let mut grants = Vec::new();
-    for rule in rules {
+    for (rule_index, rule) in rules.iter().enumerate() {
         if rule.src.is_empty() || rule.dst.is_empty() || rule.users.is_empty() {
             return Err(PolicyError::new(
                 "The SSH rule needs a source, a destination, a user, and a check period.",
@@ -1207,6 +1223,7 @@ fn compile_ssh(catalog: &Catalog, rules: &[SshRuleFile]) -> Result<Vec<SshGrant>
                                 user: user.clone(),
                                 check_period: period,
                                 recording,
+                                rule: rule_index,
                             });
                         }
                     }
@@ -1221,6 +1238,7 @@ fn compile_ssh(catalog: &Catalog, rules: &[SshRuleFile]) -> Result<Vec<SshGrant>
             left.user.as_str(),
             left.check_period,
             left.recording,
+            left.rule,
         )
             .cmp(&(
                 right.src.as_uri(),
@@ -1228,6 +1246,7 @@ fn compile_ssh(catalog: &Catalog, rules: &[SshRuleFile]) -> Result<Vec<SshGrant>
                 right.user.as_str(),
                 right.check_period,
                 right.recording,
+                right.rule,
             ))
     });
     grants.dedup();

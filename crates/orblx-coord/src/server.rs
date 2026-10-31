@@ -71,8 +71,14 @@ async fn expire_tick(coord: Coordinator) {
     loop {
         tokio::time::sleep(EXPIRE_TICK).await;
         let step = coord.clone();
-        let result =
-            tokio::task::spawn_blocking(move || agent::expire_due(&step, SystemTime::now())).await;
+        let result = tokio::task::spawn_blocking(move || {
+            // W25-31: rotate the SSH user CA when due, and move revoked serials to the list.
+            if let Err(err) = step.ssh_tick(SystemTime::now()) {
+                println!("coord ssh tick failed: {}", err.public_text());
+            }
+            agent::expire_due(&step, SystemTime::now())
+        })
+        .await;
         match result {
             Ok(Ok(_)) => failed = false,
             Ok(Err(err)) if !failed => {
@@ -102,6 +108,8 @@ async fn stamp_tick(coord: Coordinator, stamp: watch::Sender<u64>) {
             dir.join("deny.json"),
             dir.join(crate::state::CONFIG_AUDIT_FILE),
             dir.join("nodes.json"),
+            dir.join(crate::sshca::SSH_CA_FILE),
+            dir.join(crate::sshca::SSH_CERTS_FILE),
             policy,
         ]
         .iter()
@@ -162,12 +170,19 @@ async fn policy_wait(
         let deny = admin::deny_json_for(coord, name, SystemTime::now())?;
         let etag = policy_etag(&cached.digest, &deny);
         let changed = known != Some(etag.as_str());
-        if changed
-            || !matches!(
-                tokio::time::timeout_at(deadline, stamp.changed()).await,
-                Ok(Ok(()))
-            )
-        {
+        // W25-34: wake at the heartbeat time of the node too. At that time the cache gives a
+        // new signed view with a new stamp, so its ETag changes and the node gets the full
+        // reply. The short reply goes out only at the end of the hold, when no heartbeat is due.
+        let beat = tokio::time::Instant::now() + coord.netmap_heartbeat_in(name)?;
+        let until = deadline.min(beat);
+        let reply = changed
+            || match tokio::time::timeout_at(until, stamp.changed()).await {
+                Ok(Ok(())) => false,
+                Ok(Err(_)) => true,
+                // At the heartbeat time, sign again in the next loop, then send the full reply.
+                Err(_) => beat > deadline,
+            };
+        if reply {
             if !changed && unchanged_ok {
                 // W25-16: the node has this view. Send only the deny list and the ETag.
                 return proto::encode_json(&Response {
@@ -332,9 +347,24 @@ async fn handle_stream(
     mut recv: quinn::RecvStream,
     stamp: watch::Receiver<u64>,
 ) -> Result<(), CoordError> {
-    let request = proto::read_json::<Request>(&mut recv).await?;
+    let incoming = proto::read_json::<proto::Incoming>(&mut recv).await?;
+    let request = incoming.request;
+    // W25-34: refuse an older node with the version mismatch text.
+    let gated = proto::version_gate(&request.op, incoming.proto);
+    if gated.is_err() {
+        println!(
+            "coord rejected: {} node {} op {} protocol {} (need {})",
+            proto::VERSION_MISMATCH,
+            request.name,
+            request.op,
+            incoming.proto,
+            proto::NODE_PROTO
+        );
+    }
     // W25-16: a `policy-wait` reply comes as JSON bytes from the cached view.
-    let reply = if request.op == "policy-wait" {
+    let reply = if let Err(err) = gated {
+        Err(err)
+    } else if request.op == "policy-wait" {
         policy_wait_op(coord, connection, &request, stamp).await
     } else {
         match dispatch(coord, connection, request, stamp).await {
@@ -379,6 +409,95 @@ async fn policy_wait_op(
     .await
 }
 
+/// Authenticate the peer leaf for the SSH certificate path (W25-31).
+///
+/// The check uses an empty deny set. Thus a revoked node, an agent, or a coordinator SVID
+/// reaches the decision, and the decision writes an audit record.
+/// Return the SPIFFE ID and the end of the leaf.
+fn ssh_peer(
+    coord: &Coordinator,
+    connection: &quinn::Connection,
+) -> Result<(orblx_identity::SpiffeId, u64), CoordError> {
+    let Some(identity) = connection.peer_identity() else {
+        return Err(CoordError::Peer);
+    };
+    let chain = identity
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .map_err(|_| CoordError::Peer)?;
+    let Some(leaf) = chain.first() else {
+        return Err(CoordError::Peer);
+    };
+    let material = coord.tls_material()?;
+    let trust = TrustBundle::from_pem(&material.trust_pem)?;
+    let id = trust.authenticate_leaf(
+        leaf.as_ref(),
+        SystemTime::now(),
+        &orblx_identity::DenySet::empty(),
+    )?;
+    let not_after = orblx_identity::leaf_not_after(leaf.as_ref())?;
+    Ok((id, not_after))
+}
+
+/// The TLS exporter of one connection for the SSH request (W25-31).
+fn ssh_exporter(
+    connection: &quinn::Connection,
+) -> Result<[u8; crate::sshca::SSH_EXPORTER_LEN], CoordError> {
+    let mut out = [0u8; crate::sshca::SSH_EXPORTER_LEN];
+    connection
+        .export_keying_material(&mut out, crate::sshca::SSH_EXPORTER_LABEL, b"")
+        .map_err(|_| CoordError::Tls("The TLS exporter failed.".to_string()))?;
+    Ok(out)
+}
+
+/// Decide one `ssh-cert` request (W25-31). Each decision writes one audit record.
+async fn ssh_cert(
+    coord: &Coordinator,
+    connection: &quinn::Connection,
+    request: &Request,
+) -> Result<Response, CoordError> {
+    let (peer, not_after) = ssh_peer(coord, connection)?;
+    let exporter = ssh_exporter(connection)?;
+    let ask = request.ssh.clone().ok_or_else(|| {
+        CoordError::Protocol("The SSH certificate request is not valid.".to_string())
+    })?;
+    let step = coord.clone();
+    let connection_id = connection.stable_id() as u64;
+    let result = tokio::task::spawn_blocking(move || {
+        step.ssh_issue(
+            &peer,
+            not_after,
+            connection_id,
+            &exporter,
+            &ask,
+            SystemTime::now(),
+        )
+    })
+    .await
+    .map_err(|_| CoordError::State)?;
+    match result {
+        Ok(issued) => {
+            println!("ssh certificate issued serial {}", issued.serial);
+            Ok(Response {
+                ok: true,
+                detail: Some(issued.text),
+                ..Response::default()
+            })
+        }
+        Err(crate::state::SshIssueError::Deny(deny)) => {
+            println!("ssh certificate denied {}", deny.as_str());
+            Ok(Response {
+                ok: false,
+                error: Some(format!(
+                    "The coordinator refused the SSH certificate. reason {}",
+                    deny.as_str()
+                )),
+                ..Response::default()
+            })
+        }
+        Err(crate::state::SshIssueError::Coord(err)) => Err(err),
+    }
+}
+
 async fn dispatch(
     coord: &Coordinator,
     connection: &quinn::Connection,
@@ -387,6 +506,17 @@ async fn dispatch(
 ) -> Result<Response, CoordError> {
     let now = SystemTime::now();
     match request.op.as_str() {
+        "ssh-cert-nonce" => {
+            // W25-31: any trusted leaf gets a nonce. The decision on the next stream audits it.
+            let _ = ssh_peer(coord, connection)?;
+            let nonce = coord.ssh_nonce(connection.stable_id() as u64)?;
+            Ok(Response {
+                ok: true,
+                detail: Some(encode_hex(&nonce)),
+                ..Response::default()
+            })
+        }
+        "ssh-cert" => ssh_cert(coord, connection, &request).await,
         "enroll" => {
             let result = match (&request.token, &request.id_token) {
                 (Some(token), None) => coord.enroll_token(
@@ -703,6 +833,10 @@ fn run_admin(
         "admin-revoke-all" => admin::revoke_all(coord, &request.name, actor, now)?,
         "admin-revoke-undo" => admin::revoke_undo(coord, &request.name, actor, now)?,
         "admin-expire" => admin::expire(coord, &request.name, actor)?,
+        "admin-netmap-seq-reset" => {
+            owner_only()?;
+            coord.netmap_seq_reset(actor, now)?
+        }
         "admin-routes" => admin::routes(coord)?,
         "admin-audit" => admin::audit(coord, parse_since(&request.name)?)?,
         "admin-grants" => agent::list(coord, now)?,
@@ -810,9 +944,9 @@ fn leaf_response(result: crate::state::EnrollResult) -> Response {
         private_key_pem: Some(result.private_key_pem),
         trust_bundle_pem: Some(result.trust_bundle_pem),
         netmap_pub_hex: Some(encode_hex(&result.netmap_public)),
-        netmap: Some(result.signed_netmap),
+        netmap: Some(result.signed_netmap.to_wire()),
         endpoints: Some(result.endpoints),
-        grants: Some(result.signed_grants),
+        grants: Some(result.signed_grants.to_wire()),
         approved_routes: Some(result.approved_routes),
         advertised_routes: Some(result.advertised_routes),
         exit_approved: Some(result.exit_approved),
@@ -888,6 +1022,7 @@ mod tests {
             api_token: Some(secret.to_string()),
             deny_etag: None,
             expect_sha256: None,
+            ssh: None,
             unchanged_ok: false,
         }
     }
@@ -922,9 +1057,10 @@ mod tests {
         full.policy_etag = Some(etag);
         assert_eq!(bytes, serde_json::to_vec(&full).unwrap());
         let parsed: super::Response = serde_json::from_slice(&bytes).unwrap();
-        let netmap = parsed.netmap.unwrap();
-        crate::netmap::verify_signed_netmap(&netmap, &cached.view.netmap_public).unwrap();
-        crate::netmap::verify_signed_grants(&parsed.grants.unwrap(), &cached.view.netmap_public)
+        let netmap =
+            crate::netmap::verify_netmap_wire(&parsed.netmap.unwrap(), &cached.view.netmap_public)
+                .unwrap();
+        crate::netmap::verify_grants_wire(&parsed.grants.unwrap(), &cached.view.netmap_public)
             .unwrap();
         assert_eq!(netmap.netmap.peers.len(), 1);
         // W25-16: when the ETag did not change at the end of the hold, a node that keeps its

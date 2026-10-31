@@ -1637,6 +1637,7 @@ dependencies = [
 name = "orblx-cli"
 version = "0.1.0-rc.2"
 dependencies = [
+ "libc",
  "orblx-agent",
  "orblx-audit",
  "orblx-coord",
@@ -1674,6 +1675,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "ssh-key",
  "tokio",
  "tokio-rustls",
  "webpki-roots 0.26.11",
@@ -1821,6 +1823,8 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "libc",
  "orblx-audit",
+ "orblx-coord",
+ "orblx-datapath",
  "orblx-identity",
  "russh",
  "serde_json",
