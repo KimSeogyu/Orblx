@@ -549,6 +549,13 @@ fn ticket_acl_drops_bad_tickets_and_allows_a_valid_ticket() {
         ticket_failure(gate.payload_from_data(&frame, now, &deny).unwrap_err()),
         CryptoError::Identity(IdentityError::Revoked)
     );
+
+    // W25-38: the set for a deny file that failed refuses the ticket and each frame.
+    let refuse = DenySet::refuse_all();
+    assert!(gate
+        .admit_ticket(&ring, &good.bytes, &good.mac, now, &refuse)
+        .is_err());
+    assert!(gate.payload_from_data(&frame, now, &refuse).is_err());
 }
 
 fn hex(bytes: &[u8]) -> String {

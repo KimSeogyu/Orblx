@@ -338,7 +338,12 @@ async fn dispatch(
                 }
             };
             println!("enrolled {}", result.name);
-            Ok(leaf_response(result))
+            // W25-38: the reply has the deny list of the node, so the node writes
+            // `deny.json` at enroll and does not start without a deny file.
+            let deny = admin::deny_json_for(coord, &result.name, now).ok();
+            let mut response = leaf_response(result);
+            response.detail = deny;
+            Ok(response)
         }
         "renew" => {
             let peer = peer_node(coord, connection)?;

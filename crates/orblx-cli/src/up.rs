@@ -810,15 +810,11 @@ const DENY_REFRESH: Duration = Duration::from_millis(500);
 
 /// Write `deny.json` when its text changes.
 ///
-/// The function writes a temp file and renames it. A reader never sees a part file.
+/// W25-38: the function refuses a text that is not a valid deny document. It writes a
+/// temp file in the same directory, syncs it, renames it, and syncs the directory.
+/// A reader never sees a part file, and a crash leaves the old file.
 fn store_deny(state: &Path, text: &str) -> std::io::Result<()> {
-    let path = state.join("deny.json");
-    if fs::read_to_string(&path).is_ok_and(|old| old == text) {
-        return Ok(());
-    }
-    let temp = state.join(".deny.json.tmp");
-    fs::write(&temp, text.as_bytes())?;
-    fs::rename(&temp, &path)
+    orblx_identity::store_deny_file(state, text).map(|_| ())
 }
 
 fn run_down(options: StateOptions) -> Result<(), String> {
@@ -1263,12 +1259,20 @@ fn load_config(dir: &Path) -> Result<HelloConfig, String> {
     let bundle_pem = read_text(&dir.join(BUNDLE_FILE))?;
     let trust =
         orblx_identity::TrustBundle::from_pem(&bundle_pem).map_err(|err| err.to_string())?;
-    super::ticket_load::load_hello_config(
+    let mut config = super::ticket_load::load_hello_config(
         certificate_pem,
         private_key_pem,
         trust,
         &dir.join(TICKET_FILE),
-    )
+    )?;
+    // W25-38: the first deny set comes from `deny.json`. When the file is not valid, did
+    // not open, or is missing after enroll, the node refuses new sessions until the
+    // datapath reads a valid file. It never starts with an empty list in place of the file.
+    config.deny = orblx_identity::load_deny_file(dir).unwrap_or_else(|err| {
+        eprintln!("{err}");
+        orblx_identity::DenySet::refuse_all()
+    });
+    Ok(config)
 }
 
 fn parse_state(args: &[String]) -> Result<StateOptions, String> {
@@ -1489,17 +1493,24 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("orblx-deny-store-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        super::store_deny(&dir, "{\"version\":1}").unwrap();
-        assert_eq!(
-            fs::read_to_string(dir.join("deny.json")).unwrap(),
-            "{\"version\":1}"
-        );
-        super::store_deny(&dir, "{\"version\":2}").unwrap();
-        assert_eq!(
-            fs::read_to_string(dir.join("deny.json")).unwrap(),
-            "{\"version\":2}"
-        );
-        assert!(!dir.join(".deny.json.tmp").exists());
+        let v1 = r#"{"version":1,"generated_at":1,"revoked_uris":[],"revoked_ticket_nonces":[]}"#;
+        let v2 = r#"{"version":2,"generated_at":2,"revoked_uris":[],"revoked_ticket_nonces":[]}"#;
+        super::store_deny(&dir, v1).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("deny.json")).unwrap(), v1);
+        super::store_deny(&dir, v2).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("deny.json")).unwrap(), v2);
+        // W25-38: a text that is not a valid deny document does not replace the file.
+        assert!(super::store_deny(&dir, "{\"version\":3}").is_err());
+        assert_eq!(fs::read_to_string(dir.join("deny.json")).unwrap(), v2);
+        let temps = fs::read_dir(&dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .is_ok_and(|entry| entry.file_name().to_string_lossy().starts_with(".deny"))
+            })
+            .count();
+        assert_eq!(temps, 0);
         assert!(super::DENY_REFRESH <= std::time::Duration::from_millis(500));
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1638,6 +1649,53 @@ mod tests {
         let config = super::load_config(&dir.join("a")).unwrap();
         assert!(config.certificate_pem.contains("CERTIFICATE"));
         assert!(!config.private_key_pem.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// W25-38: the datapath of an enrolled node starts with a set that refuses new
+    /// sessions when the deny file is not valid, is cut short, or is missing.
+    /// A node that was never enrolled and has no deny file keeps the empty set.
+    #[test]
+    fn w25_38_new_sessions_refuse_when_the_deny_file_is_corrupt_truncated_or_missing() {
+        let dir = std::env::temp_dir().join(format!("orblx-w25-38-up-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        run(parse_issue(&[
+            "--out".to_string(),
+            dir.to_string_lossy().to_string(),
+            "--node".to_string(),
+            "a=100.64.0.1".to_string(),
+        ])
+        .unwrap())
+        .unwrap();
+        let node = dir.join("a");
+        let peer = orblx_identity::SpiffeId::node("b").unwrap();
+        // Never enrolled, no deny file: the behavior before W25-38.
+        let config = super::load_config(&node).unwrap();
+        assert!(!config.deny.refuses_all());
+        assert!(config.deny.reject_uri(&peer).is_ok());
+
+        fs::write(node.join(orblx_identity::ENROLL_MARKER_FILE), "a\n").unwrap();
+        let config = super::load_config(&node).unwrap();
+        assert!(config.deny.refuses_all(), "missing after enroll");
+        assert!(config.deny.reject_uri(&peer).is_err());
+
+        let valid =
+            r#"{"version":1,"generated_at":1,"revoked_uris":[],"revoked_ticket_nonces":[]}"#;
+        fs::write(node.join("deny.json"), b"not json {").unwrap();
+        assert!(
+            super::load_config(&node).unwrap().deny.refuses_all(),
+            "corrupt"
+        );
+        fs::write(node.join("deny.json"), &valid.as_bytes()[..valid.len() / 2]).unwrap();
+        assert!(
+            super::load_config(&node).unwrap().deny.refuses_all(),
+            "truncated"
+        );
+
+        super::store_deny(&node, valid).unwrap();
+        let config = super::load_config(&node).unwrap();
+        assert!(!config.deny.refuses_all());
+        assert!(config.deny.reject_uri(&peer).is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
 

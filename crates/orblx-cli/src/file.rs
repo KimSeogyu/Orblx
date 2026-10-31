@@ -16,7 +16,7 @@ use orblx_file::{
     name_ok, send_file, serve, FileError, Gate, ReceiverConfig, SendIdentity, DEFAULT_MAX_BYTES,
     FILE_AUDIT_FILE, FILE_PORT,
 };
-use orblx_identity::{decode_certificate_pem, DenyApply, DenySet, SpiffeId, TrustBundle};
+use orblx_identity::{decode_certificate_pem, load_deny_file, SpiffeId, TrustBundle};
 
 use super::{parse_socket, take_value};
 
@@ -219,20 +219,6 @@ fn run_send(options: &SendOptions) -> Result<(), String> {
     Ok(())
 }
 
-fn load_deny(path: &Path) -> DenySet {
-    let mut deny = DenySet::empty();
-    let Ok(bytes) = fs::read(path) else {
-        return deny;
-    };
-    match deny.apply_json(&bytes) {
-        Ok(DenyApply::Applied | DenyApply::IgnoredOlder) => deny,
-        Err(_) => {
-            eprintln!("The deny file is not valid.");
-            DenySet::empty()
-        }
-    }
-}
-
 /// Load the checks for one connection from the state directory.
 fn load_gate(state: &Path, self_id: &SpiffeId, port: u16) -> Result<Gate, FileError> {
     let fail = |text: &str| FileError(text.to_string());
@@ -240,7 +226,7 @@ fn load_gate(state: &Path, self_id: &SpiffeId, port: u16) -> Result<Gate, FileEr
         .map_err(|_| fail("The trust bundle did not open."))?;
     let bundle =
         TrustBundle::from_pem(&bundle_pem).map_err(|_| fail("The trust bundle is not valid."))?;
-    let deny = load_deny(&state.join("deny.json"));
+    let deny = load_deny_file(state).map_err(|err| FileError(err.to_string()))?;
     let public = fs::read_to_string(state.join("netmap.pub"))
         .ok()
         .and_then(|text| decode_hex_32(text.trim()).ok())
@@ -332,5 +318,56 @@ mod tests {
         assert!(parse(&args(&["receive"])).is_err());
         assert!(parse(&args(&["receive", "--dir", "/tmp/in"])).is_ok());
         assert!(parse(&args(&["receive", "--dir", "/tmp/in", "--max-bytes", "0"])).is_err());
+    }
+
+    /// W25-38: the file receiver of an enrolled node refuses each file when the deny
+    /// file is not valid, is cut short, or is missing.
+    #[test]
+    fn w25_38_file_receive_refuses_when_the_deny_file_is_corrupt_truncated_or_missing() {
+        use std::time::SystemTime;
+
+        use orblx_identity::{DenySet, MiniCa, SpiffeId, ENROLL_MARKER_FILE};
+
+        let dir = std::env::temp_dir().join(format!("orblx-file-w25-38-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = MiniCa::generate(SystemTime::now()).unwrap();
+        std::fs::write(dir.join("bundle.pem"), ca.certificate_pem()).unwrap();
+        std::fs::write(dir.join(ENROLL_MARKER_FILE), "b\n").unwrap();
+        let self_id = SpiffeId::node("b").unwrap();
+        let valid =
+            r#"{"version":1,"generated_at":1,"revoked_uris":[],"revoked_ticket_nonces":[]}"#;
+        let deny_error = |text: &str| text.contains("The deny file") && text.contains("refuses");
+
+        std::fs::write(dir.join("deny.json"), b"not json {").unwrap();
+        let err = super::load_gate(&dir, &self_id, 7000)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(deny_error(&err), "corrupt: {err}");
+
+        std::fs::write(dir.join("deny.json"), &valid.as_bytes()[..valid.len() / 2]).unwrap();
+        let err = super::load_gate(&dir, &self_id, 7000)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(deny_error(&err), "truncated: {err}");
+
+        std::fs::remove_file(dir.join("deny.json")).unwrap();
+        let err = super::load_gate(&dir, &self_id, 7000)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(deny_error(&err), "missing: {err}");
+
+        // A valid deny file passes the deny check. The next check needs the netmap key.
+        std::fs::write(dir.join("deny.json"), valid).unwrap();
+        let err = super::load_gate(&dir, &self_id, 7000)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(!deny_error(&err), "valid: {err}");
+        assert!(DenySet::from_json(valid.as_bytes()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

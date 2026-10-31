@@ -942,6 +942,10 @@ fn enroll_from_response(
         advertised_routes: response.advertised_routes.unwrap_or_default(),
         exit_approved: response.exit_approved.unwrap_or(false),
         ticket,
+        // W25-38: only a valid deny document goes to `deny.json`.
+        deny: response
+            .detail
+            .filter(|text| orblx_identity::DenySet::from_json(text.as_bytes()).is_ok()),
     })
 }
 

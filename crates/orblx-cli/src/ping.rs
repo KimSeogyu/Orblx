@@ -151,19 +151,14 @@ fn load_deny(options: &Options) -> Result<DenySet, String> {
             .map_err(|err| format!("The file {} did not open. {err}", bundle_path.display()))?;
         let text = fetch_deny_blocking(coord, &options.coord_name, &bundle, &options.state)
             .map_err(|err| err.to_string())?;
-        let _ = fs::write(options.state.join("deny.json"), text.as_bytes());
         deny.apply_json(text.as_bytes())
             .map_err(|_| "The deny document is not valid.".to_string())?;
+        // W25-38: an atomic write. A crash leaves the old file, not a part file.
+        let _ = orblx_identity::store_deny_file(&options.state, &text);
         return Ok(deny);
     }
-    let path = options.state.join("deny.json");
-    if path.exists() {
-        let bytes = fs::read(&path)
-            .map_err(|err| format!("The file {} did not open. {err}", path.display()))?;
-        deny.apply_json(&bytes)
-            .map_err(|_| "The deny document is not valid.".to_string())?;
-    }
-    Ok(deny)
+    // W25-38: a missing file after enroll fails closed, as a file that is not valid does.
+    orblx_identity::load_deny_file(&options.state).map_err(|err| err.to_string())
 }
 
 fn load_config(state: &Path) -> Result<orblx_datapath::HelloConfig, String> {

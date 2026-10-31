@@ -19,8 +19,12 @@ pub enum DenyApply {
 ///
 /// A document replaces the whole set. A lower version does not change the set.
 /// A document that fails the parse check does not change the set.
+///
+/// A set from [`DenySet::refuse_all`] refuses each identifier and each nonce (W25-38).
+/// A node uses it when its deny file is not valid, did not open, or is missing after enroll.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenySet {
+    refuse_all: bool,
     version: Option<u64>,
     generated_at: Option<u64>,
     revoked_uris: BTreeSet<String>,
@@ -36,11 +40,35 @@ impl Default for DenySet {
 impl DenySet {
     pub fn empty() -> Self {
         Self {
+            refuse_all: false,
             version: None,
             generated_at: None,
             revoked_uris: BTreeSet::new(),
             revoked_nonces: BTreeSet::new(),
         }
+    }
+
+    /// Return a set that refuses each identifier and each nonce (W25-38).
+    ///
+    /// The set fails closed. It is not an empty list. A valid document that
+    /// [`DenySet::apply_json`] applies replaces it.
+    pub fn refuse_all() -> Self {
+        Self {
+            refuse_all: true,
+            ..Self::empty()
+        }
+    }
+
+    /// Return true when the set refuses each identifier and each nonce.
+    pub fn refuses_all(&self) -> bool {
+        self.refuse_all
+    }
+
+    /// Parse one deny JSON document into a new set.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, IdentityError> {
+        let mut deny = Self::empty();
+        deny.apply_json(bytes)?;
+        Ok(deny)
     }
 
     pub fn version(&self) -> Option<u64> {
@@ -73,6 +101,7 @@ impl DenySet {
                 return Ok(DenyApply::IgnoredOlder);
             }
         }
+        self.refuse_all = false;
         self.version = Some(document.version);
         self.generated_at = Some(document.generated_at);
         self.revoked_uris = uris;
@@ -81,6 +110,9 @@ impl DenySet {
     }
 
     pub fn reject_uri(&self, id: &SpiffeId) -> Result<(), IdentityError> {
+        if self.refuse_all {
+            return Err(IdentityError::DenyDocument);
+        }
         if self.revoked_uris.contains(id.as_uri()) {
             return Err(IdentityError::Revoked);
         }
@@ -88,6 +120,9 @@ impl DenySet {
     }
 
     pub fn reject_nonce(&self, nonce: &[u8; 16]) -> Result<(), IdentityError> {
+        if self.refuse_all {
+            return Err(IdentityError::DenyDocument);
+        }
         if self.revoked_nonces.contains(nonce) {
             return Err(IdentityError::Revoked);
         }

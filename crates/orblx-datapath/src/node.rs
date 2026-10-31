@@ -806,16 +806,40 @@ async fn run_mesh_inner(
                 _ = tick.tick() => {
                     // The read runs on a blocking thread, so a slow disk does not stop
                     // the packet runtime (W25-11).
-                    let path = deny_dir.join("deny.json");
-                    let read = tokio::task::spawn_blocking(move || fs::read(path)).await;
-                    if let Ok(Ok(bytes)) = read {
-                        if last_text.as_deref() != Some(bytes.as_slice()) {
-                            if let Some(deny) = parse_deny(&bytes) {
-                                // Replace first, so a session that starts now uses the new list.
-                                // Then close the open sessions of the denied peers.
-                                deny_endpoint.replace_deny(deny.clone());
-                                close_denied_links(&lock_mesh, &deny);
-                                last_text = Some(bytes);
+                    let dir = Arc::clone(&deny_dir);
+                    let read = tokio::task::spawn_blocking(move || {
+                        orblx_identity::read_deny_file(&dir)
+                    })
+                    .await;
+                    // W25-38: a deny file that is not valid, did not open, or is missing
+                    // after enroll refuses new sessions (fail closed). The node never
+                    // keeps an old or empty list in place of such a file.
+                    let next = match read {
+                        Ok(Ok(Some(bytes))) if last_text.as_deref() == Some(bytes.as_slice()) => {
+                            Ok(None)
+                        }
+                        Ok(Ok(Some(bytes))) => parse_deny(&bytes)
+                            .map(|deny| Some((deny, bytes)))
+                            .ok_or_else(|| "The deny file is not valid.".to_string()),
+                        // The node was never enrolled and has no deny file.
+                        Ok(Ok(None)) => Ok(None),
+                        Ok(Err(err)) => Err(err.to_string()),
+                        Err(_) => Err("The deny file read failed.".to_string()),
+                    };
+                    match next {
+                        Ok(None) => {}
+                        Ok(Some((deny, bytes))) => {
+                            // Replace first, so a session that starts now uses the new list.
+                            // Then close the open sessions of the denied peers.
+                            deny_endpoint.replace_deny(deny.clone());
+                            close_denied_links(&lock_mesh, &deny);
+                            last_text = Some(bytes);
+                        }
+                        Err(reason) => {
+                            last_text = None;
+                            if !deny_endpoint.deny_refuses_all() {
+                                eprintln!("{reason} The node refuses new sessions.");
+                                deny_endpoint.replace_deny(DenySet::refuse_all());
                             }
                         }
                     }

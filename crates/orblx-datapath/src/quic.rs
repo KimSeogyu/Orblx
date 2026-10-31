@@ -201,6 +201,13 @@ impl HelloEndpoint {
         *slot = deny;
     }
 
+    /// True when the endpoint refuses each peer because its deny file failed (W25-38).
+    #[must_use]
+    pub fn deny_refuses_all(&self) -> bool {
+        let slot = self.auth.deny.lock().unwrap_or_else(|err| err.into_inner());
+        slot.refuses_all()
+    }
+
     /// True when the deny list of the endpoint revokes the peer SVID (W24).
     #[must_use]
     pub fn denies(&self, peer: &SpiffeId) -> bool {

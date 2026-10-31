@@ -178,6 +178,11 @@ pub struct EnrollResult {
     pub advertised_routes: Vec<String>,
     pub exit_approved: bool,
     pub ticket: Option<IssuedTicket>,
+    /// The deny list of the node from the enroll reply (W25-38).
+    ///
+    /// `write_state` writes it to `deny.json` with an atomic rename, so an enrolled node
+    /// starts with a valid deny file. None keeps the deny file as it is.
+    pub deny: Option<String>,
 }
 
 impl std::fmt::Debug for EnrollResult {
@@ -1517,6 +1522,7 @@ fn finish_enroll(
         advertised_routes: view.advertised_routes,
         exit_approved: view.exit_approved,
         ticket: Some(ticket),
+        deny: None,
     })
 }
 
@@ -1564,6 +1570,7 @@ fn issue_leaf(inner: &mut Inner, name: &str, now: SystemTime) -> Result<EnrollRe
         advertised_routes: view.advertised_routes,
         exit_approved: view.exit_approved,
         ticket: Some(ticket),
+        deny: None,
     })
 }
 
@@ -1975,6 +1982,9 @@ impl EnrollResult {
         )?;
         if let Some(ticket) = &self.ticket {
             write_ticket_files(dir, ticket)?;
+        }
+        if let Some(deny) = &self.deny {
+            orblx_identity::store_deny_file(dir, deny).map_err(CoordError::io)?;
         }
         Ok(())
     }
