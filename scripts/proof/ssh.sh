@@ -116,7 +116,8 @@ idp() {
 
 # mint USER: one ID token for USER@example.test (email_verified true) at /tokens/USER.
 mint() {
-  idp mint --dir /idp --kid rs1 --issuer "$ISSUER" --aud "$CLIENT" --out "/tokens/$1" \
+  # The idp service runs with a fixed address, so a second "run" container cannot start.
+  dc exec -T idp orblx-test-idp mint --dir /idp --kid rs1 --issuer "$ISSUER" --aud "$CLIENT" --out "/tokens/$1" \
     --sub "$1" --email "$1@example.test" >/dev/null
 }
 
