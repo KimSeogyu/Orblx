@@ -10,6 +10,11 @@
 # number of other running orblx containers. A sampler counts them every ORBLX_PROOF_SAMPLE_SECS
 # seconds (default 2) during the run, and the end line gives the maximum.
 # When docker ps fails, the count is "unknown" (unknown_samples in the end line).
+# W25-35: the proof user often cannot use the docker socket (the proofs use "sudo -n docker").
+# Thus, when "docker ps" fails and the user is not root, the count uses "sudo -n docker ps".
+# When unknown_samples is more than 0, the contention of the run is not known:
+# proof_lock_end prints "proof_contention_invalid LABEL unknown_samples N samples M" after the
+# proof_contention line, releases the lock, and stops the script with exit status 3.
 # Env:
 #   ORBLX_PROOF_LOCK       lock file. Default /workspace/.orblx-proof.lock when /workspace is
 #                          a writable directory, else ${TMPDIR:-/tmp}/orblx-proof.lock.
@@ -56,9 +61,15 @@ proof_lock_ms() {
 
 # Print the running orblx container names that do not belong to this proof.
 # Return 2 when docker ps fails (then the count is not known).
+proof_lock_docker_names() {
+  docker ps --format '{{.Names}}' 2>/dev/null && return 0
+  [[ "$(id -u)" != "0" ]] || return 2
+  sudo -n docker ps --format '{{.Names}}' 2>/dev/null || return 2
+}
+
 proof_lock_others() {
   local names name own mine
-  names="$(docker ps --format '{{.Names}}' 2>/dev/null)" || return 2
+  names="$(proof_lock_docker_names)" || return 2
   while IFS= read -r name; do
     [[ "$name" == orblx-* ]] || continue
     mine=0
@@ -403,11 +414,19 @@ proof_lock_end() {
     PROOF_LOCK_SAMPLER=""
   fi
   proof_context end
+  local invalid=""
   if [[ -n "$PROOF_LOCK_SAMPLES" && -f "$PROOF_LOCK_SAMPLES" ]]; then
     awk -v label="$PROOF_LOCK_LABEL" '
       { n++; if ($2 < 0) unknown++; if ($2 > 0) busy++; if ($2 > maxc) maxc = $2; if ($3 > maxl) maxl = $3 }
-      END { printf "proof_contention %s samples %d contended_samples %d unknown_samples %d max_other_orblx_containers %d max_load1 %s\n", label, n, busy + 0, unknown + 0, maxc + 0, (n ? maxl : "-") }
+      END {
+        printf "proof_contention %s samples %d contended_samples %d unknown_samples %d max_other_orblx_containers %d max_load1 %s\n", label, n, busy + 0, unknown + 0, maxc + 0, (n ? maxl : "-")
+        if (unknown > 0) printf "proof_contention_invalid %s unknown_samples %d samples %d\n", label, unknown, n
+      }
     ' "$PROOF_LOCK_SAMPLES"
+    # W25-35: fail closed when the sampler could not count the other containers.
+    if awk '$2 < 0 {bad = 1} END {exit !bad}' "$PROOF_LOCK_SAMPLES"; then
+      invalid=1
+    fi
     rm -f "$PROOF_LOCK_SAMPLES"
     PROOF_LOCK_SAMPLES=""
   fi
@@ -423,4 +442,8 @@ proof_lock_end() {
     echo "proof_lock ${PROOF_LOCK_LABEL} released at $(proof_lock_now)"
   fi
   PROOF_LOCK_LABEL=""
+  if [[ -n "$invalid" ]]; then
+    echo "proof_lock FAIL: the sampler could not count the other orblx containers, so the run is not valid (W25-35)." >&2
+    exit 3
+  fi
 }
