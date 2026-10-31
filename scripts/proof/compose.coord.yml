@@ -37,6 +37,24 @@ services:
     networks:
       - proof
 
+  # W25-14b: node-a with a TUN device. It uses the node-a state, so "orblx up" can run
+  # again after a TUN failure without a new enroll token.
+  node-a-tun:
+    image: orblx-coord:w18
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    depends_on:
+      - coord
+    volumes:
+      - orblx-coord-store:/coord-state:ro
+      - orblx-node-a:/var/lib/orblx
+    networks:
+      - proof
+
   node-b:
     image: orblx-coord:w18
     profiles: ["nodes"]
