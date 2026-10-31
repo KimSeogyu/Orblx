@@ -33,6 +33,7 @@ mod punch;
 mod relay;
 mod same_nat;
 mod signed;
+mod status_file;
 mod stick;
 mod stun;
 
