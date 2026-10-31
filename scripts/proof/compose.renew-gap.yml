@@ -1,0 +1,57 @@
+# W25-11 SVID renewal packet gap proof (renew-gap.sh).
+# Two orblx node daemons (node.rs on TUN) and one coordinator on one bridge network.
+# renew-gap.sh sets RG_* and passes the project name with -p.
+services:
+  coord:
+    image: ${RG_IMAGE}
+    command: [coord, serve, --state, /var/lib/orblx, --listen, "0.0.0.0:443", --name, coord]
+    environment:
+      ORBLX_OIDC_MODE: google
+      ORBLX_SVID_TTL: ${RG_TTL}
+    volumes:
+      - ${RG_COORD_STATE}:/var/lib/orblx
+    networks:
+      proof:
+        ipv4_address: ${RG_NET}.10
+
+  node-a:
+    image: ${RG_IMAGE}
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    environment:
+      ORBLX_TRACE_RENEW: "1"
+    volumes:
+      - ${RG_STATE_A}:/var/lib/orblx
+      - ${RG_NETMAP_A}:/etc/orblx/netmap.json:ro
+    command: [up, --netmap, /etc/orblx/netmap.json, --state-dir, /var/lib/orblx, --listen, "0.0.0.0:443", --coord, "${RG_NET}.10:443", --coord-name, coord]
+    networks:
+      proof:
+        ipv4_address: ${RG_NET}.11
+
+  node-b:
+    image: ${RG_IMAGE}
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    environment:
+      ORBLX_TRACE_RENEW: "1"
+    volumes:
+      - ${RG_STATE_B}:/var/lib/orblx
+      - ${RG_NETMAP_B}:/etc/orblx/netmap.json:ro
+    command: [up, --netmap, /etc/orblx/netmap.json, --state-dir, /var/lib/orblx, --listen, "0.0.0.0:443", --coord, "${RG_NET}.10:443", --coord-name, coord]
+    networks:
+      proof:
+        ipv4_address: ${RG_NET}.12
+
+networks:
+  proof:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${RG_NET}.0/24
+          gateway: ${RG_NET}.1
