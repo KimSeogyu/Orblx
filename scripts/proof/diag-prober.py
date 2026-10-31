@@ -58,10 +58,11 @@ def main():
             for t in a.targets:
                 hdr = struct.pack("!BBHHH", 8, 0, 0, ident, seq)
                 pkt = struct.pack("!BBHHH", 8, 0, csum(hdr + payload), ident, seq) + payload
+                t_ns, m_ns = time.time_ns(), time.monotonic_ns()
                 try:
                     sock.sendto(pkt, (t, 0))
-                    sent[(t, seq)] = time.time_ns()
-                    out.write("s %s %d %d %d\n" % (t, seq, sent[(t, seq)], time.monotonic_ns()))
+                    sent[(t, seq)] = t_ns
+                    out.write("s %s %d %d %d\n" % (t, seq, t_ns, m_ns))
                 except OSError as err:
                     out.write("x %s %d %d %d %s\n" % (t, seq, time.time_ns(), time.monotonic_ns(), err.errno))
             nxt += a.interval
