@@ -581,7 +581,10 @@ async fn fifty_offline_peers_stay_at_or_below_100_packets_per_second() {
     // state files before it (see TestNode::start_traced). The limit stays 500 ms.
     let (node_a, started) =
         TestNode::start_traced(&rig, scratch_a, &enrolled_a, port_a, &netmap_a, Some(trace));
+    // Reported, not gated (PO): the set-up time and the total time from the end of the sleep.
+    let setup = started.saturating_duration_since(trace.base);
     let mut live = None;
+    let mut live_total = None;
     let mut first_send = true;
     while started.elapsed() < Duration::from_secs(5) {
         let _ = node_a.to_node.send(packet_to(2)).await;
@@ -593,6 +596,7 @@ async fn fifty_offline_peers_stay_at_or_below_100_packets_per_second() {
             tokio::time::timeout(Duration::from_millis(20), node_b.from_node.recv()).await
         {
             live = Some(started.elapsed());
+            live_total = Some(trace.base.elapsed());
             trace.mark("harness live_packet_received");
             break;
         }
@@ -617,6 +621,18 @@ async fn fifty_offline_peers_stay_at_or_below_100_packets_per_second() {
     }
     let total: usize = per_second.iter().sum();
     let handshakes = dead.handshake_starts().len();
+    let live_total_ms =
+        live_total.map_or(-1, |total| i128::try_from(total.as_millis()).unwrap_or(-1));
+    println!(
+        "fifty_offline setup_ms {} total_from_sleep_end_ms {live_total_ms} (reported, not gated)",
+        setup.as_millis()
+    );
+    if setup > Duration::from_millis(500) {
+        println!(
+            "fifty_offline host_stall_case setup_ms {} is more than 500 ms (W25-26 rule)",
+            setup.as_millis()
+        );
+    }
     let live = live.expect("the live peer b got no packet in 5 s");
     println!(
         "fifty_offline packets_0_10s {total} pps_avg {:.1} pps_max_1s {} per_second {per_second:?} handshakes {handshakes} live_first_packet_ms {}",
