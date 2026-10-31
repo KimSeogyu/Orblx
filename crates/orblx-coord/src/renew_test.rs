@@ -714,7 +714,11 @@ async fn startup_cost_once() -> StartupPhases {
     )
     .unwrap();
     let ring = TicketRing::single(ticket_key, &[7; 32]).unwrap();
-    let port = free_port();
+    // Node b binds port 0 itself and reports the real port in the listen event. A port from
+    // free_port() is free only until its socket drops, and a parallel test can take it then
+    // (CI startup-cost run 41138247996: "node b ended before its listener started").
+    // Node b has no peer here, so no node dials the endpoint that it enrolls with.
+    let unused_endpoint = "127.0.0.1:9";
     let enroll_start = Instant::now();
     let token = coord.create_token(Duration::from_secs(600)).unwrap();
     let token_done = Instant::now();
@@ -724,7 +728,7 @@ async fn startup_cost_once() -> StartupPhases {
         &bundle,
         "b",
         &token.secret,
-        &[format!("127.0.0.1:{port}")],
+        &[unused_endpoint.to_string()],
         &[],
     ))
     .await;
@@ -741,7 +745,7 @@ async fn startup_cost_once() -> StartupPhases {
     let mut request = node_request(
         config,
         map,
-        port,
+        0,
         node_dir.0.clone(),
         renewer(addr, bundle.clone(), node_dir.0.clone()),
         stop,
@@ -759,10 +763,18 @@ async fn startup_cost_once() -> StartupPhases {
             to_tun: out_tx,
         },
     ));
-    let event = tokio::time::timeout(Duration::from_secs(30), listen_rx)
+    let event = match tokio::time::timeout(Duration::from_secs(30), listen_rx)
         .await
         .expect("node b did not start its listener in 30 s")
-        .expect("node b ended before its listener started");
+    {
+        Ok(event) => event,
+        // The node dropped the listen callback, so it ended. Show its own error.
+        Err(_) => {
+            let ended = tokio::time::timeout(Duration::from_secs(3), task).await;
+            panic!("node b ended before its listener started: {ended:?}");
+        }
+    };
+    assert_ne!(event.addr.port(), 0, "node b reported no bound port");
     let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
     handle.abort();

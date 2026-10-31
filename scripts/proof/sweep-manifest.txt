@@ -44,6 +44,7 @@ row|58|Docker image|docker-image
 partial|61|CLI UX (login/up/down/set)|w18-linux-daemon coord-enroll exit-node
 row|62|Admin CLI / console|admin
 gate|W23-4|sym relay throughput: sym_sym median of 5 runs of 30 s >= 1113 Mbit/s (W25-12)|sym-throughput
+gate|join-time|join time: 20 late-peer joins from a clean state, each 2000 ms or less from the listener start to the first packet (enroll to first packet is report only)|join-time
 
 proof|w18-linux-daemon|scripts/proof/w18-linux-daemon.sh|-|orblx-w18:local
 proof|coord-enroll|scripts/proof/coord-enroll.sh|-|orblx-coord:w18
@@ -60,7 +61,7 @@ proof|nat-realism|scripts/proof/nat-realism.sh|ORBLX_NATR_PROFILE=release ORBLX_
 proof|admin|scripts/proof/admin.sh|-|orblx-admin:w19
 proof|revoke-all|scripts/proof/revoke-all.sh|-|orblx-w24d-revoke:w24
 proof|revoke-followup|scripts/proof/revoke-followup.sh|ORBLX_PROOF_PROFILE=release|orblx-w25a-revoke:w25
-proof|api-tokens|scripts/proof/api-tokens.sh|TOKENS_BIN=@BIN@ TOKENS_PROJECT=orblx-rc3sw-tokens TOKENS_IMAGE=orblx-rc3sw-tokens:local|orblx-rc3sw-tokens:local
+proof|api-tokens|scripts/proof/api-tokens.sh|ATPROOF_BIN=@BIN@ ATPROOF_PROJECT=orblx-rc3sw-tokens ATPROOF_IMAGE=orblx-rc3sw-tokens:local|orblx-rc3sw-tokens:local
 proof|token-no-escalation|scripts/proof/token-no-escalation.sh|ESC_BIN=@BIN@ ESC_PROJECT=orblx-rc3sw-escalation ESC_IMAGE=orblx-rc3sw-escalation:local|orblx-rc3sw-escalation:local
 proof|node-share|scripts/proof/node-share.sh|-|orblx-w25a-share:w25
 proof|user-approval|scripts/proof/user-approval.sh|-|orblx-w25o-users:old orblx-w25o-users:new
@@ -71,3 +72,4 @@ proof|siem-streaming|scripts/proof/siem-streaming.sh|SIEM_BIN=@BIN@ SIEM_PROJECT
 proof|audit-webhooks|scripts/proof/audit-webhooks.sh|HOOKS_BIN=@BIN@ HOOKS_PROJECT=orblx-rc3sw-webhooks HOOKS_IMAGE=orblx-rc3sw-webhooks:local|orblx-rc3sw-webhooks:local
 proof|docker-image|scripts/proof/docker-image.sh|ORBLX_DIMG_PREFIX=orblx-rc3sw-dimg ORBLX_DIMG_IMAGE=orblx-rc3sw-image:local|orblx-rc3sw-image:local
 proof|sym-throughput|scripts/proof/sym-throughput.sh|ORBLX_NATR_PREFIX=orblx-rc3sw-symt- ORBLX_NATR_PROJECT=orblx-rc3sw-symt ORBLX_NATR_IMAGE=orblx-rc3sw-symt:local|orblx-rc3sw-symt:local|^sym_gate ok: |target/sym-throughput/run*.log
+proof|join-time|scripts/proof/join-time.sh|ORBLX_JOIN_PROFILE=release JOIN_PROJECT_BASE=orblx-rc3sw-join ORBLX_JOIN_IMAGE=orblx-rc3sw-join:local|orblx-rc3sw-join:local

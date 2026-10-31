@@ -39,7 +39,7 @@ proof_lock_take "token-no-escalation" "$ESC_PROJECT"
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
 proof_compose_clean "$ESC_PROJECT" || exit 1
-printf 'TOKENS_IMAGE=%s\n' "$ESC_IMAGE" > "$ENV_FILE"
+printf 'ATPROOF_IMAGE=%s\n' "$ESC_IMAGE" > "$ENV_FILE"
 
 as_root() {
   if [[ "$(id -u)" -eq 0 ]]; then

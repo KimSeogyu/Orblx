@@ -190,7 +190,7 @@ caller is not root, so it never asks for a password.
 - `nat-realism`: `ORBLX_NATR_PROFILE=release`, own names `orblx-rc3sw-natr`.
 - `revoke-followup`: `ORBLX_PROOF_PROFILE=release` (its default).
 - `api-tokens`, `token-no-escalation`, `audit-webhooks`, `policy-gitops`, `siem-streaming`: the
-  release binary (`TOKENS_BIN`, `ESC_BIN`, `HOOKS_BIN`, `GITOPS_BIN`, `SIEM_BIN`) and own
+  release binary (`ATPROOF_BIN`, `ESC_BIN`, `HOOKS_BIN`, `GITOPS_BIN`, `SIEM_BIN`) and own
   `orblx-rc3sw-*` project and image names.
 - `split-dns`, `policy-sync`: own `orblx-rc3sw-*` project and image names; `policy-sync` uses
   `ORBLX_SYNC_PROFILE=release` (its default). Linux only.
