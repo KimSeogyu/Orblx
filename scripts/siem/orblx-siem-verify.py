@@ -39,7 +39,7 @@ ACTIONS = [
     "lock-sign", "lock-rotate", "lock-remove", "file-receive", "file-deny",
     "token-create", "token-use", "token-deny", "token-revoke", "share",
     "unshare", "packet-deny", "unrevoke", "sink-error", "user-approve",
-    "user-reject", "route-failover",
+    "user-reject", "reserved-37", "route-failover",
 ]
 
 SYSLOG_HEAD = re.compile(
@@ -68,7 +68,7 @@ def hex32(value, what):
 
 def record_hash(record):
     action = record["action"]
-    if action not in ACTIONS:
+    if action not in ACTIONS or action.startswith("reserved-"):
         raise Bad(f"unknown action {action}")
     canonical = (
         bytes([EVENT_VERSION, ACTIONS.index(action) + 1])
