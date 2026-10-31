@@ -188,11 +188,58 @@ struct TestNode {
     task: JoinHandle<Result<(), orblx_datapath::HelloError>>,
 }
 
+/// Trace points with Unix ms for the set-up window of a test (W25-28).
+///
+/// Each line shows the Unix ms and the ms after the clock of the test started.
+#[derive(Clone, Copy)]
+struct SetupTrace {
+    test: &'static str,
+    started: Instant,
+}
+
+impl SetupTrace {
+    fn mark(self, point: &str) {
+        let unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or(0);
+        eprintln!(
+            "setup_trace {} unix_ms {unix_ms} since_start_ms {} {point}",
+            self.test,
+            self.started.elapsed().as_millis()
+        );
+    }
+}
+
+fn mark(trace: Option<SetupTrace>, point: &str) {
+    if let Some(trace) = trace {
+        trace.mark(point);
+    }
+}
+
 impl TestNode {
     fn start(rig: &Rig, state: Scratch, enrolled: &EnrollResult, port: u16, netmap: &str) -> Self {
+        Self::start_traced(rig, state, enrolled, port, netmap, None)
+    }
+
+    /// Start a node. With `trace`, mark each set-up step. The steps before
+    /// `run_memory_node` are test-only harness code.
+    fn start_traced(
+        rig: &Rig,
+        state: Scratch,
+        enrolled: &EnrollResult,
+        port: u16,
+        netmap: &str,
+        trace: Option<SetupTrace>,
+    ) -> Self {
+        mark(trace, "harness write_state begin");
         enrolled.write_state(&state.0).unwrap();
+        mark(trace, "harness write_state end");
         let netmap_path = state.0.join("netmap.json");
+        mark(trace, "harness netmap_write begin");
         fs::write(&netmap_path, netmap).unwrap();
+        mark(trace, "harness netmap_write end");
+        mark(trace, "harness request_build begin");
         let (stop, stop_rx) = watch::channel(false);
         let (to_node, from_tun) = mpsc::channel(256);
         let (to_tun, from_node) = mpsc::channel(256);
@@ -217,7 +264,13 @@ impl TestNode {
             metrics: None,
             filter: None,
         };
-        let task = tokio::spawn(run_memory_node(request, MemoryDevice { from_tun, to_tun }));
+        mark(trace, "harness request_build end");
+        mark(trace, "harness spawn begin");
+        let task = tokio::spawn(async move {
+            mark(trace, "product run_memory_node enter");
+            run_memory_node(request, MemoryDevice { from_tun, to_tun }).await
+        });
+        mark(trace, "harness spawn end");
         Self {
             state,
             to_node,
@@ -501,22 +554,36 @@ async fn fifty_offline_peers_stay_at_or_below_100_packets_per_second() {
         port_b,
         &netmap_text("b", "100.64.0.2", &peers_b),
     );
+    let slept = Instant::now();
     tokio::time::sleep(Duration::from_millis(500)).await;
     let started = Instant::now();
-    let node_a = TestNode::start(
-        &rig,
-        Scratch::new("fifty-a"),
-        &enrolled_a,
-        port_a,
-        &netmap_text("a", "100.64.0.1", &peers_a),
-    );
+    let trace = SetupTrace {
+        test: "fifty",
+        started,
+    };
+    trace.mark(&format!(
+        "harness sleep_500_end slept_ms {}",
+        slept.elapsed().as_millis()
+    ));
+    mark(Some(trace), "harness scratch begin");
+    let scratch_a = Scratch::new("fifty-a");
+    let netmap_a = netmap_text("a", "100.64.0.1", &peers_a);
+    mark(Some(trace), "harness scratch end");
+    let node_a =
+        TestNode::start_traced(&rig, scratch_a, &enrolled_a, port_a, &netmap_a, Some(trace));
     let mut live = None;
+    let mut first_send = true;
     while started.elapsed() < Duration::from_secs(5) {
         let _ = node_a.to_node.send(packet_to(2)).await;
+        if first_send {
+            trace.mark("harness first_packet_sent");
+            first_send = false;
+        }
         if let Ok(Some(_)) =
             tokio::time::timeout(Duration::from_millis(20), node_b.from_node.recv()).await
         {
             live = Some(started.elapsed());
+            trace.mark("harness live_packet_received");
             break;
         }
     }
