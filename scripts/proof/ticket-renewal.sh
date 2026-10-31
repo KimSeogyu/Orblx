@@ -211,9 +211,23 @@ done
 FIRST_END="$(awk -v e="$FIRST_ENROLL" -v t="$TR_SVID_TTL" 'BEGIN {printf "%.3f", e + t}')"
 
 echo "=== [C] start owner, a, b, c ==="
-dc up -d "${NODES[@]}"
+# Start the nodes one at a time. Each node must list the 3 other peers
+# from the coordinator netmap before the next node starts. If a node
+# dials a peer that does not have it in its netmap yet, that peer
+# refuses the session (a start race that is not part of this proof).
+listed_peers() {
+  status_of "$1" | read_all awk '$1 == "peer" {n++} END {print n + 0}'
+}
 for name in "${NODES[@]}"; do
-  wait_log "$name" "The TUN device" 30
+  dc up -d "$name"
+  wait_log "$name" "The TUN device" 30 || fail "The node ${name} did not start."
+  for ((i = 0; i < 120; i++)); do
+    [[ "$(listed_peers "$name")" -eq 3 ]] && break
+    sleep 0.5
+  done
+  n="$(listed_peers "$name")"
+  echo "netmap_peers ${name} ${n}"
+  [[ "$n" -eq 3 ]] || fail "The node ${name} lists ${n} peers from the netmap after 60 s, not 3."
 done
 # A path shows "direct" only while packets come in (STALE_AFTER is 2 s in node.rs).
 # So each wait step sends one ping to each peer overlay IP.
