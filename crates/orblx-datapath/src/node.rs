@@ -423,6 +423,54 @@ pub fn format_node_status(status: &NodeStatus) -> String {
 /// A live pid returns the status file.
 /// A stopped node returns the overlay IP from the state directory.
 pub fn read_status_text(state_dir: &Path) -> Result<String, HelloError> {
+    let mut text = read_node_status_text(state_dir)?;
+    push_coord_warning(state_dir, &mut text);
+    Ok(text)
+}
+
+/// Add the line `coord TEXT` when the node wrote a version mismatch text (W25-34).
+fn push_coord_warning(state_dir: &Path, text: &mut String) {
+    if let Ok(warning) = fs::read_to_string(state_dir.join(COORD_MISMATCH_FILE)) {
+        let line = warning.lines().next().unwrap_or("").trim();
+        if !line.is_empty() && line.len() <= 200 && !line.chars().any(char::is_control) {
+            text.push_str(&format!("coord {line}\n"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod coord_warning_tests {
+    use super::{push_coord_warning, COORD_MISMATCH_FILE};
+
+    #[test]
+    fn status_shows_the_version_mismatch_text() {
+        let dir = std::env::temp_dir().join(format!("orblx-coord-warning-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut text = "state up\n".to_string();
+        push_coord_warning(&dir, &mut text);
+        assert_eq!(text, "state up\n");
+        std::fs::write(
+            dir.join(COORD_MISMATCH_FILE),
+            "version mismatch, upgrade: the coordinator is older than the node\n",
+        )
+        .unwrap();
+        push_coord_warning(&dir, &mut text);
+        assert_eq!(
+            text,
+            "state up\ncoord version mismatch, upgrade: the coordinator is older than the node\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The node file with the last version mismatch text from the coordinator (W25-34).
+///
+/// `orblx status` shows it as the line `coord TEXT`. The node removes the file when the
+/// coordinator replies with a signed netmap seq again.
+pub const COORD_MISMATCH_FILE: &str = "coord-mismatch";
+
+fn read_node_status_text(state_dir: &Path) -> Result<String, HelloError> {
     let record = read_record(state_dir)?;
     if running_pid(state_dir).is_some() {
         let path = state_dir.join(NODE_STATUS_FILE);

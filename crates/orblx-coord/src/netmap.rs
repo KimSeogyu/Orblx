@@ -99,6 +99,21 @@ impl PartialEq for SignedGrants {
 impl Eq for SignedGrants {}
 
 impl SignedGrants {
+    /// The exact bytes that the signature covers.
+    #[must_use]
+    pub fn signed_bytes(&self) -> &[u8] {
+        self.signed_bytes.get().as_bytes()
+    }
+
+    /// The SHA-256 of the signed bytes in lowercase hex (W25-34 grants binding).
+    ///
+    /// The coordinator puts this value in [`Netmap::grants_sha256`] of the signed netmap.
+    #[must_use]
+    pub fn digest_hex(&self) -> String {
+        use sha2::{Digest, Sha256};
+        encode_hex(&Sha256::digest(self.signed_bytes()))
+    }
+
     /// The wire form with the exact signed bytes.
     #[must_use]
     pub fn to_wire(&self) -> SignedGrantsWire {
@@ -442,6 +457,7 @@ mod tests {
             split_dns: Vec::new(),
             seq: 0,
             issued_at_ms: 0,
+            grants_sha256: String::new(),
         }
     }
 
@@ -585,6 +601,10 @@ mod tests {
     ///
     /// The test fails when one of these structs loses `deny_unknown_fields`, or gets a map,
     /// a float, `untagged`, or `flatten`, or when a new struct is not in the list.
+    /// Crypto re-review: it also fails on a serde attribute that changes the parse
+    /// (`from`, `try_from`, `transparent`, `remote`, `deserialize_with`, `with`, `alias`,
+    /// `other`, `bound`), on a field that is not `pub`, and on a new grant struct in the
+    /// identity crate that is not in the list.
     #[test]
     fn signed_structs_keep_a_strict_form() {
         let datapath = include_str!("../../orblx-datapath/src/netmap.rs");
@@ -619,14 +639,82 @@ mod tests {
                 assert!(datapath_types.contains(&name), "add {name} to the guard");
             }
         }
+        // Each grant struct in the identity policy file is in the list.
+        for line in identity.lines() {
+            if let Some(rest) = line.strip_prefix("pub struct ") {
+                let name = rest.split([' ', '{', '(', '<']).next().unwrap();
+                if name.contains("Grant") {
+                    assert!(identity_types.contains(&name), "add {name} to the guard");
+                }
+            }
+        }
+    }
+
+    /// The guard catches each parse-changing serde attribute and a private field.
+    #[test]
+    fn strict_form_guard_catches_parse_changing_attributes() {
+        for attr in [
+            "#[serde(from = \"Other\")]",
+            "#[serde(try_from = \"Other\")]",
+            "#[serde(transparent)]",
+            "#[serde(remote = \"Other\")]",
+        ] {
+            let text = format!(
+                "#[serde(deny_unknown_fields)]\n{attr}\npub struct Probe {{\n    pub a: u64,\n}}\n"
+            );
+            assert!(strict_problem(&text, "Probe", &[]).is_some(), "{attr}");
+        }
+        for field_attr in [
+            "#[serde(deserialize_with = \"f\")]",
+            "#[serde(with = \"m\")]",
+            "#[serde(alias = \"b\")]",
+            "#[serde(other)]",
+            "#[serde(bound = \"\")]",
+        ] {
+            let text = format!(
+                "#[serde(deny_unknown_fields)]\npub struct Probe {{\n    {field_attr}\n    pub a: u64,\n}}\n"
+            );
+            assert!(
+                strict_problem(&text, "Probe", &[]).is_some(),
+                "{field_attr}"
+            );
+        }
+        let private = "#[serde(deny_unknown_fields)]\npub struct Probe {\n    a: u64,\n}\n";
+        assert!(strict_problem(private, "Probe", &[]).is_some());
+        let crate_field =
+            "#[serde(deny_unknown_fields)]\npub struct Probe {\n    pub(crate) a: u64,\n}\n";
+        assert!(strict_problem(crate_field, "Probe", &[]).is_some());
+        let good = "#[serde(deny_unknown_fields)]\npub struct Probe {\n    #[serde(default, skip_serializing_if = \"is_zero\")]\n    pub a: u64,\n}\n";
+        assert_eq!(strict_problem(good, "Probe", &[]), None);
     }
 
     fn check_strict(text: &str, name: &str, known: &[&str]) {
+        if let Some(problem) = strict_problem(text, name, known) {
+            panic!("{problem}");
+        }
+    }
+
+    /// The serde attribute words that change how a struct or a field parses.
+    const PARSE_CHANGING: [&str; 9] = [
+        "from =",
+        "try_from",
+        "transparent",
+        "remote",
+        "deserialize_with",
+        "with =",
+        "alias",
+        "other",
+        "bound",
+    ];
+
+    fn strict_problem(text: &str, name: &str, known: &[&str]) -> Option<String> {
         let lines: Vec<&str> = text.lines().collect();
-        let start = lines
+        let Some(start) = lines
             .iter()
             .position(|line| line.trim() == format!("pub struct {name} {{"))
-            .unwrap_or_else(|| panic!("the guard did not find {name}"));
+        else {
+            return Some(format!("the guard did not find {name}"));
+        };
         let mut attrs = Vec::new();
         for line in lines[..start].iter().rev() {
             let line = line.trim();
@@ -636,26 +724,49 @@ mod tests {
                 break;
             }
         }
-        assert!(
-            attrs.contains(&"#[serde(deny_unknown_fields)]"),
-            "{name} has no deny_unknown_fields"
-        );
-        let end = start + lines[start..].iter().position(|line| *line == "}").unwrap();
+        if !attrs.contains(&"#[serde(deny_unknown_fields)]") {
+            return Some(format!("{name} has no deny_unknown_fields"));
+        }
+        for attr in attrs.iter().filter(|attr| attr.starts_with("#[serde(")) {
+            if let Some(word) = PARSE_CHANGING.iter().find(|word| attr.contains(*word)) {
+                return Some(format!("{name} has the serde attribute {word}"));
+            }
+        }
+        let end = start + lines[start..].iter().position(|line| *line == "}")?;
         let body = lines[start..=end].join("\n");
         let body = body.replace("Box<RawValue>", "");
         for word in [
             "untagged", "flatten", "HashMap", "BTreeMap", "f32", "f64", "Value",
         ] {
-            assert!(!body.contains(word), "{name} has {word}");
+            if body.contains(word) {
+                return Some(format!("{name} has {word}"));
+            }
         }
         for line in &lines[start + 1..end] {
             let line = line.trim();
-            if let Some(field) = line.strip_prefix("pub ") {
-                let (_, ty) = field.split_once(": ").unwrap();
-                let ty = ty.trim_end_matches(',');
-                assert!(allowed_type(ty, known), "{name} has the field type {ty}");
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            if line.starts_with("#[") {
+                if line.starts_with("#[serde(") {
+                    if let Some(word) = PARSE_CHANGING.iter().find(|word| line.contains(*word)) {
+                        return Some(format!("{name} has the field serde attribute {word}"));
+                    }
+                }
+                continue;
+            }
+            let Some(field) = line.strip_prefix("pub ") else {
+                return Some(format!("{name} has a field that is not pub: {line}"));
+            };
+            let Some((_, ty)) = field.split_once(": ") else {
+                return Some(format!("{name} has a field the guard cannot read: {line}"));
+            };
+            let ty = ty.trim_end_matches(',');
+            if !allowed_type(ty, known) {
+                return Some(format!("{name} has the field type {ty}"));
             }
         }
+        None
     }
 
     fn allowed_type(ty: &str, known: &[&str]) -> bool {

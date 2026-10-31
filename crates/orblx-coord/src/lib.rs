@@ -69,7 +69,7 @@ pub use netmap::{
     verify_signed_netmap, NetmapKey, SignedEndpoint, SignedGrants, SignedGrantsWire, SignedNetmap,
     SignedNetmapWire,
 };
-pub use proto::GrantAsk;
+pub use proto::{GrantAsk, NODE_PROTO, VERSION_MISMATCH};
 pub use seq::{
     read_node_seq, reset_node_seq, unix_ms, Intake, COORD_SEQ_FILE, HEARTBEAT_MS, NODE_SEQ_FILE,
 };
@@ -456,6 +456,69 @@ mod tests {
             revoked_at.elapsed()
         );
         assert_ne!(revoked.etag, joined.etag);
+        handle.abort();
+    }
+
+    /// W25-34 (Crypto re-review): through the real server, a held `policy-wait` with no
+    /// change replies with a new signed stamp within the heartbeat time (20 s or less).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn policy_wait_sends_a_signed_heartbeat_within_20_s() {
+        let scratch = Scratch::new();
+        let node = Scratch::new();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let (addr, handle) =
+            super::server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .unwrap();
+        let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+        let token = coord.create_token(Duration::from_secs(600)).unwrap();
+        super::client::enroll_with_token(
+            addr,
+            "coord",
+            &bundle,
+            "beat-a",
+            &token.secret,
+            &["beat-a:443".to_string()],
+            &[],
+        )
+        .await
+        .unwrap()
+        .write_state(&node.0)
+        .unwrap();
+        let wait = |etag: Option<String>| {
+            let (dir, bundle) = (node.0.clone(), bundle.clone());
+            tokio::task::spawn_blocking(move || {
+                super::client::fetch_policy_wait_blocking(
+                    addr,
+                    "coord",
+                    &bundle,
+                    &dir,
+                    etag.as_deref(),
+                )
+            })
+        };
+        let first = wait(None).await.unwrap().unwrap();
+        let first_seq = first.view.signed_netmap.netmap.seq;
+        let first_at = first.view.signed_netmap.netmap.issued_at_ms;
+        let held_at = std::time::Instant::now();
+        let beat = wait(Some(first.etag.clone())).await.unwrap().unwrap();
+        let held = held_at.elapsed();
+        assert!(
+            held <= Duration::from_millis(super::HEARTBEAT_MS + 2_000),
+            "the heartbeat came after {held:?}"
+        );
+        assert!(
+            held <= Duration::from_secs(20),
+            "the heartbeat came after {held:?}"
+        );
+        let netmap = &beat.view.signed_netmap.netmap;
+        assert!(netmap.seq > first_seq);
+        assert!(netmap.issued_at_ms >= first_at + super::HEARTBEAT_MS);
+        assert!(orblx_datapath::netmap_fresh(
+            netmap.issued_at_ms,
+            super::unix_ms(SystemTime::now())
+        ));
+        assert_ne!(beat.etag, first.etag);
         handle.abort();
     }
 

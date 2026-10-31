@@ -49,6 +49,14 @@ pub struct Netmap {
     /// netmap age check ([`netmap_fresh`]). The value 0 means "no stamp".
     #[serde(default, skip_serializing_if = "is_zero")]
     pub issued_at_ms: u64,
+    /// The SHA-256 (64 lowercase hex characters) of the signed grants bytes that the
+    /// coordinator sent with this netmap (W25-34, Crypto grants binding).
+    ///
+    /// The existing netmap signature covers the field. A node refuses a signed netmap when
+    /// the field does not match the grants that came with it, so a fresh netmap cannot carry
+    /// older grants. The node-local `netmap.json` copy has an empty value.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub grants_sha256: String,
 }
 
 /// The maximum netmap age for a new SSH certificate login in milliseconds (W25-34).
@@ -305,7 +313,7 @@ impl Netmap {
         Ok(map)
     }
 
-    /// Return a copy with no stamp (`seq` and `issued_at_ms` are 0) (W25-34).
+    /// Return a copy with no stamp (`seq` and `issued_at_ms` are 0, `grants_sha256` is empty) (W25-34).
     ///
     /// The node writes this copy to `netmap.json`. A heartbeat that changes only the stamp
     /// does not change the file, so the datapath does not reload.
@@ -314,6 +322,7 @@ impl Netmap {
         let mut copy = self.clone();
         copy.seq = 0;
         copy.issued_at_ms = 0;
+        copy.grants_sha256 = String::new();
         copy
     }
 

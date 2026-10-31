@@ -151,7 +151,8 @@ struct Inner {
     /// The digest of the last refused policy file.
     fail_hash: Option<[u8; 32]>,
     /// The signed netmap `seq` allocator (W25-34).
-    seq: Mutex<crate::seq::SeqBook>,
+    /// One book for each state directory in the process.
+    seq: std::sync::Arc<Mutex<crate::seq::SeqBook>>,
 }
 
 /// The coordinator state.
@@ -311,7 +312,7 @@ impl Coordinator {
                 saw_file: false,
                 audit: None,
                 fail_hash: None,
-                seq: Mutex::new(crate::seq::SeqBook::open(dir)?),
+                seq: crate::seq::shared_book(dir)?,
             })),
         };
         {
@@ -806,6 +807,42 @@ impl Coordinator {
     ) -> Result<(), CoordError> {
         let mut inner = self.lock()?;
         record(&mut inner, actor, action, target, before, after, detail)
+    }
+
+    /// Set the stored netmap `seq` to the clock time after a clock-forward error (W25-34).
+    ///
+    /// The owner command `orblx admin netmap-seq-reset` calls this. It works only when the
+    /// stored `seq` is ahead of the clock, and it never sets a value below the clock time.
+    /// It writes one `netmap-seq-reset` audit record (code 41).
+    pub fn netmap_seq_reset(
+        &self,
+        actor: &str,
+        now: SystemTime,
+    ) -> Result<serde_json::Value, CoordError> {
+        let mut inner = self.lock()?;
+        let now_ms = crate::seq::unix_ms(now);
+        let (old, new) = inner
+            .seq
+            .lock()
+            .map_err(|_| CoordError::State)?
+            .reset_to_now(now_ms)?;
+        let before: [u8; 32] = Sha256::digest(format!("{old}\n").as_bytes()).into();
+        let after: [u8; 32] = Sha256::digest(format!("{new}\n").as_bytes()).into();
+        let detail = format!("from {old} to {new} now_ms {now_ms}");
+        record(
+            &mut inner,
+            actor,
+            ConfigAction::NetmapSeqReset,
+            crate::seq::COORD_SEQ_FILE,
+            before,
+            after,
+            &detail,
+        )?;
+        Ok(serde_json::json!({
+            "op": "netmap-seq-reset",
+            "from": old,
+            "to": new,
+        }))
     }
 
     /// Set up node lock with the first trusted owner keys (W23-1).
@@ -1632,6 +1669,7 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
         split_dns: published_split_dns(&inner.policy, self_visible),
         seq: 0,
         issued_at_ms: 0,
+        grants_sha256: String::new(),
     };
     let receiver = SpiffeId::node(&self_node.name)?;
     let grants = filtered_grants(inner, &receiver, &self_node, self_visible);
@@ -1651,8 +1689,11 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
     )?;
     payload.seq = seq;
     payload.issued_at_ms = issued_at_ms;
-    let signed_netmap = inner.netmap_key.sign_netmap(&payload)?;
+    // W25-34 (Crypto grants binding): the signed netmap carries the SHA-256 of the signed
+    // grants bytes, so a node refuses a fresh netmap with older grants.
     let signed_grants = inner.netmap_key.sign_grants(&grants)?;
+    payload.grants_sha256 = signed_grants.digest_hex();
+    let signed_netmap = inner.netmap_key.sign_netmap(&payload)?;
     let netmap_public = inner.netmap_key.public();
     verify_signed_netmap(&signed_netmap, &netmap_public)?;
     verify_signed_grants(&signed_grants, &netmap_public)?;
@@ -2069,6 +2110,7 @@ fn write_view(
     endpoints: &[SignedEndpoint],
 ) -> Result<ViewWrite, CoordError> {
     let now_ms = crate::seq::unix_ms(SystemTime::now());
+    crate::seq::check_grants_binding(netmap, grants)?;
     let intake = crate::seq::node_intake(dir, netmap, now_ms)?;
     let signed_path = dir.join("netmap.signed.json");
     if intake == crate::seq::Intake::Same {

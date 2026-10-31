@@ -618,6 +618,7 @@ mod tests {
             split_dns: Vec::new(),
             seq: 0,
             issued_at_ms: 0,
+            grants_sha256: String::new(),
         };
         let untouched = netmap.clone();
         let mut plain = netmap.clone();
@@ -660,6 +661,7 @@ mod tests {
             split_dns: Vec::new(),
             seq: 0,
             issued_at_ms: 0,
+            grants_sha256: String::new(),
         };
         write_locked_netmap(&path, &big).unwrap();
         let small = {

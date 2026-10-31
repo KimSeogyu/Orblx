@@ -282,8 +282,24 @@ async fn handle_connection(
         println!("coord rejected: the stream did not open");
         CoordError::Protocol("The request is not valid.".to_string())
     })?;
-    let request = proto::read_json::<Request>(&mut recv).await?;
-    let response = match dispatch(coord, &connection, request, stamp).await {
+    let incoming = proto::read_json::<proto::Incoming>(&mut recv).await?;
+    let request = incoming.request;
+    let gated = proto::version_gate(&request.op, incoming.proto);
+    if gated.is_err() {
+        println!(
+            "coord rejected: {} node {} op {} protocol {} (need {})",
+            proto::VERSION_MISMATCH,
+            request.name,
+            request.op,
+            incoming.proto,
+            proto::NODE_PROTO
+        );
+    }
+    let result = match gated {
+        Ok(()) => dispatch(coord, &connection, request, stamp).await,
+        Err(err) => Err(err),
+    };
+    let response = match result {
         Ok(response) => response,
         Err(err) => {
             println!("coord rejected: {}", err.public_text());
@@ -633,6 +649,10 @@ fn run_admin(
         "admin-revoke-all" => admin::revoke_all(coord, &request.name, actor, now)?,
         "admin-revoke-undo" => admin::revoke_undo(coord, &request.name, actor, now)?,
         "admin-expire" => admin::expire(coord, &request.name, actor)?,
+        "admin-netmap-seq-reset" => {
+            owner_only()?;
+            coord.netmap_seq_reset(actor, now)?
+        }
         "admin-routes" => admin::routes(coord)?,
         "admin-audit" => admin::audit(coord, parse_since(&request.name)?)?,
         "admin-grants" => agent::list(coord, now)?,

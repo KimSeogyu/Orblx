@@ -9,8 +9,9 @@
 #   The script prints the coordinator interface bytes per node per hour.
 # Gate R (replay after revoke): save the signed files of a. Node a (owner) revokes and expires c.
 #   A proof tool (crates/orblx-coord/examples/netmap_replay.rs) gives the saved older signed
-#   netmap to the node intake path. The node must refuse it (seq-lower). c stays out of the
-#   netmap of a, and a cannot ping c.
+#   netmap to the node intake path. In the first 60 s after its issued_at, the node must refuse
+#   it (seq-lower). After 60 s, the node must refuse it (stale, Crypto fix 2). c stays out of
+#   the netmap of a, and a cannot ping c.
 # Gate O (offline node): stop b for OFFLINE_SECONDS (default 75) and change the policy.
 #   Start b. b must take the new netmap and get a direct path to a with no manual step.
 # Gate B (backup-restore): copy the coordinator state, wait, put the copy back, and restart
@@ -314,6 +315,7 @@ echo "=== [C] Gate R: replay after revoke ==="
 mkdir -p "$WORK/a/replay-old"
 cp "$WORK/a/netmap.signed.json" "$WORK/a/grants.signed.json" "$WORK/a/endpoints.json" "$WORK/a/replay-old/"
 saved_seq="$(jq -r '.netmap.seq' "$WORK/a/replay-old/netmap.signed.json")"
+saved_issued="$(jq -r '.netmap.issued_at_ms' "$WORK/a/replay-old/netmap.signed.json")"
 jq -e '.netmap.peers[] | select(.name=="c")' "$WORK/a/replay-old/netmap.signed.json" >/dev/null \
   || fail "The saved netmap of a does not have c."
 c_ip="$(overlay_of a c)"
@@ -329,10 +331,26 @@ done
 jq -e '.peers[] | select(.name=="c")' "$WORK/a/netmap.json" >/dev/null 2>&1 && fail "c is still in the netmap of a."
 echo "after revoke: node_seq_a $(node_seq a) (saved ${saved_seq})"
 docker cp "$REPLAY_BIN" "$(dc --profile nodes ps -q a):/tmp/netmap_replay" >/dev/null
-replay_out="$(dc exec -T a /tmp/netmap_replay /var/lib/orblx /var/lib/orblx/replay-old 2>&1)" && replay_rc=0 || replay_rc=$?
-printf '%s\n' "$replay_out"
-[[ "$replay_rc" -eq 0 ]] || fail "Gate R: the node did not refuse the replay (rc ${replay_rc})."
-grep -q 'netmap refuse seq-lower' <<<"$replay_out" || fail "Gate R: the refusal is not seq-lower."
+# Crypto fix 2: the node refuses a netmap with issued_at more than 60 s old, before the seq
+# check. A replay in the first 60 s fails on seq-lower. A later replay fails on stale.
+replay_once() {
+  local expect="$1" age out rc
+  age=$(( $(now_ms) - saved_issued ))
+  out="$(dc exec -T a /tmp/netmap_replay /var/lib/orblx /var/lib/orblx/replay-old 2>&1)" && rc=0 || rc=$?
+  printf '%s\n' "$out"
+  echo "replay age_ms ${age} expect ${expect}"
+  [[ "$rc" -eq 0 ]] || fail "Gate R: the node did not refuse the replay (rc ${rc})."
+  grep -q "netmap refuse ${expect}" <<<"$out" || fail "Gate R: the refusal is not ${expect} (age ${age} ms)."
+}
+if [[ $(( $(now_ms) - saved_issued )) -lt 55000 ]]; then
+  replay_once seq-lower
+else
+  echo "replay age is 55 s or more: the seq-lower replay step is not done (the stale step follows)."
+fi
+while [[ $(( $(now_ms) - saved_issued )) -le 62000 ]]; do
+  sleep 1
+done
+replay_once stale
 sleep 20
 jq -e '.peers[] | select(.name=="c")' "$WORK/a/netmap.json" >/dev/null 2>&1 && fail "Gate R: c came back in the netmap of a."
 if dc exec -T a ping -n -c 3 -W 1 "$c_ip" >/dev/null 2>&1; then

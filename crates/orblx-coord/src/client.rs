@@ -464,7 +464,7 @@ pub fn admin_token_expect_blocking(
             .open_bi()
             .await
             .map_err(|err| CoordError::Tls(format!("open: {err}")))?;
-        proto::write_json(&mut send, &request).await?;
+        proto::write_request(&mut send, &request).await?;
         let _ = send.finish();
         let response: Response = proto::read_json(&mut recv).await?;
         close_and_wait(&connection, &endpoint).await;
@@ -575,7 +575,8 @@ pub fn fetch_policy_wait_blocking(
             authed_response(coord, coord_name, bundle_pem, material, request),
         )
         .await
-        .map_err(|_| CoordError::Tls("The policy wait timed out.".to_string()))??;
+        .map_err(|_| CoordError::Tls("The policy wait timed out.".to_string()))?
+        .map_err(unknown_op_is_old_coordinator)?;
         let invalid = || CoordError::Protocol("The coordinator request failed.".to_string());
         let deny = response.detail.take().ok_or_else(invalid)?;
         let etag = response.policy_etag.take().ok_or_else(invalid)?;
@@ -586,6 +587,18 @@ pub fn fetch_policy_wait_blocking(
             etag,
         })
     })
+}
+
+/// The reply of a coordinator to an op that it does not know.
+const UNKNOWN_OP_TEXT: &str = "The request is not valid.";
+
+/// A coordinator before W25-6 (for example the v0.1.0-rc.2 tag) does not know `policy-wait`.
+/// It replies [`UNKNOWN_OP_TEXT`]. The node shows the version mismatch for it (W25-34).
+fn unknown_op_is_old_coordinator(err: CoordError) -> CoordError {
+    match &err {
+        CoordError::Protocol(text) if text == UNKNOWN_OP_TEXT => proto::old_coordinator_error(),
+        _ => err,
+    }
 }
 
 /// The longest time that the coordinator holds one `deny-wait` request.
@@ -680,7 +693,7 @@ async fn authed_response(
         .open_bi()
         .await
         .map_err(|err| CoordError::Tls(format!("open: {err}")))?;
-    proto::write_json(&mut send, &request).await?;
+    proto::write_request(&mut send, &request).await?;
     let _ = send.finish();
     let response: Response = proto::read_json(&mut recv).await?;
     close_and_wait(&connection, &endpoint).await;
@@ -853,7 +866,7 @@ async fn round_trip(
         .open_bi()
         .await
         .map_err(|err| CoordError::Tls(format!("open: {err}")))?;
-    proto::write_json(&mut send, &request).await?;
+    proto::write_request(&mut send, &request).await?;
     let _ = send.finish();
     let response: Response = proto::read_json(&mut recv).await?;
     close_and_wait(&connection, &endpoint).await;
@@ -901,6 +914,10 @@ fn enroll_from_response(
     }
     // W25-34: check the signature over the received bytes, then parse them.
     let signed = verify_netmap_wire(&wire, &public)?;
+    // W25-34: an older coordinator signs no seq. The node does not use its netmap.
+    if signed.netmap.seq == 0 || signed.netmap.issued_at_ms == 0 {
+        return Err(proto::old_coordinator_error());
+    }
     let grants = response
         .grants
         .ok_or_else(|| CoordError::Protocol("The grants are not valid.".to_string()))?;
@@ -995,4 +1012,21 @@ fn block_on<T>(
         .build()
         .map_err(CoordError::io)?;
     runtime.block_on(future)
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::{unknown_op_is_old_coordinator, CoordError, UNKNOWN_OP_TEXT};
+
+    /// W25-34: a coordinator that does not know `policy-wait` gives the version mismatch.
+    #[test]
+    fn unknown_policy_wait_op_is_a_version_mismatch() {
+        let err = unknown_op_is_old_coordinator(CoordError::Protocol(UNKNOWN_OP_TEXT.to_string()));
+        assert!(err
+            .public_text()
+            .starts_with(crate::proto::VERSION_MISMATCH));
+        let other =
+            unknown_op_is_old_coordinator(CoordError::Protocol("The node is revoked.".to_string()));
+        assert_eq!(other.public_text(), "The node is revoked.");
+    }
 }
