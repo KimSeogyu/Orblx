@@ -380,3 +380,17 @@ scripts/proof/release-sweep.sh --contention-check LOG PROOF
 
 It prints `contention_check PROOF ok: unknown_samples 0 (LOG)` (exit 0) or
 `contention_check PROOF INVALID: REASON (LOG)` (exit 1).
+
+## Infrastructure abort or FAIL (W25-27)
+
+PO ruling (2026-10-31 17:20 KST). Use these rules when a proof run aborts. There is no abort
+logic in `proof-lock.sh` or in `release-sweep.sh`, so the rules are in this document.
+
+- Taking the proof lock is NOT a proof step.
+- The first proof step is the first step that builds, runs `cargo test`, starts a container,
+  or runs product code.
+- For `nat-realism`, the first proof step is the `proof_compose_clean` step at
+  `scripts/proof/nat-realism.sh:48`.
+- An abort counts as infrastructure only if the log shows that no proof step started.
+- An abort after the first proof step is a FAIL.
+- If the log is empty, nothing proves that no proof step started. Thus the run is a FAIL.
