@@ -47,6 +47,8 @@ macro_rules! tr {
 
 /// The node record file in the state directory.
 pub const NODE_RECORD_FILE: &str = "node.json";
+/// The temp file for an atomic `node.json` write.
+const NODE_RECORD_TEMP_FILE: &str = ".node.json.tmp";
 
 /// The pid file in the state directory.
 pub const NODE_PID_FILE: &str = "orblxd.pid";
@@ -423,7 +425,7 @@ pub fn format_node_status(status: &NodeStatus) -> String {
 /// A live pid returns the status file.
 /// A stopped node returns the overlay IP from the state directory.
 pub fn read_status_text(state_dir: &Path) -> Result<String, HelloError> {
-    let record = read_record(state_dir)?;
+    let record = read_status_record(state_dir)?;
     if running_pid(state_dir).is_some() {
         let path = state_dir.join(NODE_STATUS_FILE);
         match fs::read_to_string(&path) {
@@ -482,6 +484,7 @@ pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
             .map_err(|err| HelloError::Node(err.to_string()))?,
         netmask: Ipv4Addr::new(255, 255, 255, 255),
     })?;
+    store_record_once(&mut prepared)?;
     prepare_link(&bridge.name, &install)?;
     if !prepared.request.forward_routes.is_empty() {
         crate::subnet::enable_kernel_forward(&prepared.request.forward_routes)?;
@@ -532,6 +535,7 @@ pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
 pub async fn run_memory_node(request: NodeRequest, device: MemoryDevice) -> Result<(), HelloError> {
     let entered_at = Instant::now();
     let mut prepared = prepare_node(request, entered_at)?;
+    store_record_once(&mut prepared)?;
     println!("The overlay IP is {}.", prepared.record.overlay_ip);
     println!(
         "The state directory is {}.",
@@ -551,6 +555,9 @@ struct PreparedNode {
     request: NodeRequest,
     view: NodeView,
     record: NodeRecord,
+    /// `false` until `node.json` is on disk. A new record is written only after the TUN
+    /// device opens, so a failed start leaves the state directory as it was (W25-14b).
+    record_stored: bool,
     router: RouterTable,
     _pid_guard: PidGuard,
     phases: StartPhases,
@@ -571,7 +578,7 @@ fn prepare_node(request: NodeRequest, entered_at: Instant) -> Result<PreparedNod
         .check()
         .map_err(|err| HelloError::Node(err.to_string()))?;
     let view = local_view(&request)?;
-    let record = load_or_create_state(&request.state_dir, &request.netmap)?;
+    let StateRecord { record, stored } = load_state(&request.state_dir, &request.netmap)?;
     if record.overlay_ip != view.overlay_ip || record.name != view.name {
         return Err(HelloError::Node(format!(
             "The state directory keeps overlay IP {} for node {}. The netmap has overlay IP {}.",
@@ -590,6 +597,7 @@ fn prepare_node(request: NodeRequest, entered_at: Instant) -> Result<PreparedNod
         request,
         view,
         record,
+        record_stored: stored,
         router,
         _pid_guard: pid_guard,
         phases: StartPhases {
@@ -2251,7 +2259,16 @@ fn safe_text(text: &str) -> String {
     text.to_string()
 }
 
-fn load_or_create_state(dir: &Path, netmap: &Netmap) -> Result<NodeRecord, HelloError> {
+/// The node record and whether `node.json` already has it.
+struct StateRecord {
+    record: NodeRecord,
+    stored: bool,
+}
+
+/// Read the node record from the state directory. A new node gets a record from the
+/// netmap. This function does not write `node.json` (W25-14b): `store_record` writes it
+/// after the TUN device opens.
+fn load_state(dir: &Path, netmap: &Netmap) -> Result<StateRecord, HelloError> {
     fs::create_dir_all(dir).map_err(|err| HelloError::Node(err.to_string()))?;
     let overlay = parse_ipv4(&netmap.self_node.overlay_ip)
         .map_err(|err| HelloError::Node(err.to_string()))?
@@ -2268,19 +2285,67 @@ fn load_or_create_state(dir: &Path, netmap: &Netmap) -> Result<NodeRecord, Hello
                 stored.name
             )));
         }
-        return Ok(NodeRecord {
-            name: stored.name,
-            overlay_ip: stored_ip,
+        return Ok(StateRecord {
+            record: NodeRecord {
+                name: stored.name,
+                overlay_ip: stored_ip,
+            },
+            stored: true,
         });
     }
-    let record = NodeRecord {
-        name: netmap.self_node.name.clone(),
-        overlay_ip: overlay,
-    };
+    Ok(StateRecord {
+        record: NodeRecord {
+            name: netmap.self_node.name.clone(),
+            overlay_ip: overlay,
+        },
+        stored: false,
+    })
+}
+
+fn store_record_once(prepared: &mut PreparedNode) -> Result<(), HelloError> {
+    if !prepared.record_stored {
+        store_record(&prepared.request.state_dir, &prepared.record)?;
+        prepared.record_stored = true;
+    }
+    Ok(())
+}
+
+/// Write `node.json` with a temp file, fsync, and rename. A crash leaves the old file or
+/// the new file, never a part of a file.
+fn store_record(dir: &Path, record: &NodeRecord) -> Result<(), HelloError> {
+    use std::io::Write as _;
     let text =
-        serde_json::to_string_pretty(&record).map_err(|err| HelloError::Node(err.to_string()))?;
-    write_atomic(&path, text.as_bytes())?;
-    Ok(record)
+        serde_json::to_string_pretty(record).map_err(|err| HelloError::Node(err.to_string()))?;
+    let path = dir.join(NODE_RECORD_FILE);
+    let tmp = dir.join(NODE_RECORD_TEMP_FILE);
+    let io = |err: std::io::Error| HelloError::Node(err.to_string());
+    let mut file = fs::File::create(&tmp).map_err(io)?;
+    file.write_all(text.as_bytes()).map_err(io)?;
+    file.sync_all().map_err(io)?;
+    drop(file);
+    fs::rename(&tmp, &path).map_err(io)?;
+    #[cfg(unix)]
+    fs::File::open(dir).and_then(|d| d.sync_all()).map_err(io)?;
+    Ok(())
+}
+
+/// The record for `orblx status`. Before the first good `orblx up`, the state directory
+/// has no `node.json` (W25-14b). Then the record comes from the netmap in the state
+/// directory, with the same name and overlay IP that `up` writes later.
+fn read_status_record(dir: &Path) -> Result<NodeRecord, HelloError> {
+    if dir.join(NODE_RECORD_FILE).exists() {
+        return read_record(dir);
+    }
+    let Ok(netmap) = Netmap::from_path(&dir.join("netmap.json")) else {
+        return read_record(dir);
+    };
+    let overlay_ip = parse_ipv4(&netmap.self_node.overlay_ip)
+        .map_err(|err| HelloError::Node(err.to_string()))?
+        .to_string();
+    Ok(NodeRecord {
+        name: netmap.self_node.name,
+        overlay_ip,
+    })
 }
 
 fn read_record(dir: &Path) -> Result<NodeRecord, HelloError> {
@@ -2644,7 +2709,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use super::{format_node_status, load_or_create_state, NodeStatus, StatusPeer};
+    use super::{
+        format_node_status, load_state, read_status_text, store_record, NodeStatus, StatusPeer,
+    };
     use crate::netmap::Netmap;
 
     fn sample_map(ip: &str) -> Netmap {
@@ -2668,17 +2735,114 @@ mod tests {
     #[test]
     fn the_state_directory_keeps_the_overlay_ip() {
         let dir = test_dir("state");
-        let first = load_or_create_state(&dir, &sample_map("100.64.0.1")).unwrap();
-        assert_eq!(first.overlay_ip, "100.64.0.1");
-        let second = load_or_create_state(&dir, &sample_map("100.64.0.1")).unwrap();
-        assert_eq!(second.overlay_ip, "100.64.0.1");
-        let err = load_or_create_state(&dir, &sample_map("100.64.0.9")).unwrap_err();
+        let first = load_state(&dir, &sample_map("100.64.0.1")).unwrap();
+        assert_eq!(first.record.overlay_ip, "100.64.0.1");
+        assert!(!first.stored);
+        // W25-14b: reading the state does not write node.json.
+        assert!(!dir.join(super::NODE_RECORD_FILE).exists());
+        store_record(&dir, &first.record).unwrap();
+        let second = load_state(&dir, &sample_map("100.64.0.1")).unwrap();
+        assert_eq!(second.record.overlay_ip, "100.64.0.1");
+        assert!(second.stored);
+        let err = load_state(&dir, &sample_map("100.64.0.9")).err().unwrap();
         assert!(err.to_string().contains("100.64.0.1"));
         assert!(err.to_string().contains("100.64.0.9"));
         let stored = fs::read_to_string(dir.join(super::NODE_RECORD_FILE)).unwrap();
         assert!(stored.contains("100.64.0.1"));
         assert!(!stored.contains("100.64.0.9"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_stored_record_has_the_same_bytes_as_before() {
+        // The bytes that the old load_or_create_state wrote (serde_json pretty).
+        let dir = test_dir("record-bytes");
+        let record = load_state(&dir, &sample_map("100.64.0.1")).unwrap().record;
+        store_record(&dir, &record).unwrap();
+        let stored = fs::read_to_string(dir.join(super::NODE_RECORD_FILE)).unwrap();
+        assert_eq!(
+            stored,
+            "{\n  \"name\": \"a\",\n  \"overlay_ip\": \"100.64.0.1\"\n}"
+        );
+        assert!(!dir.join(super::NODE_RECORD_TEMP_FILE).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_works_before_the_first_good_up() {
+        let dir = test_dir("status-no-record");
+        fs::write(
+            dir.join("netmap.json"),
+            r#"{"version":1,"self":{"name":"a","overlay_ip":"100.64.0.1"},"peers":[]}"#,
+        )
+        .unwrap();
+        let text = read_status_text(&dir).unwrap();
+        assert_eq!(text, "state down\nname a\noverlay_ip 100.64.0.1\n");
+        assert!(!dir.join(super::NODE_RECORD_FILE).exists());
+        // The same text as after a good up.
+        store_record(
+            &dir,
+            &load_state(&dir, &sample_map("100.64.0.1")).unwrap().record,
+        )
+        .unwrap();
+        assert_eq!(read_status_text(&dir).unwrap(), text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Child process for the crash test. It writes the node record in a loop until the
+    /// parent kills it.
+    #[test]
+    #[ignore = "child process of a_crash_leaves_no_part_of_a_record"]
+    fn crash_test_child_writes_records() {
+        let Ok(dir) = std::env::var("ORBLX_NODE_RECORD_CRASH_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let record = load_state(&dir, &sample_map("100.64.0.1")).unwrap().record;
+        loop {
+            store_record(&dir, &record).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_crash_leaves_no_part_of_a_record() {
+        let exe = std::env::current_exe().unwrap();
+        let full = "{\n  \"name\": \"a\",\n  \"overlay_ip\": \"100.64.0.1\"\n}";
+        let mut kills_with_record = 0;
+        for round in 0..20u64 {
+            let dir = test_dir(&format!("crash-{round}"));
+            let mut child = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "node::tests::crash_test_child_writes_records",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env("ORBLX_NODE_RECORD_CRASH_DIR", &dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            // Kill at a different point in each round. SIGKILL gives the child no cleanup.
+            std::thread::sleep(Duration::from_micros(round * round * 150));
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let path = dir.join(super::NODE_RECORD_FILE);
+            // The old state (no record) or the new state (the full record), never a part.
+            if let Ok(text) = fs::read_to_string(&path) {
+                assert_eq!(text, full, "round {round}: a part of a record");
+                kills_with_record += 1;
+            }
+            // The next start recovers, also with a temp file from the killed write.
+            let state = load_state(&dir, &sample_map("100.64.0.1")).unwrap();
+            assert_eq!(state.record.overlay_ip, "100.64.0.1");
+            if !state.stored {
+                store_record(&dir, &state.record).unwrap();
+            }
+            assert_eq!(fs::read_to_string(&path).unwrap(), full);
+            let _ = fs::remove_dir_all(&dir);
+        }
+        eprintln!("crash rounds 20, kills after the first rename {kills_with_record}");
     }
 
     #[test]
