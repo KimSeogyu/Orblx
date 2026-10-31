@@ -39,7 +39,7 @@ ACTIONS = [
     "lock-sign", "lock-rotate", "lock-remove", "file-receive", "file-deny",
     "token-create", "token-use", "token-deny", "token-revoke", "share",
     "unshare", "packet-deny", "unrevoke", "sink-error", "user-approve",
-    "user-reject", "reserved-37", "reserved-38", "ssh-cert",
+    "user-reject", "reserved-37", "route-failover", "ssh-cert",
 ]
 
 SYSLOG_HEAD = re.compile(

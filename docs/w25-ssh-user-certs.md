@@ -68,7 +68,7 @@ detail has the decision, the reason, the serial, the key fingerprint, the node, 
 and the validity. The record has no key and no certificate. The coordinator keeps an index from
 (node, owner) to the live serials.
 
-Codes 37 and 38 are reserved for other open items.
+Code 37 is reserved for `node-remove` (W25-18). Code 38 is `route-failover` (W25-10).
 
 ## Verify on the node
 
