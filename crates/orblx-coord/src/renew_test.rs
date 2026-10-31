@@ -12,7 +12,7 @@ use orblx_datapath::{
 };
 use orblx_identity::{
     decode_certificate_pem, leaf_validity, sign_ticket, SpiffeId, TicketClaims, TicketFlags,
-    TicketSigner, TrustBundle,
+    TicketSigner, TrustBundle, MAX_SKEW,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -1205,6 +1205,356 @@ fn netmap(name: &str, ip: &str, peer: &str, peer_ip: &str, peer_port: u16) -> Ne
                 "routes": []
             }}]
         }}"#
+    );
+    Netmap::from_slice(text.as_bytes()).unwrap()
+}
+
+/// W25-33: the coordinator issues a new leaf at two thirds of the life, from the same CA.
+#[test]
+fn coordinator_leaf_renews_at_two_thirds_from_the_same_ca() {
+    let scratch = Scratch::new("coordleaf");
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.set_coord_svid_ttl(Duration::from_secs(9)).unwrap();
+    let first = coord.tls_material().unwrap();
+    let first_der = decode_certificate_pem(&first.certificate_pem).unwrap();
+    let (not_before, not_after) = leaf_validity(&first_der).unwrap();
+    assert_eq!(not_after - not_before, 9);
+    let start = UNIX_EPOCH + Duration::from_secs(not_before);
+    assert_eq!(
+        coord
+            .renew_coord_svid_if_due(start + Duration::from_secs(5))
+            .unwrap(),
+        None
+    );
+    let renewed = coord
+        .renew_coord_svid_if_due(start + Duration::from_secs(6))
+        .unwrap()
+        .unwrap();
+    assert_eq!(renewed, not_before + 6 + 9);
+    let second = coord.tls_material().unwrap();
+    assert_eq!(second.trust_pem, first.trust_pem);
+    assert_ne!(second.certificate_pem, first.certificate_pem);
+    let second_der = decode_certificate_pem(&second.certificate_pem).unwrap();
+    let trust = TrustBundle::from_pem(&first.trust_pem).unwrap();
+    let id = trust
+        .authenticate_leaf(
+            &second_der,
+            start + Duration::from_secs(14),
+            &orblx_identity::DenySet::empty(),
+        )
+        .unwrap();
+    assert_eq!(id, SpiffeId::coord("coord").unwrap());
+    assert!(coord
+        .set_coord_svid_ttl(Duration::from_secs(15 * 60 + 1))
+        .is_err());
+}
+
+/// W25-33: the coordinator renews its own leaf, and the nodes keep their sessions.
+///
+/// The coordinator leaf lives 10 s. The node leaf lives 60 s. The test runs for 95 s, so it
+/// crosses more than 3 coordinator leaf ends and the first end plus [`MAX_SKEW`]. A probe node
+/// calls the coordinator once a second. Node `c` stays offline across coordinator rotations,
+/// then comes back, renews, and reaches `a`. Before the fix, the coordinator showed one leaf
+/// for its whole life. After the end plus the skew, each coordinator call failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nodes_renew_across_coordinator_cert_ends() {
+    const COORD_LIFE: u64 = 10;
+    const NODE_LIFE: u64 = 60;
+    const C_START: Duration = Duration::from_secs(50);
+    const RUN: Duration = Duration::from_secs(95);
+    const LATE: Duration = Duration::from_secs(85);
+    let scratch = Scratch::new("coordcert");
+    let dirs: Vec<Scratch> = ["a", "b", "c", "p"]
+        .iter()
+        .map(|name| Scratch::new(&format!("coordcert-{name}")))
+        .collect();
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord
+        .set_coord_svid_ttl(Duration::from_secs(COORD_LIFE))
+        .unwrap();
+    coord
+        .set_node_svid_ttl(Duration::from_secs(NODE_LIFE))
+        .unwrap();
+    let (addr, handle) = server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+    let issued_at = Instant::now();
+    let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+    let mut enrolled = Vec::new();
+    for (at, name) in ["a", "b", "c", "p"].iter().enumerate() {
+        let token = coord.create_token(Duration::from_secs(600)).unwrap();
+        let endpoint = format!("127.0.0.1:{}", ports.get(at).copied().unwrap_or(1));
+        let result = client::enroll_with_token(
+            addr,
+            "coord",
+            &bundle,
+            name,
+            &token.secret,
+            &[endpoint],
+            &[],
+        )
+        .await
+        .unwrap();
+        result.write_state(&dirs[at].0).unwrap();
+        enrolled.push(result);
+    }
+    let first_coord_end = coord.coord_svid_not_after().unwrap();
+
+    let trust = TrustBundle::from_pem(&bundle).unwrap();
+    let signer = TicketSigner::generate();
+    let mac_key = [0x44; 32];
+    let now = SystemTime::now();
+    let ticket_key = TicketKey::new(
+        signer.verifier(),
+        mac_key,
+        now - Duration::from_secs(60),
+        now + Duration::from_secs(3_600),
+    )
+    .unwrap();
+    let ring = TicketRing::single(ticket_key, &[7; 32]).unwrap();
+    let ips = ["100.64.0.1", "100.64.0.2", "100.64.0.3"];
+    let names = ["a", "b", "c"];
+    let renew_fail = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    let mut requests = Vec::new();
+    for at in 0..3 {
+        let config = leaf_config(&enrolled[at], &trust, &signer, &mac_key, &ring, now);
+        let peers: Vec<(&str, &str, u16)> = (0..3)
+            .filter(|other| *other != at)
+            .map(|other| (names[other], ips[other], ports[other]))
+            .collect();
+        let map = mesh_netmap(names[at], ips[at], &peers);
+        let request = node_request(
+            config,
+            map,
+            ports[at],
+            dirs[at].0.clone(),
+            counted_renewer(
+                addr,
+                bundle.clone(),
+                dirs[at].0.clone(),
+                Arc::clone(&renew_fail),
+            ),
+            stop_rx.clone(),
+        );
+        let (in_tx, in_rx) = mpsc::channel(64);
+        let (out_tx, out_rx) = mpsc::channel(64);
+        inputs.push(in_tx);
+        outputs.push(out_rx);
+        requests.push((
+            request,
+            MemoryDevice {
+                from_tun: in_rx,
+                to_tun: out_tx,
+            },
+        ));
+    }
+    let mut requests = requests.into_iter();
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let (request, device) = requests.next().unwrap();
+        tasks.push(tokio::spawn(run_memory_node(request, device)));
+    }
+    let mut late_c = requests.next();
+    let mut c_started: Option<Instant> = None;
+
+    let mut coord_ends = HashSet::new();
+    let mut expiries: Vec<HashSet<String>> = vec![HashSet::new(); 3];
+    let mut last_ab: Option<Instant> = None;
+    let mut last_ba: Option<Instant> = None;
+    let mut max_gap = Duration::ZERO;
+    let (mut got_ab, mut got_ba, mut got_ca, mut got_ac) = (0u64, 0u64, 0u64, 0u64);
+    let (mut late_ab, mut late_ba) = (0u64, 0u64);
+    let (mut probes, mut probe_fail) = (0u64, 0u64);
+    let mut probe_renewals = 0u64;
+    let mut next_probe = Instant::now();
+    let probe_dir = dirs[3].0.clone();
+    let mut probe_leaf =
+        leaf_validity(&decode_certificate_pem(&enrolled[3].certificate_pem).unwrap()).unwrap();
+    let send = |from: usize, to: usize, body: &'static [u8]| {
+        ipv4_packet(
+            ips[from].parse::<Ipv4Addr>().unwrap(),
+            ips[to].parse::<Ipv4Addr>().unwrap(),
+            body,
+        )
+        .unwrap()
+    };
+    while issued_at.elapsed() < RUN {
+        if c_started.is_none() && issued_at.elapsed() >= C_START {
+            if let Some((request, device)) = late_c.take() {
+                tasks.push(tokio::spawn(run_memory_node(request, device)));
+                c_started = Some(Instant::now());
+            }
+        }
+        let _ = inputs[0].send(send(0, 1, b"ab")).await;
+        let _ = inputs[1].send(send(1, 0, b"ba")).await;
+        if c_started.is_some() {
+            let _ = inputs[2].send(send(2, 0, b"ca")).await;
+            let _ = inputs[0].send(send(0, 2, b"ac")).await;
+        }
+        let late = issued_at.elapsed() >= LATE;
+        let slice_end = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < slice_end {
+            if let Ok(Some(packet)) =
+                tokio::time::timeout(Duration::from_millis(20), outputs[1].recv()).await
+            {
+                if packet.ends_with(b"ab") {
+                    note_gap(&mut last_ab, &mut max_gap);
+                    got_ab += 1;
+                    late_ab += u64::from(late);
+                }
+            }
+            if let Ok(Some(packet)) =
+                tokio::time::timeout(Duration::from_millis(20), outputs[0].recv()).await
+            {
+                if packet.ends_with(b"ba") {
+                    note_gap(&mut last_ba, &mut max_gap);
+                    got_ba += 1;
+                    late_ba += u64::from(late);
+                } else if packet.ends_with(b"ca") {
+                    got_ca += 1;
+                }
+            }
+            if let Ok(Some(packet)) =
+                tokio::time::timeout(Duration::from_millis(5), outputs[2].recv()).await
+            {
+                if packet.ends_with(b"ac") {
+                    got_ac += 1;
+                }
+            }
+        }
+        coord_ends.insert(coord.coord_svid_not_after().unwrap());
+        for at in 0..3 {
+            if let Ok(text) = fs::read_to_string(dirs[at].0.join(NODE_STATUS_FILE)) {
+                if let Some(value) = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("svid_expiry "))
+                {
+                    expiries[at].insert(value.to_string());
+                }
+            }
+        }
+        if Instant::now() >= next_probe {
+            next_probe = Instant::now() + Duration::from_secs(1);
+            probes += 1;
+            let now_unix = unix(SystemTime::now());
+            let (not_before, not_after) = probe_leaf;
+            if now_unix >= not_before + (not_after - not_before) * 2 / 3 {
+                match client::renew_svid(addr, "coord", &bundle, &probe_dir).await {
+                    Ok(renewed) => {
+                        probe_renewals += 1;
+                        probe_leaf = leaf_validity(
+                            &decode_certificate_pem(&renewed.certificate_pem).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    Err(err) => {
+                        probe_fail += 1;
+                        println!("coord probe renew failed: {err}");
+                    }
+                }
+            } else if let Err(err) = client::fetch_netmap(addr, "coord", &bundle, &probe_dir).await
+            {
+                probe_fail += 1;
+                println!("coord probe netmap failed: {err}");
+            }
+        }
+    }
+    let _ = stop_tx.send(true);
+    for task in tasks {
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+    handle.abort();
+
+    let end_unix = unix(SystemTime::now());
+    let crossed = coord_ends.iter().filter(|end| **end < end_unix).count();
+    let renew_fail = renew_fail.load(std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "coord_cert_ends_crossed {crossed} first_end_plus_skew_crossed {} probes {probes} \
+         probe_fail {probe_fail} probe_renewals {probe_renewals} node_renew_fail {renew_fail} \
+         expiries a {} b {} c {} ab {got_ab} ba {got_ba} late_ab {late_ab} late_ba {late_ba} \
+         ca {got_ca} ac {got_ac} max_gap_ms {}",
+        end_unix > first_coord_end + MAX_SKEW.as_secs(),
+        expiries[0].len(),
+        expiries[1].len(),
+        expiries[2].len(),
+        max_gap.as_millis()
+    );
+    assert!(
+        end_unix > first_coord_end + MAX_SKEW.as_secs(),
+        "the run did not cross the first coordinator leaf end plus the skew"
+    );
+    assert_eq!(probe_fail, 0, "coordinator probe failures");
+    assert_eq!(renew_fail, 0, "node renewal failures");
+    assert!(crossed >= 3, "coordinator leaf ends crossed {crossed}");
+    assert!(probes >= 60, "coordinator probes {probes}");
+    assert!(probe_renewals >= 1, "the probe node did not renew");
+    assert!(
+        expiries[0].len() >= 3 && expiries[1].len() >= 3,
+        "node a and b leaf expiries {:?} {:?}",
+        expiries[0],
+        expiries[1]
+    );
+    assert!(
+        expiries[2].len() >= 2,
+        "node c did not renew after it came back: {:?}",
+        expiries[2]
+    );
+    assert!(
+        got_ab > 100 && got_ba > 100,
+        "packets a-to-b {got_ab} b-to-a {got_ba}"
+    );
+    assert!(
+        late_ab > 0 && late_ba > 0,
+        "late packets a-to-b {late_ab} b-to-a {late_ba}"
+    );
+    assert!(
+        got_ca > 20 && got_ac > 20,
+        "packets c-to-a {got_ca} a-to-c {got_ac}"
+    );
+    assert!(
+        max_gap <= Duration::from_secs(2),
+        "packet gap {} ms",
+        max_gap.as_millis()
+    );
+}
+
+fn counted_renewer(
+    addr: SocketAddr,
+    bundle: String,
+    state: PathBuf,
+    failures: Arc<std::sync::atomic::AtomicU64>,
+) -> SvidRenewer {
+    SvidRenewer::new(move || {
+        let result =
+            client::renew_svid_blocking(addr, "coord", &bundle, &state).map_err(|err| {
+                failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                err.to_string()
+            })?;
+        Ok(RenewedLeaf {
+            certificate_pem: result.certificate_pem,
+            private_key_pem: result.private_key_pem,
+        })
+    })
+}
+
+fn mesh_netmap(name: &str, ip: &str, peers: &[(&str, &str, u16)]) -> Netmap {
+    let peers = peers
+        .iter()
+        .map(|(peer, peer_ip, port)| {
+            format!(
+                r#"{{"name": "{peer}", "overlay_ip": "{peer_ip}",
+                    "svid": "spiffe://orblx.local/node/{peer}",
+                    "endpoints": ["127.0.0.1:{port}"], "routes": []}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let text = format!(
+        r#"{{"version": 1, "self": {{"name": "{name}", "overlay_ip": "{ip}"}}, "peers": [{peers}]}}"#
     );
     Netmap::from_slice(text.as_bytes()).unwrap()
 }

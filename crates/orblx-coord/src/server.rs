@@ -44,8 +44,13 @@ pub async fn spawn(
     coord.enable_config_audit()?;
     crate::webhook::start(coord);
     let material = coord.tls_material()?;
-    let endpoint = tlsutil::server_endpoint(&material, listen)?;
+    let (endpoint, live) = tlsutil::server_endpoint(&material, listen)?;
     let addr = endpoint.local_addr().map_err(CoordError::io)?;
+    println!("coord svid expiry {}", live.not_after());
+    let cert_coord = coord.clone();
+    tokio::spawn(async move {
+        coord_cert_tick(cert_coord, live).await;
+    });
     let tick_coord = coord.clone();
     tokio::spawn(async move {
         expire_tick(tick_coord).await;
@@ -80,6 +85,49 @@ async fn expire_tick(coord: Coordinator) {
                 println!("coord agent expire tick failed: {}", err.public_text());
             }
             _ => {}
+        }
+    }
+}
+
+/// The time between two checks of the coordinator leaf (W25-33).
+const COORD_CERT_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Renew the coordinator leaf at two thirds of its life and show the new leaf (W25-33).
+///
+/// The leaf comes from the same CA with the same SPIFFE ID and the same life.
+/// The QUIC endpoint stays up. Open connections keep their session.
+/// New handshakes get the new leaf. The tick prints only the end time, never the key.
+async fn coord_cert_tick(coord: Coordinator, live: std::sync::Arc<tlsutil::LiveCert>) {
+    let mut failed = false;
+    loop {
+        tokio::time::sleep(COORD_CERT_TICK).await;
+        let step = coord.clone();
+        let shown = live.not_after();
+        let renewed = tokio::task::spawn_blocking(move || {
+            step.renew_coord_svid_if_due(SystemTime::now())?;
+            if step.coord_svid_not_after()? == shown {
+                return Ok(None);
+            }
+            step.tls_material().map(Some)
+        })
+        .await;
+        let result = match renewed {
+            Ok(Ok(Some(material))) => live.install(&material).map(Some),
+            Ok(Ok(None)) => Ok(None),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(CoordError::State),
+        };
+        match result {
+            Ok(Some(not_after)) => {
+                failed = false;
+                println!("coord svid renewed, new expiry {not_after}");
+            }
+            Ok(None) => failed = false,
+            Err(err) if !failed => {
+                failed = true;
+                println!("coord svid renewal failed: {}", err.public_text());
+            }
+            Err(_) => {}
         }
     }
 }
