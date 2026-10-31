@@ -370,6 +370,17 @@ proof_infra_abort() {
   exit "$PROOF_INFRA_ABORT_EXIT"
 }
 
+# Report the free space when the lock is acquired. This is a reported value only: the run does
+# not stop after the lock on free space. The one check is proof_disk_check before the lock.
+proof_disk_report() {
+  local dir free
+  for dir in "$PROOF_DISK_REPO" /var/lib/docker; do
+    [[ -d "$dir" ]] || continue
+    free="$(proof_free_gib_at "$dir")" || free=unknown
+    echo "proof_context $1 phase disk_at_lock free_gib=$free dir=$dir"
+  done
+}
+
 proof_disk_check() {
   local label="$1" min="${PROOF_MIN_FREE_GIB:-}" dir free
   if ! [[ "$min" =~ ^[0-9]+$ ]]; then
@@ -442,6 +453,7 @@ proof_lock_take() {
     # A waiter must never read a half-written holder file.
     mv -f "${file}.holder.$$" "${file}.holder" 2>/dev/null || true
     echo "proof_lock ${PROOF_LOCK_LABEL} acquired at $(proof_lock_now) after $(( $(proof_lock_ms) - waited_from )) ms, file ${file}"
+    proof_disk_report "$PROOF_LOCK_LABEL"
   fi
   proof_context start
   PROOF_LOCK_SAMPLES="$(mktemp)"

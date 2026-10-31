@@ -77,6 +77,27 @@ class ProofDiskCheckTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("proof_step_ran", result.stdout)
         self.assertNotIn("proof_infra_abort", result.stderr)
+        # The free space at the lock is a reported value only.
+        self.assertRegex(result.stdout, r"(?m)^proof_context disk-test phase disk_at_lock free_gib=15 dir=")
+
+    @unittest.skipUnless(shutil.which("flock"), "flock(1) is not installed")
+    def test_low_disk_after_the_lock_is_reported_and_does_not_stop_the_run(self):
+        script = SCRIPT.replace("echo proof_step_ran",
+                                'proof_disk_report disk-test-late\necho proof_step_ran')
+        env = dict(self.env, PROOF_MIN_FREE_GIB="15", FAKE_DF_AVAIL_KIB=str(15 * 1048576))
+        result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True,
+                                timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("proof_step_ran", result.stdout)
+
+    def test_the_abort_line_has_the_sweep_format(self):
+        # The #119 sweep parses "proof_infra_abort PROOF reason=disk_low|disk_unknown".
+        for extra, reason in ((dict(FAKE_DF_AVAIL_KIB=str(3 * 1048576)), "disk_low"),
+                              (dict(FAKE_DF_FAIL="1"), "disk_unknown")):
+            result = self.run_proof(PROOF_MIN_FREE_GIB="15", **extra)
+            first = result.stderr.splitlines()[0]
+            self.assertRegex(first, rf"^proof_infra_abort disk-test reason={reason}( |\.)")
+            self.assertEqual(result.stdout, "")
 
     def test_the_abort_status_is_not_the_invalid_status(self):
         src = open(LOCK_SH).read()
