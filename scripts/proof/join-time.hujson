@@ -1,0 +1,12 @@
+{
+  // Join-time proof.
+  // Node a runs first. Node b enrolls later. Node a may ping b.
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a"],
+      "proto": "icmp",
+      "dst": ["spiffe://orblx.local/node/b:*"],
+    },
+  ],
+}
