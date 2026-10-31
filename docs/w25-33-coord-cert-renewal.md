@@ -57,8 +57,37 @@ Results (REAL box, `cargo test`, KST 2026-10-31):
 |---|---|
 | Fix (before the merge of main `130af38`) | PASS, 95.5 s. `coord_cert_ends_crossed 15`, `probes 84 probe_fail 0`, `node_renew_fail 0`, expiries a 3 b 3 c 3, ca 140 ac 140, `max_gap_ms 647`, 0 `coord handshake failed` lines. |
 | main `819c33a` + the test and the test hook only (no tick, no `LiveCert`) | FAIL (exit 101), 95.3 s. `coord_cert_ends_crossed 1`, `probe_fail 21`, `node_renew_fail 11`, 32 `coord handshake failed` lines. |
+| `ff08725` (probe in its own task) | PASS. 15 ends crossed, 0 probe failures, 0 node renewal failures, `max_gap_ms 298`, `max_send_gap_ms 278`. |
+| `ff08725` + the merge of #124 `c6fe5db` (has #117) | PASS. 15 ends crossed, `max_gap_ms 339`, `max_send_gap_ms 320`. |
 
-## 4. Docker proof plan (not run)
+### 3.1 The largest packet gap (647 ms) [REAL]
+
+The gap is a result of the test, not of the data path or of the renewal.
+
+- In the first test, the loop that sends the packets also waited for the probe call to the
+  coordinator. A probe call took up to 332 ms, and the loop sends one packet each 200 ms. The
+  largest gap between two sends (`max_send_gap`) was 547 ms, and the largest receive gap was
+  549 ms. The two values agree, so the sender caused the gap.
+- The largest gap overlapped a probe call. It also overlapped a ticket-end window
+  ([end - 2 s, end + 2 s]) and a coordinator rotation window. The gaps with no probe call in them
+  were 261 ms or less.
+- Commit `ff08725` runs the probe in its own task. The test now prints the largest gap for each
+  window kind:
+
+| Window | Largest gap (ms) |
+|---|---|
+| any (`max_gap`) | 298 |
+| sender cadence (`max_send_gap`) | 278 |
+| ticket end, [end - 2 s, end + 2 s] | 273 |
+| coordinator leaf rotation | 278 |
+| node renewal (W25-11 window) | 256 |
+
+The largest gap is now equal to the send cadence. It is not in a ticket-end, renewal, or
+rotation window. The test sends a packet each 200 ms, so it cannot measure a 200 ms gate. The
+W25-26 gate of 200 ms for each ticket end is gate 4b of `ticket-renewal.sh` (pings each 50 ms).
+P1 and P3 use that gate without change.
+
+## 4. Docker proof plan
 
 All runs: the box proof lock, `proof_compose_clean`, a frozen worktree of this branch with the
 head of PR #124 (`w25-26-ticket-proof`, which has #117) merged in. The lives are the defaults:
@@ -67,19 +96,26 @@ nodes are [C] containers.
 
 | Run | Command | Time | Gates |
 |---|---|---|---|
-| P1: gate c | `sudo SOAK_S=0 SOAK_COORD_ENDS=3 SOAK_REVOKE=1 scripts/proof/coord-cert-soak.sh` | about 37 min | ticket-renewal.sh `proof_ok` (0 refusals, 0 lost peers, gap lines, no restart, revoke, 0 contended samples); 3 or more coordinator leaf ends (t = 900, 1500, 2100); 2 or more ticket ends (TR_ENDS = 3); 0 `coord handshake failed`. |
-| P2: gate d and the late node | new script `coord-cert-rotation.sh` (not written yet) | about 20 min | See the steps below. |
+| P1: gate c | `sudo SOAK_S=0 SOAK_COORD_ENDS=3 SOAK_TR_ENDS=4 scripts/proof/coord-cert-soak.sh` | about 50 min | ticket-renewal.sh `proof_ok` (0 refusals, 0 lost peers, gap lines, no restart, revoke, 0 contended samples); 3 or more coordinator leaf ends (t = 900, 1500, 2100); 2 or more ticket ends (TR_ENDS = 3); 0 `coord handshake failed`. |
+| P2: gate d and the late node | `sudo RT_BIN=<release orblx> scripts/proof/coord-cert-rotation.sh` | about 25 min | See the steps below. |
 | P3: gate e soak | `sudo SOAK_BIN=<release orblx> scripts/proof/coord-cert-soak.sh` | about 2 h 7 min | P1 gates, `soak_run_s >= 7200` from the coordinator start, about 12 coordinator leaf ends. |
 
-P2 steps (t = 0 at the coordinator start):
-1. Enroll owner, a, and d. Start them. Each lists its peers.
-2. t = 30: stop d (`docker compose stop d`). d is offline.
-3. t = 600: the coordinator renews its leaf (`coord svid renewed`).
-4. t = 620: start d. Gate: d logs "The node renewed the SVID" in 60 s, and d pings owner and a
-   with 0% loss. d was offline across the rotation.
-5. t = 970 (after the first coordinator leaf end + skew): enroll the late node e and start it.
-   Gate: the enroll passes, and e pings owner, a, and d with 0% loss. On main this enroll fails.
-6. Gates for the whole run: 0 `coord handshake failed`, 0 refusals, 0 contended samples.
+P2 steps (`scripts/proof/coord-cert-rotation.sh`, t = 0 at the coordinator start). It uses
+`compose.ticket-renewal.yml` and `ticket-renewal.hujson` of PR #124 (exit 2 without them), the
+proof lock, `proof_compose_clean`, and the default lives:
+1. Enroll owner, a, and b. Start them. Each lists 2 peers. Ping owner and a for all of the run.
+2. Stop b (`docker compose stop b`). b is offline.
+3. t = 600: the coordinator renews its leaf (`coord svid renewed`). The script checks that the
+   leaf of b is not expired, then starts b.
+4. Gate d1: b logs "The node renewed the SVID" in 90 s, and its expiry increases.
+   Gate d2: b pings owner and a, and they ping b, 5 pings each with 0% loss.
+5. t = first coordinator leaf end + skew + 5 s: enroll the late node c and start it.
+   Gate d3: all nodes list 3 peers, and c pings each node with 0% loss. On main this enroll fails.
+6. Run to first coordinator leaf end + skew + 240 s.
+7. Gates for the whole run: 0 refusals, 0 `coord handshake failed`, 0 `coord svid renewal
+   failed`, 1 or more renewals, no restart of the coordinator, owner, or a, 0 lost peer samples
+   for owner and a, the secret scan, 0 contended samples. The script prints
+   `proof_ok coord-cert-rotation`.
 
 ## 5. Soak script and sweep lines (gate e)
 
@@ -98,24 +134,37 @@ leaf. Without PR #124 it stops with exit 2.
 The script sets `TR_SVID_TTL` to `MAX_USER_TTL` from clock.rs. It sets `TR_ENDS` so that the run
 lasts `SOAK_S` s or more (12 for 7200 s).
 
-Lines for the files of PR #119 (`w25-27-coord-tickets`):
+The PO made the soak a REQUIRED row of the rc.3 sweep. The rows-file format and the manifest
+are on PR #119 (`w25-27-coord-tickets`), so the lines are in the stacked draft PR #129 (base
+`w25-27-coord-tickets`):
+
+`docs/matrix-rows.txt`:
+
+```
+66|shipped|Coordinator certificate renewal (2 h soak, W25-33)
+```
 
 `scripts/proof/sweep-manifest.txt`:
 
 ```
-gate|coord-cert-soak|coordinator leaf soak: 2 h or more at the default lives from the coordinator start, 0 refusals, 0 lost peers, 0 coord handshake failures, 3 or more coordinator leaf ends (W25-33)|coord-cert-soak
-proof|coord-cert-soak|scripts/proof/coord-cert-soak.sh|SOAK_BIN=@BIN@ SOAK_PROJECT=orblx-rc3sw-ccsoak SOAK_IMAGE=orblx-rc3sw-ccsoak:local|orblx-rc3sw-ccsoak:local|^proof_ok coord-cert-soak$
+row|66|Coordinator certificate renewal (2 h soak, W25-33)|coord-cert-soak
+proof|coord-cert-soak|scripts/proof/coord-cert-soak.sh|SOAK_BIN=@BIN@ SOAK_PROJECT=orblx-rc3sw-ccsoak SOAK_IMAGE=orblx-rc3sw-ccsoak:local ORBLX_SWEEP_PROOF_TIMEOUT=9000|orblx-rc3sw-ccsoak:local|^proof_ok coord-cert-soak$
 ```
 
-`docs/matrix-rows.txt`: no new line. A `gate` line has no row of its own, and the sweep fails
-when the gate fails. If the PO wants the soak under row 29 too, change the manifest line to
-`partial|29|Key / SVID rotation UX|svid-renew nat-realism coord-cert-soak`. The rows file line
-`29|partial|Key / SVID rotation UX` stays the same.
+The default time for each proof (`ORBLX_SWEEP_TIMEOUT`, 3600 s) stops a 2 h soak. PR #129 adds
+the proof ENV word `ORBLX_SWEEP_PROOF_TIMEOUT=N`. It sets the time of that proof only. A bad
+value is a setup error (exit 2).
+
+The manifest and the rows file agree, so the sweep does not exit 2. Before this PR merges,
+`--plan` on #129 exits 1 (`Plan FAIL: rows 66`, no script at the commit). Merge order: #128,
+#119, #129. The PO adds row 66 to the Page.
 
 ## 6. Open items
 
-- The Docker runs P1, P2, and P3 did not run. The PO schedules them.
-- P2 needs a new script.
+- The Docker runs P2, P1, and P3 are in the box proof lock queue (results in the PR).
+- Merge conflict with #117: #117 adds the field `RenewedLeaf.ticket`. The test helper
+  `counted_renewer` in `renew_test.rs` makes a `RenewedLeaf` without it. The PR that merges
+  second must add `ticket: None,`. The proof worktree has this change only for the proof runs.
 - ticket-renewal.sh gate 4b (200 ms per ticket end) failed in run `fix3-ttl60-e47b4df1`
   (gaps to 389 ms). That is a W25-26 item. The soak uses gate 4b without change, so the soak can
   fail on it.
