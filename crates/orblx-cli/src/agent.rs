@@ -84,6 +84,8 @@ pub(crate) struct Connect {
     timeout: Duration,
     every: Option<Duration>,
     max_wait: Duration,
+    /// Loop mode only: a file that gets one time line per attempt (W25-30).
+    trace: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -228,6 +230,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
                     "--every-ms",
                     "--max-wait",
                     "--state",
+                    "--trace-file",
                 ],
             )?;
             let to = flags
@@ -239,6 +242,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
                 None => None,
             };
             Ok(Command::Connect(Connect {
+                trace: flags.get("--trace-file").map(PathBuf::from),
                 grant: PathBuf::from(flags.need("--grant")?),
                 state: PathBuf::from(flags.get("--state").unwrap_or(DEFAULT_STATE)),
                 to,
@@ -492,17 +496,21 @@ fn run_connect(command: Connect) -> Result<i32, String> {
     let mut last_ok: Option<u64> = None;
     let mut stats = LoopStats::default();
     let mut attempts = 0u64;
+    let mut trace = AttemptTrace::open(command.trace.as_deref())?;
     loop {
+        let start = now_ms();
         refresh_grant(&mut dir, &mut stats);
         let at = now_ms();
         attempts += 1;
-        match one_connect(dir.files(), to, &node, &service, &command) {
+        let result = one_connect(dir.files(), to, &node, &service, &command);
+        let done = now_ms();
+        trace.line(attempts, start, at, done, &result, &dir.files().grant.grant.id);
+        match result {
             Ok(_) => {
                 last_ok = Some(at);
                 stats.ok(at);
             }
             Err(ConnectError::Denied(reason)) => {
-                let done = now_ms();
                 println!("loop attempts {attempts}");
                 println!(
                     "loop last_ok_ms {}",
@@ -531,6 +539,49 @@ fn run_connect(command: Connect) -> Result<i32, String> {
             return Ok(EXIT_DENIED);
         }
         std::thread::sleep(every);
+    }
+}
+
+/// One time line per loop attempt, for the proof logs (W25-30). It holds no key or ticket.
+/// start_ms is before the grant directory read, send_ms is before the connect,
+/// done_ms is after the reply. The time from done_ms to the next start_ms is the sleep.
+struct AttemptTrace(Option<std::fs::File>);
+
+impl AttemptTrace {
+    fn open(path: Option<&Path>) -> Result<Self, String> {
+        let Some(path) = path else {
+            return Ok(Self(None));
+        };
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map(|file| Self(Some(file)))
+            .map_err(|err| format!("The trace file {} cannot be opened: {err}", path.display()))
+    }
+
+    fn line<T>(
+        &mut self,
+        attempt: u64,
+        start: u64,
+        send: u64,
+        done: u64,
+        result: &Result<T, ConnectError>,
+        grant: &str,
+    ) {
+        let Some(file) = self.0.as_mut() else {
+            return;
+        };
+        let result = match result {
+            Ok(_) => "ok",
+            Err(ConnectError::Denied(_)) => "deny",
+            Err(ConnectError::Failed(_)) => "failed",
+        };
+        // A trace write error does not stop the loop. The trace is for the logs only.
+        let _ = writeln!(
+            file,
+            "trace attempt {attempt} start_ms {start} send_ms {send} done_ms {done} result {result} grant {grant}"
+        );
     }
 }
 
@@ -835,7 +886,7 @@ fn help() -> String {
     "\
 orblx agent grant request --agent NAME --node NODE --service NAME --port N [--ttl SECS] [--path PREFIX] --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx agent grant fetch --id ID --out DIR [--wait SECS] --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
-orblx agent connect --grant DIR [--to IP:PORT] [--service NAME] [--send TEXT] [--timeout SECS] [--every-ms MS] [--max-wait SECS] [--state DIR]
+orblx agent connect --grant DIR [--to IP:PORT] [--service NAME] [--send TEXT] [--timeout SECS] [--every-ms MS] [--max-wait SECS] [--state DIR] [--trace-file FILE]
 orblx agent http [--grant DIR] [--to IP:PORT] [--service NAME] [--method M] [--path TARGET] [--body TEXT] [--repeat N] [--timeout SECS] [--every-ms MS] [--max-wait SECS] [--save-request FILE] [--send-file FILE] [--header NAME:VALUE]... [--state DIR]
 orblx gateway --listen IP:PORT --service NAME --target ADDR [--audit FILE] [--nonce-file FILE] [--poll-ms MS] [--stale-ms MS] [--coord ADDR] [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx agent guard --listen IP:PORT --service NAME --target ADDR [--audit FILE] [--poll-ms MS] [--stale-ms MS] [--coord ADDR] [--state DIR] [--coord-name NAME] [--bundle FILE]
@@ -850,6 +901,7 @@ connect with --every-ms opens a new connection each MS until the guard denies.
 Before each connection it reads DIR again. A newer grant with the same scope that grant fetch wrote to DIR replaces the current grant.
 It never takes a grant that deny.json in the node state (--state, default /var/lib/orblx) revokes.
 When it cannot read deny.json or ticket-verifier.pem there, it keeps the current grant.
+With --trace-file FILE the loop adds one time line per attempt to FILE (start_ms, send_ms, done_ms).
 It prints the times in Unix ms. first_deny_ms is the time of the deny reply.
 connect exits with code 3 when the guard denies.
 guard accepts a TCP connection on --listen only with a valid use proof, then forwards it to --target.
@@ -1241,6 +1293,7 @@ mod grant_end_tests {
                 timeout: Duration::from_secs(5),
                 every: Some(Duration::from_millis(100)),
                 max_wait: Duration::from_secs(6),
+                trace: None,
             };
             std::thread::spawn(move || run_connect(connect))
         }

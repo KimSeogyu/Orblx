@@ -5,6 +5,8 @@
 # next grant, the owner approves it, and the agent fetches it to the same
 # grant directory. The loop reads the directory again before each connection.
 # The coordinator issues each ticket through the normal fetch path.
+# Gap gate (PO method): for each of the switches, the time from the last guard
+# use of the old grant to the first guard use of the new grant is 200 ms or less.
 # Phase 2 (gate): a second loop must never take a next grant with another
 # scope or a revoked next grant. It stops at the grant end with deny expired.
 # The script does not print enroll tokens, private keys, tickets, or use proofs.
@@ -298,7 +300,7 @@ container_starts | tee "$WORK/starts-before.txt"
 
 echo "=== [C] start one agent loop (no restart until the end) ==="
 dc exec -T a sh -c "orblx agent connect --grant $GRANT_DIR --every-ms $EVERY_MS \
-  --max-wait $max_wait >$STATE/agent-loop.log 2>&1; echo \"loop_exit \$?\" >>$STATE/agent-loop.log" &
+  --max-wait $max_wait --trace-file $STATE/agent-loop-trace.txt >$STATE/agent-loop.log 2>&1; echo \"loop_exit \$?\" >>$STATE/agent-loop.log" &
 loop_pid=$!
 echo "loop_started_ms $(now_ms) (one process for the whole run)"
 
@@ -316,6 +318,9 @@ done
 wait "$loop_pid" || true
 echo "=== [C] agent loop output ==="
 dc exec -T a cat "$STATE/agent-loop.log" | tee "$WORK/loop.txt"
+
+echo "=== [C] agent loop trace (one line per attempt) ==="
+dc exec -T a cat "$STATE/agent-loop-trace.txt" | tee "$WORK/trace.txt"
 
 echo "=== [C] containers after the loop ==="
 container_starts | tee "$WORK/starts-after.txt"
@@ -344,24 +349,75 @@ echo "loop_exit ${loop_exit} attempts ${attempts} ok_attempts ${ok_attempts} fai
 [[ "$attempts" == "$ok_attempts" && "$failed" -eq 0 && "$denies_client" -eq 0 && "$denies_guard" -eq 0 ]]
 (( switches >= ENDS ))
 
-echo "=== [C] gap at each grant end (guard use times) ==="
-awk '$1 == "agent" && $2 == "use" {print $NF}' "$WORK/guard.txt" | sort -n >"$WORK/uses.txt"
+echo "=== [C] gap at each grant switch (guard use times) ==="
+# The PO method (W25-30): for each switch, the gap is the time from the last
+# guard use of the old grant to the first guard use of the new grant.
+# The limit is GAP_LIMIT_MS for all switches.
+awk '$1 == "agent" && $2 == "use" {print $NF, $4}' "$WORK/guard.txt" | sort -n >"$WORK/uses-id.txt"
+awk '{print $1}' "$WORK/uses-id.txt" >"$WORK/uses.txt"
 ends_crossed=0
 worst=0
-for n in $(seq 1 "$ENDS"); do
-  read -r id end_ms < <(awk -v n="$n" 'NR == n {print $2, $4}' "$WORK/grants.txt")
-  # The largest gap between two uses in the 2 s around the end.
-  gap="$(awk -v e="$end_ms" 'prev != "" && $1 >= e - 1000 && prev <= e + 1000 {g = $1 - prev; if (g > m) m = g} {prev = $1} END {print m + 0}' "$WORK/uses.txt")"
-  before="$(awk -v e="$end_ms" '$1 < e {c++} END {print c + 0}' "$WORK/uses.txt")"
-  after="$(awk -v e="$end_ms" '$1 >= e && $1 < e + 5000 {c++} END {print c + 0}' "$WORK/uses.txt")"
-  echo "end ${n} grant ${id} expires_ms ${end_ms} gap_ms ${gap} uses_5s_after ${after} uses_before ${before}"
-  if (( gap > GAP_LIMIT_MS || after == 0 )); then
-    echo "The gap at the end of grant ${id} is above ${GAP_LIMIT_MS} ms." >&2
+n=0
+while read -r _ _ _ from _ to _ switch_ms _ _; do
+  n=$(( n + 1 ))
+  last_old="$(awk -v id="$from" '$2 == id {t = $1} END {print t + 0}' "$WORK/uses-id.txt")"
+  first_new="$(awk -v id="$to" '$2 == id {print $1; exit}' "$WORK/uses-id.txt")"
+  first_new="${first_new:-0}"
+  gap=$(( first_new - last_old ))
+  echo "switch ${n} from ${from} to ${to} loop_switch_ms ${switch_ms} last_old_use_ms ${last_old} first_new_use_ms ${first_new} gap_ms ${gap} limit_ms ${GAP_LIMIT_MS}"
+  if (( last_old == 0 || first_new == 0 || gap < 0 || gap > GAP_LIMIT_MS )); then
+    echo "The gap at switch ${n} (${from} to ${to}) is not in 0..${GAP_LIMIT_MS} ms." >&2
     exit 1
   fi
   (( gap > worst )) && worst="$gap"
+done < <(grep '^loop grant_switch ' "$WORK/loop.txt")
+if (( n < ENDS )); then
+  echo "Only ${n} switches are in the loop log." >&2
+  exit 1
+fi
+echo "=== [C] access after each grant end (information and no-loss check) ==="
+for k in $(seq 1 "$ENDS"); do
+  read -r id end_ms < <(awk -v k="$k" 'NR == k {print $2, $4}' "$WORK/grants.txt")
+  # Information only: the largest gap between two uses in the 2 s around the end.
+  window="$(awk -v e="$end_ms" 'prev != "" && $1 >= e - 1000 && prev <= e + 1000 {g = $1 - prev; if (g > m) m = g} {prev = $1} END {print m + 0}' "$WORK/uses.txt")"
+  before="$(awk -v e="$end_ms" '$1 < e {c++} END {print c + 0}' "$WORK/uses.txt")"
+  after="$(awk -v e="$end_ms" '$1 >= e && $1 < e + 5000 {c++} END {print c + 0}' "$WORK/uses.txt")"
+  echo "end ${k} grant ${id} expires_ms ${end_ms} window_max_gap_ms ${window} uses_5s_after ${after} uses_before ${before}"
+  if (( after == 0 )); then
+    echo "No use in the 5 s after the end of grant ${id}." >&2
+    exit 1
+  fi
   ends_crossed=$(( ends_crossed + 1 ))
 done
+
+echo "=== [C] gap split (information only, no gate) ==="
+# trace: start_ms (before the grant directory read), send_ms (before connect), done_ms (after the reply).
+# Each ok attempt has one guard use, in the same order. Same host clock for all containers.
+trace_ok="$(awk '$1 == "trace" && $11 == "ok"' "$WORK/trace.txt" | wc -l)"
+uses_n="$(wc -l <"$WORK/uses.txt")"
+echo "trace_ok_lines ${trace_ok} guard_uses ${uses_n}"
+if [[ "$trace_ok" -eq "$uses_n" ]]; then
+  awk '$1 == "trace" && $11 == "ok" {print $5, $7, $9}' "$WORK/trace.txt" | paste -d' ' - "$WORK/uses.txt" >"$WORK/split.txt"
+  # Fields: start send done guard. Per attempt: refresh = send - start, to_guard = guard - send,
+  # from_guard = done - guard, sleep = next start - done.
+  awk -v lim="$GAP_LIMIT_MS" '
+    NR > 1 {
+      cgap = $2 - psend; ggap = $4 - pguard
+      sleep = $1 - pdone; refresh = $2 - $1
+      if (cgap > lim || ggap > lim)
+        printf "big_gap at_send_ms %d client_gap_ms %d guard_gap_ms %d prev_request_ms %d prev_to_guard_ms %d prev_from_guard_ms %d sleep_ms %d refresh_ms %d this_to_guard_ms %d\n", $2, cgap, ggap, pdone - psend, pguard - psend, pdone - pguard, sleep, refresh, $4 - $2
+    }
+    {psend = $2; pdone = $3; pguard = $4}' "$WORK/split.txt"
+  for f in request:3-2 to_guard:4-2 from_guard:3-4 refresh:2-1; do
+    name="${f%%:*}"; a="${f#*:}"; a1="${a%-*}"; a2="${a#*-}"
+    awk -v a="$a1" -v b="$a2" '{print $a - $b}' "$WORK/split.txt" | sort -n |
+      awk -v name="$name" '{v[NR] = $1} END {printf "split %s_ms p50 %d p90 %d p99 %d max %d n %d\n", name, v[int(NR * .5)], v[int(NR * .9)], v[int(NR * .99)], v[NR], NR}'
+  done
+  awk 'NR > 1 {print $1 - pdone} {pdone = $3}' "$WORK/split.txt" | sort -n |
+    awk '{v[NR] = $1} END {printf "split sleep_ms p50 %d p90 %d p99 %d max %d n %d\n", v[int(NR * .5)], v[int(NR * .9)], v[int(NR * .99)], v[NR], NR}'
+else
+  echo "split_skipped trace and guard counts differ"
+fi
 grep -c "^agent grant .* expired " "$WORK/guard.txt" | read_all awk '{print "guard_expire_lines " $1}'
 
 echo "=== [C] phase 2 (gate): no other-scope and no revoked next grant ==="
@@ -476,5 +532,5 @@ for needle in 'PRIVATE KEY' 'T0JMWEFHVDE' 'ge1.'; do
 done
 
 echo "summary gate loop_exit ${gate_exit} deny_reason ${gate_reason} switches ${gate_switches} kept_scope ${kept_scope} kept_revoked ${kept_revoked} revoked_before_fetch_refused 1"
-echo "summary ends_crossed ${ends_crossed} ttl_s ${TTL_SECS} attempts ${attempts} ok_attempts ${ok_attempts} lost 0 worst_end_gap_ms ${worst} loop_max_ok_gap_ms ${max_gap} limit_ms ${GAP_LIMIT_MS} switches ${switches} restarts 0"
+echo "summary ends_crossed ${ends_crossed} ttl_s ${TTL_SECS} attempts ${attempts} ok_attempts ${ok_attempts} lost 0 worst_switch_gap_ms ${worst} loop_max_ok_gap_ms ${max_gap} limit_ms ${GAP_LIMIT_MS} switches ${switches} restarts 0"
 echo "proof_ok"
