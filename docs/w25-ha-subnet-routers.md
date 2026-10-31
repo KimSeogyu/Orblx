@@ -86,27 +86,33 @@ The proof uses a release build. With a debug build on a loaded host, the overlay
 
 ### Results [C]
 
-Branch head ea34c8b (main 690558d, with #114), release build, 5 runs (full run 10). The proof starts from a clean compose state (`proof_compose_clean orblx-w25ha-proof clean`).
-Log: `/workspace/orblx-w18-proof/w25ha-routers-full10-ea34c8b7.log` (lock 08:00:19 to 08:05:46 KST, 31 Oct 2026). Other orblx proof containers: 0 at the start, 0 at the end.
+Branch head ad8142a (main 819c33a, with #114, #102, and #111), release build, 5 runs (full run 15). `route-failover` is code 38. The proof starts from a clean compose state (`proof_compose_clean orblx-w25ha-proof clean`). All 4 nodes use the SVID, the key, and the ticket that the coordinator issued through the normal enroll path. The proof makes no lab tickets.
+Log: `/workspace/orblx-w18-proof/w25ha-routers-full15-ad8142a8.log` (lock 12:26:39 to 12:32:09 KST, 31 Oct 2026). Other orblx proof containers: 0 at the start, 0 at the end. The lock had 0 contended samples (164 samples).
 
 | Gate | Result [C] |
 |---|---|
 | 1. Both routes need approval | Only router-a approved: router-b got 0 FORWARD bytes, and the target got 0 datagrams while router-a was down. After both approvals, the client netmap has both routers for `10.88.125.0/24`. |
-| 2. Failover (limit 5000 ms, target 2000 ms) | 1033, 1017, 996, 1017, 989 ms. 5/5 at or below 2000 ms. |
-| 2. Max gap of the UDP stream (10 ms interval) | 1011, 991, 971, 991, 970 ms |
-| 2. Ping loss (`ping -i 0.05`, 9 s) | 17/167, 17/167, 17/169, 17/171, 17/169 |
-| 2. Audit | +1 `route-failover` record for each kill. Example: `{"actor":"spiffe://orblx.local/node/client","target":"10.88.125.0/24","action":"route-failover","detail":"from router-a to router-b old_silent_ms 1000"}`. The chain verifies. |
-| 3. Failback | router-a came back. 0 route changes and 0 records in 60 s. All 5921 datagrams came through router-b. |
+| 2. Failover (limit 5000 ms, target 2000 ms) | 996, 1004, 1010, 1010, 1029 ms. 5/5 at or below 2000 ms. |
+| 2. Max gap of the UDP stream (10 ms interval) | 979, 981, 983, 993, 1013 ms |
+| 2. Ping loss (`ping -i 0.05`, 9 s) | 17/169, 17/164, 17/169, 17/169, 17/168 |
+| 2. Audit | +1 `route-failover` record for each kill (5 records). Example: `{"actor":"spiffe://orblx.local/node/client","target":"10.88.125.0/24","action":"route-failover","detail":"from router-a to router-b old_silent_ms 1009"}`. The chain verifies. |
+| 3. Failback | router-a came back. 0 route changes and 0 records in 60 s. All 5919 datagrams came through router-b. |
 | 4. Port ACL on router-b | TCP 8080 allowed. TCP 8081 and UDP 9001 (no rule): 0 FORWARD bytes, 3 packet-deny records. Guest TCP 8080: timeout. |
 | 4. UDP 53 on router-b | With the rule: 1 answer (`10.88.24.20`), 57 bytes. Without the rule: no answer, 0 bytes, 0 queries at the nameserver, 1 deny record. |
-| 5. TCP flow | The flow does not survive. It reconnected 1125 ms after the kill (the read timed out at 1124 ms). |
-| 6. Secrets | 0 lines in all container logs with a token value, a key line, or `PRIVATE KEY` (19 patterns, 433 log lines). |
+| 5. TCP flow | The flow does not survive. It reconnected 1070 ms after the kill (the read timed out at 1068 ms). |
+| 6. Secrets | 0 lines in all container logs with a token value, a key line, or `PRIVATE KEY` (11 patterns, 452 log lines). |
 | Leak | 0 packets from the client and the guest to `10.88.125.0/24` on the underlay interface. |
-| Ping before the kills | max 1.749 ms. Baseline 0/95 lost, RTT avg 1.244 ms, max 16.999 ms. |
+| Ping before the kills | max 1.647 ms. Baseline 0/96 lost, RTT avg 1.156 ms, max 1.823 ms. |
 
 The failover time is about `HA_DEAD_AFTER` (1000 ms): the client moves the route at the first packet after 1000 ms with no frame from the active router.
 
-Earlier full runs with the same result. They ran before #114, so they did not start with `proof_compose_clean`:
+Earlier full runs:
+
+- Run 14, tree 96f77c7 (log `w25ha-routers-full14-8471466c.log`, lock 11:03:52 to 11:09:47 KST): `route-failover` was code 37, with `proof_compose_clean` and enrolled tickets. Failover 1068, 1005, 1000, 1032, 1010 ms; max gap 981 to 1012 ms; 0 route changes in 60 s; TCP reconnect 1088 ms; leak 0; secret lines 0.
+- Run 10, head ea34c8b (main 690558d, log `w25ha-routers-full10-ea34c8b7.log`, lock 08:00:19 to 08:05:46 KST): with `proof_compose_clean`, but with lab tickets from `orblx node-issue`. Failover 1033, 1017, 996, 1017, 989 ms; max gap 970 to 1011 ms; 0 route changes in 60 s; TCP reconnect 1125 ms; leak 0; secret lines 0.
+- Run 11, head ff25dc3, stopped before the nodes started: `Permission denied` on `state-router-a/netmap.pub`. The root copy of the enroll state made the directories root-owned. Head d57558f gives the directories to the proof user.
+
+The runs that follow ran before #114, so they did not start with `proof_compose_clean`:
 
 - Run 9, head e176ae7 (main 6815863, log `w25ha-routers-full9-e176ae7f.log`, lock 07:22:49 to 07:28:16 KST): failover 1019, 1014, 1024, 989, 992 ms; max gap 963 to 1002 ms; 0 route changes in 60 s; TCP reconnect 1119 ms; leak 0; secret lines 0.
 - Run 8, head 8ead8fa (log `w25ha-routers-full8-8ead8fa4.log`, lock 06:18:53 to 06:24:46 KST): failover 1030, 982, 1033, 1017, 1011 ms; TCP reconnect 1124 ms; leak 0; secret lines 0.
