@@ -14,8 +14,9 @@
 #  5. No restart: same container start time, restart count 0, same orblxd pid.
 #  6. A new handshake (a to b) after the ticket ends passes.
 #  7. (TR_REVOKE=1) A revoked node gets no new ticket, and its peers stop it in TR_REVOKE_MS.
-#  8. 0 contended samples: the proof-lock sampler saw no other orblx container (and no
-#     unknown sample) while the proof held the lock. The proof also prints the host load.
+#  8. 0 contended samples while the proof held the lock: the proof-lock sampler saw no
+#     other orblx container, no unknown sample, and no host load1 above TR_LOAD_MAX
+#     (default: the CPU count).
 # Gates 3, 4 and 8 do not stop the proof at once. Gates 5, 6 and 7 run first, then the
 # proof fails if one of gates 3, 4 or 8 failed.
 # The proof reads MAX_SKEW and MAX_USER_TTL from clock.rs.
@@ -484,10 +485,13 @@ secret_scan "$WORK/stack.log"
 
 echo "=== gate 8: contention while the proof held the lock ==="
 if [[ -n "${PROOF_LOCK_SAMPLES:-}" && -f "$PROOF_LOCK_SAMPLES" ]]; then
-  read -r cs_n cs_busy cs_unknown cs_maxc cs_maxl < <(awk '{n++; if ($2 < 0) u++; if ($2 > 0) b++; if ($2 > c) c = $2; if ($3 > l) l = $3} END {printf "%d %d %d %d %s\n", n, b + 0, u + 0, c + 0, (n ? l : "-")}' "$PROOF_LOCK_SAMPLES")
+  load_max="${TR_LOAD_MAX:-$(nproc)}"
+  read -r cs_n cs_busy cs_unknown cs_maxc cs_maxl cs_load cs_lfirst cs_llast < <(awk -v lm="$load_max" '{n++; if ($2 < 0) u++; if ($2 > 0) b++; if ($2 > c) c = $2; if ($3 > l) l = $3; if ($3 + 0 > lm + 0) {h++; if (!f) f = $1; z = $1}} END {printf "%d %d %d %d %s %d %s %s\n", n, b + 0, u + 0, c + 0, (n ? l : "-"), h + 0, (f ? f : "-"), (z ? z : "-")}' "$PROOF_LOCK_SAMPLES")
   echo "contention samples ${cs_n} contended_samples ${cs_busy} unknown_samples ${cs_unknown} max_other_orblx_containers ${cs_maxc} max_load1 ${cs_maxl} cpus $(nproc)"
+  echo "host_load samples_above_load_max ${cs_load} load_max ${load_max} first_ms ${cs_lfirst} last_ms ${cs_llast}"
   (( cs_n > 0 )) || LATE_FAIL+=("The proof-lock sampler has no sample.")
   (( cs_busy == 0 && cs_unknown == 0 )) || LATE_FAIL+=("${cs_busy} contended and ${cs_unknown} unknown samples. The run does not count.")
+  (( cs_load == 0 )) || LATE_FAIL+=("${cs_load} samples have host load1 above ${load_max}. The run does not count.")
 else
   LATE_FAIL+=("No proof-lock samples. The run does not count.")
 fi
