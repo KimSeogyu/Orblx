@@ -32,6 +32,7 @@ PROOFS = {
     "natrq.sh": "echo 'prc_prc steady lost 0/20 max_ms 40 limit_ms 1000'\necho proof_ok\n",
     "ssh.sh": "echo 'proof_ticket_guard FAIL ssh: the manifest proof makes lab tickets'\nexit 1\n",
     "old.sh": 'OLD_ORBLX="${OLD_ORBLX:?set OLD_ORBLX}"\necho "old=$OLD_ORBLX"\necho proof_ok\n',
+    "slow.sh": "sleep 5\necho proof_ok\n",
     "loud.sh": "seq 1 100000\necho 'to stderr' >&2\nprintf 'no newline at end'\necho\necho proof_ok\n",
 }
 
@@ -286,7 +287,7 @@ class ReleaseSweepTest(unittest.TestCase):
         # W25-27: the shipped rows of docs/matrix-rows.txt (Page snapshot 2026-10-31 08:10 KST
         # and the PO list). Rows 28 and 29 are not shipped: 28 has no sweep line, 29 is partial.
         self.assertEqual(sorted(rows, key=int), ["19", "21", "24", "30", "31", "32", "33", "35", "38", "45",
-                                                 "49", "51", "52", "53", "58", "62"])
+                                                 "49", "51", "52", "53", "58", "62", "66"])
         self.assertEqual(sorted(partial, key=int), ["1", "9", "10", "11", "16", "17", "29", "40", "41",
                                                     "54", "61"])
         self.assertNotIn("28", rows)
@@ -301,7 +302,7 @@ class ReleaseSweepTest(unittest.TestCase):
     def test_the_real_manifest_matches_the_real_rows_file(self):
         with open(REAL_ROWS) as f:
             status = {l.split("|")[0]: l.split("|")[1] for l in f if l.strip() and not l.startswith("#")}
-        self.assertEqual(len(status), 65)
+        self.assertEqual(len(status), 66)
         for row in ["1", "9", "10", "11", "16", "17", "28", "29", "40", "41", "43", "44", "54", "61"]:
             self.assertEqual(status[row], "partial", row)
         with open(REAL_MANIFEST) as f:
@@ -311,6 +312,34 @@ class ReleaseSweepTest(unittest.TestCase):
         for l in lines:
             if l.startswith("partial|"):
                 self.assertEqual(status[l.split("|")[1]], "partial", l)
+
+    def test_a_proof_timeout_word_sets_the_time_of_that_proof_only(self):
+        # W25-33: ORBLX_SWEEP_PROOF_TIMEOUT=N in the ENV field of one proof.
+        manifest = GOOD + "row|5|Slow|slow\nproof|slow|scripts/proof/slow.sh|ORBLX_SWEEP_PROOF_TIMEOUT=1|-\n"
+        out = self.run_sweep(manifest)
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("FAIL (exit 124, timeout 1 s)", self.rows()[("5", "slow")][3])
+        self.assertEqual(self.rows()[("1", "ok")][3], "proof_ok")
+        out = self.run_sweep(manifest.replace("TIMEOUT=1|", "TIMEOUT=30|"))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.rows()[("5", "slow")][3], "proof_ok")
+
+    def test_negative_a_bad_proof_timeout_word_is_a_setup_error(self):
+        for bad in ["0", "1.5", "x", ""]:
+            manifest = GOOD + "row|5|Slow|slow\nproof|slow|scripts/proof/slow.sh|ORBLX_SWEEP_PROOF_TIMEOUT=%s|-\n" % bad
+            out = self.run_sweep(manifest, plan=True)
+            self.assertEqual(out.returncode, 2, bad + out.stdout + out.stderr)
+            self.assertIn("ORBLX_SWEEP_PROOF_TIMEOUT must be a whole number", out.stdout + out.stderr)
+
+    def test_the_real_manifest_gives_the_coordinator_soak_its_own_time(self):
+        # W25-33: the soak runs 2 h or more from the coordinator start, more than the default
+        # 3600 s of ORBLX_SWEEP_TIMEOUT.
+        with open(REAL_MANIFEST) as f:
+            lines = [l.rstrip("\n") for l in f if l.startswith("proof|coord-cert-soak|")]
+        self.assertEqual(len(lines), 1)
+        words = lines[0].split("|")[3].split()
+        self.assertIn("ORBLX_SWEEP_PROOF_TIMEOUT=9000", words)
+        self.assertEqual(lines[0].split("|")[5], "^proof_ok coord-cert-soak$")
 
     def test_negative_rows_mismatch_stops_the_sweep_before_any_proof(self):
         good_rows = self.rows_for(GOOD)

@@ -3,6 +3,8 @@
 # 2026-10-31 08:10 KST, with the PO list of 2026-10-31 (W25-27): rows 1, 9, 10, 11, 16, 17,
 # 28, 29, 40, 41, 43, 44, 54 and 61 are partial. The PO keeps the Page and this file in sync.
 # Row 32 (User approval) is shipped: the PO closed W25-15 on 2026-10-31 11:26 KST (#102).
+# Row 66 is an rc.3 required row (PO, W25-33, 2026-10-31): the coordinator renews its own leaf,
+# proved by the 2 h soak. It is not on the Page yet; the PO adds it.
 # The sweep fails (exit 2) when the manifest rows and this file differ.
 # ID|STATUS|FEATURE[|NOTE]   STATUS: shipped, partial, or missing. One line per row, any order.
 # NOTE (optional, partial rows only): the one accepted note is
@@ -76,3 +78,4 @@
 63|missing|REST API / Terraform
 64|missing|MDM / system policies
 65|missing|Multiple tailnets
+66|shipped|Coordinator certificate renewal (2 h soak, W25-33)

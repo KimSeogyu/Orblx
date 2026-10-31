@@ -46,6 +46,8 @@
 #                         root with ORBLX_SWEEP_TEST_ROOT). No rows file is a setup error.
 #   ORBLX_SWEEP_ONLY      Space list of proof names (a partial run, exit 3 at best).
 #   ORBLX_SWEEP_TIMEOUT   Seconds for each proof, without the lock wait (default 3600).
+#                         A proof ENV word ORBLX_SWEEP_PROOF_TIMEOUT=N (whole seconds) sets the
+#                         time of that proof only (W25-33: the 2 h coordinator leaf soak).
 #   ORBLX_SWEEP_KEEP      1 keeps the worktree, the target and the images.
 #   ORBLX_SWEEP_FETCH     0 does not run git fetch before COMMIT is resolved.
 #   ORBLX_SWEEP_PROGRESS  A file. The script adds one line for each step.
@@ -432,10 +434,21 @@ script_text() {
   fi
 }
 P_PIN=()
+P_TIMEOUT=()
 OLD_PINS=""
 for i in "${!P_NAME[@]}"; do
   pin="-"
   envs="${P_ENV[$i]}"
+  # W25-33: a time of its own for one proof. The value must be a whole number of seconds.
+  proof_timeout="$TIMEOUT"
+  for word in $envs; do
+    if [[ "$word" == ORBLX_SWEEP_PROOF_TIMEOUT=* ]]; then
+      proof_timeout="${word#*=}"
+      [[ "$proof_timeout" =~ ^[1-9][0-9]*$ ]] ||
+        die "manifest: proof ${P_NAME[$i]}: ORBLX_SWEEP_PROOF_TIMEOUT must be a whole number of seconds, not '$proof_timeout'"
+    fi
+  done
+  P_TIMEOUT+=("$proof_timeout")
   if [[ "$envs" == *"@OLD:"* ]]; then
     [[ "$envs" =~ OLD_ORBLX=@OLD:([^@ ]*)@ ]] ||
       die "manifest: proof ${P_NAME[$i]}: an @OLD:...@ pin must be the value of OLD_ORBLX (OLD_ORBLX=@OLD:<full sha>@)"
@@ -784,7 +797,7 @@ for i in "${!P_NAME[@]}"; do
           echo "release_sweep: no timeout command on this host, the proof runs with no time limit"
           bash "$4"
         fi
-      ' release-sweep-proof "$LOCK_LIB" "rc3-sweep:$name" "$ROOT" "$ROOT/$path" "$TIMEOUT" \
+      ' release-sweep-proof "$LOCK_LIB" "rc3-sweep:$name" "$ROOT" "$ROOT/$path" "${P_TIMEOUT[$i]}" \
       >>"$log" 2>&1 </dev/null || rc=$?
   fi
   secs=$(( $(date +%s) - started ))
@@ -805,7 +818,7 @@ for i in "${!P_NAME[@]}"; do
   else
     failed=$((failed + 1))
     if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
-      result="FAIL (exit $rc, timeout ${TIMEOUT} s): $(first_error "$log")"
+      result="FAIL (exit $rc, timeout ${P_TIMEOUT[$i]} s): $(first_error "$log")"
     elif [[ "$rc" -eq 0 && "$ok_re" == "$OK_RE" ]]; then
       result="FAIL (exit 0, no proof_ok line): $(first_error "$log")"
     elif [[ "$rc" -eq 0 ]]; then
