@@ -39,8 +39,6 @@ mod ticket;
 mod tlsutil;
 #[cfg(test)]
 mod user_approval_test;
-#[cfg(test)]
-mod w25_38_enroll_test;
 mod webhook;
 
 pub use admin::{
@@ -259,12 +257,6 @@ mod tests {
         .await
         .unwrap();
         second.write_state(&node_b.0).unwrap();
-        // W25-38: enroll writes the deny list of the node to a valid `deny.json`.
-        for dir in [&node_a.0, &node_b.0] {
-            assert!(dir.join(orblx_identity::DENY_FILE).exists());
-            let deny = orblx_identity::load_deny_file(dir).unwrap();
-            assert!(!deny.refuses_all());
-        }
         assert_eq!(first.overlay_ip, "100.64.0.1");
         assert_eq!(second.overlay_ip, "100.64.0.2");
         handle.abort();

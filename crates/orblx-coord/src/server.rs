@@ -420,12 +420,7 @@ async fn dispatch(
                 }
             };
             println!("enrolled {}", result.name);
-            // W25-38: the reply has the deny list of the node, so the node writes
-            // `deny.json` at enroll and does not start without a deny file.
-            let deny = admin::deny_json_for(coord, &result.name, now)?;
-            let mut response = leaf_response(result);
-            response.detail = Some(deny);
-            Ok(response)
+            Ok(leaf_response(result))
         }
         "renew" => {
             let peer = peer_node(coord, connection)?;
@@ -807,7 +802,7 @@ fn parse_since(text: &str) -> Result<Option<u64>, CoordError> {
         .map_err(|_| CoordError::Protocol("The audit time is not valid.".to_string()))
 }
 
-pub(crate) fn leaf_response(result: crate::state::EnrollResult) -> Response {
+fn leaf_response(result: crate::state::EnrollResult) -> Response {
     let wire = result.ticket.as_ref().map(ticket_response_fields);
     Response {
         ok: true,
