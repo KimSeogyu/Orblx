@@ -150,3 +150,16 @@ These notes go in the first release that contains W25-34 (not rc.3).
 - Keep --state-dir private (0700).
 - SSH certificate logins need a coordinator reachable within the last 60 s. Mesh traffic does not.
 - After a coordinator clock that went forward and then back, run `orblx admin netmap-seq-reset`.
+
+## Start-up race in the netmap watcher (found by the full gates on 7dab6a9)
+
+The full gates on 7dab6a9 failed at start: node a never printed "The path to b is direct."
+Node a enrolled first, so its start netmap had no peer. `orblx up` read that file, then the
+policy sync wrote the new netmap with b and c, and then the datapath netmap watcher started.
+The watcher took the file text at its start as the known text, so it never saw the change, and
+node a never added b and c. This code is also on main.
+
+The fix: `NodeRequest::netmap_text` holds the bytes of the file that gave the start netmap.
+`orblx up` reads them before the policy sync starts. The watcher starts from these bytes, so it
+applies a file that changed before it started. The test
+`renew_test::a_netmap_file_written_before_the_watcher_starts_is_applied` fails without the fix.
