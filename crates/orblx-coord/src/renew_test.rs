@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::client;
 use crate::server;
+use crate::test_port::free_port;
 use crate::{Coordinator, OidcConfig};
 
 struct Scratch(PathBuf);
@@ -46,11 +47,6 @@ fn hex(bytes: &[u8]) -> String {
         text.push(HEX[usize::from(byte & 0x0f)] as char);
     }
     text
-}
-
-fn free_port() -> u16 {
-    let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    socket.local_addr().unwrap().port()
 }
 
 fn unix(now: SystemTime) -> u64 {
@@ -804,8 +800,7 @@ async fn startup_cost_once() -> StartupPhases {
     )
     .unwrap();
     let ring = TicketRing::single(ticket_key, &[7; 32]).unwrap();
-    // Node b binds port 0 itself and reports the real port in the listen event. A port from
-    // free_port() is free only until its socket drops, and a parallel test can take it then
+    // Node b binds port 0 itself and reports the real port in the listen event
     // (CI startup-cost run 41138247996: "node b ended before its listener started").
     // Node b has no peer here, so no node dials the endpoint that it enrolls with.
     let unused_endpoint = "127.0.0.1:9";
