@@ -110,9 +110,12 @@ class ReleaseSweepTest(unittest.TestCase):
         self.root = os.path.join(self.tmp, "root")
         self.out = os.path.join(self.tmp, "out")
         os.makedirs(os.path.join(self.root, "scripts", "proof"))
+        # W25-27: the sweep wrapper line must have samples 1 or more. The sampler takes its first
+        # sample right after the lock is taken; each fake proof waits a moment so a loaded CI
+        # host still gets that sample.
         for name, body in PROOFS.items():
             with open(os.path.join(self.root, "scripts", "proof", name), "w") as f:
-                f.write("#!/usr/bin/env bash\n" + body)
+                f.write("#!/usr/bin/env bash\nsleep 0.3\n" + body)
 
     def tearDown(self):
         shutil.rmtree(self.tmp)
@@ -537,7 +540,7 @@ class ReleaseSweepTest(unittest.TestCase):
         self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
         self.assertTrue(self.rows()[("1", "fail")][3].startswith("FAIL"))
 
-    def test_negative_contention_a_missing_line_is_invalid(self):
+    def test_negative_contention_a_missing_line_or_samples_0_is_invalid(self):
         def log(text):
             path = os.path.join(self.tmp, "p.log")
             with open(path, "w") as f:
@@ -547,10 +550,17 @@ class ReleaseSweepTest(unittest.TestCase):
         out = self.contention(log("step\nproof_ok\n" + good), "p")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("contention_check p ok: unknown_samples 0", out.stdout)
+        # The proof's own line may have samples 0 (the rule is for the sweep wrapper line only).
+        own = good.replace("rc3-sweep:p", "p").replace("samples 4 contended", "samples 0 contended")
+        out = self.contention(log("proof_ok\n" + own + good), "p")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         cases = [
             ("step\nproof_ok\n", "no proof_contention rc3-sweep:p line with unknown_samples"),
             # Only the proof's own line: the sweep wrapper line is missing.
             (good.replace("rc3-sweep:p", "p"), "no proof_contention rc3-sweep:p line"),
+            # The sweep wrapper line with samples 0: no contention evidence.
+            (good.replace("samples 4 contended", "samples 0 contended"),
+             "samples 0 in proof_contention rc3-sweep:p (no contention evidence)"),
             # A line with no unknown_samples field.
             ("proof_contention rc3-sweep:p samples 4 contended_samples 0\n", "has no unknown_samples field"),
             (good.replace("unknown_samples 0", "unknown_samples 3"), "unknown_samples 3 in proof_contention rc3-sweep:p"),

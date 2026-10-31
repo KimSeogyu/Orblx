@@ -220,7 +220,8 @@ caller is not root, so it never asks for a password.
 - the real manifest has every shipped row, and each proof it names is defined;
 - contention rule: `unknown_samples 0` passes; `unknown_samples` over 0 (a fake `docker` that
   fails, or a proof's own probe line) makes the row INVALID and the sweep exit 1; a missing
-  wrapper line or a line with no `unknown_samples` field is INVALID (`--contention-check`).
+  wrapper line, a wrapper line with `samples 0`, or a line with no `unknown_samples` field is
+  INVALID, and a proof's own line with `samples 0` is not (`--contention-check`).
   The tests put a fake `docker` first on the sweep tool PATH (`$CARGO_HOME/bin`), so the probe
   result does not depend on the host.
 
@@ -358,11 +359,16 @@ line, the sweep reads its log:
   takes the lock (or the parent lock in lock mode `sweep`), so the line is there in both lock
   modes;
 - every `proof_contention` line in the log (the wrapper's and the proof's own) must have an
-  `unknown_samples` field, and it must be 0.
+  `unknown_samples` field, and it must be 0;
+- the wrapper line must also have `samples` 1 or more (Eng Lead, 2026-10-31 14:49 KST).
+  `samples 0` means the probe took no sample, so there is no contention evidence. This rule is
+  for the wrapper line only: a proof's own `proof_contention` lines may have `samples 0`.
 
 Else the result is `INVALID: proof_ok but REASON`, where REASON is
-`unknown_samples N in proof_contention LABEL`, `no proof_contention rc3-sweep:PROOF line with
-unknown_samples`, or `proof_contention LABEL has no unknown_samples field`. An INVALID row
+`unknown_samples N in proof_contention LABEL`, `samples 0 in proof_contention LABEL (no
+contention evidence)`, `no proof_contention rc3-sweep:PROOF line with unknown_samples`,
+`proof_contention LABEL has no unknown_samples field`, or `proof_contention LABEL has no samples
+field`. The first problem in the log is the reason. An INVALID row
 does not count: the summary line `Invalid rows (...): ...` names it and the sweep exits 1 (as
 for `Failed rows`). A FAIL stays a FAIL. A skipped proof is not checked.
 
@@ -374,6 +380,3 @@ scripts/proof/release-sweep.sh --contention-check LOG PROOF
 
 It prints `contention_check PROOF ok: unknown_samples 0 (LOG)` (exit 0) or
 `contention_check PROOF INVALID: REASON (LOG)` (exit 1).
-
-Limit: the rule checks `unknown_samples` only. A proof that ends before the first sample has
-`samples 0 ... unknown_samples 0` and passes the rule.

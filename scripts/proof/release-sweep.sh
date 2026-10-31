@@ -212,15 +212,24 @@ log_times() {
 # unknown_samples 0. contention_verdict LOG NAME prints "ok" (exit 0) or the reason (exit 1):
 # the log must have the sweep wrapper line "proof_contention rc3-sweep:NAME ... unknown_samples
 # N ...", and every proof_contention line in the log (the wrapper's and the proof's own) must
-# have unknown_samples 0. The probe itself is in proof-lock.sh.
+# have unknown_samples 0. The wrapper line must also have samples 1 or more (Eng Lead,
+# 2026-10-31 14:49 KST): samples 0 is no contention evidence. The proof's own lines may have
+# samples 0. The probe itself is in proof-lock.sh.
 contention_verdict() {
   local log="$1" name="$2"
   awk -v want="rc3-sweep:$name" '
     index($0, "proof_contention ") == 1 {
-      label = $2; u = ""
-      for (k = 3; k < NF; k++) if ($k == "unknown_samples") u = $(k + 1)
+      label = $2; u = ""; n = ""
+      for (k = 3; k < NF; k++) {
+        if ($k == "unknown_samples") u = $(k + 1)
+        if ($k == "samples") n = $(k + 1)
+      }
       if (u !~ /^[0-9]+$/) { bad = bad ? bad : "proof_contention " label " has no unknown_samples field"; next }
-      if (label == want) seen = 1
+      if (label == want) {
+        seen = 1
+        if (n !~ /^[0-9]+$/ && !bad) bad = "proof_contention " label " has no samples field"
+        else if (n + 0 == 0 && !bad) bad = "samples 0 in proof_contention " label " (no contention evidence)"
+      }
       if (u + 0 > 0 && !bad) bad = "unknown_samples " u " in proof_contention " label
     }
     END {
