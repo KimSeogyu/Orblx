@@ -604,8 +604,7 @@ pub(crate) fn revoked_uris_in(
     if !path.exists() {
         return Ok(std::collections::BTreeSet::new());
     }
-    let file: DenyFile =
-        serde_json::from_str(&read_text(&path)?).map_err(|_| CoordError::State)?;
+    let file: DenyFile = serde_json::from_str(&read_text(&path)?).map_err(|_| CoordError::State)?;
     Ok(file.revoked_uris.into_iter().collect())
 }
 

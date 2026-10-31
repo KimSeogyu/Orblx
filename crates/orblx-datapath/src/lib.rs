@@ -38,9 +38,9 @@ pub use framing::{decode_length_prefixed, encode_length_prefixed, MAX_FRAME_LEN}
 pub use gate::PeerGate;
 pub use ipv4::{ipv4_destination, ipv4_packet, is_icmp_echo_reply, is_ipv4_packet};
 pub use netmap::{
-    valid_split_domain, valid_split_nameserver, LockUpdate, Netmap, NetmapError, NetmapPeer,
-    NetmapSelf, NodeLockSig, SplitDns, SshRevoked, MAX_SPLIT_DNS_SERVERS, MAX_SPLIT_DNS_ZONES,
-    ssh_key_id, ssh_key_id_node, MAX_SSH_REVOKED, MAX_SSH_USER_CA, NODE_LOCK_FILE,
+    ssh_key_id, ssh_key_id_node, valid_split_domain, valid_split_nameserver, LockUpdate, Netmap,
+    NetmapError, NetmapPeer, NetmapSelf, NodeLockSig, SplitDns, SshRevoked, MAX_SPLIT_DNS_SERVERS,
+    MAX_SPLIT_DNS_ZONES, MAX_SSH_REVOKED, MAX_SSH_USER_CA, NODE_LOCK_FILE,
 };
 pub use node::{
     format_node_status, read_status_text, run_memory_node, run_node, running_pid, ListenEvent,

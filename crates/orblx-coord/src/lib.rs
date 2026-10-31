@@ -33,9 +33,9 @@ mod share;
 #[cfg(test)]
 mod share_test;
 mod sink;
+pub mod sshca;
 #[cfg(test)]
 mod sshca_test;
-pub mod sshca;
 mod state;
 mod store;
 mod ticket;
@@ -57,8 +57,8 @@ pub use client::{
     advertise_routes_blocking, agent_grant_fetch_blocking, agent_grant_request_blocking,
     enroll_with_oidc_blocking, enroll_with_token_blocking, fetch_deny_blocking,
     fetch_deny_wait_blocking, fetch_netmap_blocking, fetch_policy_wait_blocking, netmap_json,
-    publish_candidates_blocking, renew_svid_blocking, ssh_cert_request_blocking, AdminReply, GrantFetch, OidcEnroll,
-    PolicySync, DENY_WAIT_HOLD,
+    publish_candidates_blocking, renew_svid_blocking, ssh_cert_request_blocking, AdminReply,
+    GrantFetch, OidcEnroll, PolicySync, DENY_WAIT_HOLD,
 };
 pub use config::{CoordConfig, OidcSection};
 pub use error::{CoordError, USER_PENDING_TEXT, USER_REJECTED_TEXT};

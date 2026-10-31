@@ -1092,11 +1092,7 @@ fn close_denied_links(mesh: &Mesh, deny: &DenySet) {
 ///
 /// The key ID of the certificate names the node SVID. The node closes the session one time
 /// for each revoked entry. A node that is not in the deny list can open a new session.
-fn close_ssh_revoked_links(
-    mesh: &Mesh,
-    netmap: &Netmap,
-    seen: &mut HashSet<(u64, String)>,
-) {
+fn close_ssh_revoked_links(mesh: &Mesh, netmap: &Netmap, seen: &mut HashSet<(u64, String)>) {
     let mut nodes = HashSet::new();
     for item in &netmap.ssh_revoked {
         if seen.insert((item.serial, item.key_id.clone())) {

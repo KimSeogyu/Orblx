@@ -1223,7 +1223,9 @@ impl Coordinator {
         }
         let revoked_uris = crate::admin::revoked_uris_in(&state_dir)?;
         let mut book = inner.ssh_certs.clone();
-        let changed = book.sweep(now_unix, |cert| ssh_pair_revoked(&inner, &revoked_uris, cert));
+        let changed = book.sweep(now_unix, |cert| {
+            ssh_pair_revoked(&inner, &revoked_uris, cert)
+        });
         if changed {
             book.save(&state_dir)?;
             inner.ssh_certs = book;
@@ -1546,7 +1548,8 @@ fn ssh_decide(
 ) -> Result<(crate::sshca::Granted, ssh_key::PublicKey), SshDenyFacts> {
     use crate::sshca::{decide, peer_kind, verify_request, IssueFacts, SshDeny};
     peer_kind(peer).map_err(|deny| (deny, None, None))?;
-    let nonce = crate::netmap::decode_hex_32(&ask.nonce).map_err(|_| (SshDeny::Nonce, None, None))?;
+    let nonce =
+        crate::netmap::decode_hex_32(&ask.nonce).map_err(|_| (SshDeny::Nonce, None, None))?;
     if !inner.ssh_nonces.take(connection, &nonce, now_unix) {
         return Err((SshDeny::Nonce, None, None));
     }
@@ -1794,9 +1797,9 @@ fn ssh_pair_revoked(
 fn ssh_revoked_set(inner: &Inner) -> Result<Vec<orblx_datapath::SshRevoked>, CoordError> {
     let now_unix = crate::sshca::unix_secs(SystemTime::now())?;
     let revoked_uris = crate::admin::revoked_uris_in(&inner.state_dir)?;
-    Ok(inner
-        .ssh_certs
-        .revoked_set(now_unix, |cert| ssh_pair_revoked(inner, &revoked_uris, cert)))
+    Ok(inner.ssh_certs.revoked_set(now_unix, |cert| {
+        ssh_pair_revoked(inner, &revoked_uris, cert)
+    }))
 }
 
 /// Append one SSH certificate decision to the config chain (W25-31).

@@ -1822,6 +1822,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "libc",
  "orblx-audit",
+ "orblx-datapath",
  "orblx-identity",
  "russh",
  "serde_json",

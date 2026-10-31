@@ -173,7 +173,9 @@ fn an_owner_node_gets_one_short_user_cert_for_its_owner_only() {
     assert!(cert.extensions().contains_key("permit-pty"));
     assert_eq!(cert.critical_options().len(), 1);
     assert_eq!(
-        cert.critical_options().get("source-address").map(String::as_str),
+        cert.critical_options()
+            .get("source-address")
+            .map(String::as_str),
         Some("100.64.0.1/32")
     );
     assert_eq!(
@@ -304,13 +306,18 @@ fn a_revoked_node_or_user_gets_no_new_cert_and_its_live_serials_go_to_the_netmap
     let second = parse(&lab.issue(&sam, 2, &new_key()).unwrap().text);
 
     crate::admin::revoke(&lab.coord, "alice-laptop", OWNER, lab.now).unwrap();
-    assert_eq!(deny_of(lab.issue(&alice, 3, &new_key())), SshDeny::NodeRevoked);
+    assert_eq!(
+        deny_of(lab.issue(&alice, 3, &new_key())),
+        SshDeny::NodeRevoked
+    );
     let view = lab.coord.netmap_for("b-missing").err();
     assert!(view.is_some(), "an unknown node gets no view");
 
-    crate::admin::revoke_all(&lab.coord, "spiffe://orblx.local/user/sam", OWNER, lab.now)
-        .unwrap();
-    assert_eq!(deny_of(lab.issue(&sam, 4, &new_key())), SshDeny::UserRevoked);
+    crate::admin::revoke_all(&lab.coord, "spiffe://orblx.local/user/sam", OWNER, lab.now).unwrap();
+    assert_eq!(
+        deny_of(lab.issue(&sam, 4, &new_key())),
+        SshDeny::UserRevoked
+    );
 
     assert!(lab.coord.ssh_tick(SystemTime::now()).unwrap());
     let carol = lab.node_of("alice", "alice-desk");
@@ -340,7 +347,10 @@ fn a_revoked_user_gets_no_cert_from_a_node_that_is_not_revoked() {
         "revoked_ticket_nonces": [],
     });
     fs::write(lab.scratch.0.join("deny.json"), deny.to_string()).unwrap();
-    assert_eq!(deny_of(lab.issue(&alice, 1, &new_key())), SshDeny::UserRevoked);
+    assert_eq!(
+        deny_of(lab.issue(&alice, 1, &new_key())),
+        SshDeny::UserRevoked
+    );
 }
 
 #[test]
@@ -356,11 +366,15 @@ fn agent_coord_and_user_svids_get_no_cert_and_each_deny_is_audited() {
     }
     let records = lab.scratch.ssh_records();
     assert_eq!(records.len(), 4);
-    for (record, reason) in records
-        .iter()
-        .zip(["agent-svid", "coord-svid", "user-svid", "node-unknown"])
+    for (record, reason) in
+        records
+            .iter()
+            .zip(["agent-svid", "coord-svid", "user-svid", "node-unknown"])
     {
-        assert!(record.contains(&format!("decision deny reason {reason}")), "{record}");
+        assert!(
+            record.contains(&format!("decision deny reason {reason}")),
+            "{record}"
+        );
     }
 }
 
@@ -516,9 +530,7 @@ async fn the_mtls_path_binds_the_sshsig_to_the_same_connection() {
     use std::net::{Ipv4Addr, SocketAddr};
     let lab = lab();
     let node_dir = Scratch::new();
-    let _ = lab
-        .coord
-        .approve_user_by("oidc:alice", OWNER, lab.now);
+    let _ = lab.coord.approve_user_by("oidc:alice", OWNER, lab.now);
     let token = lab
         .oidc
         .issue_id_token("alice", lab.now, Duration::from_secs(600))

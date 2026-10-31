@@ -187,8 +187,7 @@ pub struct NonceBook {
 impl NonceBook {
     /// Make one nonce for the connection `connection` at `now_unix`.
     pub fn issue(&mut self, connection: u64, now_unix: u64) -> [u8; 32] {
-        self.open
-            .retain(|_, (_, expires)| *expires > now_unix);
+        self.open.retain(|_, (_, expires)| *expires > now_unix);
         while self.open.len() >= MAX_NONCES {
             let oldest = self
                 .open
@@ -204,8 +203,10 @@ impl NonceBook {
         }
         let mut nonce = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
-        self.open
-            .insert(nonce, (connection, now_unix.saturating_add(SSH_NONCE_LIFE_SECS)));
+        self.open.insert(
+            nonce,
+            (connection, now_unix.saturating_add(SSH_NONCE_LIFE_SECS)),
+        );
         nonce
     }
 
@@ -425,7 +426,8 @@ impl CertBook {
 
     /// Remove the entries that expired more than one backdate period ago.
     pub fn prune(&mut self, now_unix: u64) {
-        let keep = |valid_before: u64| valid_before.saturating_add(SSH_CERT_BACKDATE_SECS) > now_unix;
+        let keep =
+            |valid_before: u64| valid_before.saturating_add(SSH_CERT_BACKDATE_SECS) > now_unix;
         self.live.retain(|cert| keep(cert.valid_before));
         self.revoked.retain(|cert| keep(cert.valid_before));
     }
@@ -460,7 +462,8 @@ impl CertBook {
         now_unix: u64,
         revoked: impl Fn(&LiveCert) -> bool,
     ) -> Vec<orblx_datapath::SshRevoked> {
-        let keep = |valid_before: u64| valid_before.saturating_add(SSH_CERT_BACKDATE_SECS) > now_unix;
+        let keep =
+            |valid_before: u64| valid_before.saturating_add(SSH_CERT_BACKDATE_SECS) > now_unix;
         let mut out: BTreeMap<u64, String> = BTreeMap::new();
         for cert in self.revoked.iter().filter(|cert| keep(cert.valid_before)) {
             out.insert(cert.serial, cert.key_id.clone());
@@ -620,6 +623,12 @@ pub fn build_cert(
         valid_after,
         valid_before,
     })
+}
+
+/// Make one new ed25519 key for one certificate login (client side). The key stays in memory.
+#[must_use]
+pub fn new_session_key() -> PrivateKey {
+    key_from_seed(&new_seed())
 }
 
 /// Return the Unix time in seconds.

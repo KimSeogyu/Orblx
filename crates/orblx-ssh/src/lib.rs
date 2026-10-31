@@ -12,6 +12,7 @@
 //! The audit chain then holds the SHA-256 of that file.
 
 mod auth;
+pub mod cert;
 mod client;
 mod hostkey;
 mod pty;
@@ -20,7 +21,7 @@ mod server;
 
 pub use auth::{overlay_listen_addr, SSH_PORT};
 pub use client::{
-    local_terminal_size, run_session, run_shell, RawMode, SessionOutput, SessionRequest,
+    local_terminal_size, run_session, run_shell, CertLogin, RawMode, SessionOutput, SessionRequest,
     ShellTerminal,
 };
 pub use server::spawn_overlay_server;
@@ -29,6 +30,9 @@ pub use server::spawn_overlay_server;
 pub fn crate_name() -> &'static str {
     "orblx-ssh"
 }
+
+/// The OpenSSH user certificate type (W25-31).
+pub use russh::keys::Certificate as SshUserCert;
 
 #[cfg(test)]
 mod tests {

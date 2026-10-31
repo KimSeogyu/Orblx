@@ -723,6 +723,7 @@ fn spawn_deny_refresh(options: &UpOptions) {
         let mut wait_after = Instant::now();
         let mut policy_etag: Option<String> = None;
         let mut policy_after = Instant::now();
+        let mut netmap_ok = false;
         loop {
             let start = Instant::now();
             let Ok(bundle) = fs::read_to_string(state.join(BUNDLE_FILE)) else {
@@ -739,9 +740,14 @@ fn spawn_deny_refresh(options: &UpOptions) {
                 ) {
                     Ok(sync) => {
                         if policy_etag.as_deref() != Some(sync.etag.as_str()) {
-                            apply_policy_sync(&state, &sync, policy_etag.is_some());
+                            netmap_ok = apply_policy_sync(&state, &sync, policy_etag.is_some());
                         }
                         policy_etag = Some(sync.etag);
+                        // W25-31: the SSH server refuses a certificate login when the
+                        // netmap is older than 60 s. Each good reply renews the stamp.
+                        if netmap_ok {
+                            let _ = orblx_ssh::cert::write_fresh_stamp(&state, unix_now());
+                        }
                         thread::sleep(DENY_WAIT_GAP.saturating_sub(start.elapsed()));
                         continue;
                     }
@@ -780,7 +786,7 @@ fn spawn_deny_refresh(options: &UpOptions) {
 /// The deny list goes first, so a revoke reaches the datapath before the netmap.
 /// The datapath reads `deny.json` each 100 ms. The DNS responder and the packet filter read
 /// `netmap.json` and `grants.signed.json` each second. Each writer writes a temp file and renames it.
-fn apply_policy_sync(state: &Path, sync: &orblx_coord::PolicySync, announce: bool) {
+fn apply_policy_sync(state: &Path, sync: &orblx_coord::PolicySync, announce: bool) -> bool {
     if let Err(err) = store_deny(state, &sync.deny) {
         eprintln!("The node did not write the new deny list. {err}");
     }
@@ -789,11 +795,19 @@ fn apply_policy_sync(state: &Path, sync: &orblx_coord::PolicySync, announce: boo
             "The node did not write the new netmap. {}",
             err.public_text()
         );
-        return;
+        return false;
     }
     if announce {
         println!("The node applied a new policy from the coordinator.");
     }
+    true
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 /// The shortest time between two `deny-wait` requests (W25-2).
