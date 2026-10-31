@@ -159,6 +159,12 @@ pub struct NodeRequest {
     pub relay: Option<SocketAddr>,
     /// The netmap file. The node reads it again when the file changes.
     pub netmap_path: PathBuf,
+    /// The bytes of `netmap_path` that gave `netmap` (W25-34).
+    ///
+    /// The netmap watcher compares the file with these bytes, so a file that changed after
+    /// the caller read it and before the watcher started is applied. `None`: the watcher
+    /// takes the file text at its start.
+    pub netmap_text: Option<Vec<u8>>,
     /// [`crate::GrantPeers`] hides peers the signed grants do not let this node reach.
     /// [`crate::AllowPeers`] allows every peer when the node has no grant file.
     pub visibility: Arc<dyn PeerVisibility>,
@@ -892,6 +898,7 @@ async fn run_mesh_inner(
         accept_routes,
         interface: interface.clone(),
         tasks: Arc::clone(&peer_tasks),
+        start_text: request.netmap_text.take(),
     };
     tasks.push(tokio::spawn(async move {
         watch_netmap_peers(peer_watch).await;
@@ -1207,6 +1214,8 @@ struct PeerWatch {
     accept_routes: bool,
     interface: Option<String>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// The file text that gave the start netmap, from [`NodeRequest::netmap_text`].
+    start_text: Option<Vec<u8>>,
 }
 
 /// Apply a new netmap file without a restart (W25-6).
@@ -1218,7 +1227,13 @@ struct PeerWatch {
 /// A peer that leaves the netmap loses its routes. The deny list and the node lock
 /// stop its sessions, as before.
 async fn watch_netmap_peers(watch: PeerWatch) {
-    let mut last = fs::read(&watch.mesh.netmap_path).ok();
+    // W25-34: `orblx up --coord` can write a new file after it read the start netmap and
+    // before this task starts. The start text is the text of the start netmap, so that
+    // change is applied at the first tick.
+    let mut last = watch
+        .start_text
+        .clone()
+        .or_else(|| fs::read(&watch.mesh.netmap_path).ok());
     let mut started: HashSet<String> = watch
         .mesh
         .netmap
