@@ -90,7 +90,7 @@ build_image() {
   # shellcheck source=stage-image.sh
   source "$ROOT/scripts/proof/stage-image.sh"
   image_dir="$(stage_proof_image "$ROOT" "$bin")"
-  cp "$TARGET_DIR/debug/orblx-test-idp" "$image_dir/orblx-test-idp"
+  cp "$TARGET_DIR/release/orblx-test-idp" "$image_dir/orblx-test-idp"
   printf '%s\n' 'COPY orblx-test-idp /usr/local/bin/orblx-test-idp' >>"$image_dir/Dockerfile"
   as_root docker build -q -t "$tag" "$image_dir" >/dev/null
   rm -rf "$image_dir"
@@ -241,8 +241,9 @@ dc down -v --remove-orphans || true
 open_legacy_forward
 
 echo "=== [C] build images ==="
-cargo build -p orblx-cli --bin orblx -p orblx-test-idp --bin orblx-test-idp --locked
-build_image orblx-w25o-users:new "$TARGET_DIR/debug/orblx"
+echo "rustc_version $(rustc -V)"
+cargo build --release -p orblx-cli --bin orblx -p orblx-test-idp --bin orblx-test-idp --locked
+build_image orblx-w25o-users:new "$TARGET_DIR/release/orblx"
 build_image orblx-w25o-users:old "$OLD_ORBLX"
 old_has="$(as_root docker run --rm --entrypoint orblx orblx-w25o-users:old admin --help 2>&1 | grep -c 'user-approve' || true)"
 new_has="$(as_root docker run --rm --entrypoint orblx orblx-w25o-users:new admin --help 2>&1 | grep -c 'user-approve' || true)"
