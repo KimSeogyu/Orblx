@@ -2415,7 +2415,7 @@ pub fn read_verified_netmap(
     let text = read_text(&dir.join("netmap.signed.json"))?;
     let signed: SignedNetmap = serde_json::from_str(&text)
         .map_err(|_| CoordError::Protocol("The signed netmap is not valid.".to_string()))?;
-    verify_signed_netmap(&signed, &public)?;
+    crate::netmap::verify_signed_netmap(&signed, &public)?;
     let mut netmap = signed.netmap;
     let report = crate::nodelock::apply_node_lock(dir, &mut netmap)?;
     let text = serde_json::to_vec(&netmap)
