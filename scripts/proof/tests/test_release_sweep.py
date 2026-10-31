@@ -277,7 +277,7 @@ class ReleaseSweepTest(unittest.TestCase):
         proofs = {l.split("|")[1] for l in lines if l.startswith("proof|")}
         # W25-27: the shipped rows of docs/matrix-rows.txt (Page snapshot 2026-10-31 08:10 KST
         # and the PO list). Rows 28 and 29 are not shipped: 28 has no sweep line, 29 is partial.
-        self.assertEqual(sorted(rows, key=int), ["19", "21", "24", "30", "31", "33", "35", "38", "45",
+        self.assertEqual(sorted(rows, key=int), ["19", "21", "24", "30", "31", "32", "33", "35", "38", "45",
                                                  "49", "51", "52", "53", "58", "62"])
         self.assertEqual(sorted(partial, key=int), ["1", "9", "10", "11", "16", "17", "29", "40", "41",
                                                     "54", "61"])
