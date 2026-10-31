@@ -344,14 +344,17 @@ proof_lock_queue_leave() {
 # W25-14b: free disk space before the lock and before any build (proof_disk_check).
 # A build or an image step that stops on a full disk is a FAIL, so a proof does not start
 # with low free space. Each proof script sets PROOF_MIN_FREE_GIB in the script, with its reason.
-# PROOF_DISK_FLOOR_GIB is the lowest value that a script can set. The reason: the biggest build
-# output seen on this box (11 GiB, a worktree target/ at 16:42 KST 2026-10-31), plus the
-# biggest proof image (0.55 GiB), plus the image stage copy (0.25 GiB), rounded up to 12 GiB.
+# PROOF_DISK_FLOOR_GIB is the lowest value that a script can set. The reason: the PO rule of
+# 2026-10-31 (15 GiB free before builds). The measure under it: the biggest build output seen on
+# this box (11 GiB, a worktree target/ at 16:42 KST 2026-10-31), plus the biggest proof image
+# (0.55 GiB), plus the image stage copy (0.25 GiB), is 11.8 GiB.
+# The sweep (#119) parses "proof_infra_abort PROOF reason=disk_low|disk_unknown". The line comes
+# before any proof_lock line and before any build.
 # Below the minimum, or when the free space is not known, the function prints
 #   proof_infra_abort LABEL reason=... dir=DIR. No proof step ran.
 # and stops the script with exit status 4 (PROOF_INFRA_ABORT_EXIT). Status 3 stays
 # proof_contention_invalid. An infra abort is not a PASS, a FAIL, or an INVALID run.
-PROOF_DISK_FLOOR_GIB=12
+PROOF_DISK_FLOOR_GIB=15
 PROOF_INFRA_ABORT_EXIT=4
 PROOF_DISK_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 

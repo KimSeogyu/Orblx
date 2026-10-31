@@ -10,7 +10,7 @@ require_root "$@"
 # W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$PROOF_LIB_DIR/proof-lock.sh"
-PROOF_MIN_FREE_GIB=12  # reason: the biggest build output (11 GiB, a worktree target/ at 16:42 KST 2026-10-31) + the biggest proof image (0.55 GiB) + the stage copy (0.25 GiB), rounded up.
+PROOF_MIN_FREE_GIB=15  # reason: the floor. The measure: biggest build output 11 GiB (worktree target/, 16:42 KST 2026-10-31) + biggest proof image 0.55 GiB + stage copy 0.25 GiB = 11.8 GiB, under the PO floor.
 # W25-14b: start from a clean compose state (all profiles, all volumes), under the lock.
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"

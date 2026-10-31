@@ -44,7 +44,7 @@ class ProofLockFairnessTest(unittest.TestCase):
         self.lock = os.path.join(self.dir, "proof.lock")
         self.order = os.path.join(self.dir, "order")
         self.env = dict(os.environ, ORBLX_PROOF_LOCK=self.lock, ORBLX_PROOF_LOCK_NOTE_SECS="1",
-                        ORBLX_PROOF_SAMPLE_SECS="1", PROOF_MIN_FREE_GIB="12")
+                        ORBLX_PROOF_SAMPLE_SECS="1", PROOF_MIN_FREE_GIB="15")
         self.env.pop("ORBLX_PROOF_LOCK_HELD", None)
         # W25-35: the sampler uses a docker stand-in, which prints no names.
         self.env = with_fake_docker(self.env)

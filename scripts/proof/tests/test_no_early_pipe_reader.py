@@ -287,7 +287,7 @@ class ProofLockQueueTest(unittest.TestCase):
         )
         lib = os.path.join(REPO, "scripts", "proof", "proof-lock.sh")
         env = dict(os.environ, ORBLX_PROOF_LOCK=lock, ORBLX_PROOF_LOCK_NOTE_SECS="1", ORBLX_PROOF_SAMPLE_SECS="1",
-                   PROOF_MIN_FREE_GIB="12")
+                   PROOF_MIN_FREE_GIB="15")
         # W25-35: the sampler uses a docker stand-in, which prints no names.
         from fake_docker import with_fake_docker
         env = with_fake_docker(env)
@@ -570,8 +570,8 @@ class ComposeCleanupTest(unittest.TestCase):
         self.assertNotIn("sleep", src[src.index("orblx up reads netmap.json"):])
         self.assertLess(src.index("trap 'cleanup; proof_lock_end' EXIT"), src.index('proof_lock_take "coord-enroll"'))
         # W25-14b: the free-space check runs before the lock and before any proof step.
-        self.assertIn("PROOF_MIN_FREE_GIB=12  # reason:", src)
-        self.assertLess(src.index("PROOF_MIN_FREE_GIB=12"), src.index('proof_lock_take "coord-enroll"'))
+        self.assertIn("PROOF_MIN_FREE_GIB=15  # reason:", src)
+        self.assertLess(src.index("PROOF_MIN_FREE_GIB=15"), src.index('proof_lock_take "coord-enroll"'))
         self.assertLess(src.index('proof_lock_take "coord-enroll"'), src.index("cargo build"))
         # Without "--profile nodes", "down -v" keeps the node volumes (and an old ticket.bin).
         self.assertIn("dc --profile nodes down -v --remove-orphans", src)

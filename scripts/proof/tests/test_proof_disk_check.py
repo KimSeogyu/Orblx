@@ -52,35 +52,35 @@ class ProofDiskCheckTest(unittest.TestCase):
         self.assertRegex(result.stderr,
                          rf"(?m)^proof_infra_abort disk-test reason={reason}\b.*No proof step ran\.$")
         self.assertNotIn("proof_step_ran", result.stdout)
-        self.assertNotIn("proof_lock disk-test acquired", result.stdout)
+        self.assertNotIn("proof_lock", result.stdout + result.stderr)
 
     def test_low_disk_aborts_before_the_lock(self):
-        result = self.run_proof(PROOF_MIN_FREE_GIB="12", FAKE_DF_AVAIL_KIB=str(11 * 1048576))
+        result = self.run_proof(PROOF_MIN_FREE_GIB="15", FAKE_DF_AVAIL_KIB=str(14 * 1048576))
         self.assert_abort(result, "disk_low")
-        self.assertIn("free_gib=11 min_gib=12", result.stderr)
+        self.assertIn("free_gib=14 min_gib=15", result.stderr)
 
     def test_unknown_disk_aborts(self):
-        self.assert_abort(self.run_proof(PROOF_MIN_FREE_GIB="12", FAKE_DF_FAIL="1"),
+        self.assert_abort(self.run_proof(PROOF_MIN_FREE_GIB="15", FAKE_DF_FAIL="1"),
                           "disk_unknown")
 
     def test_unset_minimum_aborts(self):
         self.assert_abort(self.run_proof(), "min_unset")
 
     def test_minimum_below_the_floor_aborts(self):
-        result = self.run_proof(PROOF_MIN_FREE_GIB="11")
+        result = self.run_proof(PROOF_MIN_FREE_GIB="14")
         self.assert_abort(result, "min_below_floor")
-        self.assertIn("floor_gib=12", result.stderr)
+        self.assertIn("floor_gib=15", result.stderr)
 
     @unittest.skipUnless(shutil.which("flock"), "flock(1) is not installed")
     def test_enough_disk_runs_the_proof(self):
-        result = self.run_proof(PROOF_MIN_FREE_GIB="12", FAKE_DF_AVAIL_KIB=str(12 * 1048576))
+        result = self.run_proof(PROOF_MIN_FREE_GIB="15", FAKE_DF_AVAIL_KIB=str(15 * 1048576))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("proof_step_ran", result.stdout)
         self.assertNotIn("proof_infra_abort", result.stderr)
 
     def test_the_abort_status_is_not_the_invalid_status(self):
         src = open(LOCK_SH).read()
-        self.assertIn("PROOF_DISK_FLOOR_GIB=12", src)
+        self.assertIn("PROOF_DISK_FLOOR_GIB=15", src)
         self.assertIn("PROOF_INFRA_ABORT_EXIT=4", src)
         take = src.index("proof_lock_take() {")
         self.assertLess(src.index('proof_disk_check "$1"', take),
@@ -96,7 +96,7 @@ class ProofDiskCheckTest(unittest.TestCase):
             name = os.path.basename(path)
             m = re.search(r"(?m)^(?:export )?PROOF_MIN_FREE_GIB=(\d+)", src)
             self.assertIsNotNone(m, name)
-            self.assertGreaterEqual(int(m.group(1)), 12, name)
+            self.assertGreaterEqual(int(m.group(1)), 15, name)
             self.assertIn("reason", src[m.start() - 200:m.end() + 200], name)
             take = re.search(r"(?m)^\s*proof_lock_take ", src)
             self.assertLess(m.start(), take.start(), name)
