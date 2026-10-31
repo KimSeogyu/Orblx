@@ -534,7 +534,10 @@ dc --profile nodes --profile load logs --no-color >"$WORK/all-logs.out" 2>&1 || 
 echo "log_lines $(awk 'END {print NR}' "$WORK/all-logs.out")"
 secret_scan "$WORK/all-logs.out" || fail "A log holds a private key or an enroll token, or the log is empty."
 if [[ -n "${PROOF_LOG:-}" && -s "${PROOF_LOG}" ]]; then
-  secret_scan "$PROOF_LOG" || fail "The proof log holds a private key or an enroll token."
+  # The scan above writes its own "secret_grep 'PATTERN' N" lines into the proof log.
+  # Scan a copy without those lines, so that the scan does not count its own output.
+  awk '!/^secret_grep \047/' "$PROOF_LOG" >"$WORK/proof-log.scan" || fail "The copy of the proof log failed."
+  secret_scan "$WORK/proof-log.scan" || fail "The proof log holds a private key or an enroll token."
 fi
 
 echo "summary T_ms ${T_MS} e1_stop_to_removal_ms $((removed_ms - e1_stop_ms)) removal_to_netmap_ms a ${netmap_a} b ${netmap_b} e1_renew_after_removal 0 e1_replies 0 e2_kept 1 n1_kept 1 e3_restart_delay_ms ${delay} expected_ms ${expect} load_removed ${LOAD_NODES} c_d_lost 0"
