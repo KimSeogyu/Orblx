@@ -285,24 +285,30 @@ of the 50 first attempts. These attempts do not use the budget, so that the firs
 
 ### 7.5 Docker proof
 
-[C] `scripts/proof/dead-peer-dial.sh` on the Linux host, release build of `5279971`
-(main `5a55a0d` merged), 2026-10-31 13:45-13:51 KST. The script takes the box proof lock for
-one run and starts with `proof_compose_clean`. The coordinator and the nodes `a`, `b`, `c`, `d`
-are containers. Each node runs `orblx up --coord` and gets its tickets from the coordinator.
+[C] `scripts/proof/dead-peer-dial.sh` on the Linux host, release build. The script takes the box
+proof lock for one run and starts with `proof_compose_clean`. The coordinator and the nodes `a`, `b`,
+`c`, `d` are containers. Each node runs `orblx up --coord` and gets its tickets from the coordinator.
 The 50 dead peers are 50 enrolled nodes. Their endpoints are 50 ports of one UDP sink
 (`dead-peer-sink.py`) that never answers. A dial is one QUIC Initial DCID from node `a` at the sink.
-Log: `w25-28-docker-proof-run2.log` (`proof_ok`, 0 of 163 contention samples).
 
-| Gate | Limit | Result |
-|---|---|---|
-| 1. Dials to each dead peer after the window (13 s to 300 s) | 0, or 1 each 60 s or more | 4 per peer for each of the 50 peers, min gap 63000 ms (dead01: 73.4 / 136.4 / 199.4 / 262.4 s), 0 violations: pass |
-| 2. Outbound traffic to an idle peer `c` (started at 301 s) | redial in 1000 ms or less | redial log 98 ms, first reply 154 ms after the first ping: pass |
-| 3. Netmap change (new node `e`) with an idle peer `d` | redial in 1000 ms or less | redial log 0 ms, direct path 7 ms after node `a` applied the netmap: pass |
-| 4. 50 dead peers, datagrams from `a` in 0-10 s | 1000 or less (mean 100 per second) | 610 (mean 61.0); each second 55, 118, 24, 188, 21, 34, 60, 15, 33, 62: pass |
-| First dial to the live peer `b` | report only | direct path 408 ms after `a` started |
+- Run 3: head `7727b10` (main `1459cc2` merged), 2026-10-31 15:27-15:32 KST,
+  `w25-28-docker-proof-run3.log`, `proof_ok`, 0 contended, 0 unknown of 184 samples.
+- Run 2: head `5279971` (main `5a55a0d` merged), 2026-10-31 13:45-13:51 KST,
+  `w25-28-docker-proof-run2.log`, `proof_ok`, 0 contended, 0 unknown of 163 samples.
+
+| Gate | Limit | Run 3 (`7727b10`) | Run 2 (`5279971`) |
+|---|---|---|---|
+| 1. Dials to each dead peer after the window (13 s to 300 s) | 0, or 1 each 60 s or more | 4 per peer for each of the 50 peers, min gap 63000 ms, 0 violations: pass | 4 per peer, min gap 63000 ms, 0 violations: pass |
+| 2. Outbound traffic to an idle peer `c` (started at 301 s) | redial in 1000 ms or less | redial log 82 ms, first reply 142 ms: pass | redial log 98 ms, first reply 154 ms: pass |
+| 3. Netmap change (new node `e`) with an idle peer `d` | redial in 1000 ms or less | redial log 1 ms, direct path 7 ms after node `a` applied the netmap: pass | redial log 0 ms, direct path 7 ms: pass |
+| 4. 50 dead peers, datagrams from `a` in 0-10 s | 1000 or less (mean 100 per second) | 630 (mean 63.0); each second 57, 124, 31, 184, 23, 33, 63, 17, 33, 65: pass | 610 (mean 61.0); each second 55, 118, 24, 188, 21, 34, 60, 15, 33, 62: pass |
+| First dial to the live peer `b` | report only | direct path 405 ms after `a` started | 408 ms |
+
+Run 3 dead01 dial times (ms after `a` started): 401, 5154, 6905, 7656, 7907, 8156, 9406, 11908,
+12408 (fast window), then 73413, 136415, 199418, 262421.
 
 The script stores the times in epoch ms from the docker log time stamps. Node `a` logged
-"The node adds the peer e" 87 ms before the `enroll` command returned, so the netmap time
-is the log time and not the command time. Run 1 (`w25-28-docker-proof-run1.log`) stopped in
-setup with exit 2: the `sh` of the image has no `10#` in `$((...))`. That run measured no gate.
-The fix changed only the enroll loop of the dead peers.
+"The node adds the peer e" 54 ms (run 3) and 87 ms (run 2) before the `enroll` command returned,
+so the netmap time is the log time and not the command time. Run 1 (`w25-28-docker-proof-run1.log`)
+stopped in setup with exit 2: the `sh` of the image has no `10#` in `$((...))`. That run measured
+no gate. The fix changed only the enroll loop of the dead peers.
