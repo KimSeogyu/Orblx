@@ -504,7 +504,14 @@ fn run_connect(command: Connect) -> Result<i32, String> {
         attempts += 1;
         let result = one_connect(dir.files(), to, &node, &service, &command);
         let done = now_ms();
-        trace.line(attempts, start, at, done, &result, &dir.files().grant.grant.id);
+        trace.line(
+            attempts,
+            start,
+            at,
+            done,
+            &result,
+            &dir.files().grant.grant.id,
+        );
         match result {
             Ok(_) => {
                 last_ok = Some(at);

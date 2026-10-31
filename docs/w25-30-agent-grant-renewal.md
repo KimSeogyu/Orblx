@@ -78,12 +78,15 @@ The PO approved a run before #117, because the agent path does not use the node 
 2. Build the image. Enroll owner, a, and b with coordinator tokens through the normal enroll path. The owner approves a and b. No lab tickets.
 3. Start a guard on b (`:8080`, target `127.0.0.1:8081`).
 4. Grant TTL 60 s, 6 grant ends. For each end: request, owner approve, fetch into the same directory 20 s before the end.
-5. One `orblx agent connect --every-ms 50` loop on a for the whole run. No restart.
+5. One `orblx agent connect --every-ms 50 --trace-file FILE` loop on a for the whole run. No restart.
+   The trace file gets one line for each attempt: `start_ms` (before the directory read), `send_ms` (before the connect), and `done_ms` (after the reply). The trace is for the logs only. It holds no key or ticket.
 6. Pass criteria:
    - Container `StartedAt` and `RestartCount` do not change.
    - The loop exits 3 (no deny), attempts equal ok attempts, 0 failed, 0 client denies, 0 guard denies.
    - Grant switches are 6 or more.
-   - The gap between guard uses around each end is 200 ms or less, and uses occur after each end.
+   - Gap gate (PO method, after run 3): for each of the 6 switches, the gap is the time from the last guard use of the old grant to the first guard use of the new grant. Each gap is 200 ms or less.
+   - Each grant end has guard uses in the 5 s after it (no lost access). The largest gap in the 2 s around each end is printed for information only.
+   - The script prints a gap split for information only (no gate): `request_ms` (send to reply), `to_guard_ms`, `from_guard_ms`, `refresh_ms`, `sleep_ms`, and one `big_gap` line for each gap above 200 ms.
    - Guard chain verify and coordinator audit verify are ok. `agent-approve` records are 7 or more.
    - Secret grep is 0.
 7. Phase 2 (gate), in the same run: a new loop on a gate grant (TTL 60 s).
@@ -92,3 +95,12 @@ The PO approved a run before #117, because the agent path does not use the node 
    - A grant that the owner revokes after the fetch: the set goes into the directory after `deny.json` on a has the revoke version.
    - Pass: the loop exits 0 with `deny_reason expired` at or after the gate grant end, 0 switches, `grant_kept` scope and revoked lines, no guard use of the other grants, no guard `revoked` deny.
 8. The script prints `gate_ok`, `summary ...`, and `proof_ok`. The lock is released at exit.
+
+## Run 3 (failed, 2026-10-31 14:02 to 14:07 KST)
+
+- Run 3 used the old gap rule: the largest gap between two guard uses in the 2 s around each end.
+- End 1: 161 ms. End 2: 213 ms. The script stopped at end 2 (exit 1). Ends 3 to 6 and phase 2 did not run.
+- The loop switched to the next grant 19 s before end 2. The 213 ms gap was 641 ms after the end, between two uses of the same new grant.
+- Guard use gaps in run 3: 1827 gaps, p50 149 ms, p99 201 ms, max 238 ms, 21 gaps above 200 ms. The client `loop max_ok_gap_ms` was 287 ms (client send times, not guard times).
+- The run 3 log has no per-attempt client times. Thus the trace above was added before the next run.
+- The PO approved the switch gap method. The 200 ms limit did not change.
