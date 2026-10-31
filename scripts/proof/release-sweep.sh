@@ -264,7 +264,8 @@ else
   git -C "$REPO" show "$SHA:$ROWS_REL" >"$ROWS_TMP" 2>/dev/null || die "rows: no $ROWS_REL at $SHORT"
   ROWS_SRC="$ROWS_REL at $SHORT"
 fi
-declare -A ROW_STATUS=()
+# Row ids are numbers, so plain (sparse) arrays keyed by the id work in bash 3.2 (macOS).
+ROW_STATUS=()
 while IFS= read -r line || [[ -n "$line" ]]; do
   [[ -n "$line" && "$line" != \#* ]] || continue
   IFS='|' read -r rid rstatus _ <<<"$line"
@@ -275,11 +276,15 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 done <"$ROWS_TMP"
 [[ "${#ROW_STATUS[@]}" -gt 0 ]] || die "rows: $ROWS_SRC has no rows"
 mismatch=""
-declare -A MAN_ROW=()
+MAN_ROW=()
 for r in "${!R_ID[@]}"; do
   kind="${R_KIND[$r]}"
   [[ "$kind" == gate ]] && continue
   id="${R_ID[$r]}"
+  if [[ ! "$id" =~ ^[0-9]+$ ]]; then
+    mismatch="${mismatch}${mismatch:+; }row $id: a manifest $kind id must be a number"
+    continue
+  fi
   [[ -z "${MAN_ROW[$id]:-}" ]] || mismatch="${mismatch}${mismatch:+; }row $id is in the manifest twice"
   MAN_ROW[$id]="$kind"
   want=shipped
