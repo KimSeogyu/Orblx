@@ -151,54 +151,78 @@ async fn policy_wait(
     coord: &Coordinator,
     name: &str,
     known: Option<&str>,
+    unchanged_ok: bool,
     mut stamp: watch::Receiver<u64>,
-) -> Result<Response, CoordError> {
+) -> Result<Vec<u8>, CoordError> {
     let deadline = tokio::time::Instant::now() + crate::DENY_WAIT_HOLD;
     loop {
         stamp.borrow_and_update();
-        let view = coord.netmap_for(name)?;
+        // W25-16: the view comes from the cache when its inputs did not change.
+        let cached = coord.netmap_cached(name)?;
         let deny = admin::deny_json_for(coord, name, SystemTime::now())?;
-        let etag = policy_etag(&view, &deny)?;
+        let etag = policy_etag(&cached.digest, &deny);
         let changed = known != Some(etag.as_str());
-        // W25-34: wake at the heartbeat time of the node too. The next view then has a new
-        // signed stamp, so the node gets a signed heartbeat at least each HEARTBEAT_MS.
+        // W25-34: wake at the heartbeat time of the node too. At that time the cache gives a
+        // new signed view with a new stamp, so its ETag changes and the node gets the full
+        // reply. The short reply goes out only at the end of the hold, when no heartbeat is due.
         let beat = tokio::time::Instant::now() + coord.netmap_heartbeat_in(name)?;
         let until = deadline.min(beat);
         let reply = changed
             || match tokio::time::timeout_at(until, stamp.changed()).await {
                 Ok(Ok(())) => false,
                 Ok(Err(_)) => true,
-                Err(_) => until >= deadline,
+                // At the heartbeat time, sign again in the next loop, then send the full reply.
+                Err(_) => beat > deadline,
             };
         if reply {
-            let mut response = netmap_response(&view);
-            response.detail = Some(deny);
-            response.policy_etag = Some(etag);
-            return Ok(response);
+            if !changed && unchanged_ok {
+                // W25-16: the node has this view. Send only the deny list and the ETag.
+                return proto::encode_json(&Response {
+                    ok: true,
+                    detail: Some(deny),
+                    policy_etag: Some(etag),
+                    ..Response::default()
+                });
+            }
+            return policy_reply(&cached, &deny, &etag);
         }
     }
 }
 
-/// The SHA-256 of the signed netmap, the signed grants, the endpoints, the routes, and the
-/// deny list ETag, in hex (W25-6).
+/// The JSON of one `policy-wait` reply (W25-16).
 ///
+/// The bytes are the bytes of `serde_json::to_vec` of the full [`Response`]: the cached head
+/// holds the fields before `detail`, and `detail` and `policy_etag` are the last fields of the
+/// reply. The server encodes the large signed view one time, not one time for each reply.
+fn policy_reply(
+    cached: &crate::state::CachedView,
+    deny: &str,
+    etag: &str,
+) -> Result<Vec<u8>, CoordError> {
+    let invalid = || CoordError::Protocol("The coordinator request failed.".to_string());
+    let deny = serde_json::to_string(deny).map_err(|_| invalid())?;
+    let etag = serde_json::to_string(etag).map_err(|_| invalid())?;
+    let mut bytes = Vec::with_capacity(cached.reply_head.len() + deny.len() + etag.len() + 32);
+    bytes.extend_from_slice(&cached.reply_head);
+    bytes.extend_from_slice(b",\"detail\":");
+    bytes.extend_from_slice(deny.as_bytes());
+    bytes.extend_from_slice(b",\"policy_etag\":");
+    bytes.extend_from_slice(etag.as_bytes());
+    bytes.push(b'}');
+    Ok(bytes)
+}
+
+/// The SHA-256 of the view digest and the deny list ETag, in hex (W25-6, W25-16).
+///
+/// The view digest covers the signed netmap, the signed grants, the endpoints, and the routes.
 /// Ed25519 signatures are deterministic, so the same view gives the same ETag.
-fn policy_etag(view: &crate::state::NetmapView, deny: &str) -> Result<String, CoordError> {
+fn policy_etag(view_digest: &[u8; 32], deny: &str) -> String {
     use sha2::{Digest, Sha256};
-    let invalid = || CoordError::Protocol("The netmap is not valid.".to_string());
     let mut hasher = Sha256::new();
-    hasher.update(serde_json::to_vec(&view.signed_netmap).map_err(|_| invalid())?);
+    hasher.update(view_digest);
     hasher.update(b"\0");
-    hasher.update(serde_json::to_vec(&view.signed_grants).map_err(|_| invalid())?);
-    hasher.update(b"\0");
-    hasher.update(serde_json::to_vec(&view.endpoints).map_err(|_| invalid())?);
-    hasher.update(b"\0");
-    hasher.update(view.approved_routes.join(",").as_bytes());
-    hasher.update(b"\0");
-    hasher.update(view.advertised_routes.join(",").as_bytes());
-    hasher.update([u8::from(view.exit_approved), 0]);
     hasher.update(admin::deny_etag(deny).as_bytes());
-    Ok(encode_hex(&hasher.finalize()))
+    encode_hex(&hasher.finalize())
 }
 
 async fn warm_jwks(coord: &Coordinator) {
@@ -273,17 +297,51 @@ async fn accept_loop(
     Ok(())
 }
 
+/// Serve the requests of one connection (W25-16).
+///
+/// A connection can carry many requests. Each request uses its own bidirectional stream.
+/// The coordinator authenticates the peer leaf again for each request, at the time of that
+/// request and with the deny list of that time. The connection ends when the client closes it
+/// or after the idle timeout.
 async fn handle_connection(
     coord: &Coordinator,
     connection: quinn::Connection,
     stamp: watch::Receiver<u64>,
 ) -> Result<(), CoordError> {
-    let (mut send, mut recv) = connection.accept_bi().await.map_err(|_| {
-        println!("coord rejected: the stream did not open");
-        CoordError::Protocol("The request is not valid.".to_string())
-    })?;
+    let mut first = true;
+    loop {
+        let (send, recv) = match connection.accept_bi().await {
+            Ok(stream) => stream,
+            Err(_) if !first => return Ok(()),
+            Err(_) => {
+                println!("coord rejected: the stream did not open");
+                return Err(CoordError::Protocol(
+                    "The request is not valid.".to_string(),
+                ));
+            }
+        };
+        first = false;
+        let coord = coord.clone();
+        let connection = connection.clone();
+        let stamp = stamp.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_stream(&coord, &connection, send, recv, stamp).await {
+                println!("coord request failed: {}", err.public_text());
+            }
+        });
+    }
+}
+
+async fn handle_stream(
+    coord: &Coordinator,
+    connection: &quinn::Connection,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    stamp: watch::Receiver<u64>,
+) -> Result<(), CoordError> {
     let incoming = proto::read_json::<proto::Incoming>(&mut recv).await?;
     let request = incoming.request;
+    // W25-34: refuse an older node with the version mismatch text.
     let gated = proto::version_gate(&request.op, incoming.proto);
     if gated.is_err() {
         println!(
@@ -295,27 +353,52 @@ async fn handle_connection(
             proto::NODE_PROTO
         );
     }
-    let result = match gated {
-        Ok(()) => dispatch(coord, &connection, request, stamp).await,
-        Err(err) => Err(err),
+    // W25-16: a `policy-wait` reply comes as JSON bytes from the cached view.
+    let reply = if let Err(err) = gated {
+        Err(err)
+    } else if request.op == "policy-wait" {
+        policy_wait_op(coord, connection, &request, stamp).await
+    } else {
+        match dispatch(coord, connection, request, stamp).await {
+            Ok(response) => proto::encode_json(&response),
+            Err(err) => Err(err),
+        }
     };
-    let response = match result {
-        Ok(response) => response,
+    let bytes = match reply {
+        Ok(bytes) => bytes,
         Err(err) => {
             println!("coord rejected: {}", err.public_text());
-            Response {
+            proto::encode_json(&Response {
                 ok: false,
                 error: Some(err.public_text()),
                 ..Response::default()
-            }
+            })?
         }
     };
-    proto::write_json(&mut send, &response).await?;
+    proto::write_bytes(&mut send, &bytes).await?;
     let _ = send.finish();
-    drop(send);
-    drop(recv);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), connection.closed()).await;
     Ok(())
+}
+
+/// Serve one `policy-wait` request (W25-6, W25-16). The caller must be the named node.
+async fn policy_wait_op(
+    coord: &Coordinator,
+    connection: &quinn::Connection,
+    request: &Request,
+    stamp: watch::Receiver<u64>,
+) -> Result<Vec<u8>, CoordError> {
+    let peer = peer_node(coord, connection)?;
+    if peer != request.name {
+        return Err(CoordError::Peer);
+    }
+    policy_wait(
+        coord,
+        &request.name,
+        request.deny_etag.as_deref(),
+        request.unchanged_ok,
+        stamp,
+    )
+    .await
 }
 
 async fn dispatch(
@@ -427,13 +510,6 @@ async fn dispatch(
                 detail: Some(detail),
                 ..Response::default()
             })
-        }
-        "policy-wait" => {
-            let peer = peer_node(coord, connection)?;
-            if peer != request.name {
-                return Err(CoordError::Peer);
-            }
-            policy_wait(coord, &request.name, request.deny_etag.as_deref(), stamp).await
         }
         "agent-grant" => {
             let peer = peer_node(coord, connection)?;
@@ -778,17 +854,7 @@ fn leaf_response(result: crate::state::EnrollResult) -> Response {
 }
 
 fn netmap_response(view: &crate::state::NetmapView) -> Response {
-    Response {
-        ok: true,
-        netmap_pub_hex: Some(encode_hex(&view.netmap_public)),
-        netmap: Some(view.signed_netmap.to_wire()),
-        endpoints: Some(view.endpoints.clone()),
-        grants: Some(view.signed_grants.to_wire()),
-        approved_routes: Some(view.approved_routes.clone()),
-        advertised_routes: Some(view.advertised_routes.clone()),
-        exit_approved: Some(view.exit_approved),
-        ..Response::default()
-    }
+    view.response()
 }
 
 fn peer_node(coord: &Coordinator, connection: &quinn::Connection) -> Result<String, CoordError> {
@@ -848,7 +914,96 @@ mod tests {
             api_token: Some(secret.to_string()),
             deny_etag: None,
             expect_sha256: None,
+            unchanged_ok: false,
         }
+    }
+
+    /// W25-16: the `policy-wait` reply from the cached head is the JSON of the full reply.
+    /// The client parses it like any reply and verifies the netmap and the grants.
+    #[test]
+    fn the_cached_policy_reply_is_the_json_of_the_full_reply() {
+        let dir = std::env::temp_dir().join(format!(
+            "orblx-coord-reply-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
+        let now = SystemTime::now();
+        for name in ["reply-a", "reply-b"] {
+            let token = coord
+                .create_token_at(std::time::Duration::from_secs(60), now)
+                .unwrap();
+            coord
+                .enroll_token(name, &token.secret, &[format!("{name}:443")], &[], now)
+                .unwrap();
+        }
+        let cached = coord.netmap_cached("reply-a").unwrap();
+        let deny = "{\"deny\": [\"a \\\" b\"]}";
+        let etag = super::policy_etag(&cached.digest, deny);
+        let bytes = super::policy_reply(&cached, deny, &etag).unwrap();
+        let mut full = super::netmap_response(&cached.view);
+        full.detail = Some(deny.to_string());
+        full.policy_etag = Some(etag);
+        assert_eq!(bytes, serde_json::to_vec(&full).unwrap());
+        let parsed: super::Response = serde_json::from_slice(&bytes).unwrap();
+        let netmap =
+            crate::netmap::verify_netmap_wire(&parsed.netmap.unwrap(), &cached.view.netmap_public)
+                .unwrap();
+        crate::netmap::verify_grants_wire(&parsed.grants.unwrap(), &cached.view.netmap_public)
+            .unwrap();
+        assert_eq!(netmap.netmap.peers.len(), 1);
+        // W25-16: when the ETag did not change at the end of the hold, a node that keeps its
+        // view gets only the deny list and the ETag. Other nodes get the full view.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let deny = crate::admin::deny_json_for(&coord, "reply-a", SystemTime::now()).unwrap();
+        let etag = super::policy_etag(&cached.digest, &deny);
+        let ended = || {
+            // A closed stamp channel ends the hold at once.
+            let (_, stamp) = tokio::sync::watch::channel(0);
+            stamp
+        };
+        let small: super::Response = serde_json::from_slice(
+            &runtime
+                .block_on(super::policy_wait(
+                    &coord,
+                    "reply-a",
+                    Some(&etag),
+                    true,
+                    ended(),
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(small.ok && small.netmap.is_none() && small.grants.is_none());
+        assert_eq!(small.policy_etag.as_deref(), Some(etag.as_str()));
+        assert_eq!(small.detail.as_deref(), Some(deny.as_str()));
+        let held = runtime
+            .block_on(super::policy_wait(
+                &coord,
+                "reply-a",
+                Some(&etag),
+                false,
+                ended(),
+            ))
+            .unwrap();
+        assert_eq!(held, super::policy_reply(&cached, &deny, &etag).unwrap());
+        // A changed ETag always gets the full view, also with the flag.
+        let changed = runtime
+            .block_on(super::policy_wait(
+                &coord,
+                "reply-a",
+                Some("old"),
+                true,
+                ended(),
+            ))
+            .unwrap();
+        assert_eq!(changed, held);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The W25-3 kill check: no token runs an operation outside its scope.

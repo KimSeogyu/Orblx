@@ -93,6 +93,26 @@ The node checks each signed netmap in this order. Each refusal writes one log li
 - `orblx up` refuses to start when the state directory, the netmap file, or the netmap
   directory (no sticky bit) is group-writable or world-writable, or has another owner.
 
+## With the W25-16 view cache (#109)
+
+Eng Lead rule, PO accepted (2026-10-31 KST):
+
+- The W25-16 cache gives a cached signed view only while its stamp is younger than
+  `HEARTBEAT_MS` (15 s). When the heartbeat is due, `netmap_cached` signs a new view with a
+  new `seq` and `issued_at_ms`, also when no input changed (`heartbeat_due` in `state.rs`).
+- `policy-wait` wakes at the heartbeat time. It then signs again and sends the full reply.
+  It never sends the short `unchanged` reply for a heartbeat. The new stamp changes the view
+  digest, so the ETag changes.
+- The short reply of W25-16 does not change. It goes out only at the end of the hold when
+  no heartbeat is due. Note: the hold is 20 s and the heartbeat is 15 s, so an idle hold
+  ends at the heartbeat first. Thus in a steady idle state each idle hold ends with a full
+  reply about each 15 s. The bytes of this are in the proof results.
+- `orblx admin netmap-seq-reset` clears the cached views, because the book forgets all stamps.
+- Tests: `an_idle_waiter_gets_a_fresh_signed_view_at_each_heartbeat` (3 idle heartbeats
+  through `PolicyWaiter`: each reply has a new seq and a new signature, and the old stamp is
+  at most 15 s plus one poll (100 ms) old when the reply comes), and
+  `a_cached_view_is_due_at_the_heartbeat`.
+
 ## Upgrade and mixed versions
 
 Mixed versions fail closed with a clear error.
