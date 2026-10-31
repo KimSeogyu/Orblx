@@ -329,10 +329,15 @@ row has the mark. The release notes draft (`docs/rc3-release-notes.md`) says so 
 ## Old binaries (W25-27)
 
 Some proofs need an orblx from before a change: `user-approval` (row 32) runs a coordinator from
-before W25-15 for its migration phase (`OLD_ORBLX`). The manifest pins it by full commit SHA in
-the proof ENV field: `OLD_ORBLX=@OLD:d9704cfb2f63bebbd3890f5b1accff30b2cace1f@`. That commit is
-the parent of the W25-15 merge (#102, `538b154`), so it has no user approval.
+before W25-15 for its migration phase (`OLD_ORBLX`). Row 32: upgrade from rc.2 tag b9cae9c (tcp
+and udp only). The manifest pins it by full commit SHA in the proof ENV field:
+`OLD_ORBLX=@OLD:b9cae9c103c04d29bb08be10c7d982ec9cffc65c@`. That commit is the `v0.1.0-rc.2` tag.
+It is an ancestor of the W25-15 merge (#102, `538b154`), so it has no user approval. The proof
+still checks that the old image has 0 `user-approve` help lines.
 
+- The sweep labels an old build from git: `git rev-parse` and the tag name (`git tag
+  --points-at`), for example `commit b9cae9c1... tag v0.1.0-rc.2`. It never uses
+  `orblx --version`, because a dev build can print a release version.
 - In a run, after the main build, the sweep builds `orblx` (debug, `--locked`) at the pin in a
   temp git worktree `$ORBLX_SWEEP_WORK/old-<sha12>-wt` with its own target dir
   `$ORBLX_SWEEP_WORK/old-<sha12>-target`, copies the binary to the cache

@@ -91,7 +91,7 @@ partial|41|SSH session recording|ssh
 proof|ssh|scripts/proof/ssh.sh|-|-
 """
 
-PIN = "d9704cfb2f63bebbd3890f5b1accff30b2cace1f"
+PIN = "b9cae9c103c04d29bb08be10c7d982ec9cffc65c"
 OLD = GOOD + "row|32|User approval|old\nproof|old|scripts/proof/old.sh|OLD_ORBLX=@OLD:%s@|-\n"
 
 # W25-27 contention rule: the probe samples every 0.2 s, and the proofs run 1 s.
@@ -591,6 +591,18 @@ class ReleaseSweepTest(unittest.TestCase):
             self.assertTrue(out.stdout.startswith("contention_check p INVALID: "), out.stdout)
             self.assertIn(want, out.stdout)
 
+
+    def test_old_build_label_comes_from_git_not_from_version(self):
+        src = open(SWEEP).read()
+        body = src[src.index("old_label_of() {"):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn('rev-parse --verify -q "$1^{commit}"', body)
+        self.assertIn("tag --points-at", body)
+        self.assertNotIn("--version", body)
+        self.assertNotRegex(src, r"old_bin\"? +--version|\$OLD_ORBLX\"? +--version")
+        out = subprocess.run(["bash", "-c", 'REPO="$1"; eval "$(sed -n "/^old_label_of() {/,/^}/p" "$2")"; old_label_of "$3"',
+                              "x", os.path.join(HERE, "..", ".."), SWEEP, PIN], capture_output=True, text=True)
+        self.assertTrue(out.stdout.startswith("commit %s tag " % PIN), out.stdout)
 
     def test_abort_invalid_and_fail_are_separate_results(self):
         manifest = (

@@ -548,11 +548,19 @@ for i in "${!P_NAME[@]}"; do
   P_PIN+=("$pin")
 done
 old_bin_of() { echo "$WORK/old-orblx/$1/orblx"; }
+# The label of an old build comes from git (rev-parse and the tag name), never from
+# "orblx --version": a dev build can print a release version.
+old_label_of() {
+  local sha tag
+  sha="$(git -C "$REPO" rev-parse --verify -q "$1^{commit}" 2>/dev/null)" || sha="$1"
+  tag="$(git -C "$REPO" tag --points-at "$sha" 2>/dev/null | head -n 1)" || tag=""
+  echo "commit $sha tag ${tag:-none}"
+}
 old_step_of() {
   if [[ -n "$OLD_ENV" ]]; then
     echo "OLD_ORBLX from the environment: $OLD_ENV (no build)"
   elif [[ -x "$(old_bin_of "$1")" ]]; then
-    echo "old binary cached: $(old_bin_of "$1") (commit $1)"
+    echo "old binary cached: $(old_bin_of "$1") ($(old_label_of "$1"))"
   else
     echo "build old orblx (debug) at $1 in a temp worktree, cache $(old_bin_of "$1")"
   fi
@@ -724,13 +732,13 @@ for pin in $OLD_PINS; do
   [[ "$need" == 1 ]] || continue
   old_bin="$(old_bin_of "$pin")"
   if [[ -x "$old_bin" ]]; then
-    note "old binary cached: $old_bin (commit $pin)"
+    note "old binary cached: $old_bin ($(old_label_of "$pin"))"
     continue
   fi
   old_wt="$WORK/old-${pin:0:12}-wt"
   old_target="$WORK/old-${pin:0:12}-target"
   old_log="$OUT/rc3-sweep-$SHORT-old-${pin:0:12}-build.log"
-  note "build old orblx at $pin, worktree $old_wt, target $old_target, log $old_log"
+  note "build old orblx at $pin ($(old_label_of "$pin")), worktree $old_wt, target $old_target, log $old_log"
   mkdir -p "$WORK"
   as_root rm -rf "$old_target"
   git -C "$REPO" worktree remove --force "$old_wt" 2>/dev/null || true
@@ -740,13 +748,14 @@ for pin in $OLD_PINS; do
     tool_env CARGO_TARGET_DIR="$old_target" bash -c '
         set -euo pipefail
         cd "$1"
+        echo "old_build $4"
         git rev-parse HEAD
         rustc --version
         cargo build --locked -p orblx-cli --bin orblx
         mkdir -p "$(dirname "$3")"
         cp "$2/debug/orblx" "$3.tmp"
         mv -f "$3.tmp" "$3"
-      ' release-sweep-old-build "$old_wt" "$old_target" "$old_bin" >>"$old_log" 2>&1 </dev/null || rc=$?
+      ' release-sweep-old-build "$old_wt" "$old_target" "$old_bin" "$(old_label_of "$pin")" >>"$old_log" 2>&1 </dev/null || rc=$?
   fi
   as_root rm -rf "$old_target" || true
   git -C "$REPO" worktree remove --force "$old_wt" >/dev/null 2>&1 || true
@@ -760,7 +769,7 @@ for pin in $OLD_PINS; do
     cleanup_worktree
     exit 2
   fi
-  note "old binary ok: $old_bin (worktree and target removed)"
+  note "old binary ok: $old_bin ($(old_label_of "$pin"), worktree and target removed)"
 done
 
 # 5. Run each proof once.
