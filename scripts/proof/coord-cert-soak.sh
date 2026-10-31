@@ -91,6 +91,7 @@ coord_container() {
 }
 
 echo "=== [C] run ${TR_SCRIPT} ==="
+: > "$WORK/tr.log"
 bash "$TR_SCRIPT" > "$WORK/tr.log" 2>&1 &
 TR_PID="$!"
 # proof_compose_clean in ticket-renewal.sh removes an old stack. Follow only a coordinator

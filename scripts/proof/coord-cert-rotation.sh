@@ -162,8 +162,8 @@ poke_peers() {
   done
 }
 
-# wait_mesh NODE COUNT: NODE lists COUNT peers, each with a direct path.
-wait_mesh() {
+# wait_listed NODE COUNT: NODE lists COUNT peers from the coordinator netmap.
+wait_listed() {
   local name="$1" want="$2" i n
   for ((i = 0; i < 120; i++)); do
     [[ "$(listed_peers "$name")" -eq "$want" ]] && break
@@ -172,6 +172,12 @@ wait_mesh() {
   n="$(listed_peers "$name")"
   echo "netmap_peers ${name} ${n}"
   [[ "$n" -eq "$want" ]] || fail "The node ${name} lists ${n} peers from the netmap after 60 s, not ${want}."
+}
+
+# wait_mesh NODE COUNT: NODE lists COUNT peers, each with a direct path.
+wait_mesh() {
+  local name="$1" want="$2" i n
+  wait_listed "$name" "$want"
   for ((i = 0; i < 30; i++)); do
     poke_peers "$name"
     [[ "$(direct_peers "$name")" -eq "$want" ]] && break
@@ -234,12 +240,14 @@ declare -A OVERLAY START0 PID0
 for name in owner a b; do
   enroll "$name"
 done
-# Start all 3 nodes before the mesh check. A node has no direct path to a peer that is not up.
+# Start the nodes one at a time, as ticket-renewal.sh does. Each node must list the 2 other
+# peers from the coordinator netmap before the next node starts. If a node dials a peer that
+# does not have it in its netmap yet, that peer refuses the session (a start race that is not
+# part of this proof). Then check the direct paths when all 3 nodes are up.
 for name in owner a b; do
   dc up -d "$name"
-done
-for name in owner a b; do
   wait_log "$name" "The TUN device" 30 || fail "The node ${name} did not start."
+  wait_listed "$name" 2
 done
 for name in owner a b; do
   wait_mesh "$name" 2
@@ -311,6 +319,10 @@ until (( $(date +%s) > FIRST_COORD_END + SKEW + 5 )); do
 done
 echo "after_first_coord_end_plus_skew_unix $(date +%s)"
 enroll c
+# The running nodes must list c before c starts (the same start race as above).
+for name in owner a b; do
+  wait_listed "$name" 3
+done
 dc up -d c
 wait_log c "The TUN device" 30 || fail "The node c did not start."
 for name in c owner a b; do
