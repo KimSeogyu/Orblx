@@ -190,11 +190,11 @@ struct TestNode {
 
 /// Trace points with Unix ms for the set-up window of a test (W25-28).
 ///
-/// Each line shows the Unix ms and the ms after the clock of the test started.
+/// Each line shows the Unix ms and the ms after the end of the 500 ms sleep.
 #[derive(Clone, Copy)]
 struct SetupTrace {
     test: &'static str,
-    started: Instant,
+    base: Instant,
 }
 
 impl SetupTrace {
@@ -204,9 +204,9 @@ impl SetupTrace {
             .map(|elapsed| elapsed.as_millis())
             .unwrap_or(0);
         eprintln!(
-            "setup_trace {} unix_ms {unix_ms} since_start_ms {} {point}",
+            "setup_trace {} unix_ms {unix_ms} since_sleep_end_ms {} {point}",
             self.test,
-            self.started.elapsed().as_millis()
+            self.base.elapsed().as_millis()
         );
     }
 }
@@ -219,11 +219,16 @@ fn mark(trace: Option<SetupTrace>, point: &str) {
 
 impl TestNode {
     fn start(rig: &Rig, state: Scratch, enrolled: &EnrollResult, port: u16, netmap: &str) -> Self {
-        Self::start_traced(rig, state, enrolled, port, netmap, None)
+        Self::start_traced(rig, state, enrolled, port, netmap, None).0
     }
 
-    /// Start a node. With `trace`, mark each set-up step. The steps before
-    /// `run_memory_node` are test-only harness code.
+    /// Start a node. With `trace`, mark each set-up step.
+    ///
+    /// The function also gives the time of the first product step (W25-28).
+    /// The state files and the netmap file before it are test-only harness code:
+    /// `orblx join` writes them in an earlier process, and `orblx up` only reads them.
+    /// The request build (`HelloConfig::from_issued`, `Netmap::from_slice`) and
+    /// `run_memory_node` are product code, so they stay after that time.
     fn start_traced(
         rig: &Rig,
         state: Scratch,
@@ -231,7 +236,7 @@ impl TestNode {
         port: u16,
         netmap: &str,
         trace: Option<SetupTrace>,
-    ) -> Self {
+    ) -> (Self, Instant) {
         mark(trace, "harness write_state begin");
         enrolled.write_state(&state.0).unwrap();
         mark(trace, "harness write_state end");
@@ -239,7 +244,8 @@ impl TestNode {
         mark(trace, "harness netmap_write begin");
         fs::write(&netmap_path, netmap).unwrap();
         mark(trace, "harness netmap_write end");
-        mark(trace, "harness request_build begin");
+        let product_start = Instant::now();
+        mark(trace, "clock start, product request_build begin");
         let (stop, stop_rx) = watch::channel(false);
         let (to_node, from_tun) = mpsc::channel(256);
         let (to_tun, from_node) = mpsc::channel(256);
@@ -264,20 +270,23 @@ impl TestNode {
             metrics: None,
             filter: None,
         };
-        mark(trace, "harness request_build end");
+        mark(trace, "product request_build end");
         mark(trace, "harness spawn begin");
         let task = tokio::spawn(async move {
             mark(trace, "product run_memory_node enter");
             run_memory_node(request, MemoryDevice { from_tun, to_tun }).await
         });
         mark(trace, "harness spawn end");
-        Self {
-            state,
-            to_node,
-            from_node,
-            stop,
-            task,
-        }
+        (
+            Self {
+                state,
+                to_node,
+                from_node,
+                stop,
+                task,
+            },
+            product_start,
+        )
     }
 
     fn direct_to(&self, peer: &str) -> bool {
@@ -556,10 +565,9 @@ async fn fifty_offline_peers_stay_at_or_below_100_packets_per_second() {
     );
     let slept = Instant::now();
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let started = Instant::now();
     let trace = SetupTrace {
         test: "fifty",
-        started,
+        base: Instant::now(),
     };
     trace.mark(&format!(
         "harness sleep_500_end slept_ms {}",
@@ -569,7 +577,9 @@ async fn fifty_offline_peers_stay_at_or_below_100_packets_per_second() {
     let scratch_a = Scratch::new("fifty-a");
     let netmap_a = netmap_text("a", "100.64.0.1", &peers_a);
     mark(Some(trace), "harness scratch end");
-    let node_a =
+    // The clock starts at the first product step of node a. The harness writes the
+    // state files before it (see TestNode::start_traced). The limit stays 500 ms.
+    let (node_a, started) =
         TestNode::start_traced(&rig, scratch_a, &enrolled_a, port_a, &netmap_a, Some(trace));
     let mut live = None;
     let mut first_send = true;
@@ -587,8 +597,9 @@ async fn fifty_offline_peers_stay_at_or_below_100_packets_per_second() {
             break;
         }
     }
-    let offset = started.saturating_duration_since(zero);
-    tokio::time::sleep(Duration::from_secs(11).saturating_sub(started.elapsed())).await;
+    // The 0-10 s window of the packet gate keeps its old start (the end of the sleep).
+    let offset = trace.base.saturating_duration_since(zero);
+    tokio::time::sleep(Duration::from_secs(11).saturating_sub(trace.base.elapsed())).await;
     node_a.stop().await;
     node_b.stop().await;
     let seen: Vec<Duration> = dead
