@@ -168,8 +168,7 @@ fn find_peer(netmap: &Netmap, to: &str) -> Result<(SpiffeId, Ipv4Addr), String> 
 }
 
 fn run_send(options: &SendOptions) -> Result<(), String> {
-    let netmap =
-        Netmap::from_path(&options.state.join("netmap.json")).map_err(|err| err.to_string())?;
+    let netmap = orblx_coord::read_node_netmap(&options.state).map_err(|err| err.public_text())?;
     let (dst, addr) = match (find_peer(&netmap, &options.to), options.addr) {
         (Ok((dst, _)), Some(addr)) => (dst, addr),
         (Ok((dst, overlay)), None) => (dst, SocketAddr::from((overlay, FILE_PORT))),
@@ -271,8 +270,7 @@ fn run_receive(options: ReceiveOptions) -> Result<(), String> {
     let listen = match options.listen {
         Some(addr) => addr,
         None => {
-            let netmap =
-                Netmap::from_path(&state.join("netmap.json")).map_err(|err| err.to_string())?;
+            let netmap = orblx_coord::read_node_netmap(&state).map_err(|err| err.public_text())?;
             SocketAddr::from((parse_ip(&netmap.self_node.overlay_ip)?, FILE_PORT))
         }
     };

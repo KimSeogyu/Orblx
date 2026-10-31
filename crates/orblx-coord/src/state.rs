@@ -2061,10 +2061,241 @@ pub fn read_node_material(dir: &Path) -> Result<NodeMaterial, CoordError> {
     })
 }
 
+/// Read the node netmap from the signed netmap file only (W25-36).
+///
+/// The function reads `netmap.signed.json` and checks the signature with the pinned key in
+/// `netmap.pub`. It does not read `netmap.json`. Then it applies node lock, as `write_view` does.
+/// Thus a change to the bytes of `netmap.json` on disk does not change the parsed netmap, and a
+/// change to the bytes of `netmap.signed.json` makes the signature check fail.
+pub fn read_verified_netmap(
+    dir: &Path,
+) -> Result<(Netmap, Option<crate::nodelock::LockReport>), CoordError> {
+    let public = decode_hex_32(read_text(&dir.join("netmap.pub"))?.trim())?;
+    let text = read_text(&dir.join("netmap.signed.json"))?;
+    let signed: SignedNetmap = serde_json::from_str(&text)
+        .map_err(|_| CoordError::Protocol("The signed netmap is not valid.".to_string()))?;
+    verify_signed_netmap(&signed, &public)?;
+    let mut netmap = signed.netmap;
+    let report = crate::nodelock::apply_node_lock(dir, &mut netmap)?;
+    let text = serde_json::to_vec(&netmap)
+        .map_err(|_| CoordError::Protocol("The netmap is not valid.".to_string()))?;
+    let netmap = Netmap::from_slice(&text)
+        .map_err(|_| CoordError::Protocol("The netmap is not valid.".to_string()))?;
+    Ok((netmap, report))
+}
+
+/// Read the netmap of a node state directory (W25-36).
+///
+/// An enrolled node (with `netmap.pub`) uses [`read_verified_netmap`].
+/// A node without a coordinator (no `netmap.pub`) reads `netmap.json`, as before.
+pub fn read_node_netmap(dir: &Path) -> Result<Netmap, CoordError> {
+    if dir.join("netmap.pub").exists() {
+        return read_verified_netmap(dir).map(|(netmap, _)| netmap);
+    }
+    Netmap::from_path(&dir.join("netmap.json"))
+        .map_err(|_| CoordError::Protocol("The netmap is not valid.".to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::oidc_config;
     use super::OidcConfig;
+
+    mod signed_netmap {
+        use std::path::{Path, PathBuf};
+
+        use orblx_datapath::{Netmap, NetmapPeer, NetmapSelf};
+
+        use crate::netmap::{encode_hex, NetmapKey};
+        use crate::{read_node_netmap, read_verified_netmap};
+
+        fn temp_dir(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "orblx-w25-36-{name}-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        fn sample() -> Netmap {
+            Netmap {
+                version: 1,
+                self_node: NetmapSelf {
+                    name: "server".to_string(),
+                    overlay_ip: "100.64.0.1".to_string(),
+                    owner: String::new(),
+                },
+                peers: vec![NetmapPeer {
+                    name: "laptop".to_string(),
+                    overlay_ip: "100.64.0.2".to_string(),
+                    svid: "spiffe://orblx.local/node/laptop".to_string(),
+                    endpoints: vec!["10.0.0.2:443".to_string()],
+                    routes: vec!["192.168.1.0/24".to_string()],
+                    exit_node: false,
+                    owner: String::new(),
+                    lock_sig: None,
+                }],
+                lock: Vec::new(),
+                split_dns: Vec::new(),
+            }
+        }
+
+        /// Write the netmap files as `write_view` writes them (a valid write).
+        fn write_valid(dir: &Path) -> Netmap {
+            let key = NetmapKey::generate();
+            let netmap = sample();
+            let signed = key.sign_netmap(&netmap).unwrap();
+            std::fs::write(
+                dir.join("netmap.pub"),
+                format!("{}\n", encode_hex(&key.public())),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("netmap.json"),
+                serde_json::to_string(&netmap).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("netmap.signed.json"),
+                serde_json::to_string(&signed).unwrap(),
+            )
+            .unwrap();
+            netmap
+        }
+
+        /// Changes to the bytes of `netmap.json` after a valid write.
+        fn netmap_json_tampers() -> Vec<String> {
+            let mut moved = sample();
+            moved.peers[0].endpoints = vec!["203.0.113.9:443".to_string()];
+            let mut added = sample();
+            let mut extra = added.peers[0].clone();
+            extra.name = "intruder".to_string();
+            extra.overlay_ip = "100.64.0.9".to_string();
+            extra.svid = "spiffe://orblx.local/node/intruder".to_string();
+            added.peers.push(extra);
+            let mut route = sample();
+            route.peers[0].routes = vec!["0.0.0.0/0".to_string()];
+            route.peers[0].exit_node = true;
+            let mut self_ip = sample();
+            self_ip.self_node.overlay_ip = "100.64.0.7".to_string();
+            vec![
+                serde_json::to_string(&moved).unwrap(),
+                serde_json::to_string(&added).unwrap(),
+                serde_json::to_string(&route).unwrap(),
+                serde_json::to_string(&self_ip).unwrap(),
+                "{}".to_string(),
+                String::new(),
+            ]
+        }
+
+        #[test]
+        fn untampered_files_give_the_same_netmap_as_before() {
+            let dir = temp_dir("same");
+            let netmap = write_valid(&dir);
+            let before = Netmap::from_path(&dir.join("netmap.json")).unwrap();
+            assert_eq!(before, netmap);
+            let (verified, report) = read_verified_netmap(&dir).unwrap();
+            assert!(report.is_none());
+            assert_eq!(verified, before);
+            assert_eq!(read_node_netmap(&dir).unwrap(), before);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn tampered_netmap_json_is_never_parsed() {
+            let mut accepted = 0;
+            let tampers = netmap_json_tampers();
+            for text in &tampers {
+                let dir = temp_dir("json");
+                let netmap = write_valid(&dir);
+                std::fs::write(dir.join("netmap.json"), text).unwrap();
+                let parsed = read_node_netmap(&dir).unwrap();
+                if parsed != netmap {
+                    accepted += 1;
+                }
+                assert_eq!(read_verified_netmap(&dir).unwrap().0, netmap);
+                std::fs::remove_dir_all(&dir).unwrap();
+            }
+            println!(
+                "tampered_netmap_json files {} accepted {accepted}",
+                tampers.len()
+            );
+            assert_eq!(accepted, 0);
+        }
+
+        #[test]
+        fn tampered_signed_netmap_is_rejected() {
+            let mut accepted = 0;
+            let mut total = 0;
+            for (from, to) in [
+                ("10.0.0.2:443", "10.0.0.3:443"),
+                ("100.64.0.2", "100.64.0.3"),
+                ("192.168.1.0/24", "192.168.0.0/16"),
+                (
+                    "\"name\":\"laptop\",",
+                    "\"name\":\"laptop\",\"exit_node\":true,",
+                ),
+                ("\"name\":\"laptop\"", "\"name\":\"laptoq\""),
+            ] {
+                let dir = temp_dir("signed");
+                write_valid(&dir);
+                let path = dir.join("netmap.signed.json");
+                let text = std::fs::read_to_string(&path).unwrap();
+                assert!(text.contains(from), "{from}");
+                std::fs::write(&path, text.replacen(from, to, 1)).unwrap();
+                total += 1;
+                let verified = read_verified_netmap(&dir);
+                assert!(verified.is_err(), "{from}");
+                if read_node_netmap(&dir).is_ok() {
+                    accepted += 1;
+                }
+                std::fs::remove_dir_all(&dir).unwrap();
+            }
+            // A changed signature or key id also fails.
+            for field in ["sig", "key_id"] {
+                let dir = temp_dir("sig");
+                write_valid(&dir);
+                let path = dir.join("netmap.signed.json");
+                let mut value: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                let old = value[field].as_str().unwrap().to_string();
+                let new = if old.starts_with('A') { "B" } else { "A" };
+                value[field] = serde_json::Value::String(format!("{new}{}", &old[1..]));
+                std::fs::write(&path, value.to_string()).unwrap();
+                total += 1;
+                if read_node_netmap(&dir).is_ok() {
+                    accepted += 1;
+                }
+                std::fs::remove_dir_all(&dir).unwrap();
+            }
+            println!("tampered_signed_netmap files {total} accepted {accepted}");
+            assert_eq!(accepted, 0);
+        }
+
+        #[test]
+        fn a_node_without_a_coordinator_reads_netmap_json() {
+            let dir = temp_dir("static");
+            let netmap = sample();
+            std::fs::write(
+                dir.join("netmap.json"),
+                serde_json::to_string(&netmap).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(read_node_netmap(&dir).unwrap(), netmap);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn an_enrolled_node_without_the_signed_file_fails() {
+            let dir = temp_dir("missing");
+            write_valid(&dir);
+            std::fs::remove_file(dir.join("netmap.signed.json")).unwrap();
+            assert!(read_node_netmap(&dir).is_err());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
 
     #[test]
     fn blank_google_client_id_is_token_only() {
