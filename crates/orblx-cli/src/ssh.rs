@@ -114,6 +114,12 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
 }
 
 pub(crate) fn run(command: Command) -> Result<(), String> {
+    if let Command::Session(options) = &command {
+        // W25-31: refuse a non-root caller before the client reads any node state file.
+        if let Some(state) = options.state.as_deref() {
+            orblx_ssh::cert::require_root_caller(state)?;
+        }
+    }
     match command {
         Command::Help => {
             println!("{}", help());
@@ -306,7 +312,34 @@ The client sends standard input to the shell and prints the shell output.
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, Command};
+    use super::{parse, run, Command};
+
+    /// W25-31: a non-root caller gets the root error before the client reads node state.
+    #[test]
+    fn a_non_root_caller_is_refused_before_the_netmap_is_read() {
+        use std::os::unix::fs::MetadataExt;
+        // The state directory has no netmap. A read of the netmap gives another error.
+        let dir = std::env::temp_dir().join(format!("orblx-ssh-nonroot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A root test run (the owner of a new directory is root) cannot check this refusal.
+        if std::fs::metadata(&dir).unwrap().uid() == 0 {
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        let args: Vec<String> = [
+            "alice@b",
+            "--state",
+            dir.to_str().unwrap(),
+            "--peer-cert",
+            "p.pem",
+        ]
+        .iter()
+        .map(|item| item.to_string())
+        .collect();
+        let err = run(parse(&args).unwrap()).unwrap_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(err.contains("needs root"), "{err}");
+    }
 
     #[test]
     fn the_parser_requires_the_svid_paths() {
