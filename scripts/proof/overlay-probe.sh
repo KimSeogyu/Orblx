@@ -49,6 +49,13 @@ cleanup() {
 . "$PROOF_LIB_DIR/proof-lock.sh"
 trap 'cleanup; proof_lock_end' EXIT
 proof_lock_take "overlay-probe" "$PROJECT"
+# Fail closed before any build if the disk has less than 15G free (checked under the lock).
+free_kb="$(df -Pk /workspace | awk 'NR == 2 {print $4}')"
+echo "free_space_kb ${free_kb} (need 15728640)"
+if [ "${free_kb:-0}" -lt 15728640 ]; then
+  echo "overlay_probe_done result abort reason low_disk free_kb ${free_kb}"
+  exit 3
+fi
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
 
