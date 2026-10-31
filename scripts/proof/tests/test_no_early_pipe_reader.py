@@ -568,6 +568,10 @@ class ComposeCleanupTest(unittest.TestCase):
             self.assertIn(text, src)
         self.assertNotIn("sleep", src[src.index("orblx up reads netmap.json"):])
         self.assertLess(src.index("trap 'cleanup; proof_lock_end' EXIT"), src.index('proof_lock_take "coord-enroll"'))
+        # W25-14b: the free-space check runs before the lock and before any proof step.
+        self.assertIn("COORD_ENROLL_MIN_FREE_GIB=12", src)
+        self.assertLess(src.index("proof_infra_abort coord-enroll reason=disk_low"), src.index('proof_lock_take "coord-enroll"'))
+        self.assertLess(src.index("proof_infra_abort coord-enroll reason=disk_low"), src.index("cargo build"))
         # Without "--profile nodes", "down -v" keeps the node volumes (and an old ticket.bin).
         self.assertIn("dc --profile nodes down -v --remove-orphans", src)
         self.assertNotRegex(src, r"(?m)^dc down -v")
