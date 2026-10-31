@@ -656,6 +656,7 @@ async fn run_mesh_inner(
     to_tun: mpsc::Sender<Vec<u8>>,
     interface: Option<String>,
 ) -> Result<(), HelloError> {
+    crate::diag::start();
     let PreparedNode {
         mut request,
         view,
@@ -829,6 +830,7 @@ async fn run_mesh_inner(
                             if let Some(deny) = parse_deny(&bytes) {
                                 // Replace first, so a session that starts now uses the new list.
                                 // Then close the open sessions of the denied peers.
+                                crate::diag::event("deny_apply");
                                 deny_endpoint.replace_deny(deny.clone());
                                 close_denied_links(&lock_mesh, &deny);
                                 last_text = Some(bytes);
@@ -1129,6 +1131,7 @@ async fn read_tun(
                 let Some(packet) = packet else {
                     return;
                 };
+                crate::diag::bump(&crate::diag::RT_IN);
                 // peer_for drops the guard of the router table before the await.
                 let Some(peer) = routes.peer_for(&packet) else {
                     continue;
@@ -1139,6 +1142,7 @@ async fn read_tun(
                 };
                 if let Some(tx) = tx {
                     if tx.send(packet).await.is_ok() {
+                        crate::diag::bump(&crate::diag::RT_SEND);
                         counters.tx.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -1224,6 +1228,7 @@ async fn watch_netmap_peers(watch: PeerWatch) {
                     eprintln!("The node did not apply the new netmap. The file is not valid.");
                     continue;
                 };
+                crate::diag::event("netmap_apply");
                 apply_peer_netmap(&watch, &netmap, &mut started, &mut installed);
             }
         }
@@ -1926,6 +1931,7 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     tr!("{label} session_end reason=send_err");
                     return;
                 }
+                crate::diag::bump(&crate::diag::PEER_TX);
                 counters.tx.fetch_add(1, Ordering::Relaxed);
             }
             () = poll_slot(&mut tx_end), if tx_end.is_some() => {
@@ -1944,6 +1950,7 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                                     first_rx = false;
                                 }
                                 on_rx();
+                                crate::diag::bump(&crate::diag::PEER_RX);
                                 counters.rx.fetch_add(1, Ordering::Relaxed);
                                 if let Some(filter) = &filter {
                                     if !filter.allow_inbound(&peer_svid, &packet) {
@@ -1955,6 +1962,7 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                                         if sender.send_ipv4(&reply).await.is_err() {
                                             return;
                                         }
+                                        crate::diag::bump(&crate::diag::PEER_TX);
                                         counters.tx.fetch_add(1, Ordering::Relaxed);
                                     }
                                     InboundAction::Reply(reply) => {
@@ -1973,7 +1981,10 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                                     }
                                 }
                             }
-                            SessionEvent::Keepalive => on_rx(),
+                            SessionEvent::Keepalive => {
+                                crate::diag::bump(&crate::diag::PEER_KA);
+                                on_rx();
+                            }
                             SessionEvent::Rekey => {
                                 tr!("{label} got_rekey_req");
                                 on_rx();
@@ -2155,6 +2166,7 @@ async fn renew_loop(mut mesh: Mesh, renewer: SvidRenewer) {
 }
 
 fn apply_leaf(mesh: &Mesh, leaf: &RenewedLeaf) -> Result<u64, HelloError> {
+    crate::diag::event("leaf_apply");
     let der = decode_certificate_pem(&leaf.certificate_pem).map_err(HelloError::Identity)?;
     let id = extract_spiffe_id(&der).map_err(HelloError::Identity)?;
     if id.as_uri() != mesh.node.svid {
@@ -2196,6 +2208,7 @@ fn apply_leaf(mesh: &Mesh, leaf: &RenewedLeaf) -> Result<u64, HelloError> {
 }
 
 fn signal_rekey(mesh: &Mesh) {
+    crate::diag::event("rekey_signal");
     {
         let links = lock(&mesh.links);
         for link in links.values() {
@@ -2626,6 +2639,7 @@ fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut 
                 // (up to COMMAND_WAIT for each call) must not hold the new answers.
                 let _ = watch_state.tables.send(table.clone());
                 refresh_resolver_in_background(watch_state, table);
+                crate::diag::event("dns_netmap_apply");
                 println!("The DNS answers follow the new netmap.");
             }
             Ok(_) => {

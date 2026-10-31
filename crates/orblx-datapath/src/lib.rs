@@ -2,6 +2,7 @@ use std::fmt;
 
 mod acl;
 mod connector;
+mod diag;
 mod dns;
 mod error;
 mod exit_route;

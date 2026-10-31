@@ -18,6 +18,9 @@ x-node: &node
   environment:
     # Node renew trace lines ("trace <epoch_ms> ...") for gate 9 of the proof.
     ORBLX_TRACE_RENEW: "1"
+    # W25-42 diagnostic only: empty means off.
+    ORBLX_DIAG_FILE: ${TR_DIAG_FILE:-}
+    ORBLX_DIAG_TICK_MS: "10"
 
 x-up: &up
   - up

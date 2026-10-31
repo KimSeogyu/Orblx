@@ -56,6 +56,13 @@ TR_REVOKE="${TR_REVOKE:-1}"
 TR_REVOKE_MS="${TR_REVOKE_MS:-1000}"
 TR_BIN="${TR_BIN:-}"
 TR_OUT_DIR="${TR_OUT_DIR:-}"
+# W25-42 diagnostic mode (not a gate change): node diag files, ping -O, host probers,
+# docker events and dmesg in TR_OUT_DIR.
+TR_DIAG="${TR_DIAG:-0}"
+if [[ "$TR_DIAG" == "1" ]]; then
+  export TR_DIAG_FILE=/var/lib/orblx/diag.txt
+fi
+DIAG_PIDS=()
 # Host stall limits per 100 ms sample. Baseline: 3000 samples (300 s, 15:29:40-15:34:40 KST
 # 2026-10-31, load1 0.7-2.0, 8 CPUs, no proof container of this run). Baseline max: steal
 # 100 ms, iowait 80 ms (both summed over 8 CPUs, 10 ms steps), cpu some 72.7 ms, io full
@@ -86,6 +93,19 @@ cleanup() {
     kill "$pid" >/dev/null 2>&1 || true
   done
   [[ -z "$SAMPLER_PID" ]] || kill "$SAMPLER_PID" >/dev/null 2>&1 || true
+  for pid in "${DIAG_PIDS[@]}"; do
+    kill "$pid" >/dev/null 2>&1 || true
+  done
+  if [[ "$TR_DIAG" == "1" && -n "${OUTD:-}" ]]; then
+    local n
+    for n in "${NODES[@]}"; do
+      dc cp "${n}:/var/lib/orblx/diag.txt" "$OUTD/diag-${n}.txt" >/dev/null 2>&1 || echo "diag_copy_failed ${n}"
+    done
+    dmesg -T > "$OUTD/dmesg.txt" 2>&1 || true
+    dc logs -t > "$OUTD/stack.log" 2>&1 || true
+    cp "$WORK"/ping-*.txt "$OUTD/" 2>/dev/null || true
+    echo "diag_out ${OUTD}"
+  fi
   if [[ "$status" -ne 0 ]]; then
     echo "---- docker logs, last 80 lines per service (the proof failed) ----"
     dc logs -t --tail 80 2>&1 | sed 's/[A-Za-z0-9_-]\{40,\}/<redacted>/g' || true
@@ -323,12 +343,30 @@ done
 python3 "$ROOT/scripts/proof/host-sampler.py" --out "$OUTD/host-samples.txt" --interval 0.1 "${cg_args[@]}" &
 SAMPLER_PID="$!"
 echo "host_sampler pid ${SAMPLER_PID} cgroups ${#cg_args[@]}"
+if [[ "$TR_DIAG" == "1" ]]; then
+  echo "=== [C] W25-42 diag: host probers (nsenter net ns), docker events ==="
+  docker events --format '{{.TimeNano}} {{.Type}} {{.Action}} {{.Actor.Attributes.name}}' > "$OUTD/docker-events.txt" 2>&1 &
+  DIAG_PIDS+=("$!")
+  for src in "${NODES[@]}"; do
+    npid="$(docker inspect -f '{{.State.Pid}}' "$(dc ps -q "$src")")"
+    targets=()
+    for dst in "${NODES[@]}"; do
+      [[ "$src" == "$dst" ]] || targets+=("${OVERLAY[$dst]}")
+    done
+    nsenter --net="/proc/${npid}/ns/net" python3 "$ROOT/scripts/proof/diag-prober.py" \
+      --out "$OUTD/hostprobe-${src}.txt" --interval "$TR_PING_I" --secs "$PING_SECS" "${targets[@]}" &
+    DIAG_PIDS+=("$!")
+    echo "diag_prober ${src} netns_pid ${npid} targets ${targets[*]}"
+  done
+fi
+PING_OPT=()
+[[ "$TR_DIAG" == "1" ]] && PING_OPT=(-O)
 
 echo "=== [C] ping each pair every ${TR_PING_I} s for ${PING_SECS} s ==="
 for src in "${NODES[@]}"; do
   for dst in "${NODES[@]}"; do
     [[ "$src" == "$dst" ]] && continue
-    dc exec -T "$src" ping -D -n -i "$TR_PING_I" -w "$PING_SECS" "${OVERLAY[$dst]}" \
+    dc exec -T "$src" ping -D -n "${PING_OPT[@]}" -i "$TR_PING_I" -w "$PING_SECS" "${OVERLAY[$dst]}" \
       > "$WORK/ping-${src}-${dst}.txt" 2>&1 &
     PING_PIDS+=("$!")
   done

@@ -313,6 +313,7 @@ mod linux {
         loop {
             match device.recv_timeout(&mut buf, Duration::from_millis(50)) {
                 Ok(size) => {
+                    crate::diag::bump(&crate::diag::TUN_READ);
                     if from_tun.blocking_send(buf[..size].to_vec()).is_err() {
                         return;
                     }
@@ -340,6 +341,7 @@ mod linux {
                 eprintln!("The TUN device write failed. {err}");
                 return;
             }
+            crate::diag::bump(&crate::diag::TUN_WRITE);
         }
     }
 }
