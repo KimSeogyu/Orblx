@@ -220,6 +220,8 @@ pub struct OidcIdClaims {
     pub subject: String,
     /// The lowercase `email` claim, when the token has one.
     pub email: Option<String>,
+    /// True only when the token has `email_verified: true` (W25-15).
+    pub email_verified: bool,
     /// The token expiry as Unix seconds.
     pub expires_at: u64,
 }
@@ -374,6 +376,7 @@ impl OidcJwks {
         Ok(OidcIdClaims {
             subject: claims.sub,
             email,
+            email_verified: claims.email_verified == Some(true),
             expires_at: claims.exp,
         })
     }
