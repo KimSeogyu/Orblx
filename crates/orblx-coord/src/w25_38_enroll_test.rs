@@ -44,17 +44,26 @@ async fn w25_38_enroll_deny_list_never_moves_back() {
     let node = Scratch::new();
     let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
     let token = coord.create_token(Duration::from_secs(600)).unwrap();
-    let (addr, handle) =
-        crate::server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .await
-            .unwrap();
+    let (addr, handle) = crate::server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
     let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
-    let result =
-        crate::client::enroll_with_token(addr, "coord", &bundle, "seq-a", &token.secret, &[], &[])
-            .await
-            .unwrap();
+    let result = crate::client::enroll_with_token(
+        addr,
+        "coord",
+        &bundle,
+        "seq-a",
+        &token.secret,
+        &["seq-a:443".to_string()],
+        &[],
+    )
+    .await
+    .unwrap();
     handle.abort();
-    let sent = result.deny.clone().expect("the enroll reply has a deny list");
+    let sent = result
+        .deny
+        .clone()
+        .expect("the enroll reply has a deny list");
     let sent_version = DenySet::from_json(sent.as_bytes())
         .unwrap()
         .version()
@@ -87,11 +96,9 @@ async fn w25_38_enroll_with_an_old_coordinator_fails_closed_with_version_mismatc
     let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
     let token = coord.create_token(Duration::from_secs(600)).unwrap();
     let material = coord.tls_material().unwrap();
-    let endpoint = crate::tlsutil::server_endpoint(
-        &material,
-        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-    )
-    .unwrap();
+    let endpoint =
+        crate::tlsutil::server_endpoint(&material, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .unwrap();
     let addr = endpoint.local_addr().unwrap();
     let old = coord.clone();
     let server = tokio::spawn(async move {
@@ -115,11 +122,18 @@ async fn w25_38_enroll_with_an_old_coordinator_fails_closed_with_version_mismatc
         let _ = tokio::time::timeout(Duration::from_secs(5), connection.closed()).await;
     });
     let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
-    let err =
-        crate::client::enroll_with_token(addr, "coord", &bundle, "old-a", &token.secret, &[], &[])
-            .await
-            .unwrap_err()
-            .to_string();
+    let err = crate::client::enroll_with_token(
+        addr,
+        "coord",
+        &bundle,
+        "old-a",
+        &token.secret,
+        &["old-a:443".to_string()],
+        &[],
+    )
+    .await
+    .unwrap_err()
+    .to_string();
     server.await.unwrap();
     assert!(err.contains("Version mismatch"), "{err}");
     assert!(

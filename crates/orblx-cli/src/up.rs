@@ -1673,7 +1673,7 @@ mod tests {
     /// sessions when the deny file is not valid, is cut short, or is missing.
     /// A node that was never enrolled and has no deny file keeps the empty set.
     #[test]
-    fn w25_38_new_sessions_refuse_when_the_deny_file_is_corrupt_truncated_or_missing() {
+    fn w25_38_new_sessions_refuse_when_the_deny_file_is_corrupt_truncated_missing_or_unreadable() {
         let dir = std::env::temp_dir().join(format!("orblx-w25-38-up-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         run(parse_issue(&[
@@ -1708,6 +1708,13 @@ mod tests {
             super::load_config(&node).unwrap().deny.refuses_all(),
             "truncated"
         );
+        fs::remove_file(node.join("deny.json")).unwrap();
+        fs::create_dir(node.join("deny.json")).unwrap();
+        assert!(
+            super::load_config(&node).unwrap().deny.refuses_all(),
+            "unreadable"
+        );
+        fs::remove_dir(node.join("deny.json")).unwrap();
 
         super::store_deny(&node, valid).unwrap();
         let config = super::load_config(&node).unwrap();
