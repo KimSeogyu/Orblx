@@ -11,9 +11,9 @@
 #   6. The owner SVID (mTLS) still works. A node that is not an owner is still refused.
 # The script never prints a token. It prints proof_ok.
 # Environment:
-#   TOKENS_PROJECT  Compose project name (default orblx-api-tokens-proof).
-#   TOKENS_IMAGE    Image tag (default orblx-api-tokens:local).
-#   TOKENS_BIN      An orblx binary to use. Without it, the script builds target/debug/orblx.
+#   ATPROOF_PROJECT  Compose project name (default orblx-api-tokens-proof).
+#   ATPROOF_IMAGE    Image tag (default orblx-api-tokens:local).
+#   ATPROOF_BIN      An orblx binary to use. Without it, the script builds target/debug/orblx.
 #   ORBLX_NET_HOOK  A root script that the script runs after the network starts.
 #   PROOF_LOG       The log file of this run. The secret check also reads this file.
 set -euo pipefail
@@ -23,8 +23,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 FILE="scripts/proof/compose.api-tokens.yml"
-TOKENS_PROJECT="${TOKENS_PROJECT:-orblx-api-tokens-proof}"
-TOKENS_IMAGE="${TOKENS_IMAGE:-orblx-api-tokens:local}"
+ATPROOF_PROJECT="${ATPROOF_PROJECT:-orblx-api-tokens-proof}"
+ATPROOF_IMAGE="${ATPROOF_IMAGE:-orblx-api-tokens:local}"
 EXPIRY_LIMIT_MS=1000
 REVOKE_LIMIT_MS=1000
 WORK="$(mktemp -d)"
@@ -33,12 +33,12 @@ ENV_FILE="$WORK/env"
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$PROOF_LIB_DIR/proof-lock.sh"
 trap proof_lock_end EXIT
-proof_lock_take "api-tokens" "$TOKENS_PROJECT"
+proof_lock_take "api-tokens" "$ATPROOF_PROJECT"
 # W25-14b: start from a clean compose state (all profiles, all volumes).
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
-proof_compose_clean "$TOKENS_PROJECT" || exit 1
-printf 'TOKENS_IMAGE=%s\n' "$TOKENS_IMAGE" > "$ENV_FILE"
+proof_compose_clean "$ATPROOF_PROJECT" || exit 1
+printf 'ATPROOF_IMAGE=%s\n' "$ATPROOF_IMAGE" > "$ENV_FILE"
 
 as_root() {
   if [[ "$(id -u)" -eq 0 ]]; then
@@ -49,7 +49,7 @@ as_root() {
 }
 
 dc() {
-  as_root docker compose -p "$TOKENS_PROJECT" --env-file "$ENV_FILE" --progress quiet --profile nodes -f "$FILE" "$@"
+  as_root docker compose -p "$ATPROOF_PROJECT" --env-file "$ENV_FILE" --progress quiet --profile nodes -f "$FILE" "$@"
 }
 
 cleanup() {
@@ -97,8 +97,8 @@ client_call() {
 echo "=== [REAL] host ==="
 uname -sm
 
-echo "=== [C] build image ${TOKENS_IMAGE} (project ${TOKENS_PROJECT}) ==="
-bin="${TOKENS_BIN:-}"
+echo "=== [C] build image ${ATPROOF_IMAGE} (project ${ATPROOF_PROJECT}) ==="
+bin="${ATPROOF_BIN:-}"
 if [[ -z "$bin" ]]; then
   cargo build -p orblx-cli --bin orblx --locked
   bin="$ROOT/target/debug/orblx"
@@ -107,7 +107,7 @@ fi
 # shellcheck source=stage-image.sh
 source "$ROOT/scripts/proof/stage-image.sh"
 image_dir="$(stage_proof_image "$ROOT" "$bin")"
-as_root docker build -q -t "$TOKENS_IMAGE" "$image_dir" >/dev/null
+as_root docker build -q -t "$ATPROOF_IMAGE" "$image_dir" >/dev/null
 rm -rf "$image_dir"
 
 echo "=== [C] start coordinator ==="

@@ -58,7 +58,7 @@ proof|nat-realism|scripts/proof/nat-realism.sh|ORBLX_NATR_PROFILE=release ORBLX_
 proof|admin|scripts/proof/admin.sh|-|orblx-admin:w19
 proof|revoke-all|scripts/proof/revoke-all.sh|-|orblx-w24d-revoke:w24
 proof|revoke-followup|scripts/proof/revoke-followup.sh|ORBLX_PROOF_PROFILE=release|orblx-w25a-revoke:w25
-proof|api-tokens|scripts/proof/api-tokens.sh|TOKENS_BIN=@BIN@ TOKENS_PROJECT=orblx-rc3sw-tokens TOKENS_IMAGE=orblx-rc3sw-tokens:local|orblx-rc3sw-tokens:local
+proof|api-tokens|scripts/proof/api-tokens.sh|ATPROOF_BIN=@BIN@ ATPROOF_PROJECT=orblx-rc3sw-tokens ATPROOF_IMAGE=orblx-rc3sw-tokens:local|orblx-rc3sw-tokens:local
 proof|token-no-escalation|scripts/proof/token-no-escalation.sh|ESC_BIN=@BIN@ ESC_PROJECT=orblx-rc3sw-escalation ESC_IMAGE=orblx-rc3sw-escalation:local|orblx-rc3sw-escalation:local
 proof|node-share|scripts/proof/node-share.sh|-|orblx-w25a-share:w25
 proof|ssh|scripts/proof/ssh.sh|-|orblx-ssh:local
