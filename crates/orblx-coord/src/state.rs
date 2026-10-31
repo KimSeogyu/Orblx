@@ -273,6 +273,8 @@ pub struct CachedView {
 #[derive(Clone)]
 pub struct Coordinator {
     inner: Arc<Mutex<Inner>>,
+    /// W25-18: when each node was last online. The data is not in the node store.
+    presence: Arc<crate::ephemeral::Presence>,
 }
 
 /// A successful enrollment.
@@ -430,6 +432,7 @@ impl Coordinator {
                 views: ViewCache::default(),
                 endpoint_sigs: RefCell::new(HashMap::new()),
             })),
+            presence: Arc::new(crate::ephemeral::Presence::default()),
         };
         {
             let mut inner = coord.lock()?;
@@ -499,6 +502,18 @@ impl Coordinator {
         inner.store.create_token(ttl, now)
     }
 
+    /// Create one enroll token for an ephemeral node (W25-18).
+    ///
+    /// A node that enrolls with the token is removed after it stays offline too long.
+    pub fn create_ephemeral_token(
+        &self,
+        ttl: std::time::Duration,
+    ) -> Result<CreatedToken, CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        inner.store.create_token_with(ttl, SystemTime::now(), true)
+    }
+
     pub fn enroll_token(
         &self,
         name: &str,
@@ -507,9 +522,10 @@ impl Coordinator {
         routes: &[String],
         now: SystemTime,
     ) -> Result<EnrollResult, CoordError> {
-        let _ = SpiffeId::node(name)?;
+        let id = SpiffeId::node(name)?;
         let mut inner = self.lock()?;
         reload(&mut inner)?;
+        refuse_denied_name(&inner, &id)?;
         let plan = inner
             .store
             .begin_enroll(name, secret, now, endpoints, routes)?;
@@ -525,9 +541,10 @@ impl Coordinator {
         routes: &[String],
         now: SystemTime,
     ) -> Result<EnrollResult, CoordError> {
-        let _ = SpiffeId::node(name)?;
+        let id = SpiffeId::node(name)?;
         let mut inner = self.lock()?;
         reload(&mut inner)?;
+        refuse_denied_name(&inner, &id)?;
         let login = owner_from_oidc(&inner.oidc, id_token, nonce, now)?;
         // W25-15: a user that is not approved gets no plan, no overlay address, and no SVID.
         admit_user(&mut inner, &login, now)?;
@@ -1138,6 +1155,51 @@ impl Coordinator {
         read_text(&path)
     }
 
+    /// Delete ephemeral nodes and write one `node-remove` record for each node (W25-18).
+    ///
+    /// Each item is a node name and the text that follows `reason ephemeral`.
+    /// The caller adds the SVIDs to the deny file first. The store refuses a node that is
+    /// not ephemeral.
+    pub fn remove_ephemeral_nodes(
+        &self,
+        removals: &[(String, String)],
+    ) -> Result<Vec<StoredNode>, CoordError> {
+        // W25-18: one lock for the whole batch, so a reader sees one change of the node list.
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        let actor = coord_actor_of(&inner)?;
+        let mut removed = Vec::with_capacity(removals.len());
+        for (name, detail) in removals {
+            let before = node_digest(&inner, name);
+            let node = inner.store.remove_ephemeral(name)?;
+            let detail = format!(
+                "reason ephemeral {detail} svid {} overlay_ip {}",
+                node.svid, node.overlay_ip
+            );
+            record(
+                &mut inner,
+                &actor,
+                ConfigAction::NodeRemove,
+                name,
+                before,
+                EMPTY_DIGEST,
+                &detail,
+            )?;
+            removed.push(node);
+        }
+        Ok(removed)
+    }
+
+    /// Return the presence table of the nodes (W25-18).
+    pub(crate) fn presence(&self) -> &crate::ephemeral::Presence {
+        &self.presence
+    }
+
+    /// Set how long an ephemeral node can stay offline (W25-18).
+    pub fn set_ephemeral_offline(&self, offline: std::time::Duration) -> Result<(), CoordError> {
+        self.presence.set_offline(offline)
+    }
+
     /// Return the coordinator SPIFFE ID text.
     pub fn coord_actor(&self) -> Result<String, CoordError> {
         let inner = self.lock()?;
@@ -1735,6 +1797,18 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&digest);
     hash
+}
+
+/// Refuse a node name whose SPIFFE ID is in the deny file (W25-18).
+///
+/// The SVID of a removed ephemeral node stays denied, so the name cannot enroll again.
+fn refuse_denied_name(inner: &Inner, id: &SpiffeId) -> Result<(), CoordError> {
+    if crate::admin::uri_denied_in(&inner.state_dir, id.as_uri())? {
+        return Err(CoordError::Protocol(
+            "The node name is revoked. Use a new name.".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn finish_enroll(

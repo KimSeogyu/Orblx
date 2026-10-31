@@ -101,6 +101,9 @@ struct NodeRecord {
     approved: bool,
     #[serde(default)]
     expired: bool,
+    /// W25-18: the coordinator removes the node after it stays offline too long.
+    #[serde(default)]
+    ephemeral: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +112,9 @@ struct TokenRecord {
     hash_hex: String,
     expires_unix: u64,
     used: bool,
+    /// W25-18: a node that enrolls with this token is ephemeral.
+    #[serde(default)]
+    ephemeral: bool,
 }
 
 #[derive(Clone)]
@@ -145,6 +151,25 @@ pub struct StoredNode {
     pub exit_node: bool,
     pub approved: bool,
     pub expired: bool,
+    /// W25-18: the node is ephemeral.
+    pub ephemeral: bool,
+}
+
+impl From<&NodeRecord> for StoredNode {
+    fn from(node: &NodeRecord) -> Self {
+        Self {
+            name: node.name.clone(),
+            overlay_ip: node.overlay_ip.clone(),
+            svid: node.svid.clone(),
+            owner: node.owner.clone(),
+            endpoints: node.endpoints.clone(),
+            routes: node.routes.clone(),
+            exit_node: node.exit_node,
+            approved: node.approved,
+            expired: node.expired,
+            ephemeral: node.ephemeral,
+        }
+    }
 }
 
 impl NodeStore {
@@ -336,27 +361,23 @@ impl NodeStore {
     }
 
     pub fn nodes(&self) -> Vec<StoredNode> {
-        self.disk
-            .nodes
-            .iter()
-            .map(|node| StoredNode {
-                name: node.name.clone(),
-                overlay_ip: node.overlay_ip.clone(),
-                svid: node.svid.clone(),
-                owner: node.owner.clone(),
-                endpoints: node.endpoints.clone(),
-                routes: node.routes.clone(),
-                exit_node: node.exit_node,
-                approved: node.approved,
-                expired: node.expired,
-            })
-            .collect()
+        self.disk.nodes.iter().map(StoredNode::from).collect()
     }
 
     pub fn create_token(
         &mut self,
         ttl: Duration,
         now: SystemTime,
+    ) -> Result<CreatedToken, CoordError> {
+        self.create_token_with(ttl, now, false)
+    }
+
+    /// Create one enroll token. A node that enrolls with an `ephemeral` token is ephemeral (W25-18).
+    pub fn create_token_with(
+        &mut self,
+        ttl: Duration,
+        now: SystemTime,
+        ephemeral: bool,
     ) -> Result<CreatedToken, CoordError> {
         let ttl_secs = whole_secs(ttl)?;
         if !(1..=MAX_TOKEN_TTL).contains(&ttl_secs) {
@@ -374,6 +395,7 @@ impl NodeStore {
             hash_hex,
             expires_unix,
             used: false,
+            ephemeral,
         });
         self.persist()?;
         Ok(CreatedToken {
@@ -411,13 +433,15 @@ impl NodeStore {
         if now_unix >= record.expires_unix {
             return Err(CoordError::TokenExpired);
         }
-        self.plan(
+        let mut plan = self.plan(
             name,
             endpoints,
             routes,
             format!("token:{}", record.id),
             record.id.clone(),
-        )
+        )?;
+        plan.ephemeral = record.ephemeral;
+        Ok(plan)
     }
 
     pub fn begin_oidc(
@@ -472,22 +496,34 @@ impl NodeStore {
             enrolled_unix: now_unix,
             approved: true,
             expired: false,
+            ephemeral: plan.ephemeral,
         };
-        let stored = StoredNode {
-            name: node.name.clone(),
-            overlay_ip: node.overlay_ip.clone(),
-            svid: node.svid.clone(),
-            owner: node.owner.clone(),
-            endpoints: node.endpoints.clone(),
-            routes: node.routes.clone(),
-            exit_node: node.exit_node,
-            approved: node.approved,
-            expired: node.expired,
-        };
+        let stored = StoredNode::from(&node);
         self.disk.nodes.push(node);
         self.disk.next_index = plan.next_index;
         self.persist()?;
         Ok(stored)
+    }
+
+    /// Delete one ephemeral node record and return it (W25-18).
+    ///
+    /// The overlay address of the node becomes free for the next enroll.
+    /// The function refuses a node that is not ephemeral.
+    pub fn remove_ephemeral(&mut self, name: &str) -> Result<StoredNode, CoordError> {
+        let position = self
+            .disk
+            .nodes
+            .iter()
+            .position(|node| node.name == name)
+            .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        if !self.disk.nodes[position].ephemeral {
+            return Err(CoordError::Protocol(
+                "The node is not ephemeral.".to_string(),
+            ));
+        }
+        let node = self.disk.nodes.remove(position);
+        self.persist()?;
+        Ok(StoredNode::from(&node))
     }
 
     /// Replace the advertised routes for an enrolled node.
@@ -588,20 +624,31 @@ impl NodeStore {
             parse_endpoint(endpoint)?;
         }
         let canonical_routes = subnet_routes(routes)?;
-        let ip = overlay_ip(self.disk.next_index)?;
-        let next_index = self
-            .disk
-            .next_index
+        // W25-18: use the lowest index that no node holds. The address of a removed
+        // ephemeral node is free again. With no removed node, the index is `next_index`.
+        let mut index = 0u32;
+        let ip = loop {
+            let ip = overlay_ip(index)?.to_string();
+            if index >= self.disk.next_index
+                || !self.disk.nodes.iter().any(|node| node.overlay_ip == ip)
+            {
+                break ip;
+            }
+            index = index.checked_add(1).ok_or(CoordError::Pool)?;
+        };
+        let next_index = index
             .checked_add(1)
-            .ok_or(CoordError::Pool)?;
+            .ok_or(CoordError::Pool)?
+            .max(self.disk.next_index);
         Ok(EnrollPlan {
             name: name.to_string(),
-            overlay_ip: ip.to_string(),
+            overlay_ip: ip,
             endpoints: endpoints.to_vec(),
             routes: canonical_routes,
             owner,
             token_id,
             next_index,
+            ephemeral: false,
         })
     }
 
@@ -622,6 +669,8 @@ pub struct EnrollPlan {
     owner: String,
     token_id: String,
     next_index: u32,
+    /// W25-18: the node is ephemeral.
+    pub ephemeral: bool,
 }
 
 /// Check `oidc:SUBJECT` with the same rule as [`NodeStore::begin_oidc`].
@@ -686,4 +735,106 @@ pub fn unix_now(now: SystemTime) -> Result<u64, CoordError> {
     now.duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|_| CoordError::Time)
+}
+
+#[cfg(test)]
+mod ephemeral_tests {
+    use super::*;
+
+    fn store(label: &str) -> (NodeStore, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "orblx-w25q-store-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        (NodeStore::open(&dir.join("nodes.json")).unwrap(), dir)
+    }
+
+    fn add(store: &mut NodeStore, name: &str, ephemeral: bool) -> String {
+        let now = SystemTime::now();
+        let token = store
+            .create_token_with(Duration::from_secs(60), now, ephemeral)
+            .unwrap();
+        let plan = store
+            .begin_enroll(
+                name,
+                &token.secret,
+                now,
+                &["127.0.0.1:443".to_string()],
+                &[],
+            )
+            .unwrap();
+        let svid = format!("spiffe://orblx.local/node/{name}");
+        store.commit(plan, svid, now).unwrap().overlay_ip
+    }
+
+    #[test]
+    fn the_default_token_is_not_ephemeral() {
+        let (mut store, dir) = store("default");
+        let token = store
+            .create_token(Duration::from_secs(60), SystemTime::now())
+            .unwrap();
+        let plan = store
+            .begin_enroll(
+                "plain",
+                &token.secret,
+                SystemTime::now(),
+                &["127.0.0.1:443".to_string()],
+                &[],
+            )
+            .unwrap();
+        assert!(!plan.ephemeral);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn remove_refuses_a_node_that_is_not_ephemeral() {
+        let (mut store, dir) = store("refuse");
+        add(&mut store, "plain", false);
+        assert!(store.remove_ephemeral("plain").is_err());
+        assert_eq!(store.nodes().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_removed_address_is_used_again_and_others_do_not_move() {
+        let (mut store, dir) = store("reuse");
+        let first = add(&mut store, "a", false);
+        let second = add(&mut store, "b", true);
+        let third = add(&mut store, "c", false);
+        assert_eq!(store.remove_ephemeral("b").unwrap().overlay_ip, second);
+        assert_eq!(add(&mut store, "d", true), second);
+        let fifth = add(&mut store, "e", false);
+        assert!(![first.as_str(), second.as_str(), third.as_str()].contains(&fifth.as_str()));
+        let reopened = NodeStore::open(&dir.join("nodes.json")).unwrap();
+        assert_eq!(reopened.nodes().len(), 4);
+        assert!(reopened
+            .nodes()
+            .iter()
+            .any(|node| node.name == "d" && node.ephemeral));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_old_store_reads_as_not_ephemeral() {
+        let (mut store, dir) = store("old");
+        add(&mut store, "a", true);
+        let path = dir.join("nodes.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for list in ["nodes", "tokens"] {
+            for item in value[list].as_array_mut().unwrap() {
+                item.as_object_mut().unwrap().remove("ephemeral");
+            }
+        }
+        std::fs::write(&path, value.to_string()).unwrap();
+        let reopened = NodeStore::open(&path).unwrap();
+        assert!(!reopened.nodes()[0].ephemeral);
+        assert!(!reopened.disk.tokens[0].ephemeral);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

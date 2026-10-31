@@ -50,6 +50,11 @@ pub async fn spawn(
     tokio::spawn(async move {
         expire_tick(tick_coord).await;
     });
+    crate::ephemeral::start(coord)?;
+    let ephemeral_coord = coord.clone();
+    tokio::spawn(async move {
+        crate::ephemeral::tick(ephemeral_coord).await;
+    });
     let (stamp_tx, stamp_rx) = watch::channel(0u64);
     let stamp_coord = coord.clone();
     tokio::spawn(async move {
@@ -333,6 +338,9 @@ async fn handle_stream(
     stamp: watch::Receiver<u64>,
 ) -> Result<(), CoordError> {
     let request = proto::read_json::<Request>(&mut recv).await?;
+    // W25-18: a node is online while it has an open request. Enroll has no node SVID.
+    let node = peer_node(coord, connection).ok();
+    let seen = node.as_deref().map(|name| coord.presence().begin(name));
     // W25-16: a `policy-wait` reply comes as JSON bytes from the cached view.
     let reply = if request.op == "policy-wait" {
         policy_wait_op(coord, connection, &request, stamp).await
@@ -353,6 +361,7 @@ async fn handle_stream(
             })?
         }
     };
+    drop(seen);
     proto::write_bytes(&mut send, &bytes).await?;
     let _ = send.finish();
     Ok(())

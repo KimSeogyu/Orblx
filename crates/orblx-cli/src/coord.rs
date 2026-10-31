@@ -40,11 +40,15 @@ pub(crate) enum Command {
         name: String,
         policy: Option<PathBuf>,
         config: Option<PathBuf>,
+        /// W25-18: the offline limit of an ephemeral node.
+        ephemeral_offline: Option<Duration>,
     },
     TokenCreate {
         state: PathBuf,
         out: PathBuf,
         ttl: Duration,
+        /// W25-18: a node that enrolls with the token is ephemeral.
+        ephemeral: bool,
     },
     Enroll {
         name: String,
@@ -100,6 +104,7 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             name,
             policy,
             config,
+            ephemeral_offline,
         } => {
             let from_file = match &config {
                 Some(path) => CoordConfig::from_file(path)
@@ -143,16 +148,32 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
                     .set_policy_file(&policy)
                     .map_err(|err| err.to_string())?;
             }
+            if let Some(offline) = ephemeral_offline {
+                coord
+                    .set_ephemeral_offline(offline)
+                    .map_err(|_| "The ephemeral offline time is not valid.".to_string())?;
+            }
             println!("state {}", state.display());
             serve_blocking(&coord, listen).map_err(|err| err.to_string())
         }
-        Command::TokenCreate { state, out, ttl } => {
+        Command::TokenCreate {
+            state,
+            out,
+            ttl,
+            ephemeral,
+        } => {
             let name = stored_coord_name(&state)?;
             let coord = Coordinator::open(&state, &name, OidcConfig::TokenOnly)
                 .map_err(|err| err.to_string())?;
-            let created = coord.create_token(ttl).map_err(|err| err.to_string())?;
+            let created = if ephemeral {
+                coord.create_ephemeral_token(ttl)
+            } else {
+                coord.create_token(ttl)
+            }
+            .map_err(|err| err.to_string())?;
             write_secret(&out, &created.secret)?;
             println!("wrote one enroll token");
+            println!("ephemeral {ephemeral}");
             println!("token_id {}", created.id);
             println!("expires_unix {}", created.expires_unix);
             println!("out {}", out.display());
@@ -424,6 +445,7 @@ fn parse_serve(args: &[String]) -> Result<Command, String> {
     let mut name = None;
     let mut policy = None;
     let mut config = None;
+    let mut ephemeral_offline = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -435,6 +457,12 @@ fn parse_serve(args: &[String]) -> Result<Command, String> {
             "--name" => name = Some(value),
             "--policy" => policy = Some(PathBuf::from(value)),
             "--config" => config = Some(PathBuf::from(value)),
+            "--ephemeral-offline" => {
+                let secs: u64 = value.parse().map_err(|_| {
+                    "The ephemeral offline time is not a number of seconds.".to_string()
+                })?;
+                ephemeral_offline = Some(Duration::from_secs(secs));
+            }
             other => return Err(format!("The flag {other} is not valid.\n{}", help())),
         }
     }
@@ -444,6 +472,7 @@ fn parse_serve(args: &[String]) -> Result<Command, String> {
         name: name.unwrap_or_else(|| "coord".to_string()),
         policy,
         config,
+        ephemeral_offline,
     })
 }
 
@@ -454,10 +483,15 @@ fn parse_token(args: &[String]) -> Result<Command, String> {
     let mut state = None;
     let mut out = None;
     let mut ttl = Duration::from_secs(3600);
+    let mut ephemeral = false;
     let mut index = 1;
     while index < args.len() {
         let flag = args[index].as_str();
         index += 1;
+        if flag == "--ephemeral" {
+            ephemeral = true;
+            continue;
+        }
         let value = take_value(args, &mut index)?;
         match flag {
             "--state" => state = Some(PathBuf::from(value)),
@@ -475,6 +509,7 @@ fn parse_token(args: &[String]) -> Result<Command, String> {
         state: state.ok_or_else(|| "The command needs --state.".to_string())?,
         out: out.ok_or_else(|| "The command needs --out.".to_string())?,
         ttl,
+        ephemeral,
     })
 }
 
@@ -667,8 +702,8 @@ fn parse_netmap(args: &[String]) -> Result<Command, String> {
 
 fn help() -> String {
     "\
-orblx coord serve --state DIR [--listen ADDR] [--name NAME] [--policy FILE] [--config FILE]
-orblx coord token create --state DIR --out FILE [--ttl SECS]
+orblx coord serve --state DIR [--listen ADDR] [--name NAME] [--policy FILE] [--config FILE] [--ephemeral-offline SECS]
+orblx coord token create --state DIR --out FILE [--ttl SECS] [--ephemeral]
 orblx coord enroll --name NAME --coord ADDR --bundle FILE (--token-file FILE | --id-token-file FILE [--nonce HEX] [--wait-approval SECS]) --state DIR [--coord-name NAME] [--endpoint HOST:PORT] [--route CIDR]
 orblx coord advertise --coord ADDR --bundle FILE --state DIR [--route CIDR]... [--exit-node on|off] [--coord-name NAME]
 orblx coord netmap --coord ADDR --bundle FILE --state DIR [--coord-name NAME] [--watch]
@@ -697,6 +732,10 @@ The coordinator writes each route change and exit-node change to config-audit.js
 preset = \"google\" selects Google as the issuer.
 --id-token-file enrolls with an OIDC ID token from the configured issuer.
 The command does not print the ID token.
+--ephemeral makes an ephemeral token. A node that enrolls with it is ephemeral.
+The coordinator removes an ephemeral node that stays offline longer than --ephemeral-offline.
+The default is 600 seconds. The range is 2 seconds to 30 days.
+The name of a removed node stays revoked.
 A new OIDC user waits until an owner runs orblx admin user-approve.
 A waiting or rejected user gets no SVID.
 --wait-approval SECS tries the enroll again each 250 ms while the user waits, up to SECS (1 to 3600).

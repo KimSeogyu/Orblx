@@ -274,7 +274,8 @@ pub fn nodes(coord: &Coordinator) -> Result<Value, CoordError> {
                 "owner": node.owner,
                 "approved": node.approved && !node.expired,
                 "expired": node.expired,
-                "pending": !node.approved && !node.expired
+                "pending": !node.approved && !node.expired,
+                "ephemeral": node.ephemeral
             })
         })
         .collect();
@@ -557,7 +558,11 @@ pub(crate) fn deny_digest(coord: &Coordinator) -> Result<[u8; 32], CoordError> {
     Ok(sha256_digest(text.as_bytes()))
 }
 
-fn push_revoke(coord: &Coordinator, svid: &str, now: SystemTime) -> Result<u64, CoordError> {
+pub(crate) fn push_revoke(
+    coord: &Coordinator,
+    svid: &str,
+    now: SystemTime,
+) -> Result<u64, CoordError> {
     push_deny(coord, &[svid.to_string()], &[], now)
 }
 
@@ -592,6 +597,18 @@ pub(crate) fn push_deny(
     let text = file.to_json()?;
     write_text(&coord.state_dir()?.join(DENY_FILE), &text, 0o644)?;
     Ok(file.version)
+}
+
+/// Return true when the deny file in `dir` holds the SPIFFE ID `uri` (W25-18).
+///
+/// The caller can hold the coordinator lock. The function does not take it.
+pub(crate) fn uri_denied_in(dir: &std::path::Path, uri: &str) -> Result<bool, CoordError> {
+    let path = dir.join(DENY_FILE);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let file: DenyFile = serde_json::from_str(&read_text(&path)?).map_err(|_| CoordError::State)?;
+    Ok(file.revoked_uris.iter().any(|item| item == uri))
 }
 
 fn read_deny(coord: &Coordinator, now: SystemTime) -> Result<DenyFile, CoordError> {
