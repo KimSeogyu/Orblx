@@ -79,6 +79,8 @@ enum HelloMode {
 }
 
 fn main() {
+    // W25-36: the running node readers verify the signed netmap of an enrolled node.
+    orblx_coord::install_netmap_check();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match action_from_args(args) {
         Ok(Action::Hello) => println!("{}", hello_line()),
