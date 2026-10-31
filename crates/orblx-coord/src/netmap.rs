@@ -84,28 +84,51 @@ impl NetmapKey {
     }
 
     pub fn sign_netmap(&self, payload: &Netmap) -> Result<SignedNetmap, CoordError> {
-        validate_payload(payload)?;
-        let bytes = canonical_payload(payload)?;
-        let sig = STANDARD.encode(self.signing.sign(&bytes).to_bytes());
+        self.sign_netmap_owned(payload.clone())
+    }
+
+    /// Sign `payload` and verify the new signature over the same bytes (W25-16).
+    ///
+    /// The netmap gets the same signature as from [`Self::sign_netmap`]. The check does not
+    /// encode the payload again, so one netmap costs one JSON encode.
+    pub fn sign_netmap_owned(&self, payload: Netmap) -> Result<SignedNetmap, CoordError> {
+        validate_payload(&payload)?;
+        let bytes = canonical_payload(&payload)?;
+        let sig = self.sign_checked(&bytes)?;
         Ok(SignedNetmap {
-            netmap: payload.clone(),
+            netmap: payload,
             sig,
             key_id: self.key_id(),
         })
     }
 
     pub fn sign_grants(&self, grants: &ReceiverGrants) -> Result<SignedGrants, CoordError> {
+        self.sign_grants_owned(grants.clone())
+    }
+
+    /// Sign `grants` and verify the new signature over the same bytes (W25-16).
+    pub fn sign_grants_owned(&self, grants: ReceiverGrants) -> Result<SignedGrants, CoordError> {
         grants
             .check()
             .map_err(|err| CoordError::Protocol(err.to_string()))?;
-        let bytes = serde_json::to_vec(grants)
+        let bytes = serde_json::to_vec(&grants)
             .map_err(|_| CoordError::Protocol("The grants are not valid.".to_string()))?;
-        let sig = STANDARD.encode(self.signing.sign(&bytes).to_bytes());
+        let sig = self.sign_checked(&bytes)?;
         Ok(SignedGrants {
-            grants: grants.clone(),
+            grants,
             sig,
             key_id: self.key_id(),
         })
+    }
+
+    /// Sign `bytes`, then verify the signature with the public key before it goes out.
+    fn sign_checked(&self, bytes: &[u8]) -> Result<String, CoordError> {
+        let signature = self.signing.sign(bytes);
+        self.signing
+            .verifying_key()
+            .verify(bytes, &signature)
+            .map_err(|_| CoordError::Signature)?;
+        Ok(STANDARD.encode(signature.to_bytes()))
     }
 
     pub(crate) fn sign_agent_grant(

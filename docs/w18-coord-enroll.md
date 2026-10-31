@@ -220,3 +220,13 @@ On the REAL Mac, run `orblx coord netmap` again.
 `overlay_ip` is the same value.
 Do this before the node SVID expires.
 The life is 15 minutes.
+
+## W25-14b: the node.json failure (gate 1 ruling)
+
+The `orblx up` check in `coord-enroll.sh` fails when a failed `orblx up` changes the node state.
+On 0c541297 and later, a failed `orblx up` (no TUN device) wrote a new `node.json`.
+This is a product bug: `load_or_create_state` wrote `node.json` before the TUN device opened.
+The code is from #34 and #45. It is not from #41.
+#114 removes the stale compose volumes. Before #114, an old `node.json` in those volumes hid the bug.
+The fix is in #118: `orblx up` writes `node.json` only after the TUN device opens.
+The check in `coord-enroll.sh` does not change.
