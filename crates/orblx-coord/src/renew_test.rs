@@ -111,6 +111,8 @@ async fn renew_replaces_the_leaf_and_keeps_the_address() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_stays_up_for_three_svid_lifetimes() {
     const LIFE_SECS: u64 = 60;
+    const PROBE_MS: u64 = 20;
+    const RENEW_GAP_LIMIT: Duration = Duration::from_millis(200);
     let scratch = Scratch::new("life");
     let node_a = Scratch::new("life-a");
     let node_b = Scratch::new("life-b");
@@ -169,6 +171,7 @@ async fn session_stays_up_for_three_svid_lifetimes() {
     let map_a = netmap("a", "100.64.0.1", "b", "100.64.0.2", port_b);
     let map_b = netmap("b", "100.64.0.2", "a", "100.64.0.1", port_a);
 
+    let renewals = Arc::new(Mutex::new(Vec::new()));
     let (stop_tx, stop_a) = watch::channel(false);
     let stop_b = stop_a.clone();
     let (a_in_tx, a_in_rx) = mpsc::channel(64);
@@ -182,7 +185,12 @@ async fn session_stays_up_for_three_svid_lifetimes() {
             map_a,
             port_a,
             node_a.0.clone(),
-            renewer(addr, bundle.clone(), node_a.0.clone()),
+            renewer(
+                addr,
+                bundle.clone(),
+                node_a.0.clone(),
+                Arc::clone(&renewals),
+            ),
             stop_a,
         ),
         MemoryDevice {
@@ -196,7 +204,12 @@ async fn session_stays_up_for_three_svid_lifetimes() {
             map_b,
             port_b,
             node_b.0.clone(),
-            renewer(addr, bundle.clone(), node_b.0.clone()),
+            renewer(
+                addr,
+                bundle.clone(),
+                node_b.0.clone(),
+                Arc::clone(&renewals),
+            ),
             stop_b,
         ),
         MemoryDevice {
@@ -205,15 +218,32 @@ async fn session_stays_up_for_three_svid_lifetimes() {
         },
     ));
 
+    // The stall probe shares the runtime with the nodes and the coordinator. A late tick
+    // shows that the runtime thread did not run, so the gap is not in the datapath.
+    let max_stall = Arc::new(Mutex::new(Duration::ZERO));
+    let stall_probe = tokio::spawn(stall_probe(Arc::clone(&max_stall)));
+    // The OS stall probe runs on its own thread, outside the runtime. A stall that both probes
+    // see at the same time is a host stall (the thread did not get a CPU), not blocking code.
+    let os_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let max_os_stall = Arc::new(Mutex::new(Duration::ZERO));
+    let os_probe = {
+        let (stop, max) = (Arc::clone(&os_stop), Arc::clone(&max_os_stall));
+        std::thread::spawn(move || os_stall_probe(&stop, &max))
+    };
+
     let mut last_ab: Option<Instant> = None;
     let mut last_ba: Option<Instant> = None;
     let mut max_gap = Duration::ZERO;
+    let mut gaps = Vec::new();
     let mut got_ab = 0u64;
     let mut got_ba = 0u64;
     let mut saw_direct = false;
     let mut expiries = HashSet::new();
     let limit = Duration::from_secs(LIFE_SECS * 3 + 8);
+    let mut round = 0u64;
+    let mut status_read: Option<tokio::task::JoinHandle<(std::io::Result<String>, u128)>> = None;
     while issued_at.elapsed() < limit {
+        // One probe each way every 20 ms, so a 200 ms gap shows as about 10 lost probes.
         let _ = a_in_tx
             .send(
                 ipv4_packet(
@@ -234,36 +264,76 @@ async fn session_stays_up_for_three_svid_lifetimes() {
                 .unwrap(),
             )
             .await;
-        let slice_end = Instant::now() + Duration::from_millis(200);
-        while Instant::now() < slice_end {
-            if let Ok(Some(_)) =
-                tokio::time::timeout(Duration::from_millis(20), b_out_rx.recv()).await
-            {
-                note_gap(&mut last_ab, &mut max_gap);
-                got_ab += 1;
-            }
-            if let Ok(Some(_)) =
-                tokio::time::timeout(Duration::from_millis(20), a_out_rx.recv()).await
-            {
-                note_gap(&mut last_ba, &mut max_gap);
-                got_ba += 1;
+        let tick = tokio::time::Instant::now() + Duration::from_millis(PROBE_MS);
+        loop {
+            tokio::select! {
+                got = b_out_rx.recv() => {
+                    if got.is_some() {
+                        note_gap("ab", &mut last_ab, &mut max_gap, &mut gaps);
+                        got_ab += 1;
+                    }
+                }
+                got = a_out_rx.recv() => {
+                    if got.is_some() {
+                        note_gap("ba", &mut last_ba, &mut max_gap, &mut gaps);
+                        got_ba += 1;
+                    }
+                }
+                () = tokio::time::sleep_until(tick) => break,
             }
         }
-        if let Ok(text) = fs::read_to_string(node_a.0.join(NODE_STATUS_FILE)) {
-            if text.contains("path direct ") {
-                saw_direct = true;
+        round += 1;
+        // W25-11: the status file read runs on a blocking thread. A slow disk read must not
+        // stop this loop, because then the loop sends no probes and sees a false gap.
+        if status_read.as_ref().is_some_and(|read| read.is_finished()) {
+            let (read, read_ms) = status_read.take().unwrap().await.unwrap();
+            if read_ms >= 20 {
+                let ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis();
+                eprintln!("trace {ms} test slow_io op=status_read ms={read_ms}");
             }
-            if let Some(value) = text
-                .lines()
-                .find_map(|line| line.strip_prefix("svid_expiry "))
-            {
-                expiries.insert(value.to_string());
+            if let Ok(text) = read {
+                if text.contains("path direct ") {
+                    saw_direct = true;
+                }
+                if let Some(value) = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("svid_expiry "))
+                {
+                    expiries.insert(value.to_string());
+                }
             }
+        }
+        if status_read.is_none() && round.is_multiple_of(10) {
+            let path = node_a.0.join(NODE_STATUS_FILE);
+            status_read = Some(tokio::task::spawn_blocking(move || {
+                let read_started = Instant::now();
+                let read = fs::read_to_string(path);
+                (read, read_started.elapsed().as_millis())
+            }));
         }
         if last_ab.is_some() && last_ba.is_some() && max_gap > Duration::from_secs(2) {
             break;
         }
     }
+    stall_probe.abort();
+    os_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = os_probe.join();
+    let max_stall = *max_stall.lock().unwrap();
+    let max_os_stall = *max_os_stall.lock().unwrap();
+    let renewals = renewals.lock().unwrap().clone();
+    let renew_gap = renewal_max_gap(&gaps, &renewals);
+    println!(
+        "renew_gap_summary probe_ms {PROBE_MS} ab {got_ab} ba {got_ba} max_gap_ms {} renewals {} renewal_max_gap_ms {} runtime_max_stall_ms {} os_max_stall_ms {} expiries {}",
+        max_gap.as_millis(),
+        renewals.len(),
+        renew_gap.as_millis(),
+        max_stall.as_millis(),
+        max_os_stall.as_millis(),
+        expiries.len()
+    );
 
     let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(3), task_a).await;
@@ -278,6 +348,16 @@ async fn session_stays_up_for_three_svid_lifetimes() {
         max_gap <= Duration::from_secs(2),
         "packet gap {} ms",
         max_gap.as_millis()
+    );
+    assert!(
+        renewals.len() >= 4,
+        "renew calls {} over three lifetimes",
+        renewals.len()
+    );
+    assert!(
+        renew_gap <= RENEW_GAP_LIMIT,
+        "packet gap {} ms at an SVID renewal",
+        renew_gap.as_millis()
     );
     assert!(saw_direct, "status did not report path direct");
     assert!(
@@ -545,7 +625,12 @@ async fn late_peer_case(
             map_a,
             port_a,
             node_a.0.clone(),
-            renewer(addr, bundle.clone(), node_a.0.clone()),
+            renewer(
+                addr,
+                bundle.clone(),
+                node_a.0.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
             stop_a,
         ),
         MemoryDevice {
@@ -610,7 +695,12 @@ async fn late_peer_case(
         map_b,
         port_b,
         node_b.0.clone(),
-        renewer(addr, bundle.clone(), node_b.0.clone()),
+        renewer(
+            addr,
+            bundle.clone(),
+            node_b.0.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+        ),
         stop_b,
     );
     let hook = Arc::clone(&listened);
@@ -921,7 +1011,12 @@ async fn startup_cost_once() -> StartupPhases {
         map,
         0,
         node_dir.0.clone(),
-        renewer(addr, bundle.clone(), node_dir.0.clone()),
+        renewer(
+            addr,
+            bundle.clone(),
+            node_dir.0.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+        ),
         stop,
     );
     request.on_listen = Some(Box::new(move |event| {
@@ -1166,7 +1261,12 @@ async fn late_listener_case(tag: &str, late: Duration) -> Option<Duration> {
             map_a,
             port_a,
             node_a.0.clone(),
-            renewer(addr, bundle.clone(), node_a.0.clone()),
+            renewer(
+                addr,
+                bundle.clone(),
+                node_a.0.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
             stop_a,
         ),
         MemoryDevice {
@@ -1182,7 +1282,12 @@ async fn late_listener_case(tag: &str, late: Duration) -> Option<Duration> {
             map_b,
             port_b,
             node_b.0.clone(),
-            renewer(addr, bundle.clone(), node_b.0.clone()),
+            renewer(
+                addr,
+                bundle.clone(),
+                node_b.0.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
             stop_b,
         ),
         MemoryDevice {
@@ -1278,10 +1383,94 @@ async fn late_listener_soak() {
     );
 }
 
-fn note_gap(last: &mut Option<Instant>, max_gap: &mut Duration) {
+/// The renewal window: from 1 s before a renew call to 3 s after it (W25-11).
+const RENEW_WINDOW_BEFORE: Duration = Duration::from_secs(1);
+const RENEW_WINDOW_AFTER: Duration = Duration::from_secs(3);
+
+/// Return the largest gap that overlaps one renewal window.
+fn renewal_max_gap(gaps: &[(Instant, Instant)], renewals: &[Instant]) -> Duration {
+    gaps.iter()
+        .filter(|(prev, now)| {
+            renewals.iter().any(|start| {
+                let from = start.checked_sub(RENEW_WINDOW_BEFORE).unwrap_or(*start);
+                let to = *start + RENEW_WINDOW_AFTER;
+                *prev < to && *now > from
+            })
+        })
+        .map(|(prev, now)| now.saturating_duration_since(*prev))
+        .max()
+        .unwrap_or(Duration::ZERO)
+}
+
+/// Tick every 5 ms and keep the largest delay of a tick. Trace a delay over 100 ms.
+async fn stall_probe(max_stall: Arc<Mutex<Duration>>) {
+    let step = Duration::from_millis(5);
+    let mut last = Instant::now();
+    loop {
+        tokio::time::sleep(step).await;
+        let now = Instant::now();
+        let late = now.saturating_duration_since(last).saturating_sub(step);
+        if late > Duration::from_millis(100) {
+            let ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            eprintln!("trace {ms} test stall ms={}", late.as_millis());
+        }
+        {
+            let mut max = max_stall.lock().unwrap();
+            if late > *max {
+                *max = late;
+            }
+        }
+        last = now;
+    }
+}
+
+/// The same probe on an OS thread. Trace a delay over 100 ms.
+fn os_stall_probe(stop: &std::sync::atomic::AtomicBool, max_stall: &Mutex<Duration>) {
+    let step = Duration::from_millis(5);
+    let mut last = Instant::now();
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        std::thread::sleep(step);
+        let now = Instant::now();
+        let late = now.saturating_duration_since(last).saturating_sub(step);
+        if late > Duration::from_millis(100) {
+            let ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            eprintln!("trace {ms} test os_stall ms={}", late.as_millis());
+        }
+        {
+            let mut max = max_stall.lock().unwrap();
+            if late > *max {
+                *max = late;
+            }
+        }
+        last = now;
+    }
+}
+
+fn note_gap(
+    dir: &str,
+    last: &mut Option<Instant>,
+    max_gap: &mut Duration,
+    gaps: &mut Vec<(Instant, Instant)>,
+) {
     let now = Instant::now();
     if let Some(prev) = *last {
         let gap = now.saturating_duration_since(prev);
+        if gap > Duration::from_millis(40) {
+            gaps.push((prev, now));
+        }
+        if gap > Duration::from_millis(100) {
+            let ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            eprintln!("trace {ms} test gap dir={dir} ms={}", gap.as_millis());
+        }
         if gap > *max_gap {
             *max_gap = gap;
         }
@@ -1289,8 +1478,15 @@ fn note_gap(last: &mut Option<Instant>, max_gap: &mut Duration) {
     *last = Some(now);
 }
 
-fn renewer(addr: SocketAddr, bundle: String, state: PathBuf) -> SvidRenewer {
+/// A renewer that also notes the time of each renew call.
+fn renewer(
+    addr: SocketAddr,
+    bundle: String,
+    state: PathBuf,
+    calls: Arc<Mutex<Vec<Instant>>>,
+) -> SvidRenewer {
     SvidRenewer::new(move || {
+        calls.lock().unwrap().push(Instant::now());
         let result = client::renew_svid_blocking(addr, "coord", &bundle, &state)
             .map_err(|err| err.to_string())?;
         Ok(RenewedLeaf {
