@@ -1570,6 +1570,69 @@ mod tests {
 
     use super::{parse_issue, parse_set, parse_up, run, Command, DEFAULT_STATE_DIR};
 
+    /// A state directory before the first good `orblx up`: the netmap is there, `node.json`
+    /// is not (W25-14b).
+    fn state_without_node_record(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("orblx-no-record-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("netmap.json"),
+            r#"{"version":1,"self":{"name":"a","overlay_ip":"100.64.0.1"},"peers":[]}"#,
+        )
+        .unwrap();
+        assert!(!dir.join(orblx_datapath::NODE_RECORD_FILE).exists());
+        dir
+    }
+
+    #[test]
+    fn down_works_before_the_first_good_up() {
+        // No node process: down reports that the node is down.
+        let dir = state_without_node_record("down-idle");
+        super::run_down(super::StateOptions {
+            state_dir: dir.clone(),
+        })
+        .unwrap();
+        // A running node process: down stops it with only the pid file.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        fs::write(
+            dir.join(orblx_datapath::NODE_PID_FILE),
+            child.id().to_string(),
+        )
+        .unwrap();
+        let reaper = std::thread::spawn(move || child.wait().unwrap());
+        super::run_down(super::StateOptions {
+            state_dir: dir.clone(),
+        })
+        .unwrap();
+        assert!(
+            !reaper.join().unwrap().success(),
+            "the node process was not stopped"
+        );
+        assert!(!dir.join(orblx_datapath::NODE_RECORD_FILE).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn renew_works_before_the_first_good_up() {
+        let dir = state_without_node_record("renew");
+        fs::write(dir.join("coord-addr"), "127.0.0.1:9").unwrap();
+        fs::write(dir.join("coord-name"), "coord").unwrap();
+        let renewer = super::load_renewer(&dir, None, None).unwrap();
+        assert!(renewer.is_some(), "renew needs node.json");
+        // The renew call reads the trust bundle and the coordinator, not node.json.
+        let err = super::renew_from_coord(&dir, "127.0.0.1:9".parse().unwrap(), "coord")
+            .err()
+            .unwrap();
+        assert!(!err.contains("node.json"), "renew read node.json: {err}");
+        assert!(!dir.join(orblx_datapath::NODE_RECORD_FILE).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn store_deny_replaces_the_file_and_leaves_no_temp_file() {
         let dir = std::env::temp_dir().join(format!("orblx-deny-store-{}", std::process::id()));
