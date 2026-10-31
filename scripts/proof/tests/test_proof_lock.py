@@ -80,7 +80,7 @@ class ProofLockTest(unittest.TestCase):
         self.assertIn("proof_lock two waiting", out_two)
         self.assertIn("label=one", out_two)
         # W25-14: the waiter prints the wait time, the queue position, and the holder.
-        self.assertGreaterEqual(len(re.findall(r"waiting for lock, \d+ s, position \d+, .*holder: label=one", out_two)), 2)
+        self.assertGreaterEqual(len(re.findall(r"waiting for lock, \d+ s, position \d+, .*holder: label=one", out_two)), 2, out_two)
         for out, label in ((out_one, "one"), (out_two, "two")):
             for phase in ("queued", "start", "end"):
                 self.assertRegex(out, rf"proof_context {label} phase {phase} time \S+ load \S+ other_orblx_containers (\d+|unknown)")
