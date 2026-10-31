@@ -212,6 +212,8 @@ if [[ -z "$BIN" ]]; then
   cargo build -p orblx-cli --bin orblx --locked
   BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/orblx"
 fi
+# The PO rule: a latency run records the toolchain and the build profile of the binary.
+echo "eph_bin ${BIN} profile $(basename "$(dirname "$BIN")") $(rustc -V 2>/dev/null || echo 'rustc unknown')"
 # shellcheck source=scripts/proof/stage-image.sh
 source "$ROOT/scripts/proof/stage-image.sh"
 image_dir="$(stage_proof_image "$ROOT" "$BIN")"
@@ -244,11 +246,19 @@ echo "=== [C] start a, b, n1, e1 to e4 ==="
 dc --profile nodes up -d a b n1 e1 e2 e3 e4
 a_ip="$(ip_of a)"; b_ip="$(ip_of b)"; e1_ip="$(ip_of e1)"; e2_ip="$(ip_of e2)"
 echo "overlay a ${a_ip} b ${b_ip} e1 ${e1_ip} e2 ${e2_ip}"
+start_ms="$(now_ms)"
+reached=0
 for _ in $(seq 1 60); do
-  dc exec -T a ping -n -c 1 -W 1 "$b_ip" >/dev/null 2>&1 \
-    && dc exec -T a ping -n -c 1 -W 1 "$e1_ip" >/dev/null 2>&1 && break
+  if dc exec -T a ping -n -c 1 -W 1 "$b_ip" >/dev/null 2>&1 \
+    && dc exec -T a ping -n -c 1 -W 1 "$e1_ip" >/dev/null 2>&1; then
+    reached=1
+    break
+  fi
   sleep 1
 done
+echo "first_reach a_to_b_e1 ${reached} start_to_reach_ms $(( $(now_ms) - start_ms ))"
+# A node that cannot reach its peers fails here with the node logs.
+[[ "$reached" -eq 1 ]] || fail "a cannot reach b and e1 over the overlay."
 echo "---- [C] overlay ping a to b, e1, e2 ----"
 dc exec -T a ping -n -c 5 -i 0.2 -W 1 "$b_ip" | tail -n 2
 dc exec -T a ping -n -c 5 -i 0.2 -W 1 "$e1_ip" | tail -n 2
