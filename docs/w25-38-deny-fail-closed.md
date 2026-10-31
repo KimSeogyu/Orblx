@@ -77,10 +77,10 @@ A crash before the first rename after enroll leaves no `deny.json`. The reader r
 
 The enroll reply has no deny list. Enroll is not mutual TLS, because the node has no certificate before enroll. So the node takes its deny list only from a mutual TLS request with its new SVID.
 
-1. `write_state` writes `node-name`. From this point, `deny.json` is "missing after enroll", and each reader refuses each peer.
-2. Right after `write_state`, `orblx coord enroll` and `orblx login` call `orblx_coord::fetch_first_deny_blocking`. It opens a new mutual TLS connection with the new SVID, sends the `deny` request, and writes the reply with `store_deny_file`. There is no wait for a poll tick.
-3. The command prints `deny_list ready_ms N`. N is the refuse-all window, from before `write_state` to the first valid `deny.json`.
-4. When the fetch fails (for example, the coordinator is not reachable), the command prints this error and `deny_list pending`, and the enroll stays done:
+1. The enroll reply gives the node its SVID. Right after the reply, with no wait for a poll tick, the enroll client (`enroll_with_token`, `enroll_with_oidc`) opens a new mutual TLS connection with the new SVID and sends the `deny` request. The result is `EnrollResult::first_deny` (`FirstDeny::Fetched` or `FirstDeny::Failed`).
+2. `write_state` writes `node-name` and the other node files, then writes the list with `store_deny_file` as the last file. Between `node-name` and `deny.json`, the file is "missing after enroll", and each reader refuses each peer.
+3. `orblx coord enroll` and `orblx login` print `deny_list ready_ms N`. N is the refuse-all window, from the time the node got its SVID to a valid `deny.json` on disk. When the first fetch failed, the command tries one more fetch with `orblx_coord::fetch_first_deny_blocking`.
+4. When both fetches fail (for example, the coordinator is not reachable), the command prints this error and `deny_list pending`, and the enroll stays done:
    `The node is enrolled, but it did not get its deny list from the coordinator. <error> The node refuses SSH logins, file receive, new sessions, and ping until it gets the list. `orblx up` gets the list when the coordinator is reachable.`
 5. The node then stays refuse-all. The deny refresh of `orblx up` tries `policy-wait`, then `deny-wait`, then a `deny` fetch each 500 ms. Each fetch has a limit of 10 s (`DENY_FETCH_LIMIT`), so a stopped coordinator does not hold a fetch for the QUIC idle timeout (60 s). When the coordinator comes back, the node gets the list with no manual step.
 
@@ -92,13 +92,13 @@ This change needs no coordinator change. The `deny` request exists since W25-2. 
 
 | Run | Values (ms) | Max (ms) |
 |---|---|---|
-| 1 | 173, 208, 182, 210, 265, 200, 205, 180, 172, 171 | 265 |
+| 1 | 189, 186, 191, 192, 189, 190, 191, 192, 183, 189 | 192 |
 
 The [C] proof gate 4 measures the same window with the release binary in containers.
 
 ### Coordinator not reachable after enroll (`cargo test`)
 
-- `w25_38_enroll_test::w25_38_unreachable_coordinator_after_enroll_keeps_the_node_refuse_all`: the first fetch fails after the 10 s limit (10002 ms), and each reader still refuses.
+- `w25_38_enroll_test::w25_38_unreachable_coordinator_after_enroll_keeps_the_node_refuse_all`: the coordinator stops after the enroll reply. The fetch fails after the 10 s limit (10002 ms), and each reader still refuses.
 - `up::tests::w25_38_node_recovers_its_deny_list_when_the_coordinator_comes_back_after_enroll`: the node is refuse-all with no coordinator. The deny refresh of `orblx up` runs. The coordinator starts on the same address. The node gets the valid list in 1079 ms with no manual step. The revoked peer is refused and the good peer is accepted.
 
 ## Gate tests (`cargo test`)
@@ -129,7 +129,7 @@ The [C] proof gate 4 measures the same window with the release binary in contain
 | Refuse-all window, 10 enrolls, 2000 ms or less | `w25_38_enroll_test::w25_38_refuse_all_window_after_enroll_is_two_seconds_or_less` | pass |
 | Coordinator not reachable after enroll: refuse-all, clear error | `w25_38_enroll_test::w25_38_unreachable_coordinator_after_enroll_keeps_the_node_refuse_all` | pass |
 | Coordinator comes back: recovery with no manual step | `up::tests::w25_38_node_recovers_its_deny_list_when_the_coordinator_comes_back_after_enroll` | pass |
-| renew_test (assertions not changed) | `renew_test::*` | pass |
+| renew_test (file not changed; it uses `write_state` with the first deny list from the enroll client) | `renew_test::*` | pass |
 
 Each 4-kind test uses corrupt, truncated, missing after enroll, and unreadable (a directory in place of the file), and counts 0 accepted.
 
