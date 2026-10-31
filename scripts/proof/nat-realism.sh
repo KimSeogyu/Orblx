@@ -20,6 +20,7 @@
 # ORBLX_NATR_IMAGE, ORBLX_NATR_PUB and ORBLX_NATR_LAN change the names and the subnets.
 # W25-5: the script takes the box proof lock (proof-lock.sh) and prints proof_context lines.
 # The script measures TCP bulk throughput on the plain, direct and relay paths.
+# W25-16: each bulk also prints a bulk_pps line (measured interface packet counters, report only).
 # The script prints proof_ok.
 set -euo pipefail
 
@@ -482,6 +483,53 @@ copy_bulk() {
   docker cp "$ROOT/scripts/proof/tcp-bulk.py" "$1:/tmp/tcp-bulk.py" >/dev/null
 }
 
+# W25-16: the interface that carries the bulk in a container. The client sends on the route to the
+# target IP. The server receives on the interface that holds the target IP. On an overlay path this is
+# the orblx TUN. Prints nothing when it is not found.
+bulk_dev() {
+  local name="$1" mode="$2" ip="$3"
+  if [[ "$mode" == route ]]; then
+    docker exec "$name" ip -o route get "$ip" 2>/dev/null \
+      | awk '!done {for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); done = 1; break }}' || true
+  else
+    docker exec "$name" ip -o addr show to "$ip" 2>/dev/null | awk 'NR == 1 { print $2 }' || true
+  fi
+}
+
+# W25-16: the rx and tx packet counters of an interface in a container: "rx tx", or nothing.
+dev_packets() {
+  [[ -n "$2" ]] || return 0
+  docker exec "$1" cat "/sys/class/net/$2/statistics/rx_packets" "/sys/class/net/$2/statistics/tx_packets" \
+    2>/dev/null | paste -sd ' ' || true
+}
+
+# W25-16: the measured packet rate of one bulk transfer, from the interface counters read
+# before and after the transfer. pps is the data packets the server interface received
+# (on an overlay path: the frames the node decrypted and wrote to its TUN) divided by the
+# bulk seconds of the server result. client_tx_pps uses the same seconds. window_s is the
+# wall time between the two counter reads. Report only: no gate reads this line.
+bulk_pps_line() {
+  local label="$1" cdev="$2" sdev="$3" c0="$4" c1="$5" s0="$6" s1="$7" t0="$8" t1="$9" result="${10}"
+  python3 - "$label" "$cdev" "$sdev" "$c0" "$c1" "$s0" "$s1" "$t0" "$t1" "$result" <<'PY'
+import sys
+label, cdev, sdev, c0, c1, s0, s1, t0, t1, result = sys.argv[1:11]
+words = result.split()
+secs = float(words[words.index("seconds") + 1]) if "seconds" in words else 0.0
+def pair(text):
+    p = text.split()
+    return (int(p[0]), int(p[1])) if len(p) == 2 else None
+c0, c1, s0, s1 = pair(c0), pair(c1), pair(s0), pair(s1)
+if not (cdev and sdev and c0 and c1 and s0 and s1 and secs > 0):
+    print("bulk_pps %s none client_dev %s server_dev %s (no counter)" % (label, cdev or "-", sdev or "-"))
+    sys.exit(0)
+ctx, crx = c1[1] - c0[1], c1[0] - c0[0]
+srx, stx = s1[0] - s0[0], s1[1] - s0[1]
+print("bulk_pps %s client_dev %s tx_packets %d rx_packets %d server_dev %s rx_packets %d tx_packets %d "
+      "bulk_s %.3f window_s %.3f pps %.0f client_tx_pps %.0f"
+      % (label, cdev, ctx, crx, sdev, srx, stx, secs, float(t1) - float(t0), srx / secs, ctx / secs))
+PY
+}
+
 # Measure the throughput of one TCP bulk transfer of BULK_SECS seconds.
 # Arguments: label, client container, server container, target IP.
 bulk() {
@@ -505,10 +553,19 @@ bulk() {
     done
     (sleep 1 && dc exec -T relay python3 /tmp/tcp-bulk.py cpu "orblx relay" $((BULK_SECS - 2)) >"${tmp}/relay") &
   fi
+  local cdev sdev c0 c1 s0 s1 t0 t1
+  cdev="$(bulk_dev "$client" route "$ip")"
+  sdev="$(bulk_dev "$server" addr "$ip")"
+  c0="$(dev_packets "$client" "$cdev")"
+  s0="$(dev_packets "$server" "$sdev")"
+  t0="$(date +%s.%N)"
   if ! docker exec "$client" timeout $((BULK_SECS + 60)) python3 /tmp/tcp-bulk.py client "$ip" "$BULK_PORT" "$BULK_SECS"; then
     echo "The ${label} bulk transfer failed." >&2
     exit 1
   fi
+  c1="$(dev_packets "$client" "$cdev")"
+  s1="$(dev_packets "$server" "$sdev")"
+  t1="$(date +%s.%N)"
   wait
   if [[ "$label" != "plain" ]]; then
     for name in "$client" "$server" relay; do
@@ -530,6 +587,9 @@ bulk() {
   fi
   echo "throughput ${label} ${out}"
   SUMMARY+=("throughput ${label} ${out}")
+  line="$(bulk_pps_line "$label" "$cdev" "$sdev" "$c0" "$c1" "$s0" "$s1" "$t0" "$t1" "$out")"
+  echo "$line"
+  SUMMARY+=("$line")
 }
 
 # Sample the CPU of idle orblx processes for IDLE_SECS seconds. No ping or bulk runs.

@@ -6,6 +6,9 @@
 # Env: ORBLX_SERIAL_OUT (default target/serial-rtt) gets runN.log, runN.exit and serial-rtt.md.
 #      The ORBLX_NATR_* variables of nat-realism.sh pass through.
 #      ORBLX_SERIAL_SPIKE_MS (default 20) is the max ping limit.
+# W25-16: during each run, host-probe.py writes runN.hostprobe.tsv (CPU iowait and steal, PSI cpu,
+# io and memory, disk busy; ORBLX_HOST_PROBE_INTERVAL, default 0.5 s, KST time stamps). After each
+# run the table prints the probe rows around the max ping (host_probe_context). Report only.
 # The script stops after a run with a ping above the limit while no other orblx container ran
 # (contention is then not the cause; see docs/w25-proof-lock.md). It exits 1 when a run fails
 # the limit, loses a gate ping, or does not print proof_ok.
@@ -20,20 +23,32 @@ PROJECT="${ORBLX_NATR_PROJECT:-orblx-natr-proof}"
 
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$ROOT/scripts/proof/proof-lock.sh"
-trap proof_lock_end EXIT
+PROBE_PID=""
+probe_stop() {
+  if [[ -n "$PROBE_PID" ]]; then
+    kill "$PROBE_PID" 2>/dev/null
+    wait "$PROBE_PID" 2>/dev/null
+    PROBE_PID=""
+  fi
+}
+trap 'probe_stop; proof_lock_end' EXIT
 proof_lock_take "serial-rtt:${PROJECT}" "$NATR_PREFIX" "${PROJECT}-"
 
 mkdir -p "$OUT"
-rm -f "$OUT"/run*.log "$OUT"/run*.exit "$OUT"/serial-rtt.md
+rm -f "$OUT"/run*.log "$OUT"/run*.exit "$OUT"/run*.hostprobe.tsv "$OUT"/serial-rtt.md
 
 status=0
 for i in $(seq 1 "$RUNS"); do
   echo "=== serial run ${i}/${RUNS} start $(proof_lock_now) ==="
+  python3 "$ROOT/scripts/proof/host-probe.py" >"$OUT/run${i}.hostprobe.tsv" 2>/dev/null &
+  PROBE_PID=$!
   ORBLX_NATR_PROFILE=release ./scripts/proof/nat-realism.sh >"$OUT/run${i}.log" 2>&1
   code=$?
+  probe_stop
   echo "$code" >"$OUT/run${i}.exit"
   echo "=== serial run ${i}/${RUNS} end $(proof_lock_now) exit ${code} ==="
   python3 "$ROOT/scripts/proof/serial-rtt-table.py" "$OUT" --upto "$i" --last-row
+  python3 "$ROOT/scripts/proof/serial-rtt-table.py" "$OUT" --upto "$i" --probe-context || true
   python3 "$ROOT/scripts/proof/serial-rtt-table.py" "$OUT" --upto "$i" --kill-check
   case $? in
     0) ;;
