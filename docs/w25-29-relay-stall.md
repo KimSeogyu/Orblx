@@ -62,15 +62,44 @@ The status file content and its name do not change.
 
 Log: `w25-29-fix-edge-tests.log`.
 
-## 5. Gate (A)
+## 5. Where the loop runs (shipped or lab)
+
+The router loop is in the shipped `orblx` binary. It is not the default node path.
+
+| Fact | Evidence |
+|---|---|
+| `orblx nat` is a CLI subcommand of the `orblx` binary | `crates/orblx-cli/src/main.rs:22`, `:56`, `:191-192`, `:302-303` |
+| `orblx nat run` calls `run_nat_node` | `crates/orblx-cli/src/nat.rs:137-157`; help text `:287` |
+| `run_nat_node` starts the `orblx-nat-router` thread | `crates/orblx-edge/src/nat_run.rs:179`, `:281-282` (`router_loop` at `:1569`) |
+| No feature gate or `cfg` hides the subcommand | `crates/orblx-cli/Cargo.toml`, `crates/orblx-cli/src/main.rs:22` |
+| The release builds this binary and puts it in the tarball | `.github/workflows/release.yml:48`; `scripts/release/package.sh:41` |
+| The systemd unit runs `orblx up`, not `orblx nat run` | `scripts/orblxd.service:8` |
+| The node image runs `orblx up` by default; other commands go to the binary | `docker/entrypoint.sh` (header), `:26` (`exec /usr/local/bin/orblx "$@"`); `docker/Dockerfile:42-43` |
+| A user doc names `orblx nat run` | `docs/w20-nat-followup.md:5`, `docs/w20-nat-realism.md:33` |
+
+Thus a user who runs `orblx nat run` from a release gets this loop. The default
+daemon (`orblxd.service`) and the default image command do not run it.
+
+A related point that this change does not fix: `orblx up` also writes
+`status.txt` with a blocking `write_atomic` from tokio tasks
+(`crates/orblx-datapath/src/node.rs:1636-1671`). It does this on a 1 s tick
+(`:695-705`) and, on a path change, in the session receive callback
+(`:1474`, `note_rx` at `:1603-1616`). The runtime is multi-thread (`:379`).
+This path was not measured in W25-29.
+
+## 6. Gate (A)
 
 The gate is 30 serial-rtt switch runs on this branch, each alone, 0 above
 200 ms. The runs are not done yet. The results go in this section.
 
-## 6. Limits
+## 7. Limits
 
 - The cause is a hypothesis. The disk stalls are measured; a stall at the same
   time as a ping stall is not measured.
-- One 45.3 ms spike (relay prc_prc seq 1, 2026-10-31 09:56:26 KST, run 12 of the
-  extra 20 runs on 97049038) had no slow disk probe and no host PSI peak near
-  it. This change may not remove that kind of spike.
+- One 45.3 ms spike is unexplained. It was relay prc_prc seq 1, the first
+  packet of the relay ping right after the direct-to-relay switch, at
+  2026-10-31 09:56:26 KST, in run 12 of the extra runs on 97049038. The run was
+  alone (0 of 154 contention samples). No disk probe of 5 ms or more and no
+  host PSI peak was near it (the 959.4 ms rename was at 09:57:03, outside a
+  ping window). In the other 21 runs on 97049038, seq 1 of this ping was
+  0.316 to 0.917 ms. This change may not remove that kind of spike.
