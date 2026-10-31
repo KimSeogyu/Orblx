@@ -35,6 +35,23 @@ pub struct Request {
     /// The text `none` means that no policy file is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect_sha256: Option<String>,
+    /// W25-31: one SSH user certificate request (`ssh-cert`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshCertAsk>,
+}
+
+/// One SSH user certificate request (W25-31).
+///
+/// The request names no user. The coordinator takes the owner of the node from its store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshCertAsk {
+    /// The SSH public key in OpenSSH text. Only ed25519.
+    pub public_key: String,
+    /// The SSHSIG in PEM, namespace `cert-request@orblx`, over the TLS exporter and the nonce.
+    pub sshsig: String,
+    /// The nonce from `ssh-cert-nonce` in hex.
+    pub nonce: String,
 }
 
 /// One agent grant request.

@@ -36,6 +36,52 @@ pub struct Netmap {
     /// An empty list stays out of the JSON text.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub split_dns: Vec<SplitDns>,
+    /// The SSH user CA public keys in OpenSSH text (W25-31): the current key and the next key.
+    ///
+    /// The SSH server accepts a user certificate only when its CA key is in this list.
+    /// The node reads the list again for each login. An empty list stays out of the JSON text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_user_ca: Vec<String>,
+    /// The revoked SSH user certificates (W25-31).
+    ///
+    /// The SSH server refuses a certificate with a serial or a key ID in this list, and closes
+    /// its open sessions. An empty list stays out of the JSON text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_revoked: Vec<SshRevoked>,
+}
+
+/// The maximum number of SSH user CA keys in one netmap (W25-31).
+pub const MAX_SSH_USER_CA: usize = 2;
+
+/// The maximum number of revoked SSH user certificates in one netmap (W25-31).
+pub const MAX_SSH_REVOKED: usize = 4096;
+
+/// Make the key ID of one SSH user certificate (W25-31).
+///
+/// The key ID names the node SVID that asked for the certificate, the owner of that node,
+/// and the serial. The SSH server and the datapath read the node SVID back with
+/// [`ssh_key_id_node`].
+#[must_use]
+pub fn ssh_key_id(node_uri: &str, owner: &str, serial: u64) -> String {
+    format!("orblx-ssh node={node_uri} owner={owner} serial={serial}")
+}
+
+/// Return the node SVID URI in one SSH certificate key ID (W25-31).
+#[must_use]
+pub fn ssh_key_id_node(key_id: &str) -> Option<&str> {
+    let rest = key_id.strip_prefix("orblx-ssh node=")?;
+    let (node, _) = rest.split_once(' ')?;
+    node.starts_with("spiffe://").then_some(node)
+}
+
+/// One revoked SSH user certificate (W25-31).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshRevoked {
+    /// The certificate serial.
+    pub serial: u64,
+    /// The certificate key ID.
+    pub key_id: String,
 }
 
 /// The maximum number of split DNS zones in one netmap (W24-F).
@@ -316,8 +362,32 @@ impl Netmap {
                 });
             }
         }
-        check_split_dns(&self.split_dns)
+        check_split_dns(&self.split_dns)?;
+        check_ssh_fields(&self.ssh_user_ca, &self.ssh_revoked)
     }
+}
+
+fn check_ssh_fields(cas: &[String], revoked: &[SshRevoked]) -> Result<(), NetmapError> {
+    let bad = |detail: &str| NetmapError::Json {
+        detail: detail.to_string(),
+    };
+    if cas.len() > MAX_SSH_USER_CA {
+        return Err(bad("The netmap has too many SSH user CA keys."));
+    }
+    for ca in cas {
+        if ca.len() > 256 || !ca.starts_with("ssh-ed25519 ") || ca.chars().any(char::is_control) {
+            return Err(bad("The SSH user CA key is not valid."));
+        }
+    }
+    if revoked.len() > MAX_SSH_REVOKED {
+        return Err(bad("The netmap has too many revoked SSH certificates."));
+    }
+    for item in revoked {
+        if item.key_id.len() > 512 || item.key_id.chars().any(char::is_control) {
+            return Err(bad("The revoked SSH certificate is not valid."));
+        }
+    }
+    Ok(())
 }
 
 fn check_split_dns(zones: &[SplitDns]) -> Result<(), NetmapError> {

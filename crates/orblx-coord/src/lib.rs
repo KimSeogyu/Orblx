@@ -33,6 +33,9 @@ mod share;
 #[cfg(test)]
 mod share_test;
 mod sink;
+#[cfg(test)]
+mod sshca_test;
+pub mod sshca;
 mod state;
 mod store;
 mod ticket;
@@ -54,7 +57,7 @@ pub use client::{
     advertise_routes_blocking, agent_grant_fetch_blocking, agent_grant_request_blocking,
     enroll_with_oidc_blocking, enroll_with_token_blocking, fetch_deny_blocking,
     fetch_deny_wait_blocking, fetch_netmap_blocking, fetch_policy_wait_blocking, netmap_json,
-    publish_candidates_blocking, renew_svid_blocking, AdminReply, GrantFetch, OidcEnroll,
+    publish_candidates_blocking, renew_svid_blocking, ssh_cert_request_blocking, AdminReply, GrantFetch, OidcEnroll,
     PolicySync, DENY_WAIT_HOLD,
 };
 pub use config::{CoordConfig, OidcSection};
@@ -64,11 +67,11 @@ pub use netmap::{
     decode_hex_32, encode_hex, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap,
     NetmapKey, SignedEndpoint, SignedGrants, SignedNetmap,
 };
-pub use proto::GrantAsk;
+pub use proto::{GrantAsk, SshCertAsk};
 pub use server::serve_blocking;
 pub use state::{
     oidc_config, read_node_material, Coordinator, EnrollResult, IssuerFetch, NetmapView,
-    OidcConfig, CONFIG_AUDIT_FILE, ISSUER_JWKS_TTL_SECS, ISSUER_REFETCH_SECS,
+    OidcConfig, SshIssueError, CONFIG_AUDIT_FILE, ISSUER_JWKS_TTL_SECS, ISSUER_REFETCH_SECS,
 };
 pub use store::{CreatedToken, StoredUser, UserState};
 

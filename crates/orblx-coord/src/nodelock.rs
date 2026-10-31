@@ -606,6 +606,8 @@ mod tests {
             ],
             lock: Vec::new(),
             split_dns: Vec::new(),
+            ssh_user_ca: Vec::new(),
+            ssh_revoked: Vec::new(),
         };
         let untouched = netmap.clone();
         let mut plain = netmap.clone();

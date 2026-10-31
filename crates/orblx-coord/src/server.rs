@@ -71,8 +71,14 @@ async fn expire_tick(coord: Coordinator) {
     loop {
         tokio::time::sleep(EXPIRE_TICK).await;
         let step = coord.clone();
-        let result =
-            tokio::task::spawn_blocking(move || agent::expire_due(&step, SystemTime::now())).await;
+        let result = tokio::task::spawn_blocking(move || {
+            // W25-31: rotate the SSH user CA when due, and move revoked serials to the list.
+            if let Err(err) = step.ssh_tick(SystemTime::now()) {
+                println!("coord ssh tick failed: {}", err.public_text());
+            }
+            agent::expire_due(&step, SystemTime::now())
+        })
+        .await;
         match result {
             Ok(Ok(_)) => failed = false,
             Ok(Err(err)) if !failed => {
@@ -102,6 +108,8 @@ async fn stamp_tick(coord: Coordinator, stamp: watch::Sender<u64>) {
             dir.join("deny.json"),
             dir.join(crate::state::CONFIG_AUDIT_FILE),
             dir.join("nodes.json"),
+            dir.join(crate::sshca::SSH_CA_FILE),
+            dir.join(crate::sshca::SSH_CERTS_FILE),
             policy,
         ]
         .iter()
@@ -278,6 +286,7 @@ async fn handle_connection(
         CoordError::Protocol("The request is not valid.".to_string())
     })?;
     let request = proto::read_json::<Request>(&mut recv).await?;
+    let ssh_nonce = request.op == "ssh-cert-nonce";
     let response = match dispatch(coord, &connection, request, stamp).await {
         Ok(response) => response,
         Err(err) => {
@@ -293,8 +302,140 @@ async fn handle_connection(
     let _ = send.finish();
     drop(send);
     drop(recv);
+    if ssh_nonce && response.ok {
+        // W25-31: the certificate request comes on a second stream of the same connection.
+        // The TLS exporter of this connection is in the signed message.
+        ssh_cert_stream(coord, &connection).await?;
+    }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), connection.closed()).await;
     Ok(())
+}
+
+/// The longest wait for the certificate request stream after the nonce (W25-31).
+const SSH_CERT_STREAM_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Read one `ssh-cert` request on the second stream and reply (W25-31).
+async fn ssh_cert_stream(
+    coord: &Coordinator,
+    connection: &quinn::Connection,
+) -> Result<(), CoordError> {
+    let Ok(Ok((mut send, mut recv))) =
+        tokio::time::timeout(SSH_CERT_STREAM_WAIT, connection.accept_bi()).await
+    else {
+        return Ok(());
+    };
+    let request = proto::read_json::<Request>(&mut recv).await?;
+    let response = if request.op == "ssh-cert" {
+        match ssh_cert(coord, connection, &request).await {
+            Ok(response) => response,
+            Err(err) => {
+                println!("coord rejected: {}", err.public_text());
+                Response {
+                    ok: false,
+                    error: Some(err.public_text()),
+                    ..Response::default()
+                }
+            }
+        }
+    } else {
+        Response {
+            ok: false,
+            error: Some("The request is not valid.".to_string()),
+            ..Response::default()
+        }
+    };
+    proto::write_json(&mut send, &response).await?;
+    let _ = send.finish();
+    Ok(())
+}
+
+/// Authenticate the peer leaf for the SSH certificate path (W25-31).
+///
+/// The check uses an empty deny set. Thus a revoked node, an agent, or a coordinator SVID
+/// reaches the decision, and the decision writes an audit record.
+/// Return the SPIFFE ID and the end of the leaf.
+fn ssh_peer(
+    coord: &Coordinator,
+    connection: &quinn::Connection,
+) -> Result<(orblx_identity::SpiffeId, u64), CoordError> {
+    let Some(identity) = connection.peer_identity() else {
+        return Err(CoordError::Peer);
+    };
+    let chain = identity
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .map_err(|_| CoordError::Peer)?;
+    let Some(leaf) = chain.first() else {
+        return Err(CoordError::Peer);
+    };
+    let material = coord.tls_material()?;
+    let trust = TrustBundle::from_pem(&material.trust_pem)?;
+    let id = trust.authenticate_leaf(
+        leaf.as_ref(),
+        SystemTime::now(),
+        &orblx_identity::DenySet::empty(),
+    )?;
+    let not_after = orblx_identity::leaf_not_after(leaf.as_ref())?;
+    Ok((id, not_after))
+}
+
+/// The TLS exporter of one connection for the SSH request (W25-31).
+fn ssh_exporter(
+    connection: &quinn::Connection,
+) -> Result<[u8; crate::sshca::SSH_EXPORTER_LEN], CoordError> {
+    let mut out = [0u8; crate::sshca::SSH_EXPORTER_LEN];
+    connection
+        .export_keying_material(&mut out, crate::sshca::SSH_EXPORTER_LABEL, b"")
+        .map_err(|_| CoordError::Tls("The TLS exporter failed.".to_string()))?;
+    Ok(out)
+}
+
+/// Decide one `ssh-cert` request (W25-31). Each decision writes one audit record.
+async fn ssh_cert(
+    coord: &Coordinator,
+    connection: &quinn::Connection,
+    request: &Request,
+) -> Result<Response, CoordError> {
+    let (peer, not_after) = ssh_peer(coord, connection)?;
+    let exporter = ssh_exporter(connection)?;
+    let ask = request.ssh.clone().ok_or_else(|| {
+        CoordError::Protocol("The SSH certificate request is not valid.".to_string())
+    })?;
+    let step = coord.clone();
+    let connection_id = connection.stable_id() as u64;
+    let result = tokio::task::spawn_blocking(move || {
+        step.ssh_issue(
+            &peer,
+            not_after,
+            connection_id,
+            &exporter,
+            &ask,
+            SystemTime::now(),
+        )
+    })
+    .await
+    .map_err(|_| CoordError::State)?;
+    match result {
+        Ok(issued) => {
+            println!("ssh certificate issued serial {}", issued.serial);
+            Ok(Response {
+                ok: true,
+                detail: Some(issued.text),
+                ..Response::default()
+            })
+        }
+        Err(crate::state::SshIssueError::Deny(deny)) => {
+            println!("ssh certificate denied {}", deny.as_str());
+            Ok(Response {
+                ok: false,
+                error: Some(format!(
+                    "The coordinator refused the SSH certificate. reason {}",
+                    deny.as_str()
+                )),
+                ..Response::default()
+            })
+        }
+        Err(crate::state::SshIssueError::Coord(err)) => Err(err),
+    }
 }
 
 async fn dispatch(
@@ -305,6 +446,17 @@ async fn dispatch(
 ) -> Result<Response, CoordError> {
     let now = SystemTime::now();
     match request.op.as_str() {
+        "ssh-cert-nonce" => {
+            // W25-31: any trusted leaf gets a nonce. The decision on the next stream audits it.
+            let _ = ssh_peer(coord, connection)?;
+            let nonce = coord.ssh_nonce(connection.stable_id() as u64)?;
+            Ok(Response {
+                ok: true,
+                detail: Some(encode_hex(&nonce)),
+                ..Response::default()
+            })
+        }
+        "ssh-cert" => ssh_cert(coord, connection, &request).await,
         "enroll" => {
             let result = match (&request.token, &request.id_token) {
                 (Some(token), None) => coord.enroll_token(
@@ -823,6 +975,7 @@ mod tests {
             api_token: Some(secret.to_string()),
             deny_etag: None,
             expect_sha256: None,
+            ssh: None,
         }
     }
 

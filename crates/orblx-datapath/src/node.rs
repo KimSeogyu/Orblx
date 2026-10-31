@@ -635,6 +635,8 @@ async fn run_mesh_inner(
         // tick does not touch the endpoint or the links when nothing changed.
         let mut ticks: u64 = 0;
         let mut last_text: Option<Vec<u8>> = None;
+        let mut last_netmap: Option<Vec<u8>> = None;
+        let mut ssh_closed: HashSet<(u64, String)> = HashSet::new();
         loop {
             tokio::select! {
                 changed = deny_shutdown.changed() => {
@@ -652,6 +654,16 @@ async fn run_mesh_inner(
                                 close_denied_links(&lock_mesh, &deny);
                                 last_text = Some(bytes);
                             }
+                        }
+                    }
+                    // W25-31: a revoked SSH user certificate closes the mesh sessions of the
+                    // node that asked for it. The node reads the netmap only when its text changes.
+                    if let Ok(bytes) = fs::read(&lock_mesh.netmap_path) {
+                        if last_netmap.as_deref() != Some(bytes.as_slice()) {
+                            if let Ok(netmap) = Netmap::from_slice(&bytes) {
+                                close_ssh_revoked_links(&lock_mesh, &netmap, &mut ssh_closed);
+                            }
+                            last_netmap = Some(bytes);
                         }
                     }
                     if ticks.is_multiple_of(100) {
@@ -1071,6 +1083,45 @@ fn close_denied_links(mesh: &Mesh, deny: &DenySet) {
         };
         if deny.reject_uri(&id).is_err() && !*link.cancel.borrow() {
             println!("The peer {name} is in the deny list. The node closes the session.");
+            let _ = link.cancel.send(true);
+        }
+    }
+}
+
+/// Close the open mesh sessions of each node with a new revoked SSH certificate (W25-31).
+///
+/// The key ID of the certificate names the node SVID. The node closes the session one time
+/// for each revoked entry. A node that is not in the deny list can open a new session.
+fn close_ssh_revoked_links(
+    mesh: &Mesh,
+    netmap: &Netmap,
+    seen: &mut HashSet<(u64, String)>,
+) {
+    let mut nodes = HashSet::new();
+    for item in &netmap.ssh_revoked {
+        if seen.insert((item.serial, item.key_id.clone())) {
+            if let Some(node) = crate::netmap::ssh_key_id_node(&item.key_id) {
+                nodes.insert(node.to_string());
+            }
+        }
+    }
+    if nodes.is_empty() {
+        return;
+    }
+    let svids: HashMap<&str, &str> = mesh
+        .netmap
+        .peers
+        .iter()
+        .chain(netmap.peers.iter())
+        .map(|peer| (peer.name.as_str(), peer.svid.as_str()))
+        .collect();
+    let links = lock(&mesh.links);
+    for (name, link) in links.iter() {
+        let Some(svid) = svids.get(name.as_str()) else {
+            continue;
+        };
+        if nodes.contains(*svid) && !*link.cancel.borrow() {
+            println!("The peer {name} has a revoked SSH certificate. The node closes the session.");
             let _ = link.cancel.send(true);
         }
     }

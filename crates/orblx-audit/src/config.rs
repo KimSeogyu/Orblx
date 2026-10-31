@@ -106,11 +106,20 @@ pub enum ConfigAction {
     UserApprove,
     /// An owner rejected one OIDC user (W25-15).
     UserReject,
+    /// The coordinator decided one SSH user certificate request (W25-31).
+    ///
+    /// The coordinator writes one record for each allow and for each deny.
+    SshCert,
 }
 
 impl ConfigAction {
+    /// Codes that no action in this build uses. Code 37 is reserved for `node-remove` (W25-18)
+    /// and code 38 for `route-failover` (W25 HA routes).
+    /// The SIEM verifier has the placeholder `reserved-N` for each of these codes.
+    pub const RESERVED_CODES: [u8; 2] = [37, 38];
+
     /// Every action in code order.
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 37] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -147,6 +156,7 @@ impl ConfigAction {
         Self::SinkError,
         Self::UserApprove,
         Self::UserReject,
+        Self::SshCert,
     ];
 
     /// Return the stable action token.
@@ -189,6 +199,7 @@ impl ConfigAction {
             Self::SinkError => "sink-error",
             Self::UserApprove => "user-approve",
             Self::UserReject => "user-reject",
+            Self::SshCert => "ssh-cert",
         }
     }
 
@@ -238,6 +249,7 @@ impl ConfigAction {
             Self::SinkError => 34,
             Self::UserApprove => 35,
             Self::UserReject => 36,
+            Self::SshCert => 39,
         }
     }
 
@@ -693,11 +705,22 @@ mod tests {
             .map(|name| name.trim().trim_matches('"'))
             .filter(|name| !name.is_empty())
             .collect();
-        assert_eq!(names.len(), ConfigAction::ALL.len());
-        for (at, action) in ConfigAction::ALL.iter().enumerate() {
-            assert_eq!(usize::from(action.code()), at + 1, "{}", action.as_str());
-            assert_eq!(names[at], action.as_str());
+        assert_eq!(
+            names.len(),
+            ConfigAction::ALL.len() + ConfigAction::RESERVED_CODES.len()
+        );
+        let mut actions = ConfigAction::ALL.iter();
+        for (at, name) in names.iter().enumerate() {
+            let code = u8::try_from(at + 1).unwrap();
+            if ConfigAction::RESERVED_CODES.contains(&code) {
+                assert_eq!(*name, format!("reserved-{code}"));
+                continue;
+            }
+            let action = actions.next().unwrap();
+            assert_eq!(action.code(), code, "{}", action.as_str());
+            assert_eq!(*name, action.as_str());
         }
+        assert!(actions.next().is_none());
     }
 
     struct Scratch(PathBuf);

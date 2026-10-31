@@ -5,7 +5,8 @@ use orblx_identity::SpiffeId;
 
 use crate::error::CoordError;
 use crate::netmap::{
-    decode_hex_32, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap, SignedNetmap,
+    decode_hex_32, encode_hex, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap,
+    SignedNetmap,
 };
 use crate::proto::{self, GrantAsk, Request, Response};
 use crate::state::{read_node_material, EnrollResult, NetmapView, NodeMaterial};
@@ -35,6 +36,7 @@ pub async fn enroll_with_token(
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        ssh: None,
     };
     round_trip(coord, coord_name, bundle_pem, None, request, None, true).await
 }
@@ -90,6 +92,7 @@ pub async fn enroll_with_oidc(input: OidcEnroll<'_>) -> Result<EnrollResult, Coo
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        ssh: None,
     };
     round_trip(
         input.coord,
@@ -149,6 +152,7 @@ pub async fn advertise_routes(
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        ssh: None,
     };
     let result = round_trip(
         coord,
@@ -186,6 +190,7 @@ pub async fn fetch_netmap(
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        ssh: None,
     };
     let result = round_trip(
         coord,
@@ -239,6 +244,7 @@ pub async fn renew_svid(
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        ssh: None,
     };
     let result = round_trip(
         coord,
@@ -305,6 +311,7 @@ pub async fn publish_candidates(
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        ssh: None,
     };
     let result = round_trip(
         coord,
@@ -359,6 +366,7 @@ pub async fn advertise_exit(
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        ssh: None,
     };
     let result = round_trip(
         coord,
@@ -452,6 +460,7 @@ pub fn admin_token_expect_blocking(
             api_token: Some(api_token.to_string()),
             deny_etag: None,
             expect_sha256: expect.map(str::to_string),
+            ssh: None,
         };
         let endpoint =
             tlsutil::client_endpoint(&client_tls, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
@@ -518,6 +527,7 @@ pub fn fetch_deny_wait_blocking(
             api_token: None,
             deny_etag: etag.map(str::to_string),
             expect_sha256: None,
+            ssh: None,
         };
         let limit = DENY_WAIT_HOLD + std::time::Duration::from_secs(10);
         tokio::time::timeout(
@@ -568,6 +578,7 @@ pub fn fetch_policy_wait_blocking(
             api_token: None,
             deny_etag: etag.map(str::to_string),
             expect_sha256: None,
+            ssh: None,
         };
         let limit = DENY_WAIT_HOLD + std::time::Duration::from_secs(10);
         let mut response = tokio::time::timeout(
@@ -613,6 +624,7 @@ async fn admin_call(
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        ssh: None,
     };
     authed_detail(coord, coord_name, bundle_pem, material, request).await
 }
@@ -637,6 +649,7 @@ async fn fetch_deny(
         api_token: None,
         deny_etag: None,
         expect_sha256: None,
+        ssh: None,
     };
     authed_detail(coord, coord_name, bundle_pem, material, request).await
 }
@@ -693,6 +706,128 @@ async fn authed_response(
     Ok(response)
 }
 
+/// Ask for one SSH user certificate with the node SVID in `state_dir` (W25-31).
+///
+/// The caller gives the SSH private key. The function signs the TLS exporter of the mTLS
+/// connection and the coordinator nonce with that key. The result is the certificate in
+/// OpenSSH text.
+pub fn ssh_cert_request_blocking(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+    key: &ssh_key::PrivateKey,
+) -> Result<String, CoordError> {
+    let material = read_node_material(state_dir)?;
+    let public_key = key
+        .public_key()
+        .to_openssh()
+        .map_err(|_| CoordError::Protocol("The SSH key is not valid.".to_string()))?;
+    block_on(ssh_cert_request(
+        coord,
+        coord_name,
+        bundle_pem,
+        material,
+        move |exporter, nonce| {
+            Ok(crate::proto::SshCertAsk {
+                public_key: public_key.clone(),
+                sshsig: crate::sshca::sign_request(key, exporter, nonce)?,
+                nonce: encode_hex(nonce),
+            })
+        },
+    ))
+}
+
+/// Ask for a nonce and then send the request on a second stream of the same connection.
+///
+/// `make_ask` gets the TLS exporter of this connection and the nonce.
+pub(crate) async fn ssh_cert_request<F>(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    material: NodeMaterial,
+    make_ask: F,
+) -> Result<String, CoordError>
+where
+    F: FnOnce(
+        &[u8; crate::sshca::SSH_EXPORTER_LEN],
+        &[u8; 32],
+    ) -> Result<crate::proto::SshCertAsk, CoordError>,
+{
+    let expect_coord = SpiffeId::coord(coord_name)?;
+    let client_tls = ClientTls {
+        trust_pem: bundle_pem.to_string(),
+        expect_coord,
+        certificate_pem: Some(material.certificate_pem),
+        private_key_pem: Some(material.private_key_pem),
+    };
+    let endpoint =
+        tlsutil::client_endpoint(&client_tls, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
+    let connection = endpoint
+        .connect(coord, tlsutil::SERVER_NAME)
+        .map_err(|err| CoordError::Tls(format!("connect: {err}")))?
+        .await
+        .map_err(|err| CoordError::Tls(format!("handshake: {err}")))?;
+    let result = async {
+        let mut nonce_request = blank_request("ssh-cert-nonce");
+        nonce_request.name = String::new();
+        let reply = stream_trip(&connection, &nonce_request).await?;
+        let nonce = decode_hex_32(reply.detail.as_deref().unwrap_or_default())
+            .map_err(|_| CoordError::Protocol("The SSH nonce is not valid.".to_string()))?;
+        let mut exporter = [0u8; crate::sshca::SSH_EXPORTER_LEN];
+        connection
+            .export_keying_material(&mut exporter, crate::sshca::SSH_EXPORTER_LABEL, b"")
+            .map_err(|_| CoordError::Tls("The TLS exporter failed.".to_string()))?;
+        let mut cert_request = blank_request("ssh-cert");
+        cert_request.ssh = Some(make_ask(&exporter, &nonce)?);
+        let reply = stream_trip(&connection, &cert_request).await?;
+        reply
+            .detail
+            .ok_or_else(|| CoordError::Protocol("The SSH certificate is missing.".to_string()))
+    }
+    .await;
+    close_and_wait(&connection, &endpoint).await;
+    result
+}
+
+fn blank_request(op: &str) -> Request {
+    Request {
+        op: op.to_string(),
+        name: String::new(),
+        token: None,
+        id_token: None,
+        nonce: None,
+        endpoints: Vec::new(),
+        routes: Vec::new(),
+        exit_node: false,
+        grant: None,
+        api_token: None,
+        deny_etag: None,
+        expect_sha256: None,
+        ssh: None,
+    }
+}
+
+async fn stream_trip(
+    connection: &quinn::Connection,
+    request: &Request,
+) -> Result<Response, CoordError> {
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|err| CoordError::Tls(format!("open: {err}")))?;
+    proto::write_json(&mut send, request).await?;
+    let _ = send.finish();
+    let response: Response = proto::read_json(&mut recv).await?;
+    if !response.ok {
+        let text = response
+            .error
+            .unwrap_or_else(|| "The coordinator request failed.".to_string());
+        return Err(CoordError::Protocol(text));
+    }
+    Ok(response)
+}
+
 /// Ask for one agent JIT grant with the node SVID in `state_dir`.
 ///
 /// The result is the reply document with the grant id.
@@ -718,6 +853,7 @@ pub fn agent_grant_request_blocking(
             api_token: None,
             deny_etag: None,
             expect_sha256: None,
+            ssh: None,
         };
         authed_detail(coord, coord_name, bundle_pem, material, request).await
     })
@@ -765,6 +901,7 @@ pub fn agent_grant_fetch_blocking(
             api_token: None,
             deny_etag: None,
             expect_sha256: None,
+            ssh: None,
         };
         let response = authed_response(coord, coord_name, bundle_pem, material, request).await?;
         let invalid = || CoordError::Protocol("The grant reply is not valid.".to_string());
