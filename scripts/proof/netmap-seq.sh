@@ -16,8 +16,9 @@
 # Gate B (backup-restore): copy the coordinator state, wait, put the copy back, and restart
 #   the coordinator. The nodes must take the next netmap with no refusal. The seq goes up.
 # No node log may have "netmap refuse" in the run.
-# PO rule: each contention claim gives unknown_samples with contended_samples. A run with
-# unknown_samples > 0 is not valid: the script prints proof_invalid and stops with exit 1.
+# PO rule: each contention claim gives unknown_samples with contended_samples. A run is valid
+# only with samples >= 1 and unknown_samples 0. Else the script prints proof_invalid and stops
+# with exit 1.
 # SEQ_MODE=baseline runs only the setup and the heartbeat bytes for an older binary
 # (ORBLX_SEQ_BIN), with no seq gate.
 # The script does not print enroll tokens or private keys.
@@ -194,14 +195,21 @@ change_counts() {
 }
 
 # Read the proof-lock sampler file (one line per sample: time count load1; count -1 = unknown).
+# PO rule (W25-35, #132): the run is valid only with samples >= 1 and unknown_samples 0.
+# The script reports contended_samples with unknown_samples. It never drops a gap or a sample
+# as a host stall.
 contention_check() {
-  local line unknown
-  [[ -n "${PROOF_LOCK_SAMPLES:-}" && -f "$PROOF_LOCK_SAMPLES" ]] || fail "No proof-lock samples: contention is unknown."
-  line="$(awk '{ n++; if ($2 < 0) u++; if ($2 > 0) b++ } END { printf "samples %d contended_samples %d unknown_samples %d", n, b + 0, u + 0 }' "$PROOF_LOCK_SAMPLES")"
+  local line samples unknown
+  [[ -n "${PROOF_LOCK_SAMPLES:-}" && -f "$PROOF_LOCK_SAMPLES" ]] || {
+    echo "proof_invalid $1 no proof-lock sample file: contention is unknown" >&2
+    exit 1
+  }
+  line="$(awk '{ n++; if ($2 < 0) u++; if ($2 > 0) b++ } END { printf "samples %d contended_samples %d unknown_samples %d", n + 0, b + 0, u + 0 }' "$PROOF_LOCK_SAMPLES")"
   echo "contention_check $1 ${line}"
+  samples="$(awk '{print $2}' <<<"$line")"
   unknown="$(awk '{print $6}' <<<"$line")"
-  if [[ "$unknown" -gt 0 ]]; then
-    echo "proof_invalid unknown_samples ${unknown}" >&2
+  if [[ "$samples" -lt 1 || "$unknown" -gt 0 ]]; then
+    echo "proof_invalid $1 samples ${samples} unknown_samples ${unknown}" >&2
     exit 1
   fi
 }
