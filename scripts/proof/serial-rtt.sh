@@ -20,6 +20,7 @@ PROJECT="${ORBLX_NATR_PROJECT:-orblx-natr-proof}"
 
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$ROOT/scripts/proof/proof-lock.sh"
+PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap proof_lock_end EXIT
 proof_lock_take "serial-rtt:${PROJECT}" "$NATR_PREFIX" "${PROJECT}-"
 

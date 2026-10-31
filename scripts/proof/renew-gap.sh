@@ -37,6 +37,7 @@ env_file=""
 . "$ROOT/scripts/proof/pipe-lib.sh"
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$ROOT/scripts/proof/proof-lock.sh"
+PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 
 dc() {
   docker compose -p "$PROJECT" --env-file "$env_file" -f "$FILE" "$@"
