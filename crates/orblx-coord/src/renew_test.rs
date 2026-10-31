@@ -494,7 +494,7 @@ async fn session_crosses_coordinator_ticket_ends() {
             if let Ok(Some(_)) =
                 tokio::time::timeout(Duration::from_millis(20), b_out_rx.recv()).await
             {
-                note_gap(&mut last_ab, &mut max_gap);
+                note_slice_gap(&mut last_ab, &mut max_gap);
                 if late {
                     late_ab += 1;
                 }
@@ -502,7 +502,7 @@ async fn session_crosses_coordinator_ticket_ends() {
             if let Ok(Some(_)) =
                 tokio::time::timeout(Duration::from_millis(20), a_out_rx.recv()).await
             {
-                note_gap(&mut last_ba, &mut max_gap);
+                note_slice_gap(&mut last_ba, &mut max_gap);
                 if late {
                     late_ba += 1;
                 }
@@ -1450,6 +1450,18 @@ fn os_stall_probe(stop: &std::sync::atomic::AtomicBool, max_stall: &Mutex<Durati
         }
         last = now;
     }
+}
+
+/// The largest time between two packets in one direction, with no trace output.
+fn note_slice_gap(last: &mut Option<Instant>, max_gap: &mut Duration) {
+    let now = Instant::now();
+    if let Some(prev) = *last {
+        let gap = now.saturating_duration_since(prev);
+        if gap > *max_gap {
+            *max_gap = gap;
+        }
+    }
+    *last = Some(now);
 }
 
 fn note_gap(
