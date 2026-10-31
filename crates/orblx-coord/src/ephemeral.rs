@@ -290,14 +290,15 @@ pub(crate) fn remove_due(coord: &Coordinator, now: SystemTime) -> Result<Vec<Str
         .map(|node| node.name)
         .collect();
     let presence = coord.presence();
-    let mut removed = Vec::new();
+    let mut due = Vec::new();
     for (name, _) in presence.due(&ephemeral, at) {
-        let Some(offline) = presence.still_due(&name, at) else {
-            continue;
-        };
-        remove_one(coord, &name, offline, now)?;
-        presence.forget(&name);
-        removed.push(name);
+        if let Some(offline) = presence.still_due(&name, at) {
+            due.push((name, offline));
+        }
+    }
+    let removed = remove_batch(coord, &due, now)?;
+    for name in &removed {
+        presence.forget(name);
     }
     let left: Vec<String> = ephemeral
         .into_iter()
@@ -307,32 +308,53 @@ pub(crate) fn remove_due(coord: &Coordinator, now: SystemTime) -> Result<Vec<Str
     Ok(removed)
 }
 
-/// Deny the SVID, delete the record, and write one `node-remove` record.
-fn remove_one(
+/// Deny the SVIDs, delete the records, and write one `node-remove` record for each node.
+///
+/// One tick makes one deny change and one node list change for all its nodes, so the
+/// peers get one update and not one update for each node.
+fn remove_batch(
     coord: &Coordinator,
-    name: &str,
-    offline_ms: u64,
+    due: &[(String, u64)],
     now: SystemTime,
-) -> Result<(), CoordError> {
-    let node = coord
-        .node_list()?
-        .into_iter()
-        .find(|node| node.name == name)
-        .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
-    if !node.ephemeral {
-        return Err(CoordError::Protocol(
-            "The node is not ephemeral.".to_string(),
-        ));
+) -> Result<Vec<String>, CoordError> {
+    if due.is_empty() {
+        return Ok(Vec::new());
     }
-    let version = crate::admin::push_revoke(coord, &node.svid, now)?;
+    let nodes = coord.node_list()?;
+    let mut svids = Vec::with_capacity(due.len());
+    for (name, _) in due {
+        let node = nodes
+            .iter()
+            .find(|node| &node.name == name)
+            .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        if !node.ephemeral {
+            return Err(CoordError::Protocol(
+                "The node is not ephemeral.".to_string(),
+            ));
+        }
+        svids.push(node.svid.clone());
+    }
+    let version = crate::admin::push_deny(coord, &svids, &[], now)?;
     let limit = coord.presence().offline().as_secs();
-    let detail = format!("offline_ms {offline_ms} limit_secs {limit} deny_version {version}");
-    let removed = coord.remove_ephemeral_node(name, &detail)?;
-    println!(
-        "ephemeral removed {} overlay_ip {} offline_ms {offline_ms} deny_version {version}",
-        removed.name, removed.overlay_ip
-    );
-    Ok(())
+    let removals: Vec<(String, String)> = due
+        .iter()
+        .map(|(name, offline_ms)| {
+            (
+                name.clone(),
+                format!("offline_ms {offline_ms} limit_secs {limit} deny_version {version}"),
+            )
+        })
+        .collect();
+    let removed = coord.remove_ephemeral_nodes(&removals)?;
+    for (node, (_, offline_ms)) in removed.iter().zip(due) {
+        println!(
+            "ephemeral removed {} overlay_ip {} offline_ms {offline_ms} deny_version {version} batch {}",
+            node.name,
+            node.overlay_ip,
+            removed.len()
+        );
+    }
+    Ok(removed.into_iter().map(|node| node.name).collect())
 }
 
 /// Run [`remove_due`] each 500 ms.
@@ -587,6 +609,48 @@ mod tests {
             .is_err());
         assert_eq!(enroll(&coord, "eph2", true, start), eph_ip);
         assert_ne!(enroll(&coord, "steady2", false, start), kept_ip);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn one_tick_removes_its_nodes_with_one_deny_version() {
+        let dir = scratch("batch");
+        let coord = Coordinator::open(&dir, "coord", crate::OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        coord.set_ephemeral_offline(Duration::from_secs(2)).unwrap();
+        let start = SystemTime::now();
+        enroll(&coord, "steady", false, start);
+        for name in ["eph1", "eph2", "eph3"] {
+            enroll(&coord, name, true, start);
+        }
+        // The first tick sees the nodes. They are offline from here.
+        assert!(remove_due(&coord, start).unwrap().is_empty());
+        let removed = remove_due(&coord, start + Duration::from_millis(2_001)).unwrap();
+        assert_eq!(removed.len(), 3);
+        let deny: serde_json::Value =
+            serde_json::from_str(&crate::admin::deny_json(&coord, SystemTime::now()).unwrap())
+                .unwrap();
+        assert_eq!(deny["version"], 1);
+        for name in ["eph1", "eph2", "eph3"] {
+            assert!(deny
+                .to_string()
+                .contains(&format!("spiffe://orblx.local/node/{name}")));
+        }
+        let audit = coord.config_audit_text().unwrap();
+        let removes: Vec<&str> = audit
+            .lines()
+            .filter(|line| line.contains("\"node-remove\""))
+            .collect();
+        assert_eq!(removes.len(), 3);
+        assert!(removes.iter().all(|line| line.contains("deny_version 1 ")));
+        assert!(orblx_audit::ConfigLog::open(&dir.join(crate::state::CONFIG_AUDIT_FILE)).is_ok());
+        let names: Vec<String> = coord
+            .node_list()
+            .unwrap()
+            .into_iter()
+            .map(|node| node.name)
+            .collect();
+        assert_eq!(names, vec!["steady".to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

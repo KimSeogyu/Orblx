@@ -85,7 +85,7 @@ proof_compose_clean "$PROOF_PROJECT" || exit 1
 
 fail() {
   echo "FAIL: $1" >&2
-  dc --profile nodes --profile load logs --no-color coord a b e1 e2 e3 e4 >&2 || true
+  dc --profile nodes --profile load logs -t --no-color coord a b c d e1 e2 e3 e4 >&2 || true
   exit 1
 }
 
@@ -503,7 +503,8 @@ for _ in $(seq 1 120); do
   dc exec -T c sh -c 'cat /tmp/ping-g6.log' | read_all grep -q 'packets transmitted' && break
   sleep 1
 done
-dc exec -T c sh -c 'tail -n 2 /tmp/ping-g6.log' | steady_ping_gate "c->d during the removal of ${LOAD_NODES} nodes" "$PINGS" 0 1000 \
+# The full ping log gives a report-only steady_warn line for each reply above 200 ms.
+dc exec -T c sh -c 'cat /tmp/ping-g6.log' | steady_ping_gate "c->d during the removal of ${LOAD_NODES} nodes" "$PINGS" 0 1000 200 \
   || fail "c lost pings to d while the coordinator removed the load clients."
 echo "[C] gate6 ok"
 

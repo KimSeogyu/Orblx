@@ -42,18 +42,19 @@ orblx coord serve --state DIR --ephemeral-offline SECS
 
 ## 3. Removal
 
-One removal does these steps:
+One tick (each 500 ms) removes all due nodes in one batch. The batch does these steps:
 
-1. The coordinator adds the SVID of the node to the deny file (the same path as `orblx coord revoke`).
-   The SVID cannot renew, and peers drop the node.
-2. The coordinator deletes the node record. The overlay address becomes free.
+1. The coordinator adds the SVIDs of all nodes in the batch to the deny file in one write (one new deny
+   version, the same deny file as `orblx coord revoke`). The SVIDs cannot renew, and peers drop the nodes.
+2. The coordinator deletes the node records under one lock, so a reader sees one change of the node list.
+   The overlay addresses become free.
    The next enroll gets the lowest free address, so a new node can get the address of the removed node.
-3. The coordinator writes **1** `node-remove` config audit record (code 37): actor `coord`,
+3. The coordinator writes **1** `node-remove` config audit record (code 37) for each node: actor `coord`,
    detail `reason ephemeral offline_ms X limit_secs T deny_version V svid ... overlay_ip ...`.
    `orblx audit verify-config` and `scripts/siem/orblx-siem-verify.py` accept the new action.
 4. The deny change wakes each `policy-wait` request. Peers get the new netmap without the node.
 
-The coordinator prints `ephemeral removed NAME overlay_ip IP offline_ms X deny_version V`. It prints no key or token.
+The coordinator prints `ephemeral removed NAME overlay_ip IP offline_ms X deny_version V batch N` for each node. It prints no key or token.
 
 **Name reuse.** The name of a removed node stays on the deny list. An enroll with the same name gets
 `The node name is revoked. Use a new name.` The token is not used up. Enroll the node with a new name.

@@ -1155,33 +1155,38 @@ impl Coordinator {
         read_text(&path)
     }
 
-    /// Delete one ephemeral node and write one `node-remove` record (W25-18).
+    /// Delete ephemeral nodes and write one `node-remove` record for each node (W25-18).
     ///
-    /// The caller adds the SVID to the deny file first. `detail` follows `reason ephemeral`.
-    /// The store refuses a node that is not ephemeral.
-    pub fn remove_ephemeral_node(
+    /// Each item is a node name and the text that follows `reason ephemeral`.
+    /// The caller adds the SVIDs to the deny file first. The store refuses a node that is
+    /// not ephemeral.
+    pub fn remove_ephemeral_nodes(
         &self,
-        name: &str,
-        detail: &str,
-    ) -> Result<StoredNode, CoordError> {
+        removals: &[(String, String)],
+    ) -> Result<Vec<StoredNode>, CoordError> {
+        // W25-18: one lock for the whole batch, so a reader sees one change of the node list.
         let mut inner = self.lock()?;
         reload(&mut inner)?;
-        let before = node_digest(&inner, name);
-        let removed = inner.store.remove_ephemeral(name)?;
         let actor = coord_actor_of(&inner)?;
-        let detail = format!(
-            "reason ephemeral {detail} svid {} overlay_ip {}",
-            removed.svid, removed.overlay_ip
-        );
-        record(
-            &mut inner,
-            &actor,
-            ConfigAction::NodeRemove,
-            name,
-            before,
-            EMPTY_DIGEST,
-            &detail,
-        )?;
+        let mut removed = Vec::with_capacity(removals.len());
+        for (name, detail) in removals {
+            let before = node_digest(&inner, name);
+            let node = inner.store.remove_ephemeral(name)?;
+            let detail = format!(
+                "reason ephemeral {detail} svid {} overlay_ip {}",
+                node.svid, node.overlay_ip
+            );
+            record(
+                &mut inner,
+                &actor,
+                ConfigAction::NodeRemove,
+                name,
+                before,
+                EMPTY_DIGEST,
+                &detail,
+            )?;
+            removed.push(node);
+        }
         Ok(removed)
     }
 
