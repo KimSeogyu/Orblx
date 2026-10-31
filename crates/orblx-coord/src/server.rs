@@ -160,12 +160,17 @@ async fn policy_wait(
         let deny = admin::deny_json_for(coord, name, SystemTime::now())?;
         let etag = policy_etag(&view, &deny)?;
         let changed = known != Some(etag.as_str());
-        if changed
-            || !matches!(
-                tokio::time::timeout_at(deadline, stamp.changed()).await,
-                Ok(Ok(()))
-            )
-        {
+        // W25-34: wake at the heartbeat time of the node too. The next view then has a new
+        // signed stamp, so the node gets a signed heartbeat at least each HEARTBEAT_MS.
+        let beat = tokio::time::Instant::now() + coord.netmap_heartbeat_in(name)?;
+        let until = deadline.min(beat);
+        let reply = changed
+            || match tokio::time::timeout_at(until, stamp.changed()).await {
+                Ok(Ok(())) => false,
+                Ok(Err(_)) => true,
+                Err(_) => until >= deadline,
+            };
+        if reply {
             let mut response = netmap_response(&view);
             response.detail = Some(deny);
             response.policy_etag = Some(etag);
@@ -735,9 +740,9 @@ fn leaf_response(result: crate::state::EnrollResult) -> Response {
         private_key_pem: Some(result.private_key_pem),
         trust_bundle_pem: Some(result.trust_bundle_pem),
         netmap_pub_hex: Some(encode_hex(&result.netmap_public)),
-        netmap: Some(result.signed_netmap),
+        netmap: Some(result.signed_netmap.to_wire()),
         endpoints: Some(result.endpoints),
-        grants: Some(result.signed_grants),
+        grants: Some(result.signed_grants.to_wire()),
         approved_routes: Some(result.approved_routes),
         advertised_routes: Some(result.advertised_routes),
         exit_approved: Some(result.exit_approved),
@@ -756,9 +761,9 @@ fn netmap_response(view: &crate::state::NetmapView) -> Response {
     Response {
         ok: true,
         netmap_pub_hex: Some(encode_hex(&view.netmap_public)),
-        netmap: Some(view.signed_netmap.clone()),
+        netmap: Some(view.signed_netmap.to_wire()),
         endpoints: Some(view.endpoints.clone()),
-        grants: Some(view.signed_grants.clone()),
+        grants: Some(view.signed_grants.to_wire()),
         approved_routes: Some(view.approved_routes.clone()),
         advertised_routes: Some(view.advertised_routes.clone()),
         exit_approved: Some(view.exit_approved),

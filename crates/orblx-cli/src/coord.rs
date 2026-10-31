@@ -218,6 +218,8 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
                 }
             }
             .map_err(|err| err.to_string())?;
+            // W25-34: a new enrollment is the local reset of the last netmap seq.
+            orblx_coord::reset_node_seq(&state).map_err(|err| err.to_string())?;
             result.write_state(&state).map_err(|err| err.to_string())?;
             remember_coord(&state, coord, &coord_name)?;
             print_enrolled(&result);
@@ -311,10 +313,12 @@ fn watch_netmap(
     loop {
         match fetch_policy_wait_blocking(coord, coord_name, bundle_pem, state, etag.as_deref()) {
             Ok(sync) => {
-                if etag.as_deref() != Some(sync.etag.as_str()) {
-                    sync.view
-                        .write_state(state)
-                        .map_err(|err| err.public_text())?;
+                let write = sync
+                    .view
+                    .write_state_checked(state)
+                    .map_err(|err| err.public_text())?;
+                // W25-34: a signed heartbeat changes only the stamp, so it prints no line.
+                if write == orblx_coord::ViewWrite::Content {
                     let unix_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |since| since.as_millis());

@@ -16,8 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_coord::{
-    advertise_routes_blocking, decode_hex_32, encode_hex, renew_svid_blocking,
-    verify_signed_grants, NetmapKey, SignedGrants,
+    advertise_routes_blocking, decode_hex_32, encode_hex, renew_svid_blocking, verify_grants_wire,
+    NetmapKey, SignedGrantsWire,
 };
 use orblx_crypto::{mac_input, ticket_mac};
 use orblx_datapath::{
@@ -392,6 +392,9 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
 }
 
 fn run_up(mut options: UpOptions) -> Result<(), String> {
+    // SAFETY: `geteuid` has no arguments and no failure case.
+    let euid = unsafe { libc::geteuid() };
+    check_private_paths(&options.state_dir, &options.netmap, euid)?;
     apply_saved_exit(&mut options)?;
     let (netmap_path, forward_routes, forward_exit) = publish_routes(&options)?;
     let netmap = locked_netmap(&options.state_dir, &netmap_path)?;
@@ -440,6 +443,55 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
     .map_err(|err| err.to_string())
 }
 
+/// Refuse a state directory or a netmap path that another user can change (W25-34).
+///
+/// The node refuses to start when the state directory, the netmap file, or the directory
+/// of the netmap file is group-writable or world-writable, or has an owner that is not
+/// `euid`. A directory with the sticky bit (for example `/tmp`) can hold the netmap file.
+/// A path that does not exist yet is not checked.
+pub(crate) fn check_private_paths(
+    state_dir: &Path,
+    netmap: &Path,
+    euid: u32,
+) -> Result<(), String> {
+    check_private_path(state_dir, euid, false)?;
+    check_private_path(netmap, euid, false)?;
+    if let Some(parent) = netmap
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        if parent != state_dir {
+            check_private_path(parent, euid, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_private_path(path: &Path, euid: u32, sticky_ok: bool) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("The path {} did not open. {err}", path.display())),
+    };
+    if meta.uid() != euid {
+        return Err(format!(
+            "The node refused to start. The owner of {} is not the node user. \
+             Keep --state-dir private (0700).",
+            path.display()
+        ));
+    }
+    let sticky = sticky_ok && meta.is_dir() && meta.mode() & 0o1000 != 0;
+    if meta.mode() & 0o022 != 0 && !sticky {
+        return Err(format!(
+            "The node refused to start. Another user can write {}. \
+             Keep --state-dir private (0700).",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Read the netmap and apply node lock (W23-1).
 ///
 /// With a node lock file, the function writes the netmap file again without the peers
@@ -451,9 +503,8 @@ fn locked_netmap(state_dir: &Path, netmap_path: &Path) -> Result<Netmap, String>
     if let Some(report) = report {
         orblx_coord::nodelock::print_report(&report);
         if !report.dropped.is_empty() {
-            let text = serde_json::to_string(&netmap)
-                .map_err(|_| "The netmap is not valid.".to_string())?;
-            fs::write(netmap_path, text.as_bytes())
+            // W25-34: an atomic write, so a crash never leaves a part of the file.
+            orblx_coord::nodelock::write_locked_netmap(netmap_path, &netmap)
                 .map_err(|err| format!("The netmap file was not written. {err}"))?;
         }
     }
@@ -784,14 +835,18 @@ fn apply_policy_sync(state: &Path, sync: &orblx_coord::PolicySync, announce: boo
     if let Err(err) = store_deny(state, &sync.deny) {
         eprintln!("The node did not write the new deny list. {err}");
     }
-    if let Err(err) = sync.view.write_state(state) {
-        eprintln!(
-            "The node did not write the new netmap. {}",
-            err.public_text()
-        );
-        return;
-    }
-    if announce {
+    let write = match sync.view.write_state_checked(state) {
+        Ok(write) => write,
+        Err(err) => {
+            eprintln!(
+                "The node did not write the new netmap. {}",
+                err.public_text()
+            );
+            return;
+        }
+    };
+    // W25-34: a signed heartbeat changes only the stamp. The node does not announce it.
+    if announce && write == orblx_coord::ViewWrite::Content {
         println!("The node applied a new policy from the coordinator.");
     }
 }
@@ -1127,10 +1182,10 @@ impl LiveGrants {
     fn open(path: &Path, dir: &Path, self_name: &str, overlay: Ipv4Addr) -> Result<Self, String> {
         let bytes = fs::read(path)
             .map_err(|err| format!("The file {} did not open. {err}", path.display()))?;
-        let signed = parse_grants(&bytes)?;
+        let wire = parse_grants(&bytes)?;
         let public = decode_hex_32(read_text(&dir.join("netmap.pub"))?.trim())
             .map_err(|_| "The netmap public key is not valid.".to_string())?;
-        verify_signed_grants(&signed, &public)
+        let signed = verify_grants_wire(&wire, &public)
             .map_err(|_| "The grant signature is not valid.".to_string())?;
         let receiver = SpiffeId::node(self_name).map_err(|err| err.to_string())?;
         if signed.grants.receiver != receiver.as_uri() {
@@ -1166,17 +1221,17 @@ impl LiveGrants {
                 return;
             }
         }
-        let signed = match parse_grants(&bytes) {
-            Ok(signed) => signed,
+        let wire = match parse_grants(&bytes) {
+            Ok(wire) => wire,
             Err(text) => {
                 self.keep_previous(bytes, &text);
                 return;
             }
         };
-        if verify_signed_grants(&signed, &self.public).is_err() {
+        let Ok(signed) = verify_grants_wire(&wire, &self.public) else {
             self.keep_previous(bytes, "The grant signature is not valid.");
             return;
-        }
+        };
         if signed.grants.receiver != self.receiver {
             self.keep_previous(bytes, "The grant receiver does not match the node.");
             return;
@@ -1221,7 +1276,9 @@ impl PeerVisibility for LiveGrants {
     }
 }
 
-fn parse_grants(bytes: &[u8]) -> Result<SignedGrants, String> {
+/// Parse the wire form only. The caller checks the signature over the received bytes
+/// before it parses the grants (W25-34).
+fn parse_grants(bytes: &[u8]) -> Result<SignedGrantsWire, String> {
     serde_json::from_slice(bytes).map_err(|_| "The grants are not valid.".to_string())
 }
 
@@ -1412,6 +1469,46 @@ fn unix_secs(now: SystemTime) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn start_refuses_open_state_paths() {
+        // W25-34 negative test: a group-writable or world-writable path, or a path with
+        // another owner, stops the node.
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = std::env::temp_dir().join(format!("orblx-perm-{}", std::process::id()));
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let netmap = state.join("netmap.json");
+        std::fs::write(&netmap, b"{}").unwrap();
+        std::fs::set_permissions(&netmap, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let me = std::fs::metadata(&state).unwrap().uid();
+        super::check_private_paths(&state, &netmap, me).unwrap();
+        // Another owner.
+        let err = super::check_private_paths(&state, &netmap, me.wrapping_add(1)).unwrap_err();
+        assert!(err.contains("owner"), "{err}");
+        // A group-writable netmap file.
+        std::fs::set_permissions(&netmap, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(super::check_private_paths(&state, &netmap, me).is_err());
+        std::fs::set_permissions(&netmap, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // A world-writable state directory.
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = super::check_private_paths(&state, &netmap, me).unwrap_err();
+        assert!(err.contains("Keep --state-dir private (0700)."), "{err}");
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A world-writable netmap directory with no sticky bit, then with the sticky bit.
+        let other = root.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let outside = other.join("netmap.json");
+        std::fs::write(&outside, b"{}").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(super::check_private_paths(&state, &outside, me).is_err());
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        super::check_private_paths(&state, &outside, me).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     use std::fs;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::os::unix::fs::PermissionsExt;

@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use orblx_audit::AuditLog;
-use orblx_coord::{decode_hex_32, verify_signed_grants, SignedGrants};
+use orblx_coord::{decode_hex_32, grants_from_slice};
 use orblx_datapath::enforce_receiver_tcp;
 use orblx_identity::{Policy, SpiffeId};
 
@@ -107,8 +107,6 @@ fn run_enforce(
             state.join("grants.signed.json").display()
         )
     })?;
-    let signed: SignedGrants =
-        serde_json::from_str(&signed_text).map_err(|_| "The grants are not valid.".to_string())?;
     let public_text = std::fs::read_to_string(state.join("netmap.pub")).map_err(|err| {
         format!(
             "The file {} did not open. {err}",
@@ -116,7 +114,9 @@ fn run_enforce(
         )
     })?;
     let public = decode_hex_32(public_text.trim()).map_err(|err| err.to_string())?;
-    verify_signed_grants(&signed, &public).map_err(|err| err.to_string())?;
+    // W25-34: check the signature over the file bytes, then parse them.
+    let signed =
+        grants_from_slice(signed_text.as_bytes(), &public).map_err(|err| err.to_string())?;
     let src_id =
         SpiffeId::node(src).map_err(|_| "The source node name is not valid.".to_string())?;
     println!("src {}", src_id.as_uri());
