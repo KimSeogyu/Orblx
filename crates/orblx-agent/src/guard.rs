@@ -659,6 +659,39 @@ pub(crate) fn spawn_poll(core: Arc<GuardCore>, fetch: DenyFetch, poll: Duration)
     });
 }
 
+/// When `ORBLX_AGENT_TIMING` is `1`, the guard prints the time of each step of each
+/// connection (W25-39). The line holds no proof byte.
+fn timing_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ORBLX_AGENT_TIMING").is_ok_and(|value| value == "1"))
+}
+
+/// The time of each guard step of one connection, in Unix microseconds. 0 means not reached.
+#[derive(Default)]
+struct ServeTiming {
+    accept_us: u64,
+    line_us: u64,
+    admit_us: u64,
+    upstream_us: u64,
+    reply_us: u64,
+}
+
+impl ServeTiming {
+    fn print(&self, peer: SocketAddr, result: &str) {
+        if timing_on() {
+            println!(
+                "agent timing peer_port {} accept_us {} line_us {} admit_us {} upstream_us {} reply_us {} result {result}",
+                peer.port(),
+                self.accept_us,
+                self.line_us,
+                self.admit_us,
+                self.upstream_us,
+                self.reply_us
+            );
+        }
+    }
+}
+
 fn serve_one(
     core: &GuardCore,
     stream: TcpStream,
@@ -666,22 +699,33 @@ fn serve_one(
     port: u16,
     target: SocketAddr,
 ) -> Result<(), AgentError> {
+    let mut timing = ServeTiming {
+        accept_us: crate::client::unix_micros_now(),
+        ..ServeTiming::default()
+    };
     let io = |err: std::io::Error| AgentError::Io(err.to_string());
     let peer = stream.peer_addr().map_err(io)?;
     stream.set_read_timeout(Some(LINE_TIMEOUT)).map_err(io)?;
     let mut writer = stream.try_clone().map_err(io)?;
     let mut reader = BufReader::new(stream);
     let line = read_line(&mut reader)?;
+    timing.line_us = crate::client::unix_micros_now();
     let decision = core.admit(&line, service, port, &[], peer, SystemTime::now())?;
+    timing.admit_us = crate::client::unix_micros_now();
     match decision {
         GuardDecision::Refuse(reason) => {
             let _ = writer.write_all(format!("orblx-deny {reason}\n").as_bytes());
+            timing.reply_us = crate::client::unix_micros_now();
+            timing.print(peer, "deny");
             let _ = writer.shutdown(Shutdown::Both);
             Ok(())
         }
         GuardDecision::Admit(_) => {
             let mut upstream = TcpStream::connect_timeout(&target, DIAL_TIMEOUT).map_err(io)?;
+            timing.upstream_us = crate::client::unix_micros_now();
             writer.write_all(b"orblx-ok\n").map_err(io)?;
+            timing.reply_us = crate::client::unix_micros_now();
+            timing.print(peer, "ok");
             let buffered = reader.buffer().to_vec();
             if !buffered.is_empty() {
                 upstream.write_all(&buffered).map_err(io)?;
