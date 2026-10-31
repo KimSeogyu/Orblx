@@ -40,6 +40,7 @@ ACTIONS = [
     "token-create", "token-use", "token-deny", "token-revoke", "share",
     "unshare", "packet-deny", "unrevoke", "sink-error", "user-approve",
     "user-reject", "reserved-37", "route-failover", "ssh-cert",
+    "reserved-40", "netmap-seq-reset",
 ]
 
 SYSLOG_HEAD = re.compile(

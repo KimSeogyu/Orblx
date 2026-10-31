@@ -112,12 +112,16 @@ pub enum ConfigAction {
     ///
     /// The coordinator writes one record for each allow and for each deny.
     SshCert,
+    /// An owner set the stored netmap `seq` to the coordinator clock time after a
+    /// clock-forward error (W25-34).
+    NetmapSeqReset,
 }
 
 impl ConfigAction {
     /// Codes that no action in this build uses. Code 37 is reserved for `node-remove` (W25-18).
+    /// Codes 39 and 40 are reserved for other open work items. W25-34 takes code 41.
     /// The SIEM verifier has the placeholder `reserved-N` for each of these codes.
-    pub const RESERVED_CODES: [u8; 1] = [37];
+    pub const RESERVED_CODES: [u8; 3] = [37, 39, 40];
 
     /// Every action in code order.
     pub const ALL: [Self; 38] = [
@@ -159,6 +163,7 @@ impl ConfigAction {
         Self::UserReject,
         Self::RouteFailover,
         Self::SshCert,
+        Self::NetmapSeqReset,
     ];
 
     /// Return the stable action token.
@@ -203,6 +208,7 @@ impl ConfigAction {
             Self::UserReject => "user-reject",
             Self::RouteFailover => "route-failover",
             Self::SshCert => "ssh-cert",
+            Self::NetmapSeqReset => "netmap-seq-reset",
         }
     }
 
@@ -254,6 +260,7 @@ impl ConfigAction {
             Self::UserReject => 36,
             Self::RouteFailover => 38,
             Self::SshCert => 39,
+            Self::NetmapSeqReset => 41,
         }
     }
 

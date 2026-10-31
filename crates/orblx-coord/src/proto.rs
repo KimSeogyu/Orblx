@@ -5,6 +5,58 @@ use crate::netmap::{SignedEndpoint, SignedGrantsWire, SignedNetmapWire};
 
 pub const MAX_MESSAGE: usize = 256 * 1024;
 
+/// The node protocol version that a client sends with each request (W25-34).
+///
+/// Version 1: the client checks the signed netmap `seq` and `issued_at_ms`.
+/// A request with no version is from an older node.
+pub const NODE_PROTO: u32 = 1;
+
+/// The start of the error text when the coordinator and the node have different versions.
+pub const VERSION_MISMATCH: &str = "version mismatch, upgrade";
+
+/// The ops that the coordinator serves to an older node (W25-34).
+///
+/// They carry only the deny list, so an older node still gets each revoke.
+/// All other ops refuse an older node with [`VERSION_MISMATCH`].
+pub const OLD_NODE_OPS: [&str; 2] = ["deny", "deny-wait"];
+
+/// One request on the wire, with the node protocol version (W25-34).
+#[derive(Serialize)]
+struct Outgoing<'a> {
+    #[serde(flatten)]
+    request: &'a Request,
+    proto: u32,
+}
+
+/// One request that the coordinator reads. An older node sends no `proto` (0).
+#[derive(Deserialize)]
+pub struct Incoming {
+    #[serde(flatten)]
+    pub request: Request,
+    #[serde(default)]
+    pub proto: u32,
+}
+
+/// Refuse an older node, except for [`OLD_NODE_OPS`] (W25-34).
+pub fn version_gate(op: &str, proto: u32) -> Result<(), CoordError> {
+    if proto >= NODE_PROTO || OLD_NODE_OPS.contains(&op) {
+        return Ok(());
+    }
+    Err(CoordError::Protocol(format!(
+        "{VERSION_MISMATCH}: the node is older than the coordinator (no signed netmap seq). \
+         Upgrade the coordinator and all nodes together."
+    )))
+}
+
+/// The error when a coordinator sends a netmap with no signed `seq` (W25-34).
+#[must_use]
+pub fn old_coordinator_error() -> CoordError {
+    CoordError::Protocol(format!(
+        "{VERSION_MISMATCH}: the coordinator is older than the node (no signed netmap seq). \
+         Upgrade the coordinator and all nodes together."
+    ))
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Request {
     pub op: String,
@@ -35,6 +87,11 @@ pub struct Request {
     /// The text `none` means that no policy file is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect_sha256: Option<String>,
+    /// W25-16: for `policy-wait`, the node keeps the view of `deny_etag`. When the hold ends
+    /// and the ETag did not change, the coordinator replies with only the deny list and the
+    /// ETag, without the view. An old coordinator ignores the field and sends the full reply.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unchanged_ok: bool,
     /// W25-31: one SSH user certificate request (`ssh-cert`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshCertAsk>,
@@ -138,8 +195,18 @@ pub async fn write_json(
     send: &mut quinn::SendStream,
     value: &impl Serialize,
 ) -> Result<(), CoordError> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|_| CoordError::Protocol("The coordinator request failed.".to_string()))?;
+    let bytes = encode_json(value)?;
+    write_bytes(send, &bytes).await
+}
+
+/// Encode one message as JSON.
+pub fn encode_json(value: &impl Serialize) -> Result<Vec<u8>, CoordError> {
+    serde_json::to_vec(value)
+        .map_err(|_| CoordError::Protocol("The coordinator request failed.".to_string()))
+}
+
+/// Write one message that is JSON already, with its length prefix (W25-16).
+pub async fn write_bytes(send: &mut quinn::SendStream, bytes: &[u8]) -> Result<(), CoordError> {
     if bytes.len() > MAX_MESSAGE {
         return Err(CoordError::Protocol(
             "The coordinator request failed.".to_string(),
@@ -150,10 +217,25 @@ pub async fn write_json(
     send.write_all(&len.to_be_bytes())
         .await
         .map_err(|err| CoordError::Tls(err.to_string()))?;
-    send.write_all(&bytes)
+    send.write_all(bytes)
         .await
         .map_err(|err| CoordError::Tls(err.to_string()))?;
     Ok(())
+}
+
+/// Write one request with the node protocol version (W25-34).
+pub async fn write_request(
+    send: &mut quinn::SendStream,
+    request: &Request,
+) -> Result<(), CoordError> {
+    write_json(
+        send,
+        &Outgoing {
+            request,
+            proto: NODE_PROTO,
+        },
+    )
+    .await
 }
 
 pub async fn read_json<T: for<'de> Deserialize<'de>>(
@@ -186,5 +268,65 @@ async fn read_exact(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> Result<(), 
             "The response ended early.".to_string(),
         )),
         Err(quinn::ReadExactError::ReadError(err)) => Err(CoordError::Tls(format!("read: {err}"))),
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::{
+        old_coordinator_error, version_gate, Incoming, Outgoing, Request, NODE_PROTO,
+        VERSION_MISMATCH,
+    };
+
+    fn request(op: &str) -> Request {
+        serde_json::from_str(&format!(r#"{{"op":"{op}","name":"a"}}"#)).unwrap()
+    }
+
+    #[test]
+    fn a_new_client_sends_the_protocol_version() {
+        let wanted = request("policy-wait");
+        let bytes = serde_json::to_vec(&Outgoing {
+            request: &wanted,
+            proto: NODE_PROTO,
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["proto"], NODE_PROTO);
+        assert_eq!(value["op"], "policy-wait");
+        // An older coordinator reads the same bytes as a plain request (it ignores `proto`).
+        let old: Request = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(old.op, "policy-wait");
+        let read: Incoming = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(read.proto, NODE_PROTO);
+        assert_eq!(read.request.name, "a");
+    }
+
+    #[test]
+    fn an_old_node_gets_only_the_deny_list() {
+        let read: Incoming = serde_json::from_str(r#"{"op":"policy-wait","name":"a"}"#).unwrap();
+        assert_eq!(read.proto, 0);
+        for op in [
+            "enroll",
+            "renew",
+            "netmap",
+            "policy-wait",
+            "advertise",
+            "admin-revoke",
+        ] {
+            let err = version_gate(op, 0).unwrap_err().public_text();
+            assert!(err.starts_with(VERSION_MISMATCH), "{op}: {err}");
+            assert!(err.contains("Upgrade the coordinator and all nodes together."));
+        }
+        for op in ["deny", "deny-wait"] {
+            assert!(version_gate(op, 0).is_ok(), "{op}");
+        }
+        assert!(version_gate("policy-wait", NODE_PROTO).is_ok());
+    }
+
+    #[test]
+    fn the_old_coordinator_text_is_public() {
+        let text = old_coordinator_error().public_text();
+        assert!(text.starts_with(VERSION_MISMATCH), "{text}");
+        assert!(text.contains("the coordinator is older than the node"));
     }
 }

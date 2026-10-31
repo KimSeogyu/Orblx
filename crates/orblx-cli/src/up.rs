@@ -775,6 +775,9 @@ fn spawn_deny_refresh(options: &UpOptions) {
         let mut policy_etag: Option<String> = None;
         let mut policy_after = Instant::now();
         let mut netmap_ok = false;
+        let mut mismatch = MismatchNote::default();
+        // W25-16: one waiter keeps one QUIC connection for all policy waits.
+        let mut waiter = orblx_coord::PolicyWaiter::new(coord, &name).ok();
         loop {
             let start = Instant::now();
             let Ok(bundle) = fs::read_to_string(state.join(BUNDLE_FILE)) else {
@@ -782,14 +785,19 @@ fn spawn_deny_refresh(options: &UpOptions) {
                 continue;
             };
             if start >= policy_after {
-                match orblx_coord::fetch_policy_wait_blocking(
-                    coord,
-                    &name,
-                    &bundle,
-                    &state,
-                    policy_etag.as_deref(),
-                ) {
+                let synced = match waiter.as_mut() {
+                    Some(waiter) => waiter.wait(&bundle, &state, policy_etag.as_deref()),
+                    None => orblx_coord::fetch_policy_wait_blocking(
+                        coord,
+                        &name,
+                        &bundle,
+                        &state,
+                        policy_etag.as_deref(),
+                    ),
+                };
+                match synced {
                     Ok(sync) => {
+                        mismatch.clear(&state);
                         if policy_etag.as_deref() != Some(sync.etag.as_str()) {
                             netmap_ok = apply_policy_sync(&state, &sync, policy_etag.is_some());
                         }
@@ -799,7 +807,8 @@ fn spawn_deny_refresh(options: &UpOptions) {
                         thread::sleep(DENY_WAIT_GAP.saturating_sub(start.elapsed()));
                         continue;
                     }
-                    Err(_) => {
+                    Err(err) => {
+                        mismatch.note(&state, &err.public_text());
                         policy_after = Instant::now() + policy_wait_retry(netmap_ok);
                         // W25-31: the next reply comes at once, so the signed netmap stamp is
                         // renewed without a second hold time.
@@ -834,6 +843,53 @@ fn spawn_deny_refresh(options: &UpOptions) {
             thread::sleep(DENY_REFRESH.saturating_sub(start.elapsed()));
         }
     });
+}
+
+/// The version mismatch state of the policy loop (W25-34).
+///
+/// When the coordinator has another version, `policy-wait` fails with a text that starts with
+/// [`orblx_coord::VERSION_MISMATCH`]. The node logs it at once and again each
+/// [`MISMATCH_LOG_EVERY`], and writes it for `orblx status`. The node keeps its mesh and
+/// its last netmap, and it gets each revoke through `deny-wait`.
+#[derive(Default)]
+struct MismatchNote {
+    last_log: Option<Instant>,
+}
+
+/// The time between two version mismatch log lines (W25-34).
+const MISMATCH_LOG_EVERY: Duration = Duration::from_secs(300);
+
+impl MismatchNote {
+    fn note(&mut self, state: &Path, text: &str) {
+        if !text.starts_with(orblx_coord::VERSION_MISMATCH) {
+            return;
+        }
+        if self
+            .last_log
+            .is_none_or(|last| last.elapsed() >= MISMATCH_LOG_EVERY)
+        {
+            eprintln!("ALERT {text} The node keeps the mesh and the last netmap. SSH certificate logins stop after 60 s.");
+            self.last_log = Some(Instant::now());
+        }
+        let path = state.join(orblx_datapath::COORD_MISMATCH_FILE);
+        let line = format!("{text}\n");
+        if fs::read_to_string(&path).is_ok_and(|old| old == line) {
+            return;
+        }
+        let temp = state.join(".coord-mismatch.tmp");
+        if fs::write(&temp, line.as_bytes()).is_ok() {
+            let _ = fs::rename(&temp, &path);
+        }
+    }
+
+    fn clear(&mut self, state: &Path) {
+        let path = state.join(orblx_datapath::COORD_MISMATCH_FILE);
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+            println!("The coordinator version matches the node again.");
+        }
+        self.last_log = None;
+    }
 }
 
 /// Write the files of one `policy-wait` reply (W25-6).

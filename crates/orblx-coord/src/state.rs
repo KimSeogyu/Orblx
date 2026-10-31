@@ -1,6 +1,8 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use orblx_audit::{
     sha256_digest, ConfigAction, ConfigEvent, ConfigLog, ConfigRecord, EMPTY_DIGEST,
@@ -15,8 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::error::CoordError;
 use crate::files::{create_private_dir, read_text, write_bytes, write_text};
 use crate::netmap::{
-    decode_hex_32, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap, NetmapKey,
-    SignedEndpoint, SignedGrants, SignedNetmap,
+    decode_hex_32, verify_signed_endpoint, NetmapKey, SignedEndpoint, SignedGrants, SignedNetmap,
 };
 use crate::store::{CreatedToken, NodeStore, StoredNode, StoredUser, UserState};
 use crate::ticket::{self, IssuedTicket};
@@ -159,7 +160,122 @@ struct Inner {
     /// The single-use SSH request nonces (W25-31).
     ssh_nonces: crate::sshca::NonceBook,
     /// The signed netmap `seq` allocator (W25-34).
-    seq: Mutex<crate::seq::SeqBook>,
+    /// One book for each state directory in the process.
+    seq: std::sync::Arc<Mutex<crate::seq::SeqBook>>,
+    /// The count of policy changes. The view cache uses it as a key (W25-16).
+    policy_gen: u64,
+    /// The node store file that `inner.store` holds, when no change came after the read (W25-16).
+    nodes_loaded: Option<LoadedFile>,
+    /// The lock store file and its contents (W25-16).
+    lock_loaded: Option<(LoadedFile, crate::nodelock::LockStore)>,
+    /// Signed views for the current inputs (W25-16).
+    views: ViewCache,
+    /// Endpoint signatures by node name and endpoint (W25-16).
+    ///
+    /// Ed25519 signatures are deterministic. The same key and the same endpoint give the same
+    /// signature, so the coordinator signs each endpoint one time.
+    endpoint_sigs: RefCell<HashMap<(String, String), SignedEndpoint>>,
+}
+
+/// The time after which the coordinator reads a state file again, also when its metadata
+/// did not change (W25-16).
+const RELOAD_MAX_AGE: Duration = Duration::from_secs(1);
+
+/// The identity of a state file at one time: device, inode, size, mtime, and ctime.
+///
+/// A writer writes a temp file and renames it, so each write gives a new inode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp([i64; 7]);
+
+impl FileStamp {
+    fn of(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self([
+            meta.dev() as i64,
+            meta.ino() as i64,
+            meta.size() as i64,
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec(),
+        ]))
+    }
+}
+
+/// A state file that the coordinator read, and the digest of its bytes.
+#[derive(Debug, Clone)]
+struct LoadedFile {
+    stamp: Option<FileStamp>,
+    at: Instant,
+    digest: [u8; 32],
+}
+
+impl LoadedFile {
+    fn fresh(&self, path: &Path) -> bool {
+        self.at.elapsed() < RELOAD_MAX_AGE && FileStamp::of(path) == self.stamp
+    }
+}
+
+/// The inputs of a signed view: the node store, the policy, and the lock store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ViewKey {
+    nodes: [u8; 32],
+    policy_gen: u64,
+    lock: [u8; 32],
+}
+
+#[derive(Default)]
+struct ViewCache {
+    key: Option<ViewKey>,
+    /// The parts of each view that do not depend on the receiver, for `key`.
+    inputs: Option<ViewInputs>,
+    views: HashMap<String, Arc<CachedView>>,
+}
+
+/// The parts of a signed view that do not depend on the receiver (W25-16).
+///
+/// The coordinator makes them one time for each set of inputs, not one time for each view.
+struct ViewInputs {
+    nodes: Vec<StoredNode>,
+    lock: crate::nodelock::LockStore,
+    /// The published routes and the exit approval of each node, by node name.
+    published: HashMap<String, (Vec<String>, bool)>,
+}
+
+impl ViewInputs {
+    fn new(inner: &Inner, lock: crate::nodelock::LockStore) -> Self {
+        let nodes = inner.store.nodes();
+        let published = nodes
+            .iter()
+            .map(|node| {
+                let routes = published_routes(&inner.policy, &node.svid, &node.routes);
+                let exit = published_exit(&inner.policy, &node.svid, node.exit_node);
+                (node.name.clone(), (routes, exit))
+            })
+            .collect();
+        Self {
+            nodes,
+            lock,
+            published,
+        }
+    }
+
+    fn published(&self, name: &str) -> (Vec<String>, bool) {
+        self.published.get(name).cloned().unwrap_or_default()
+    }
+}
+
+/// A signed view, its reply, and the digest of its contents (W25-16).
+#[derive(Debug)]
+pub struct CachedView {
+    pub view: NetmapView,
+    /// The JSON of the `policy-wait` reply without `detail` and `policy_etag`, and without
+    /// the last `}`. The server adds the two fields and the `}` for each reply.
+    pub reply_head: Vec<u8>,
+    /// The SHA-256 of the reply JSON. It covers the signed netmap, the signed grants, the
+    /// endpoints, the routes, and the exit approval.
+    pub digest: [u8; 32],
 }
 
 /// The coordinator state.
@@ -325,7 +441,12 @@ impl Coordinator {
                 ssh_ca,
                 ssh_certs,
                 ssh_nonces: crate::sshca::NonceBook::default(),
-                seq: Mutex::new(crate::seq::SeqBook::open(dir)?),
+                seq: crate::seq::shared_book(dir)?,
+                policy_gen: 0,
+                nodes_loaded: None,
+                lock_loaded: None,
+                views: ViewCache::default(),
+                endpoint_sigs: RefCell::new(HashMap::new()),
             })),
         };
         {
@@ -516,7 +637,8 @@ impl Coordinator {
     /// The count grows with each record, so the deny list version stays monotonic.
     pub fn share_deny_for(&self, name: &str) -> Result<(Vec<String>, u64), CoordError> {
         let mut inner = self.lock()?;
-        reload(&mut inner)?;
+        // A read path: the store is read again only when the file changed (W25-16).
+        reload_read(&mut inner)?;
         let nodes = inner.store.nodes();
         let viewer = nodes
             .iter()
@@ -528,9 +650,63 @@ impl Coordinator {
     }
 
     pub fn netmap_for(&self, name: &str) -> Result<NetmapView, CoordError> {
+        Ok(self.netmap_cached(name)?.view.clone())
+    }
+
+    /// Return the signed view of a node, from the cache when its inputs did not change (W25-16).
+    ///
+    /// The coordinator signs a new view when the node store, the policy, or the lock store
+    /// changes. Each new view gets a new netmap signature and a new grant signature.
+    pub fn netmap_cached(&self, name: &str) -> Result<Arc<CachedView>, CoordError> {
         let mut inner = self.lock()?;
-        reload(&mut inner)?;
-        sign_view(&inner, name)
+        reload_read(&mut inner)?;
+        let lock_digest = load_lock_store(&mut inner)?;
+        let Some(nodes) = inner.nodes_loaded.as_ref().map(|file| file.digest) else {
+            return Err(CoordError::State);
+        };
+        let key = ViewKey {
+            nodes,
+            policy_gen: inner.policy_gen,
+            lock: lock_digest,
+        };
+        if inner.views.key != Some(key) || inner.views.inputs.is_none() {
+            inner.views.key = Some(key);
+            inner.views.views.clear();
+            prune_endpoint_sigs(&inner);
+            // The lock store is the store that gave `lock_digest`.
+            let lock = inner
+                .lock_loaded
+                .as_ref()
+                .map(|(_, store)| store.clone())
+                .unwrap_or_default();
+            let inputs = ViewInputs::new(&inner, lock);
+            inner.views.inputs = Some(inputs);
+        }
+        if let Some(view) = inner.views.views.get(name) {
+            // W25-34: a cached view is good only until its signed heartbeat is due. Then the
+            // coordinator signs a new view with a new stamp, also when no input changed.
+            if !heartbeat_due(&view.view, crate::seq::unix_ms(SystemTime::now())) {
+                return Ok(Arc::clone(view));
+            }
+        }
+        let inputs = inner.views.inputs.as_ref().ok_or(CoordError::State)?;
+        let view = sign_view_with(&inner, name, inputs)?;
+        let mut reply_head =
+            serde_json::to_vec(&ViewReply::of(&view)).map_err(|_| CoordError::State)?;
+        let digest: [u8; 32] = Sha256::digest(&reply_head).into();
+        if reply_head.pop() != Some(b'}') {
+            return Err(CoordError::State);
+        }
+        let cached = Arc::new(CachedView {
+            view,
+            reply_head,
+            digest,
+        });
+        inner
+            .views
+            .views
+            .insert(name.to_string(), Arc::clone(&cached));
+        Ok(cached)
     }
 
     /// The time until the netmap of one node needs a signed heartbeat (W25-34).
@@ -820,6 +996,44 @@ impl Coordinator {
     ) -> Result<(), CoordError> {
         let mut inner = self.lock()?;
         record(&mut inner, actor, action, target, before, after, detail)
+    }
+
+    /// Set the stored netmap `seq` to the clock time after a clock-forward error (W25-34).
+    ///
+    /// The owner command `orblx admin netmap-seq-reset` calls this. It works only when the
+    /// stored `seq` is ahead of the clock, and it never sets a value below the clock time.
+    /// It writes one `netmap-seq-reset` audit record (code 41).
+    pub fn netmap_seq_reset(
+        &self,
+        actor: &str,
+        now: SystemTime,
+    ) -> Result<serde_json::Value, CoordError> {
+        let mut inner = self.lock()?;
+        let now_ms = crate::seq::unix_ms(now);
+        let (old, new) = inner
+            .seq
+            .lock()
+            .map_err(|_| CoordError::State)?
+            .reset_to_now(now_ms)?;
+        // The book forgot all stamps, so the cached views go too. Each node gets a new view.
+        inner.views.views.clear();
+        let before: [u8; 32] = Sha256::digest(format!("{old}\n").as_bytes()).into();
+        let after: [u8; 32] = Sha256::digest(format!("{new}\n").as_bytes()).into();
+        let detail = format!("from {old} to {new} now_ms {now_ms}");
+        record(
+            &mut inner,
+            actor,
+            ConfigAction::NetmapSeqReset,
+            crate::seq::COORD_SEQ_FILE,
+            before,
+            after,
+            &detail,
+        )?;
+        Ok(serde_json::json!({
+            "op": "netmap-seq-reset",
+            "from": old,
+            "to": new,
+        }))
     }
 
     /// Set up node lock with the first trusted owner keys (W23-1).
@@ -1269,6 +1483,9 @@ impl Coordinator {
 }
 
 fn reload(inner: &mut Inner) -> Result<(), CoordError> {
+    // The caller can change `inner.store` after this read, so the next read path reads the
+    // file again (W25-16).
+    inner.nodes_loaded = None;
     inner.store = NodeStore::open(&inner.state_dir.join(STORE_FILE))?;
     refresh_policy(inner);
     if inner.audit.is_some() && !inner.store.migration_unrecorded().is_empty() {
@@ -1276,6 +1493,99 @@ fn reload(inner: &mut Inner) -> Result<(), CoordError> {
         record_user_migration(inner, &actor)?;
     }
     Ok(())
+}
+
+/// Read the node store and the policy for a read-only request (W25-16).
+///
+/// The coordinator reads `nodes.json` again when its metadata changed, when a change path ran
+/// after the last read, or when the last read is older than [`RELOAD_MAX_AGE`].
+fn reload_read(inner: &mut Inner) -> Result<(), CoordError> {
+    let path = inner.state_dir.join(STORE_FILE);
+    let fresh = inner
+        .nodes_loaded
+        .as_ref()
+        .is_some_and(|file| file.fresh(&path));
+    if !fresh {
+        let stamp = FileStamp::of(&path);
+        let at = Instant::now();
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(CoordError::io(err)),
+        };
+        let digest = sha256(&bytes);
+        let same = inner
+            .nodes_loaded
+            .as_ref()
+            .is_some_and(|file| file.digest == digest);
+        if !same {
+            inner.nodes_loaded = None;
+            inner.store = NodeStore::open(&path)?;
+        }
+        inner.nodes_loaded = Some(LoadedFile { stamp, at, digest });
+    }
+    refresh_policy(inner);
+    Ok(())
+}
+
+/// Read the lock store when its file changed, and return the digest of the file (W25-16).
+fn load_lock_store(inner: &mut Inner) -> Result<[u8; 32], CoordError> {
+    let path = inner.state_dir.join(crate::nodelock::COORD_LOCK_FILE);
+    if let Some((file, _)) = &inner.lock_loaded {
+        if file.fresh(&path) {
+            return Ok(file.digest);
+        }
+    }
+    let stamp = FileStamp::of(&path);
+    let at = Instant::now();
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(CoordError::io(err)),
+    };
+    let digest = sha256(&bytes);
+    let store = crate::nodelock::read_store(&inner.state_dir)?;
+    // The digest is of the bytes before the parse. A write between the two reads gives a new
+    // stamp, so the next request reads the file again.
+    inner.lock_loaded = Some((LoadedFile { stamp, at, digest }, store));
+    Ok(digest)
+}
+
+/// Remove endpoint signatures of endpoints that no node has now.
+fn prune_endpoint_sigs(inner: &Inner) {
+    let mut sigs = inner.endpoint_sigs.borrow_mut();
+    if sigs.is_empty() {
+        return;
+    }
+    let live: std::collections::HashSet<(String, String)> = inner
+        .store
+        .nodes()
+        .iter()
+        .flat_map(|node| {
+            node.endpoints
+                .iter()
+                .map(|endpoint| (node.name.clone(), endpoint.clone()))
+        })
+        .collect();
+    sigs.retain(|key, _| live.contains(key));
+}
+
+/// Return the signature of one endpoint, from the cache or from a new signature.
+///
+/// The coordinator verifies a new signature one time, before it goes in the cache.
+fn signed_endpoint(
+    inner: &Inner,
+    name: &str,
+    endpoint: &str,
+) -> Result<SignedEndpoint, CoordError> {
+    let key = (name.to_string(), endpoint.to_string());
+    if let Some(signed) = inner.endpoint_sigs.borrow().get(&key) {
+        return Ok(signed.clone());
+    }
+    let signed = inner.netmap_key.sign_endpoint(name, endpoint)?;
+    verify_signed_endpoint(&signed, &inner.netmap_key.public())?;
+    inner.endpoint_sigs.borrow_mut().insert(key, signed.clone());
+    Ok(signed)
 }
 
 fn refresh_policy(inner: &mut Inner) {
@@ -1317,6 +1627,7 @@ fn refresh_policy(inner: &mut Inner) {
             let rules = rules_digest(&bytes);
             let rules_changed = inner.rules_hash != Some(rules);
             inner.policy = policy;
+            inner.policy_gen += 1;
             inner.policy_hash = Some(hash);
             inner.rules_hash = Some(rules);
             inner.has_good = true;
@@ -1363,6 +1674,7 @@ fn adopt_saved_policy(inner: &mut Inner) {
     };
     if let Ok(policy) = Policy::from_hujson(&bytes) {
         inner.policy = policy;
+        inner.policy_gen += 1;
         inner.has_good = true;
         inner.policy_hash = Some(sha256(&bytes));
         inner.rules_hash = Some(rules_digest(&bytes));
@@ -1773,6 +2085,14 @@ fn issue_leaf(inner: &mut Inner, name: &str, now: SystemTime) -> Result<EnrollRe
     })
 }
 
+/// True when the signed stamp of `view` is [`crate::seq::HEARTBEAT_MS`] old or older (W25-34).
+///
+/// A due view must not go out again: the coordinator signs a new view with a new stamp.
+fn heartbeat_due(view: &NetmapView, now_ms: u64) -> bool {
+    let issued = view.signed_netmap.netmap.issued_at_ms;
+    now_ms >= issued.saturating_add(crate::seq::HEARTBEAT_MS)
+}
+
 fn node_visible(node: &StoredNode) -> bool {
     node.approved && !node.expired
 }
@@ -1832,41 +2152,53 @@ fn record_ssh(
 }
 
 fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
-    let lock_store = crate::nodelock::read_store(&inner.state_dir)?;
-    let nodes = inner.store.nodes();
+    let lock = crate::nodelock::read_store(&inner.state_dir)?;
+    sign_view_with(inner, name, &ViewInputs::new(inner, lock))
+}
+
+/// Sign the view of node `name` from `inputs` (W25-16).
+///
+/// Each call signs a new netmap and new grants. The signatures are checked before they go out.
+fn sign_view_with(
+    inner: &Inner,
+    name: &str,
+    inputs: &ViewInputs,
+) -> Result<NetmapView, CoordError> {
+    let nodes = &inputs.nodes;
     let self_node = nodes
         .iter()
         .find(|node| node.name == name)
-        .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?
-        .clone();
-    let self_visible = node_visible(&self_node);
+        .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+    let self_visible = node_visible(self_node);
     let mut peers = Vec::new();
     let mut endpoints = Vec::new();
     if self_visible {
-        for node in nodes.iter().filter(|node| {
-            node_visible(node) && crate::share::sees(&inner.policy, &self_node, node)
-        }) {
+        for node in nodes
+            .iter()
+            .filter(|node| node_visible(node) && crate::share::sees(&inner.policy, self_node, node))
+        {
             for endpoint in &node.endpoints {
-                endpoints.push(inner.netmap_key.sign_endpoint(&node.name, endpoint)?);
+                endpoints.push(signed_endpoint(inner, &node.name, endpoint)?);
             }
             if node.name == self_node.name {
                 continue;
             }
             // A shared node from another tenant gives no subnet routes and no exit node.
-            let other = crate::share::cross_tenant(&inner.policy, &self_node, node);
+            let other = crate::share::cross_tenant(&inner.policy, self_node, node);
+            let (routes, exit_node) = if other {
+                (Vec::new(), false)
+            } else {
+                inputs.published(&node.name)
+            };
             peers.push(NetmapPeer {
                 name: node.name.clone(),
                 overlay_ip: node.overlay_ip.clone(),
                 svid: node.svid.clone(),
                 endpoints: node.endpoints.clone(),
-                routes: if other {
-                    Vec::new()
-                } else {
-                    published_routes(&inner.policy, &node.svid, &node.routes)
-                },
-                exit_node: !other && published_exit(&inner.policy, &node.svid, node.exit_node),
+                routes,
+                exit_node,
                 owner: String::new(),
-                lock_sig: lock_store.sigs.get(&node.name).cloned(),
+                lock_sig: inputs.lock.sigs.get(&node.name).cloned(),
             });
         }
     }
@@ -1878,7 +2210,7 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
             owner: String::new(),
         },
         peers,
-        lock: lock_store.updates.clone(),
+        lock: inputs.lock.updates.clone(),
         split_dns: published_split_dns(&inner.policy, self_visible),
         ssh_user_ca: if self_visible {
             inner.ssh_ca.public_lines()?
@@ -1888,9 +2220,10 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
         ssh_revoked: ssh_revoked_set(inner)?,
         seq: 0,
         issued_at_ms: 0,
+        grants_sha256: String::new(),
     };
     let receiver = SpiffeId::node(&self_node.name)?;
-    let grants = filtered_grants(inner, &receiver, &self_node, self_visible);
+    let grants = filtered_grants(inner, &receiver, self_node, self_visible, nodes);
     // W25-34: the same view content within the heartbeat time gets the same stamp.
     // A change of the netmap, the grants, or the endpoints gets a new seq.
     let invalid = || CoordError::Protocol("The netmap is not valid.".to_string());
@@ -1907,16 +2240,13 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
     )?;
     payload.seq = seq;
     payload.issued_at_ms = issued_at_ms;
-    let signed_netmap = inner.netmap_key.sign_netmap(&payload)?;
-    let signed_grants = inner.netmap_key.sign_grants(&grants)?;
+    // W25-34 (Crypto grants binding): the signed netmap carries the SHA-256 of the signed
+    // grants bytes, so a node refuses a fresh netmap with older grants.
+    let signed_grants = inner.netmap_key.sign_grants_owned(grants)?;
+    payload.grants_sha256 = signed_grants.digest_hex();
+    let signed_netmap = inner.netmap_key.sign_netmap_owned(payload)?;
     let netmap_public = inner.netmap_key.public();
-    verify_signed_netmap(&signed_netmap, &netmap_public)?;
-    verify_signed_grants(&signed_grants, &netmap_public)?;
-    for endpoint in &endpoints {
-        verify_signed_endpoint(endpoint, &netmap_public)?;
-    }
-    let approved_routes = published_routes(&inner.policy, &self_node.svid, &self_node.routes);
-    let exit_approved = published_exit(&inner.policy, &self_node.svid, self_node.exit_node);
+    let (approved_routes, exit_approved) = inputs.published(&self_node.name);
     Ok(NetmapView {
         signed_netmap,
         signed_grants,
@@ -1926,6 +2256,54 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
         advertised_routes: self_node.routes.clone(),
         exit_approved,
     })
+}
+
+/// The JSON shape of [`NetmapView::response`], with borrowed fields (W25-16).
+///
+/// The field names and their order are those of `proto::Response`, so the JSON is the same
+/// and the coordinator does not copy the view to encode it.
+#[derive(serde::Serialize)]
+struct ViewReply<'a> {
+    ok: bool,
+    netmap_pub_hex: String,
+    netmap: &'a SignedNetmap,
+    endpoints: &'a [SignedEndpoint],
+    grants: &'a SignedGrants,
+    approved_routes: &'a [String],
+    advertised_routes: &'a [String],
+    exit_approved: bool,
+}
+
+impl<'a> ViewReply<'a> {
+    fn of(view: &'a NetmapView) -> Self {
+        Self {
+            ok: true,
+            netmap_pub_hex: crate::netmap::encode_hex(&view.netmap_public),
+            netmap: &view.signed_netmap,
+            endpoints: &view.endpoints,
+            grants: &view.signed_grants,
+            approved_routes: &view.approved_routes,
+            advertised_routes: &view.advertised_routes,
+            exit_approved: view.exit_approved,
+        }
+    }
+}
+
+impl NetmapView {
+    /// The coordinator reply that carries this view.
+    pub(crate) fn response(&self) -> crate::proto::Response {
+        crate::proto::Response {
+            ok: true,
+            netmap_pub_hex: Some(crate::netmap::encode_hex(&self.netmap_public)),
+            netmap: Some(self.signed_netmap.to_wire()),
+            endpoints: Some(self.endpoints.clone()),
+            grants: Some(self.signed_grants.to_wire()),
+            approved_routes: Some(self.approved_routes.clone()),
+            advertised_routes: Some(self.advertised_routes.clone()),
+            exit_approved: Some(self.exit_approved),
+            ..crate::proto::Response::default()
+        }
+    }
 }
 
 /// Copy the policy `splitDns` zones into the netmap (W24-F).
@@ -1960,6 +2338,7 @@ fn filtered_grants(
     receiver: &SpiffeId,
     self_node: &StoredNode,
     self_visible: bool,
+    nodes: &[StoredNode],
 ) -> orblx_identity::ReceiverGrants {
     if !self_visible {
         return orblx_identity::ReceiverGrants {
@@ -1972,7 +2351,6 @@ fn filtered_grants(
             guarded: Vec::new(),
         };
     }
-    let nodes = inner.store.nodes();
     // A node that the receiver does not see gives no grant and is not in reach (W25-1).
     let hidden: std::collections::BTreeSet<String> = nodes
         .iter()
@@ -1989,7 +2367,7 @@ fn filtered_grants(
     let mut grants = inner.policy.receiver_grants(receiver);
     grants.grants.retain(|grant| !other.contains(&grant.src));
     grants.reach.retain(|dst| !other.contains(dst));
-    for grant in crate::share::share_grants(&inner.policy, self_node, &nodes) {
+    for grant in crate::share::share_grants(&inner.policy, self_node, nodes) {
         if !grants.grants.contains(&grant) {
             grants.grants.push(grant);
         }
@@ -2325,6 +2703,7 @@ fn write_view(
     endpoints: &[SignedEndpoint],
 ) -> Result<ViewWrite, CoordError> {
     let now_ms = crate::seq::unix_ms(SystemTime::now());
+    crate::seq::check_grants_binding(netmap, grants)?;
     let intake = crate::seq::node_intake(dir, netmap, now_ms)?;
     let signed_path = dir.join("netmap.signed.json");
     if intake == crate::seq::Intake::Same {
@@ -2407,5 +2786,35 @@ mod tests {
         let missing = oidc_config(orblx_identity::OidcMode::Google, None).unwrap();
         assert!(matches!(blank, OidcConfig::TokenOnly));
         assert!(matches!(missing, OidcConfig::TokenOnly));
+    }
+
+    /// W25-34 with W25-16: the view cache gives a cached view only until its heartbeat is
+    /// due. Then `netmap_cached` signs a new view with a new stamp.
+    #[test]
+    fn a_cached_view_is_due_at_the_heartbeat() {
+        let scratch = std::env::temp_dir().join(format!(
+            "orblx-w2534-due-{}-{}",
+            std::process::id(),
+            crate::seq::unix_ms(std::time::SystemTime::now())
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let coord = super::Coordinator::open(&scratch, "coord", OidcConfig::TokenOnly).unwrap();
+        let now = std::time::SystemTime::now();
+        let token = coord
+            .create_token_at(std::time::Duration::from_secs(60), now)
+            .unwrap();
+        coord
+            .enroll_token("due-a", &token.secret, &["due-a:443".to_string()], &[], now)
+            .unwrap();
+        let cached = coord.netmap_cached("due-a").unwrap();
+        let issued = cached.view.signed_netmap.netmap.issued_at_ms;
+        let beat = crate::seq::HEARTBEAT_MS;
+        assert!(!super::heartbeat_due(&cached.view, issued));
+        assert!(!super::heartbeat_due(&cached.view, issued + beat - 1));
+        assert!(super::heartbeat_due(&cached.view, issued + beat));
+        let again = coord.netmap_cached("due-a").unwrap();
+        assert!(std::sync::Arc::ptr_eq(&cached, &again));
+        drop(coord);
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

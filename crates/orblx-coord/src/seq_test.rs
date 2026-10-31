@@ -51,9 +51,11 @@ fn restamp(view: &NetmapView, key: &NetmapKey, seq: u64, issued_at_ms: u64) -> N
     let mut netmap = view.signed_netmap.netmap.clone();
     netmap.seq = seq;
     netmap.issued_at_ms = issued_at_ms;
+    let signed_grants = key.sign_grants(&view.signed_grants.grants).unwrap();
+    netmap.grants_sha256 = signed_grants.digest_hex();
     NetmapView {
         signed_netmap: key.sign_netmap(&netmap).unwrap(),
-        signed_grants: key.sign_grants(&view.signed_grants.grants).unwrap(),
+        signed_grants,
         endpoints: view.endpoints.clone(),
         netmap_public: key.public(),
         approved_routes: view.approved_routes.clone(),
@@ -252,4 +254,126 @@ fn write_state_sets_the_dir_mode_again() {
         .unwrap();
     let mode = fs::metadata(&node.0).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700);
+}
+
+/// Crypto Fix 3: the node start path (`orblx up --coord`, up.rs fetch) writes the netmap
+/// with a missing or a corrupt `netmap.seq` file. A corrupt file is moved aside.
+#[test]
+fn node_write_path_accepts_a_missing_or_corrupt_seq_file() {
+    let coord_dir = Scratch::new("fix3-coord");
+    let coord = Coordinator::open(&coord_dir.0, "coord", OidcConfig::TokenOnly).unwrap();
+    let first = enroll(&coord, "f3-a");
+    for (label, bytes) in [
+        ("missing", None),
+        ("corrupt", Some(b"garbage\n".to_vec())),
+        ("binary", Some(vec![0xff, 0x00, 0xfe])),
+    ] {
+        let node = Scratch::new(&format!("fix3-{label}"));
+        first.write_state(&node.0).unwrap();
+        let path = node.0.join(crate::NODE_SEQ_FILE);
+        match &bytes {
+            None => fs::remove_file(&path).unwrap(),
+            Some(bytes) => fs::write(&path, bytes).unwrap(),
+        }
+        let view = coord.netmap_for("f3-a").unwrap();
+        view.write_state_checked(&node.0)
+            .unwrap_or_else(|err| panic!("{label}: {err}"));
+        let (seq, _) = read_node_seq(&node.0).unwrap().unwrap();
+        assert_eq!(seq, view.signed_netmap.netmap.seq, "{label}");
+        let aside = fs::read_dir(&node.0)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("netmap.seq.corrupt-")
+            })
+            .count();
+        assert_eq!(aside, usize::from(bytes.is_some()), "{label}");
+    }
+}
+
+/// Crypto Fix 5: a fresh netmap with older grants is refused on the node write path.
+#[test]
+fn fresh_netmap_with_older_grants_is_refused() {
+    let coord_dir = Scratch::new("fix5-coord");
+    let node = Scratch::new("fix5-node");
+    let key = NetmapKey::generate();
+    let coord = Coordinator::open(&coord_dir.0, "coord", OidcConfig::TokenOnly).unwrap();
+    enroll(&coord, "f5-a");
+    let base = coord.netmap_for("f5-a").unwrap();
+    assert_eq!(
+        base.signed_netmap.netmap.grants_sha256,
+        base.signed_grants.digest_hex()
+    );
+    write_pub(&node.0, &key);
+    // The older grants let the node reach one more peer.
+    let mut older = base.signed_grants.grants.clone();
+    older
+        .reach
+        .push("spiffe://orblx.local/node/f5-old".to_string());
+    let older = key.sign_grants(&older).unwrap();
+    let now = unix_ms(SystemTime::now());
+    let fresh = restamp(&base, &key, now, now);
+    assert_ne!(older.digest_hex(), fresh.signed_grants.digest_hex());
+    let mixed = NetmapView {
+        signed_grants: older,
+        ..restamp(&base, &key, now, now)
+    };
+    assert!(mixed.write_state_checked(&node.0).is_err());
+    assert!(read_node_seq(&node.0).unwrap().is_none());
+    assert!(!node.0.join("grants.signed.json").exists());
+    assert_eq!(
+        fresh.write_state_checked(&node.0).unwrap(),
+        ViewWrite::Content
+    );
+}
+
+/// Crypto Fix 4 through the coordinator: a stored seq 1 day ahead of the clock stops all
+/// signing. The owner reset sets the stored seq to the clock time and writes one
+/// `netmap-seq-reset` audit record (code 41).
+#[test]
+fn coordinator_refuses_to_sign_ahead_of_the_clock_until_the_reset() {
+    let coord_dir = Scratch::new("fix4-coord");
+    let coord = Coordinator::open(&coord_dir.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    enroll(&coord, "f4-a");
+    enroll(&coord, "f4-b");
+    let start = coord.netmap_for("f4-a").unwrap().signed_netmap.netmap.seq;
+    // The reset is refused while the stored seq is not ahead of the clock.
+    assert!(coord.netmap_seq_reset("owner", SystemTime::now()).is_err());
+    let ahead = unix_ms(SystemTime::now()) + 86_400_000;
+    fs::write(
+        coord_dir.0.join(crate::COORD_SEQ_FILE),
+        format!("{ahead}\n"),
+    )
+    .unwrap();
+    // A content change needs a new seq. The coordinator refuses to sign it.
+    crate::admin::expire(&coord, "f4-b", "test").unwrap();
+    assert!(coord.netmap_for("f4-a").is_err());
+    let token = coord.create_token(Duration::from_secs(600)).unwrap();
+    assert!(coord
+        .enroll_token("f4-c", &token.secret, &[], &[], SystemTime::now())
+        .is_err());
+    assert_eq!(
+        fs::read_to_string(coord_dir.0.join(crate::COORD_SEQ_FILE))
+            .unwrap()
+            .trim(),
+        ahead.to_string()
+    );
+    let now = SystemTime::now();
+    let value = coord.netmap_seq_reset("owner", now).unwrap();
+    assert_eq!(value["from"], ahead);
+    assert_eq!(value["to"], unix_ms(now));
+    let view = coord.netmap_for("f4-a").unwrap();
+    assert!(view.signed_netmap.netmap.seq > start);
+    assert!(view.signed_netmap.netmap.seq < ahead);
+    let audit = coord.config_audit_text().unwrap();
+    let resets: Vec<&str> = audit
+        .lines()
+        .filter(|line| line.contains("\"netmap-seq-reset\""))
+        .collect();
+    assert_eq!(resets.len(), 1, "{audit}");
+    assert!(resets[0].contains(&format!("from {ahead} to {}", unix_ms(now))));
 }

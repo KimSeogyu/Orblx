@@ -61,7 +61,7 @@ pub use client::{
     enroll_with_oidc_blocking, enroll_with_token_blocking, fetch_deny_blocking,
     fetch_deny_wait_blocking, fetch_netmap_blocking, fetch_policy_wait_blocking, netmap_json,
     publish_candidates_blocking, renew_svid_blocking, ssh_cert_request_blocking, AdminReply,
-    GrantFetch, OidcEnroll, PolicySync, DENY_WAIT_HOLD,
+    GrantFetch, OidcEnroll, PolicySync, PolicyWaiter, DENY_WAIT_HOLD,
 };
 pub use config::{CoordConfig, OidcSection};
 pub use error::{CoordError, USER_PENDING_TEXT, USER_REJECTED_TEXT};
@@ -72,7 +72,7 @@ pub use netmap::{
     verify_signed_netmap, NetmapKey, SignedEndpoint, SignedGrants, SignedGrantsWire, SignedNetmap,
     SignedNetmapWire,
 };
-pub use proto::{GrantAsk, SshCertAsk};
+pub use proto::{GrantAsk, SshCertAsk, NODE_PROTO, VERSION_MISMATCH};
 pub use seq::{
     read_node_seq, reset_node_seq, unix_ms, Intake, COORD_SEQ_FILE, HEARTBEAT_MS, NODE_SEQ_FILE,
 };
@@ -461,6 +461,391 @@ mod tests {
         );
         assert_ne!(revoked.etag, joined.etag);
         handle.abort();
+    }
+
+    /// W25-34 (Crypto re-review): through the real server, a held `policy-wait` with no
+    /// change replies with a new signed stamp within the heartbeat time (20 s or less).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn policy_wait_sends_a_signed_heartbeat_within_20_s() {
+        let scratch = Scratch::new();
+        let node = Scratch::new();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let (addr, handle) =
+            super::server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .unwrap();
+        let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+        let token = coord.create_token(Duration::from_secs(600)).unwrap();
+        super::client::enroll_with_token(
+            addr,
+            "coord",
+            &bundle,
+            "beat-a",
+            &token.secret,
+            &["beat-a:443".to_string()],
+            &[],
+        )
+        .await
+        .unwrap()
+        .write_state(&node.0)
+        .unwrap();
+        let wait = |etag: Option<String>| {
+            let (dir, bundle) = (node.0.clone(), bundle.clone());
+            tokio::task::spawn_blocking(move || {
+                super::client::fetch_policy_wait_blocking(
+                    addr,
+                    "coord",
+                    &bundle,
+                    &dir,
+                    etag.as_deref(),
+                )
+            })
+        };
+        let first = wait(None).await.unwrap().unwrap();
+        let first_seq = first.view.signed_netmap.netmap.seq;
+        let first_at = first.view.signed_netmap.netmap.issued_at_ms;
+        let held_at = std::time::Instant::now();
+        let beat = wait(Some(first.etag.clone())).await.unwrap().unwrap();
+        let held = held_at.elapsed();
+        assert!(
+            held <= Duration::from_millis(super::HEARTBEAT_MS + 2_000),
+            "the heartbeat came after {held:?}"
+        );
+        assert!(
+            held <= Duration::from_secs(20),
+            "the heartbeat came after {held:?}"
+        );
+        let netmap = &beat.view.signed_netmap.netmap;
+        assert!(netmap.seq > first_seq);
+        assert!(netmap.issued_at_ms >= first_at + super::HEARTBEAT_MS);
+        assert!(orblx_datapath::netmap_fresh(
+            netmap.issued_at_ms,
+            super::unix_ms(SystemTime::now())
+        ));
+        assert_ne!(beat.etag, first.etag);
+        handle.abort();
+    }
+
+    /// W25-16: a `PolicyWaiter` sends each wait on the same QUIC connection. The coordinator
+    /// still holds a known ETag and replies when the netmap or the deny list changes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_policy_waiter_keeps_one_connection_for_all_waits() {
+        let scratch = Scratch::new();
+        let node = Scratch::new();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let (addr, handle) =
+            super::server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .unwrap();
+        let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+        let enroll = |name: &'static str| {
+            let token = coord.create_token(Duration::from_secs(600)).unwrap();
+            let bundle = bundle.clone();
+            async move {
+                super::client::enroll_with_token(
+                    addr,
+                    "coord",
+                    &bundle,
+                    name,
+                    &token.secret,
+                    &[format!("{name}:443")],
+                    &[],
+                )
+                .await
+                .unwrap()
+            }
+        };
+        enroll("keep-a").await.write_state(&node.0).unwrap();
+        let waiter = std::sync::Arc::new(std::sync::Mutex::new(
+            super::PolicyWaiter::new(addr, "coord").unwrap(),
+        ));
+        let wait = |etag: Option<String>| {
+            let (dir, bundle, waiter) = (node.0.clone(), bundle.clone(), waiter.clone());
+            tokio::task::spawn_blocking(move || {
+                let mut waiter = waiter.lock().unwrap();
+                let sync = waiter.wait(&bundle, &dir, etag.as_deref());
+                (sync, waiter.connection_id())
+            })
+        };
+        let (first, id) = wait(None).await.unwrap();
+        let first = first.unwrap();
+        let id = id.expect("the waiter has no connection");
+        assert!(first.view.signed_netmap.netmap.peers.is_empty());
+        let (again, again_id) = wait(Some("old".to_string())).await.unwrap();
+        assert_eq!(again.unwrap().etag, first.etag);
+        assert_eq!(again_id, Some(id), "the waiter opened a new connection");
+        let held = wait(Some(first.etag.clone()));
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(
+            !held.is_finished(),
+            "the coordinator did not hold the request"
+        );
+        enroll("keep-b").await;
+        let joined_at = std::time::Instant::now();
+        let (mut joined, joined_id) = held.await.unwrap();
+        assert_eq!(joined_id, Some(id), "the waiter opened a new connection");
+        while !joined
+            .as_ref()
+            .unwrap()
+            .view
+            .signed_netmap
+            .netmap
+            .peers
+            .iter()
+            .any(|peer| peer.name == "keep-b")
+        {
+            assert!(joined_at.elapsed() < Duration::from_secs(1));
+            let etag = joined.unwrap().etag;
+            let (next, next_id) = wait(Some(etag)).await.unwrap();
+            assert_eq!(next_id, Some(id), "the waiter opened a new connection");
+            joined = next;
+        }
+        assert!(
+            joined_at.elapsed() < Duration::from_secs(1),
+            "the peer came {:?} after the enroll",
+            joined_at.elapsed()
+        );
+        let joined = joined.unwrap();
+        let held = wait(Some(joined.etag.clone()));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let owner = orblx_identity::SpiffeId::node("owner").unwrap();
+        super::revoke_all(&coord, "keep-b", owner.as_uri(), SystemTime::now()).unwrap();
+        let revoked_at = std::time::Instant::now();
+        let (mut revoked, revoked_id) = held.await.unwrap();
+        assert_eq!(revoked_id, Some(id), "the waiter opened a new connection");
+        while !revoked
+            .as_ref()
+            .unwrap()
+            .deny
+            .contains("spiffe://orblx.local/node/keep-b")
+        {
+            assert!(revoked_at.elapsed() < Duration::from_secs(1));
+            let etag = revoked.unwrap().etag;
+            revoked = wait(Some(etag)).await.unwrap().0;
+        }
+        assert!(revoked_at.elapsed() < Duration::from_secs(1));
+        // W25-16 and W25-34: with no change, the hold ends at the signed heartbeat
+        // (HEARTBEAT_MS is shorter than DENY_WAIT_HOLD). The heartbeat is a new signed view,
+        // so the reply is the full reply with a new signature, on the same connection.
+        let revoked = revoked.unwrap();
+        let idle_at = std::time::Instant::now();
+        let (idle, idle_id) = wait(Some(revoked.etag.clone())).await.unwrap();
+        let idle = idle.unwrap();
+        assert!(idle_at.elapsed() <= Duration::from_millis(super::HEARTBEAT_MS + 1_000));
+        assert_eq!(idle_id, Some(id), "the waiter opened a new connection");
+        assert_ne!(idle.etag, revoked.etag);
+        assert_eq!(idle.deny, revoked.deny);
+        assert_ne!(idle.view.signed_netmap.sig, revoked.view.signed_netmap.sig);
+        assert!(idle.view.signed_netmap.netmap.seq > revoked.view.signed_netmap.netmap.seq);
+        // The waiter owns a runtime, so it drops outside of the async context.
+        tokio::task::spawn_blocking(move || drop(waiter))
+            .await
+            .unwrap();
+        handle.abort();
+    }
+
+    /// W25-34 with W25-16 (Eng Lead rule): an idle node with no input change gets a new
+    /// signed view at each heartbeat. The reply is the full reply, never the short reply.
+    /// When each reply comes, the stamp that the node had is at most
+    /// HEARTBEAT_MS plus one poll old.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_waiter_gets_a_fresh_signed_view_at_each_heartbeat() {
+        /// One poll: the coordinator change check and the node wait gap are 100 ms.
+        const POLL_MS: u64 = 100;
+        let scratch = Scratch::new();
+        let node = Scratch::new();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let (addr, handle) =
+            super::server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .unwrap();
+        let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+        let token = coord.create_token(Duration::from_secs(600)).unwrap();
+        super::client::enroll_with_token(
+            addr,
+            "coord",
+            &bundle,
+            "idle-a",
+            &token.secret,
+            &["idle-a:443".to_string()],
+            &[],
+        )
+        .await
+        .unwrap()
+        .write_state(&node.0)
+        .unwrap();
+        let waiter = std::sync::Arc::new(std::sync::Mutex::new(
+            super::PolicyWaiter::new(addr, "coord").unwrap(),
+        ));
+        let wait = |etag: Option<String>| {
+            let (dir, bundle, waiter) = (node.0.clone(), bundle.clone(), waiter.clone());
+            tokio::task::spawn_blocking(move || {
+                let mut waiter = waiter.lock().unwrap();
+                let sync = waiter.wait(&bundle, &dir, etag.as_deref());
+                (sync, waiter.connection_id())
+            })
+        };
+        let (first, id) = wait(None).await.unwrap();
+        let mut last = first.unwrap();
+        let id = id.expect("the waiter has no connection");
+        for beat in 1..=3 {
+            let (next, next_id) = wait(Some(last.etag.clone())).await.unwrap();
+            let next = next.unwrap();
+            let now_ms = super::unix_ms(SystemTime::now());
+            let old = &last.view.signed_netmap.netmap;
+            let age_ms = now_ms.saturating_sub(old.issued_at_ms);
+            println!("idle heartbeat {beat}: old stamp age {age_ms} ms at the reply");
+            assert!(
+                age_ms <= super::HEARTBEAT_MS + POLL_MS,
+                "heartbeat {beat}: the old stamp was {age_ms} ms old"
+            );
+            assert_eq!(next_id, Some(id), "the waiter opened a new connection");
+            let netmap = &next.view.signed_netmap.netmap;
+            assert!(netmap.seq > old.seq, "heartbeat {beat}: no new seq");
+            assert!(netmap.issued_at_ms > old.issued_at_ms);
+            assert_ne!(
+                next.view.signed_netmap.sig, last.view.signed_netmap.sig,
+                "heartbeat {beat}: the reply had the old view"
+            );
+            assert_ne!(next.etag, last.etag);
+            // Only the stamp changed.
+            assert_eq!(netmap.peers, old.peers);
+            last = next;
+        }
+        tokio::task::spawn_blocking(move || drop(waiter))
+            .await
+            .unwrap();
+        handle.abort();
+    }
+
+    /// W25-16: after each change, the cached view of each node is the view that a new
+    /// signature gives. A coordinator with no cache on the same state is the reference.
+    /// So the cache never serves a view that is older than its inputs.
+    #[test]
+    fn each_change_gives_the_view_of_a_new_signature() {
+        let scratch = Scratch::new();
+        let now = SystemTime::now();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let names = ["diff-a", "diff-b", "diff-c"];
+        for name in names {
+            let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+            coord
+                .enroll_token(name, &token.secret, &[format!("{name}:443")], &[], now)
+                .unwrap();
+        }
+        let policy_path = scratch.0.join("policy.hujson");
+        let routes_policy = r#"{
+          "tags": {
+            "tag:router": ["spiffe://orblx.local/node/diff-b"],
+            "tag:exit": ["spiffe://orblx.local/node/diff-c"]
+          },
+          "tagOwners": {
+            "tag:router": ["spiffe://orblx.local/node/diff-a"],
+            "tag:exit": ["spiffe://orblx.local/node/diff-a"]
+          },
+          "acls": [{"action": "accept", "src": ["spiffe://orblx.local/node/diff-b"],
+            "proto": "tcp", "dst": ["spiffe://orblx.local/node/diff-a:22"]}],
+          "autoApprovers": {
+            "routes": {"10.9.0.0/24": ["tag:router"]},
+            "exitNode": ["tag:exit"]
+          }
+        }"#;
+        let check = |step: &str, seen: &mut Vec<[u8; 32]>| {
+            let reference = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+            for name in names {
+                let cached = coord.netmap_cached(name).unwrap();
+                let fresh = reference.netmap_cached(name).unwrap();
+                assert_eq!(
+                    cached.digest, fresh.digest,
+                    "step {step}: the cached view of {name} is not the new view"
+                );
+                assert_eq!(
+                    serde_json::to_vec(&cached.view.signed_netmap).unwrap(),
+                    serde_json::to_vec(&fresh.view.signed_netmap).unwrap(),
+                    "step {step}: the netmap signature of {name} is old"
+                );
+            }
+            seen.push(coord.netmap_cached("diff-a").unwrap().digest);
+        };
+        let mut seen = Vec::new();
+        check("start", &mut seen);
+        coord
+            .set_candidates("diff-b", &["diff-b:444".to_string()])
+            .unwrap();
+        check("endpoint", &mut seen);
+        fs::write(&policy_path, routes_policy).unwrap();
+        check("policy", &mut seen);
+        coord
+            .advertise_routes("diff-b", &["10.9.0.0/24".to_string()])
+            .unwrap();
+        check("routes", &mut seen);
+        coord.advertise_exit("diff-c", true).unwrap();
+        check("exit", &mut seen);
+        coord.expire_node("diff-c").unwrap();
+        check("expire", &mut seen);
+        let nodes = scratch.0.join("nodes.json");
+        let text = fs::read_to_string(&nodes).unwrap();
+        fs::write(&nodes, text.replace("diff-b:444", "diff-b:445")).unwrap();
+        check("outside edit", &mut seen);
+        fs::write(&policy_path, r#"{"acls": []}"#).unwrap();
+        check("policy again", &mut seen);
+        // Each step changed the view of diff-a, so each step gave a new signed view.
+        for (index, digest) in seen.iter().enumerate().skip(1) {
+            assert_ne!(*digest, seen[index - 1], "step {index} gave no new view");
+        }
+    }
+
+    /// W25-16: the coordinator signs a view again only when an input changes.
+    #[test]
+    fn the_signed_view_cache_follows_the_node_store_and_the_policy() {
+        let scratch = Scratch::new();
+        let now = SystemTime::now();
+        let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        for name in ["cache-a", "cache-b"] {
+            let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+            coord
+                .enroll_token(name, &token.secret, &[format!("{name}:443")], &[], now)
+                .unwrap();
+        }
+        let first = coord.netmap_cached("cache-a").unwrap();
+        let again = coord.netmap_cached("cache-a").unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &again),
+            "the view was signed again"
+        );
+        assert_eq!(first.view.signed_netmap.netmap.peers.len(), 1);
+        // A change through the coordinator gives a new view.
+        coord
+            .set_candidates("cache-b", &["cache-b:444".to_string()])
+            .unwrap();
+        let moved = coord.netmap_cached("cache-a").unwrap();
+        assert_ne!(moved.digest, first.digest);
+        assert_eq!(
+            moved.view.signed_netmap.netmap.peers[0].endpoints,
+            vec!["cache-b:444".to_string()]
+        );
+        // A change of the node store file from outside gives a new view.
+        let path = scratch.0.join("nodes.json");
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(&path, text.replace("cache-b:444", "cache-b:445")).unwrap();
+        let edited = coord.netmap_cached("cache-a").unwrap();
+        assert_eq!(
+            edited.view.signed_netmap.netmap.peers[0].endpoints,
+            vec!["cache-b:445".to_string()]
+        );
+        // A policy change gives a new view with new grants.
+        let policy = r#"{"acls": [{"action": "accept",
+            "src": ["spiffe://orblx.local/node/cache-b"], "proto": "tcp",
+            "dst": ["spiffe://orblx.local/node/cache-a:22"]}]}"#;
+        fs::write(scratch.0.join("policy.hujson"), policy).unwrap();
+        let granted = coord.netmap_cached("cache-a").unwrap();
+        assert_ne!(granted.digest, edited.digest);
+        assert_eq!(granted.view.signed_grants.grants.grants.len(), 1);
+        // The cached view is the view that a new signature gives: a second coordinator on
+        // the same state has no cache and gives the same digest.
+        let other = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+        let fresh = other.netmap_cached("cache-a").unwrap();
+        assert_eq!(fresh.digest, granted.digest);
     }
 
     #[test]
