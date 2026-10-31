@@ -372,6 +372,10 @@ field`. The first problem in the log is the reason. An INVALID row
 does not count: the summary line `Invalid rows (...): ...` names it and the sweep exits 1 (as
 for `Failed rows`). A FAIL stays a FAIL. A skipped proof is not checked.
 
+Since W25-35 (#132), `proof_lock_end` also prints `proof_contention_invalid LABEL ...` and
+exits 3 when `unknown_samples` is more than 0. When the proof gave its pass line and the
+wrapper exit is 3 with that line in the log, the sweep marks the row INVALID, not FAIL.
+
 To check one log by hand:
 
 ```

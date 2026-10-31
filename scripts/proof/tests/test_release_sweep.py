@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 import unittest
 
+from fake_docker import SUDO_FAILS, with_fake_docker
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SWEEP = os.path.join(HERE, "..", "release-sweep.sh")
 REAL_MANIFEST = os.path.join(HERE, "..", "sweep-manifest.txt")
@@ -100,13 +102,18 @@ class ReleaseSweepTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         # A fake docker first on the sweep tool PATH ($CARGO_HOME/bin): "docker ps" works (no
         # containers), so the contention probe has unknown_samples 0, unless the file
-        # docker-fails exists (then docker ps fails and each sample is unknown).
+        # docker-fails exists (then docker ps fails and each sample is unknown). W25-35: when
+        # docker ps fails, the probe tries "sudo -n docker ps"; the sudo stand-in always fails.
         self.cargo_home = os.path.join(self.tmp, "cargo")
         os.makedirs(os.path.join(self.cargo_home, "bin"))
         docker = os.path.join(self.cargo_home, "bin", "docker")
         with open(docker, "w") as f:
             f.write('#!/bin/sh\n[ -f "%s" ] && exit 1\nexit 0\n' % os.path.join(self.tmp, "docker-fails"))
         os.chmod(docker, 0o755)
+        sudo = os.path.join(self.cargo_home, "bin", "sudo")
+        with open(sudo, "w") as f:
+            f.write(SUDO_FAILS)
+        os.chmod(sudo, 0o755)
         self.root = os.path.join(self.tmp, "root")
         self.out = os.path.join(self.tmp, "out")
         os.makedirs(os.path.join(self.root, "scripts", "proof"))
@@ -144,7 +151,8 @@ class ReleaseSweepTest(unittest.TestCase):
         os.makedirs(os.path.join(self.root, "docs"), exist_ok=True)
         with open(os.path.join(self.root, "docs", "matrix-rows.txt"), "w") as f:
             f.write(self.rows_for(manifest))
-        env = dict(os.environ)
+        # W25-35: the sampler of the proof lock uses a docker stand-in, which prints no names.
+        env = with_fake_docker(dict(os.environ))
         env.update({
             "ORBLX_SWEEP_TEST_ROOT": self.root,
             "ORBLX_SWEEP_OUT": self.out,
@@ -154,6 +162,8 @@ class ReleaseSweepTest(unittest.TestCase):
             "ORBLX_SWEEP_MIN_FREE_GB": "0",
         })
         env.pop("OLD_ORBLX", None)
+        # release-sweep.sh sets PATH for each proof; its first dir is "$CARGO_HOME/bin" (the
+        # docker and sudo stand-ins of setUp).
         env["CARGO_HOME"] = self.cargo_home
         env["ORBLX_SWEEP_WORK"] = os.path.join(self.tmp, "work")
         env.update(extra_env or {})
@@ -525,6 +535,10 @@ class ReleaseSweepTest(unittest.TestCase):
         self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
         res = self.rows()[("1", "slow")][3]
         self.assertRegex(res, r"^INVALID: proof_ok but unknown_samples [1-9]\d* in proof_contention rc3-sweep:slow$")
+        # W25-35: the probe printed its invalid line and stopped the wrapper with exit 3; the row
+        # is INVALID, not FAIL.
+        with open(os.path.join(self.out, "rc3-sweep-testsha-slow.log")) as f:
+            self.assertRegex(f.read(), r"(?m)^proof_contention_invalid rc3-sweep:slow unknown_samples [1-9]")
         self.assertIn("Failed rows: none.", self.table())
         self.assertIn("they do not count): 1", self.table())
         self.assertIn("Invalid proofs: ", self.table())

@@ -288,6 +288,9 @@ class ProofLockQueueTest(unittest.TestCase):
         )
         lib = os.path.join(REPO, "scripts", "proof", "proof-lock.sh")
         env = dict(os.environ, ORBLX_PROOF_LOCK=lock, ORBLX_PROOF_LOCK_NOTE_SECS="1", ORBLX_PROOF_SAMPLE_SECS="1")
+        # W25-35: the sampler uses a docker stand-in, which prints no names.
+        from fake_docker import with_fake_docker
+        env = with_fake_docker(env)
         procs = []
         heads = []
         for label, hold in [("holder", "3"), ("first", "1"), ("second", "1"), ("third", "1")]:

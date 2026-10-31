@@ -858,12 +858,19 @@ for i in "${!P_NAME[@]}"; do
     ' release-sweep-step-logs "$ROOT" "${P_STEPS[$i]}" >>"$log" 2>&1 </dev/null || true
   fi
   ok_re="${P_OK[$i]}"
-  if [[ "$rc" -eq 0 ]] && has_line "$ok_re" <"$log"; then
+  # W25-35 (proof-lock.sh): when unknown_samples is more than 0, proof_lock_end prints a
+  # "proof_contention_invalid LABEL ..." line and exits 3. A proof that gave its pass line and
+  # then stopped only for that reason is INVALID (its contention is not known), not FAIL.
+  probe_exit=0
+  if [[ "$rc" -eq 3 ]] && has_line '^proof_contention_invalid ' <"$log"; then
+    probe_exit=1
+  fi
+  if [[ "$rc" -eq 0 || "$probe_exit" -eq 1 ]] && has_line "$ok_re" <"$log" \
+    && ! verdict="$(contention_verdict "$log" "$name")"; then
+    result="INVALID: proof_ok but $verdict"
+    invalid=$((invalid + 1))
+  elif [[ "$rc" -eq 0 ]] && has_line "$ok_re" <"$log"; then
     result="proof_ok"
-    if ! verdict="$(contention_verdict "$log" "$name")"; then
-      result="INVALID: proof_ok but $verdict"
-      invalid=$((invalid + 1))
-    fi
   else
     failed=$((failed + 1))
     if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
