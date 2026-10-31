@@ -58,6 +58,12 @@ fn a_generic_issuer_token_enrolls_a_node_and_bad_tokens_fail() {
     let rs = TestKey::generate("rs1", KeyAlg::RS256).unwrap();
     let es = TestKey::generate("es1", KeyAlg::ES256).unwrap();
     let now = SystemTime::now();
+    coord.enable_config_audit().unwrap();
+    for user in ["oidc:alice", "oidc:bob"] {
+        coord
+            .approve_user_by(user, "spiffe://orblx.local/node/owner", now)
+            .unwrap();
+    }
 
     let token = mint(&rs, &spec("alice"), None).unwrap();
     assert!(matches!(

@@ -1,0 +1,124 @@
+# User approval proof stack (W25-15).
+# idp is the [C] OIDC test issuer. coord runs COORD_IMAGE, so the script can start the
+# store with a coordinator from before the change and then change to the new one.
+# owner and srv enroll with tokens. The OIDC users enroll nina-pc and mia-pc.
+# nina-pc enrolls with --wait-approval and then starts, in one container.
+name: orblx-w25o-users
+
+services:
+  idp:
+    image: orblx-w25o-users:new
+    entrypoint: ["orblx-test-idp"]
+    command: [serve, --dir, /idp, --issuer, "https://idp:8443", --listen, "0.0.0.0:8443"]
+    volumes:
+      - orblx-w25o-users-idp:/idp
+      - orblx-w25o-users-tokens:/tokens
+    networks: [proof]
+
+  coord:
+    image: ${COORD_IMAGE:?set COORD_IMAGE}
+    entrypoint: ["orblx"]
+    command:
+      [coord, serve, --state, /var/lib/orblx, --listen, "0.0.0.0:443", --name, coord,
+       --policy, /policy/policy.hujson, --config, /etc/orblx/coord.toml]
+    volumes:
+      - orblx-w25o-users-store:/var/lib/orblx
+      - ${POLICY_DIR:?set POLICY_DIR}:/policy:ro
+      - ${CONFIG_FILE:?set CONFIG_FILE}:/etc/orblx/coord.toml:ro
+      - ${IDP_CA_FILE:?set IDP_CA_FILE}:/etc/orblx/idp-ca.pem:ro
+    networks: [proof]
+
+  owner:
+    image: orblx-w25o-users:new
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    volumes:
+      - orblx-w25o-users-store:/coord-state:ro
+      - orblx-w25o-users-tokens:/tokens:ro
+      - orblx-w25o-users-owner:/var/lib/orblx
+    networks: [proof]
+
+  srv:
+    image: orblx-w25o-users:new
+    profiles: ["nodes"]
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    command: [up, --state-dir, /var/lib/orblx, --listen, "0.0.0.0:443", --coord, "${COORD_ADDR:?set COORD_ADDR}", --bundle, /var/lib/orblx/bundle.pem, --coord-name, coord]
+    environment:
+      COORD_ADDR: ${COORD_ADDR:?set COORD_ADDR}
+    volumes:
+      - orblx-w25o-users-store:/coord-state:ro
+      - orblx-w25o-users-tokens:/tokens:ro
+      - orblx-w25o-users-srv:/var/lib/orblx
+    networks: [proof]
+
+  mia-pc:
+    image: orblx-w25o-users:new
+    profiles: ["nodes"]
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    command: [up, --state-dir, /var/lib/orblx, --listen, "0.0.0.0:443", --coord, "${COORD_ADDR:?set COORD_ADDR}", --bundle, /var/lib/orblx/bundle.pem, --coord-name, coord]
+    environment:
+      COORD_ADDR: ${COORD_ADDR:?set COORD_ADDR}
+    volumes:
+      - orblx-w25o-users-store:/coord-state:ro
+      - orblx-w25o-users-tokens:/tokens:ro
+      - orblx-w25o-users-mia-pc:/var/lib/orblx
+    networks: [proof]
+
+  rex-pc:
+    image: orblx-w25o-users:new
+    profiles: ["nodes"]
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    command: [up, --state-dir, /var/lib/orblx, --listen, "0.0.0.0:443", --coord, "${COORD_ADDR:?set COORD_ADDR}", --bundle, /var/lib/orblx/bundle.pem, --coord-name, coord]
+    environment:
+      COORD_ADDR: ${COORD_ADDR:?set COORD_ADDR}
+    volumes:
+      - orblx-w25o-users-store:/coord-state:ro
+      - orblx-w25o-users-tokens:/tokens:ro
+      - orblx-w25o-users-rex-pc:/var/lib/orblx
+    networks: [proof]
+
+  nina-pc:
+    image: orblx-w25o-users:new
+    profiles: ["nodes"]
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["sh", "-c"]
+    command: ["orblx coord enroll --name nina-pc --coord $$COORD_ADDR --bundle /coord-state/trust-bundle.pem --id-token-file /tokens/nina --state /var/lib/orblx --endpoint nina-pc:443 --wait-approval 300 && exec orblx up --state-dir /var/lib/orblx --listen 0.0.0.0:443 --coord $$COORD_ADDR --bundle /var/lib/orblx/bundle.pem --coord-name coord"]
+    environment:
+      COORD_ADDR: ${COORD_ADDR:?set COORD_ADDR}
+    volumes:
+      - orblx-w25o-users-store:/coord-state:ro
+      - orblx-w25o-users-tokens:/tokens:ro
+      - orblx-w25o-users-nina-pc:/var/lib/orblx
+    networks: [proof]
+
+volumes:
+  orblx-w25o-users-idp:
+  orblx-w25o-users-tokens:
+  orblx-w25o-users-store:
+  orblx-w25o-users-owner:
+  orblx-w25o-users-srv:
+  orblx-w25o-users-mia-pc:
+  orblx-w25o-users-rex-pc:
+  orblx-w25o-users-nina-pc:
+
+networks:
+  proof:
