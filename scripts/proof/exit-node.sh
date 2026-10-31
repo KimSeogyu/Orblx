@@ -56,6 +56,10 @@ cleanup() {
 . "$PROOF_LIB_DIR/proof-lock.sh"
 trap 'cleanup; proof_lock_end' EXIT
 proof_lock_take "exit-node"
+# W25-14b: start from a clean compose state (all profiles, all volumes).
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
+proof_compose_clean "orblx-exit-proof" || exit 1
 
 dc() {
   "${DOCKER[@]}" compose --env-file "$WORK/proof.env" --progress quiet -f "$FILE" "$@"

@@ -210,7 +210,7 @@ ROOT_PROOFS = ["coord-enroll.sh", "split-dns.sh", "svid-renew.sh", "w18-names.sh
 PROOFS_WITH_OWN_LOCK = sorted(
     f for f in os.listdir(os.path.join(REPO, "scripts", "proof"))
     if f.endswith(".sh") and f not in {
-        "proof-lock.sh", "pipe-lib.sh", "serve-lib.sh", "stage-image.sh", "entrypoint.sh", "nat-router.sh",
+        "proof-lock.sh", "pipe-lib.sh", "compose-clean.sh", "serve-lib.sh", "stage-image.sh", "entrypoint.sh", "nat-router.sh",
         # The rc.3 release sweep is a driver, not a proof. It builds before the lock (so no proof
         # waits for a build) and takes the lock for each proof it runs (test_release_sweep.py).
         "release-sweep.sh"}
@@ -287,11 +287,22 @@ class ProofLockQueueTest(unittest.TestCase):
         lib = os.path.join(REPO, "scripts", "proof", "proof-lock.sh")
         env = dict(os.environ, ORBLX_PROOF_LOCK=lock, ORBLX_PROOF_LOCK_NOTE_SECS="1", ORBLX_PROOF_SAMPLE_SECS="1")
         procs = []
+        heads = []
         for label, hold in [("holder", "3"), ("first", "1"), ("second", "1"), ("third", "1")]:
-            procs.append(subprocess.Popen(["bash", "-c", script, lib, label, order, hold], env=env,
-                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
-            time.sleep(0.4)
-        outs = [p.communicate(timeout=60)[0] for p in procs]
+            proc = subprocess.Popen(["bash", "-c", script, lib, label, order, hold], env=env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            # W25-19: start the next proof only after this one is in the queue. The holder is in
+            # the queue when it has the lock. A waiter is in the queue when it prints its first
+            # proof_context line, because the ticket is made before that line.
+            mark = "proof_lock holder acquired" if label == "holder" else f"proof_context {label} phase queued"
+            head = ""
+            while mark not in head:
+                line = proc.stdout.readline()
+                self.assertTrue(line, f"{label} ended before {mark!r}: {head}")
+                head += line
+            procs.append(proc)
+            heads.append(head)
+        outs = [h + p.communicate(timeout=60)[0] for h, p in zip(heads, procs)]
         self.assertEqual([p.returncode for p in procs], [0, 0, 0, 0], outs)
         with open(order) as f:
             events = [l.split() for l in f.read().split("\n") if l]
@@ -326,6 +337,37 @@ class SteadyPingGateTest(unittest.TestCase):
         self.assertIn("prc_sym steady lost 0/50 max_ms 121.701 limit_ms 100", res.stdout)
         self.assertIn("max ping RTT 121.701 ms is more than 100 ms", res.stderr)
 
+    @staticmethod
+    def sample(ms):
+        return ("64 bytes from 100.64.0.2: icmp_seq=1 ttl=64 time=0.412 ms\n"
+                "64 bytes from 100.64.0.2: icmp_seq=2 ttl=64 time=%s ms\n"
+                "64 bytes from 100.64.0.2: icmp_seq=3 ttl=64 time=0.398 ms\n"
+                "50 packets transmitted, 50 received, 0%% packet loss, time 10087ms\n"
+                "rtt min/avg/max/mdev = 0.214/4.100/%s/1.000 ms\n" % (ms, ms))
+
+    def nat_gate(self, text):
+        return subprocess.run(["bash", "-c", '. "$0"; set -euo pipefail; steady_ping_gate prc_sym 50 1 200 100',
+                               PIPE_LIB], input=text, capture_output=True, text=True)
+
+    def test_a_201_ms_sample_fails_the_stall_limit(self):
+        res = self.nat_gate(self.sample("201"))
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("max ping RTT 201 ms is more than 200 ms", res.stderr)
+        self.assertIn("steady_warn prc_sym icmp_seq 2 ms 201 warn_ms 100 limit_ms 200 time ", res.stdout)
+
+    def test_a_150_ms_sample_passes_with_a_steady_warn_line(self):
+        res = self.nat_gate(self.sample("150"))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        warn = [line for line in res.stdout.splitlines() if line.startswith("steady_warn ")]
+        self.assertEqual(len(warn), 1, res.stdout)
+        self.assertRegex(warn[0], r"^steady_warn prc_sym icmp_seq 2 ms 150 warn_ms 100 limit_ms 200 "
+                                  r"time \d{4}-\d\d-\d\dT\S+ proof_context ")
+
+    def test_no_steady_warn_line_at_or_below_100_ms(self):
+        res = self.nat_gate(self.sample("100"))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("steady_warn", res.stdout)
+
     def test_a_normal_run_passes(self):
         res = self.gate(self.GOOD)
         self.assertEqual(res.returncode, 0, res.stderr)
@@ -340,7 +382,9 @@ class SteadyPingGateTest(unittest.TestCase):
             text = f.read()
         body = text[text.index("steady_pings() {"):]
         body = body[: body.index("\n}\n")]
-        self.assertIn('steady_ping_gate "$label" "$PINGS" "$MAX_LOSS" "$STEADY_MAX_MS" || exit 1', body)
+        self.assertIn('steady_ping_gate "$label" "$PINGS" "$MAX_LOSS" "$STEADY_MAX_MS" "$STEADY_WARN_MS" || exit 1', body)
+        self.assertIn('STEADY_MAX_MS="${ORBLX_NATR_STEADY_MAX_MS:-200}"', text)
+        self.assertIn("STEADY_WARN_MS=100", text)
         # proof_ok comes after the last steady ping run.
         self.assertGreater(text.rindex("proof_ok"), text.rindex("\nsteady_pings "))
 

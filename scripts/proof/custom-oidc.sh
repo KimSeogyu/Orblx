@@ -25,6 +25,10 @@ CLIENT="orblx-proof"
 . "$PROOF_LIB_DIR/proof-lock.sh"
 trap proof_lock_end EXIT
 proof_lock_take "custom-oidc"
+# W25-14b: start from a clean compose state (all profiles, all volumes).
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
+proof_compose_clean "orblx-oidc-proof" || exit 1
 : > "$IDP_CA_FILE"
 
 cleanup() {
