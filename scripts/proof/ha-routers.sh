@@ -61,7 +61,7 @@ cleanup() {
   fi
   proof_lock_end || true
 }
-trap cleanup EXIT
+trap 'cleanup' EXIT
 
 fail() {
   echo "FAIL: $1" >&2
