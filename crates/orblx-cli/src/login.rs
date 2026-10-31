@@ -148,6 +148,8 @@ fn login(
         routes,
     })
     .map_err(|err| err.to_string())?;
+    // W25-34: a new enrollment is the local reset of the last netmap seq.
+    orblx_coord::reset_node_seq(state).map_err(|err| err.to_string())?;
     result.write_state(state).map_err(|err| err.to_string())?;
     println!("enrolled");
     println!("name {}", result.name);

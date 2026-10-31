@@ -5,7 +5,7 @@ use orblx_identity::SpiffeId;
 
 use crate::error::CoordError;
 use crate::netmap::{
-    decode_hex_32, encode_hex, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap,
+    decode_hex_32, encode_hex, verify_grants_wire, verify_netmap_wire, verify_signed_endpoint,
     SignedNetmap,
 };
 use crate::proto::{self, GrantAsk, Request, Response};
@@ -1018,7 +1018,7 @@ fn enroll_from_response(
         response.ticket_not_after,
         response.svid_ca_pub_hex.clone(),
     )?;
-    let signed = response
+    let wire = response
         .netmap
         .ok_or_else(|| CoordError::Protocol("The netmap is not valid.".to_string()))?;
     let endpoints = response.endpoints.unwrap_or_default();
@@ -1036,11 +1036,12 @@ fn enroll_from_response(
             return Err(CoordError::Signature);
         }
     }
-    verify_signed_netmap(&signed, &public)?;
+    // W25-34: check the signature over the received bytes, then parse them.
+    let signed = verify_netmap_wire(&wire, &public)?;
     let grants = response
         .grants
         .ok_or_else(|| CoordError::Protocol("The grants are not valid.".to_string()))?;
-    verify_signed_grants(&grants, &public)?;
+    let grants = verify_grants_wire(&grants, &public)?;
     let receiver = format!("spiffe://orblx.local/node/{}", signed.netmap.self_node.name);
     if grants.grants.receiver != receiver {
         return Err(CoordError::Protocol(

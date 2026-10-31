@@ -85,10 +85,18 @@ The node SSH server (russh) checks in this order:
 7. The serial or the key_id is not in the netmap `ssh_revoked` list, and the client node or the
    user is not in the deny list.
 
-The SSH server refuses a new certificate login when the netmap is older than 60 s (the node writes
-`netmap-fresh` after each good policy-wait reply; with no change the coordinator replies each 20 s).
-After a failed policy-wait, a node that has a netmap tries again after 2 s and asks for a reply at
-once. Thus one failed reply does not make a false stale refusal while the coordinator is up.
+Before the checks, each new certificate login reads the signed netmap (Crypto C3, W25-34 #131).
+The SSH server calls `orblx_coord::read_verified_netmap` (it checks the netmap signature over
+the stored bytes of `netmap.signed.json`) and `orblx_datapath::netmap_fresh`. The age uses only
+the signed `issued_at_ms`. The server refuses the login with `stale-netmap` when the signed
+netmap is absent, fails the check, has no stamp, or is older than 60 s. It refuses with
+`future-netmap` when `issued_at_ms` is more than 60 s after the node clock. The CA set and the
+revoked list come from the same signed netmap.
+
+The coordinator signs a new stamp at least each 15 s (the W25-34 heartbeat), and `policy-wait`
+replies at that time. After a failed policy-wait, a node that has a netmap tries again after
+2 s and asks for a reply at once. Thus one failed reply does not make a false stale refusal
+while the coordinator is up.
 
 SSH certificate logins need a coordinator reachable within the last 60 s. Mesh traffic does not.
 Each deny writes 1 deny record in `ssh-audit.jsonl`.

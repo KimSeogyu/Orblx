@@ -398,6 +398,16 @@ pub fn apply_node_lock(dir: &Path, netmap: &mut Netmap) -> Result<Option<LockRep
 }
 
 /// Print one report. The text holds node names and counts only.
+/// Write the netmap file again after node lock dropped peers (W25-34).
+///
+/// The function writes a temp file, syncs it, and renames it. A reader or a crash never
+/// sees a part of the file: the file has the old netmap or the new netmap.
+pub fn write_locked_netmap(path: &Path, netmap: &Netmap) -> Result<(), CoordError> {
+    let text = serde_json::to_string(netmap)
+        .map_err(|_| CoordError::Protocol("The netmap is not valid.".to_string()))?;
+    write_text(path, &text, 0o644)
+}
+
 pub fn print_report(report: &LockReport) {
     println!(
         "node lock version {} keys {} keeps {} drops {}",
@@ -608,6 +618,8 @@ mod tests {
             split_dns: Vec::new(),
             ssh_user_ca: Vec::new(),
             ssh_revoked: Vec::new(),
+            seq: 0,
+            issued_at_ms: 0,
         };
         let untouched = netmap.clone();
         let mut plain = netmap.clone();
@@ -627,6 +639,60 @@ mod tests {
         assert_eq!(read_node_lock(&dir).unwrap().unwrap().version, 1);
         // A different pin is refused while the file exists.
         assert!(trust_keys(&dir, &[k1.key_id()]).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn node_lock_drop_write_is_atomic() {
+        // W25-34 crash test: a reader during the node lock drop write always sees one full
+        // netmap, the old one or the new one. A temp file that a crash left changes nothing.
+        let dir = temp_dir("atomic");
+        let path = dir.join("netmap.json");
+        let mut big = Netmap {
+            version: 1,
+            self_node: NetmapSelf {
+                name: "a".to_string(),
+                overlay_ip: "100.64.0.1".to_string(),
+                owner: String::new(),
+            },
+            peers: (2..200)
+                .map(|n| peer(&format!("p{n}"), &format!("100.64.0.{n}")))
+                .collect(),
+            lock: Vec::new(),
+            split_dns: Vec::new(),
+            ssh_user_ca: Vec::new(),
+            ssh_revoked: Vec::new(),
+            seq: 0,
+            issued_at_ms: 0,
+        };
+        write_locked_netmap(&path, &big).unwrap();
+        let small = {
+            big.peers.truncate(1);
+            big.clone()
+        };
+        std::fs::write(dir.join("netmap.json.tmp"), b"{\"version\":").unwrap();
+        assert!(Netmap::from_path(&path).is_ok());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let stop = stop.clone();
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let mut reads = 0_u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let bytes = std::fs::read(&path).unwrap();
+                    assert!(Netmap::from_slice(&bytes).is_ok(), "a torn netmap file");
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        let full = Netmap::from_path(&path).unwrap();
+        for round in 0..300 {
+            let next = if round % 2 == 0 { &small } else { &full };
+            write_locked_netmap(&path, next).unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(reader.join().unwrap() > 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -392,7 +392,7 @@ impl SshHandler {
             return refuse(self, node_id, CertRefuse::SourceAddress);
         };
         let now_unix = unix_now();
-        let netmap = match fresh_netmap(&self.shared.state_dir, now_unix) {
+        let netmap = match fresh_netmap(&self.shared.state_dir, unix_now_ms()) {
             Ok(netmap) => netmap,
             Err(refused) => return refuse(self, node_id, refused),
         };
@@ -1330,6 +1330,13 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
@@ -1975,7 +1982,8 @@ mod tests {
         // A stale netmap refuses a new certificate login.
         let fresh = testkit::Spec::user("oidc:alice", "laptop", 502, now);
         let fresh_cert = testkit::sign(&ca, &key, &fresh);
-        crate::cert::write_fresh_stamp(&dir, now - 120).unwrap();
+        let ca_lines = [testkit::ca_line(&ca)];
+        testkit::write_netmap_at(&dir, &ca_lines, &[], (now - 120) * 1000);
         assert!(session_within(request(login(&key, &fresh_cert)))
             .await
             .is_err());

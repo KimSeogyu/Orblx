@@ -8,17 +8,68 @@ use orblx_edge::endpoint_sign_payload;
 use orblx_identity::ReceiverGrants;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 use crate::error::CoordError;
 use crate::ippool::is_overlay_ip;
 
-/// One signed netmap document.
+/// One signed netmap document that passed the signature check, or that this coordinator signed.
 ///
-/// `sig` is the base64 Ed25519 signature over the canonical JSON of `netmap`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// `sig` is the base64 Ed25519 signature over the exact bytes of the `netmap` JSON object.
+/// The type keeps those bytes (W25-34). The JSON text of the type puts those bytes back
+/// unchanged. The type has no `Deserialize`: a reader gets the type only from
+/// [`verify_netmap_wire`], which checks the signature over the received bytes first and
+/// then parses them.
+#[derive(Debug, Clone)]
 pub struct SignedNetmap {
     pub netmap: Netmap,
+    pub sig: String,
+    pub key_id: String,
+    signed_bytes: Box<RawValue>,
+}
+
+impl PartialEq for SignedNetmap {
+    fn eq(&self, other: &Self) -> bool {
+        self.netmap == other.netmap
+            && self.sig == other.sig
+            && self.key_id == other.key_id
+            && self.signed_bytes.get() == other.signed_bytes.get()
+    }
+}
+
+impl Eq for SignedNetmap {}
+
+impl SignedNetmap {
+    /// The exact signed bytes of the `netmap` object.
+    #[must_use]
+    pub fn signed_bytes(&self) -> &[u8] {
+        self.signed_bytes.get().as_bytes()
+    }
+
+    /// The wire form with the exact signed bytes.
+    #[must_use]
+    pub fn to_wire(&self) -> SignedNetmapWire {
+        SignedNetmapWire {
+            netmap: self.signed_bytes.clone(),
+            sig: self.sig.clone(),
+            key_id: self.key_id.clone(),
+        }
+    }
+}
+
+impl Serialize for SignedNetmap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.to_wire().serialize(serializer)
+    }
+}
+
+/// The received form of one signed netmap (W25-34).
+///
+/// `netmap` holds the received bytes of the JSON object, with no parse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedNetmapWire {
+    pub netmap: Box<RawValue>,
     pub sig: String,
     pub key_id: String,
 }
@@ -26,10 +77,50 @@ pub struct SignedNetmap {
 /// The receiver grant set, signed with the netmap key.
 ///
 /// `sig` is the base64 Ed25519 signature over the canonical JSON of `grants`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// The type keeps the exact signed bytes of `grants` (W25-34), as [`SignedNetmap`] does.
+/// A reader gets the type only from [`verify_grants_wire`].
+#[derive(Debug, Clone)]
 pub struct SignedGrants {
     pub grants: ReceiverGrants,
+    pub sig: String,
+    pub key_id: String,
+    signed_bytes: Box<RawValue>,
+}
+
+impl PartialEq for SignedGrants {
+    fn eq(&self, other: &Self) -> bool {
+        self.grants == other.grants
+            && self.sig == other.sig
+            && self.key_id == other.key_id
+            && self.signed_bytes.get() == other.signed_bytes.get()
+    }
+}
+
+impl Eq for SignedGrants {}
+
+impl SignedGrants {
+    /// The wire form with the exact signed bytes.
+    #[must_use]
+    pub fn to_wire(&self) -> SignedGrantsWire {
+        SignedGrantsWire {
+            grants: self.signed_bytes.clone(),
+            sig: self.sig.clone(),
+            key_id: self.key_id.clone(),
+        }
+    }
+}
+
+impl Serialize for SignedGrants {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.to_wire().serialize(serializer)
+    }
+}
+
+/// The received form of one signed grant set (W25-34).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedGrantsWire {
+    pub grants: Box<RawValue>,
     pub sig: String,
     pub key_id: String,
 }
@@ -91,6 +182,7 @@ impl NetmapKey {
             netmap: payload.clone(),
             sig,
             key_id: self.key_id(),
+            signed_bytes: raw_value(&bytes)?,
         })
     }
 
@@ -105,6 +197,7 @@ impl NetmapKey {
             grants: grants.clone(),
             sig,
             key_id: self.key_id(),
+            signed_bytes: raw_value(&bytes)?,
         })
     }
 
@@ -128,26 +221,105 @@ impl NetmapKey {
     }
 }
 
-pub fn verify_signed_netmap(signed: &SignedNetmap, public: &[u8; 32]) -> Result<(), CoordError> {
-    if signed.key_id != encode_hex(public) {
+/// Check the signature of one received netmap over the received bytes, then parse them (W25-34).
+///
+/// The parse uses `deny_unknown_fields`. There is no parse before the signature check.
+pub fn verify_netmap_wire(
+    wire: &SignedNetmapWire,
+    public: &[u8; 32],
+) -> Result<SignedNetmap, CoordError> {
+    if wire.key_id != encode_hex(public) {
         return Err(CoordError::Signature);
     }
-    validate_payload(&signed.netmap)?;
-    let bytes = canonical_payload(&signed.netmap)?;
-    verify_b64(public, &bytes, &signed.sig)
+    let bytes = wire.netmap.get().as_bytes();
+    verify_b64(public, bytes, &wire.sig)?;
+    let netmap: Netmap = serde_json::from_slice(bytes)
+        .map_err(|_| CoordError::Protocol("The netmap is not valid.".to_string()))?;
+    validate_payload(&netmap)?;
+    Ok(SignedNetmap {
+        netmap,
+        sig: wire.sig.clone(),
+        key_id: wire.key_id.clone(),
+        signed_bytes: raw_value(bytes)?,
+    })
 }
 
-pub fn verify_signed_grants(signed: &SignedGrants, public: &[u8; 32]) -> Result<(), CoordError> {
-    if signed.key_id != encode_hex(public) {
+/// Check the signature of one received grant set over the received bytes, then parse them
+/// (W25-34).
+pub fn verify_grants_wire(
+    wire: &SignedGrantsWire,
+    public: &[u8; 32],
+) -> Result<SignedGrants, CoordError> {
+    if wire.key_id != encode_hex(public) {
         return Err(CoordError::Signature);
     }
-    signed
-        .grants
+    let bytes = wire.grants.get().as_bytes();
+    verify_b64(public, bytes, &wire.sig)?;
+    let grants: ReceiverGrants = serde_json::from_slice(bytes)
+        .map_err(|_| CoordError::Protocol("The grants are not valid.".to_string()))?;
+    grants
         .check()
         .map_err(|err| CoordError::Protocol(err.to_string()))?;
-    let bytes = serde_json::to_vec(&signed.grants)
+    Ok(SignedGrants {
+        grants,
+        sig: wire.sig.clone(),
+        key_id: wire.key_id.clone(),
+        signed_bytes: raw_value(bytes)?,
+    })
+}
+
+/// Parse and check one signed grant file text (W25-34).
+pub fn grants_from_slice(bytes: &[u8], public: &[u8; 32]) -> Result<SignedGrants, CoordError> {
+    let wire: SignedGrantsWire = serde_json::from_slice(bytes)
         .map_err(|_| CoordError::Protocol("The grants are not valid.".to_string()))?;
-    verify_b64(public, &bytes, &signed.sig)
+    verify_grants_wire(&wire, public)
+}
+
+/// Parse and check one signed netmap file text (W25-34).
+pub fn netmap_from_slice(bytes: &[u8], public: &[u8; 32]) -> Result<SignedNetmap, CoordError> {
+    let wire: SignedNetmapWire = serde_json::from_slice(bytes)
+        .map_err(|_| CoordError::Protocol("The netmap is not valid.".to_string()))?;
+    verify_netmap_wire(&wire, public)
+}
+
+/// Check one signed netmap over its kept bytes.
+///
+/// The struct must be the parse of those bytes. A changed field makes the check fail.
+pub fn verify_signed_netmap(signed: &SignedNetmap, public: &[u8; 32]) -> Result<(), CoordError> {
+    let checked = verify_netmap_wire(&signed.to_wire(), public)?;
+    if checked.netmap != signed.netmap || checked.sig != signed.sig {
+        return Err(CoordError::Signature);
+    }
+    Ok(())
+}
+
+/// Check one signed grant set over its kept bytes.
+pub fn verify_signed_grants(signed: &SignedGrants, public: &[u8; 32]) -> Result<(), CoordError> {
+    let checked = verify_grants_wire(&signed.to_wire(), public)?;
+    if checked.grants != signed.grants || checked.sig != signed.sig {
+        return Err(CoordError::Signature);
+    }
+    Ok(())
+}
+
+/// Read and check the signed netmap in one node state directory (W25-34).
+///
+/// The function reads `netmap.signed.json` and `netmap.pub`, checks the signature over the
+/// stored bytes, then parses them. An SSH certificate login uses the signed `issued_at_ms`
+/// of the result with [`orblx_datapath::netmap_fresh`].
+pub fn read_verified_netmap(state_dir: &std::path::Path) -> Result<SignedNetmap, CoordError> {
+    let public_text =
+        std::fs::read_to_string(state_dir.join("netmap.pub")).map_err(CoordError::io)?;
+    let public = decode_hex_32(public_text.trim())?;
+    let bytes = std::fs::read(state_dir.join("netmap.signed.json")).map_err(CoordError::io)?;
+    netmap_from_slice(&bytes, &public)
+}
+
+fn raw_value(bytes: &[u8]) -> Result<Box<RawValue>, CoordError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| CoordError::Protocol("The signed bytes are not valid.".to_string()))?;
+    RawValue::from_string(text.to_string())
+        .map_err(|_| CoordError::Protocol("The signed bytes are not valid.".to_string()))
 }
 
 pub fn verify_signed_endpoint(
@@ -243,6 +415,9 @@ pub fn decode_hex_32(text: &str) -> Result<[u8; 32], CoordError> {
 mod tests {
     use orblx_datapath::{Netmap, NetmapPeer, NetmapSelf};
 
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
     use super::{verify_signed_endpoint, verify_signed_netmap, NetmapKey};
 
     fn sample() -> Netmap {
@@ -267,6 +442,8 @@ mod tests {
             split_dns: Vec::new(),
             ssh_user_ca: Vec::new(),
             ssh_revoked: Vec::new(),
+            seq: 0,
+            issued_at_ms: 0,
         }
     }
 
@@ -323,6 +500,178 @@ mod tests {
         let mut open = signed.clone();
         open.grants.filter = false;
         assert!(super::verify_signed_grants(&open, &key.public()).is_err());
+    }
+
+    #[test]
+    fn tampered_stamp_is_rejected() {
+        // W25-34: seq and issued_at_ms are inside the existing netmap signature.
+        let key = NetmapKey::generate();
+        let mut stamped = sample();
+        stamped.seq = 1_800_000_000_000;
+        stamped.issued_at_ms = 1_800_000_000_000;
+        let signed = key.sign_netmap(&stamped).unwrap();
+        verify_signed_netmap(&signed, &key.public()).unwrap();
+        let mut seq = signed.clone();
+        seq.netmap.seq += 1;
+        assert!(verify_signed_netmap(&seq, &key.public()).is_err());
+        let mut issued = signed.clone();
+        issued.netmap.issued_at_ms += 1;
+        assert!(verify_signed_netmap(&issued, &key.public()).is_err());
+        // The same change in the received bytes fails too.
+        let text = serde_json::to_string(&signed).unwrap();
+        let bumped = text.replace("1800000000000,", "1800000000001,");
+        assert_ne!(bumped, text);
+        assert!(super::netmap_from_slice(bumped.as_bytes(), &key.public()).is_err());
+        let back = super::netmap_from_slice(text.as_bytes(), &key.public()).unwrap();
+        assert_eq!(back, signed);
+    }
+
+    #[test]
+    fn verify_uses_the_received_bytes_then_parses() {
+        use ed25519_dalek::Signer;
+        let key = NetmapKey::generate();
+        // Bytes that are not the canonical form of the struct still verify: the check uses
+        // the received bytes, not a new serialization.
+        let pretty = serde_json::to_string_pretty(&sample()).unwrap();
+        let sig = STANDARD.encode(key.signing.sign(pretty.as_bytes()).to_bytes());
+        let wire = format!(
+            r#"{{"netmap":{pretty},"sig":"{sig}","key_id":"{}"}}"#,
+            key.key_id()
+        );
+        let signed = super::netmap_from_slice(wire.as_bytes(), &key.public()).unwrap();
+        assert_eq!(signed.netmap, sample());
+        assert_eq!(signed.signed_bytes(), pretty.as_bytes());
+        assert_eq!(serde_json::to_string(&signed).unwrap(), wire);
+        // A signed netmap with an unknown field fails the parse after the check.
+        let extra = r#"{"version":1,"self":{"name":"server","overlay_ip":"100.64.0.1"},"peers":[],"extra":1}"#;
+        let sig = STANDARD.encode(key.signing.sign(extra.as_bytes()).to_bytes());
+        let wire = format!(
+            r#"{{"netmap":{extra},"sig":"{sig}","key_id":"{}"}}"#,
+            key.key_id()
+        );
+        assert!(super::netmap_from_slice(wire.as_bytes(), &key.public()).is_err());
+        // A duplicate key is refused by the parse.
+        let dup = r#"{"version":1,"version":1,"self":{"name":"server","overlay_ip":"100.64.0.1"},"peers":[]}"#;
+        let sig = STANDARD.encode(key.signing.sign(dup.as_bytes()).to_bytes());
+        let wire = format!(
+            r#"{{"netmap":{dup},"sig":"{sig}","key_id":"{}"}}"#,
+            key.key_id()
+        );
+        assert!(super::netmap_from_slice(wire.as_bytes(), &key.public()).is_err());
+        // An unknown field next to the netmap is refused.
+        let text = serde_json::to_string(&key.sign_netmap(&sample()).unwrap()).unwrap();
+        let outer = text.replacen('{', r#"{"seq":9,"#, 1);
+        assert!(super::netmap_from_slice(outer.as_bytes(), &key.public()).is_err());
+    }
+
+    #[test]
+    fn grants_verify_uses_the_received_bytes() {
+        use ed25519_dalek::Signer;
+        let key = NetmapKey::generate();
+        let grants =
+            r#"{ "version": 1, "receiver": "spiffe://orblx.local/node/box", "grants": [] }"#;
+        let sig = STANDARD.encode(key.signing.sign(grants.as_bytes()).to_bytes());
+        let wire = format!(
+            r#"{{"grants":{grants},"sig":"{sig}","key_id":"{}"}}"#,
+            key.key_id()
+        );
+        let signed = super::grants_from_slice(wire.as_bytes(), &key.public()).unwrap();
+        assert_eq!(signed.grants.receiver, "spiffe://orblx.local/node/box");
+        super::verify_signed_grants(&signed, &key.public()).unwrap();
+        assert_eq!(serde_json::to_string(&signed).unwrap(), wire);
+        let tampered = wire.replace("\"grants\": []", "\"grants\":  []");
+        assert!(super::grants_from_slice(tampered.as_bytes(), &key.public()).is_err());
+    }
+
+    /// W25-34 CI guard: the signed netmap and grant structs keep a strict JSON form.
+    ///
+    /// The test fails when one of these structs loses `deny_unknown_fields`, or gets a map,
+    /// a float, `untagged`, or `flatten`, or when a new struct is not in the list.
+    #[test]
+    fn signed_structs_keep_a_strict_form() {
+        let datapath = include_str!("../../orblx-datapath/src/netmap.rs");
+        let identity = include_str!("../../orblx-identity/src/policy.rs");
+        let coord = include_str!("netmap.rs");
+        let datapath_types = [
+            "Netmap",
+            "SplitDns",
+            "NodeLockSig",
+            "LockUpdate",
+            "NetmapSelf",
+            "NetmapPeer",
+            "SshRevoked",
+        ];
+        let identity_types = ["ReceiverGrants", "ReceiverGrant", "SubnetGrant"];
+        let coord_types = ["SignedNetmapWire", "SignedGrantsWire"];
+        let mut known: Vec<&str> = datapath_types.to_vec();
+        known.extend(identity_types);
+        known.extend(coord_types);
+        for (text, names) in [
+            (datapath, &datapath_types[..]),
+            (identity, &identity_types[..]),
+            (coord, &coord_types[..]),
+        ] {
+            for name in names {
+                check_strict(text, name, &known);
+            }
+        }
+        // Each struct in the datapath netmap file is in the list.
+        for line in datapath.lines() {
+            if let Some(rest) = line.strip_prefix("pub struct ") {
+                let name = rest.split([' ', '{', '(']).next().unwrap();
+                assert!(datapath_types.contains(&name), "add {name} to the guard");
+            }
+        }
+    }
+
+    fn check_strict(text: &str, name: &str, known: &[&str]) {
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.trim() == format!("pub struct {name} {{"))
+            .unwrap_or_else(|| panic!("the guard did not find {name}"));
+        let mut attrs = Vec::new();
+        for line in lines[..start].iter().rev() {
+            let line = line.trim();
+            if line.starts_with("#[") {
+                attrs.push(line);
+            } else if !line.starts_with("///") {
+                break;
+            }
+        }
+        assert!(
+            attrs.contains(&"#[serde(deny_unknown_fields)]"),
+            "{name} has no deny_unknown_fields"
+        );
+        let end = start + lines[start..].iter().position(|line| *line == "}").unwrap();
+        let body = lines[start..=end].join("\n");
+        let body = body.replace("Box<RawValue>", "");
+        for word in [
+            "untagged", "flatten", "HashMap", "BTreeMap", "f32", "f64", "Value",
+        ] {
+            assert!(!body.contains(word), "{name} has {word}");
+        }
+        for line in &lines[start + 1..end] {
+            let line = line.trim();
+            if let Some(field) = line.strip_prefix("pub ") {
+                let (_, ty) = field.split_once(": ").unwrap();
+                let ty = ty.trim_end_matches(',');
+                assert!(allowed_type(ty, known), "{name} has the field type {ty}");
+            }
+        }
+    }
+
+    fn allowed_type(ty: &str, known: &[&str]) -> bool {
+        const PLAIN: [&str; 7] = ["String", "bool", "u8", "u16", "u32", "u64", "Box<RawValue>"];
+        if PLAIN.contains(&ty) || known.contains(&ty) {
+            return true;
+        }
+        for wrap in ["Vec<", "Option<"] {
+            if let Some(inner) = ty.strip_prefix(wrap).and_then(|ty| ty.strip_suffix('>')) {
+                return allowed_type(inner, known);
+            }
+        }
+        false
     }
 
     #[test]

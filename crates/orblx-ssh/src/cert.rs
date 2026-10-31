@@ -30,11 +30,8 @@ use russh::keys::ssh_key::{Certificate, PublicKey};
 /// The largest clock skew for the validity window in seconds.
 pub const CERT_SKEW_SECS: u64 = 60;
 
-/// The file with the Unix time of the last good netmap sync from the coordinator.
-pub const NETMAP_FRESH_FILE: &str = "netmap-fresh";
-
-/// The oldest netmap sync for a new certificate login in seconds.
-pub const NETMAP_MAX_AGE_SECS: u64 = 60;
+/// The oldest signed netmap for a new certificate login in seconds (W25-34 `NETMAP_MAX_AGE_MS`).
+pub const NETMAP_MAX_AGE_SECS: u64 = orblx_datapath::NETMAP_MAX_AGE_MS / 1000;
 
 /// Why the server refused one certificate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,8 +58,10 @@ pub enum CertRefuse {
     Revoked,
     /// The key ID does not name a node SVID.
     KeyId,
-    /// The netmap is too old or absent.
+    /// The signed netmap is older than 60 s, has no stamp, is absent, or fails the signature check.
     StaleNetmap,
+    /// The signed netmap `issued_at_ms` is more than 60 s after the node clock (Crypto C3).
+    FutureNetmap,
 }
 
 impl CertRefuse {
@@ -82,6 +81,7 @@ impl CertRefuse {
             Self::Revoked => "revoked",
             Self::KeyId => "key-id",
             Self::StaleNetmap => "stale-netmap",
+            Self::FutureNetmap => "future-netmap",
         }
     }
 
@@ -89,7 +89,7 @@ impl CertRefuse {
     #[must_use]
     pub fn audit_reason(self) -> DenyReason {
         match self {
-            Self::Validity | Self::StaleNetmap => DenyReason::Expired,
+            Self::Validity | Self::StaleNetmap | Self::FutureNetmap => DenyReason::Expired,
             Self::Policy | Self::SourceAddress => DenyReason::Destination,
             Self::RevokedSerial | Self::Revoked => DenyReason::Revoked,
             Self::NotUser
@@ -261,27 +261,24 @@ pub fn source_contains(list: &str, peer: IpAddr) -> bool {
     })
 }
 
-/// Read the netmap of this node and check its age.
+/// Read the signed netmap of this node and check its age (W25-31, Crypto C3).
 ///
-/// The SSH server refuses a new certificate login when the last good sync is older than
-/// [`NETMAP_MAX_AGE_SECS`], or when the netmap or the stamp is absent.
-pub fn fresh_netmap(state_dir: &std::path::Path, now_unix: u64) -> Result<Netmap, CertRefuse> {
-    let stamp = std::fs::read_to_string(state_dir.join(NETMAP_FRESH_FILE))
-        .ok()
-        .and_then(|text| text.trim().parse::<u64>().ok())
-        .ok_or(CertRefuse::StaleNetmap)?;
-    if now_unix.saturating_sub(stamp) > NETMAP_MAX_AGE_SECS {
+/// The function uses only the signed `issued_at_ms` of `netmap.signed.json`
+/// ([`orblx_coord::read_verified_netmap`] and [`orblx_datapath::netmap_fresh`]).
+/// It refuses a new certificate login when the signature check fails, when the netmap has no
+/// stamp or is older than 60 s ([`CertRefuse::StaleNetmap`]), or when `issued_at_ms` is more
+/// than 60 s after `now_ms` ([`CertRefuse::FutureNetmap`]).
+pub fn fresh_netmap(state_dir: &std::path::Path, now_ms: u64) -> Result<Netmap, CertRefuse> {
+    let signed =
+        orblx_coord::read_verified_netmap(state_dir).map_err(|_| CertRefuse::StaleNetmap)?;
+    let issued_at_ms = signed.netmap.issued_at_ms;
+    if issued_at_ms > now_ms.saturating_add(orblx_datapath::NETMAP_MAX_SKEW_MS) {
+        return Err(CertRefuse::FutureNetmap);
+    }
+    if !orblx_datapath::netmap_fresh(issued_at_ms, now_ms) {
         return Err(CertRefuse::StaleNetmap);
     }
-    Netmap::from_path(&state_dir.join("netmap.json")).map_err(|_| CertRefuse::StaleNetmap)
-}
-
-/// Write the sync stamp (the caller is the node daemon after a good `policy-wait` reply).
-pub fn write_fresh_stamp(state_dir: &std::path::Path, now_unix: u64) -> std::io::Result<()> {
-    let path = state_dir.join(NETMAP_FRESH_FILE);
-    let tmp = state_dir.join(format!("{NETMAP_FRESH_FILE}.tmp"));
-    std::fs::write(&tmp, format!("{now_unix}\n"))?;
-    std::fs::rename(tmp, path)
+    Ok(signed.netmap)
 }
 
 /// Refuse a caller that is not root (W25-31).
@@ -393,12 +390,24 @@ pub(crate) mod testkit {
         builder.sign(ca).unwrap()
     }
 
-    /// Write a netmap with the CA set and the revoked list, and a fresh sync stamp.
+    /// Write a signed netmap with the CA set and the revoked list, issued at `now` (Unix s).
     pub(crate) fn write_netmap(
         dir: &std::path::Path,
         ca: &[String],
         revoked: &[orblx_datapath::SshRevoked],
         now: u64,
+    ) {
+        write_netmap_at(dir, ca, revoked, now.saturating_mul(1000));
+    }
+
+    /// Write a signed netmap with the CA set, the revoked list, and one `issued_at_ms`.
+    ///
+    /// The test key signs the netmap. `netmap.pub` holds its public key.
+    pub(crate) fn write_netmap_at(
+        dir: &std::path::Path,
+        ca: &[String],
+        revoked: &[orblx_datapath::SshRevoked],
+        issued_at_ms: u64,
     ) {
         let map = serde_json::json!({
             "version": 1,
@@ -407,10 +416,22 @@ pub(crate) mod testkit {
             "ssh_user_ca": ca,
             "ssh_revoked": revoked,
         });
+        let mut netmap: orblx_datapath::Netmap = serde_json::from_value(map).unwrap();
+        netmap.seq = issued_at_ms.max(1);
+        netmap.issued_at_ms = issued_at_ms;
+        let key = orblx_coord::NetmapKey::from_seed(&[7; 32]);
+        let signed = key.sign_netmap(&netmap).unwrap();
+        std::fs::write(
+            dir.join("netmap.pub"),
+            format!("{}\n", orblx_coord::encode_hex(&key.public())),
+        )
+        .unwrap();
+        let tmp = dir.join("netmap.signed.json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&signed).unwrap()).unwrap();
+        std::fs::rename(&tmp, dir.join("netmap.signed.json")).unwrap();
         let tmp = dir.join("netmap.json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec(&map).unwrap()).unwrap();
+        std::fs::write(&tmp, serde_json::to_vec(&netmap.without_stamp()).unwrap()).unwrap();
         std::fs::rename(&tmp, dir.join("netmap.json")).unwrap();
-        super::write_fresh_stamp(dir, now).unwrap();
     }
 }
 
@@ -623,22 +644,59 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("orblx-ssh-fresh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let now = 1_800_000_000;
+        let now_ms = 1_800_000_000_000;
+        let ca = [testkit::ca_line(&testkit::key(1))];
+        // No signed netmap.
         assert_eq!(
-            fresh_netmap(&dir, now).unwrap_err(),
+            fresh_netmap(&dir, now_ms).unwrap_err(),
             CertRefuse::StaleNetmap
         );
-        testkit::write_netmap(&dir, &[testkit::ca_line(&testkit::key(1))], &[], now);
-        assert_eq!(fresh_netmap(&dir, now + 60).unwrap().ssh_user_ca.len(), 1);
+        testkit::write_netmap_at(&dir, &ca, &[], now_ms);
         assert_eq!(
-            fresh_netmap(&dir, now + 61).unwrap_err(),
+            fresh_netmap(&dir, now_ms + 60_000)
+                .unwrap()
+                .ssh_user_ca
+                .len(),
+            1
+        );
+        // Crypto C3: an age above 60 s is refused.
+        assert_eq!(
+            fresh_netmap(&dir, now_ms + 60_001).unwrap_err(),
             CertRefuse::StaleNetmap
         );
-        std::fs::remove_file(dir.join("netmap.json")).unwrap();
+        // A changed signed netmap fails the signature check.
+        let path = dir.join("netmap.signed.json");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("100.64.0.10", "100.64.0.11")).unwrap();
         assert_eq!(
-            fresh_netmap(&dir, now).unwrap_err(),
+            fresh_netmap(&dir, now_ms).unwrap_err(),
             CertRefuse::StaleNetmap
         );
+        // A netmap with no stamp is refused.
+        testkit::write_netmap_at(&dir, &ca, &[], 0);
+        assert_eq!(
+            fresh_netmap(&dir, now_ms).unwrap_err(),
+            CertRefuse::StaleNetmap
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_netmap_issued_more_than_60_s_ahead_refuses_new_logins() {
+        // Crypto C3: the signed issued_at_ms more than 60 s after the node clock is refused.
+        let dir = std::env::temp_dir().join(format!("orblx-ssh-future-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now_ms = 1_800_000_000_000;
+        let ca = [testkit::ca_line(&testkit::key(1))];
+        testkit::write_netmap_at(&dir, &ca, &[], now_ms + 60_000);
+        assert!(fresh_netmap(&dir, now_ms).is_ok());
+        testkit::write_netmap_at(&dir, &ca, &[], now_ms + 60_001);
+        assert_eq!(
+            fresh_netmap(&dir, now_ms).unwrap_err(),
+            CertRefuse::FutureNetmap
+        );
+        assert_eq!(CertRefuse::FutureNetmap.as_str(), "future-netmap");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

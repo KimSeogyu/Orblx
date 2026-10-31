@@ -211,7 +211,7 @@ wait_path() {
 wait_ca() {
   local node="$1" i
   for i in $(seq 1 60); do
-    if dc exec -T "$node" sh -c "test -s $STATE/netmap-fresh && jq -e '.ssh_user_ca | length == 2' $STATE/netmap.json" >/dev/null 2>&1; then
+    if dc exec -T "$node" sh -c "jq -e '.netmap.issued_at_ms > 0 and (.netmap.ssh_user_ca | length == 2)' $STATE/netmap.signed.json" >/dev/null 2>&1; then
       echo "node ${node} netmap ssh_user_ca 2 fresh"
       return 0
     fi
@@ -563,11 +563,11 @@ echo "chain record 2"
 
 echo "=== [C] gate: idle ${IDLE_SECS} s with the coordinator up: the netmap stays fresh ==="
 # No change in the coordinator. Node a logs in to node b each ${IDLE_STEP} s.
-# Each 5 s the script reads the age of the fresh stamp on node b. The limit is 60 s.
+# Each 5 s the script reads the age of the signed issued_at_ms on node b. The limit is 60 s.
 stamp_age() {
-  dc exec -T b sh -c "echo \$(( \$(date +%s) - \$(cat $STATE/netmap-fresh) ))" | tr -d '\r'
+  dc exec -T b sh -c "echo \$(( (\$(date +%s%3N) - \$(jq -r .netmap.issued_at_ms $STATE/netmap.signed.json)) / 1000 ))" | tr -d '\r'
 }
-refused_before="$(dc logs b 2>&1 | grep -c 'ssh certificate refused serial [0-9]* reason stale-netmap' || true)"
+refused_before="$(dc logs b 2>&1 | grep -Ec 'ssh certificate refused serial [0-9]* reason (stale|future)-netmap' || true)"
 idle_start="$(date +%s)"
 idle_logins=0
 idle_refused=0
@@ -587,7 +587,7 @@ while (( $(date +%s) - idle_start < IDLE_SECS + 1 )); do
   fi
   sleep 5
 done
-refused_after="$(dc logs b 2>&1 | grep -c 'ssh certificate refused serial [0-9]* reason stale-netmap' || true)"
+refused_after="$(dc logs b 2>&1 | grep -Ec 'ssh certificate refused serial [0-9]* reason (stale|future)-netmap' || true)"
 echo "idle_secs $(( $(date +%s) - idle_start )) logins ${idle_logins} refused ${idle_refused} stale_refusals $((refused_after - refused_before)) max_stamp_age_s ${idle_max_age}"
 (( idle_logins >= IDLE_SECS / IDLE_STEP ))
 (( idle_refused == 0 ))

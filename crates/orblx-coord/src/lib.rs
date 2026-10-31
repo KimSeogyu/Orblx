@@ -28,6 +28,9 @@ pub mod nodelock;
 mod proto;
 #[cfg(test)]
 mod renew_test;
+mod seq;
+#[cfg(test)]
+mod seq_test;
 mod server;
 mod share;
 #[cfg(test)]
@@ -64,14 +67,20 @@ pub use config::{CoordConfig, OidcSection};
 pub use error::{CoordError, USER_PENDING_TEXT, USER_REJECTED_TEXT};
 pub use http_util::{fetch_google_jwks_blocking, post_google_token_blocking};
 pub use netmap::{
-    decode_hex_32, encode_hex, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap,
-    NetmapKey, SignedEndpoint, SignedGrants, SignedNetmap,
+    decode_hex_32, encode_hex, grants_from_slice, netmap_from_slice, read_verified_netmap,
+    verify_grants_wire, verify_netmap_wire, verify_signed_endpoint, verify_signed_grants,
+    verify_signed_netmap, NetmapKey, SignedEndpoint, SignedGrants, SignedGrantsWire, SignedNetmap,
+    SignedNetmapWire,
 };
 pub use proto::{GrantAsk, SshCertAsk};
+pub use seq::{
+    read_node_seq, reset_node_seq, unix_ms, Intake, COORD_SEQ_FILE, HEARTBEAT_MS, NODE_SEQ_FILE,
+};
 pub use server::serve_blocking;
 pub use state::{
     oidc_config, read_node_material, Coordinator, EnrollResult, IssuerFetch, NetmapView,
-    OidcConfig, SshIssueError, CONFIG_AUDIT_FILE, ISSUER_JWKS_TTL_SECS, ISSUER_REFETCH_SECS,
+    OidcConfig, SshIssueError, ViewWrite, CONFIG_AUDIT_FILE, ISSUER_JWKS_TTL_SECS,
+    ISSUER_REFETCH_SECS,
 };
 pub use store::{CreatedToken, StoredUser, UserState};
 
@@ -278,7 +287,7 @@ mod tests {
         assert_eq!(view.signed_netmap.netmap.peers[0].overlay_ip, "100.64.0.2");
         let node_text = fs::read_to_string(node_a.0.join("netmap.json")).unwrap();
         let parsed = orblx_datapath::Netmap::from_slice(node_text.as_bytes()).unwrap();
-        assert_eq!(parsed, view.signed_netmap.netmap);
+        assert_eq!(parsed, view.signed_netmap.netmap.without_stamp());
         assert!(!node_text.contains("\"sig\""));
         let reused = super::client::enroll_with_token(
             addr,

@@ -158,6 +158,8 @@ struct Inner {
     ssh_certs: crate::sshca::CertBook,
     /// The single-use SSH request nonces (W25-31).
     ssh_nonces: crate::sshca::NonceBook,
+    /// The signed netmap `seq` allocator (W25-34).
+    seq: Mutex<crate::seq::SeqBook>,
 }
 
 /// The coordinator state.
@@ -323,6 +325,7 @@ impl Coordinator {
                 ssh_ca,
                 ssh_certs,
                 ssh_nonces: crate::sshca::NonceBook::default(),
+                seq: Mutex::new(crate::seq::SeqBook::open(dir)?),
             })),
         };
         {
@@ -528,6 +531,13 @@ impl Coordinator {
         let mut inner = self.lock()?;
         reload(&mut inner)?;
         sign_view(&inner, name)
+    }
+
+    /// The time until the netmap of one node needs a signed heartbeat (W25-34).
+    pub fn netmap_heartbeat_in(&self, name: &str) -> Result<Duration, CoordError> {
+        let inner = self.lock()?;
+        let book = inner.seq.lock().map_err(|_| CoordError::State)?;
+        Ok(book.heartbeat_in(name, crate::seq::unix_ms(SystemTime::now())))
     }
 
     /// Store advertised subnet routes and return a fresh signed netmap.
@@ -1860,7 +1870,7 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
             });
         }
     }
-    let payload = Netmap {
+    let mut payload = Netmap {
         version: 1,
         self_node: NetmapSelf {
             name: self_node.name.clone(),
@@ -1876,10 +1886,28 @@ fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
             Vec::new()
         },
         ssh_revoked: ssh_revoked_set(inner)?,
+        seq: 0,
+        issued_at_ms: 0,
     };
-    let signed_netmap = inner.netmap_key.sign_netmap(&payload)?;
     let receiver = SpiffeId::node(&self_node.name)?;
     let grants = filtered_grants(inner, &receiver, &self_node, self_visible);
+    // W25-34: the same view content within the heartbeat time gets the same stamp.
+    // A change of the netmap, the grants, or the endpoints gets a new seq.
+    let invalid = || CoordError::Protocol("The netmap is not valid.".to_string());
+    let mut content = Sha256::new();
+    content.update(serde_json::to_vec(&payload).map_err(|_| invalid())?);
+    content.update(b"\0");
+    content.update(serde_json::to_vec(&grants).map_err(|_| invalid())?);
+    content.update(b"\0");
+    content.update(serde_json::to_vec(&endpoints).map_err(|_| invalid())?);
+    let (seq, issued_at_ms) = inner.seq.lock().map_err(|_| CoordError::State)?.stamp(
+        &self_node.name,
+        content.finalize().into(),
+        crate::seq::unix_ms(SystemTime::now()),
+    )?;
+    payload.seq = seq;
+    payload.issued_at_ms = issued_at_ms;
+    let signed_netmap = inner.netmap_key.sign_netmap(&payload)?;
     let signed_grants = inner.netmap_key.sign_grants(&grants)?;
     let netmap_public = inner.netmap_key.public();
     verify_signed_netmap(&signed_netmap, &netmap_public)?;
@@ -2260,7 +2288,16 @@ fn write_ticket_files(dir: &Path, ticket: &IssuedTicket) -> Result<(), CoordErro
 }
 
 impl NetmapView {
+    /// Write the view to the node state directory.
+    ///
+    /// The function sets the directory mode to `0700` again (W25-34).
     pub fn write_state(&self, dir: &Path) -> Result<(), CoordError> {
+        self.write_state_checked(dir).map(|_| ())
+    }
+
+    /// Write the view and tell what changed (W25-34).
+    pub fn write_state_checked(&self, dir: &Path) -> Result<ViewWrite, CoordError> {
+        create_private_dir(dir)?;
         write_view(
             dir,
             &self.signed_netmap,
@@ -2270,13 +2307,39 @@ impl NetmapView {
     }
 }
 
+/// What one view write changed on the node (W25-34).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewWrite {
+    /// The same `seq` and the same signed bytes. The node changed no file.
+    Same,
+    /// A new `seq`, and only the stamp changed. The datapath files did not change.
+    StampOnly,
+    /// A new `seq`, and the netmap, the grants, or the endpoints changed.
+    Content,
+}
+
 fn write_view(
     dir: &Path,
     netmap: &SignedNetmap,
     grants: &SignedGrants,
     endpoints: &[SignedEndpoint],
-) -> Result<(), CoordError> {
-    let mut local = netmap.netmap.clone();
+) -> Result<ViewWrite, CoordError> {
+    let now_ms = crate::seq::unix_ms(SystemTime::now());
+    let intake = crate::seq::node_intake(dir, netmap, now_ms)?;
+    let signed_path = dir.join("netmap.signed.json");
+    if intake == crate::seq::Intake::Same {
+        let on_disk = std::fs::read(&signed_path).ok();
+        let current = serde_json::to_vec(netmap).ok();
+        if on_disk.is_some() && on_disk == current {
+            return Ok(ViewWrite::Same);
+        }
+        // The node stopped after it wrote the seq and before it wrote the netmap.
+    } else {
+        // Sync the seq before the netmap files, so a restart never accepts a lower seq.
+        crate::seq::record_node_seq(dir, netmap)?;
+    }
+    // The local copy has no stamp, so a heartbeat does not change `netmap.json`.
+    let mut local = netmap.netmap.without_stamp();
     if let Some(report) = crate::nodelock::apply_node_lock(dir, &mut local)? {
         crate::nodelock::print_report(&report);
     }
@@ -2292,12 +2355,28 @@ fn write_view(
         .map_err(|_| CoordError::Protocol("The grants are not valid.".to_string()))?;
     let signed_grants = serde_json::to_string(grants)
         .map_err(|_| CoordError::Protocol("The grants are not valid.".to_string()))?;
-    write_text(&dir.join("netmap.json"), &netmap_text, 0o644)?;
-    write_text(&dir.join("netmap.signed.json"), &signed_text, 0o644)?;
-    write_text(&dir.join("grants.json"), &grant_text, 0o644)?;
-    write_text(&dir.join("grants.signed.json"), &signed_grants, 0o644)?;
-    write_text(&dir.join("endpoints.json"), &endpoint_text, 0o644)?;
-    Ok(())
+    let mut changed = false;
+    changed |= write_if_changed(&dir.join("netmap.json"), &netmap_text)?;
+    write_text(&signed_path, &signed_text, 0o644)?;
+    changed |= write_if_changed(&dir.join("grants.json"), &grant_text)?;
+    changed |= write_if_changed(&dir.join("grants.signed.json"), &signed_grants)?;
+    changed |= write_if_changed(&dir.join("endpoints.json"), &endpoint_text)?;
+    Ok(if changed {
+        ViewWrite::Content
+    } else {
+        ViewWrite::StampOnly
+    })
+}
+
+/// Write a node file only when its text changes (W25-34).
+///
+/// A file with the same text keeps its bytes and its time, so no reader reloads it.
+fn write_if_changed(path: &Path, text: &str) -> Result<bool, CoordError> {
+    if std::fs::read(path).is_ok_and(|old| old == text.as_bytes()) {
+        return Ok(false);
+    }
+    write_text(path, text, 0o644)?;
+    Ok(true)
 }
 
 pub fn read_node_material(dir: &Path) -> Result<NodeMaterial, CoordError> {

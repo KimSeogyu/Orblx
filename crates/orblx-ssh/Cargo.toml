@@ -11,6 +11,7 @@ base64 = "0.22"
 libc = "0.2"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 orblx-audit = { path = "../orblx-audit" }
+orblx-coord = { path = "../orblx-coord" }
 orblx-datapath = { path = "../orblx-datapath" }
 orblx-identity = { path = "../orblx-identity" }
 russh = { version = "=0.65.0", default-features = false, features = ["ring"] }

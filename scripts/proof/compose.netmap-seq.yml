@@ -1,0 +1,119 @@
+# W25-34 netmap seq proof stack. `docker compose up` starts only the coordinator.
+# The nodes use the nodes profile. Each node runs `orblx up --coord`.
+name: ${PROOF_PROJECT:-orblx-w2534-seq-proof}
+
+x-node: &node
+  image: ${ORBLX_SEQ_IMAGE:-orblx-w2534-seq:local}
+  profiles: ["nodes"]
+  entrypoint: ["orblx"]
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+  devices:
+    - /dev/net/tun:/dev/net/tun
+  sysctls:
+    net.ipv4.conf.all.rp_filter: "0"
+    net.ipv4.conf.default.rp_filter: "0"
+  stop_grace_period: 10s
+
+services:
+  coord:
+    image: ${ORBLX_SEQ_IMAGE:-orblx-w2534-seq:local}
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /etc/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+    volumes:
+      - ${SEQ_COORD_STATE:?set SEQ_COORD_STATE}:/var/lib/orblx
+      - ${SEQ_POLICY_DIR:?set SEQ_POLICY_DIR}:/etc/orblx:ro
+    networks:
+      proof:
+        ipv4_address: 172.30.134.2
+
+  tool:
+    image: ${ORBLX_SEQ_IMAGE:-orblx-w2534-seq:local}
+    profiles: ["tool"]
+    entrypoint: ["orblx"]
+    volumes:
+      - ${SEQ_WORK:?set SEQ_WORK}:/work
+      - ${SEQ_COORD_STATE:?set SEQ_COORD_STATE}:/coord-state:ro
+    networks:
+      - proof
+
+  a:
+    <<: *node
+    volumes:
+      - ${SEQ_A_STATE:?set SEQ_A_STATE}:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.134.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --metrics
+      - 127.0.0.1:9464
+    networks:
+      proof:
+        ipv4_address: 172.30.134.4
+
+  b:
+    <<: *node
+    volumes:
+      - ${SEQ_B_STATE:?set SEQ_B_STATE}:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.134.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --metrics
+      - 127.0.0.1:9464
+    networks:
+      proof:
+        ipv4_address: 172.30.134.5
+
+  c:
+    <<: *node
+    volumes:
+      - ${SEQ_C_STATE:?set SEQ_C_STATE}:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.134.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --metrics
+      - 127.0.0.1:9464
+    networks:
+      proof:
+        ipv4_address: 172.30.134.6
+
+networks:
+  proof:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.134.0/24
+          gateway: 172.30.134.1
+          ip_range: 172.30.134.128/25
