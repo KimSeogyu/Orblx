@@ -8,6 +8,7 @@
 #  2. 0 refusals ("capability ticket check rejected", "leaf check failed", "The end time has passed").
 #  3. 0 lost peers: each status sample shows all 3 peers with path direct.
 #  4. The largest gap between two replies of a pair is TR_GAP_MS or less.
+#     The proof prints one gap line for each ticket end of each node (ticket_end ...).
 #  5. No restart: same container start time, restart count 0, same orblxd pid.
 #  6. A new handshake (a to b) after the ticket ends passes.
 #  7. (TR_REVOKE=1) A revoked node gets no new ticket, and its peers stop it in TR_REVOKE_MS.
@@ -317,8 +318,8 @@ for name in "${NODES[@]}"; do
   [[ "$sha_now" != "${ENROLL_SHA[$name]}" ]] || fail "The node ${name} has the ticket from enroll."
 done
 
-echo "=== gate 3: lost peers ==="
-(( lost == 0 )) || fail "${lost} status samples show a lost peer."
+echo "=== gate 3: lost peers (checked after gate 4b) ==="
+echo "lost_peer_samples ${lost}"
 
 echo "=== gate 4: reply gaps ==="
 worst=0
@@ -337,6 +338,47 @@ for src in "${NODES[@]}"; do
   done
 done
 echo "max_gap_ms_all_pairs ${worst} limit_ms ${TR_GAP_MS}"
+
+# W25-26 PO gate: one gap line for each ticket end of each node.
+# The window starts 1 s before the renewal that replaced that ticket and ends 5 s after
+# the ticket end + MAX_SKEW. The gap is the largest time between two replies in the window
+# on a pair that has the node at one end.
+echo "=== gate 4b: reply gap at each ticket end, per node ==="
+end_lines=0
+end_fail=0
+for name in "${NODES[@]}"; do
+  renews=""
+  for ts in $(dc logs -t --no-log-prefix "$name" 2>&1 | read_all awk '/The node renewed the SVID/ {print $1}'); do
+    renews="${renews} $(date -u -d "$ts" +%s.%N)"
+  done
+  files=()
+  for other in "${NODES[@]}"; do
+    [[ "$other" == "$name" ]] && continue
+    files+=("$WORK/ping-${name}-${other}.txt" "$WORK/ping-${other}-${name}.txt")
+  done
+  for e in ${EXPIRIES[$name]}; do
+    if (( e + SKEW >= RUN_END )); then
+      continue
+    fi
+    r="$(printf '%s\n' $renews | awk -v e="$e" 'NF && $1 + 0 < e + 0 && $1 + 0 > m + 0 {m = $1} END {printf "%.3f", m + 0}')"
+    if awk -v r="$r" 'BEGIN {exit !(r + 0 == 0)}'; then
+      echo "ticket_end node ${name} end_unix ${e} renew_at none"
+      end_fail=$((end_fail + 1))
+      continue
+    fi
+    ws="$(awk -v r="$r" 'BEGIN {printf "%.3f", r - 1}')"
+    we=$(( e + SKEW + 5 ))
+    g="$(awk -v a="$ws" -v b="$we" 'FNR == 1 {p = ""} /bytes from/ {ts = $1; gsub(/[\[\]]/, "", ts); if (p != "" && ts + 0 >= a + 0 && p + 0 <= b + 0) {d = (ts - p) * 1000; if (d > m) m = d}; p = ts} END {printf "%.0f", m + 0}' "${files[@]}")"
+    echo "ticket_end node ${name} end_unix ${e} renew_at ${r} renew_before_end_s $(awk -v e="$e" -v r="$r" 'BEGIN {printf "%.1f", e - r}') window ${ws}-${we} max_gap_ms ${g} limit_ms ${TR_GAP_MS}"
+    end_lines=$((end_lines + 1))
+    if (( g > TR_GAP_MS )); then
+      end_fail=$((end_fail + 1))
+    fi
+  done
+done
+echo "ticket_end_lines ${end_lines} ticket_end_gaps_above_limit ${end_fail}"
+(( lost == 0 )) || fail "${lost} status samples show a lost peer."
+(( end_fail == 0 )) || fail "${end_fail} ticket ends have a reply gap above ${TR_GAP_MS} ms or no renewal."
 (( worst <= TR_GAP_MS )) || fail "A reply gap of ${worst} ms is above ${TR_GAP_MS} ms."
 
 echo "=== gate 5: no restart ==="
