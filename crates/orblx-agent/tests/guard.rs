@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ed25519_dalek::SigningKey;
 use orblx_agent::{
     open_use, seal_use, sign_grant, AgentGrant, GrantDir, GrantFiles, GrantRefresh, GuardConfig,
-    GuardCore, GuardDecision, SignedAgentGrant, UseTarget, UseTrust, GRANT_VERSION,
+    GuardCore, GuardDecision, NodeDeny, SignedAgentGrant, UseTarget, UseTrust, GRANT_VERSION,
 };
 use orblx_audit::{verify_config_file, ConfigAction, DenyReason};
 use orblx_identity::{
@@ -32,9 +32,12 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn fixture(ttl: u64) -> Fixture {
+    fixture_signed(ttl, TicketSigner::generate())
+}
+
+fn fixture_signed(ttl: u64, signer: TicketSigner) -> Fixture {
     let start = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
     let ca = MiniCa::generate(start).unwrap();
-    let signer = TicketSigner::generate();
     let netmap = SigningKey::from_bytes(&[7u8; 32]);
     let node = SpiffeId::node("b").unwrap();
     let agent = SpiffeId::agent("bot").unwrap();
@@ -335,63 +338,153 @@ fn a_stale_deny_set_refuses_each_use() {
     assert!(matches!(decision, GuardDecision::Refuse("stale")));
 }
 
+/// The ticket seed of the grant sets in the grant directory tests.
+const DIR_SEED: [u8; 32] = [5u8; 32];
+
 /// One grant set with a new id and, when given, a new service.
-fn grant_set(ttl: u64, id: &str, service: Option<&str>) -> GrantFiles {
-    let fixture = fixture(ttl);
+/// It returns the set and its ticket nonce in hex.
+fn grant_set(ttl: u64, id: &str, service: Option<&str>) -> (GrantFiles, String) {
+    let fixture = fixture_signed(ttl, TicketSigner::from_seed(&DIR_SEED));
     let mut grant = fixture.files.grant.grant.clone();
     grant.id = id.to_string();
     if let Some(service) = service {
         grant.service = service.to_string();
     }
-    GrantFiles {
+    let files = GrantFiles {
         grant: sign_grant(&fixture.netmap, &grant).unwrap(),
         ..fixture.files
-    }
+    };
+    (files, fixture.nonce_hex)
+}
+
+/// A node state directory with a ticket verifier and a deny list.
+fn node_state(name: &str, nonces: &[&str]) -> PathBuf {
+    let state = temp_path(name).parent().unwrap().to_path_buf();
+    std::fs::write(
+        state.join("ticket-verifier.pem"),
+        TicketSigner::from_seed(&DIR_SEED).public_key_pem(),
+    )
+    .unwrap();
+    write_deny(&state, nonces);
+    state
+}
+
+fn write_deny(state: &std::path::Path, nonces: &[&str]) {
+    let list: Vec<String> = nonces.iter().map(|nonce| format!("\"{nonce}\"")).collect();
+    let text = format!(
+        r#"{{"version":{},"generated_at":1,"revoked_uris":[],"revoked_ticket_nonces":[{}]}}"#,
+        nonces.len() + 1,
+        list.join(",")
+    );
+    std::fs::write(state.join("deny.json"), text).unwrap();
 }
 
 #[test]
 fn a_grant_dir_takes_only_a_complete_newer_grant_with_the_same_scope() {
     let dir = temp_path("grant-dir").with_file_name("grant");
-    let first = grant_set(30, "00000000000000a1", None);
+    let state = node_state("grant-dir-state", &[]);
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_001);
+    let (first, _) = grant_set(30, "00000000000000a1", None);
     first.write(&dir).unwrap();
-    let mut grants = GrantDir::open(&dir).unwrap();
-    assert_eq!(grants.refresh(), GrantRefresh::Same);
+    let mut grants = GrantDir::open(&dir, NodeDeny::new(&state)).unwrap();
+    assert_eq!(grants.refresh_at(now), GrantRefresh::Same);
 
     // A newer grant with the same scope replaces the current grant.
-    let second = grant_set(60, "00000000000000a2", None);
+    let (second, _) = grant_set(60, "00000000000000a2", None);
     second.write(&dir).unwrap();
     assert_eq!(
-        grants.refresh(),
+        grants.refresh_at(now),
         GrantRefresh::Switched {
             from: "00000000000000a1".to_string(),
             to: "00000000000000a2".to_string(),
         }
     );
-    assert_eq!(grants.refresh(), GrantRefresh::Same);
+    assert_eq!(grants.refresh_at(now), GrantRefresh::Same);
 
     // A mixed set (a write that is not complete) does not replace it.
-    let third = grant_set(90, "00000000000000a3", None);
+    let (third, _) = grant_set(90, "00000000000000a3", None);
     third.write(&dir).unwrap();
     std::fs::write(dir.join("ticket.bin"), &second.ticket).unwrap();
-    assert_eq!(grants.refresh(), GrantRefresh::Kept("incomplete"));
+    assert_eq!(grants.refresh_at(now), GrantRefresh::Kept("incomplete"));
     assert!(GrantFiles::load(&dir).is_err());
     third.write(&dir).unwrap();
     std::fs::write(dir.join("agent.key.pem"), &second.key_pem).unwrap();
-    assert_eq!(grants.refresh(), GrantRefresh::Kept("incomplete"));
+    assert_eq!(grants.refresh_at(now), GrantRefresh::Kept("incomplete"));
     assert_eq!(grants.files().grant.grant.id, "00000000000000a2");
 
     // When the write is complete, the agent takes the grant.
     third.write(&dir).unwrap();
-    assert!(matches!(grants.refresh(), GrantRefresh::Switched { .. }));
+    assert!(matches!(
+        grants.refresh_at(now),
+        GrantRefresh::Switched { .. }
+    ));
     assert_eq!(grants.files().grant.grant.id, "00000000000000a3");
 
     // Another scope or an earlier end does not replace the current grant.
     grant_set(120, "00000000000000b1", Some("db"))
+        .0
         .write(&dir)
         .unwrap();
-    assert_eq!(grants.refresh(), GrantRefresh::Kept("scope"));
-    grant_set(40, "00000000000000b2", None).write(&dir).unwrap();
-    assert_eq!(grants.refresh(), GrantRefresh::Kept("older"));
+    assert_eq!(grants.refresh_at(now), GrantRefresh::Kept("scope"));
+    grant_set(40, "00000000000000b2", None)
+        .0
+        .write(&dir)
+        .unwrap();
+    assert_eq!(grants.refresh_at(now), GrantRefresh::Kept("older"));
     assert_eq!(grants.files().grant.grant.id, "00000000000000a3");
     let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+/// W25-30 gate: a revoked next grant is never taken, and the check fails closed.
+#[test]
+fn a_grant_dir_never_takes_a_revoked_next_grant() {
+    let dir = temp_path("grant-revoked").with_file_name("grant");
+    let state = node_state("grant-revoked-state", &[]);
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_001);
+    let (first, _) = grant_set(30, "00000000000000c1", None);
+    first.write(&dir).unwrap();
+    let mut grants = GrantDir::open(&dir, NodeDeny::new(&state)).unwrap();
+
+    // The deny list holds the ticket nonce of the next grant.
+    let (revoked, nonce) = grant_set(60, "00000000000000c2", None);
+    write_deny(&state, &[&nonce]);
+    revoked.write(&dir).unwrap();
+    assert_eq!(grants.refresh_at(now), GrantRefresh::Kept("revoked"));
+    assert_eq!(grants.refresh_at(now), GrantRefresh::Same);
+    assert_eq!(grants.files().grant.grant.id, "00000000000000c1");
+
+    // With no deny list, the agent keeps the current grant and checks again later.
+    std::fs::remove_file(state.join("deny.json")).unwrap();
+    let (next, _) = grant_set(90, "00000000000000c3", None);
+    next.write(&dir).unwrap();
+    assert_eq!(grants.refresh_at(now), GrantRefresh::Kept("deny-unknown"));
+    assert_eq!(grants.files().grant.grant.id, "00000000000000c1");
+
+    // A ticket from another signer is not taken.
+    write_deny(&state, &[]);
+    let (other, _) = fixture_with_other_signer(120, "00000000000000c4");
+    other.write(&dir).unwrap();
+    assert_eq!(grants.refresh_at(now), GrantRefresh::Kept("ticket"));
+
+    // A good grant after the deny list is back is taken.
+    next.write(&dir).unwrap();
+    assert!(matches!(
+        grants.refresh_at(now),
+        GrantRefresh::Switched { .. }
+    ));
+    assert_eq!(grants.files().grant.grant.id, "00000000000000c3");
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+fn fixture_with_other_signer(ttl: u64, id: &str) -> (GrantFiles, String) {
+    let fixture = fixture(ttl);
+    let mut grant = fixture.files.grant.grant.clone();
+    grant.id = id.to_string();
+    let files = GrantFiles {
+        grant: sign_grant(&fixture.netmap, &grant).unwrap(),
+        ..fixture.files
+    };
+    (files, fixture.nonce_hex)
 }

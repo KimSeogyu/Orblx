@@ -5,6 +5,8 @@
 # next grant, the owner approves it, and the agent fetches it to the same
 # grant directory. The loop reads the directory again before each connection.
 # The coordinator issues each ticket through the normal fetch path.
+# Phase 2 (gate): a second loop must never take a next grant with another
+# scope or a revoked next grant. It stops at the grant end with deny expired.
 # The script does not print enroll tokens, private keys, tickets, or use proofs.
 set -euo pipefail
 # shellcheck source=scripts/proof/pipe-lib.sh
@@ -26,6 +28,8 @@ LEAD_SECS="${RENEW_LEAD_SECS:-20}"
 EVERY_MS=50
 GAP_LIMIT_MS=200
 GRANT_DIR="$STATE/agent-cur"
+GATE_DIR="$STATE/agent-gate"
+STAGE_DIR="$STATE/agent-stage"
 
 as_root() {
   if [[ "$(id -u)" -eq 0 ]]; then
@@ -171,18 +175,43 @@ now_ms() {
 # Request, approve, and fetch one grant to the grant directory.
 # Prints "grant ID expires_ms MS fetched_ms MS".
 next_grant() {
+  local out="${1:-$GRANT_DIR}" port="${2:-8080}"
   local flags reply id fetched expires
   mapfile -t flags < <(coord_flags)
-  reply="$(on_a agent grant request --agent bot --node b --service web --port 8080 \
+  reply="$(on_a agent grant request --agent bot --node b --service web --port "$port" \
     --ttl "$TTL_SECS" "${flags[@]}")"
   printf '%s\n' "$reply" >&2
   id="$(printf '%s\n' "$reply" | field grant_id)"
   printf '%s\n' "$reply" | read_all grep -qx 'grant_state pending'
   owner grant-approve "$id" >&2
-  fetched="$(on_a agent grant fetch --id "$id" --out "$GRANT_DIR" --wait 5 "${flags[@]}")"
+  fetched="$(on_a agent grant fetch --id "$id" --out "$out" --wait 5 "${flags[@]}")"
   printf '%s\n' "$fetched" >&2
   expires="$(printf '%s\n' "$fetched" | field grant_expires_ms)"
   echo "grant ${id} expires_ms ${expires} fetched_ms $(now_ms)"
+}
+
+# Request and approve one grant, with no fetch. Prints the grant ID.
+approved_grant() {
+  local flags reply id
+  mapfile -t flags < <(coord_flags)
+  reply="$(on_a agent grant request --agent bot --node b --service web --port 8080 \
+    --ttl "$TTL_SECS" "${flags[@]}")"
+  printf '%s\n' "$reply" >&2
+  id="$(printf '%s\n' "$reply" | field grant_id)"
+  owner grant-approve "$id" >&2
+  echo "$id"
+}
+
+# The deny list version in the node state of a.
+deny_version_a() {
+  dc exec -T a cat "$STATE/deny.json" | read_all awk 'match($0, /"version": *[0-9]+/) {v = substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", v); print v; exit}'
+}
+
+# Copy one complete grant set from STAGE_DIR to GATE_DIR, as fetch writes it:
+# each file is an atomic rename, and grant.json is last.
+stage_to_gate() {
+  dc exec -T a sh -c "set -e; for f in agent.crt.pem agent.key.pem ticket.bin grant.json; do \
+    cp -p $STAGE_DIR/\$f $GATE_DIR/\$f.tmp; mv $GATE_DIR/\$f.tmp $GATE_DIR/\$f; done"
 }
 
 container_starts() {
@@ -335,6 +364,83 @@ for n in $(seq 1 "$ENDS"); do
 done
 grep -c "^agent grant .* expired " "$WORK/guard.txt" | read_all awk '{print "guard_expire_lines " $1}'
 
+echo "=== [C] phase 2 (gate): no other-scope and no revoked next grant ==="
+gate_line="$(next_grant "$GATE_DIR" | tee -a "$WORK/gate-grants.txt")"
+echo "$gate_line"
+gate_id="$(printf '%s\n' "$gate_line" | read_all awk '{print $2; exit}')"
+gate_end="$(printf '%s\n' "$gate_line" | read_all awk '{print $4; exit}')"
+gate_wait=$(( (gate_end - $(now_ms)) / 1000 + 20 ))
+dc exec -T a sh -c "orblx agent connect --grant $GATE_DIR --every-ms $EVERY_MS \
+  --max-wait $gate_wait >$STATE/agent-gate.log 2>&1; echo \"loop_exit \$?\" >>$STATE/agent-gate.log" &
+gate_pid=$!
+echo "gate_loop_started_ms $(now_ms) grant ${gate_id} expires_ms ${gate_end} max_wait_s ${gate_wait}"
+sleep 3
+
+echo "=== [C] gate: a newer grant with another scope (port 8082) to the same directory ==="
+scope_line="$(next_grant "$GATE_DIR" 8082)"
+echo "$scope_line"
+scope_id="$(printf '%s\n' "$scope_line" | read_all awk '{print $2; exit}')"
+sleep 3
+
+echo "=== [C] gate: revoked before fetch: the fetch must fail ==="
+early_id="$(approved_grant)"
+owner grant-revoke "$early_id"
+mapfile -t flags < <(coord_flags)
+if on_a agent grant fetch --id "$early_id" --out "$STAGE_DIR-early" --wait 5 "${flags[@]}"; then
+  echo "The coordinator delivered a revoked grant." >&2
+  exit 1
+fi
+echo "gate revoked_before_fetch ${early_id} fetch_refused 1"
+
+echo "=== [C] gate: revoked after fetch: the set goes to the directory after the revoke ==="
+late_line="$(next_grant "$STAGE_DIR")"
+echo "$late_line"
+late_id="$(printf '%s\n' "$late_line" | read_all awk '{print $2; exit}')"
+revoke_out="$(owner grant-revoke "$late_id")"
+printf '%s\n' "$revoke_out"
+want_version="$(printf '%s\n' "$revoke_out" | field deny_version)"
+if [[ -z "$want_version" ]]; then
+  echo "The revoke reply has no deny_version." >&2
+  exit 1
+fi
+for i in $(seq 1 50); do
+  have_version="$(deny_version_a || true)"
+  if [[ -n "$have_version" && "$have_version" -ge "$want_version" ]]; then
+    break
+  fi
+  if [[ "$i" -eq 50 ]]; then
+    echo "The deny list on a did not reach version ${want_version}." >&2
+    exit 1
+  fi
+  sleep 0.2
+done
+echo "gate deny_version_a ${have_version} want ${want_version} at_ms $(now_ms)"
+stage_to_gate
+echo "gate revoked_set_written ${late_id} at_ms $(now_ms)"
+
+wait "$gate_pid" || true
+echo "=== [C] gate loop output ==="
+dc exec -T a cat "$STATE/agent-gate.log" | tee "$WORK/gate-loop.txt"
+dc exec -T b cat "$STATE/guard-web.log" >"$WORK/guard-all.txt"
+gate_exit="$(awk '$1 == "loop_exit" {print $2}' "$WORK/gate-loop.txt")"
+gate_reason="$(awk '$1 == "loop" && $2 == "deny_reason" {print $3}' "$WORK/gate-loop.txt")"
+gate_deny_ms="$(awk '$1 == "loop" && $2 == "first_deny_start_ms" {print $3}' "$WORK/gate-loop.txt")"
+gate_switches="$(awk '$1 == "loop" && $2 == "grant_switches" {print $3}' "$WORK/gate-loop.txt")"
+kept_scope="$(grep -c '^loop grant_kept reason scope ' "$WORK/gate-loop.txt" || true)"
+kept_revoked="$(grep -c '^loop grant_kept reason revoked ' "$WORK/gate-loop.txt" || true)"
+uses_scope="$(grep -c "^agent use grant ${scope_id} " "$WORK/guard-all.txt" || true)"
+uses_late="$(grep -c "^agent use grant ${late_id} " "$WORK/guard-all.txt" || true)"
+uses_early="$(grep -c "^agent use grant ${early_id} " "$WORK/guard-all.txt" || true)"
+guard_revoked_denies="$(grep -c '^agent deny reason revoked ' "$WORK/guard-all.txt" || true)"
+echo "gate loop_exit ${gate_exit} deny_reason ${gate_reason} first_deny_start_ms ${gate_deny_ms} grant_end_ms ${gate_end} switches ${gate_switches} kept_scope ${kept_scope} kept_revoked ${kept_revoked} uses_scope_grant ${uses_scope} uses_revoked_grant ${uses_late} uses_early_revoked ${uses_early} guard_revoked_denies ${guard_revoked_denies}"
+# Exit code 0: the guard denied. The deny is at the end of the gate grant.
+[[ "$gate_exit" == 0 && "$gate_reason" == expired ]]
+(( gate_deny_ms >= gate_end ))
+[[ "$gate_switches" == 0 ]]
+(( kept_scope >= 1 && kept_revoked >= 1 ))
+(( uses_scope == 0 && uses_late == 0 && uses_early == 0 && guard_revoked_denies == 0 ))
+echo "gate_ok"
+
 echo "=== [C] audit chains ==="
 web_verify="$(dc exec -T b orblx audit verify-config --file "$STATE/agent-audit-web.jsonl")"
 printf '%s\n' "$web_verify"
@@ -349,7 +455,7 @@ echo "coord_agent_approve ${approves}"
 echo "=== [C] logs hold no key, ticket, or use proof ==="
 {
   dc logs coord a b 2>&1
-  cat "$WORK/guard.txt" "$WORK/loop.txt"
+  cat "$WORK/guard-all.txt" "$WORK/loop.txt" "$WORK/gate-loop.txt"
   dc exec -T b cat "$STATE/agent-audit-web.jsonl"
   dc exec -T coord cat "$STATE/config-audit.jsonl" 2>/dev/null || true
 } >"$WORK/all-logs.out"
@@ -369,5 +475,6 @@ for needle in 'PRIVATE KEY' 'T0JMWEFHVDE' 'ge1.'; do
   fi
 done
 
+echo "summary gate loop_exit ${gate_exit} deny_reason ${gate_reason} switches ${gate_switches} kept_scope ${kept_scope} kept_revoked ${kept_revoked} revoked_before_fetch_refused 1"
 echo "summary ends_crossed ${ends_crossed} ttl_s ${TTL_SECS} attempts ${attempts} ok_attempts ${ok_attempts} lost 0 worst_end_gap_ms ${worst} loop_max_ok_gap_ms ${max_gap} limit_ms ${GAP_LIMIT_MS} switches ${switches} restarts 0"
 echo "proof_ok"
