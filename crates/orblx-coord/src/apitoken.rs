@@ -42,6 +42,8 @@ pub const MAX_API_TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 pub const SCOPES: &[(&str, &str)] = &[
     ("admin-nodes", "nodes:read"),
     ("admin-users", "nodes:read"),
+    ("admin-user-approve", "nodes:write"),
+    ("admin-user-reject", "nodes:write"),
     ("admin-routes", "nodes:read"),
     ("admin-approve", "nodes:write"),
     ("admin-revoke", "nodes:write"),
