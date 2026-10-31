@@ -5,4 +5,6 @@ release owner copies the lines into the GitHub release.
 
 ## Known limits
 
-- SSH: partial. Coordinator-issued SSH certificates come later.
+- SSH: partial. The coordinator issues SSH user certificates (W25-31, `docs/w25-ssh-user-certs.md`).
+  SSH identity = the user who owns the client node. Do not enroll a multi-user host as a personal node.
+  There is no OIDC step-up at login yet (W25-32).
