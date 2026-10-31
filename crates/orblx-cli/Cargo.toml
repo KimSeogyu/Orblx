@@ -22,6 +22,7 @@ orblx-identity = { path = "../orblx-identity" }
 orblx-relay = { path = "../orblx-relay" }
 orblx-serve = { path = "../orblx-serve" }
 orblx-ssh = { path = "../orblx-ssh" }
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.54.1", features = ["rt", "macros", "net", "io-util", "sync", "time"] }

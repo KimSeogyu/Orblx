@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Issue 2 minute node SVIDs and keep one session up for at least 6 minutes.
+# Enroll two nodes at the coordinator with 1 minute node SVIDs and tickets
+# (W25-27: the tickets come from the coordinator enroll path) and keep one
+# session up for at least 6 minutes, across 2 or more ticket ends.
 # The script pings once per second and reports loss.
 # The script skips the proof when it is not root or when Docker is absent.
 set -euo pipefail
@@ -25,6 +27,11 @@ work=$(mktemp -d)
 env_file=""
 image_dir=""
 ping_count=370
+# W25-27: the coordinator SVID and ticket life (ORBLX_SVID_TTL). The ping crosses
+# 2 or more ticket ends. A ticket ends at its expires time plus 60 s clock skew.
+svid_ttl=60
+min_ticket_ends=2
+ticket_skew=60
 
 require_toolchain() {
   if ! command -v cargo >/dev/null 2>&1; then
@@ -109,11 +116,7 @@ source "$root/scripts/proof/stage-image.sh"
 image_dir="$(stage_proof_image "$root" "$bin")"
 docker build -t orblx-svid:local "$image_dir"
 
-mkdir -p "$work/coord" "$work/a" "$work/b" "$work/tickets"
-"$bin" node-issue \
-  --out "$work/tickets" \
-  --node a=100.64.0.1 \
-  --node b=100.64.0.2
+mkdir -p "$work/coord" "$work/a" "$work/b"
 
 cat >"$work/netmap-a.json" <<'EOF'
 {
@@ -149,6 +152,7 @@ SVID_STATE_A=$work/a
 SVID_STATE_B=$work/b
 SVID_NETMAP_A=$work/netmap-a.json
 SVID_NETMAP_B=$work/netmap-b.json
+SVID_TTL=$svid_ttl
 EOF
 echo "env_file ${env_file}"
 
@@ -195,17 +199,13 @@ echo "=== [C] enroll b ==="
   --state "$work/b" \
   --endpoint 172.28.19.12:443
 
-copy_tickets() {
-  local name=$1
-  local dest=$2
-  local file
-  for file in ticket.bin ticket.bin.mac ticket-verifier.pem ticket-mac.key svid-ca.pub ticket-not-before ticket-not-after; do
-    cp "$work/tickets/${name}/${file}" "$dest/${file}"
-  done
-  chmod 600 "$dest/ticket.bin" "$dest/ticket.bin.mac" "$dest/ticket-mac.key"
-}
-copy_tickets a "$work/a"
-copy_tickets b "$work/b"
+echo "=== [C] coordinator tickets ==="
+proof_ticket_guard coord "$work/a" "$work/b"
+first_expires=$(proof_ticket_expires "$work/a")
+b_expires=$(proof_ticket_expires "$work/b")
+if [[ "$b_expires" -lt "$first_expires" ]]; then
+  first_expires=$b_expires
+fi
 
 echo "=== [C] start nodes ==="
 compose up -d node-a node-b
@@ -229,7 +229,9 @@ wait_direct node-b a
 
 echo "=== [C] ping every second ==="
 ping_log="$work/ping.txt"
+ping_start=$(date +%s)
 compose exec -T node-a ping -n -D -O -i 1 -c "$ping_count" -W 1 100.64.0.2 >"$ping_log"
+ping_end=$(date +%s)
 cat "$ping_log"
 
 sent=$(awk '/packets transmitted/ { print $1; exit }' "$ping_log")
@@ -273,6 +275,23 @@ if [[ "$received" -lt $((sent - 3)) ]]; then
 fi
 if [[ "${#expiry_lines[@]}" -lt 2 ]]; then
   echo "The node did not renew the SVID."
+  exit 1
+fi
+# W25-27: count the ticket ends inside the ping window. The first ticket ends at the
+# enroll ticket expires time plus the skew; each renewed ticket ends at most one
+# ticket life later.
+ticket_ends=0
+ticket_end=$((first_expires + ticket_skew))
+while [[ "$ticket_end" -le "$ping_end" ]]; do
+  if [[ "$ticket_end" -ge "$ping_start" ]]; then
+    ticket_ends=$((ticket_ends + 1))
+  fi
+  ticket_end=$((ticket_end + svid_ttl))
+done
+echo "ticket_ttl_s ${svid_ttl}"
+echo "ticket_ends_crossed ${ticket_ends}"
+if [[ "$ticket_ends" -lt "$min_ticket_ends" ]]; then
+  echo "The ping crossed fewer than ${min_ticket_ends} ticket ends."
   exit 1
 fi
 echo "loss_window_ok true"

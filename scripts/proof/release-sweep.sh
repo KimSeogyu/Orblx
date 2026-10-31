@@ -18,8 +18,16 @@
 #   4. Write the summary $ORBLX_SWEEP_OUT/rc3-sweep-<sha>.md: one line for each row and proof
 #      with the row, the result, the log path, the time and the proof_contention line.
 #   5. Remove the images of each proof and, at the end, the worktree and its target.
-# There is no retry and no skip: each proof runs once, and a failed proof does not stop the
-# sweep. A shipped row with no proof is a FAIL.
+# There is no retry, and no skip except the rows-file mark below: each proof runs once, and a
+# failed proof does not stop the sweep. A shipped row with no proof is a FAIL.
+# W25-27: the row status has ONE source, docs/matrix-rows.txt (ID|STATUS|FEATURE, copied
+# from the gap matrix Page). The "row" lines of the manifest must be exactly the shipped rows
+# of that file, and each "partial" line must name a partial row of it. Any difference stops
+# the sweep (exit 2) before a proof runs, in --plan and in a run, and names the rows.
+# A partial row may carry a 4th field, the skip mark (exactly SKIP_MARK below). A proof whose
+# rows all carry the mark does not run: the summary shows it as skipped with the mark. Any
+# other 4th field, or the mark on a shipped row, is exit 2. The SSH rows (40 and 41) can not
+# be shipped for rc.3: a shipped claim for them in either file is exit 2 (PO, 2026-10-31).
 # Exit: 0 every row passed; 1 a proof failed or a row has no proof (the summary names the
 # rows); 2 setup, manifest or build error; 3 ORBLX_SWEEP_ONLY run with no failure (a partial
 # run never counts).
@@ -34,6 +42,8 @@
 #   ORBLX_SWEEP_OUT       Log and summary directory (default /workspace/orblx-w18-proof).
 #   ORBLX_SWEEP_WT        Worktree path (default /workspace/orblx-rc3-sweep-<sha>).
 #   ORBLX_SWEEP_MANIFEST  Manifest file. Default: the manifest of COMMIT, else of this checkout.
+#   ORBLX_SWEEP_ROWS      Rows file. Default: docs/matrix-rows.txt of COMMIT (of the test
+#                         root with ORBLX_SWEEP_TEST_ROOT). No rows file is a setup error.
 #   ORBLX_SWEEP_ONLY      Space list of proof names (a partial run, exit 3 at best).
 #   ORBLX_SWEEP_TIMEOUT   Seconds for each proof, without the lock wait (default 3600).
 #   ORBLX_SWEEP_KEEP      1 keeps the worktree, the target and the images.
@@ -43,6 +53,16 @@
 #                         for all the proofs.
 #   ORBLX_SWEEP_MIN_FREE_GB Free disk space (GB) that the run needs before it starts (default
 #                         30), on the file system of the worktree and of ORBLX_SWEEP_OUT.
+#   ORBLX_SWEEP_WORK      Work dir for the old-binary builds and their cache (default
+#                         /workspace/orblx-rc3-sweep-work).
+#   OLD_ORBLX             When set, the proofs that pin an old binary use it, and the sweep
+#                         builds none.
+# Old binaries (W25-27): a proof ENV word may hold @OLD:<full commit SHA>@. The sweep builds
+# orblx (debug) at that commit in a temp git worktree with its own target dir, caches the
+# binary at $ORBLX_SWEEP_WORK/old-orblx/<sha>/orblx, deletes the worktree and the target, and
+# puts the cached path in the word. A proof whose script needs OLD_ORBLX ("OLD_ORBLX:?") must
+# have an OLD_ORBLX=@OLD:<sha>@ word. No pin, a pin that is not 40 hex digits, or (with git)
+# a pin that is not an ancestor of COMMIT is exit 2, in --plan and in a run.
 #   ORBLX_SWEEP_TEST_ROOT Test only: use this directory as the checkout. No git, no build,
 #                         no sudo, no image removal.
 # The script prints no token and no key.
@@ -68,8 +88,11 @@ TIMEOUT="${ORBLX_SWEEP_TIMEOUT:-3600}"
 ONLY="${ORBLX_SWEEP_ONLY:-}"
 KEEP="${ORBLX_SWEEP_KEEP:-0}"
 TEST_ROOT="${ORBLX_SWEEP_TEST_ROOT:-}"
+WORK="${ORBLX_SWEEP_WORK:-/workspace/orblx-rc3-sweep-work}"
+OLD_ENV="${OLD_ORBLX:-}"
 PROGRESS="${ORBLX_SWEEP_PROGRESS:-}"
 MANIFEST_REL="scripts/proof/sweep-manifest.txt"
+ROWS_REL="docs/matrix-rows.txt"
 TOOL_CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 TOOL_RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 TOOL_PATH="$TOOL_CARGO_HOME/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -208,7 +231,8 @@ script_at() {
 
 # 2. Read the manifest.
 MANIFEST_TMP="$(mktemp)"
-trap 'rm -f "$MANIFEST_TMP"' EXIT
+ROWS_TMP="$(mktemp)"
+trap 'rm -f "$MANIFEST_TMP" "$ROWS_TMP"' EXIT
 if [[ -n "${ORBLX_SWEEP_MANIFEST:-}" ]]; then
   cp "$ORBLX_SWEEP_MANIFEST" "$MANIFEST_TMP" || die "cannot read $ORBLX_SWEEP_MANIFEST"
   MANIFEST_SRC="$ORBLX_SWEEP_MANIFEST"
@@ -228,8 +252,11 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   [[ -n "$line" && "$line" != \#* ]] || continue
   IFS='|' read -r kind f1 f2 f3 f4 f5 f6 <<<"$line"
   case "$kind" in
-    row|gate)
+    row|gate|partial)
       [[ -n "$f1" && -n "$f3" ]] || die "manifest: bad line: $line"
+      if [[ "$kind" == partial && "$f3" == "-" ]]; then
+        die "manifest: partial row $f1 has no proof (a partial row with no proof is not a sweep row)"
+      fi
       R_KIND+=("$kind"); R_ID+=("$f1"); R_FEAT+=("$f2"); R_PROOFS+=("$f3")
       ;;
     proof)
@@ -241,6 +268,77 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   esac
 done <"$MANIFEST_TMP"
 [[ "${#R_ID[@]}" -gt 0 && "${#P_NAME[@]}" -gt 0 ]] || die "manifest: no rows or no proofs"
+
+# W25-27: the row status source. Read it, then compare it with the manifest rows.
+if [[ -n "${ORBLX_SWEEP_ROWS:-}" ]]; then
+  cp "$ORBLX_SWEEP_ROWS" "$ROWS_TMP" || die "cannot read $ORBLX_SWEEP_ROWS"
+  ROWS_SRC="$ORBLX_SWEEP_ROWS"
+elif [[ -n "$TEST_ROOT" ]]; then
+  cp "$ROOT/$ROWS_REL" "$ROWS_TMP" 2>/dev/null || die "rows: no $ROWS_REL in the test root"
+  ROWS_SRC="$ROOT/$ROWS_REL"
+else
+  git -C "$REPO" show "$SHA:$ROWS_REL" >"$ROWS_TMP" 2>/dev/null || die "rows: no $ROWS_REL at $SHORT"
+  ROWS_SRC="$ROWS_REL at $SHORT"
+fi
+# Row ids are numbers, so plain (sparse) arrays keyed by the id work in bash 3.2 (macOS).
+ROW_STATUS=()
+ROW_NOTE=()
+SKIP_MARK='not in rc.3 sweep: no coordinator SSH certs'
+SSH_ROWS="40 41"
+while IFS= read -r line || [[ -n "$line" ]]; do
+  [[ -n "$line" && "$line" != \#* ]] || continue
+  IFS='|' read -r rid rstatus _ rnote <<<"$line"
+  [[ "$rid" =~ ^[0-9]+$ ]] || die "rows: bad line: $line"
+  case "$rstatus" in shipped|partial|missing) ;; *) die "rows: bad status in line: $line" ;; esac
+  [[ -z "${ROW_STATUS[$rid]:-}" ]] || die "rows: row $rid is listed twice"
+  if [[ -n "$rnote" && "$rnote" != "$SKIP_MARK" ]]; then
+    die "rows: row $rid has an unknown 4th field '$rnote' (the only one is '$SKIP_MARK')"
+  fi
+  if [[ -n "$rnote" && "$rstatus" != partial ]]; then
+    die "rows: row $rid is $rstatus and has the skip mark; only a partial row can be skipped"
+  fi
+  ROW_STATUS[$rid]="$rstatus"
+  ROW_NOTE[$rid]="$rnote"
+done <"$ROWS_TMP"
+[[ "${#ROW_STATUS[@]}" -gt 0 ]] || die "rows: $ROWS_SRC has no rows"
+for id in $SSH_ROWS; do
+  if [[ "${ROW_STATUS[$id]:-}" == shipped ]]; then
+    die "rows: row $id (SSH) claims shipped in $ROWS_SRC; the SSH rows stay partial for rc.3 (no coordinator SSH certs)"
+  fi
+done
+for r in "${!R_ID[@]}"; do
+  if [[ "${R_KIND[$r]}" == row && " $SSH_ROWS " == *" ${R_ID[$r]} "* ]]; then
+    die "manifest: row ${R_ID[$r]} (SSH) claims shipped ($MANIFEST_SRC); the SSH rows stay partial for rc.3 (no coordinator SSH certs)"
+  fi
+done
+mismatch=""
+MAN_ROW=()
+for r in "${!R_ID[@]}"; do
+  kind="${R_KIND[$r]}"
+  [[ "$kind" == gate ]] && continue
+  id="${R_ID[$r]}"
+  if [[ ! "$id" =~ ^[0-9]+$ ]]; then
+    mismatch="${mismatch}${mismatch:+; }row $id: a manifest $kind id must be a number"
+    continue
+  fi
+  [[ -z "${MAN_ROW[$id]:-}" ]] || mismatch="${mismatch}${mismatch:+; }row $id is in the manifest twice"
+  MAN_ROW[$id]="$kind"
+  want=shipped
+  [[ "$kind" == partial ]] && want=partial
+  have="${ROW_STATUS[$id]:-not in the rows file}"
+  if [[ "$have" != "$want" ]]; then
+    mismatch="${mismatch}${mismatch:+; }row $id: manifest $kind, rows file $have"
+  fi
+done
+for id in $(printf '%s\n' "${!ROW_STATUS[@]}" | sort -n); do
+  if [[ "${ROW_STATUS[$id]}" == shipped && -z "${MAN_ROW[$id]:-}" ]]; then
+    mismatch="${mismatch}${mismatch:+; }row $id: rows file shipped, no manifest row line"
+  fi
+done
+if [[ -n "$mismatch" ]]; then
+  die "rows mismatch between the manifest ($MANIFEST_SRC) and the rows file ($ROWS_SRC): $mismatch"
+fi
+note "rows: the manifest matches $ROWS_SRC"
 
 # Report only (PO, W25-17): nat-realism prints a steady_warn line for a steady ping sample over
 # 100 ms. A run is the nat-realism proof log, or one step log section of a proof with step logs
@@ -284,9 +382,35 @@ done
 for i in "${!P_NAME[@]}"; do
   [[ "${P_USED[$i]}" == 1 ]] || die "manifest: proof ${P_NAME[$i]} backs no row and no gate"
 done
+
+# W25-27: a proof is skipped only when every row that names it has the skip mark in the rows
+# file. A proof that also backs a row without the mark (or a gate) runs.
+P_SKIP=()
+for i in "${!P_NAME[@]}"; do
+  skip=1
+  for r in "${!R_ID[@]}"; do
+    [[ " ${R_PROOFS[$r]} " == *" ${P_NAME[$i]} "* ]] || continue
+    if [[ "${R_KIND[$r]}" == gate || "${ROW_NOTE[${R_ID[$r]}]:-}" != "$SKIP_MARK" ]]; then
+      skip=0
+    fi
+  done
+  P_SKIP+=("$skip")
+  if [[ "$skip" == 1 ]]; then
+    note "skip: proof ${P_NAME[$i]} (rows $(for r in "${!R_ID[@]}"; do [[ " ${R_PROOFS[$r]} " == *" ${P_NAME[$i]} "* ]] && printf '%s ' "${R_ID[$r]}"; done)): $SKIP_MARK"
+  fi
+done
 for want in $ONLY; do
   proof_index "$want" >/dev/null || die "unknown proof $want"
 done
+
+# A partial row shows its status next to its number.
+row_label() {
+  if [[ "${R_KIND[$1]}" == partial ]]; then
+    echo "${R_ID[$1]} (partial)"
+  else
+    echo "${R_ID[$1]}"
+  fi
+}
 
 rows_of() {
   local p="$1" r out=""
@@ -299,6 +423,49 @@ rows_of() {
 }
 
 # 3. Plan: list every row and its proof, and the time estimate. No build, no proof run.
+# W25-27: old-binary pins. P_PIN[i] is the pinned SHA of proof i, or "-".
+script_text() {
+  if [[ -n "$TEST_ROOT" ]]; then
+    cat "$ROOT/$1" 2>/dev/null
+  else
+    git -C "$REPO" show "$SHA:$1" 2>/dev/null
+  fi
+}
+P_PIN=()
+OLD_PINS=""
+for i in "${!P_NAME[@]}"; do
+  pin="-"
+  envs="${P_ENV[$i]}"
+  if [[ "$envs" == *"@OLD:"* ]]; then
+    [[ "$envs" =~ OLD_ORBLX=@OLD:([^@ ]*)@ ]] ||
+      die "manifest: proof ${P_NAME[$i]}: an @OLD:...@ pin must be the value of OLD_ORBLX (OLD_ORBLX=@OLD:<full sha>@)"
+    pin="${BASH_REMATCH[1]}"
+    [[ "$pin" =~ ^[0-9a-f]{40}$ ]] ||
+      die "manifest: proof ${P_NAME[$i]}: bad old-binary pin '$pin' (a full 40-hex commit SHA)"
+    if [[ -z "$TEST_ROOT" ]]; then
+      git -C "$REPO" cat-file -e "$pin^{commit}" 2>/dev/null ||
+        die "manifest: proof ${P_NAME[$i]}: old-binary pin $pin is not a commit here"
+      git -C "$REPO" merge-base --is-ancestor "$pin" "$SHA" ||
+        die "manifest: proof ${P_NAME[$i]}: old-binary pin $pin is not an ancestor of $SHORT"
+    fi
+    [[ " $OLD_PINS " == *" $pin "* ]] || OLD_PINS="${OLD_PINS:+$OLD_PINS }$pin"
+  fi
+  if [[ "$pin" == "-" ]] && script_text "${P_PATH[$i]}" | has_line 'OLD_ORBLX:[?]'; then
+    die "manifest: proof ${P_NAME[$i]} needs OLD_ORBLX (its script requires it), and its manifest line has no OLD_ORBLX=@OLD:<full sha>@ pin"
+  fi
+  P_PIN+=("$pin")
+done
+old_bin_of() { echo "$WORK/old-orblx/$1/orblx"; }
+old_step_of() {
+  if [[ -n "$OLD_ENV" ]]; then
+    echo "OLD_ORBLX from the environment: $OLD_ENV (no build)"
+  elif [[ -x "$(old_bin_of "$1")" ]]; then
+    echo "old binary cached: $(old_bin_of "$1") (commit $1)"
+  else
+    echo "build old orblx (debug) at $1 in a temp worktree, cache $(old_bin_of "$1")"
+  fi
+}
+
 if [[ "$PLAN" == 1 ]]; then
   PLAN_FILE="$OUT/rc3-sweep-$SHORT-plan.md"
   bad=0
@@ -322,14 +489,16 @@ if [[ "$PLAN" == 1 ]]; then
       fi
       for p in ${R_PROOFS[$r]}; do
         i="$(proof_index "$p")"
-        if script_at "${P_PATH[$i]}"; then
+        if [[ "${P_SKIP[$i]}" == 1 ]]; then
+          have="skipped: $SKIP_MARK"
+        elif script_at "${P_PATH[$i]}"; then
           have="${P_PATH[$i]}"
         else
           have="FAIL: no ${P_PATH[$i]}"
           bad=1
           bad_rows="${bad_rows:+$bad_rows, }${R_ID[$r]}"
         fi
-        echo "| ${R_ID[$r]} | $(cell "${R_FEAT[$r]}") | $p | $have |"
+        echo "| $(row_label "$r") | $(cell "${R_FEAT[$r]}") | $p | $have |"
       done
     done
     echo
@@ -361,6 +530,15 @@ if [[ "$PLAN" == 1 ]]; then
       fi
       echo "| $p | $(rows_of "$p") | $est | $src |"
     done
+    if [[ -n "$OLD_PINS" ]]; then
+      echo
+      echo "| proof | old-binary step |"
+      echo "|---|---|"
+      for i in "${!P_NAME[@]}"; do
+        [[ "${P_PIN[$i]}" != "-" ]] || continue
+        echo "| ${P_NAME[$i]} | $(old_step_of "${P_PIN[$i]}") |"
+      done
+    fi
     echo
     echo "Rows: ${#R_ID[@]}. Proofs: ${#P_NAME[@]}."
     echo "Estimate: ${total_est} s ($((total_est / 60)) min) for the ${measured} proofs with a measure (the run time under the lock, from the newest passing log in $OUT), plus the build and the lock waits.${unmeasured:+ No measure: $unmeasured.}"
@@ -438,6 +616,61 @@ if [[ -z "$TEST_ROOT" ]]; then
   note "build ok: $(awk '!done && /^rustc / {print; done = 1}' "$build_log")"
 fi
 
+# W25-27: the old binaries of the pins of the proofs that run.
+if [[ -n "$OLD_ENV" ]]; then
+  [[ -x "$OLD_ENV" ]] || die "OLD_ORBLX=$OLD_ENV is not an executable file"
+  note "old binary: OLD_ORBLX from the environment: $OLD_ENV (no build)"
+fi
+for pin in $OLD_PINS; do
+  [[ -z "$OLD_ENV" && -z "$TEST_ROOT" ]] || break
+  need=0
+  for i in "${!P_NAME[@]}"; do
+    [[ "${P_PIN[$i]}" == "$pin" && "${P_SKIP[$i]}" != 1 ]] || continue
+    [[ -z "$ONLY" || " $ONLY " == *" ${P_NAME[$i]} "* ]] || continue
+    need=1
+  done
+  [[ "$need" == 1 ]] || continue
+  old_bin="$(old_bin_of "$pin")"
+  if [[ -x "$old_bin" ]]; then
+    note "old binary cached: $old_bin (commit $pin)"
+    continue
+  fi
+  old_wt="$WORK/old-${pin:0:12}-wt"
+  old_target="$WORK/old-${pin:0:12}-target"
+  old_log="$OUT/rc3-sweep-$SHORT-old-${pin:0:12}-build.log"
+  note "build old orblx at $pin, worktree $old_wt, target $old_target, log $old_log"
+  mkdir -p "$WORK"
+  as_root rm -rf "$old_target"
+  git -C "$REPO" worktree remove --force "$old_wt" 2>/dev/null || true
+  rc=0
+  git -C "$REPO" worktree add -q --detach "$old_wt" "$pin" >"$old_log" 2>&1 || rc=$?
+  if [[ "$rc" == 0 ]]; then
+    tool_env CARGO_TARGET_DIR="$old_target" bash -c '
+        set -euo pipefail
+        cd "$1"
+        git rev-parse HEAD
+        rustc --version
+        cargo build --locked -p orblx-cli --bin orblx
+        mkdir -p "$(dirname "$3")"
+        cp "$2/debug/orblx" "$3.tmp"
+        mv -f "$3.tmp" "$3"
+      ' release-sweep-old-build "$old_wt" "$old_target" "$old_bin" >>"$old_log" 2>&1 </dev/null || rc=$?
+  fi
+  as_root rm -rf "$old_target" || true
+  git -C "$REPO" worktree remove --force "$old_wt" >/dev/null 2>&1 || true
+  if [[ "$rc" != 0 || ! -x "$old_bin" ]]; then
+    note "old build FAIL: $(first_error "$old_log")"
+    {
+      echo "| row | feature | proof | result | log | time | proof_contention |"
+      echo "|---|---|---|---|---|---|---|"
+      echo "| - | old orblx $pin | - | FAIL: $(first_error "$old_log") | $old_log | - | - |"
+    } >"$TABLE"
+    cleanup_worktree
+    exit 2
+  fi
+  note "old binary ok: $old_bin (worktree and target removed)"
+done
+
 # 5. Run each proof once.
 P_RESULT=(); P_LOG=(); P_TIME=(); P_CONT=()
 for i in "${!P_NAME[@]}"; do
@@ -462,7 +695,7 @@ write_table() {
       res=ok
       for p in ${R_PROOFS[$r]}; do
         i="$(proof_index "$p")"
-        echo "| ${R_ID[$r]} | $(cell "${R_FEAT[$r]}") | $p | ${P_RESULT[$i]} | ${P_LOG[$i]} | ${P_TIME[$i]} | ${P_CONT[$i]} |"
+        echo "| $(row_label "$r") | $(cell "${R_FEAT[$r]}") | $p | ${P_RESULT[$i]} | ${P_LOG[$i]} | ${P_TIME[$i]} | ${P_CONT[$i]} |"
         [[ "${P_RESULT[$i]}" == FAIL* ]] && res=fail
       done
       if [[ "$res" == fail ]]; then
@@ -482,7 +715,7 @@ case "$LOCK_MODE" in
     # One hold for all the proofs. The wrapper of each proof sees ORBLX_PROOF_LOCK_HELD.
     # shellcheck source=proof-lock.sh
     . "$LOCK_LIB"
-    trap 'proof_lock_end; rm -f "$MANIFEST_TMP"' EXIT
+    trap 'proof_lock_end; rm -f "$MANIFEST_TMP" "$ROWS_TMP"' EXIT
     note "lock mode sweep: wait for the lock"
     proof_lock_take "rc3-sweep:$SHORT" orblx-rc3sw-
     note "lock mode sweep: lock taken $(now)"
@@ -496,10 +729,17 @@ STEADY_WARNED=0
 failed=0
 ran=0
 not_run=0
+skipped=0
 write_table
 for i in "${!P_NAME[@]}"; do
   name="${P_NAME[$i]}"
   path="${P_PATH[$i]}"
+  if [[ "${P_SKIP[$i]}" == 1 ]]; then
+    P_RESULT[$i]="skipped ($SKIP_MARK)"
+    skipped=$((skipped + 1))
+    note "proof $name skipped: $SKIP_MARK"
+    continue
+  fi
   if [[ -n "$ONLY" && " $ONLY " != *" $name "* ]]; then
     P_RESULT[$i]="not run (ORBLX_SWEEP_ONLY)"
     not_run=$((not_run + 1))
@@ -510,7 +750,15 @@ for i in "${!P_NAME[@]}"; do
   : >"$log"
   env_words=()
   if [[ "${P_ENV[$i]}" != "-" ]]; then
-    read -r -a env_words <<<"${P_ENV[$i]//@BIN@/$BIN}"
+    words="${P_ENV[$i]//@BIN@/$BIN}"
+    if [[ "${P_PIN[$i]}" != "-" ]]; then
+      if [[ -n "$OLD_ENV" ]]; then
+        words="${words//@OLD:${P_PIN[$i]}@/$OLD_ENV}"
+      else
+        words="${words//@OLD:${P_PIN[$i]}@/$(old_bin_of "${P_PIN[$i]}")}"
+      fi
+    fi
+    read -r -a env_words <<<"$words"
   fi
   note "proof $name start $(now) log $log"
   started="$(date +%s)"
@@ -588,7 +836,7 @@ cleanup_worktree
 write_table
 total=$(( $(date +%s) - SWEEP_START ))
 {
-  echo "Proofs run: $ran. Failed proofs: $failed. Not run: $not_run. Total time: ${total} s ($((total / 60)) min $((total % 60)) s). Ended $(date '+%Y-%m-%d %H:%M:%S %Z')."
+  echo "Proofs run: $ran. Failed proofs: $failed. Not run: $not_run. Skipped (rows file mark): $skipped. Total time: ${total} s ($((total / 60)) min $((total % 60)) s). Ended $(date '+%Y-%m-%d %H:%M:%S %Z')."
   if [[ "$not_run" -gt 0 ]]; then
     echo "Partial run (ORBLX_SWEEP_ONLY): it does not count."
   fi

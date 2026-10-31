@@ -5,12 +5,16 @@
 # On node a, c and c.lab.orblx are NXDOMAIN.
 # Node b still resolves and answers.
 # W24: the datapath on c also drops TCP from a (the ACL has no rule for it).
+# W25-27: a coordinator container serves w18-names.hujson and issues the node SVIDs,
+# tickets, and signed grants through the normal enroll path. No lab tickets.
 # The script stops with exit 1 when it is not root.
 # The script needs Docker and a built orblx binary.
 
 set -euo pipefail
 # shellcheck source=scripts/proof/pipe-lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
+# shellcheck source=scripts/proof/enroll-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/enroll-lib.sh"
 # W25-14: this proof needs root. It stops at once without root.
 require_root "$@"
 
@@ -83,13 +87,9 @@ source "$root/scripts/proof/stage-image.sh"
 image_dir="$(stage_proof_image "$root" "$bin")"
 docker build -t orblx-w18:local "$image_dir"
 
-mkdir -p "$work/a" "$work/b" "$work/c"
-"$bin" node-issue \
-  --out "$work" \
-  --policy "$root/scripts/proof/w18-names.hujson" \
-  --node a=100.64.0.1 \
-  --node b=100.64.0.2 \
-  --node c=100.64.0.3
+mkdir -p "$work/coord" "$work/a" "$work/b" "$work/c"
+# The coordinator reads its policy from STATE/policy.hujson.
+cp "$root/scripts/proof/w18-names.hujson" "$work/coord/policy.hujson"
 
 write_netmap() {
   local path=$1
@@ -137,7 +137,18 @@ export W18_STATE_C="$work/c"
 export W18_NETMAP_A="$work/netmap-a.json"
 export W18_NETMAP_B="$work/netmap-b.json"
 export W18_NETMAP_C="$work/netmap-c.json"
+export W18_COORD_STATE="$work/coord"
 
+echo "=== [C] start coordinator ==="
+docker compose -f "$compose_file" up -d coord
+proof_coord_wait_bundle "$work/coord"
+for name in a b c; do
+  docker compose -f "$compose_file" exec -T coord orblx coord token create --state /var/lib/orblx --ttl 3600 --out "/var/lib/orblx/tokens/${name}"
+done
+proof_coord_enroll "$bin" 172.28.18.10:443 "$work/coord" "$work/coord/tokens/a" a "$work/a" 172.28.18.11:443 100.64.0.1
+proof_coord_enroll "$bin" 172.28.18.10:443 "$work/coord" "$work/coord/tokens/b" b "$work/b" 172.28.18.12:443 100.64.0.2
+proof_coord_enroll "$bin" 172.28.18.10:443 "$work/coord" "$work/coord/tokens/c" c "$work/c" 172.28.18.13:443 100.64.0.3
+proof_ticket_guard coord "$work/a" "$work/b" "$work/c"
 docker compose -f "$compose_file" up -d --remove-orphans
 
 wait_direct() {

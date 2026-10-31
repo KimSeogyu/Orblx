@@ -34,6 +34,27 @@ pub struct SessionRequest {
     pub peer_cert: PathBuf,
     /// Remote command.
     pub command: String,
+    /// W25-31: sign in with a user certificate from the coordinator, not with an SVID proof.
+    pub cert_login: Option<CertLogin>,
+}
+
+/// One user certificate login (W25-31).
+///
+/// The key lives only in memory. The certificate is short. Debug output elides the key.
+pub struct CertLogin {
+    /// The private key of the certificate.
+    pub key: russh::keys::PrivateKey,
+    /// The user certificate.
+    pub cert: russh::keys::Certificate,
+}
+
+impl std::fmt::Debug for CertLogin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CertLogin")
+            .field("serial", &self.cert.serial())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Remote command output.
@@ -172,8 +193,6 @@ pub async fn run_shell(
 async fn open_channel(
     request: &SessionRequest,
 ) -> Result<(client::Handle<ClientHandler>, russh::Channel<client::Msg>), String> {
-    let cert_pem = read_text(&request.identity_dir.join("cert.pem"))?;
-    let key_pem = read_text(&request.identity_dir.join("key.pem"))?;
     let bundle_pem = read_text(&request.identity_dir.join("bundle.pem"))?;
     let peer_pem = read_text(&request.peer_cert)?;
     let bundle = TrustBundle::from_pem(&bundle_pem)
@@ -188,6 +207,34 @@ async fn open_channel(
     }
     let host_key = ed25519_public_key_from_certificate_pem(&peer_pem)
         .map_err(|_| "The node SVID is not valid.".to_string())?;
+    let config = Arc::new(client::Config {
+        inactivity_timeout: Some(std::time::Duration::from_secs(30)),
+        ..client::Config::default()
+    });
+    if let Some(login) = &request.cert_login {
+        let handler = ClientHandler { expect: host_key };
+        let mut handle = client::connect(config, request.addr, handler)
+            .await
+            .map_err(|_| "The SSH session did not open.".to_string())?;
+        let auth = handle
+            .authenticate_openssh_cert(
+                &request.user,
+                Arc::new(login.key.clone()),
+                login.cert.clone(),
+            )
+            .await
+            .map_err(|_| "The SSH session did not open.".to_string())?;
+        if !auth.success() {
+            return Err("The SSH session was refused.".to_string());
+        }
+        let channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|_| "The SSH session did not open.".to_string())?;
+        return Ok((handle, channel));
+    }
+    let cert_pem = read_text(&request.identity_dir.join("cert.pem"))?;
+    let key_pem = read_text(&request.identity_dir.join("key.pem"))?;
     let leaf_der =
         decode_certificate_pem(&cert_pem).map_err(|_| "The SVID is not valid.".to_string())?;
     let ticket = fs::read(request.identity_dir.join("ticket.bin")).ok();
@@ -200,10 +247,6 @@ async fn open_channel(
         SystemTime::now(),
         ticket.as_deref(),
     )?;
-    let config = Arc::new(client::Config {
-        inactivity_timeout: Some(std::time::Duration::from_secs(30)),
-        ..client::Config::default()
-    });
     let handler = ClientHandler { expect: host_key };
     let mut handle = client::connect(config, request.addr, handler)
         .await

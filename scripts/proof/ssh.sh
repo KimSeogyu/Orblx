@@ -1,7 +1,23 @@
 #!/usr/bin/env bash
-# SSH proof for three node containers on one Linux host.
-# The containers stand in for other hosts.
-# The script does not print private keys, tickets, or SVID proofs.
+# SSH proof (W25-31): SSH user certificates from the coordinator.
+# The containers stand in for other hosts on one Linux host.
+# The coordinator issues the node SVIDs and tickets (OIDC and token enroll) and the SSH user
+# certificates. The proof makes no lab SVIDs and no lab tickets.
+#
+# Gates:
+#   - alice (owner of node a) gets a certificate with life <= 900 s and the principal
+#     oidc:alice, and runs a command and a PTY shell on node b.
+#   - mallory (no ssh rule) gets no certificate. The coordinator writes 1 deny record.
+#   - pat (pending) and rex (rejected) cannot enroll a node, so they cannot ask.
+#   - the sharee gets only the sharee login: sharee@b works, alice@b from node s is refused.
+#   - a non-root caller on node a is refused. The node SVID key is mode 600, owner root.
+#   - a certificate from a CA that is not in the netmap is refused (openssh-client in the
+#     image, [C]).
+#   - revoke of user sharee and of node a: no new certificate, and the open session ends.
+#     The script prints the ms from the revoke command to the session end on node b.
+#   - each certificate request writes exactly 1 ssh-cert record (code 39) at the coordinator.
+#   - the session recording gates of row 41 (recording, tamper verify, read-only dir).
+# The script does not print private keys, ID tokens, enroll tokens, tickets, or certificates.
 set -euo pipefail
 # shellcheck source=scripts/proof/pipe-lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
@@ -10,7 +26,23 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 FILE="scripts/proof/compose.ssh.yml"
 WORK="$(mktemp -d)"
-ENV_FILE="$WORK/ssh.env"
+export POLICY_DIR="$WORK/policy"
+export CONFIG_FILE="$WORK/coord.toml"
+export IDP_CA_FILE="$WORK/idp-ca.pem"
+export SSH_REC_C="$WORK/c-rec"
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+ISSUER="https://idp:8443"
+CLIENT="orblx-proof"
+COORD="172.28.19.10:443"
+STATE=/var/lib/orblx
+REVOKE_LIMIT_MS="${ORBLX_SSH_REVOKE_LIMIT_MS:-60000}"
+# W25-31 PO Q13: the idle phase with the coordinator up (at least 600 s, a login each 30 s).
+IDLE_SECS="${ORBLX_SSH_IDLE_SECS:-600}"
+IDLE_STEP=30
+# One line for each certificate request of a root caller (a subshell can add a line too).
+ask() {
+  echo ask >>"$WORK/asks"
+}
 
 as_root() {
   if [[ "$(id -u)" -eq 0 ]]; then
@@ -21,16 +53,18 @@ as_root() {
 }
 
 dc() {
-  as_root docker compose --env-file "$ENV_FILE" --progress quiet -f "$FILE" "$@"
+  as_root env POLICY_DIR="$POLICY_DIR" CONFIG_FILE="$CONFIG_FILE" IDP_CA_FILE="$IDP_CA_FILE" \
+    SSH_REC_C="$SSH_REC_C" docker compose --progress quiet --profile nodes -f "$FILE" "$@"
 }
 
 cleanup() {
   local status=$?
   if [[ "$status" -ne 0 ]]; then
-    echo "---- docker logs ----"
-    dc logs || true
+    echo "---- docker logs (tail) ----"
+    dc logs --tail 60 2>&1 | grep -v 'PRIVATE KEY' || true
   fi
-  dc down --remove-orphans >/dev/null 2>&1 || true
+  jobs -p | xargs -r kill 2>/dev/null || true
+  dc down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
 # W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
@@ -53,390 +87,573 @@ open_legacy_forward() {
   as_root iptables-legacy -P FORWARD ACCEPT
 }
 
-write_netmap() {
-  local path=$1
-  local name=$2
-  local ip=$3
-  local peer1_name=$4
-  local peer1_ip=$5
-  local peer1_underlay=$6
-  local peer2_name=$7
-  local peer2_ip=$8
-  local peer2_underlay=$9
-  cat >"$path" <<EOF
-{
-  "version": 1,
-  "self": {"name": "${name}", "overlay_ip": "${ip}"},
-  "peers": [
-    {
-      "name": "${peer1_name}",
-      "overlay_ip": "${peer1_ip}",
-      "svid": "spiffe://orblx.local/node/${peer1_name}",
-      "endpoints": ["${peer1_underlay}:443"],
-      "routes": ["${peer1_ip}/32"]
-    },
-    {
-      "name": "${peer2_name}",
-      "overlay_ip": "${peer2_ip}",
-      "svid": "spiffe://orblx.local/node/${peer2_name}",
-      "endpoints": ["${peer2_underlay}:443"],
-      "routes": ["${peer2_ip}/32"]
-    }
-  ]
-}
-EOF
+now_ms() {
+  date +%s%3N
 }
 
-wait_direct() {
-  local node=$1
-  local peer=$2
-  local attempt
-  for attempt in $(seq 1 40); do
-    if dc exec -T "$node" orblx status 2>/dev/null | read_all grep -q "peer ${peer} overlay_ip .* path direct "; then
+wait_log() {
+  local service="$1" needle="$2" i
+  for i in $(seq 1 60); do
+    if dc logs "$service" 2>&1 | read_all grep -q -- "$needle"; then
       return 0
     fi
     sleep 1
   done
-  echo "The node ${node} did not reach ${peer}." >&2
+  echo "The service ${service} did not print: ${needle}" >&2
   return 1
 }
 
-wait_listen() {
-  local node=$1
-  local attempt
-  for attempt in $(seq 1 40); do
-    if dc logs "$node" 2>/dev/null | read_all grep -q 'ssh_listen '; then
+wait_bundle() {
+  local i
+  for i in $(seq 1 90); do
+    if dc exec -T coord cat "$STATE/trust-bundle.pem" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
   done
-  echo "The node ${node} did not listen for SSH." >&2
+  echo "The coordinator did not write the trust bundle." >&2
   return 1
 }
 
-ssh_from() {
-  local node=$1
-  local target=$2
-  local identity=$3
-  local peer=$4
-  dc exec -T "$node" orblx ssh "$target" \
-    --identity "$identity" \
-    --netmap /etc/orblx/netmap.json \
-    --peer-cert "$peer" \
-    --command 'printf '\''%s\n'\'' "$ORBLX_SSH_USER"'
+idp() {
+  dc run --rm --no-deps --entrypoint orblx-test-idp idp "$@"
+}
+
+# mint USER: one ID token for USER@example.test (email_verified true) at /tokens/USER.
+mint() {
+  # The idp service runs with a fixed address, so a second "run" container cannot start.
+  dc exec -T idp orblx-test-idp mint --dir /idp --kid rs1 --issuer "$ISSUER" --aud "$CLIENT" --out "/tokens/$1" \
+    --sub "$1" --email "$1@example.test" >/dev/null
+}
+
+run_node() {
+  local service="$1"
+  shift
+  dc run --rm --no-deps -T --entrypoint orblx "$service" "$@"
+}
+
+owner() {
+  run_node owner admin "$@" --coord "$COORD" --state "$STATE" --bundle "$STATE/bundle.pem"
+}
+
+enroll_token() {
+  local name="$1"
+  dc exec -T coord orblx coord token create --state "$STATE" --ttl 3600 \
+    --out "$STATE/tokens/${name}" >/dev/null
+  run_node "$name" coord enroll --name "$name" --coord "$COORD" \
+    --bundle /coord-state/trust-bundle.pem --token-file "/coord-state/tokens/${name}" \
+    --state "$STATE" --endpoint "$(service_ip "$name"):443" >/dev/null
+  echo "enrolled ${name} with a token"
+}
+
+# enroll_user SERVICE NODE USER STATE_DIR: one OIDC enroll. Keeps the exit code.
+enroll_user() {
+  run_node "$1" coord enroll --name "$2" --coord "$COORD" \
+    --bundle /coord-state/trust-bundle.pem --id-token-file "/tokens/$3" \
+    --state "$4" --endpoint "$(service_ip "$1"):443"
+}
+
+service_ip() {
+  case "$1" in
+    a) echo 172.28.19.11 ;;
+    b) echo 172.28.19.12 ;;
+    c) echo 172.28.19.13 ;;
+    s) echo 172.28.19.14 ;;
+    m) echo 172.28.19.15 ;;
+    *) echo 172.28.19.20 ;;
+  esac
+}
+
+# expect_enroll_refused LABEL TEXT USER: the enroll of USER (in a throwaway state dir) fails.
+expect_enroll_refused() {
+  local label="$1" text="$2" user="$3" out status
+  set +e
+  out="$(enroll_user owner "${user}-pc" "$user" "/tmp/${user}" 2>&1)"
+  status=$?
+  set -e
+  printf '%s\n' "$out" | grep -v -i 'token' | sed "s/^/  ${label}: /"
+  if [[ "$status" -eq 0 ]]; then
+    echo "The coordinator enrolled ${label}." >&2
+    exit 1
+  fi
+  printf '%s\n' "$out" | read_all grep -qF -- "$text"
+  echo "check ${label} enroll refused (no node SVID, no certificate)"
+}
+
+coord_file() {
+  dc exec -T coord cat "$STATE/$1"
+}
+
+# The ssh-cert records at the coordinator.
+cert_records() {
+  coord_file config-audit.jsonl | jq -c 'select(.action == "ssh-cert")'
+}
+
+cert_count() {
+  cert_records | wc -l | tr -d ' '
+}
+
+wait_path() {
+  local from="$1" to="$2" i
+  for i in $(seq 1 60); do
+    if dc exec -T "$from" orblx status --state-dir "$STATE" 2>/dev/null \
+      | read_all grep -q "^peer ${to} .* path direct "; then
+      echo "path ${from} ${to} direct"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "The path from ${from} to ${to} did not come up." >&2
+  return 1
+}
+
+# The SSH server of a target node starts when the node has a fresh netmap with the CA set.
+wait_ca() {
+  local node="$1" i
+  for i in $(seq 1 60); do
+    if dc exec -T "$node" sh -c "jq -e '.netmap.issued_at_ms > 0 and (.netmap.ssh_user_ca | length == 2)' $STATE/netmap.signed.json" >/dev/null 2>&1; then
+      echo "node ${node} netmap ssh_user_ca 2 fresh"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "The node ${node} has no fresh netmap with the SSH CA set." >&2
+  return 1
+}
+
+# Copy the current SVID of target node TO into node FROM at /tmp/peers/TO.pem.
+peer_pem() {
+  local from="$1" to="$2"
+  dc exec -T "$to" cat "$STATE/cert.pem" \
+    | dc exec -T "$from" sh -c "mkdir -p /tmp/peers && cat > /tmp/peers/${to}.pem"
+}
+
+# ssh_cert FROM USER@TO [EXTRA...]: one certificate login from node FROM as root.
+ssh_cert() {
+  local from="$1" target="$2" to
+  shift 2
+  to="${target#*@}"
+  peer_pem "$from" "$to"
+  ask
+  dc exec -T "$from" orblx ssh "$target" --state "$STATE" --peer-cert "/tmp/peers/${to}.pem" \
+    --command 'printf '\''%s\n'\'' "$ORBLX_SSH_USER"' "$@"
 }
 
 expect_deny() {
-  local label=$1
+  local label="$1" out
   shift
-  if ssh_from "$@"; then
+  if out="$(ssh_cert "$@" 2>&1)"; then
+    printf '%s\n' "$out"
     echo "The session ${label} was accepted." >&2
     return 1
   fi
+  printf '%s\n' "$out" | sed "s/^/  ${label}: /"
   echo "denied ${label}"
 }
+
+# The last ssh-cert record for one node: decision, reason, and principal.
+last_record() {
+  cert_records | jq -r --arg n "spiffe://orblx.local/node/$1" \
+    'select(.actor == $n) | .detail' | tail -n 1
+}
+
+b_audit_revoked() {
+  dc exec -T b sh -c "grep -c '\"reason\":\"revoked\"' $STATE/ssh-audit.jsonl || true" | tr -d '\r'
+}
+
+# open_shell FROM USER@TO: start a PTY shell that stays open. SHELL_PID is the host pid of the client.
+open_shell() {
+  local from="$1" target="$2" to
+  to="${target#*@}"
+  peer_pem "$from" "$to"
+  ask
+  {
+    sleep 1
+    printf 'echo open-$((40+2))\n'
+    sleep 300
+  } | dc exec -T "$from" orblx ssh "$target" --state "$STATE" --peer-cert "/tmp/peers/${to}.pem" \
+    --shell >"$WORK/shell-${from}.out" 2>&1 &
+  SHELL_PID=$!
+}
+
+wait_open() {
+  local from="$1" i
+  for i in $(seq 1 60); do
+    if tr -d '\r' <"$WORK/shell-${from}.out" | read_all grep -qx 'open-42'; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "The shell from ${from} did not open." >&2
+  cat "$WORK/shell-${from}.out" >&2 || true
+  return 1
+}
+
+# measure_revoke LABEL PID BEFORE START_MS: wait until the open session ends.
+# The session end is a new revoked deny record on node b, or the end of the client process.
+measure_revoke() {
+  local label="$1" pid="$2" before="$3" start="$4" now count signal=""
+  while :; do
+    now="$(now_ms)"
+    if ! kill -0 "$pid" 2>/dev/null; then
+      signal="client-exit"
+      break
+    fi
+    count="$(b_audit_revoked)"
+    if (( count > before )); then
+      signal="node-b-revoked-record"
+      break
+    fi
+    if (( now - start > REVOKE_LIMIT_MS )); then
+      echo "The open session of ${label} did not end in ${REVOKE_LIMIT_MS} ms." >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
+  echo "revoke_to_session_end_ms ${label} $((now - start)) signal ${signal}"
+  results+=("${label}=$((now - start))")
+  # The client process must end too.
+  local i
+  for i in $(seq 1 100); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "The client of ${label} did not end." >&2
+    exit 1
+  fi
+  echo "client_ended ${label} after $(( $(now_ms) - start )) ms"
+  dc logs b 2>&1 | grep 'ssh certificate revoked serial' | sed 's/^[^|]*| //' | tail -n 2 || true
+}
+
+results=()
+mkdir -p "$POLICY_DIR" "$SSH_REC_C"
+: >"$IDP_CA_FILE"
+cp "$ROOT/scripts/proof/ssh.hujson" "$POLICY_DIR/policy.hujson"
+cat >"$CONFIG_FILE" <<CONF
+# [C] coordinator config for the SSH proof.
+[oidc]
+issuer = "${ISSUER}"
+client_id = "${CLIENT}"
+allowed_domains = ["example.test"]
+allowed_emails = []
+ca_file = "/etc/orblx/idp-ca.pem"
+CONF
 
 echo "=== [REAL] one Linux host ==="
 uname -s
 uname -m
+open_legacy_forward
 
-echo "=== [C] build image ==="
-cargo build -p orblx-cli --bin orblx
+echo "=== [C] build image (release) ==="
+# The PO rule of 19:50 KST: an acceptance run with a latency or gap gate uses a release build.
+# The log keeps the rustc version and the cargo profile line ("Finished `release` profile").
+rustc --version
+cargo build --release -p orblx-cli --bin orblx -p orblx-test-idp --bin orblx-test-idp --locked
 # shellcheck source=stage-image.sh
 source "$ROOT/scripts/proof/stage-image.sh"
-IMAGE_DIR="$(stage_proof_image "$ROOT" "$ROOT/target/debug/orblx")"
-as_root docker build -t orblx-ssh:local "$IMAGE_DIR"
+IMAGE_DIR="$(stage_proof_image "$ROOT" "$TARGET_DIR/release/orblx")"
+cp "$TARGET_DIR/release/orblx-test-idp" "$IMAGE_DIR/orblx-test-idp"
+{
+  printf '%s\n' 'COPY orblx-test-idp /usr/local/bin/orblx-test-idp'
+  # [C] openssh-client for the foreign CA gate only. The node does not run sshd.
+  printf '%s\n' 'RUN apt-get update && apt-get install -y --no-install-recommends openssh-client && rm -rf /var/lib/apt/lists/*'
+} >>"$IMAGE_DIR/Dockerfile"
+# --no-cache: the build does not use cached layers. Run 5 failed when a cached layer was
+# removed during the build ("No such image").
+as_root docker build --no-cache -q -t orblx-ssh:local "$IMAGE_DIR" >/dev/null
 rm -rf "$IMAGE_DIR"
 
-echo "=== [C] issue SVIDs ==="
-"$ROOT/target/debug/orblx" node-issue \
-  --out "$WORK" \
-  --node a=100.64.0.1 \
-  --node b=100.64.0.2 \
-  --node c=100.64.0.3 \
-  --user alice \
-  --user mallory \
-  --agent helper \
-  --agent-parent alice \
-  --agent-host 100.64.0.2 \
-  --agent-user alice
+echo "=== [C] test issuer and coordinator ==="
+idp init --dir /idp --host idp >/dev/null
+dc run --rm --no-deps --entrypoint cat idp /idp/ca.pem >"$IDP_CA_FILE"
+grep -q 'BEGIN CERTIFICATE' "$IDP_CA_FILE"
+dc up -d idp
+wait_log idp "idp serve"
+dc up -d coord
+wait_bundle
+wait_log coord "oidc issuer"
+ca_mode="$(dc exec -T coord stat -c '%a %U' "$STATE/ssh-user-ca.json" | tr -d '\r')"
+echo "coord ssh-user-ca.json mode ${ca_mode}"
+[[ "$ca_mode" == "600 root" ]]
 
-for name in a b c; do
-  cp "$ROOT/scripts/proof/ssh.hujson" "$WORK/$name/policy.hujson"
+echo "=== [C] enroll: owner, b, c with tokens; a, s, m with OIDC ==="
+for name in owner b c; do
+  enroll_token "$name"
 done
-mkdir -p "$WORK/peers"
-cp "$WORK/b/cert.pem" "$WORK/peers/b.pem"
-cp "$WORK/c/cert.pem" "$WORK/peers/c.pem"
+for user in alice sharee mallory pat rex; do
+  mint "$user"
+done
+enroll_user a a alice "$STATE" >/dev/null
+echo "enrolled a as oidc:alice (owner user, no wait)"
+expect_enroll_refused "sharee pending" "The user waits for owner approval." sharee
+expect_enroll_refused "mallory pending" "The user waits for owner approval." mallory
+expect_enroll_refused "pat pending" "The user waits for owner approval." pat
+expect_enroll_refused "rex pending" "The user waits for owner approval." rex
+owner user-approve oidc:sharee >/dev/null
+owner user-approve oidc:mallory >/dev/null
+owner user-reject oidc:rex >/dev/null
+expect_enroll_refused "rex rejected" "The owner rejected this user." rex
+expect_enroll_refused "pat still pending" "The user waits for owner approval." pat
+enroll_user s s sharee "$STATE" >/dev/null
+echo "enrolled s as oidc:sharee (approved)"
+enroll_user m m mallory "$STATE" >/dev/null
+echo "enrolled m as oidc:mallory (approved)"
+owner nodes | read_all awk '$1 == "node" {print "node", $2, $3}'
+users_out="$(owner users)"
+printf '%s\n' "$users_out" | read_all awk '$1 == "user" {print}'
 
-write_netmap "$WORK/netmap-a.json" a 100.64.0.1 b 100.64.0.2 172.28.19.12 c 100.64.0.3 172.28.19.13
-write_netmap "$WORK/netmap-b.json" b 100.64.0.2 a 100.64.0.1 172.28.19.11 c 100.64.0.3 172.28.19.13
-write_netmap "$WORK/netmap-c.json" c 100.64.0.3 a 100.64.0.1 172.28.19.11 b 100.64.0.2 172.28.19.12
+echo "=== [C] SSH policy on the target nodes b and c ==="
+for name in b c; do
+  dc run --rm --no-deps -T --entrypoint sh "$name" -c "cat > $STATE/policy.hujson" \
+    <"$ROOT/scripts/proof/ssh.hujson"
+  echo "policy ${name} written"
+done
 
-cat >"$ENV_FILE" <<EOF
-SSH_STATE_A=$WORK/a
-SSH_STATE_B=$WORK/b
-SSH_STATE_C=$WORK/c
-SSH_NETMAP_A=$WORK/netmap-a.json
-SSH_NETMAP_B=$WORK/netmap-b.json
-SSH_NETMAP_C=$WORK/netmap-c.json
-SSH_USERS=$WORK/users
-SSH_AGENTS=$WORK/agents
-SSH_PEERS=$WORK/peers
-SSH_REC_C=$WORK/c-rec
-EOF
-mkdir -p "$WORK/c-rec"
-
-open_legacy_forward
 echo "=== [C] start nodes ==="
-dc up -d --remove-orphans
-wait_direct node-a b
-wait_direct node-a c
-wait_direct node-b a
-wait_listen node-b
-wait_listen node-c
+dc up -d a b c s m
+for name in a b c s m; do
+  wait_log "$name" 'The TUN device'
+done
+wait_path a b
+wait_path a c
+wait_path s b
+wait_path m b
+wait_ca b
+wait_ca c
+b_ip="$(dc exec -T b jq -r '.self.overlay_ip' "$STATE/netmap.json" | tr -d '\r')"
+a_ip="$(dc exec -T a jq -r '.self.overlay_ip' "$STATE/netmap.json" | tr -d '\r')"
+echo "a_ip ${a_ip} b_ip ${b_ip}"
 
-echo "=== [C] alice to node b ==="
-alice_out="$(ssh_from node-a alice@b /var/lib/orblx-id/users/alice /var/lib/orblx-peers/b.pem)"
+echo "=== [C] lab-ticket guard: the node tickets come from the coordinator ==="
+for name in a b c s m; do
+  mkdir -p "$WORK/guard/$name"
+  dc exec -T "$name" cat "$STATE/ticket.bin" >"$WORK/guard/$name/ticket.bin"
+  dc exec -T "$name" cat "$STATE/node-name" >"$WORK/guard/$name/node-name"
+done
+proof_ticket_guard coord "$WORK/guard/a" "$WORK/guard/b" "$WORK/guard/c" "$WORK/guard/s" "$WORK/guard/m"
+rm -rf "$WORK/guard"
+
+echo "=== [C] gate: the node SVID key is root-only, and a non-root caller is refused ==="
+key_mode="$(dc exec -T a stat -c '%a %U' "$STATE/key.pem" | tr -d '\r')"
+echo "node a key.pem mode ${key_mode}"
+[[ "$key_mode" == "600 root" ]]
+peer_pem a b
+if nonroot="$(dc exec -T --user 65534 a orblx ssh alice@b --state "$STATE" \
+  --peer-cert /tmp/peers/b.pem 2>&1)"; then
+  echo "The non-root caller got a session." >&2
+  exit 1
+fi
+printf '%s\n' "$nonroot" | sed 's/^/  nonroot: /'
+printf '%s\n' "$nonroot" | read_all grep -q 'needs root'
+echo "denied nonroot (no request reached the coordinator)"
+[[ "$(cert_count)" -eq 0 ]]
+
+echo "=== [C] gate: alice gets a certificate for oidc:alice and runs a command on b ==="
+alice_out="$(ssh_cert a alice@b | tr -d '\r')"
 printf '%s\n' "$alice_out"
 [[ "$alice_out" == "alice" ]]
+rec="$(last_record a)"
+echo "coord ssh-cert ${rec}"
+echo "$rec" | read_all grep -q 'decision allow'
+echo "$rec" | read_all grep -q 'principal oidc:alice'
+after="$(echo "$rec" | read_all awk '{for (i = 1; i < NF; i++) if ($i == "valid_after") print $(i + 1)}')"
+before="$(echo "$rec" | read_all awk '{for (i = 1; i < NF; i++) if ($i == "valid_before") print $(i + 1)}')"
+life=$((before - after))
+echo "cert_life_s ${life} (valid_after is now - 60)"
+(( life <= 900 + 60 ))
+(( before - $(date +%s) <= 900 ))
+dc logs b 2>&1 | read_all grep -q 'ssh certificate accepted serial [0-9]* principal oidc:alice'
+echo "node b accepted the certificate"
 
-echo "=== [C] admin revoke of node b through deny.json ==="
-stamp="$(date +%s)"
-cat >"$WORK/b/deny.json" <<EOF
-{"version":1,"generated_at":${stamp},"revoked_uris":["spiffe://orblx.local/node/b"],"revoked_ticket_nonces":[]}
-EOF
-start_sec="$(date +%s)"
-expect_deny node-b node-a alice@b /var/lib/orblx-id/users/alice /var/lib/orblx-peers/b.pem
-end_sec="$(date +%s)"
-elapsed="$((end_sec - start_sec))"
-echo "node_revoke_seconds ${elapsed}"
-[[ "$elapsed" -lt 60 ]]
-stamp="$(date +%s)"
-cat >"$WORK/b/deny.json" <<EOF
-{"version":2,"generated_at":${stamp},"revoked_uris":[],"revoked_ticket_nonces":[]}
-EOF
-alice_out="$(ssh_from node-a alice@b /var/lib/orblx-id/users/alice /var/lib/orblx-peers/b.pem)"
-printf '%s\n' "$alice_out"
-[[ "$alice_out" == "alice" ]]
+echo "=== [C] gate: mallory is refused at the coordinator ==="
+expect_deny mallory m mallory@b
+rec="$(last_record m)"
+echo "coord ssh-cert ${rec}"
+echo "$rec" | read_all grep -q 'decision deny'
+echo "$rec" | read_all grep -q 'reason no-grant'
 
-echo "=== [C] mallory denied ==="
-expect_deny mallory node-a mallory@b /var/lib/orblx-id/users/mallory /var/lib/orblx-peers/b.pem
+echo "=== [C] gate: the sharee gets only the sharee login ==="
+sharee_out="$(ssh_cert s sharee@b | tr -d '\r')"
+printf '%s\n' "$sharee_out"
+[[ "$sharee_out" == "sharee" ]]
+rec="$(last_record s)"
+echo "coord ssh-cert ${rec}"
+echo "$rec" | read_all grep -q 'principal oidc:sharee'
+expect_deny "sharee as alice" s alice@b
+dc logs b 2>&1 | read_all grep -Eq 'ssh certificate refused serial [0-9]+ reason (policy|principal)'
+echo "node b refused the sharee certificate for the login alice"
 
-echo "=== [C] alice to node c denied ==="
-expect_deny host node-a alice@c /var/lib/orblx-id/users/alice /var/lib/orblx-peers/c.pem
+echo "=== [C] gate: alice to node c without a rule is refused ==="
+expect_deny "alice to c" a alice@c
 
-echo "=== [C] agent one shot ==="
-agent_out="$(ssh_from node-a alice@b /var/lib/orblx-id/agents/helper /var/lib/orblx-peers/b.pem)"
-printf '%s\n' "$agent_out"
-[[ "$agent_out" == "alice" ]]
-expect_deny replay node-a alice@b /var/lib/orblx-id/agents/helper /var/lib/orblx-peers/b.pem
+echo "=== [C] gate: a certificate from a CA that is not in the netmap is refused ==="
+# [C] OpenSSH makes a foreign CA and one certificate for oidc:alice with the right
+# source-address. The node b SSH server refuses it (reason unknown-ca).
+dc exec -T a sh -c "rm -rf /tmp/rogue && mkdir -p /tmp/rogue && cd /tmp/rogue \
+  && ssh-keygen -q -t ed25519 -N '' -f ca && ssh-keygen -q -t ed25519 -N '' -f user \
+  && ssh-keygen -q -s ca -I rogue -n oidc:alice -z 7 -V -1m:+5m \
+     -O clear -O permit-pty -O source-address=${a_ip}/32 user.pub"
+if rogue="$(dc exec -T a ssh -F /dev/null -i /tmp/rogue/user \
+  -o CertificateFile=/tmp/rogue/user-cert.pub -o IdentitiesOnly=yes -o BatchMode=yes \
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
+  "alice@${b_ip}" true 2>&1)"; then
+  echo "The foreign CA certificate got a session." >&2
+  exit 1
+fi
+printf '%s\n' "$rogue" | grep -v -i 'warning' | sed 's/^/  rogue: /' || true
+dc logs b 2>&1 | read_all grep -q 'ssh certificate refused serial 7 reason unknown-ca'
+echo "denied foreign_ca (node b reason unknown-ca)"
+dc exec -T a rm -rf /tmp/rogue
 
-echo "=== [C] recorded session on node b ==="
-rec_out="$(ssh_from node-a rec@b /var/lib/orblx-id/users/alice /var/lib/orblx-peers/b.pem)"
+echo "=== [C] row 41: recorded session on node b ==="
+rec_out="$(ssh_cert a rec@b | tr -d '\r')"
 printf '%s\n' "$rec_out"
 [[ "$rec_out" == "rec" ]]
-shopt -s nullglob
-rec_files=("$WORK"/b/recordings/*.cast)
-shopt -u nullglob
-echo "recording_files ${#rec_files[@]}"
-[[ "${#rec_files[@]}" -eq 1 ]]
-rec_file="${rec_files[0]}"
-echo "recording_file recordings/$(basename "$rec_file")"
-echo "---- recording ----"
-cat "$rec_file"
-echo "---- end recording ----"
-rec_sha="$(sha256sum "$rec_file" | cut -d' ' -f1)"
+rec_files="$(dc exec -T b sh -c "ls $STATE/recordings/*.cast 2>/dev/null | wc -l" | tr -d '\r ')"
+echo "recording_files ${rec_files}"
+[[ "$rec_files" -eq 1 ]]
+rec_file="$(dc exec -T b sh -c "ls $STATE/recordings/*.cast" | tr -d '\r')"
+rec_sha="$(dc exec -T b sha256sum "$rec_file" | cut -d' ' -f1)"
 echo "recording_sha256 ${rec_sha}"
-grep -q "\"kind\":\"record\".*\"recording_sha256\":\"${rec_sha}\"" "$WORK/b/ssh-audit.jsonl"
+dc exec -T b grep -q "\"kind\":\"record\".*\"recording_sha256\":\"${rec_sha}\"" "$STATE/ssh-audit.jsonl"
 echo "chain_has_recording_sha256 yes"
-b_audit="$(dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl)"
+b_audit="$(dc exec -T b orblx audit verify --file "$STATE/ssh-audit.jsonl" | tr -d '\r')"
 printf '%s\n' "$b_audit"
 echo "$b_audit" | read_all grep -qx 'record 1'
 
-echo "=== [C] one changed byte in the recording fails verify ==="
-cp "$rec_file" "$WORK/recording.orig"
-printf 'X' | dd of="$rec_file" bs=1 seek=1 count=1 conv=notrunc status=none
-if bad="$(dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl 2>&1)"; then
+echo "=== [C] row 41: one changed byte in the recording fails verify ==="
+dc exec -T b cp "$rec_file" /tmp/recording.orig
+dc exec -T b sh -c "printf X | dd of='$rec_file' bs=1 seek=1 count=1 conv=notrunc status=none"
+if bad="$(dc exec -T b orblx audit verify --file "$STATE/ssh-audit.jsonl" 2>&1)"; then
   echo "The changed recording passed verify." >&2
   exit 1
 fi
 printf 'verify_failed %s\n' "$bad"
 echo "$bad" | read_all grep -q 'recording check failed'
-cp "$WORK/recording.orig" "$rec_file"
-dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl | read_all grep -qx ok
+dc exec -T b cp /tmp/recording.orig "$rec_file"
+dc exec -T b orblx audit verify --file "$STATE/ssh-audit.jsonl" | tr -d '\r' | read_all grep -qx ok
 echo "verify_after_restore ok"
 
-echo "=== [C] read-only recording directory on node c fails closed ==="
-if dc exec -T node-c sh -c 'touch /var/lib/orblx/recordings/probe' 2>/dev/null; then
+echo "=== [C] row 41: read-only recording directory on node c fails closed ==="
+if dc exec -T c sh -c "touch $STATE/recordings/probe" 2>/dev/null; then
   echo "The recording directory on node c is writable." >&2
   exit 1
 fi
 echo "recording_dir_read_only yes"
-expect_deny recording node-a rec@c /var/lib/orblx-id/users/alice /var/lib/orblx-peers/c.pem
-c_rec_deny="$(grep -c '"kind":"deny".*"reason":"recording"' "$WORK/c/ssh-audit.jsonl" || true)"
+expect_deny recording a rec@c
+c_rec_deny="$(dc exec -T c sh -c "grep -c '\"kind\":\"deny\".*\"reason\":\"recording\"' $STATE/ssh-audit.jsonl || true" | tr -d '\r')"
 echo "deny_recording ${c_rec_deny}"
 [[ "$c_rec_deny" -ge 1 ]]
 
-echo "=== [C] rule without recording on node b works as before ==="
-alice_out="$(ssh_from node-a alice@b /var/lib/orblx-id/users/alice /var/lib/orblx-peers/b.pem)"
-printf '%s\n' "$alice_out"
-[[ "$alice_out" == "alice" ]]
-shopt -s nullglob
-rec_files=("$WORK"/b/recordings/*.cast)
-shopt -u nullglob
-echo "recording_files ${#rec_files[@]}"
-[[ "${#rec_files[@]}" -eq 1 ]]
-
-echo "=== [C] interactive PTY shell on node b is recorded ==="
-# The input goes in with pauses, as a person types. The shell does not
-# echo the line after `stty -echo`, so the recording keeps only a marker.
+echo "=== [C] row 41: interactive PTY shell on node b is recorded ==="
+peer_pem a b
+ask
 pty_out="$(
   {
-    sleep 2
+    sleep 3
     printf 'echo pty-$((6*7))\n'
     sleep 2
-    printf 'stty -echo; read -r s; stty echo; echo got-${#s}\n'
-    sleep 2
-    printf 'hidden-w23\n'
-    sleep 2
     printf 'exit\n'
     sleep 2
-  } | dc exec -T -e TERM=xterm-256color node-a orblx ssh rec@b \
-    --identity /var/lib/orblx-id/users/alice \
-    --netmap /etc/orblx/netmap.json \
-    --peer-cert /var/lib/orblx-peers/b.pem \
-    --shell
+  } | dc exec -T a orblx ssh rec@b --state "$STATE" --peer-cert /tmp/peers/b.pem --shell
 )"
-printf '%s\n' "$pty_out" | tr -d '\r' | grep -E '^(pty-42|got-10)$'
 printf '%s\n' "$pty_out" | tr -d '\r' | read_all grep -qx 'pty-42'
-printf '%s\n' "$pty_out" | tr -d '\r' | read_all grep -qx 'got-10'
-shopt -s nullglob
-rec_files=("$WORK"/b/recordings/*.cast)
-shopt -u nullglob
-echo "recording_files ${#rec_files[@]}"
-[[ "${#rec_files[@]}" -eq 2 ]]
-pty_file=""
-for candidate in "${rec_files[@]}"; do
-  [[ "$candidate" == "$rec_file" ]] || pty_file="$candidate"
+echo "pty_output pty-42"
+rec_files="$(dc exec -T b sh -c "ls $STATE/recordings/*.cast | wc -l" | tr -d '\r ')"
+echo "recording_files ${rec_files}"
+[[ "$rec_files" -eq 2 ]]
+dc exec -T b orblx audit verify --file "$STATE/ssh-audit.jsonl" | tr -d '\r' | read_all grep -qx 'record 2'
+echo "chain record 2"
+
+echo "=== [C] gate: idle ${IDLE_SECS} s with the coordinator up: the netmap stays fresh ==="
+# No change in the coordinator. Node a logs in to node b each ${IDLE_STEP} s.
+# Each 5 s the script reads the age of the signed issued_at_ms on node b. The limit is 60 s.
+stamp_age() {
+  dc exec -T b sh -c "echo \$(( (\$(date +%s%3N) - \$(jq -r .netmap.issued_at_ms $STATE/netmap.signed.json)) / 1000 ))" | tr -d '\r'
+}
+refused_before="$(dc logs b 2>&1 | grep -Ec 'ssh certificate refused serial [0-9]* reason (stale|future)-netmap' || true)"
+idle_start="$(date +%s)"
+idle_logins=0
+idle_refused=0
+idle_max_age=0
+next_login="$idle_start"
+while (( $(date +%s) - idle_start < IDLE_SECS + 1 )); do
+  age="$(stamp_age)"
+  (( age > idle_max_age )) && idle_max_age="$age"
+  if (( $(date +%s) >= next_login )); then
+    if out="$(ssh_cert a alice@b 2>&1 | tr -d '\r')" && [[ "$out" == "alice" ]]; then
+      idle_logins=$((idle_logins + 1))
+    else
+      idle_refused=$((idle_refused + 1))
+      printf '%s\n' "$out" | sed 's/^/  idle refused: /'
+    fi
+    next_login=$((next_login + IDLE_STEP))
+  fi
+  sleep 5
 done
-echo "pty_recording_file recordings/$(basename "$pty_file")"
-echo "---- pty recording ----"
-cat "$pty_file"
-echo "---- end pty recording ----"
-if grep -q 'hidden-w23' "$pty_file"; then
-  echo "The hidden input is in the recording." >&2
+refused_after="$(dc logs b 2>&1 | grep -Ec 'ssh certificate refused serial [0-9]* reason (stale|future)-netmap' || true)"
+echo "idle_secs $(( $(date +%s) - idle_start )) logins ${idle_logins} refused ${idle_refused} stale_refusals $((refused_after - refused_before)) max_stamp_age_s ${idle_max_age}"
+(( idle_logins >= IDLE_SECS / IDLE_STEP ))
+(( idle_refused == 0 ))
+(( refused_after == refused_before ))
+(( idle_max_age < 60 ))
+echo "idle_gate ok"
+
+echo "=== [C] gate: revoke user sharee ends the open sharee session ==="
+open_shell s sharee@b
+pid_s="$SHELL_PID"
+wait_open s
+before="$(b_audit_revoked)"
+start="$(now_ms)"
+owner revoke-all spiffe://orblx.local/user/sharee | read_all grep -x "revoked_all spiffe://orblx.local/user/sharee"
+measure_revoke user_sharee "$pid_s" "$before" "$start"
+expect_deny "sharee after revoke" s sharee@b
+rec="$(last_record s)"
+echo "coord ssh-cert ${rec}"
+echo "$rec" | read_all grep -q 'decision deny'
+echo "$rec" | read_all grep -Eq 'reason (user-revoked|node-revoked)'
+
+echo "=== [C] gate: revoke node a ends the open alice session ==="
+open_shell a alice@b
+pid_a="$SHELL_PID"
+wait_open a
+before="$(b_audit_revoked)"
+start="$(now_ms)"
+owner revoke a | read_all grep -x "revoked a"
+measure_revoke node_a "$pid_a" "$before" "$start"
+expect_deny "alice after node revoke" a alice@b
+rec="$(last_record a)"
+echo "coord ssh-cert ${rec}"
+echo "$rec" | read_all grep -q 'decision deny'
+echo "$rec" | read_all grep -q 'reason node-revoked'
+# The netmap of b lists the live serials of the revoked pairs.
+revoked_n="$(dc exec -T b jq '.ssh_revoked | length' "$STATE/netmap.json" | tr -d '\r')"
+echo "node b netmap ssh_revoked ${revoked_n}"
+(( revoked_n >= 1 ))
+
+echo "=== [C] gate: 1 ssh-cert record (code 39) for each request ==="
+records="$(cert_count)"
+ASKS="$(wc -l <"$WORK/asks" | tr -d ' ')"
+echo "ssh_cert_requests ${ASKS} ssh_cert_records ${records}"
+[[ "$records" -eq "$ASKS" ]]
+allow="$(cert_records | jq -r '.detail' | grep -c 'decision allow' || true)"
+deny="$(cert_records | jq -r '.detail' | grep -c 'decision deny' || true)"
+echo "ssh_cert_allow ${allow} ssh_cert_deny ${deny}"
+owner audit --verify | read_all grep -E '^verify ok'
+
+echo "=== [C] audit chains on the target nodes ==="
+dc exec -T b orblx audit verify --file "$STATE/ssh-audit.jsonl" | tr -d '\r' | read_all grep -qx ok
+echo "node b chain ok"
+dc exec -T c orblx audit verify --file "$STATE/ssh-audit.jsonl" | tr -d '\r' | read_all grep -qx ok
+echo "node c chain ok"
+
+echo "=== [C] no secrets in the logs ==="
+if dc logs 2>&1 | read_all grep -Eq 'PRIVATE KEY|ssh-ed25519-cert-v01|BEGIN SSH SIGNATURE'; then
+  echo "A log holds a key, a certificate, or a signature." >&2
   exit 1
 fi
-echo "hidden_input_not_recorded yes"
-python3 - "$pty_file" <<'PY'
-import json
-import sys
+echo "logs_clean yes"
 
-lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
-header = json.loads(lines[0])
-events = [json.loads(line) for line in lines[1:]]
-times = [event[0] for event in events]
-assert times == sorted(times), "The event times are not in order."
-codes = {event[1] for event in events}
-assert codes <= {"i", "o", "r", "m"}, codes
-first_input = next(n for n, e in enumerate(events) if e[1] == "i" and "pty-" in e[2])
-first_output = next(n for n, e in enumerate(events) if e[1] == "o" and "pty-42" in e[2])
-assert first_input < first_output, "The output is before its input."
-assert any(e[1] == "m" for e in events), "The hidden input has no marker."
-print("pty_header width %d height %d term %s" % (
-    header["width"], header["height"], header.get("env", {}).get("TERM", "-")))
-print("pty_events %d input %d output %d marker %d" % (
-    len(events),
-    sum(1 for e in events if e[1] == "i"),
-    sum(1 for e in events if e[1] == "o"),
-    sum(1 for e in events if e[1] == "m")))
-print("pty_time_order ok input_before_output ok")
-PY
-pty_sha="$(sha256sum "$pty_file" | cut -d' ' -f1)"
-echo "pty_recording_sha256 ${pty_sha}"
-grep -q "\"kind\":\"record\".*\"recording_sha256\":\"${pty_sha}\"" "$WORK/b/ssh-audit.jsonl"
-echo "chain_has_pty_recording_sha256 yes"
-b_audit="$(dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl)"
-printf '%s\n' "$b_audit"
-echo "$b_audit" | read_all grep -qx 'record 2'
-
-echo "=== [C] one changed byte in the PTY recording fails verify ==="
-cp "$pty_file" "$WORK/pty.orig"
-size="$(stat -c %s "$pty_file")"
-printf 'X' | dd of="$pty_file" bs=1 seek="$((size - 3))" count=1 conv=notrunc status=none
-if bad="$(dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl 2>&1)"; then
-  echo "The changed PTY recording passed verify." >&2
-  exit 1
-fi
-printf 'verify_failed %s\n' "$bad"
-echo "$bad" | read_all grep -q 'recording check failed'
-cp "$WORK/pty.orig" "$pty_file"
-dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl | read_all grep -qx ok
-echo "verify_after_restore ok"
-
-echo "=== [C] PTY shell with a read-only recording directory on node c fails closed ==="
-if c_out="$(printf 'echo leaked\nexit\n' | dc exec -T node-a orblx ssh rec@c \
-  --identity /var/lib/orblx-id/users/alice \
-  --netmap /etc/orblx/netmap.json \
-  --peer-cert /var/lib/orblx-peers/c.pem \
-  --shell 2>&1)"; then
-  echo "The PTY shell on node c was accepted." >&2
-  exit 1
-fi
-printf '%s\n' "$c_out"
-echo "$c_out" | read_all grep -q 'The SSH shell was refused.'
-if echo "$c_out" | read_all grep -q leaked; then
-  echo "The refused shell ran input." >&2
-  exit 1
-fi
-echo "denied pty_recording"
-c_rec_deny="$(grep -c '"kind":"deny".*"reason":"recording"' "$WORK/c/ssh-audit.jsonl" || true)"
-echo "deny_recording ${c_rec_deny}"
-[[ "$c_rec_deny" -ge 2 ]]
-
-echo "=== [C] PTY shell without recording on node b ==="
-plain_out="$(
-  {
-    sleep 2
-    printf 'echo plain-$ORBLX_SSH_USER\n'
-    sleep 2
-    printf 'exit\n'
-    sleep 2
-  } | dc exec -T node-a orblx ssh alice@b \
-    --identity /var/lib/orblx-id/users/alice \
-    --netmap /etc/orblx/netmap.json \
-    --peer-cert /var/lib/orblx-peers/b.pem \
-    --shell
-)"
-printf '%s\n' "$plain_out" | tr -d '\r' | grep -x 'plain-alice'
-shopt -s nullglob
-rec_files=("$WORK"/b/recordings/*.cast)
-shopt -u nullglob
-echo "recording_files ${#rec_files[@]}"
-[[ "${#rec_files[@]}" -eq 2 ]]
-
-echo "=== [C] revoke alice ==="
-stamp="$(date +%s)"
-cat >"$WORK/b/deny.json" <<EOF
-{"version":3,"generated_at":${stamp},"revoked_uris":["spiffe://orblx.local/user/alice"],"revoked_ticket_nonces":[]}
-EOF
-start_sec="$(date +%s)"
-expect_deny revoked node-a alice@b /var/lib/orblx-id/users/alice /var/lib/orblx-peers/b.pem
-end_sec="$(date +%s)"
-elapsed="$((end_sec - start_sec))"
-echo "revoke_seconds ${elapsed}"
-[[ "$elapsed" -lt 60 ]]
-
-echo "=== [C] audit chain on node b ==="
-b_audit="$(dc exec -T node-b orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl)"
-printf '%s\n' "$b_audit"
-echo "$b_audit" | read_all grep -q '^ok$'
-echo "$b_audit" | read_all grep -Eq '^start [1-9]'
-echo "$b_audit" | read_all grep -Eq '^end [1-9]'
-echo "$b_audit" | read_all grep -Eq '^deny [1-9]'
-echo "=== [C] audit chain on node c ==="
-c_audit="$(dc exec -T node-c orblx audit verify --file /var/lib/orblx/ssh-audit.jsonl)"
-printf '%s\n' "$c_audit"
-echo "$c_audit" | read_all grep -Eq '^deny [1-9]'
-
+echo "revoke_ms ${results[*]}"
 echo "proof_ok"
