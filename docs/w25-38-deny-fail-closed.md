@@ -144,6 +144,8 @@ Each 4-kind test uses corrupt, truncated, missing after enroll, and unreadable (
 5. The coordinator starts again. b gets a valid list. allowed is accepted again and a is still refused.
 6. Gate 4: `ORBLX_DENY_WINDOW_ENROLLS` (default 10) more enrolls. Each prints `deny_list ready_ms N`. Each N must be 2000 ms or less. The proof prints `summary w25_38_window ... over 0`.
 
+How the proof reads one SSH probe: `ssh_ok` in the output is accepted. A non-zero exit that is not the 20 s limit (status 124) is refused. When the datapath of b refuses the QUIC session, the TCP connect gets no reply and the probe stops at the 20 s limit. That result is refused only when the `orblx_node_refused` counter of b increased during the probe. Each other result is unknown.
+
 Pass: `summary ... samples N accepted 0 unknown 0` with N >= 1, then `proof_ok`, and a `proof_contention` line with `unknown_samples 0`.
 
 ## Known limits

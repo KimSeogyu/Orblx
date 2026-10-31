@@ -198,14 +198,27 @@ ssh_cmd() {
 }
 
 # Print accepted, refused, or unknown for one SSH login from FROM to b.
+# The SSH client connects over the mesh. When the datapath of b refuses the QUIC session
+# of FROM, the TCP connect gets no reply and the client stops at the 20 s limit (status
+# 124). That result is refused only when the orblx_node_refused counter of b increased
+# during the attempt. Then b refused a session or a frame in that time. Other timeouts are
+# unknown.
 ssh_try() {
   local from="$1"
   local out="$WORK/ssh-${from}.out"
   local status=0
+  local before after
+  before="$(refused_count)"
   dc exec -T "$from" sh -c "timeout 20 $(ssh_cmd) --command 'echo ssh_ok'" >"$out" 2>&1 || status=$?
+  after="$(refused_count)"
   if [[ "$status" -eq 0 ]] && grep -q '^ssh_ok' "$out"; then
     echo accepted
-  elif [[ "$status" -ne 0 && "$status" -ne 124 ]] && ! grep -q '^ssh_ok' "$out"; then
+  elif grep -q '^ssh_ok' "$out"; then
+    echo unknown
+  elif [[ "$status" -ne 0 && "$status" -ne 124 ]]; then
+    echo refused
+  elif [[ "$status" -eq 124 && "$before" =~ ^[0-9]+$ && "$after" =~ ^[0-9]+$ ]] \
+    && (( after > before )); then
     echo refused
   else
     echo unknown
