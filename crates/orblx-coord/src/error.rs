@@ -41,6 +41,10 @@ pub enum CoordError {
     Time,
     /// The live policy sha256 is not the expected sha256 (W25-9).
     Conflict,
+    /// The OIDC user waits for owner approval (W25-15).
+    UserPending,
+    /// An owner rejected the OIDC user (W25-15).
+    UserRejected,
 }
 
 impl CoordError {
@@ -72,9 +76,19 @@ impl CoordError {
             Self::Conflict => {
                 "The live policy changed. Its sha256 is not the expected sha256.".to_string()
             }
+            Self::UserPending => USER_PENDING_TEXT.to_string(),
+            Self::UserRejected => USER_REJECTED_TEXT.to_string(),
         }
     }
 }
+
+/// The enroll error text for a pending OIDC user (W25-15).
+///
+/// `orblx coord enroll --wait-approval` tries again on this text.
+pub const USER_PENDING_TEXT: &str = "The user waits for owner approval.";
+
+/// The enroll error text for a rejected OIDC user (W25-15).
+pub const USER_REJECTED_TEXT: &str = "The owner rejected this user.";
 
 fn sanitize_protocol(text: &str) -> String {
     if text.is_empty()
