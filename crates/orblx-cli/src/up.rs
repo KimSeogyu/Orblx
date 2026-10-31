@@ -751,7 +751,14 @@ fn spawn_deny_refresh(options: &UpOptions) {
                         thread::sleep(DENY_WAIT_GAP.saturating_sub(start.elapsed()));
                         continue;
                     }
-                    Err(_) => policy_after = Instant::now() + DENY_WAIT_RETRY,
+                    Err(_) => {
+                        policy_after = Instant::now() + policy_wait_retry(netmap_ok);
+                        // W25-31: the next reply comes at once, so the fresh stamp of the SSH
+                        // server is renewed without a second hold time.
+                        if netmap_ok {
+                            policy_etag = None;
+                        }
+                    }
                 }
             }
             if start >= wait_after {
@@ -802,6 +809,23 @@ fn apply_policy_sync(state: &Path, sync: &orblx_coord::PolicySync, announce: boo
     }
     true
 }
+
+/// The time before the node tries `policy-wait` again after it failed.
+///
+/// W25-31: a node that has a netmap from `policy-wait` tries again after
+/// [`POLICY_WAIT_RETRY_FRESH`]. Thus one failed reply does not make the netmap older than the
+/// 60 s limit of the SSH certificate login while the coordinator is up.
+/// A node with no such netmap (for example with an old coordinator) waits [`DENY_WAIT_RETRY`].
+fn policy_wait_retry(netmap_ok: bool) -> Duration {
+    if netmap_ok {
+        POLICY_WAIT_RETRY_FRESH
+    } else {
+        DENY_WAIT_RETRY
+    }
+}
+
+/// The retry time of `policy-wait` for a node that has a netmap from it (W25-31).
+const POLICY_WAIT_RETRY_FRESH: Duration = Duration::from_secs(2);
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -1426,6 +1450,20 @@ fn unix_secs(now: SystemTime) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_failed_policy_wait_keeps_the_ssh_netmap_fresh_within_60_s() {
+        // W25-31: one failed reply, one deny-wait hold, and one reply at once (no ETag).
+        let worst = super::policy_wait_retry(true) + orblx_coord::DENY_WAIT_HOLD;
+        assert!(
+            worst.as_secs() < orblx_ssh::cert::NETMAP_MAX_AGE_SECS / 2,
+            "{worst:?}"
+        );
+        // The idle reply comes each hold time.
+        assert!(orblx_coord::DENY_WAIT_HOLD.as_secs() <= 20);
+        // A node with no netmap from policy-wait keeps the old retry time.
+        assert_eq!(super::policy_wait_retry(false), super::DENY_WAIT_RETRY);
+    }
+
     use std::fs;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::os::unix::fs::PermissionsExt;

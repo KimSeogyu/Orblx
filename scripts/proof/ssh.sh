@@ -36,8 +36,13 @@ CLIENT="orblx-proof"
 COORD="172.28.19.10:443"
 STATE=/var/lib/orblx
 REVOKE_LIMIT_MS="${ORBLX_SSH_REVOKE_LIMIT_MS:-60000}"
-# The number of certificate requests that reached the coordinator.
-ASKS=0
+# W25-31 PO Q13: the idle phase with the coordinator up (at least 600 s, a login each 30 s).
+IDLE_SECS="${ORBLX_SSH_IDLE_SECS:-600}"
+IDLE_STEP=30
+# One line for each certificate request of a root caller (a subshell can add a line too).
+ask() {
+  echo ask >>"$WORK/asks"
+}
 
 as_root() {
   if [[ "$(id -u)" -eq 0 ]]; then
@@ -229,7 +234,7 @@ ssh_cert() {
   shift 2
   to="${target#*@}"
   peer_pem "$from" "$to"
-  ASKS=$((ASKS + 1))
+  ask
   dc exec -T "$from" orblx ssh "$target" --state "$STATE" --peer-cert "/tmp/peers/${to}.pem" \
     --command 'printf '\''%s\n'\'' "$ORBLX_SSH_USER"' "$@"
 }
@@ -261,7 +266,7 @@ open_shell() {
   local from="$1" target="$2" to
   to="${target#*@}"
   peer_pem "$from" "$to"
-  ASKS=$((ASKS + 1))
+  ask
   {
     sleep 1
     printf 'echo open-$((40+2))\n'
@@ -538,7 +543,7 @@ echo "deny_recording ${c_rec_deny}"
 
 echo "=== [C] row 41: interactive PTY shell on node b is recorded ==="
 peer_pem a b
-ASKS=$((ASKS + 1))
+ask
 pty_out="$(
   {
     sleep 3
@@ -555,6 +560,40 @@ echo "recording_files ${rec_files}"
 [[ "$rec_files" -eq 2 ]]
 dc exec -T b orblx audit verify --file "$STATE/ssh-audit.jsonl" | tr -d '\r' | read_all grep -qx 'record 2'
 echo "chain record 2"
+
+echo "=== [C] gate: idle ${IDLE_SECS} s with the coordinator up: the netmap stays fresh ==="
+# No change in the coordinator. Node a logs in to node b each ${IDLE_STEP} s.
+# Each 5 s the script reads the age of the fresh stamp on node b. The limit is 60 s.
+stamp_age() {
+  dc exec -T b sh -c "echo \$(( \$(date +%s) - \$(cat $STATE/netmap-fresh) ))" | tr -d '\r'
+}
+refused_before="$(dc logs b 2>&1 | grep -c 'ssh certificate refused serial [0-9]* reason stale-netmap' || true)"
+idle_start="$(date +%s)"
+idle_logins=0
+idle_refused=0
+idle_max_age=0
+next_login="$idle_start"
+while (( $(date +%s) - idle_start < IDLE_SECS + 1 )); do
+  age="$(stamp_age)"
+  (( age > idle_max_age )) && idle_max_age="$age"
+  if (( $(date +%s) >= next_login )); then
+    if out="$(ssh_cert a alice@b 2>&1 | tr -d '\r')" && [[ "$out" == "alice" ]]; then
+      idle_logins=$((idle_logins + 1))
+    else
+      idle_refused=$((idle_refused + 1))
+      printf '%s\n' "$out" | sed 's/^/  idle refused: /'
+    fi
+    next_login=$((next_login + IDLE_STEP))
+  fi
+  sleep 5
+done
+refused_after="$(dc logs b 2>&1 | grep -c 'ssh certificate refused serial [0-9]* reason stale-netmap' || true)"
+echo "idle_secs $(( $(date +%s) - idle_start )) logins ${idle_logins} refused ${idle_refused} stale_refusals $((refused_after - refused_before)) max_stamp_age_s ${idle_max_age}"
+(( idle_logins >= IDLE_SECS / IDLE_STEP ))
+(( idle_refused == 0 ))
+(( refused_after == refused_before ))
+(( idle_max_age < 60 ))
+echo "idle_gate ok"
 
 echo "=== [C] gate: revoke user sharee ends the open sharee session ==="
 open_shell s sharee@b
@@ -590,6 +629,7 @@ echo "node b netmap ssh_revoked ${revoked_n}"
 
 echo "=== [C] gate: 1 ssh-cert record (code 39) for each request ==="
 records="$(cert_count)"
+ASKS="$(wc -l <"$WORK/asks" | tr -d ' ')"
 echo "ssh_cert_requests ${ASKS} ssh_cert_records ${records}"
 [[ "$records" -eq "$ASKS" ]]
 allow="$(cert_records | jq -r '.detail' | grep -c 'decision allow' || true)"

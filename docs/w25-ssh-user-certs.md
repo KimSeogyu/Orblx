@@ -86,7 +86,11 @@ The node SSH server (russh) checks in this order:
    user is not in the deny list.
 
 The SSH server refuses a new certificate login when the netmap is older than 60 s (the node writes
-`netmap-fresh` after each good policy-wait reply; the reply comes at most each 20 s).
+`netmap-fresh` after each good policy-wait reply; with no change the coordinator replies each 20 s).
+After a failed policy-wait, a node that has a netmap tries again after 2 s and asks for a reply at
+once. Thus one failed reply does not make a false stale refusal while the coordinator is up.
+
+SSH certificate logins need a coordinator reachable within the last 60 s. Mesh traffic does not.
 Each deny writes 1 deny record in `ssh-audit.jsonl`.
 
 ## Sharing and agents
