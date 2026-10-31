@@ -1610,7 +1610,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "orblx-agent"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3-dev"
 dependencies = [
  "base64",
  "ed25519-dalek 2.2.0",
@@ -1623,7 +1623,7 @@ dependencies = [
 
 [[package]]
 name = "orblx-audit"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3-dev"
 dependencies = [
  "hmac 0.12.1",
  "orblx-identity",
@@ -1635,7 +1635,7 @@ dependencies = [
 
 [[package]]
 name = "orblx-cli"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3-dev"
 dependencies = [
  "orblx-agent",
  "orblx-audit",
@@ -1655,7 +1655,7 @@ dependencies = [
 
 [[package]]
 name = "orblx-coord"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3-dev"
 dependencies = [
  "base64",
  "ed25519-dalek 2.2.0",
@@ -1681,7 +1681,7 @@ dependencies = [
 
 [[package]]
 name = "orblx-crypto"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3-dev"
 dependencies = [
  "hkdf 0.12.4",
  "hmac 0.12.1",
@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "orblx-datapath"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3-dev"
 dependencies = [
  "libc",
  "orblx-audit",
@@ -1714,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "orblx-edge"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3-dev"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -1733,7 +1733,7 @@ dependencies = [
 
 [[package]]
 name = "orblx-file"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3-dev"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "orblx-audit",
@@ -1744,7 +1744,7 @@ dependencies = [
 
 [[package]]
 name = "orblx-identity"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3-dev"
 dependencies = [
  "base64",
  "ed25519-dalek 2.2.0",
@@ -1762,7 +1762,7 @@ dependencies = [
 
 [[package]]
 name = "orblx-relay"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3-dev"
 dependencies = [
  "getrandom 0.2.17",
  "libc",
@@ -1770,7 +1770,7 @@ dependencies = [
 
 [[package]]
 name = "orblx-serve"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3-dev"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -1790,7 +1790,7 @@ dependencies = [
 
 [[package]]
 name = "orblx-sim"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3-dev"
 dependencies = [
  "axum",
  "base64",
@@ -1815,7 +1815,7 @@ dependencies = [
 
 [[package]]
 name = "orblx-ssh"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3-dev"
 dependencies = [
  "base64",
  "ed25519-dalek 2.2.0",
@@ -1830,7 +1830,7 @@ dependencies = [
 
 [[package]]
 name = "orblx-test-idp"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3-dev"
 dependencies = [
  "base64",
  "jsonwebtoken",
