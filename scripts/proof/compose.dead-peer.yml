@@ -1,0 +1,119 @@
+# W25-28 dead peer dial proof stack.
+# `docker compose up` starts only the coordinator. The nodes use the nodes profile.
+name: ${PROOF_PROJECT:-orblx-w2528-dead-proof}
+
+x-node: &node
+  image: ${ORBLX_DEAD_IMAGE:-orblx-w2528-dead:local}
+  profiles: ["nodes"]
+  entrypoint: ["orblx"]
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+  devices:
+    - /dev/net/tun:/dev/net/tun
+  sysctls:
+    net.ipv4.conf.all.rp_filter: "0"
+    net.ipv4.conf.default.rp_filter: "0"
+  stop_grace_period: 10s
+
+x-up: &up
+  - up
+  - --state-dir
+  - /var/lib/orblx
+  - --listen
+  - 0.0.0.0:443
+  - --coord
+  - 172.30.133.2:443
+  - --bundle
+  - /var/lib/orblx/bundle.pem
+
+services:
+  coord:
+    image: ${ORBLX_DEAD_IMAGE:-orblx-w2528-dead:local}
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /etc/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+    volumes:
+      - ${DEAD_COORD_STATE:?set DEAD_COORD_STATE}:/var/lib/orblx
+      - ./dead-peer.hujson:/etc/orblx/policy.hujson:ro
+    networks:
+      proof:
+        ipv4_address: 172.30.133.2
+
+  tool:
+    image: ${ORBLX_DEAD_IMAGE:-orblx-w2528-dead:local}
+    profiles: ["tool"]
+    entrypoint: ["orblx"]
+    volumes:
+      - ${DEAD_WORK:?set DEAD_WORK}:/work
+      - ${DEAD_COORD_STATE:?set DEAD_COORD_STATE}:/coord-state:ro
+    networks:
+      - proof
+
+  # The 50 dead peers: one UDP sink that never answers, on ports 20001-20050.
+  sink:
+    image: ${ORBLX_DEAD_IMAGE:-orblx-w2528-dead:local}
+    profiles: ["nodes"]
+    entrypoint: ["python3", "-u", "/proof/dead-peer-sink.py", "172.30.133.9", "20001", "20050", "/work/sink.log"]
+    volumes:
+      - ./:/proof:ro
+      - ${DEAD_WORK:?set DEAD_WORK}:/work
+    networks:
+      proof:
+        ipv4_address: 172.30.133.9
+
+  a:
+    <<: *node
+    volumes:
+      - ${DEAD_WORK:?set DEAD_WORK}/a:/var/lib/orblx
+    command: *up
+    networks:
+      proof:
+        ipv4_address: 172.30.133.4
+
+  b:
+    <<: *node
+    volumes:
+      - ${DEAD_WORK:?set DEAD_WORK}/b:/var/lib/orblx
+    command: *up
+    networks:
+      proof:
+        ipv4_address: 172.30.133.5
+
+  # c and d are enrolled before a starts, and start later. Before they start, they are dead.
+  c:
+    <<: *node
+    volumes:
+      - ${DEAD_WORK:?set DEAD_WORK}/c:/var/lib/orblx
+    command: *up
+    networks:
+      proof:
+        ipv4_address: 172.30.133.6
+
+  d:
+    <<: *node
+    volumes:
+      - ${DEAD_WORK:?set DEAD_WORK}/d:/var/lib/orblx
+    command: *up
+    networks:
+      proof:
+        ipv4_address: 172.30.133.7
+
+networks:
+  proof:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.133.0/24
+          gateway: 172.30.133.1
+          ip_range: 172.30.133.128/25
