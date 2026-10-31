@@ -42,6 +42,8 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
     let op = match args[0].as_str() {
         "nodes" => "admin-nodes",
         "users" => "admin-users",
+        "user-approve" => "admin-user-approve",
+        "user-reject" => "admin-user-reject",
         "approve" => "admin-approve",
         "revoke" => "admin-revoke",
         "revoke-all" => "admin-revoke-all",
@@ -112,9 +114,13 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
             | "admin-expire"
             | "admin-grant-approve"
             | "admin-grant-revoke"
+            | "admin-user-approve"
+            | "admin-user-reject"
     ) {
         let what = if op.starts_with("admin-grant") {
             "a grant id"
+        } else if op.starts_with("admin-user-") {
+            "a user (oidc:SUBJECT)"
         } else if op == "admin-revoke-all" || op == "admin-revoke-undo" {
             "a principal"
         } else {
@@ -373,11 +379,30 @@ fn print_admin(op: &str, value: &Value) -> Result<(), String> {
                 .get("users")
                 .and_then(Value::as_array)
                 .ok_or_else(|| "The coordinator response is not valid.".to_string())?;
+            let mut pending = 0usize;
             for user in users {
                 let subject = text_field(user, "subject")?;
-                println!("user {subject}");
+                let state = user
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("approved");
+                if state == "pending" {
+                    pending += 1;
+                }
+                let nodes = user
+                    .get("nodes")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                println!("user {subject} {state} nodes {nodes}");
             }
             println!("users {}", users.len());
+            println!("users_pending {pending}");
+        }
+        "admin-user-approve" => {
+            println!("user_approved {}", text_field(value, "user")?);
+        }
+        "admin-user-reject" => {
+            println!("user_rejected {}", text_field(value, "user")?);
         }
         "admin-approve" => {
             println!("approved {}", text_field(value, "name")?);
@@ -626,6 +651,8 @@ fn help() -> String {
     "\
 orblx admin nodes --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin users --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin user-approve USER --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin user-reject USER --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin approve NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin revoke NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin revoke-all PRINCIPAL --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
@@ -648,7 +675,8 @@ With --token-file, the command sends the scoped API token in FILE and no client 
 The coordinator accepts the call only when the token has the scope of the operation.
 The command then prints `status N done_ms MS`. 401: the token is not valid, expired, or revoked.
 403: the token does not have the scope. Only an owner SVID can create, list, or revoke tokens.
-Scopes: nodes:read (nodes, users, routes), nodes:write (approve, revoke, revoke-all, revoke-undo, expire),
+Scopes: nodes:read (nodes, users, routes),
+nodes:write (approve, revoke, revoke-all, revoke-undo, expire, user-approve, user-reject),
 grants:read (grants), grants:write (grant-approve, grant-revoke), audit:read (audit),
 lock:read and lock:write (node lock), policy:read (policy), policy:write (policy-set).
 TIME for --ttl is seconds or an age such as 90s, 30m, 2h, or 7d. The maximum is 30d.
@@ -666,6 +694,12 @@ PRINCIPAL is a node name or a SPIFFE URI of a node, a user, or an agent.
 revoke-undo removes the SVID deny entry of the principal with one deny change and one audit record.
 The grants that revoke-all revoked stay revoked.
 expire removes the node from netmaps until approve.
+users lists the OIDC users with the state pending, approved, or rejected.
+A new OIDC user is pending. A pending or rejected user gets no SVID and cannot enroll a node.
+user-approve lets USER enroll nodes. USER is oidc:SUBJECT or SUBJECT.
+An owner can approve a user before the first sign-in.
+user-reject refuses a pending or new USER. An owner user cannot be rejected.
+Each user-approve and user-reject writes one audit record.
 grants lists the agent JIT grants.
 grant-approve lets the agent fetch the grant. Only an owner approves an agent grant.
 grant-revoke ends grant ID only. The ticket nonce of the grant goes into the deny set.
@@ -684,6 +718,36 @@ The command does not print private keys or enroll tokens.
 #[cfg(test)]
 mod tests {
     use super::{parse, Command};
+
+    #[test]
+    fn user_approve_and_reject_parse_the_user() {
+        for (mode, op) in [
+            ("user-approve", "admin-user-approve"),
+            ("user-reject", "admin-user-reject"),
+        ] {
+            let command = parse(&[
+                mode.to_string(),
+                "oidc:nina".to_string(),
+                "--coord".to_string(),
+                "127.0.0.1:443".to_string(),
+            ])
+            .unwrap();
+            match command {
+                Command::Call(call) => {
+                    assert_eq!(call.op, op);
+                    assert_eq!(call.target, "oidc:nina");
+                }
+                Command::Help => panic!("help"),
+            }
+            let err = parse(&[
+                mode.to_string(),
+                "--coord".to_string(),
+                "127.0.0.1:443".to_string(),
+            ])
+            .unwrap_err();
+            assert!(err.contains("a user"), "{err}");
+        }
+    }
 
     #[test]
     fn approve_parses_the_node_name() {

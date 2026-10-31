@@ -3,7 +3,7 @@ use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use orblx_identity::{OidcMode, GOOGLE_CLIENT_ID_ENV, MAX_USER_TTL};
 
@@ -25,6 +25,8 @@ pub(crate) enum EnrollSecret {
     IdToken {
         file: PathBuf,
         nonce: Option<String>,
+        /// Try again while the user waits for owner approval (W25-15).
+        wait_approval: Option<Duration>,
     },
 }
 
@@ -186,23 +188,33 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
                         &routes,
                     )
                 }
-                EnrollSecret::IdToken { file, nonce } => {
+                EnrollSecret::IdToken {
+                    file,
+                    nonce,
+                    wait_approval,
+                } => {
                     let id_token = fs::read_to_string(file)
                         .map_err(|err| format!("The ID token file did not open. {err}"))?;
                     let id_token = id_token.trim();
                     if id_token.is_empty() {
                         return Err("The ID token file is empty.".to_string());
                     }
-                    enroll_with_oidc_blocking(OidcEnroll {
-                        coord,
-                        coord_name: &coord_name,
-                        bundle_pem: &bundle_pem,
-                        name: &name,
-                        id_token,
-                        nonce: nonce.as_deref(),
-                        endpoints: &endpoints,
-                        routes: &routes,
-                    })
+                    let enroll = || {
+                        enroll_with_oidc_blocking(OidcEnroll {
+                            coord,
+                            coord_name: &coord_name,
+                            bundle_pem: &bundle_pem,
+                            name: &name,
+                            id_token,
+                            nonce: nonce.as_deref(),
+                            endpoints: &endpoints,
+                            routes: &routes,
+                        })
+                    };
+                    match wait_approval {
+                        Some(limit) => enroll_wait_approval(enroll, *limit),
+                        None => enroll(),
+                    }
                 }
             }
             .map_err(|err| err.to_string())?;
@@ -471,6 +483,7 @@ fn parse_enroll(args: &[String]) -> Result<Command, String> {
     let mut token_file = None;
     let mut id_token_file = None;
     let mut nonce = None;
+    let mut wait_approval = None;
     let mut state = None;
     let mut endpoints = Vec::new();
     let mut routes = Vec::new();
@@ -480,6 +493,7 @@ fn parse_enroll(args: &[String]) -> Result<Command, String> {
         index += 1;
         let value = take_value(args, &mut index)?;
         match flag {
+            "--wait-approval" => wait_approval = Some(parse_wait_approval(&value)?),
             "--name" => name = Some(value),
             "--coord" => coord = Some(parse_socket(&value, DEFAULT_PORT)?),
             "--coord-name" => coord_name = Some(value),
@@ -499,8 +513,15 @@ fn parse_enroll(args: &[String]) -> Result<Command, String> {
         coord_name: coord_name.unwrap_or_else(|| "coord".to_string()),
         bundle: bundle.ok_or_else(|| "The command needs --bundle.".to_string())?,
         secret: match (token_file, id_token_file, nonce) {
+            (Some(_), None, _) if wait_approval.is_some() => {
+                return Err("The --wait-approval flag needs --id-token-file.".to_string())
+            }
             (Some(file), None, None) => EnrollSecret::Token(file),
-            (None, Some(file), nonce) => EnrollSecret::IdToken { file, nonce },
+            (None, Some(file), nonce) => EnrollSecret::IdToken {
+                file,
+                nonce,
+                wait_approval,
+            },
             (Some(_), Some(_), _) => {
                 return Err("Use --token-file or --id-token-file, not both.".to_string())
             }
@@ -515,6 +536,54 @@ fn parse_enroll(args: &[String]) -> Result<Command, String> {
         endpoints,
         routes,
     })
+}
+
+/// The longest `--wait-approval` time: one hour.
+const MAX_WAIT_APPROVAL_SECS: u64 = 3600;
+
+/// The time between two enroll tries while the user waits for approval.
+const APPROVAL_POLL: Duration = Duration::from_millis(250);
+
+fn parse_wait_approval(value: &str) -> Result<Duration, String> {
+    let secs: u64 = value
+        .parse()
+        .map_err(|_| "The --wait-approval value is not a number of seconds.".to_string())?;
+    if !(1..=MAX_WAIT_APPROVAL_SECS).contains(&secs) {
+        return Err(format!(
+            "The --wait-approval value must be 1 to {MAX_WAIT_APPROVAL_SECS} seconds."
+        ));
+    }
+    Ok(Duration::from_secs(secs))
+}
+
+/// Enroll again while the coordinator says that the user waits for approval (W25-15).
+///
+/// The ID token stays the same. The token expiry also ends the wait.
+fn enroll_wait_approval<T>(
+    mut enroll: impl FnMut() -> Result<T, orblx_coord::CoordError>,
+    limit: Duration,
+) -> Result<T, orblx_coord::CoordError> {
+    let start = Instant::now();
+    let mut told = false;
+    loop {
+        match enroll() {
+            Err(orblx_coord::CoordError::Protocol(text))
+                if text == orblx_coord::USER_PENDING_TEXT && start.elapsed() < limit =>
+            {
+                if !told {
+                    println!("enroll pending: {text}");
+                    told = true;
+                }
+                std::thread::sleep(APPROVAL_POLL);
+            }
+            other => {
+                if told && other.is_ok() {
+                    println!("approval_wait_ms {}", start.elapsed().as_millis());
+                }
+                return other;
+            }
+        }
+    }
 }
 
 fn parse_advertise(args: &[String]) -> Result<Command, String> {
@@ -597,7 +666,7 @@ fn help() -> String {
     "\
 orblx coord serve --state DIR [--listen ADDR] [--name NAME] [--policy FILE] [--config FILE]
 orblx coord token create --state DIR --out FILE [--ttl SECS]
-orblx coord enroll --name NAME --coord ADDR --bundle FILE (--token-file FILE | --id-token-file FILE [--nonce HEX]) --state DIR [--coord-name NAME] [--endpoint HOST:PORT] [--route CIDR]
+orblx coord enroll --name NAME --coord ADDR --bundle FILE (--token-file FILE | --id-token-file FILE [--nonce HEX] [--wait-approval SECS]) --state DIR [--coord-name NAME] [--endpoint HOST:PORT] [--route CIDR]
 orblx coord advertise --coord ADDR --bundle FILE --state DIR [--route CIDR]... [--exit-node on|off] [--coord-name NAME]
 orblx coord netmap --coord ADDR --bundle FILE --state DIR [--coord-name NAME] [--watch]
 
@@ -625,6 +694,9 @@ The coordinator writes each route change and exit-node change to config-audit.js
 preset = \"google\" selects Google as the issuer.
 --id-token-file enrolls with an OIDC ID token from the configured issuer.
 The command does not print the ID token.
+A new OIDC user waits until an owner runs orblx admin user-approve.
+A waiting or rejected user gets no SVID.
+--wait-approval SECS tries the enroll again each 250 ms while the user waits, up to SECS (1 to 3600).
 "
     .to_string()
 }
@@ -632,6 +704,82 @@ The command does not print the ID token.
 #[cfg(test)]
 mod tests {
     use super::{parse, Command};
+
+    #[test]
+    fn wait_approval_needs_an_id_token_and_a_valid_time() {
+        let base = |extra: &[&str]| {
+            let mut args: Vec<String> = [
+                "enroll",
+                "--name",
+                "pc",
+                "--coord",
+                "127.0.0.1:443",
+                "--bundle",
+                "/tmp/b",
+                "--state",
+                "/tmp/s",
+            ]
+            .iter()
+            .map(|text| text.to_string())
+            .collect();
+            args.extend(extra.iter().map(|text| text.to_string()));
+            parse(&args)
+        };
+        match base(&["--id-token-file", "/tmp/t", "--wait-approval", "30"]).unwrap() {
+            Command::Enroll {
+                secret: super::EnrollSecret::IdToken { wait_approval, .. },
+                ..
+            } => assert_eq!(wait_approval, Some(std::time::Duration::from_secs(30))),
+            _ => panic!("not an OIDC enroll"),
+        }
+        assert!(base(&["--token-file", "/tmp/t", "--wait-approval", "30"]).is_err());
+        assert!(base(&["--id-token-file", "/tmp/t", "--wait-approval", "0"]).is_err());
+        assert!(base(&["--id-token-file", "/tmp/t", "--wait-approval", "3601"]).is_err());
+        assert!(base(&["--id-token-file", "/tmp/t", "--wait-approval", "x"]).is_err());
+    }
+
+    #[test]
+    fn wait_approval_tries_again_only_while_the_user_is_pending() {
+        use orblx_coord::CoordError;
+        let mut calls = 0;
+        let result = super::enroll_wait_approval(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(CoordError::Protocol(
+                        orblx_coord::USER_PENDING_TEXT.to_string(),
+                    ))
+                } else {
+                    Ok(calls)
+                }
+            },
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(result.unwrap(), 3);
+        let mut rejected = 0;
+        let result: Result<(), _> = super::enroll_wait_approval(
+            || {
+                rejected += 1;
+                Err(CoordError::Protocol(
+                    orblx_coord::USER_REJECTED_TEXT.to_string(),
+                ))
+            },
+            std::time::Duration::from_secs(5),
+        );
+        assert!(result.is_err());
+        assert_eq!(rejected, 1);
+        let start = std::time::Instant::now();
+        let result: Result<(), _> = super::enroll_wait_approval(
+            || {
+                Err(CoordError::Protocol(
+                    orblx_coord::USER_PENDING_TEXT.to_string(),
+                ))
+            },
+            std::time::Duration::from_secs(1),
+        );
+        assert!(result.is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    }
 
     #[test]
     fn token_create_requires_out() {
