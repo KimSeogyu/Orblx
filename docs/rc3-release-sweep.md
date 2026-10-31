@@ -190,7 +190,7 @@ caller is not root, so it never asks for a password.
 - `nat-realism`: `ORBLX_NATR_PROFILE=release`, own names `orblx-rc3sw-natr`.
 - `revoke-followup`: `ORBLX_PROOF_PROFILE=release` (its default).
 - `api-tokens`, `token-no-escalation`, `audit-webhooks`, `policy-gitops`, `siem-streaming`: the
-  release binary (`TOKENS_BIN`, `ESC_BIN`, `HOOKS_BIN`, `GITOPS_BIN`, `SIEM_BIN`) and own
+  release binary (`ATPROOF_BIN`, `ESC_BIN`, `HOOKS_BIN`, `GITOPS_BIN`, `SIEM_BIN`) and own
   `orblx-rc3sw-*` project and image names.
 - `split-dns`, `policy-sync`: own `orblx-rc3sw-*` project and image names; `policy-sync` uses
   `ORBLX_SYNC_PROFILE=release` (its default). Linux only.
@@ -312,3 +312,24 @@ session recording) have the mark, so the `ssh` proof does not run in the rc.3 sw
 tickets, and the lab-ticket guard fails it. The sweep exits 2 when row 40 or row 41 claims
 shipped in the rows file or the manifest, when a 4th field is not the mark, and when a shipped
 row has the mark. The release notes draft (`docs/rc3-release-notes.md`) says so for users.
+
+## Old binaries (W25-27)
+
+Some proofs need an orblx from before a change: `user-approval` (row 32) runs a coordinator from
+before W25-15 for its migration phase (`OLD_ORBLX`). The manifest pins it by full commit SHA in
+the proof ENV field: `OLD_ORBLX=@OLD:d9704cfb2f63bebbd3890f5b1accff30b2cace1f@`. That commit is
+the parent of the W25-15 merge (#102, `538b154`), so it has no user approval.
+
+- In a run, after the main build, the sweep builds `orblx` (debug, `--locked`) at the pin in a
+  temp git worktree `$ORBLX_SWEEP_WORK/old-<sha12>-wt` with its own target dir
+  `$ORBLX_SWEEP_WORK/old-<sha12>-target`, copies the binary to the cache
+  `$ORBLX_SWEEP_WORK/old-orblx/<sha>/orblx`, and deletes the worktree and the target (also when
+  the build fails). The default `ORBLX_SWEEP_WORK` is `/workspace/orblx-rc3-sweep-work`. A cached
+  binary is reused. A failed old build is exit 2, with the log
+  `rc3-sweep-<sha>-old-<sha12>-build.log`.
+- When `OLD_ORBLX` is set in the caller's environment, the sweep uses it and builds nothing. It
+  must be an executable file (else exit 2).
+- `--plan` shows the step for each pinned proof (build, cached, or from the environment).
+- Exit 2 in `--plan` and in a run: a proof whose script needs `OLD_ORBLX` (`OLD_ORBLX:?`) with no
+  pin, a pin that is not 40 lowercase hex digits, a pin that is not the value of `OLD_ORBLX`,
+  and (with git) a pin that is not a commit or not an ancestor of `COMMIT`.

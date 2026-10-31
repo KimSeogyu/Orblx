@@ -53,6 +53,16 @@
 #                         for all the proofs.
 #   ORBLX_SWEEP_MIN_FREE_GB Free disk space (GB) that the run needs before it starts (default
 #                         30), on the file system of the worktree and of ORBLX_SWEEP_OUT.
+#   ORBLX_SWEEP_WORK      Work dir for the old-binary builds and their cache (default
+#                         /workspace/orblx-rc3-sweep-work).
+#   OLD_ORBLX             When set, the proofs that pin an old binary use it, and the sweep
+#                         builds none.
+# Old binaries (W25-27): a proof ENV word may hold @OLD:<full commit SHA>@. The sweep builds
+# orblx (debug) at that commit in a temp git worktree with its own target dir, caches the
+# binary at $ORBLX_SWEEP_WORK/old-orblx/<sha>/orblx, deletes the worktree and the target, and
+# puts the cached path in the word. A proof whose script needs OLD_ORBLX ("OLD_ORBLX:?") must
+# have an OLD_ORBLX=@OLD:<sha>@ word. No pin, a pin that is not 40 hex digits, or (with git)
+# a pin that is not an ancestor of COMMIT is exit 2, in --plan and in a run.
 #   ORBLX_SWEEP_TEST_ROOT Test only: use this directory as the checkout. No git, no build,
 #                         no sudo, no image removal.
 # The script prints no token and no key.
@@ -78,6 +88,8 @@ TIMEOUT="${ORBLX_SWEEP_TIMEOUT:-3600}"
 ONLY="${ORBLX_SWEEP_ONLY:-}"
 KEEP="${ORBLX_SWEEP_KEEP:-0}"
 TEST_ROOT="${ORBLX_SWEEP_TEST_ROOT:-}"
+WORK="${ORBLX_SWEEP_WORK:-/workspace/orblx-rc3-sweep-work}"
+OLD_ENV="${OLD_ORBLX:-}"
 PROGRESS="${ORBLX_SWEEP_PROGRESS:-}"
 MANIFEST_REL="scripts/proof/sweep-manifest.txt"
 ROWS_REL="docs/matrix-rows.txt"
@@ -411,6 +423,49 @@ rows_of() {
 }
 
 # 3. Plan: list every row and its proof, and the time estimate. No build, no proof run.
+# W25-27: old-binary pins. P_PIN[i] is the pinned SHA of proof i, or "-".
+script_text() {
+  if [[ -n "$TEST_ROOT" ]]; then
+    cat "$ROOT/$1" 2>/dev/null
+  else
+    git -C "$REPO" show "$SHA:$1" 2>/dev/null
+  fi
+}
+P_PIN=()
+OLD_PINS=""
+for i in "${!P_NAME[@]}"; do
+  pin="-"
+  envs="${P_ENV[$i]}"
+  if [[ "$envs" == *"@OLD:"* ]]; then
+    [[ "$envs" =~ OLD_ORBLX=@OLD:([^@ ]*)@ ]] ||
+      die "manifest: proof ${P_NAME[$i]}: an @OLD:...@ pin must be the value of OLD_ORBLX (OLD_ORBLX=@OLD:<full sha>@)"
+    pin="${BASH_REMATCH[1]}"
+    [[ "$pin" =~ ^[0-9a-f]{40}$ ]] ||
+      die "manifest: proof ${P_NAME[$i]}: bad old-binary pin '$pin' (a full 40-hex commit SHA)"
+    if [[ -z "$TEST_ROOT" ]]; then
+      git -C "$REPO" cat-file -e "$pin^{commit}" 2>/dev/null ||
+        die "manifest: proof ${P_NAME[$i]}: old-binary pin $pin is not a commit here"
+      git -C "$REPO" merge-base --is-ancestor "$pin" "$SHA" ||
+        die "manifest: proof ${P_NAME[$i]}: old-binary pin $pin is not an ancestor of $SHORT"
+    fi
+    [[ " $OLD_PINS " == *" $pin "* ]] || OLD_PINS="${OLD_PINS:+$OLD_PINS }$pin"
+  fi
+  if [[ "$pin" == "-" ]] && script_text "${P_PATH[$i]}" | has_line 'OLD_ORBLX:[?]'; then
+    die "manifest: proof ${P_NAME[$i]} needs OLD_ORBLX (its script requires it), and its manifest line has no OLD_ORBLX=@OLD:<full sha>@ pin"
+  fi
+  P_PIN+=("$pin")
+done
+old_bin_of() { echo "$WORK/old-orblx/$1/orblx"; }
+old_step_of() {
+  if [[ -n "$OLD_ENV" ]]; then
+    echo "OLD_ORBLX from the environment: $OLD_ENV (no build)"
+  elif [[ -x "$(old_bin_of "$1")" ]]; then
+    echo "old binary cached: $(old_bin_of "$1") (commit $1)"
+  else
+    echo "build old orblx (debug) at $1 in a temp worktree, cache $(old_bin_of "$1")"
+  fi
+}
+
 if [[ "$PLAN" == 1 ]]; then
   PLAN_FILE="$OUT/rc3-sweep-$SHORT-plan.md"
   bad=0
@@ -475,6 +530,15 @@ if [[ "$PLAN" == 1 ]]; then
       fi
       echo "| $p | $(rows_of "$p") | $est | $src |"
     done
+    if [[ -n "$OLD_PINS" ]]; then
+      echo
+      echo "| proof | old-binary step |"
+      echo "|---|---|"
+      for i in "${!P_NAME[@]}"; do
+        [[ "${P_PIN[$i]}" != "-" ]] || continue
+        echo "| ${P_NAME[$i]} | $(old_step_of "${P_PIN[$i]}") |"
+      done
+    fi
     echo
     echo "Rows: ${#R_ID[@]}. Proofs: ${#P_NAME[@]}."
     echo "Estimate: ${total_est} s ($((total_est / 60)) min) for the ${measured} proofs with a measure (the run time under the lock, from the newest passing log in $OUT), plus the build and the lock waits.${unmeasured:+ No measure: $unmeasured.}"
@@ -551,6 +615,61 @@ if [[ -z "$TEST_ROOT" ]]; then
   fi
   note "build ok: $(awk '!done && /^rustc / {print; done = 1}' "$build_log")"
 fi
+
+# W25-27: the old binaries of the pins of the proofs that run.
+if [[ -n "$OLD_ENV" ]]; then
+  [[ -x "$OLD_ENV" ]] || die "OLD_ORBLX=$OLD_ENV is not an executable file"
+  note "old binary: OLD_ORBLX from the environment: $OLD_ENV (no build)"
+fi
+for pin in $OLD_PINS; do
+  [[ -z "$OLD_ENV" && -z "$TEST_ROOT" ]] || break
+  need=0
+  for i in "${!P_NAME[@]}"; do
+    [[ "${P_PIN[$i]}" == "$pin" && "${P_SKIP[$i]}" != 1 ]] || continue
+    [[ -z "$ONLY" || " $ONLY " == *" ${P_NAME[$i]} "* ]] || continue
+    need=1
+  done
+  [[ "$need" == 1 ]] || continue
+  old_bin="$(old_bin_of "$pin")"
+  if [[ -x "$old_bin" ]]; then
+    note "old binary cached: $old_bin (commit $pin)"
+    continue
+  fi
+  old_wt="$WORK/old-${pin:0:12}-wt"
+  old_target="$WORK/old-${pin:0:12}-target"
+  old_log="$OUT/rc3-sweep-$SHORT-old-${pin:0:12}-build.log"
+  note "build old orblx at $pin, worktree $old_wt, target $old_target, log $old_log"
+  mkdir -p "$WORK"
+  as_root rm -rf "$old_target"
+  git -C "$REPO" worktree remove --force "$old_wt" 2>/dev/null || true
+  rc=0
+  git -C "$REPO" worktree add -q --detach "$old_wt" "$pin" >"$old_log" 2>&1 || rc=$?
+  if [[ "$rc" == 0 ]]; then
+    tool_env CARGO_TARGET_DIR="$old_target" bash -c '
+        set -euo pipefail
+        cd "$1"
+        git rev-parse HEAD
+        rustc --version
+        cargo build --locked -p orblx-cli --bin orblx
+        mkdir -p "$(dirname "$3")"
+        cp "$2/debug/orblx" "$3.tmp"
+        mv -f "$3.tmp" "$3"
+      ' release-sweep-old-build "$old_wt" "$old_target" "$old_bin" >>"$old_log" 2>&1 </dev/null || rc=$?
+  fi
+  as_root rm -rf "$old_target" || true
+  git -C "$REPO" worktree remove --force "$old_wt" >/dev/null 2>&1 || true
+  if [[ "$rc" != 0 || ! -x "$old_bin" ]]; then
+    note "old build FAIL: $(first_error "$old_log")"
+    {
+      echo "| row | feature | proof | result | log | time | proof_contention |"
+      echo "|---|---|---|---|---|---|---|"
+      echo "| - | old orblx $pin | - | FAIL: $(first_error "$old_log") | $old_log | - | - |"
+    } >"$TABLE"
+    cleanup_worktree
+    exit 2
+  fi
+  note "old binary ok: $old_bin (worktree and target removed)"
+done
 
 # 5. Run each proof once.
 P_RESULT=(); P_LOG=(); P_TIME=(); P_CONT=()
@@ -631,7 +750,15 @@ for i in "${!P_NAME[@]}"; do
   : >"$log"
   env_words=()
   if [[ "${P_ENV[$i]}" != "-" ]]; then
-    read -r -a env_words <<<"${P_ENV[$i]//@BIN@/$BIN}"
+    words="${P_ENV[$i]//@BIN@/$BIN}"
+    if [[ "${P_PIN[$i]}" != "-" ]]; then
+      if [[ -n "$OLD_ENV" ]]; then
+        words="${words//@OLD:${P_PIN[$i]}@/$OLD_ENV}"
+      else
+        words="${words//@OLD:${P_PIN[$i]}@/$(old_bin_of "${P_PIN[$i]}")}"
+      fi
+    fi
+    read -r -a env_words <<<"$words"
   fi
   note "proof $name start $(now) log $log"
   started="$(date +%s)"

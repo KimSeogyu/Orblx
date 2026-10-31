@@ -2,8 +2,15 @@
 # Copied from the Page "Orblx vs Tailscale 기능 격차 매트릭스 + Wave 계획" snapshot of
 # 2026-10-31 08:10 KST, with the PO list of 2026-10-31 (W25-27): rows 1, 9, 10, 11, 16, 17,
 # 28, 29, 40, 41, 43, 44, 54 and 61 are partial. The PO keeps the Page and this file in sync.
+# Row 32 (User approval) is shipped: the PO closed W25-15 on 2026-10-31 11:26 KST (#102).
 # The sweep fails (exit 2) when the manifest rows and this file differ.
-# ID|STATUS|FEATURE   STATUS: shipped, partial, or missing.
+# ID|STATUS|FEATURE[|NOTE]   STATUS: shipped, partial, or missing. One line per row, any order.
+# NOTE (optional, partial rows only): the one accepted note is
+#   "not in rc.3 sweep: no coordinator SSH certs" (the sweep skips a proof only when all of its
+#   rows have it). A new note kind needs a matching change in scripts/proof/release-sweep.sh.
+# To add a row (for example a new shipped or required row), add its line here and, for a
+# shipped row, a "row|ID|FEATURE|PROOFS" line in scripts/proof/sweep-manifest.txt in the same
+# change; the sweep exits 2 when the two files differ.
 1|partial|P2P mesh datapath (상시, N peers)
 2|partial|Coordination server / netmap
 3|partial|NAT traversal (STUN + hole punch)
@@ -35,7 +42,7 @@
 29|partial|Key / SVID rotation UX
 30|shipped|Revocation / device removal
 31|shipped|Device approval
-32|missing|User approval
+32|shipped|User approval
 33|shipped|Auth keys (headless 등록)
 34|partial|Ephemeral nodes
 35|shipped|OAuth clients / API tokens
