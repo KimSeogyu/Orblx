@@ -433,7 +433,9 @@ dc --profile load up -d load
 # for the other enrolls would be offline for longer than T and the coordinator would remove it.
 dc --profile load exec -d load sh -c "mkdir -p /tmp/load; for i in \$(seq 1 ${LOAD_NODES}); do orblx coord enroll --name load\$i --coord ${COORD} --bundle /coord-state/trust-bundle.pem --token-file /coord-state/tokens/load\$i --state /tmp/load/\$i --endpoint 172.30.218.9:\$((20000 + i)) >/tmp/load/\$i.enroll 2>&1 || { echo enroll_failed >/tmp/load/\$i.enroll; continue; }; orblx coord netmap --coord ${COORD} --bundle /tmp/load/\$i/bundle.pem --state /tmp/load/\$i --watch >/tmp/load/\$i.log 2>&1 & done; wait"
 for _ in $(seq 1 60); do
-  ups="$(dc --profile load exec -T load sh -c 'cat /tmp/load/*.log 2>/dev/null' | grep -c '^policy_update ' || true)"
+  # Count the clients that got a first policy, not the policy lines (a client can get more than one).
+  ups="$(dc --profile load exec -T load sh -c 'grep -l "^policy_update " /tmp/load/*.log 2>/dev/null | wc -l' | tr -d '[:space:]' || true)"
+  ups="${ups:-0}"
   [[ "$ups" -ge "$LOAD_NODES" ]] && break
   sleep 1
 done
