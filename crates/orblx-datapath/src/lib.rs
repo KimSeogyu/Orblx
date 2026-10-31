@@ -21,6 +21,7 @@ mod subnet;
 mod tun_bench;
 mod tun_dev;
 mod tun_macos;
+mod udp_trace;
 
 pub use acl::enforce_receiver_tcp;
 pub use connector::{

@@ -5,6 +5,10 @@
 //! source or the destination port is in the port list. The line holds the time in
 //! microseconds, the addresses, the ports, the TCP flags, and the payload length.
 //! The line holds no payload byte. When the variables are not set, the trace does nothing.
+//!
+//! W25-41: the same trace also marks the stages inside the node (channel hops, the
+//! stream write, the frame read, the ticket check) with the TCP sequence number, and
+//! it marks each UDP send and receive of the QUIC socket (the size and the count only).
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
@@ -54,6 +58,7 @@ pub(crate) struct TcpFields {
     pub dst: Ipv4Addr,
     pub dst_port: u16,
     pub flags: u8,
+    pub seq: u32,
     pub payload: usize,
 }
 
@@ -75,19 +80,32 @@ pub(crate) fn tcp_fields(packet: &[u8]) -> Option<TcpFields> {
         dst: Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
         dst_port: u16::from_be_bytes([tcp[2], tcp[3]]),
         flags: tcp[13],
+        seq: u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]),
         payload: tcp.len().saturating_sub(offset),
     })
 }
 
-/// Write one trace line for a packet. `dir` is `read` (from the TUN device) or `write` (to it).
-pub(crate) fn trace_tun(dir: &str, packet: &[u8]) {
+/// Return true when the trace is on.
+pub(crate) fn enabled() -> bool {
+    tracer().is_some()
+}
+
+fn now_us() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_micros())
+        .unwrap_or(0)
+}
+
+/// Write one trace line for a packet at one stage.
+///
+/// `stage` is `read` (from the TUN device), `write` (to the TUN device), or the name
+/// of a stage inside the node (W25-41).
+pub(crate) fn trace_tun(stage: &str, packet: &[u8]) {
     let Some(tracer) = tracer() else {
         return;
     };
-    let at_us = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_micros())
-        .unwrap_or(0);
+    let at_us = now_us();
     let Some(tcp) = tcp_fields(packet) else {
         return;
     };
@@ -98,8 +116,24 @@ pub(crate) fn trace_tun(dir: &str, packet: &[u8]) {
         // A trace write error does not stop the datapath.
         let _ = writeln!(
             file,
-            "dp {dir} at_us {at_us} src {}:{} dst {}:{} flags {:02x} len {}",
-            tcp.src, tcp.src_port, tcp.dst, tcp.dst_port, tcp.flags, tcp.payload
+            "dp {stage} at_us {at_us} src {}:{} dst {}:{} flags {:02x} len {} seq {}",
+            tcp.src, tcp.src_port, tcp.dst, tcp.dst_port, tcp.flags, tcp.payload, tcp.seq
+        );
+    }
+}
+
+/// Write one trace line for a UDP send or receive of the QUIC socket (W25-41).
+///
+/// The line holds the byte count and the datagram count. It holds no byte of the datagram.
+pub(crate) fn trace_udp(stage: &str, bytes: usize, datagrams: usize) {
+    let Some(tracer) = tracer() else {
+        return;
+    };
+    let at_us = now_us();
+    if let Ok(mut file) = tracer.file.lock() {
+        let _ = writeln!(
+            file,
+            "udp {stage} at_us {at_us} bytes {bytes} datagrams {datagrams}"
         );
     }
 }
@@ -125,6 +159,7 @@ mod tests {
         assert_eq!(fields.src_port, 40000);
         assert_eq!(fields.dst_port, 8080);
         assert_eq!(fields.flags, 0x02);
+        assert_eq!(fields.seq, 0);
         assert_eq!(fields.payload, 0);
     }
 

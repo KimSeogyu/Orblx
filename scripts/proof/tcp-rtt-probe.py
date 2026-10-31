@@ -4,6 +4,9 @@
 serve HOST PORT          echo one line back on each connection
 probe HOST PORT SECS MS  open one connection every MS ms for SECS s, send one line,
                          read the echo, close; print one line per attempt (Unix us)
+
+W25-41: both sides set TCP_NODELAY and send each line in one write, so Nagle and
+delayed ACK add no time.
 """
 import socket
 import socketserver
@@ -17,8 +20,9 @@ def now_us():
 
 class Echo(socketserver.StreamRequestHandler):
     def handle(self):
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         line = self.rfile.readline()
-        self.wfile.write(line)
+        self.connection.sendall(line)
 
 
 class Server(socketserver.ThreadingTCPServer):
@@ -35,6 +39,7 @@ def probe(host, port, secs, every_ms):
         try:
             with socket.create_connection((host, port), timeout=5) as sock:
                 connect = now_us()
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 local = sock.getsockname()[1]
                 sock.sendall(b"ping\n")
                 data = b""

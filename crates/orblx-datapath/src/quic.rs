@@ -147,7 +147,23 @@ impl HelloEndpoint {
             .map_err(|err| HelloError::Tls(err.to_string()))?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
         server.transport_config(transport_config());
-        let mut endpoint = quinn::Endpoint::server(server, listen).map_err(io_error)?;
+        let mut endpoint = if crate::pkt_trace::enabled() {
+            // W25-41: the same socket as Endpoint::server, with a send and receive time trace.
+            let socket = std::net::UdpSocket::bind(listen).map_err(io_error)?;
+            let runtime = quinn::default_runtime().ok_or_else(|| {
+                HelloError::Quic("The call is outside a Tokio runtime.".to_string())
+            })?;
+            let inner = runtime.wrap_udp_socket(socket).map_err(io_error)?;
+            quinn::Endpoint::new_with_abstract_socket(
+                quinn::EndpointConfig::default(),
+                Some(server),
+                Arc::new(crate::udp_trace::TracedUdp(inner)),
+                runtime,
+            )
+            .map_err(io_error)?
+        } else {
+            quinn::Endpoint::server(server, listen).map_err(io_error)?
+        };
         let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client_config)
             .map_err(|err| HelloError::Tls(err.to_string()))?;
         let mut client = quinn::ClientConfig::new(Arc::new(quic_client));
@@ -509,6 +525,7 @@ impl HelloSender {
             .write_all(&bytes)
             .await
             .map_err(|err| HelloError::Quic(err.to_string()))?;
+        crate::pkt_trace::trace_tun("stream_written", packet);
         self.next_seq = self.next_seq.checked_add(1).ok_or(HelloError::BadSeq)?;
         Ok(())
     }
@@ -591,11 +608,13 @@ impl HelloReceiver {
         self.next_seq = expect_seq(self.next_seq, frame.seq)?;
         match frame.frame_type {
             FrameType::Data => {
+                crate::pkt_trace::trace_tun("frame_read", &frame.payload);
                 let deny = deny_now(&self.deny);
                 let payload = self
                     .gate
                     .payload_from_data(&frame, SystemTime::now(), &deny)?
                     .to_vec();
+                crate::pkt_trace::trace_tun("ticket_checked", &payload);
                 Ok(SessionEvent::Packet(payload))
             }
             FrameType::Ctrl => {

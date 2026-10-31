@@ -1113,6 +1113,7 @@ async fn read_tun(
                 let Some(packet) = packet else {
                     return;
                 };
+                crate::pkt_trace::trace_tun("tun_dequeued", &packet);
                 // peer_for drops the guard of the router table before the await.
                 let Some(peer) = routes.peer_for(&packet) else {
                     continue;
@@ -1899,6 +1900,7 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     tx_end = Some(Box::pin(sender.finish()));
                     continue;
                 };
+                crate::pkt_trace::trace_tun("link_dequeued", &packet);
                 if let Some(filter) = &filter {
                     filter.note_outbound(&packet);
                 }
@@ -1951,6 +1953,7 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                                         }
                                     }
                                     InboundAction::Forward => {
+                                        crate::pkt_trace::trace_tun("tun_enqueue", &packet);
                                         if to_tun.send(packet).await.is_err() {
                                             return;
                                         }
