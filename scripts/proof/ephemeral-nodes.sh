@@ -18,7 +18,7 @@
 #      offline time: no removal before T, and the removal comes 1500 ms or less after T.
 #      e4 runs through the restart and stays.
 #   6. 20 load clients stop at the same time. The coordinator removes all 20.
-#      a pings b each 50 ms in this time with 0 lost pings.
+#      c pings d each 50 ms in this time with 0 lost pings (c and d enroll just before).
 #   7. The W23-4 gates use nat-realism.sh.
 #   The config chain passes `orblx audit verify-config`. The logs hold 0 keys and 0 tokens.
 # A node is offline from the end of its last coordinator request. A running node holds a
@@ -426,7 +426,7 @@ done
 dc exec -T a ping -n -c 10 -i 0.2 -W 1 "$b_ip" | tail -n 2
 echo "[C] gate5 ok"
 
-echo "=== Gate 6 [C]: ${LOAD_NODES} ephemeral clients stop at once, a pings b ==="
+echo "=== Gate 6 [C]: ${LOAD_NODES} ephemeral clients stop at once, c pings d ==="
 dc exec -T coord sh -c "for i in \$(seq 1 ${LOAD_NODES}); do orblx coord token create --state /var/lib/orblx --out /var/lib/orblx/tokens/load\$i --ttl 3600 --ephemeral >/dev/null || exit 1; done"
 dc --profile load up -d load
 # Each client starts its watch right after its own enroll. With a short T, a client that waits
@@ -445,12 +445,29 @@ echo "load_enroll_failed $(dc --profile load exec -T load sh -c 'cat /tmp/load/*
 load_eph="$(store_nodes | awk '$1 ~ /^load/ && $2 == "true"' | awk 'END {print NR}')"
 echo "load_ephemeral_in_store ${load_eph}"
 [[ "$load_eph" -eq "$LOAD_NODES" ]] || fail "Not all load clients are ephemeral."
+# c and d are new nodes that are not ephemeral. They enroll here, so their capability
+# tickets are new. The node ticket life is the SVID life (EPH_SVID_TTL), and an SVID renew
+# does not give the node a new ticket (see docs/w25-ephemeral-nodes.md). The tickets of a
+# and b from gate 1 have expired at this point, so a new handshake of a and b fails.
+for n in c d; do token "$n"; done
+enroll c 172.30.218.7
+enroll d 172.30.218.8
+for n in c d; do store_nodes | has_line "^$n false " || fail "Node ${n} is ephemeral."; done
+dc --profile nodes up -d c d
+d_ip="$(ip_of d)"
+for _ in $(seq 1 60); do
+  dc exec -T c ping -n -c 1 -W 1 "$d_ip" >/dev/null 2>&1 && break
+  sleep 1
+done
+dc exec -T c ping -n -c 5 -i 0.2 -W 1 "$d_ip" | tail -n 2
 for _ in $(seq 1 30); do
-  [[ "$(load_peers a)" -eq "$LOAD_NODES" ]] && break
+  [[ "$(load_peers c)" -eq "$LOAD_NODES" ]] && break
   sleep 0.5
 done
-PINGS=1200
-dc exec -d a sh -c "ping -n -i 0.05 -W 1 -c ${PINGS} ${b_ip} >/tmp/ping-g6.log 2>&1"
+echo "netmap_load_peers_before c $(load_peers c) d $(load_peers d)"
+[[ "$(load_peers c)" -eq "$LOAD_NODES" ]] || fail "The netmap of c does not have all load clients."
+PINGS=600
+dc exec -d c sh -c "ping -n -i 0.05 -W 1 -c ${PINGS} ${d_ip} >/tmp/ping-g6.log 2>&1"
 sleep 2
 # A new config record changes the deny list version of each node, so each load client
 # starts a new poll now. Then the 20 polls end at about the same time.
@@ -476,17 +493,18 @@ for i in $(seq 1 "$LOAD_NODES"); do
   [[ "$(remove_count "load$i")" -eq 1 ]] || fail "load${i} does not have exactly 1 removal record."
 done
 for _ in $(seq 1 30); do
-  [[ "$(load_peers a)" -eq 0 && "$(load_peers b)" -eq 0 ]] && break
+  [[ "$(load_peers a)" -eq 0 && "$(load_peers b)" -eq 0 && "$(load_peers c)" -eq 0 && "$(load_peers d)" -eq 0 ]] && break
   sleep 0.2
 done
-echo "netmap_load_peers a $(load_peers a) b $(load_peers b)"
-[[ "$(load_peers a)" -eq 0 && "$(load_peers b)" -eq 0 ]] || fail "A peer kept a load client in the netmap."
+echo "netmap_load_peers a $(load_peers a) b $(load_peers b) c $(load_peers c) d $(load_peers d)"
+[[ "$(load_peers a)" -eq 0 && "$(load_peers b)" -eq 0 && "$(load_peers c)" -eq 0 && "$(load_peers d)" -eq 0 ]] \
+  || fail "A peer kept a load client in the netmap."
 for _ in $(seq 1 120); do
-  dc exec -T a sh -c 'cat /tmp/ping-g6.log' | read_all grep -q 'packets transmitted' && break
+  dc exec -T c sh -c 'cat /tmp/ping-g6.log' | read_all grep -q 'packets transmitted' && break
   sleep 1
 done
-dc exec -T a sh -c 'tail -n 2 /tmp/ping-g6.log' | steady_ping_gate "a->b during the removal of ${LOAD_NODES} nodes" "$PINGS" 0 1000 \
-  || fail "a lost pings to b while the coordinator removed the load clients."
+dc exec -T c sh -c 'tail -n 2 /tmp/ping-g6.log' | steady_ping_gate "c->d during the removal of ${LOAD_NODES} nodes" "$PINGS" 0 1000 \
+  || fail "c lost pings to d while the coordinator removed the load clients."
 echo "[C] gate6 ok"
 
 echo "=== Gate 4 [C]: n1 (not ephemeral) stays after 10 x T ==="
@@ -498,7 +516,7 @@ echo "---- [C] every node-remove target was ephemeral ----"
 lab_cat coord/config-audit.jsonl | jq -r 'select(.action == "node-remove") | .target' | sort >"$WORK/removed-names"
 lab_cat coord/config-audit.jsonl | jq -r 'select(.action == "enroll") | .target' | sort >"$WORK/enrolled-names"
 echo "node_remove_total $(awk 'END {print NR}' "$WORK/removed-names") unique $(sort -u "$WORK/removed-names" | awk 'END {print NR}')"
-for n in a b n1 r1 sync1 e2 e4; do
+for n in a b c d n1 r1 sync1 e2 e4; do
   [[ "$(remove_count "$n")" -eq 0 ]] || fail "KILL: the chain has a removal of ${n}."
 done
 expected_removed="$(printf '%s\n' e1 e3 $(seq -f 'load%g' 1 "$LOAD_NODES") | sort)"
@@ -519,5 +537,5 @@ if [[ -n "${PROOF_LOG:-}" && -s "${PROOF_LOG}" ]]; then
   secret_scan "$PROOF_LOG" || fail "The proof log holds a private key or an enroll token."
 fi
 
-echo "summary T_ms ${T_MS} e1_stop_to_removal_ms $((removed_ms - e1_stop_ms)) removal_to_netmap_ms a ${netmap_a} b ${netmap_b} e1_renew_after_removal 0 e1_replies 0 e2_kept 1 n1_kept 1 e3_restart_delay_ms ${delay} expected_ms ${expect} load_removed ${LOAD_NODES} a_b_lost 0"
+echo "summary T_ms ${T_MS} e1_stop_to_removal_ms $((removed_ms - e1_stop_ms)) removal_to_netmap_ms a ${netmap_a} b ${netmap_b} e1_renew_after_removal 0 e1_replies 0 e2_kept 1 n1_kept 1 e3_restart_delay_ms ${delay} expected_ms ${expect} load_removed ${LOAD_NODES} c_d_lost 0"
 echo "proof_ok"

@@ -100,6 +100,42 @@ services:
       proof:
         ipv4_address: 172.30.218.5
 
+  c:
+    <<: *node
+    volumes:
+      - ${EPH_LAB:?set EPH_LAB}/c:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.218.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+    networks:
+      proof:
+        ipv4_address: 172.30.218.7
+
+  d:
+    <<: *node
+    volumes:
+      - ${EPH_LAB:?set EPH_LAB}/d:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.218.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+    networks:
+      proof:
+        ipv4_address: 172.30.218.8
+
   n1:
     <<: *node
     volumes:

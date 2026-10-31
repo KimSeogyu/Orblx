@@ -1,15 +1,20 @@
 {
   // W25-18 ephemeral node proof.
-  // a and b are steady nodes. e1, e2, and e4 are ephemeral nodes with a datapath.
+  // a and b are steady nodes. c and d are steady nodes that enroll for gate 6. e1, e2, and e4 are ephemeral nodes with a datapath.
   "owners": ["spiffe://orblx.local/node/a"],
   "acls": [
     {
       "action": "accept",
-      "src": ["spiffe://orblx.local/node/a", "spiffe://orblx.local/node/b"],
+      "src": [
+        "spiffe://orblx.local/node/a",
+        "spiffe://orblx.local/node/b",
+        "spiffe://orblx.local/node/c",
+      ],
       "proto": "icmp",
       "dst": [
         "spiffe://orblx.local/node/a:*",
         "spiffe://orblx.local/node/b:*",
+        "spiffe://orblx.local/node/d:*",
         "spiffe://orblx.local/node/e1:*",
         "spiffe://orblx.local/node/e2:*",
         "spiffe://orblx.local/node/e4:*",
