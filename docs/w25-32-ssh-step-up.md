@@ -260,7 +260,9 @@ There are no fixed sleeps, no retries, and no exclusions.
 | G3 accept | 10 serial runs. Each run: 2 s or less from the coordinator accepting the ID token to the destination accepting the login, over the netmap push path. Report the max. All 10 runs must pass. |
 | G4 expiry | With `"stepUp": "1m"`: a login before `expires_at` is accepted. A login after `expires_at` is refused. The test controls the clock or waits on the expiry event. It does not use a fixed sleep. |
 | G5 negative | A token for a different subject, a reused nonce, a nonce from a different connection, a tampered signature (`tamper_signature`), a token with no `auth_time` and `iat` older than 120 s + `MAX_SKEW`, and a token with no `auth_time` for a nonce whose request did not send `max_age=0` or `prompt=login`. Each is refused with its reason and 1 audit record. |
-| G5b netmap integrity | Change one field of one `ssh_step_up` entry in a signed netmap. `verify_signed_netmap` fails. A netmap with a lower or equal sequence is refused (C7). |
+| G5b netmap integrity (PO gate) | Change one field of one `ssh_step_up` entry in a signed netmap. `verify_signed_netmap` fails. A netmap with a lower or equal sequence is refused (C7). |
+| G9 stale netmap, stepUp rule (PO gate) | Stop the coordinator. Let the netmap age pass 60 s. A new login to a rule with `stepUp` is refused with `stale-netmap`, also with a live `ssh_step_up` entry. |
+| G10 stale netmap, rule without stepUp (PO gate) | Stop the coordinator. Let the netmap age pass 60 s. A new login to a rule without `stepUp` works as it does now: accepted, with no new refusal reason. |
 | G5c binding | A cert with the right principal but a different key ID node is refused. A cert with the right node but a different principal is refused. An entry with no valid cert gives no access. |
 | G1b range edges | `stepUp` compiles for `60s`, `1m`, `1440m`, `24h`. It does not compile for `59s`, `0m`, `1441m`, `25h`, `86401s`, `01h`, and an empty string. No `stepUp` means off. |
 | G6 revoke | Revoke the client node, then revoke a user. In each case, the same netmap delta that adds the cert serials to `ssh_revoked` removes the `ssh_step_up` entry. A new login is refused. The open session stops by the existing revoke path. |
@@ -272,7 +274,19 @@ Port 8787 is off limits. The proofs do not read `orblx_oauth.env`.
 
 ### 10.1 Release note
 
-Add this line: "SSH step-up needs a browser on the client node." 
+Add these lines:
+
+- "SSH step-up needs a browser on the client node."
+- "A step-up SSH login needs a coordinator that is reachable within the last 60 s."
+
+### 10.2 PO gates
+
+The PO set two product gates. Both must pass before W25-32 ships.
+
+1. G5b: the existing netmap signature covers `ssh_step_up`. Change the field, and the netmap does not verify.
+2. G9 and G10: the 60 s netmap age rule applies ONLY to rules with `stepUp`. Rules without `stepUp` work as they do now when the coordinator is offline.
+
+Conflict to solve before product code: #127 (W25-31) applies `NETMAP_MAX_AGE_SECS` (60 s) to every certificate login. G10 needs a different order: the destination checks the netmap age only when `ssh_step_up(principal, this node, login user)` is `Some(Some(age))`. W25-32 changes the #127 check order in this way, or #127 changes before it merges. The PO and the #127 owner decide which.
 
 ## 11. Rejected alternatives
 
@@ -310,9 +324,13 @@ Add this line: "SSH step-up needs a browser on the client node."
 | C4 | A gate, not an authenticator. | Step 5a runs only after the W25-31 cert check passes. |
 | C5 | Coordinator token checks. | The existing verifier (`iss`, `aud`, `exp`, `nonce` = the W25-31 single-use nonce) plus `auth_time` freshness (section 6). `sub` must equal the enrolled OIDC `sub` of the owner. The raw ID token is never logged, stored, or forwarded. |
 | C6 | Cert life. | `valid_before = min(now + 15 min, node SVID not_after, step_up.expires_at)`. |
-| C7 | Netmap age and order. | A netmap older than 60 s refuses a new SSH login (#127 `NETMAP_MAX_AGE_SECS`). The skew on `expires_at` is 60 s or less. GAP: today `Netmap.version` is the document schema version. It must be 1. There is no increasing netmap counter. W25-32 must add a signed, increasing `seq: u64` to `Netmap`. The coordinator keeps the counter on disk, so a restart does not reset it. The node refuses a `seq` that is lower than or equal to the last accepted `seq`. This is a new field inside the existing signature, as in C1. See open question Q12. |
+| C7 | Netmap age and order. | A netmap older than 60 s refuses a new SSH login to a rule with `stepUp` (#127 `NETMAP_MAX_AGE_SECS`). PO gate: rules without `stepUp` do not get this refusal (G9, G10, section 10.2). The skew on `expires_at` is 60 s or less. GAP: today `Netmap.version` is the document schema version. It must be 1. There is no increasing netmap counter. W25-32 must add a signed, increasing `seq: u64` to `Netmap`. The coordinator keeps the counter on disk, so a restart does not reset it. The node refuses a `seq` that is lower than or equal to the last accepted `seq`. This is a new field inside the existing signature, as in C1. See open question Q12. |
 | C8 | Revoke. | A node or user revoke removes the entry in the same netmap delta that adds the serials to `ssh_revoked`. Planned test G6. |
 
 ## 14. Open questions
 
-- **Q12 (Crypto, PO):** C7 needs an increasing netmap version, and the code has none today. Is a new signed `seq: u64` field in `Netmap`, persisted by the coordinator, acceptable under the Q4 answer? Is it in W25-32, or in a separate item before W25-32?
+- **Q12 (OPEN with Crypto and the PO): netmap `seq` and a signed `issued_at`.** C7 needs an increasing netmap version, and the code has none today. The netmap age today is a local stamp that the node writes when it receives a netmap. It is not a signed time. Questions:
+  - Is a new signed `seq: u64` field in `Netmap`, persisted by the coordinator, acceptable under the Q4 answer?
+  - Is a signed `issued_at` field in `Netmap` necessary for the 60 s age rule?
+  - Are these fields in W25-32, or in a separate item before W25-32?
+- **Q13 (PO, #127 owner):** #127 refuses every certificate login when the netmap is older than 60 s. The PO gate G10 needs this only for rules with `stepUp`. Which change takes the fix: #127 or W25-32? See section 10.2.
