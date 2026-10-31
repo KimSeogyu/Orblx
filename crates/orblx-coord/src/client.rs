@@ -5,7 +5,7 @@ use orblx_identity::SpiffeId;
 
 use crate::error::CoordError;
 use crate::netmap::{
-    decode_hex_32, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap, SignedNetmap,
+    decode_hex_32, verify_grants_wire, verify_netmap_wire, verify_signed_endpoint, SignedNetmap,
 };
 use crate::proto::{self, GrantAsk, Request, Response};
 use crate::state::{read_node_material, EnrollResult, NetmapView, NodeMaterial};
@@ -472,7 +472,7 @@ pub fn admin_token_expect_blocking(
             .open_bi()
             .await
             .map_err(|err| CoordError::Tls(format!("open: {err}")))?;
-        proto::write_json(&mut send, &request).await?;
+        proto::write_request(&mut send, &request).await?;
         let _ = send.finish();
         let response: Response = proto::read_json(&mut recv).await?;
         close_and_wait(&connection, &endpoint).await;
@@ -572,13 +572,31 @@ pub fn fetch_policy_wait_blocking(
             authed_response(coord, coord_name, bundle_pem, material, request),
         )
         .await
-        .map_err(|_| CoordError::Tls("The policy wait timed out.".to_string()))??;
+        .map_err(|_| CoordError::Tls("The policy wait timed out.".to_string()))?
+        .map_err(unknown_op_is_old_coordinator)?;
         policy_sync_from(response, bundle_pem, pinned)
     })
 }
 
+/// The reply of a coordinator to an op that it does not know.
+const UNKNOWN_OP_TEXT: &str = "The request is not valid.";
+
+/// A coordinator before W25-6 (for example the v0.1.0-rc.2 tag) does not know `policy-wait`.
+/// It replies [`UNKNOWN_OP_TEXT`]. The node shows the version mismatch for it (W25-34).
+fn unknown_op_is_old_coordinator(err: CoordError) -> CoordError {
+    match &err {
+        CoordError::Protocol(text) if text == UNKNOWN_OP_TEXT => proto::old_coordinator_error(),
+        _ => err,
+    }
+}
+
 /// The longest time that the coordinator holds one `deny-wait` request.
 pub const DENY_WAIT_HOLD: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The shortest time between two `deny-wait` or `policy-wait` requests of a node (W25-2).
+///
+/// It is the poll interval of the node policy loop in `orblx up`.
+pub const POLICY_WAIT_GAP: std::time::Duration = std::time::Duration::from_millis(100);
 
 async fn admin_call(
     coord: SocketAddr,
@@ -700,7 +718,7 @@ async fn exchange(
         .open_bi()
         .await
         .map_err(|err| CoordError::Tls(format!("open: {err}")))?;
-    proto::write_json(&mut send, request).await?;
+    proto::write_request(&mut send, request).await?;
     let _ = send.finish();
     proto::read_json(&mut recv).await
 }
@@ -843,7 +861,8 @@ impl PolicyWaiter {
                 return Err(err);
             }
         };
-        let response = response_ok(response)?;
+        // W25-34: a coordinator before W25-6 does not know `policy-wait`.
+        let response = response_ok(response).map_err(unknown_op_is_old_coordinator)?;
         if response.netmap.is_none() {
             // A reply without the view: the view of the ETag did not change (W25-16).
             let invalid = || CoordError::Protocol("The coordinator request failed.".to_string());
@@ -1067,7 +1086,7 @@ async fn round_trip(
         .open_bi()
         .await
         .map_err(|err| CoordError::Tls(format!("open: {err}")))?;
-    proto::write_json(&mut send, &request).await?;
+    proto::write_request(&mut send, &request).await?;
     let _ = send.finish();
     let response: Response = proto::read_json(&mut recv).await?;
     close_and_wait(&connection, &endpoint).await;
@@ -1095,7 +1114,7 @@ fn enroll_from_response(
         response.ticket_not_after,
         response.svid_ca_pub_hex.clone(),
     )?;
-    let signed = response
+    let wire = response
         .netmap
         .ok_or_else(|| CoordError::Protocol("The netmap is not valid.".to_string()))?;
     let endpoints = response.endpoints.unwrap_or_default();
@@ -1113,11 +1132,16 @@ fn enroll_from_response(
             return Err(CoordError::Signature);
         }
     }
-    verify_signed_netmap(&signed, &public)?;
+    // W25-34: check the signature over the received bytes, then parse them.
+    let signed = verify_netmap_wire(&wire, &public)?;
+    // W25-34: an older coordinator signs no seq. The node does not use its netmap.
+    if signed.netmap.seq == 0 || signed.netmap.issued_at_ms == 0 {
+        return Err(proto::old_coordinator_error());
+    }
     let grants = response
         .grants
         .ok_or_else(|| CoordError::Protocol("The grants are not valid.".to_string()))?;
-    verify_signed_grants(&grants, &public)?;
+    let grants = verify_grants_wire(&grants, &public)?;
     let receiver = format!("spiffe://orblx.local/node/{}", signed.netmap.self_node.name);
     if grants.grants.receiver != receiver {
         return Err(CoordError::Protocol(
@@ -1208,4 +1232,21 @@ fn block_on<T>(
         .build()
         .map_err(CoordError::io)?;
     runtime.block_on(future)
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::{unknown_op_is_old_coordinator, CoordError, UNKNOWN_OP_TEXT};
+
+    /// W25-34: a coordinator that does not know `policy-wait` gives the version mismatch.
+    #[test]
+    fn unknown_policy_wait_op_is_a_version_mismatch() {
+        let err = unknown_op_is_old_coordinator(CoordError::Protocol(UNKNOWN_OP_TEXT.to_string()));
+        assert!(err
+            .public_text()
+            .starts_with(crate::proto::VERSION_MISMATCH));
+        let other =
+            unknown_op_is_old_coordinator(CoordError::Protocol("The node is revoked.".to_string()));
+        assert_eq!(other.public_text(), "The node is revoked.");
+    }
 }
