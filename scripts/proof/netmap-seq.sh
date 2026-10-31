@@ -16,6 +16,8 @@
 # Gate B (backup-restore): copy the coordinator state, wait, put the copy back, and restart
 #   the coordinator. The nodes must take the next netmap with no refusal. The seq goes up.
 # No node log may have "netmap refuse" in the run.
+# PO rule: each contention claim gives unknown_samples with contended_samples. A run with
+# unknown_samples > 0 is not valid: the script prints proof_invalid and stops with exit 1.
 # SEQ_MODE=baseline runs only the setup and the heartbeat bytes for an older binary
 # (ORBLX_SEQ_BIN), with no seq gate.
 # The script does not print enroll tokens or private keys.
@@ -191,6 +193,19 @@ change_counts() {
   printf '%s\n' "$out"
 }
 
+# Read the proof-lock sampler file (one line per sample: time count load1; count -1 = unknown).
+contention_check() {
+  local line unknown
+  [[ -n "${PROOF_LOCK_SAMPLES:-}" && -f "$PROOF_LOCK_SAMPLES" ]] || fail "No proof-lock samples: contention is unknown."
+  line="$(awk '{ n++; if ($2 < 0) u++; if ($2 > 0) b++ } END { printf "samples %d contended_samples %d unknown_samples %d", n, b + 0, u + 0 }' "$PROOF_LOCK_SAMPLES")"
+  echo "contention_check $1 ${line}"
+  unknown="$(awk '{print $6}' <<<"$line")"
+  if [[ "$unknown" -gt 0 ]]; then
+    echo "proof_invalid unknown_samples ${unknown}" >&2
+    exit 1
+  fi
+}
+
 echo "=== [C] W25-34 netmap seq proof mode ${MODE} start $(date '+%F %T %Z') ==="
 dc --profile nodes --profile tool down -v --remove-orphans >/dev/null 2>&1 || true
 mkdir -p "$SEQ_COORD_STATE" "$SEQ_POLICY_DIR"
@@ -279,6 +294,7 @@ for node in "${NODES[@]}"; do
   fi
 done
 [[ "$hb_fail" -eq 0 ]] || fail "Gate H"
+contention_check heartbeat
 echo "GATE_PASS H heartbeat"
 
 if [[ "$MODE" != full ]]; then
@@ -370,4 +386,5 @@ for node in "${NODES[@]}"; do
   [[ "$(log_count "$node" 'netmap refuse')" -eq 0 ]] || fail "node ${node} printed netmap refuse."
 done
 echo "No node log has netmap refuse."
+contention_check end
 echo "proof_ok $(date '+%F %T %Z')"
