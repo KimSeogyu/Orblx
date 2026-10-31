@@ -64,6 +64,15 @@ impl DenySet {
         self.refuse_all
     }
 
+    /// Mark the set as stale after a failed reload (W25-38).
+    ///
+    /// The set keeps its version and its entries, as the agent guard keeps its last
+    /// good set. A stale set refuses each identifier and each nonce. A valid document
+    /// with a higher version, or the same document again, makes it current.
+    pub fn mark_stale(&mut self) {
+        self.refuse_all = true;
+    }
+
     /// Parse one deny JSON document into a new set.
     pub fn from_json(bytes: &[u8]) -> Result<Self, IdentityError> {
         let mut deny = Self::empty();
@@ -97,6 +106,16 @@ impl DenySet {
             nonces.insert(bytes);
         }
         if let Some(current) = self.version {
+            // W25-38: the same document again makes a stale set current.
+            // The set never moves to a lower version.
+            let same = document.version == current
+                && document.generated_at == self.generated_at.unwrap_or_default()
+                && uris == self.revoked_uris
+                && nonces == self.revoked_nonces;
+            if self.refuse_all && same {
+                self.refuse_all = false;
+                return Ok(DenyApply::Applied);
+            }
             if document.version <= current {
                 return Ok(DenyApply::IgnoredOlder);
             }

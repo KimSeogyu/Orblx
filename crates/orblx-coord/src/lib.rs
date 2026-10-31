@@ -39,6 +39,8 @@ mod ticket;
 mod tlsutil;
 #[cfg(test)]
 mod user_approval_test;
+#[cfg(test)]
+mod w25_38_enroll_test;
 mod webhook;
 
 pub use admin::{

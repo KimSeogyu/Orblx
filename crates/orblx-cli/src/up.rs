@@ -757,7 +757,7 @@ fn spawn_deny_refresh(options: &UpOptions) {
                     etag.as_deref(),
                 ) {
                     Ok(text) => {
-                        let _ = store_deny(&state, &text);
+                        report_store_deny(store_deny(&state, &text));
                         etag = Some(orblx_coord::deny_etag(&text));
                         thread::sleep(DENY_WAIT_GAP.saturating_sub(start.elapsed()));
                         continue;
@@ -767,7 +767,7 @@ fn spawn_deny_refresh(options: &UpOptions) {
             }
             // The fetch starts each DENY_REFRESH. The time of the fetch is not added (W25-1).
             if let Ok(text) = orblx_coord::fetch_deny_blocking(coord, &name, &bundle, &state) {
-                let _ = store_deny(&state, &text);
+                report_store_deny(store_deny(&state, &text));
                 etag = Some(orblx_coord::deny_etag(&text));
             }
             thread::sleep(DENY_REFRESH.saturating_sub(start.elapsed()));
@@ -781,9 +781,7 @@ fn spawn_deny_refresh(options: &UpOptions) {
 /// The datapath reads `deny.json` each 100 ms. The DNS responder and the packet filter read
 /// `netmap.json` and `grants.signed.json` each second. Each writer writes a temp file and renames it.
 fn apply_policy_sync(state: &Path, sync: &orblx_coord::PolicySync, announce: bool) {
-    if let Err(err) = store_deny(state, &sync.deny) {
-        eprintln!("The node did not write the new deny list. {err}");
-    }
+    report_store_deny(store_deny(state, &sync.deny));
     if let Err(err) = sync.view.write_state(state) {
         eprintln!(
             "The node did not write the new netmap. {}",
@@ -813,8 +811,21 @@ const DENY_REFRESH: Duration = Duration::from_millis(500);
 /// W25-38: the function refuses a text that is not a valid deny document. It writes a
 /// temp file in the same directory, syncs it, renames it, and syncs the directory.
 /// A reader never sees a part file, and a crash leaves the old file.
-fn store_deny(state: &Path, text: &str) -> std::io::Result<()> {
-    orblx_identity::store_deny_file(state, text).map(|_| ())
+/// It does not write a list with a version that is not higher than the file version,
+/// so the list never moves back.
+fn store_deny(state: &Path, text: &str) -> std::io::Result<orblx_identity::DenyStore> {
+    orblx_identity::store_deny_file(state, text)
+}
+
+/// Print the result of one deny write. W25-38: no caller ignores a write error.
+fn report_store_deny(result: std::io::Result<orblx_identity::DenyStore>) {
+    match result {
+        Ok(orblx_identity::DenyStore::Written | orblx_identity::DenyStore::Same) => {}
+        Ok(orblx_identity::DenyStore::KeptCurrent { current, offered }) => eprintln!(
+            "The coordinator sent deny list version {offered}. The node keeps version {current}."
+        ),
+        Err(err) => eprintln!("The node did not write the new deny list. {err}"),
+    }
 }
 
 fn run_down(options: StateOptions) -> Result<(), String> {

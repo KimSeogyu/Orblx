@@ -15,7 +15,7 @@ use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::deny::DenySet;
+use crate::deny::{DenyApply, DenySet};
 
 /// The name of the deny file in a node state directory.
 pub const DENY_FILE: &str = "deny.json";
@@ -95,28 +95,157 @@ pub fn load_deny_file(state_dir: &Path) -> Result<DenySet, DenyFileError> {
     }
 }
 
+/// The result of [`store_deny_file`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyStore {
+    /// The function installed the new text.
+    Written,
+    /// The file already has the same text.
+    Same,
+    /// The file has a valid document with the same or a higher version. The function
+    /// kept it, so the deny list never moves back (the rule of [`DenySet::apply_json`]).
+    KeptCurrent {
+        /// The version in the file.
+        current: u64,
+        /// The version in the text that the function did not write.
+        offered: u64,
+    },
+}
+
 /// Write the deny file of a node state directory with an atomic rename.
 ///
 /// The function refuses a text that is not a valid deny document, so the old file
-/// stays. It does not write when the file already has the same text.
-/// It returns true when it installed a new file.
-pub fn store_deny_file(state_dir: &Path, text: &str) -> io::Result<bool> {
-    if DenySet::from_json(text.as_bytes()).is_err() {
+/// stays. It does not write when the file already has the same text. It does not
+/// write a document with a version that is not higher than the version in a valid
+/// file. Thus the deny list never moves back. This is the same rule as a deny reload.
+pub fn store_deny_file(state_dir: &Path, text: &str) -> io::Result<DenyStore> {
+    let Ok(offered) = DenySet::from_json(text.as_bytes()) else {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             "The deny document is not valid. The node keeps the old deny file.",
         ));
-    }
+    };
     let path = state_dir.join(DENY_FILE);
-    if fs::read(&path).is_ok_and(|old| old == text.as_bytes()) {
-        return Ok(false);
+    if let Ok(old) = fs::read(&path) {
+        if old == text.as_bytes() {
+            return Ok(DenyStore::Same);
+        }
+        let current = DenySet::from_json(&old).ok().and_then(|set| set.version());
+        if let (Some(current), Some(offered)) = (current, offered.version()) {
+            if offered <= current {
+                return Ok(DenyStore::KeptCurrent { current, offered });
+            }
+        }
     }
     let temp = write_temp(state_dir, text.as_bytes())?;
     if let Err(err) = install(&temp, &path) {
         let _ = fs::remove_file(&temp);
         return Err(err);
     }
-    Ok(true)
+    Ok(DenyStore::Written)
+}
+
+/// The result of one [`DenyCache`] reload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DenyReload {
+    /// The set did not change.
+    Same,
+    /// The set changed. Apply it.
+    Changed,
+    /// The reload failed. The set keeps its last good entries and is stale, so it
+    /// refuses each identifier and each nonce. `first` is true when the set was not
+    /// stale before this reload.
+    Stale {
+        /// The reason of the failure.
+        error: DenyFileError,
+        /// True when this reload made the set stale.
+        first: bool,
+    },
+}
+
+/// The last good deny set of one reader (W25-38).
+///
+/// A failed reload keeps the last good set and marks it stale, as the agent guard
+/// does. A stale set refuses each identifier and each nonce. The reader never uses
+/// an empty set in place of a bad file. A valid file with a higher version, or the
+/// same file again, makes the set current. A file with a lower version does not
+/// change the set.
+#[derive(Debug, Clone)]
+pub struct DenyCache {
+    set: DenySet,
+    last: Option<Vec<u8>>,
+}
+
+impl Default for DenyCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DenyCache {
+    /// A cache that refuses each identifier until the first good reload.
+    pub fn new() -> Self {
+        Self::with_set(DenySet::refuse_all())
+    }
+
+    /// A cache that starts with a set that the caller loaded.
+    pub fn with_set(set: DenySet) -> Self {
+        Self { set, last: None }
+    }
+
+    /// The current set. It refuses each identifier when it is stale.
+    pub fn set(&self) -> &DenySet {
+        &self.set
+    }
+
+    /// Read the deny file of the state directory again.
+    pub fn reload(&mut self, state_dir: &Path) -> DenyReload {
+        self.apply_read(state_dir, read_deny_file(state_dir))
+    }
+
+    /// Apply the result of [`read_deny_file`].
+    pub fn apply_read(
+        &mut self,
+        state_dir: &Path,
+        read: Result<Option<Vec<u8>>, DenyFileError>,
+    ) -> DenyReload {
+        let bytes = match read {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                // The node was never enrolled and has no deny file: the behavior
+                // before W25-38. A set with a version stays.
+                self.last = None;
+                if self.set.version().is_none() && self.set.refuses_all() {
+                    self.set = DenySet::empty();
+                    return DenyReload::Changed;
+                }
+                return DenyReload::Same;
+            }
+            Err(error) => return self.stale(error),
+        };
+        if !self.set.refuses_all() && self.last.as_deref() == Some(bytes.as_slice()) {
+            return DenyReload::Same;
+        }
+        match self.set.apply_json(&bytes) {
+            Ok(DenyApply::Applied) => {
+                self.last = Some(bytes);
+                DenyReload::Changed
+            }
+            // A lower version does not change the set. A stale set stays stale.
+            Ok(DenyApply::IgnoredOlder) => {
+                self.last = Some(bytes);
+                DenyReload::Same
+            }
+            Err(_) => self.stale(DenyFileError::Invalid(state_dir.join(DENY_FILE))),
+        }
+    }
+
+    fn stale(&mut self, error: DenyFileError) -> DenyReload {
+        let first = !self.set.refuses_all();
+        self.set.mark_stale();
+        self.last = None;
+        DenyReload::Stale { error, first }
+    }
 }
 
 fn enrolled(state_dir: &Path) -> bool {
@@ -281,7 +410,7 @@ mod tests {
     fn w25_38_crash_during_write_keeps_old_file() {
         let dir = Dir::new("crash");
         dir.enroll();
-        assert!(store_deny_file(&dir.0, V1).unwrap());
+        assert_eq!(store_deny_file(&dir.0, V1).unwrap(), DenyStore::Written);
         // The crash comes after the temp write and before the rename.
         // The temp file has only a part of the new text.
         let temp = write_temp(&dir.0, &V2.as_bytes()[..V2.len() / 2]).unwrap();
@@ -290,7 +419,7 @@ mod tests {
         assert_eq!(deny.version(), Some(1));
         assert!(deny.reject_uri(&node("b")).is_err());
         // The temp file is left. The next write installs the full new text.
-        assert!(store_deny_file(&dir.0, V2).unwrap());
+        assert_eq!(store_deny_file(&dir.0, V2).unwrap(), DenyStore::Written);
         let deny = load_deny_file(&dir.0).unwrap();
         assert_eq!(deny.version(), Some(2));
         assert!(deny.reject_uri(&node("c")).is_err());
@@ -312,7 +441,7 @@ mod tests {
     #[test]
     fn w25_38_store_refuses_invalid_text_and_keeps_old_file() {
         let dir = Dir::new("store-invalid");
-        assert!(store_deny_file(&dir.0, V1).unwrap());
+        assert_eq!(store_deny_file(&dir.0, V1).unwrap(), DenyStore::Written);
         let err = store_deny_file(&dir.0, &V2[..V2.len() - 3]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert_eq!(fs::read_to_string(dir.0.join(DENY_FILE)).unwrap(), V1);
@@ -322,9 +451,9 @@ mod tests {
     #[test]
     fn w25_38_store_skips_same_text_and_leaves_no_temp() {
         let dir = Dir::new("store-same");
-        assert!(store_deny_file(&dir.0, V1).unwrap());
-        assert!(!store_deny_file(&dir.0, V1).unwrap());
-        assert!(store_deny_file(&dir.0, V2).unwrap());
+        assert_eq!(store_deny_file(&dir.0, V1).unwrap(), DenyStore::Written);
+        assert_eq!(store_deny_file(&dir.0, V1).unwrap(), DenyStore::Same);
+        assert_eq!(store_deny_file(&dir.0, V2).unwrap(), DenyStore::Written);
         assert_eq!(fs::read_to_string(dir.0.join(DENY_FILE)).unwrap(), V2);
         assert!(temp_files(&dir.0).is_empty());
     }
@@ -339,5 +468,91 @@ mod tests {
         deny.apply_json(V1.as_bytes()).unwrap();
         assert!(!deny.refuses_all());
         assert!(deny.reject_uri(&node("a")).is_ok());
+    }
+
+    #[test]
+    fn w25_38_store_never_moves_the_deny_list_back() {
+        let dir = Dir::new("store-back");
+        assert_eq!(store_deny_file(&dir.0, V2).unwrap(), DenyStore::Written);
+        // A lower version and the same version with other text do not replace the file.
+        assert_eq!(
+            store_deny_file(&dir.0, V1).unwrap(),
+            DenyStore::KeptCurrent {
+                current: 2,
+                offered: 1
+            }
+        );
+        let same_version = V2.replace("\"generated_at\":20", "\"generated_at\":21");
+        assert_eq!(
+            store_deny_file(&dir.0, &same_version).unwrap(),
+            DenyStore::KeptCurrent {
+                current: 2,
+                offered: 2
+            }
+        );
+        assert_eq!(fs::read_to_string(dir.0.join(DENY_FILE)).unwrap(), V2);
+        // A file that is not valid does not block a new valid list.
+        fs::write(dir.0.join(DENY_FILE), b"not json {").unwrap();
+        assert_eq!(store_deny_file(&dir.0, V1).unwrap(), DenyStore::Written);
+        assert!(temp_files(&dir.0).is_empty());
+    }
+
+    #[test]
+    fn w25_38_reload_failure_keeps_the_last_good_set_and_goes_stale() {
+        let dir = Dir::new("cache");
+        dir.enroll();
+        let mut cache = DenyCache::new();
+        assert!(cache.set().refuses_all(), "no read yet");
+        fs::write(dir.0.join(DENY_FILE), V2).unwrap();
+        assert_eq!(cache.reload(&dir.0), DenyReload::Changed);
+        assert_eq!(cache.reload(&dir.0), DenyReload::Same);
+        assert!(cache.set().reject_uri(&node("a")).is_ok());
+
+        let damage = |path: &Path, name: &str| match name {
+            "corrupt" => fs::write(path, b"not json {").unwrap(),
+            "truncated" => fs::write(path, &V2.as_bytes()[..V2.len() / 2]).unwrap(),
+            "missing" => fs::remove_file(path).unwrap(),
+            _ => {
+                fs::remove_file(path).unwrap();
+                fs::create_dir(path).unwrap();
+            }
+        };
+        for name in ["corrupt", "truncated", "missing", "unreadable"] {
+            let path = dir.0.join(DENY_FILE);
+            damage(&path, name);
+            let DenyReload::Stale { first, .. } = cache.reload(&dir.0) else {
+                panic!("{name}: the reload did not go stale");
+            };
+            assert!(first, "{name}");
+            assert!(matches!(
+                cache.reload(&dir.0),
+                DenyReload::Stale { first: false, .. }
+            ));
+            // The stale set keeps the last good version and refuses each identifier.
+            assert_eq!(cache.set().version(), Some(2), "{name}");
+            assert!(cache.set().reject_uri(&node("a")).is_err(), "{name}");
+            assert!(cache.set().reject_nonce(&[0u8; 16]).is_err(), "{name}");
+            // An older valid list does not make the set current.
+            if path.is_dir() {
+                fs::remove_dir(&path).unwrap();
+            }
+            fs::write(&path, V1).unwrap();
+            assert_eq!(cache.reload(&dir.0), DenyReload::Same, "{name}");
+            assert!(cache.set().reject_uri(&node("a")).is_err(), "{name}");
+            // The last good list again makes the set current.
+            fs::write(&path, V2).unwrap();
+            assert_eq!(cache.reload(&dir.0), DenyReload::Changed, "{name}");
+            assert!(cache.set().reject_uri(&node("a")).is_ok(), "{name}");
+            assert!(cache.set().reject_uri(&node("c")).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn w25_38_cache_of_a_never_enrolled_node_without_a_file_is_empty() {
+        let dir = Dir::new("cache-lab");
+        let mut cache = DenyCache::new();
+        assert_eq!(cache.reload(&dir.0), DenyReload::Changed);
+        assert_eq!(cache.set(), &DenySet::empty());
+        assert_eq!(cache.reload(&dir.0), DenyReload::Same);
     }
 }

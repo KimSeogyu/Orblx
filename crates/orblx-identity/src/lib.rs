@@ -52,7 +52,8 @@ pub use cert::{
 pub use clock::{MAX_AGENT_TTL, MAX_SKEW, MAX_USER_TTL};
 pub use deny::{DenyApply, DenySet};
 pub use deny_file::{
-    load_deny_file, read_deny_file, store_deny_file, DenyFileError, DENY_FILE, ENROLL_MARKER_FILE,
+    load_deny_file, read_deny_file, store_deny_file, DenyCache, DenyFileError, DenyReload,
+    DenyStore, DENY_FILE, ENROLL_MARKER_FILE,
 };
 pub use error::IdentityError;
 pub use google::{

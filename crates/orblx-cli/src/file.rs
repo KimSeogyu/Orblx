@@ -8,6 +8,7 @@
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use orblx_coord::{decode_hex_32, verify_signed_grants, SignedGrants};
@@ -16,7 +17,7 @@ use orblx_file::{
     name_ok, send_file, serve, FileError, Gate, ReceiverConfig, SendIdentity, DEFAULT_MAX_BYTES,
     FILE_AUDIT_FILE, FILE_PORT,
 };
-use orblx_identity::{decode_certificate_pem, load_deny_file, SpiffeId, TrustBundle};
+use orblx_identity::{decode_certificate_pem, DenyCache, DenyReload, SpiffeId, TrustBundle};
 
 use super::{parse_socket, take_value};
 
@@ -220,13 +221,29 @@ fn run_send(options: &SendOptions) -> Result<(), String> {
 }
 
 /// Load the checks for one connection from the state directory.
-fn load_gate(state: &Path, self_id: &SpiffeId, port: u16) -> Result<Gate, FileError> {
+///
+/// W25-38: `deny` keeps the last good deny set. A deny file that is not valid, did not
+/// open, or is missing after enroll makes the set stale, and the receiver refuses.
+fn load_gate(
+    state: &Path,
+    self_id: &SpiffeId,
+    port: u16,
+    deny: &Mutex<DenyCache>,
+) -> Result<Gate, FileError> {
     let fail = |text: &str| FileError(text.to_string());
     let bundle_pem = fs::read_to_string(state.join("bundle.pem"))
         .map_err(|_| fail("The trust bundle did not open."))?;
     let bundle =
         TrustBundle::from_pem(&bundle_pem).map_err(|_| fail("The trust bundle is not valid."))?;
-    let deny = load_deny_file(state).map_err(|err| FileError(err.to_string()))?;
+    let deny = {
+        let mut cache = deny.lock().unwrap_or_else(|err| err.into_inner());
+        if let DenyReload::Stale { error, .. } = cache.reload(state) {
+            return Err(FileError(format!(
+                "The file receiver refuses the file. {error}"
+            )));
+        }
+        cache.set().clone()
+    };
     let public = fs::read_to_string(state.join("netmap.pub"))
         .ok()
         .and_then(|text| decode_hex_32(text.trim()).ok())
@@ -263,7 +280,8 @@ fn run_receive(options: ReceiveOptions) -> Result<(), String> {
         }
     };
     let port = listen.port();
-    load_gate(&state, &self_id, port).map_err(|err| err.to_string())?;
+    let deny = Mutex::new(DenyCache::new());
+    load_gate(&state, &self_id, port, &deny).map_err(|err| err.to_string())?;
     let listener = TcpListener::bind(listen)
         .map_err(|err| format!("The file receiver did not bind {listen}. {err}"))?;
     println!("file_receive node {}", self_id.as_uri());
@@ -273,8 +291,10 @@ fn run_receive(options: ReceiveOptions) -> Result<(), String> {
         audit_path: state.join(FILE_AUDIT_FILE),
         max_bytes: options.max_bytes,
     };
-    serve(listener, config, move || load_gate(&state, &self_id, port))
-        .map_err(|err| err.to_string())
+    serve(listener, config, move || {
+        load_gate(&state, &self_id, port, &deny)
+    })
+    .map_err(|err| err.to_string())
 }
 
 fn help() -> String {
@@ -321,12 +341,14 @@ mod tests {
     }
 
     /// W25-38: the file receiver of an enrolled node refuses each file when the deny
-    /// file is not valid, is cut short, or is missing.
+    /// file is not valid, is cut short, is missing, or does not open. The receiver keeps
+    /// the last good set and makes it stale. It never uses an empty list.
     #[test]
-    fn w25_38_file_receive_refuses_when_the_deny_file_is_corrupt_truncated_or_missing() {
+    fn w25_38_file_receive_refuses_when_the_deny_file_is_corrupt_truncated_missing_or_unreadable() {
+        use std::sync::Mutex;
         use std::time::SystemTime;
 
-        use orblx_identity::{DenySet, MiniCa, SpiffeId, ENROLL_MARKER_FILE};
+        use orblx_identity::{DenyCache, MiniCa, SpiffeId, ENROLL_MARKER_FILE};
 
         let dir = std::env::temp_dir().join(format!("orblx-file-w25-38-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -335,39 +357,49 @@ mod tests {
         std::fs::write(dir.join("bundle.pem"), ca.certificate_pem()).unwrap();
         std::fs::write(dir.join(ENROLL_MARKER_FILE), "b\n").unwrap();
         let self_id = SpiffeId::node("b").unwrap();
+        let path = dir.join("deny.json");
         let valid =
             r#"{"version":1,"generated_at":1,"revoked_uris":[],"revoked_ticket_nonces":[]}"#;
-        let deny_error = |text: &str| text.contains("The deny file") && text.contains("refuses");
-
-        std::fs::write(dir.join("deny.json"), b"not json {").unwrap();
-        let err = super::load_gate(&dir, &self_id, 7000)
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(deny_error(&err), "corrupt: {err}");
-
-        std::fs::write(dir.join("deny.json"), &valid.as_bytes()[..valid.len() / 2]).unwrap();
-        let err = super::load_gate(&dir, &self_id, 7000)
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(deny_error(&err), "truncated: {err}");
-
-        std::fs::remove_file(dir.join("deny.json")).unwrap();
-        let err = super::load_gate(&dir, &self_id, 7000)
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(deny_error(&err), "missing: {err}");
+        let deny_error = |text: &str| {
+            text.contains("The file receiver refuses the file. The deny file")
+                && text.contains("refuses SSH, file receive, and new sessions")
+        };
+        let cache = Mutex::new(DenyCache::new());
+        let gate = |cache: &Mutex<DenyCache>| {
+            super::load_gate(&dir, &self_id, 7000, cache)
+                .err()
+                .unwrap()
+                .to_string()
+        };
 
         // A valid deny file passes the deny check. The next check needs the netmap key.
-        std::fs::write(dir.join("deny.json"), valid).unwrap();
-        let err = super::load_gate(&dir, &self_id, 7000)
-            .err()
-            .unwrap()
-            .to_string();
+        std::fs::write(&path, valid).unwrap();
+        let err = gate(&cache);
         assert!(!deny_error(&err), "valid: {err}");
-        assert!(DenySet::from_json(valid.as_bytes()).is_ok());
+        assert!(err.contains("netmap key"), "valid: {err}");
+
+        for kind in ["corrupt", "truncated", "missing", "unreadable"] {
+            match kind {
+                "corrupt" => std::fs::write(&path, b"not json {").unwrap(),
+                "truncated" => std::fs::write(&path, &valid.as_bytes()[..valid.len() / 2]).unwrap(),
+                "missing" => std::fs::remove_file(&path).unwrap(),
+                _ => {
+                    std::fs::remove_file(&path).unwrap();
+                    std::fs::create_dir(&path).unwrap();
+                }
+            }
+            let err = gate(&cache);
+            assert!(deny_error(&err), "{kind}: {err}");
+            // A new receiver with no last good set refuses too.
+            let err = gate(&Mutex::new(DenyCache::new()));
+            assert!(deny_error(&err), "{kind} (new receiver): {err}");
+            if path.is_dir() {
+                std::fs::remove_dir(&path).unwrap();
+            }
+            std::fs::write(&path, valid).unwrap();
+            let err = gate(&cache);
+            assert!(!deny_error(&err), "{kind} restored: {err}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

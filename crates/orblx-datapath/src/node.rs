@@ -795,7 +795,7 @@ async fn run_mesh_inner(
         // The node applies the list only when the file text changes. Thus the
         // tick does not touch the endpoint or the links when nothing changed.
         let mut ticks: u64 = 0;
-        let mut last_text: Option<Vec<u8>> = None;
+        let mut deny_cache = orblx_identity::DenyCache::with_set(deny_endpoint.deny_set());
         loop {
             tokio::select! {
                 changed = deny_shutdown.changed() => {
@@ -810,36 +810,30 @@ async fn run_mesh_inner(
                     let read = tokio::task::spawn_blocking(move || {
                         orblx_identity::read_deny_file(&dir)
                     })
-                    .await;
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(orblx_identity::DenyFileError::Unreadable(
+                            deny_dir.join(orblx_identity::DENY_FILE),
+                            std::io::ErrorKind::Other,
+                        ))
+                    });
                     // W25-38: a deny file that is not valid, did not open, or is missing
-                    // after enroll refuses new sessions (fail closed). The node never
-                    // keeps an old or empty list in place of such a file.
-                    let next = match read {
-                        Ok(Ok(Some(bytes))) if last_text.as_deref() == Some(bytes.as_slice()) => {
-                            Ok(None)
-                        }
-                        Ok(Ok(Some(bytes))) => parse_deny(&bytes)
-                            .map(|deny| Some((deny, bytes)))
-                            .ok_or_else(|| "The deny file is not valid.".to_string()),
-                        // The node was never enrolled and has no deny file.
-                        Ok(Ok(None)) => Ok(None),
-                        Ok(Err(err)) => Err(err.to_string()),
-                        Err(_) => Err("The deny file read failed.".to_string()),
-                    };
-                    match next {
-                        Ok(None) => {}
-                        Ok(Some((deny, bytes))) => {
+                    // after enroll makes the set stale. The stale set keeps the last good
+                    // entries and refuses new sessions, as the agent guard does. The node
+                    // never uses an empty list in place of such a file.
+                    match deny_cache.apply_read(&deny_dir, read) {
+                        orblx_identity::DenyReload::Same => {}
+                        orblx_identity::DenyReload::Changed => {
                             // Replace first, so a session that starts now uses the new list.
                             // Then close the open sessions of the denied peers.
+                            let deny = deny_cache.set().clone();
                             deny_endpoint.replace_deny(deny.clone());
                             close_denied_links(&lock_mesh, &deny);
-                            last_text = Some(bytes);
                         }
-                        Err(reason) => {
-                            last_text = None;
-                            if !deny_endpoint.deny_refuses_all() {
-                                eprintln!("{reason} The node refuses new sessions.");
-                                deny_endpoint.replace_deny(DenySet::refuse_all());
+                        orblx_identity::DenyReload::Stale { error, first } => {
+                            if first {
+                                eprintln!("{error} The node refuses new sessions.");
+                                deny_endpoint.replace_deny(deny_cache.set().clone());
                             }
                         }
                     }
@@ -1359,14 +1353,6 @@ fn close_denied_links(mesh: &Mesh, deny: &DenySet) {
         if deny.reject_uri(&id).is_err() {
             let _ = retired.cancel.send(true);
         }
-    }
-}
-
-fn parse_deny(bytes: &[u8]) -> Option<DenySet> {
-    let mut deny = DenySet::empty();
-    match deny.apply_json(bytes) {
-        Ok(_) => Some(deny),
-        Err(_) => None,
     }
 }
 

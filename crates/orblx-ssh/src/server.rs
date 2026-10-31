@@ -23,8 +23,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_audit::{AuditLog, SessionEvent, SessionIds};
 use orblx_identity::{
-    ed25519_public_key_from_certificate_pem, ed25519_seed_from_private_pem, load_deny_file,
-    read_deny_file, DenySet, Policy, SpiffeId, TicketVerifier, TrustBundle,
+    ed25519_public_key_from_certificate_pem, ed25519_seed_from_private_pem, DenyCache, DenyReload,
+    DenySet, Policy, SpiffeId, TicketVerifier, TrustBundle,
 };
 use russh::keys::ssh_encoding::bytes::Bytes;
 use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Session};
@@ -43,6 +43,9 @@ struct Shared {
     bundle: TrustBundle,
     verifier: Option<TicketVerifier>,
     state_dir: PathBuf,
+    /// W25-38: the last good deny set. A failed reload makes it stale. A stale set
+    /// refuses each login and stops each open session.
+    deny: Mutex<DenyCache>,
     audit: Mutex<AuditLog>,
     spent: Mutex<BTreeSet<[u8; 16]>>,
     frames: AtomicU32,
@@ -335,13 +338,7 @@ impl SshHandler {
         let policy = load_policy(&self.shared.state_dir.join("policy.hujson"));
         // W25-38: a deny file that is not valid, did not open, or is missing after enroll
         // refuses the login. It is never an empty list.
-        let deny = match load_deny_file(&self.shared.state_dir) {
-            Ok(deny) => deny,
-            Err(err) => {
-                eprintln!("The SSH server refuses the login. {err}");
-                DenySet::refuse_all()
-            }
-        };
+        let deny = self.shared.reload_deny("The SSH server refuses the login.");
         if deny.reject_uri(&self.shared.node_id).is_err() {
             self.audit_refuse(&RefusedLogin {
                 peer: self.shared.node_id.clone(),
@@ -743,60 +740,49 @@ const DENY_WATCH: Duration = Duration::from_millis(100);
 /// denies the source or this node, the session stops. Thus a revoke-all stops an
 /// open session within one node deny fetch plus one watch period.
 struct DenyWatch {
-    state_dir: PathBuf,
     next: Instant,
-    last: Option<Vec<u8>>,
 }
 
 impl DenyWatch {
-    fn new(shared: &Shared) -> Self {
+    fn new(_shared: &Shared) -> Self {
         Self {
-            state_dir: shared.state_dir.clone(),
             next: Instant::now(),
-            last: None,
         }
     }
 
-    /// Return true when a new deny file text denies the session.
+    /// Return true when the deny set denies the session.
     ///
     /// W25-38: a deny file that is not valid, did not open, or is missing after enroll
-    /// also stops the session (fail closed).
+    /// makes the set stale, and a stale set stops the session (fail closed).
     fn denied(&mut self, shared: &Shared, admitted: &Admitted) -> bool {
         let now = Instant::now();
         if now < self.next {
             return false;
         }
         self.next = now + DENY_WATCH;
-        let bytes = match read_deny_file(&self.state_dir) {
-            Ok(Some(bytes)) => bytes,
-            // The node was never enrolled and has no deny file.
-            Ok(None) => return false,
-            Err(err) => {
-                eprintln!("The SSH server stops the session. {err}");
-                return true;
-            }
-        };
-        if self.last.as_deref() == Some(bytes.as_slice()) {
-            return false;
-        }
-        let Ok(deny) = DenySet::from_json(&bytes) else {
-            eprintln!("The SSH server stops the session. The deny file is not valid.");
-            return true;
-        };
-        self.last = Some(bytes);
+        let deny = shared.reload_deny("The SSH server stops the session.");
         deny.reject_uri(&admitted.src).is_err() || deny.reject_uri(&shared.node_id).is_err()
+    }
+}
+
+impl Shared {
+    /// Read the deny file again and return the current set (W25-38).
+    ///
+    /// A failed reload keeps the last good set and marks it stale, as the agent guard
+    /// does. The stale set refuses each identifier. The function prints the reason
+    /// with `refusal` each time that the set is stale.
+    fn reload_deny(&self, refusal: &str) -> DenySet {
+        let mut cache = self.deny.lock().unwrap_or_else(|err| err.into_inner());
+        if let DenyReload::Stale { error, .. } = cache.reload(&self.state_dir) {
+            eprintln!("{refusal} {error}");
+        }
+        cache.set().clone()
     }
 }
 
 fn recheck(shared: &Shared, admitted: &Admitted) -> Result<(), RefusedLogin> {
     let policy = load_policy(&shared.state_dir.join("policy.hujson"));
-    let deny = match load_deny_file(&shared.state_dir) {
-        Ok(deny) => deny,
-        Err(err) => {
-            eprintln!("The SSH server refuses the session check. {err}");
-            DenySet::refuse_all()
-        }
-    };
+    let deny = shared.reload_deny("The SSH server refuses the session check.");
     if deny.reject_uri(&shared.node_id).is_err() {
         return Err(RefusedLogin {
             peer: shared.node_id.clone(),
@@ -1041,6 +1027,7 @@ impl Shared {
             bundle,
             verifier,
             state_dir: state_dir.to_path_buf(),
+            deny: Mutex::new(DenyCache::new()),
             audit: Mutex::new(AuditLog::new()),
             spent: Mutex::new(load_spent(&state_dir.join("ssh-spent.txt"))),
             frames: AtomicU32::new(1),
@@ -1437,52 +1424,132 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A node state directory with one plain rule (alice) and one rule that
-    /// needs a recording (rec). The user directory is `alice`.
-    /// W25-38: an enrolled node refuses SSH when its deny file is not valid, is cut
-    /// short, or is missing. It never uses an empty list in place of the file.
-    #[tokio::test]
-    async fn w25_38_ssh_refuses_when_the_deny_file_is_corrupt_truncated_or_missing() {
-        let dir = recording_fixture("w25-38");
-        let alice_dir = dir.join("alice");
-        let node = SpiffeId::node("box").unwrap();
-        std::fs::write(dir.join(orblx_identity::ENROLL_MARKER_FILE), "box\n").unwrap();
-        let valid =
-            r#"{"version":1,"generated_at":1,"revoked_uris":[],"revoked_ticket_nonces":[]}"#;
-        std::fs::write(dir.join("deny.json"), valid).unwrap();
+    /// W25-38: the four ways that a deny file can fail. Each one fails closed.
+    const W25_38_VALID: &str =
+        r#"{"version":1,"generated_at":1,"revoked_uris":[],"revoked_ticket_nonces":[]}"#;
 
+    fn w25_38_damage(path: &std::path::Path, kind: &str) {
+        match kind {
+            "corrupt" => std::fs::write(path, b"not json {").unwrap(),
+            "truncated" => {
+                std::fs::write(path, &W25_38_VALID.as_bytes()[..W25_38_VALID.len() / 2]).unwrap();
+            }
+            "missing" => std::fs::remove_file(path).unwrap(),
+            "unreadable" => {
+                // A directory at the deny file path does not open as a file.
+                std::fs::remove_file(path).unwrap();
+                std::fs::create_dir(path).unwrap();
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn w25_38_restore(path: &std::path::Path) {
+        if path.is_dir() {
+            std::fs::remove_dir(path).unwrap();
+        }
+        std::fs::write(path, W25_38_VALID).unwrap();
+    }
+
+    const W25_38_KINDS: [&str; 4] = ["corrupt", "truncated", "missing", "unreadable"];
+
+    /// An enrolled node with a valid deny file and a running SSH server.
+    async fn w25_38_server(tag: &str) -> (std::path::PathBuf, SocketAddr) {
+        let dir = recording_fixture(tag);
+        std::fs::write(dir.join(orblx_identity::ENROLL_MARKER_FILE), "box\n").unwrap();
+        std::fs::write(dir.join("deny.json"), W25_38_VALID).unwrap();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let shared = std::sync::Arc::new(Shared::load(&dir, Ipv4Addr::LOCALHOST).unwrap());
         tokio::spawn(super::accept_loop(listener, shared));
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let request = || SessionRequest {
+        (dir, addr)
+    }
+
+    fn w25_38_request(dir: &std::path::Path, addr: SocketAddr, command: &str) -> SessionRequest {
+        SessionRequest {
             user: "alice".to_string(),
             addr,
-            dst: node.clone(),
-            identity_dir: alice_dir.clone(),
+            dst: SpiffeId::node("box").unwrap(),
+            identity_dir: dir.join("alice"),
             peer_cert: dir.join("peer.pem"),
-            command: "echo ok".to_string(),
-        };
+            command: command.to_string(),
+        }
+    }
 
-        let ok = session_within(request()).await.unwrap();
+    /// W25-38: an enrolled node refuses each new SSH login when its deny file is not
+    /// valid, is cut short, is missing, or does not open. It never uses an empty list.
+    #[tokio::test]
+    async fn w25_38_ssh_login_refuses_when_the_deny_file_is_corrupt_truncated_missing_or_unreadable(
+    ) {
+        let (dir, addr) = w25_38_server("w25-38-login").await;
+        let path = dir.join("deny.json");
+        let ok = session_within(w25_38_request(&dir, addr, "echo ok"))
+            .await
+            .unwrap();
         assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "ok");
-
-        std::fs::write(dir.join("deny.json"), b"not json {").unwrap();
-        assert!(session_within(request()).await.is_err(), "corrupt");
-
-        std::fs::write(dir.join("deny.json"), &valid.as_bytes()[..valid.len() / 2]).unwrap();
-        assert!(session_within(request()).await.is_err(), "truncated");
-
-        std::fs::remove_file(dir.join("deny.json")).unwrap();
-        assert!(session_within(request()).await.is_err(), "missing");
-
-        std::fs::write(dir.join("deny.json"), valid).unwrap();
-        let again = session_within(request()).await.unwrap();
-        assert_eq!(String::from_utf8_lossy(&again.stdout).trim(), "ok");
+        for kind in W25_38_KINDS {
+            w25_38_damage(&path, kind);
+            assert!(
+                session_within(w25_38_request(&dir, addr, "echo ok"))
+                    .await
+                    .is_err(),
+                "{kind}: the login was accepted"
+            );
+            w25_38_restore(&path);
+            let again = session_within(w25_38_request(&dir, addr, "echo ok"))
+                .await
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&again.stdout).trim(),
+                "ok",
+                "{kind}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// W25-38: the open-session recheck stops an open SSH session when the deny file
+    /// becomes not valid, cut short, missing, or does not open.
+    #[tokio::test]
+    async fn w25_38_ssh_open_session_stops_when_the_deny_file_is_corrupt_truncated_missing_or_unreadable(
+    ) {
+        let (dir, addr) = w25_38_server("w25-38-open").await;
+        let path = dir.join("deny.json");
+        for kind in W25_38_KINDS {
+            let damage_path = path.clone();
+            let writer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1500));
+                w25_38_damage(&damage_path, kind);
+                std::time::Instant::now()
+            });
+            let open =
+                session_within(w25_38_request(&dir, addr, "sleep 5; printf %s\\n late")).await;
+            let ended = std::time::Instant::now();
+            let damaged_at = writer.join().unwrap();
+            assert!(
+                ended.duration_since(damaged_at) < Duration::from_millis(1000),
+                "{kind}: the open session ran {:?} after the damage",
+                ended.duration_since(damaged_at)
+            );
+            if let Ok(output) = &open {
+                assert!(
+                    !String::from_utf8_lossy(&output.stdout).contains("late"),
+                    "{kind}"
+                );
+                assert_ne!(output.exit_status, 0, "{kind}");
+            }
+            w25_38_restore(&path);
+        }
+        let ok = session_within(w25_38_request(&dir, addr, "echo ok"))
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node state directory with one plain rule (alice) and one rule that
+    /// needs a recording (rec). The user directory is `alice`.
     fn recording_fixture(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("orblx-ssh-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

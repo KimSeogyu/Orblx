@@ -857,7 +857,37 @@ async fn round_trip(
     let _ = send.finish();
     let response: Response = proto::read_json(&mut recv).await?;
     close_and_wait(&connection, &endpoint).await;
-    enroll_from_response(response, bundle_pem, pinned_public, require_leaf)
+    // W25-38: the enroll reply comes on this connection, which verified the coordinator
+    // SVID with the trust bundle. It must have the deny list of the node.
+    let enroll_deny = (request.op == "enroll" && response.ok).then(|| response.detail.clone());
+    let mut result = enroll_from_response(response, bundle_pem, pinned_public, require_leaf)?;
+    if let Some(detail) = enroll_deny {
+        result.deny = Some(enroll_deny_text(detail)?);
+    }
+    Ok(result)
+}
+
+/// The text of the coordinator release note for W25-38.
+pub const ENROLL_DENY_UPGRADE: &str = "Upgrade the coordinator and all nodes together.";
+
+/// Check the deny list of one enroll reply (W25-38).
+///
+/// A coordinator before W25-38 does not send a deny list. The node then has no
+/// `deny.json` after enroll and refuses all sessions, so the enroll fails closed now
+/// with a clear error.
+fn enroll_deny_text(detail: Option<String>) -> Result<String, CoordError> {
+    let Some(text) = detail else {
+        return Err(CoordError::Protocol(format!(
+            "Version mismatch: the coordinator did not send a deny list at enroll. \
+             {ENROLL_DENY_UPGRADE}"
+        )));
+    };
+    if orblx_identity::DenySet::from_json(text.as_bytes()).is_err() {
+        return Err(CoordError::Protocol(
+            "The coordinator sent a deny list that is not valid at enroll.".to_string(),
+        ));
+    }
+    Ok(text)
 }
 
 fn enroll_from_response(
@@ -942,10 +972,8 @@ fn enroll_from_response(
         advertised_routes: response.advertised_routes.unwrap_or_default(),
         exit_approved: response.exit_approved.unwrap_or(false),
         ticket,
-        // W25-38: only a valid deny document goes to `deny.json`.
-        deny: response
-            .detail
-            .filter(|text| orblx_identity::DenySet::from_json(text.as_bytes()).is_ok()),
+        // W25-38: `round_trip` sets the deny list of an enroll reply.
+        deny: None,
     })
 }
 
