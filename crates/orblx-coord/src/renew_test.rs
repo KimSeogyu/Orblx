@@ -1476,6 +1476,7 @@ async fn nodes_renew_across_coordinator_cert_ends() {
         .unwrap();
     let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
     let issued_at = Instant::now();
+    let issued_unix = SystemTime::now();
     let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
     let mut enrolled = Vec::new();
     for (at, name) in ["a", "b", "c", "p"].iter().enumerate() {
@@ -1512,6 +1513,8 @@ async fn nodes_renew_across_coordinator_cert_ends() {
     let ips = ["100.64.0.1", "100.64.0.2", "100.64.0.3"];
     let names = ["a", "b", "c"];
     let renew_fail = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let renew_at: Vec<Arc<Mutex<Vec<Instant>>>> =
+        (0..3).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
@@ -1533,6 +1536,7 @@ async fn nodes_renew_across_coordinator_cert_ends() {
                 bundle.clone(),
                 dirs[at].0.clone(),
                 Arc::clone(&renew_fail),
+                Arc::clone(&renew_at[at]),
             ),
             stop_rx.clone(),
         );
@@ -1565,12 +1569,18 @@ async fn nodes_renew_across_coordinator_cert_ends() {
     let mut gaps = Vec::new();
     let (mut got_ab, mut got_ba, mut got_ca, mut got_ac) = (0u64, 0u64, 0u64, 0u64);
     let (mut late_ab, mut late_ba) = (0u64, 0u64);
-    let (mut probes, mut probe_fail) = (0u64, 0u64);
-    let mut probe_renewals = 0u64;
-    let mut next_probe = Instant::now();
-    let probe_dir = dirs[3].0.clone();
-    let mut probe_leaf =
-        leaf_validity(&decode_certificate_pem(&enrolled[3].certificate_pem).unwrap()).unwrap();
+    let mut coord_rotations: Vec<Instant> = Vec::new();
+    let mut last_coord_end = first_coord_end;
+    let mut last_send_ab: Option<Instant> = None;
+    let mut max_send_gap = Duration::ZERO;
+    // The probe runs in its own task, so a slow coordinator call does not delay the packets.
+    let probe = tokio::spawn(coord_probe(
+        addr,
+        bundle.clone(),
+        dirs[3].0.clone(),
+        leaf_validity(&decode_certificate_pem(&enrolled[3].certificate_pem).unwrap()).unwrap(),
+        stop_rx.clone(),
+    ));
     let send = |from: usize, to: usize, body: &'static [u8]| {
         ipv4_packet(
             ips[from].parse::<Ipv4Addr>().unwrap(),
@@ -1586,6 +1596,11 @@ async fn nodes_renew_across_coordinator_cert_ends() {
                 c_started = Some(Instant::now());
             }
         }
+        let sent_at = Instant::now();
+        if let Some(prev) = last_send_ab {
+            max_send_gap = max_send_gap.max(sent_at.saturating_duration_since(prev));
+        }
+        last_send_ab = Some(sent_at);
         let _ = inputs[0].send(send(0, 1, b"ab")).await;
         let _ = inputs[1].send(send(1, 0, b"ba")).await;
         if c_started.is_some() {
@@ -1623,7 +1638,12 @@ async fn nodes_renew_across_coordinator_cert_ends() {
                 }
             }
         }
-        coord_ends.insert(coord.coord_svid_not_after().unwrap());
+        let coord_end = coord.coord_svid_not_after().unwrap();
+        if coord_end != last_coord_end {
+            coord_rotations.push(Instant::now());
+            last_coord_end = coord_end;
+        }
+        coord_ends.insert(coord_end);
         for at in 0..3 {
             if let Ok(text) = fs::read_to_string(dirs[at].0.join(NODE_STATUS_FILE)) {
                 if let Some(value) = text
@@ -1634,39 +1654,37 @@ async fn nodes_renew_across_coordinator_cert_ends() {
                 }
             }
         }
-        if Instant::now() >= next_probe {
-            next_probe = Instant::now() + Duration::from_secs(1);
-            probes += 1;
-            let now_unix = unix(SystemTime::now());
-            let (not_before, not_after) = probe_leaf;
-            if now_unix >= not_before + (not_after - not_before) * 2 / 3 {
-                match client::renew_svid(addr, "coord", &bundle, &probe_dir).await {
-                    Ok(renewed) => {
-                        probe_renewals += 1;
-                        probe_leaf = leaf_validity(
-                            &decode_certificate_pem(&renewed.certificate_pem).unwrap(),
-                        )
-                        .unwrap();
-                    }
-                    Err(err) => {
-                        probe_fail += 1;
-                        println!("coord probe renew failed: {err}");
-                    }
-                }
-            } else if let Err(err) = client::fetch_netmap(addr, "coord", &bundle, &probe_dir).await
-            {
-                probe_fail += 1;
-                println!("coord probe netmap failed: {err}");
-            }
-        }
     }
     let _ = stop_tx.send(true);
+    let report = probe.await.unwrap();
+    let (probes, probe_fail, probe_renewals) = (report.probes, report.fail, report.renewals);
     for task in tasks {
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
     }
     handle.abort();
 
     let end_unix = unix(SystemTime::now());
+    print_gap_places(
+        &gaps,
+        &GapMarks {
+            renewals: renew_at[0]
+                .lock()
+                .unwrap()
+                .iter()
+                .chain(renew_at[1].lock().unwrap().iter())
+                .copied()
+                .collect(),
+            ticket_ends: expiries[0]
+                .iter()
+                .chain(expiries[1].iter())
+                .filter_map(|end| end.parse::<u64>().ok())
+                .filter_map(|end| unix_instant(end, issued_at, issued_unix))
+                .collect(),
+            coord_rotations,
+            probe_calls: report.calls,
+        },
+        max_send_gap,
+    );
     let crossed = coord_ends.iter().filter(|end| **end < end_unix).count();
     let renew_fail = renew_fail.load(std::sync::atomic::Ordering::Relaxed);
     println!(
@@ -1719,13 +1737,155 @@ async fn nodes_renew_across_coordinator_cert_ends() {
     );
 }
 
+/// The result of [`coord_probe`].
+struct ProbeReport {
+    probes: u64,
+    fail: u64,
+    renewals: u64,
+    calls: Vec<(Instant, Instant)>,
+}
+
+/// Call the coordinator once a second until `stop`: a netmap fetch, or a renewal at two thirds
+/// of the probe leaf life (W25-33).
+async fn coord_probe(
+    addr: SocketAddr,
+    bundle: String,
+    dir: PathBuf,
+    mut leaf: (u64, u64),
+    mut stop: watch::Receiver<bool>,
+) -> ProbeReport {
+    let mut report = ProbeReport {
+        probes: 0,
+        fail: 0,
+        renewals: 0,
+        calls: Vec::new(),
+    };
+    while !*stop.borrow() {
+        let start = Instant::now();
+        report.probes += 1;
+        let (not_before, not_after) = leaf;
+        if unix(SystemTime::now()) >= not_before + (not_after - not_before) * 2 / 3 {
+            match client::renew_svid(addr, "coord", &bundle, &dir).await {
+                Ok(renewed) => {
+                    report.renewals += 1;
+                    leaf =
+                        leaf_validity(&decode_certificate_pem(&renewed.certificate_pem).unwrap())
+                            .unwrap();
+                }
+                Err(err) => {
+                    report.fail += 1;
+                    println!("coord probe renew failed: {err}");
+                }
+            }
+        } else if let Err(err) = client::fetch_netmap(addr, "coord", &bundle, &dir).await {
+            report.fail += 1;
+            println!("coord probe netmap failed: {err}");
+        }
+        report.calls.push((start, Instant::now()));
+        let next = start + Duration::from_secs(1);
+        tokio::select! {
+            _ = tokio::time::sleep_until(next.into()) => {}
+            _ = stop.changed() => {}
+        }
+    }
+    report
+}
+
+/// Marks for the place of a packet gap (W25-33).
+struct GapMarks {
+    renewals: Vec<Instant>,
+    ticket_ends: Vec<Instant>,
+    coord_rotations: Vec<Instant>,
+    probe_calls: Vec<(Instant, Instant)>,
+}
+
+/// Map a unix second to an [`Instant`] with one pair of clock reads.
+fn unix_instant(at: u64, base: Instant, base_unix: SystemTime) -> Option<Instant> {
+    let base_s = base_unix.duration_since(UNIX_EPOCH).ok()?;
+    let at = Duration::from_secs(at);
+    if at >= base_s {
+        base.checked_add(at - base_s)
+    } else {
+        base.checked_sub(base_s - at)
+    }
+}
+
+/// Print the largest packet gap in each kind of window, and the place of the largest gap.
+/// The ticket end window is [end - 2 s, end + 2 s], as in gate 4b of ticket-renewal.sh.
+/// The renewal and coordinator rotation windows are the W25-11 renewal window.
+fn print_gap_places(gaps: &[(Instant, Instant)], marks: &GapMarks, max_send_gap: Duration) {
+    let two = Duration::from_secs(2);
+    let ticket_window = |(prev, now): &(Instant, Instant)| {
+        marks.ticket_ends.iter().any(|end| {
+            let from = end.checked_sub(two).unwrap_or(*end);
+            *prev < *end + two && *now > from
+        })
+    };
+    let probe_overlap = |(prev, now): &(Instant, Instant)| {
+        marks
+            .probe_calls
+            .iter()
+            .any(|(start, end)| *prev < *end && *now > *start)
+    };
+    let largest = |keep: &dyn Fn(&(Instant, Instant)) -> bool| {
+        gaps.iter()
+            .filter(|gap| keep(gap))
+            .map(|(prev, now)| now.saturating_duration_since(*prev))
+            .max()
+            .unwrap_or(Duration::ZERO)
+    };
+    let renewal = renewal_max_gap(gaps, &marks.renewals);
+    let rotation = renewal_max_gap(gaps, &marks.coord_rotations);
+    let ticket = largest(&ticket_window);
+    let probe = largest(&probe_overlap);
+    let no_probe = largest(&|gap| !probe_overlap(gap));
+    let max_probe = marks
+        .probe_calls
+        .iter()
+        .map(|(start, end)| end.saturating_duration_since(*start))
+        .max()
+        .unwrap_or(Duration::ZERO);
+    let place = gaps
+        .iter()
+        .max_by_key(|(prev, now)| now.saturating_duration_since(*prev))
+        .map(|gap| {
+            let one = |window: &[Instant]| renewal_max_gap(std::slice::from_ref(gap), window);
+            format!(
+                "node_renewal_window {} ticket_end_window {} coord_rotation_window {} probe_call {}",
+                !one(&marks.renewals).is_zero(),
+                ticket_window(gap),
+                !one(&marks.coord_rotations).is_zero(),
+                probe_overlap(gap)
+            )
+        })
+        .unwrap_or_default();
+    println!(
+        "gap_places node_renewal_window_max_gap_ms {} ticket_end_window_max_gap_ms {} \
+         coord_rotation_window_max_gap_ms {} probe_call_max_gap_ms {} no_probe_max_gap_ms {} \
+         max_send_gap_ms {} max_probe_call_ms {} renewals {} ticket_ends {} coord_rotations {}",
+        renewal.as_millis(),
+        ticket.as_millis(),
+        rotation.as_millis(),
+        probe.as_millis(),
+        no_probe.as_millis(),
+        max_send_gap.as_millis(),
+        max_probe.as_millis(),
+        marks.renewals.len(),
+        marks.ticket_ends.len(),
+        marks.coord_rotations.len()
+    );
+    println!("gap_places largest_gap {place}");
+}
+
 fn counted_renewer(
     addr: SocketAddr,
     bundle: String,
     state: PathBuf,
     failures: Arc<std::sync::atomic::AtomicU64>,
+    calls: Arc<Mutex<Vec<Instant>>>,
 ) -> SvidRenewer {
     SvidRenewer::new(move || {
+        calls.lock().unwrap().push(Instant::now());
         let result =
             client::renew_svid_blocking(addr, "coord", &bundle, &state).map_err(|err| {
                 failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

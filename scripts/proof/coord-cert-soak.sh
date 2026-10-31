@@ -10,9 +10,11 @@
 #     failed", "capability ticket check rejected", "The end time has passed"), 0 lost peers,
 #     per-end gap lines, no restart, 0 contended samples.
 #  2. The coordinator crosses SOAK_COORD_ENDS or more ends of its own leaf. An end is a
-#     "coord svid expiry" or "coord svid renewed, new expiry" value before the run end.
+#     "coord svid expiry" or "coord svid renewed, new expiry" value E with E + MAX_SKEW before
+#     the run end (run_end_unix of ticket-renewal.sh: the end of the pings and status samples).
 #  3. 0 "coord handshake failed" lines and 0 "coord svid renewal failed" lines.
 #  4. The run is SOAK_S seconds or more from the coordinator start to the run end.
+# Each gate value prints, also when the proof fails.
 # The script does not print tokens, keys, tickets, or bundles. It reads only coordinator
 # lines that it selects by name.
 set -euo pipefail
@@ -72,7 +74,9 @@ PERIOD=$(( TTL - TTL / 3 ))
 # ticket-renewal.sh ends the run at: first ticket end + (TR_ENDS - 1) * PERIOD + SKEW + 5 s.
 # The first ticket end is about TTL s after the coordinator start.
 ends_for_soak=$(( (SOAK_S - TTL - SKEW - 5 + PERIOD - 1) / PERIOD + 1 ))
-# The coordinator leaf ends at TTL, then each PERIOD s. The run must pass SOAK_COORD_ENDS ends.
+# The coordinator leaf ends at TTL, then each PERIOD s, so its end K + MAX_SKEW comes at about
+# TTL + (K - 1) * PERIOD + SKEW. The first ticket end comes after the first coordinator leaf end
+# (the nodes enroll after the coordinator start), so TR_ENDS = K is enough for K ends.
 ends_for_coord=$(( SOAK_COORD_ENDS ))
 TR_ENDS="${SOAK_TR_ENDS:-$(( ends_for_soak > ends_for_coord ? ends_for_soak : ends_for_coord ))}"
 (( TR_ENDS >= 2 )) || TR_ENDS=2
@@ -107,7 +111,6 @@ done
 tr_status=0
 wait "$TR_PID" || tr_status=$?
 TR_PID=""
-RUN_END="$(date +%s)"
 if [[ -n "$FOLLOW_PID" ]]; then
   kill "$FOLLOW_PID" >/dev/null 2>&1 || true
   wait "$FOLLOW_PID" 2>/dev/null || true
@@ -117,14 +120,16 @@ sed 's/^/tr | /' "$WORK/tr.log"
 echo "tr_exit ${tr_status}"
 
 echo "=== gates ==="
+RUN_END="$(awk '/^renew_period_s .* run_end_unix [0-9]+ / && !f {for (i = 1; i < NF; i++) if ($i == "run_end_unix") print $(i + 1); f = 1}' "$WORK/tr.log")"
+[[ -n "$RUN_END" ]] || fail "ticket-renewal.sh printed no run_end_unix."
 [[ -s "$COORD_LOG" ]] || fail "No coordinator log. The proof did not start the coordinator."
 coord_start_utc="$(awk '/ coord listen / && !f {print $1; f = 1}' "$COORD_LOG")"
 [[ -n "$coord_start_utc" ]] || fail "The coordinator log has no 'coord listen' line."
 coord_start="$(date -d "$coord_start_utc" +%s)"
 soak_run_s=$(( RUN_END - coord_start ))
-ends="$(awk -v e="$RUN_END" '
+ends="$(awk -v e="$RUN_END" -v s="$SKEW" '
   / coord svid expiry [0-9]+$/ || / coord svid renewed, new expiry [0-9]+$/ {
-    v = $NF; if (!(v in seen)) { seen[v] = 1; if (v + 0 < e + 0) n++ }
+    v = $NF; if (!(v in seen)) { seen[v] = 1; if (v + s < e + 0) n++ }
   }
   END {print n + 0}' "$COORD_LOG")"
 renewals="$(awk '/ coord svid renewed, new expiry / {n++} END {print n + 0}' "$COORD_LOG")"
