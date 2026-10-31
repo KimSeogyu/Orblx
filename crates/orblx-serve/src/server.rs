@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use orblx_datapath::Netmap;
 use orblx_identity::{DenySet, Policy, SpiffeId, TrustBundle};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
@@ -260,8 +259,9 @@ fn admit(
     ingress: Ingress,
     https_port: u16,
 ) -> Result<String, String> {
-    let netmap =
-        Netmap::from_path(&shared.netmap_path).map_err(|_| "netmap-not-valid".to_string())?;
+    // W25-36: with coordinator state, only the signed netmap names the peers.
+    let netmap = orblx_datapath::read_running_netmap(&shared.state_dir, &shared.netmap_path)
+        .map_err(|_| "netmap-not-valid".to_string())?;
     let src_text = src.to_string();
     let Some(peer) = netmap.peers.iter().find(|peer| peer.overlay_ip == src_text) else {
         return Err("unknown-source".to_string());
@@ -386,6 +386,20 @@ mod tests {
         assert_eq!(
             admit(&shared, peer_a, Ingress::Tunnel, 443),
             Err("no-node-svid".to_string())
+        );
+        let _ = fs::remove_dir_all(&shared.state_dir);
+    }
+
+    /// W25-36: with coordinator state, serve does not take the peers from netmap.json.
+    /// This process has no signed netmap check, so the check fails closed.
+    #[test]
+    fn an_enrolled_node_does_not_admit_from_netmap_json() {
+        let shared = shared_with_netmap("enrolled");
+        fs::write(shared.state_dir.join("node-name"), "b\n").unwrap_or_else(|_| panic!("name"));
+        let peer_a = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1));
+        assert_eq!(
+            admit(&shared, peer_a, Ingress::Tunnel, 443),
+            Err("netmap-not-valid".to_string())
         );
         let _ = fs::remove_dir_all(&shared.state_dir);
     }

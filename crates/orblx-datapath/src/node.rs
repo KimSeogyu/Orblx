@@ -882,6 +882,7 @@ async fn run_mesh_inner(
                 interface,
                 overlay,
                 netmap_path,
+                state_dir: (*state_dir).clone(),
                 node_name: node.name.clone(),
                 node_overlay: node.overlay_ip.clone(),
                 visibility,
@@ -1170,7 +1171,9 @@ struct PeerWatch {
 /// A peer that leaves the netmap loses its routes. The deny list and the node lock
 /// stop its sessions, as before.
 async fn watch_netmap_peers(watch: PeerWatch) {
-    let mut last = fs::read(&watch.mesh.netmap_path).ok();
+    // W25-36: with coordinator state, the source is the signed netmap, not netmap.json.
+    let source = crate::netmap_source_file(&watch.mesh.state_dir, &watch.mesh.netmap_path);
+    let mut last = fs::read(&source).ok();
     let mut started: HashSet<String> = watch
         .mesh
         .netmap
@@ -1196,17 +1199,31 @@ async fn watch_netmap_peers(watch: PeerWatch) {
             _ = tick.tick() => {
                 // W25-11: read the file on a blocking thread. A slow disk must not stop the
                 // runtime that moves the packets.
-                let path = watch.mesh.netmap_path.clone();
+                let path = source.clone();
                 let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || fs::read(path)).await else {
                     continue;
                 };
                 if last.as_deref() == Some(bytes.as_slice()) {
                     continue;
                 }
-                last = Some(bytes.clone());
-                let Ok(netmap) = Netmap::from_slice(&bytes) else {
-                    eprintln!("The node did not apply the new netmap. The file is not valid.");
+                last = Some(bytes);
+                // W25-36: parse only through the source check. With coordinator state, only a
+                // netmap with a good signature passes. The node never parses netmap.json then.
+                let state_dir = Arc::clone(&watch.mesh.state_dir);
+                let netmap_path = watch.mesh.netmap_path.clone();
+                let Ok(read) = tokio::task::spawn_blocking(move || {
+                    crate::read_running_netmap(&state_dir, &netmap_path)
+                })
+                .await
+                else {
                     continue;
+                };
+                let netmap = match read {
+                    Ok(netmap) => netmap,
+                    Err(err) => {
+                        eprintln!("The node did not apply the new netmap. {err}");
+                        continue;
+                    }
                 };
                 apply_peer_netmap(&watch, &netmap, &mut started, &mut installed);
             }
@@ -1276,7 +1293,7 @@ fn apply_peer_netmap(
 }
 
 fn fresh_netmap(mesh: &Mesh) -> Netmap {
-    match Netmap::from_path(&mesh.netmap_path) {
+    match crate::read_running_netmap(&mesh.state_dir, &mesh.netmap_path) {
         Ok(netmap) => netmap,
         Err(_) => (*mesh.netmap).clone(),
     }
@@ -2289,7 +2306,7 @@ fn read_status_record(dir: &Path) -> Result<NodeRecord, HelloError> {
     if dir.join(NODE_RECORD_FILE).exists() {
         return read_record(dir);
     }
-    let Ok(netmap) = Netmap::from_path(&dir.join("netmap.json")) else {
+    let Ok(netmap) = crate::read_running_netmap(dir, &dir.join("netmap.json")) else {
         return read_record(dir);
     };
     let overlay_ip = parse_ipv4(&netmap.self_node.overlay_ip)
@@ -2439,6 +2456,7 @@ struct DnsSpawn {
     interface: String,
     overlay: Ipv4Addr,
     netmap_path: PathBuf,
+    state_dir: PathBuf,
     node_name: String,
     node_overlay: String,
     visibility: Arc<dyn PeerVisibility>,
@@ -2508,6 +2526,7 @@ async fn spawn_overlay_dns(
     tasks.push(tokio::spawn(async move {
         watch_netmap_dns(DnsWatch {
             path: dns.netmap_path,
+            state_dir: dns.state_dir,
             node_name: dns.node_name,
             node_overlay: dns.node_overlay,
             interface: dns.interface,
@@ -2525,6 +2544,7 @@ async fn spawn_overlay_dns(
 
 struct DnsWatch {
     path: PathBuf,
+    state_dir: PathBuf,
     node_name: String,
     node_overlay: String,
     interface: String,
@@ -2537,7 +2557,7 @@ struct DnsWatch {
 }
 
 async fn watch_netmap_dns(mut watch_state: DnsWatch) {
-    let mut last = fs::read(&watch_state.path).unwrap_or_default();
+    let mut last = fs::read(dns_source(&watch_state)).unwrap_or_default();
     let mut last_error = String::new();
     let mut grant_revision = watch_state.visibility.revision();
     loop {
@@ -2582,10 +2602,15 @@ fn refresh_resolver_in_background(watch_state: &DnsWatch, table: DnsTable) {
     });
 }
 
+/// W25-36: with coordinator state, the DNS watcher follows the signed netmap file.
+fn dns_source(watch_state: &DnsWatch) -> PathBuf {
+    crate::netmap_source_file(&watch_state.state_dir, &watch_state.path)
+}
+
 fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut String) {
-    match fs::read(&watch_state.path) {
+    match fs::read(dns_source(watch_state)) {
         Ok(bytes) if bytes == *last => {}
-        Ok(bytes) => match Netmap::from_slice(&bytes) {
+        Ok(bytes) => match crate::read_running_netmap(&watch_state.state_dir, &watch_state.path) {
             Ok(map) if self_matches(&map, &watch_state.node_name, &watch_state.node_overlay) => {
                 last.clone_from(&bytes);
                 last_error.clear();

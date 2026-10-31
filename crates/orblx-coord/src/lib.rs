@@ -67,9 +67,9 @@ pub use netmap::{
 pub use proto::GrantAsk;
 pub use server::serve_blocking;
 pub use state::{
-    oidc_config, read_node_material, read_node_netmap, read_verified_netmap, Coordinator,
-    EnrollResult, IssuerFetch, NetmapView, OidcConfig, CONFIG_AUDIT_FILE, ISSUER_JWKS_TTL_SECS,
-    ISSUER_REFETCH_SECS,
+    install_netmap_check, oidc_config, read_node_material, read_node_netmap, read_verified_netmap,
+    Coordinator, EnrollResult, IssuerFetch, NetmapView, OidcConfig, CONFIG_AUDIT_FILE,
+    ISSUER_JWKS_TTL_SECS, ISSUER_REFETCH_SECS,
 };
 pub use store::{CreatedToken, StoredUser, UserState};
 

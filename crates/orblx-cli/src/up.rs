@@ -393,8 +393,8 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
 
 fn run_up(mut options: UpOptions) -> Result<(), String> {
     apply_saved_exit(&mut options)?;
-    let (netmap_path, forward_routes, forward_exit, from_coord) = publish_routes(&options)?;
-    let netmap = if uses_signed_netmap(&options, &netmap_path, from_coord) {
+    let (netmap_path, forward_routes, forward_exit) = publish_routes(&options)?;
+    let netmap = if uses_signed_netmap(&options) {
         signed_netmap(&options.state_dir)?
     } else {
         locked_netmap(&options.state_dir, &netmap_path)?
@@ -446,14 +446,11 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
 
 /// Tell if the node must parse the signed netmap (W25-36).
 ///
-/// An enrolled node (with `netmap.pub`) that uses the netmap from the coordinator parses only
-/// `netmap.signed.json` after the signature check. A node with its own `--netmap` file and no
-/// coordinator fetch keeps that file.
-fn uses_signed_netmap(options: &UpOptions, netmap_path: &Path, from_coord: bool) -> bool {
-    if !options.state_dir.join("netmap.pub").exists() {
-        return false;
-    }
-    from_coord || netmap_path == options.state_dir.join("netmap.json")
+/// A node with coordinator state parses only `netmap.signed.json` after the signature
+/// check, also with a `--netmap` option. No option or file mode turns the check off.
+/// A node without coordinator state (a static `orblx issue` node) keeps its netmap file.
+fn uses_signed_netmap(options: &UpOptions) -> bool {
+    orblx_datapath::has_coordinator_state(&options.state_dir)
 }
 
 /// Parse the netmap only from the signed bytes and apply node lock (W25-36).
@@ -573,18 +570,17 @@ fn resolve_coord(text: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("The coordinator address {text} is not valid."))
 }
 
-fn publish_routes(options: &UpOptions) -> Result<(PathBuf, Vec<String>, bool, bool), String> {
+fn publish_routes(options: &UpOptions) -> Result<(PathBuf, Vec<String>, bool), String> {
     let wants_fetch = options.coord.is_some()
         && (options.accept_routes || options.exit_node.is_some() || options.advertise_exit);
     if options.advertise_routes.is_empty() && !options.advertise_exit && !wants_fetch {
-        return Ok((options.netmap.clone(), Vec::new(), false, false));
+        return Ok((options.netmap.clone(), Vec::new(), false));
     }
     let Some(coord) = options.coord else {
         return Ok((
             options.netmap.clone(),
             options.advertise_routes.clone(),
             options.advertise_exit,
-            false,
         ));
     };
     let bundle = options
@@ -598,12 +594,7 @@ fn publish_routes(options: &UpOptions) -> Result<(PathBuf, Vec<String>, bool, bo
         orblx_coord::fetch_netmap_blocking(coord, coord_name, &bundle_pem, &options.state_dir)
             .map_err(|err| err.to_string())?;
         println!("The node uses the coordinator netmap.");
-        return Ok((
-            options.state_dir.join("netmap.json"),
-            Vec::new(),
-            false,
-            true,
-        ));
+        return Ok((options.state_dir.join("netmap.json"), Vec::new(), false));
     }
     let mut forward_routes = Vec::new();
     let mut forward_exit = false;
@@ -656,7 +647,7 @@ fn publish_routes(options: &UpOptions) -> Result<(PathBuf, Vec<String>, bool, bo
     } else {
         options.state_dir.join("netmap.json")
     };
-    Ok((path, forward_routes, forward_exit, true))
+    Ok((path, forward_routes, forward_exit))
 }
 
 fn apply_saved_exit(options: &mut UpOptions) -> Result<(), String> {

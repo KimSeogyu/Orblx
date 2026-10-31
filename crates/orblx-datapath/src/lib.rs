@@ -11,6 +11,7 @@ mod gate;
 mod ha;
 mod ipv4;
 mod netmap;
+mod netmap_source;
 mod node;
 mod quic;
 mod relay_path;
@@ -42,6 +43,10 @@ pub use ipv4::{ipv4_destination, ipv4_packet, is_icmp_echo_reply, is_ipv4_packet
 pub use netmap::{
     valid_split_domain, valid_split_nameserver, LockUpdate, Netmap, NetmapError, NetmapPeer,
     NetmapSelf, NodeLockSig, SplitDns, MAX_SPLIT_DNS_SERVERS, MAX_SPLIT_DNS_ZONES, NODE_LOCK_FILE,
+};
+pub use netmap_source::{
+    has_coordinator_state, netmap_source_file, read_running_netmap, set_netmap_verifier,
+    NetmapVerifier, COORDINATOR_STATE_FILES, SIGNED_NETMAP_FILE,
 };
 pub use node::{
     format_node_status, read_status_text, run_memory_node, run_node, running_pid, ListenEvent,

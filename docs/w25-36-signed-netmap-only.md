@@ -28,3 +28,24 @@ The tests write valid files, then change the bytes on disk. [C]
 - The runtime readers of `netmap.json` (datapath netmap watch, DNS, serve) still read the file. They are not in this change.
 - A node with `netmap.pub` removed is a node without a coordinator. It reads `netmap.json`.
 - No live node run (REAL) is in this change.
+
+## Running readers and fail closed (W25-36 b, c)
+
+- REAL: `orblx-datapath` has `read_running_netmap` (`netmap_source.rs`). The netmap watcher,
+  `fresh_netmap`, the DNS watcher, `orblx status`, and the serve check use it.
+- REAL: coordinator state is one of `node.crt.pem`, `netmap.signed.json`, `coord-addr`,
+  `node-name`. `netmap.pub` alone is not coordinator state, because a static
+  `orblx issue --policy` node has it too.
+- REAL: with coordinator state, the readers watch `netmap.signed.json` and parse the netmap only
+  through the signature check from `orblx-coord` (`install_netmap_check`). They never read
+  `netmap.json`. `orblx up` uses the signed netmap also with a `--netmap` option.
+- REAL: coordinator state without `netmap.pub` or without `netmap.signed.json` fails closed with
+  a clear error. A process without the installed check also fails closed.
+- REAL tests: `tampers_while_the_node_reads_are_never_accepted` (9 files, 0 accepted),
+  `an_enrolled_node_without_netmap_pub_fails_closed` (4 markers, 0 accepted),
+  `a_static_node_with_netmap_pub_reads_netmap_json`, `an_enrolled_node_does_not_admit_from_netmap_json`,
+  and the `netmap_source` tests.
+- [C] The running test drives the same read function as the node tasks. A full `run_node` needs
+  a TUN device (root), so CI does not run it.
+- [C] A local user who can delete all coordinator files can also change every other state file.
+  This change does not defend against that user.
