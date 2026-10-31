@@ -1,0 +1,172 @@
+# W25-10 HA subnet routers proof.
+# router-a and router-b advertise the same route 10.88.125.0/24.
+# The coordinator, both routers, the client, and the guest share the proof network.
+# Both routers and the target share the lan network. The target has no overlay.
+# The client and the guest accept routes.
+
+name: ${PROOF_PROJECT:-orblx-w25ha-proof}
+
+x-node: &node
+  image: ${ORBLX_HA_IMAGE:-orblx-w25ha:local}
+  profiles: ["nodes"]
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+  devices:
+    - /dev/net/tun:/dev/net/tun
+  sysctls:
+    net.ipv4.conf.all.rp_filter: "0"
+    net.ipv4.conf.default.rp_filter: "0"
+  stop_grace_period: 10s
+
+x-router-command: &router_command
+  - up
+  - --netmap
+  - /etc/orblx/netmap.json
+  - --state-dir
+  - /var/lib/orblx
+  - --listen
+  - 0.0.0.0:443
+  - --advertise-routes
+  - 10.88.125.0/24
+
+x-client-command: &client_command
+  - up
+  - --netmap
+  - /etc/orblx/netmap.json
+  - --state-dir
+  - /var/lib/orblx
+  - --listen
+  - 0.0.0.0:443
+  - --accept-routes
+
+services:
+  coord:
+    image: ${ORBLX_HA_IMAGE:-orblx-w25ha:local}
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /etc/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+    volumes:
+      - ${HA_COORD_STATE:?set HA_COORD_STATE}:/var/lib/orblx
+      - ${HA_POLICY_DIR:?set HA_POLICY_DIR}:/etc/orblx:ro
+    networks:
+      proof:
+        ipv4_address: 172.30.125.2
+
+  tool:
+    image: ${ORBLX_HA_IMAGE:-orblx-w25ha:local}
+    profiles: ["tool"]
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    volumes:
+      - ${HA_TOOL_STATE:?set HA_TOOL_STATE}:/var/lib/orblx
+      - ${HA_COORD_STATE:?set HA_COORD_STATE}:/coord-state:ro
+    networks:
+      - proof
+
+  router-a:
+    <<: *node
+    # The router writes ip_forward and iptables. The container needs a writable /proc/sys.
+    privileged: true
+    volumes:
+      - ${HA_ROUTER_A_STATE:?set HA_ROUTER_A_STATE}:/var/lib/orblx
+      - ${HA_ROUTER_A_NETMAP:?set HA_ROUTER_A_NETMAP}:/etc/orblx/netmap.json:ro
+    command: *router_command
+    networks:
+      proof:
+        ipv4_address: 172.30.125.3
+      lan:
+        ipv4_address: 10.88.125.2
+
+  router-b:
+    <<: *node
+    privileged: true
+    volumes:
+      - ${HA_ROUTER_B_STATE:?set HA_ROUTER_B_STATE}:/var/lib/orblx
+      - ${HA_ROUTER_B_NETMAP:?set HA_ROUTER_B_NETMAP}:/etc/orblx/netmap.json:ro
+    command: *router_command
+    networks:
+      proof:
+        ipv4_address: 172.30.125.6
+      lan:
+        ipv4_address: 10.88.125.3
+
+  client:
+    <<: *node
+    volumes:
+      - ${HA_CLIENT_STATE:?set HA_CLIENT_STATE}:/var/lib/orblx
+      - ${HA_CLIENT_NETMAP:?set HA_CLIENT_NETMAP}:/etc/orblx/netmap.json:ro
+      - ./:/proof:ro
+    command: *client_command
+    networks:
+      proof:
+        ipv4_address: 172.30.125.4
+
+  guest:
+    <<: *node
+    volumes:
+      - ${HA_GUEST_STATE:?set HA_GUEST_STATE}:/var/lib/orblx
+      - ${HA_GUEST_NETMAP:?set HA_GUEST_NETMAP}:/etc/orblx/netmap.json:ro
+      - ./:/proof:ro
+    command: *client_command
+    networks:
+      proof:
+        ipv4_address: 172.30.125.5
+
+  # The LAN target. It logs the receive time and the source of each datagram.
+  target:
+    image: ${ORBLX_HA_IMAGE:-orblx-w25ha:local}
+    profiles: ["nodes"]
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        python3 -u /proof/acl-probe.py listen-stamp 10.88.125.5 9000 /tmp/u9000.log &
+        python3 -u /proof/acl-probe.py listen-stamp 10.88.125.5 9001 /tmp/u9001.log &
+        python3 -u /proof/acl-probe.py listen-tcp 10.88.125.5 8080 /tmp/t8080.log &
+        python3 -u /proof/acl-probe.py listen-tcp 10.88.125.5 8081 /tmp/t8081.log &
+        python3 -u /proof/acl-probe.py listen-echo 10.88.125.5 8090 &
+        wait
+    volumes:
+      - ./:/proof:ro
+    networks:
+      lan:
+        ipv4_address: 10.88.125.5
+
+  # The LAN nameserver for the UDP 53 gate.
+  landns:
+    image: ${ORBLX_HA_IMAGE:-orblx-w25ha:local}
+    profiles: ["nodes"]
+    entrypoint: ["python3", "-u", "/proof/split-dns-server.py", "lan", "10.88.125.53"]
+    volumes:
+      - ./:/proof:ro
+    networks:
+      lan:
+        ipv4_address: 10.88.125.53
+
+networks:
+  proof:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.125.0/24
+          gateway: 172.30.125.1
+          ip_range: 172.30.125.128/25
+  lan:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.88.125.0/24
+          gateway: 10.88.125.1
+          ip_range: 10.88.125.128/25

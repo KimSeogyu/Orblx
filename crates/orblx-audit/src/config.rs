@@ -108,11 +108,13 @@ pub enum ConfigAction {
     UserReject,
     /// The coordinator removed one ephemeral node after it stayed offline too long (W25-18).
     NodeRemove,
+    /// A client moved an HA subnet route to another router (W25-10).
+    RouteFailover,
 }
 
 impl ConfigAction {
     /// Every action in code order.
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 38] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -150,6 +152,7 @@ impl ConfigAction {
         Self::UserApprove,
         Self::UserReject,
         Self::NodeRemove,
+        Self::RouteFailover,
     ];
 
     /// Return the stable action token.
@@ -193,6 +196,7 @@ impl ConfigAction {
             Self::UserApprove => "user-approve",
             Self::UserReject => "user-reject",
             Self::NodeRemove => "node-remove",
+            Self::RouteFailover => "route-failover",
         }
     }
 
@@ -243,6 +247,7 @@ impl ConfigAction {
             Self::UserApprove => 35,
             Self::UserReject => 36,
             Self::NodeRemove => 37,
+            Self::RouteFailover => 38,
         }
     }
 
@@ -699,10 +704,14 @@ mod tests {
             .filter(|name| !name.is_empty())
             .collect();
         assert_eq!(names.len(), ConfigAction::ALL.len());
-        for (at, action) in ConfigAction::ALL.iter().enumerate() {
-            assert_eq!(usize::from(action.code()), at + 1, "{}", action.as_str());
-            assert_eq!(names[at], action.as_str());
+        let mut actions = ConfigAction::ALL.iter();
+        for (at, name) in names.iter().enumerate() {
+            let code = u8::try_from(at + 1).unwrap();
+            let action = actions.next().unwrap();
+            assert_eq!(action.code(), code, "{}", action.as_str());
+            assert_eq!(*name, action.as_str());
         }
+        assert!(actions.next().is_none());
     }
 
     struct Scratch(PathBuf);
