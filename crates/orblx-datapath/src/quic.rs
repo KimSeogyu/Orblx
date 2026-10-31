@@ -75,9 +75,26 @@ struct Auth {
     trust: TrustBundle,
     deny: SharedDeny,
     allow: SharedAllow,
-    ticket_bytes: Vec<u8>,
-    ticket_mac: [u8; 32],
+    presented: Mutex<Presented>,
     ticket_ring: TicketRing,
+}
+
+/// The capability ticket that this endpoint presents in each new handshake.
+///
+/// A renewal replaces it (W25-26). A bound session keeps the ticket that it presented.
+#[derive(Clone)]
+struct Presented {
+    bytes: Vec<u8>,
+    mac: [u8; 32],
+}
+
+impl Auth {
+    fn presented_now(&self) -> Presented {
+        self.presented
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
 }
 
 type SharedDeny = Arc<Mutex<DenySet>>;
@@ -162,6 +179,10 @@ impl HelloEndpoint {
     pub fn install_identity(&self, config: &HelloConfig) -> Result<(), HelloError> {
         let (server_config, _) = server_rustls(config)?;
         let (client_config, _) = client_rustls(config)?;
+        let presented = Presented {
+            bytes: config.ticket_bytes.clone(),
+            mac: config.ticket_mac,
+        };
         let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(server_config)
             .map_err(|err| HelloError::Tls(err.to_string()))?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
@@ -175,6 +196,11 @@ impl HelloEndpoint {
             .client_config
             .lock()
             .unwrap_or_else(|err| err.into_inner()) = Some(client);
+        *self
+            .auth
+            .presented
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = presented;
         Ok(())
     }
 
@@ -676,11 +702,13 @@ async fn bind_session(
     }
     let peer_not_after = leaf_not_after(&leaf).map_err(HelloError::Identity)?;
     let (mut send, mut recv) = open_stream(&connection, role).await?;
-    if let Err(err) = exchange_ticket(&mut send, &mut recv, role, auth, &mut gate).await {
+    let presented = auth.presented_now();
+    if let Err(err) = exchange_ticket(&mut send, &mut recv, role, auth, &presented, &mut gate).await
+    {
         reject_ticket(&connection);
         return Err(err);
     }
-    let local_hash = orblx_crypto::ticket_hash(&auth.ticket_bytes);
+    let local_hash = orblx_crypto::ticket_hash(&presented.bytes);
     let sender_gate = PeerGate::bound(peer.clone());
     Ok(HelloSession {
         connection,
@@ -707,22 +735,26 @@ async fn exchange_ticket(
     recv: &mut quinn::RecvStream,
     role: StreamRole,
     auth: &Auth,
+    presented: &Presented,
     gate: &mut PeerGate,
 ) -> Result<(), HelloError> {
     match role {
         StreamRole::Client => {
-            write_presented(send, auth).await?;
+            write_presented(send, presented).await?;
             read_presented(recv, auth, gate).await
         }
         StreamRole::Server => {
             read_presented(recv, auth, gate).await?;
-            write_presented(send, auth).await
+            write_presented(send, presented).await
         }
     }
 }
 
-async fn write_presented(send: &mut quinn::SendStream, auth: &Auth) -> Result<(), HelloError> {
-    let frame = presented_frame(&auth.ticket_bytes, &auth.ticket_mac);
+async fn write_presented(
+    send: &mut quinn::SendStream,
+    presented: &Presented,
+) -> Result<(), HelloError> {
+    let frame = presented_frame(&presented.bytes, &presented.mac);
     let bytes = encode_length_prefixed(&frame)?;
     send.write_all(&bytes)
         .await
@@ -906,8 +938,10 @@ fn auth_from(config: &HelloConfig) -> Auth {
         trust: config.trust.clone(),
         deny: Arc::new(Mutex::new(config.deny.clone())),
         allow: Arc::new(Mutex::new(None)),
-        ticket_bytes: config.ticket_bytes.clone(),
-        ticket_mac: config.ticket_mac,
+        presented: Mutex::new(Presented {
+            bytes: config.ticket_bytes.clone(),
+            mac: config.ticket_mac,
+        }),
         ticket_ring: config.ticket_ring.clone(),
     }
 }
