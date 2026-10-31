@@ -32,6 +32,7 @@ mod cert;
 mod clock;
 mod codec;
 mod deny;
+mod deny_file;
 mod error;
 mod google;
 mod issuer;
@@ -50,6 +51,10 @@ pub use cert::{
 };
 pub use clock::{MAX_AGENT_TTL, MAX_SKEW, MAX_USER_TTL};
 pub use deny::{DenyApply, DenySet};
+pub use deny_file::{
+    load_deny_file, read_deny_file, store_deny_file, DenyCache, DenyFileError, DenyReload,
+    DenyStore, DENY_FILE, ENROLL_MARKER_FILE,
+};
 pub use error::IdentityError;
 pub use google::{
     google_client_id_ok, GoogleClient, GoogleIdClaims, GoogleJwks, GoogleTokenRequest, OidcMode,

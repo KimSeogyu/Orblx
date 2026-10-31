@@ -368,6 +368,13 @@ fn write_status(path: &Path, text: &str) {
 struct NodeCounters {
     tx: AtomicU64,
     rx: AtomicU64,
+    /// Sessions and frames that the identity, ticket, or deny check refused (W25-38).
+    refused: AtomicU64,
+}
+
+/// True when the identity, the ticket, or the deny check refused a session or a frame.
+fn is_refusal(err: &HelloError) -> bool {
+    matches!(err, HelloError::Identity(_) | HelloError::Ticket(_))
 }
 
 #[derive(Clone)]
@@ -696,6 +703,7 @@ async fn run_mesh_inner(
     let counters = Arc::new(NodeCounters {
         tx: AtomicU64::new(0),
         rx: AtomicU64::new(0),
+        refused: AtomicU64::new(0),
     });
 
     let tun_shutdown = shutdown_rx.clone();
@@ -764,7 +772,7 @@ async fn run_mesh_inner(
                 .count();
             let sessions = u64::try_from(sessions).unwrap_or(u64::MAX);
             format!(
-                "{}{}{}",
+                "{}{}{}{}",
                 orblx_audit::sample_line(
                     "orblx_node_packets_tx",
                     "counter",
@@ -776,6 +784,11 @@ async fn run_mesh_inner(
                     metrics_counters.rx.load(Ordering::Relaxed)
                 ),
                 orblx_audit::sample_line("orblx_node_sessions", "gauge", sessions),
+                orblx_audit::sample_line(
+                    "orblx_node_refused",
+                    "counter",
+                    metrics_counters.refused.load(Ordering::Relaxed)
+                ),
             )
         }) {
             Ok(bound) => println!("metrics {bound}"),
@@ -795,7 +808,7 @@ async fn run_mesh_inner(
         // The node applies the list only when the file text changes. Thus the
         // tick does not touch the endpoint or the links when nothing changed.
         let mut ticks: u64 = 0;
-        let mut last_text: Option<Vec<u8>> = None;
+        let mut deny_cache = orblx_identity::DenyCache::with_set(deny_endpoint.deny_set());
         loop {
             tokio::select! {
                 changed = deny_shutdown.changed() => {
@@ -806,16 +819,34 @@ async fn run_mesh_inner(
                 _ = tick.tick() => {
                     // The read runs on a blocking thread, so a slow disk does not stop
                     // the packet runtime (W25-11).
-                    let path = deny_dir.join("deny.json");
-                    let read = tokio::task::spawn_blocking(move || fs::read(path)).await;
-                    if let Ok(Ok(bytes)) = read {
-                        if last_text.as_deref() != Some(bytes.as_slice()) {
-                            if let Some(deny) = parse_deny(&bytes) {
-                                // Replace first, so a session that starts now uses the new list.
-                                // Then close the open sessions of the denied peers.
-                                deny_endpoint.replace_deny(deny.clone());
-                                close_denied_links(&lock_mesh, &deny);
-                                last_text = Some(bytes);
+                    let dir = Arc::clone(&deny_dir);
+                    let read = tokio::task::spawn_blocking(move || {
+                        orblx_identity::read_deny_file(&dir)
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(orblx_identity::DenyFileError::Unreadable(
+                            deny_dir.join(orblx_identity::DENY_FILE),
+                            std::io::ErrorKind::Other,
+                        ))
+                    });
+                    // W25-38: a deny file that is not valid, did not open, or is missing
+                    // after enroll makes the set stale. The stale set keeps the last good
+                    // entries and refuses new sessions, as the agent guard does. The node
+                    // never uses an empty list in place of such a file.
+                    match deny_cache.apply_read(&deny_dir, read) {
+                        orblx_identity::DenyReload::Same => {}
+                        orblx_identity::DenyReload::Changed => {
+                            // Replace first, so a session that starts now uses the new list.
+                            // Then close the open sessions of the denied peers.
+                            let deny = deny_cache.set().clone();
+                            deny_endpoint.replace_deny(deny.clone());
+                            close_denied_links(&lock_mesh, &deny);
+                        }
+                        orblx_identity::DenyReload::Stale { error, first } => {
+                            if first {
+                                eprintln!("{error} The node refuses new sessions.");
+                                deny_endpoint.replace_deny(deny_cache.set().clone());
                             }
                         }
                     }
@@ -1338,14 +1369,6 @@ fn close_denied_links(mesh: &Mesh, deny: &DenySet) {
     }
 }
 
-fn parse_deny(bytes: &[u8]) -> Option<DenySet> {
-    let mut deny = DenySet::empty();
-    match deny.apply_json(bytes) {
-        Ok(_) => Some(deny),
-        Err(_) => None,
-    }
-}
-
 async fn accept_loop(mut mesh: Mesh) {
     loop {
         tokio::select! {
@@ -1383,7 +1406,12 @@ async fn accept_loop(mut mesh: Mesh) {
                     // The error is for one connection only. The next accept waits for a new
                     // connection, so the loop does not spin. A pause here would delay each
                     // connection behind it, for example after a peer stops its extra dial attempts.
-                    Err(err) => eprintln!("The node did not accept a peer. {err}"),
+                    Err(err) => {
+                        if is_refusal(&err) {
+                            mesh.counters.refused.fetch_add(1, Ordering::Relaxed);
+                        }
+                        eprintln!("The node did not accept a peer. {err}");
+                    }
                 }
             }
         }
@@ -1971,6 +1999,9 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                         tr!("{label} rx_end");
                     }
                     Err(err) => {
+                        if is_refusal(&err) {
+                            counters.refused.fetch_add(1, Ordering::Relaxed);
+                        }
                         tr!("{label} session_end reason=recv_err {err}");
                         return;
                     }

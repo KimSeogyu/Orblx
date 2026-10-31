@@ -39,6 +39,8 @@ mod ticket;
 mod tlsutil;
 #[cfg(test)]
 mod user_approval_test;
+#[cfg(test)]
+mod w25_38_enroll_test;
 mod webhook;
 
 pub use admin::{
@@ -53,9 +55,9 @@ pub use client::{
     admin_blocking, admin_token_blocking, admin_token_expect_blocking, advertise_exit_blocking,
     advertise_routes_blocking, agent_grant_fetch_blocking, agent_grant_request_blocking,
     enroll_with_oidc_blocking, enroll_with_token_blocking, fetch_deny_blocking,
-    fetch_deny_wait_blocking, fetch_netmap_blocking, fetch_policy_wait_blocking, netmap_json,
-    publish_candidates_blocking, renew_svid_blocking, AdminReply, GrantFetch, OidcEnroll,
-    PolicySync, PolicyWaiter, DENY_WAIT_HOLD,
+    fetch_deny_wait_blocking, fetch_first_deny_blocking, fetch_netmap_blocking,
+    fetch_policy_wait_blocking, netmap_json, publish_candidates_blocking, renew_svid_blocking,
+    AdminReply, GrantFetch, OidcEnroll, PolicySync, PolicyWaiter, DENY_WAIT_HOLD,
 };
 pub use config::{CoordConfig, OidcSection};
 pub use error::{CoordError, USER_PENDING_TEXT, USER_REJECTED_TEXT};
@@ -67,7 +69,7 @@ pub use netmap::{
 pub use proto::GrantAsk;
 pub use server::serve_blocking;
 pub use state::{
-    oidc_config, read_node_material, Coordinator, EnrollResult, IssuerFetch, NetmapView,
+    oidc_config, read_node_material, Coordinator, EnrollResult, FirstDeny, IssuerFetch, NetmapView,
     OidcConfig, CONFIG_AUDIT_FILE, ISSUER_JWKS_TTL_SECS, ISSUER_REFETCH_SECS,
 };
 pub use store::{CreatedToken, StoredUser, UserState};

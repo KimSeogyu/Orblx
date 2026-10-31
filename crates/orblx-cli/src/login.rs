@@ -148,12 +148,22 @@ fn login(
         routes,
     })
     .map_err(|err| err.to_string())?;
+    let start = std::time::Instant::now();
     result.write_state(state).map_err(|err| err.to_string())?;
+    let first = crate::coord::first_deny(
+        coord,
+        coord_name,
+        &bundle_pem,
+        state,
+        &result.first_deny,
+        start,
+    );
     println!("enrolled");
     println!("name {}", result.name);
     println!("overlay_ip {}", result.overlay_ip);
     println!("svid {}", result.svid);
     println!("peers {}", result.signed_netmap.netmap.peers.len());
+    crate::coord::print_first_deny(&first);
     Ok(())
 }
 

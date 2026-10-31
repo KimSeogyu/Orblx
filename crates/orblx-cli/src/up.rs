@@ -763,7 +763,7 @@ fn spawn_deny_refresh(options: &UpOptions) {
                     etag.as_deref(),
                 ) {
                     Ok(text) => {
-                        let _ = store_deny(&state, &text);
+                        report_store_deny(store_deny(&state, &text));
                         etag = Some(orblx_coord::deny_etag(&text));
                         thread::sleep(DENY_WAIT_GAP.saturating_sub(start.elapsed()));
                         continue;
@@ -773,7 +773,7 @@ fn spawn_deny_refresh(options: &UpOptions) {
             }
             // The fetch starts each DENY_REFRESH. The time of the fetch is not added (W25-1).
             if let Ok(text) = orblx_coord::fetch_deny_blocking(coord, &name, &bundle, &state) {
-                let _ = store_deny(&state, &text);
+                report_store_deny(store_deny(&state, &text));
                 etag = Some(orblx_coord::deny_etag(&text));
             }
             thread::sleep(DENY_REFRESH.saturating_sub(start.elapsed()));
@@ -787,9 +787,7 @@ fn spawn_deny_refresh(options: &UpOptions) {
 /// The datapath reads `deny.json` each 100 ms. The DNS responder and the packet filter read
 /// `netmap.json` and `grants.signed.json` each second. Each writer writes a temp file and renames it.
 fn apply_policy_sync(state: &Path, sync: &orblx_coord::PolicySync, announce: bool) {
-    if let Err(err) = store_deny(state, &sync.deny) {
-        eprintln!("The node did not write the new deny list. {err}");
-    }
+    report_store_deny(store_deny(state, &sync.deny));
     if let Err(err) = sync.view.write_state(state) {
         eprintln!(
             "The node did not write the new netmap. {}",
@@ -816,15 +814,24 @@ const DENY_REFRESH: Duration = Duration::from_millis(500);
 
 /// Write `deny.json` when its text changes.
 ///
-/// The function writes a temp file and renames it. A reader never sees a part file.
-fn store_deny(state: &Path, text: &str) -> std::io::Result<()> {
-    let path = state.join("deny.json");
-    if fs::read_to_string(&path).is_ok_and(|old| old == text) {
-        return Ok(());
+/// W25-38: the function refuses a text that is not a valid deny document. It writes a
+/// temp file in the same directory, syncs it, renames it, and syncs the directory.
+/// A reader never sees a part file, and a crash leaves the old file.
+/// It does not write a list with a version that is not higher than the file version,
+/// so the list never moves back.
+fn store_deny(state: &Path, text: &str) -> std::io::Result<orblx_identity::DenyStore> {
+    orblx_identity::store_deny_file(state, text)
+}
+
+/// Print the result of one deny write. W25-38: no caller ignores a write error.
+fn report_store_deny(result: std::io::Result<orblx_identity::DenyStore>) {
+    match result {
+        Ok(orblx_identity::DenyStore::Written | orblx_identity::DenyStore::Same) => {}
+        Ok(orblx_identity::DenyStore::KeptCurrent { current, offered }) => eprintln!(
+            "The coordinator sent deny list version {offered}. The node keeps version {current}."
+        ),
+        Err(err) => eprintln!("The node did not write the new deny list. {err}"),
     }
-    let temp = state.join(".deny.json.tmp");
-    fs::write(&temp, text.as_bytes())?;
-    fs::rename(&temp, &path)
 }
 
 fn run_down(options: StateOptions) -> Result<(), String> {
@@ -1269,12 +1276,20 @@ fn load_config(dir: &Path) -> Result<HelloConfig, String> {
     let bundle_pem = read_text(&dir.join(BUNDLE_FILE))?;
     let trust =
         orblx_identity::TrustBundle::from_pem(&bundle_pem).map_err(|err| err.to_string())?;
-    super::ticket_load::load_hello_config(
+    let mut config = super::ticket_load::load_hello_config(
         certificate_pem,
         private_key_pem,
         trust,
         &dir.join(TICKET_FILE),
-    )
+    )?;
+    // W25-38: the first deny set comes from `deny.json`. When the file is not valid, did
+    // not open, or is missing after enroll, the node refuses new sessions until the
+    // datapath reads a valid file. It never starts with an empty list in place of the file.
+    config.deny = orblx_identity::load_deny_file(dir).unwrap_or_else(|err| {
+        eprintln!("{err}");
+        orblx_identity::DenySet::refuse_all()
+    });
+    Ok(config)
 }
 
 fn parse_state(args: &[String]) -> Result<StateOptions, String> {
@@ -1495,17 +1510,24 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("orblx-deny-store-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        super::store_deny(&dir, "{\"version\":1}").unwrap();
-        assert_eq!(
-            fs::read_to_string(dir.join("deny.json")).unwrap(),
-            "{\"version\":1}"
-        );
-        super::store_deny(&dir, "{\"version\":2}").unwrap();
-        assert_eq!(
-            fs::read_to_string(dir.join("deny.json")).unwrap(),
-            "{\"version\":2}"
-        );
-        assert!(!dir.join(".deny.json.tmp").exists());
+        let v1 = r#"{"version":1,"generated_at":1,"revoked_uris":[],"revoked_ticket_nonces":[]}"#;
+        let v2 = r#"{"version":2,"generated_at":2,"revoked_uris":[],"revoked_ticket_nonces":[]}"#;
+        super::store_deny(&dir, v1).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("deny.json")).unwrap(), v1);
+        super::store_deny(&dir, v2).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("deny.json")).unwrap(), v2);
+        // W25-38: a text that is not a valid deny document does not replace the file.
+        assert!(super::store_deny(&dir, "{\"version\":3}").is_err());
+        assert_eq!(fs::read_to_string(dir.join("deny.json")).unwrap(), v2);
+        let temps = fs::read_dir(&dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .is_ok_and(|entry| entry.file_name().to_string_lossy().starts_with(".deny"))
+            })
+            .count();
+        assert_eq!(temps, 0);
         assert!(super::DENY_REFRESH <= std::time::Duration::from_millis(500));
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1645,6 +1667,163 @@ mod tests {
         assert!(config.certificate_pem.contains("CERTIFICATE"));
         assert!(!config.private_key_pem.is_empty());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// W25-38: the datapath of an enrolled node starts with a set that refuses new
+    /// sessions when the deny file is not valid, is cut short, or is missing.
+    /// A node that was never enrolled and has no deny file keeps the empty set.
+    #[test]
+    fn w25_38_new_sessions_refuse_when_the_deny_file_is_corrupt_truncated_missing_or_unreadable() {
+        let dir = std::env::temp_dir().join(format!("orblx-w25-38-up-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        run(parse_issue(&[
+            "--out".to_string(),
+            dir.to_string_lossy().to_string(),
+            "--node".to_string(),
+            "a=100.64.0.1".to_string(),
+        ])
+        .unwrap())
+        .unwrap();
+        let node = dir.join("a");
+        let peer = orblx_identity::SpiffeId::node("b").unwrap();
+        // Never enrolled, no deny file: the behavior before W25-38.
+        let config = super::load_config(&node).unwrap();
+        assert!(!config.deny.refuses_all());
+        assert!(config.deny.reject_uri(&peer).is_ok());
+
+        fs::write(node.join(orblx_identity::ENROLL_MARKER_FILE), "a\n").unwrap();
+        let config = super::load_config(&node).unwrap();
+        assert!(config.deny.refuses_all(), "missing after enroll");
+        assert!(config.deny.reject_uri(&peer).is_err());
+
+        let valid =
+            r#"{"version":1,"generated_at":1,"revoked_uris":[],"revoked_ticket_nonces":[]}"#;
+        fs::write(node.join("deny.json"), b"not json {").unwrap();
+        assert!(
+            super::load_config(&node).unwrap().deny.refuses_all(),
+            "corrupt"
+        );
+        fs::write(node.join("deny.json"), &valid.as_bytes()[..valid.len() / 2]).unwrap();
+        assert!(
+            super::load_config(&node).unwrap().deny.refuses_all(),
+            "truncated"
+        );
+        fs::remove_file(node.join("deny.json")).unwrap();
+        fs::create_dir(node.join("deny.json")).unwrap();
+        assert!(
+            super::load_config(&node).unwrap().deny.refuses_all(),
+            "unreadable"
+        );
+        fs::remove_dir(node.join("deny.json")).unwrap();
+
+        super::store_deny(&node, valid).unwrap();
+        let config = super::load_config(&node).unwrap();
+        assert!(!config.deny.refuses_all());
+        assert!(config.deny.reject_uri(&peer).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// W25-38: the coordinator is not reachable after enroll. The first deny fetch fails
+    /// with a clear error and the node refuses each peer. When the coordinator comes back,
+    /// the deny refresh of `orblx up` gets the list with no manual step.
+    #[test]
+    fn w25_38_node_recovers_its_deny_list_when_the_coordinator_comes_back_after_enroll() {
+        use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+        use std::time::{Duration, Instant, SystemTime};
+
+        let root = std::env::temp_dir().join(format!(
+            "orblx-w25-38-recover-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let coord_dir = root.join("coord");
+        let node = root.join("node");
+        fs::create_dir_all(&coord_dir).unwrap();
+        let coord =
+            orblx_coord::Coordinator::open(&coord_dir, "coord", orblx_coord::OidcConfig::TokenOnly)
+                .unwrap();
+        let now = SystemTime::now();
+        let token = coord.create_token(Duration::from_secs(600)).unwrap();
+        let _ = coord
+            .enroll_token(
+                "gone-a",
+                &token.secret,
+                &["gone-a:443".to_string()],
+                &[],
+                now,
+            )
+            .unwrap();
+        orblx_coord::revoke_all(&coord, "gone-a", "test", now).unwrap();
+        let token = coord.create_token(Duration::from_secs(600)).unwrap();
+        let result = coord
+            .enroll_token(
+                "late-b",
+                &token.secret,
+                &["late-b:443".to_string()],
+                &[],
+                now,
+            )
+            .unwrap();
+        // A free port with no coordinator on it.
+        let addr: SocketAddr = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let start = Instant::now();
+        result.write_state(&node).unwrap();
+        let bundle = fs::read_to_string(node.join(super::BUNDLE_FILE)).unwrap();
+        let first =
+            crate::coord::first_deny(addr, "coord", &bundle, &node, &result.first_deny, start);
+        let err = first.unwrap_err();
+        println!("w25_38_first_deny_error {err}");
+        assert!(err.contains("coordinator"), "{err}");
+        let gone = orblx_identity::SpiffeId::node("gone-a").unwrap();
+        let config = super::load_config(&node).unwrap();
+        assert!(config.deny.refuses_all());
+        assert!(config.deny.reject_uri(&gone).is_err());
+
+        let options = match parse_up(&[
+            "--state-dir".to_string(),
+            node.to_string_lossy().to_string(),
+            "--coord".to_string(),
+            addr.to_string(),
+            "--coord-name".to_string(),
+            "coord".to_string(),
+            "--metrics".to_string(),
+            "off".to_string(),
+        ])
+        .unwrap()
+        {
+            Command::Up(options) => options,
+            _ => panic!("not up"),
+        };
+        super::spawn_deny_refresh(&options);
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(super::load_config(&node).unwrap().deny.refuses_all());
+
+        let back = Instant::now();
+        let serve = coord.clone();
+        std::thread::spawn(move || {
+            let _ = orblx_coord::serve_blocking(&serve, addr);
+        });
+        let limit = Duration::from_secs(120);
+        loop {
+            let config = super::load_config(&node).unwrap();
+            if !config.deny.refuses_all() {
+                assert!(config.deny.reject_uri(&gone).is_err());
+                let good = orblx_identity::SpiffeId::node("late-b").unwrap();
+                assert!(config.deny.reject_uri(&good).is_ok());
+                break;
+            }
+            assert!(back.elapsed() < limit, "no recovery in {limit:?}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        println!("w25_38_recovery_ms {}", back.elapsed().as_millis());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
