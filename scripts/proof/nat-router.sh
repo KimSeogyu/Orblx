@@ -82,10 +82,14 @@ EOF
   echo "miniupnpd pid $!"
   i=0
   while [ "$i" -lt 50 ]; do
-    if ss -lun 2>/dev/null | grep -q ':5351'; then
-      echo "router mapping daemon miniupnpd"
-      return 0
-    fi
+    # Read the whole ss list. A pipe into grep -q closes early and sends SIGPIPE.
+    listen="$(ss -lun 2>/dev/null || true)"
+    case "$listen" in
+      *:5351*)
+        echo "router mapping daemon miniupnpd"
+        return 0
+        ;;
+    esac
     i=$((i + 1))
     sleep 0.1
   done

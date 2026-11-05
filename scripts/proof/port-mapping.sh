@@ -31,8 +31,8 @@ export ORBLX_ROUTER_D="${ORBLX_ROUTER_D:-symmetric}"
 
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$ROOT/scripts/proof/proof-lock.sh"
-PROOF_MIN_FREE_GIB=15
-trap proof_lock_end EXIT
+PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
+trap 'cleanup; proof_lock_end' EXIT
 proof_lock_take "port-mapping:${PROJECT}" "$NATR_PREFIX" "${PROJECT}-"
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
@@ -53,6 +53,10 @@ echo "rustc $(rustc -V)"
 
 dc() {
   docker compose --progress quiet -p "$PROJECT" -f "$FILE" "$@"
+}
+
+cleanup() {
+  dc --profile nodes down -v --remove-orphans >/dev/null 2>&1 || true
 }
 
 as_root() {
@@ -215,9 +219,8 @@ first_ms() {
 ping_loss() {
   local out transmitted received
   out="$(docker exec "$1" ping -n -i 0.2 -c "$PINGS" -W 1 "$2" || true)"
-  printf '%s\n' "$out" | tail -2 >&2
-  transmitted="$(printf '%s\n' "$out" | awk '/packets transmitted/ {print $1; exit}')"
-  received="$(printf '%s\n' "$out" | awk '/packets transmitted/ {print $4; exit}')"
+  printf '%s\n' "$out" | awk '/packets transmitted/ || /^rtt /' >&2
+  read -r transmitted received < <(printf '%s\n' "$out" | awk '/packets transmitted/ {t = $1; r = $4} END {print t, r}')
   if [[ ! "$transmitted" =~ ^[0-9]+$ || ! "$received" =~ ^[0-9]+$ ]]; then
     echo "none"
     return 0
@@ -466,8 +469,8 @@ dc exec -T coord orblx coord token create --state /var/lib/orblx --ttl 3600 --ou
 dc exec -T coord orblx coord token create --state /var/lib/orblx --ttl 3600 --out /var/lib/orblx/tokens/node-d | sed 's/[A-Za-z0-9_-]\{32,\}/<redacted>/g'
 enroll_node node-c
 enroll_node node-d
-IP_C="$(dc --profile nodes run --rm --no-deps --entrypoint /bin/sh node-c -c "ip route replace default via $(gateway_of node-c) && orblx coord netmap --coord ${COORD} --bundle /coord-state/trust-bundle.pem --state /var/lib/orblx" | awk '/^overlay_ip / {print $2; exit}')"
-IP_D="$(dc --profile nodes run --rm --no-deps --entrypoint /bin/sh node-d -c "ip route replace default via $(gateway_of node-d) && orblx coord netmap --coord ${COORD} --bundle /coord-state/trust-bundle.pem --state /var/lib/orblx" | awk '/^overlay_ip / {print $2; exit}')"
+IP_C="$(dc --profile nodes run --rm --no-deps --entrypoint /bin/sh node-c -c "ip route replace default via $(gateway_of node-c) && orblx coord netmap --coord ${COORD} --bundle /coord-state/trust-bundle.pem --state /var/lib/orblx" | awk '/^overlay_ip / {ip = $2} END {print ip}')"
+IP_D="$(dc --profile nodes run --rm --no-deps --entrypoint /bin/sh node-d -c "ip route replace default via $(gateway_of node-d) && orblx coord netmap --coord ${COORD} --bundle /coord-state/trust-bundle.pem --state /var/lib/orblx" | awk '/^overlay_ip / {ip = $2} END {print ip}')"
 echo "overlay node-c ${IP_C}"
 echo "overlay node-d ${IP_D}"
 check_unmapped_is_symmetric

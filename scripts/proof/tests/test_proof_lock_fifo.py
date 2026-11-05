@@ -31,7 +31,8 @@ LIB_W25_14 = os.path.join(HERE, "fixtures", "proof-lock-w25-14-9d53d3c.sh")
 # A stand-in proof: take the lock, write start and end times, hold the lock for $3 s.
 PROOF = (
     '. "$0"; trap proof_lock_end EXIT; proof_lock_take "$1"; '
-    'echo "start $1 $(date +%s%3N)" >>"$2"; sleep "$3"; echo "end $1 $(date +%s%3N)" >>"$2"'
+    'echo "start $1 $(awk \'{printf "%d", $1 * 1000}\' /proc/uptime)" >>"$2"; '
+    'sleep "$3"; echo "end $1 $(awk \'{printf "%d", $1 * 1000}\' /proc/uptime)" >>"$2"'
 )
 
 HAS_FLOCK = shutil.which("flock") is not None and os.path.isdir("/proc/self/fdinfo")
@@ -152,8 +153,9 @@ class ProofLockFairnessTest(unittest.TestCase):
         # A CI runner can be an ancestor with hundreds of fds. The check must not make one
         # grep per fd: that took 0.7 s with 600 fds and made the W25-5 waiter test fail on CI.
         open(self.lock, "a").close()
-        check = ('. "$0"; s=$(date +%s%3N); p="$(proof_lock_plain_parent "$1")"; rc=$?; '
-                 'echo "rc=$rc ms=$(( $(date +%s%3N) - s )) pid=${p%% *}"')
+        check = ('. "$0"; s=$(awk \'{printf "%d", $1 * 1000}\' /proc/uptime); '
+                 'p="$(proof_lock_plain_parent "$1")"; rc=$?; '
+                 'echo "rc=$rc ms=$(( $(awk \'{printf "%d", $1 * 1000}\' /proc/uptime) - s )) pid=${p%% *}"')
         fds = [os.open(os.devnull, os.O_RDONLY) for _ in range(2000)]
         held = os.open(self.lock, os.O_RDWR)
         try:
