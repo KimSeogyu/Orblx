@@ -43,6 +43,8 @@ pub mod sshca;
 mod sshca_test;
 mod state;
 mod store;
+#[cfg(test)]
+mod test_port;
 mod ticket;
 mod tlsutil;
 #[cfg(test)]
