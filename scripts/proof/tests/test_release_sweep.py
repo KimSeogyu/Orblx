@@ -535,21 +535,47 @@ class ReleaseSweepTest(unittest.TestCase):
         self.assertIn("Invalid rows (the contention probe did not report unknown_samples 0; they do not count): none.",
                       self.table())
 
+    def tool_path_has_flock(self):
+        """True when the sweep tool path (release-sweep.sh TOOL_PATH) can run flock.
+
+        The proof wrapper uses that path. The foreign-container check runs only after this
+        proof takes the lock. A host with no flock runs the proof with no lock.
+        """
+        with open(SWEEP) as f:
+            text = f.read()
+        match = re.search(r'^TOOL_PATH="([^"]*)"', text, re.M)
+        self.assertIsNotNone(match, "release-sweep.sh must set TOOL_PATH")
+        path = match.group(1).replace("$TOOL_CARGO_HOME", self.cargo_home)
+        return any(os.access(os.path.join(d, "flock"), os.X_OK) for d in path.split(":") if d)
+
     def test_negative_contention_unknown_samples_over_0_makes_the_row_invalid(self):
-        # Docker ps fails. The lock stops before the proof (containers_unknown, exit 5).
-        # The contention probe does not run, so the row is not INVALID for unknown_samples.
+        # Docker ps fails. With flock, the foreign check aborts before the proof
+        # (containers_unknown, exit 5). That reason is not an abort reason, so the row is FAIL.
+        # With no flock, the foreign check does not run. The proof runs. unknown_samples
+        # over 0 makes the row INVALID.
         open(os.path.join(self.tmp, "docker-fails"), "w").close()
         out = self.run_sweep(PROBE + "row|3|Lock|ok\nproof|ok|scripts/proof/ok.sh|-|-\n")
         self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
         res = self.rows()[("1", "slow")][3]
-        self.assertEqual(res, 'FAIL (exit 5): proof_infra_abort with reason "containers_unknown" '
-                         '(only disk_low and disk_unknown)')
         with open(os.path.join(self.out, "rc3-sweep-testsha-slow.log")) as f:
             log = f.read()
-        self.assertIn("proof_infra_abort rc3-sweep:slow reason=containers_unknown names=none. "
-                      "No proof step ran.", log)
-        self.assertNotIn("proof_ok", log)
-        self.assertIn("Failed rows: 1", self.table())
+        if self.tool_path_has_flock():
+            self.assertEqual(res, 'FAIL (exit 5): proof_infra_abort with reason "containers_unknown" '
+                             '(only disk_low and disk_unknown)')
+            self.assertIn("proof_infra_abort rc3-sweep:slow reason=containers_unknown names=none. "
+                          "No proof step ran.", log)
+            self.assertNotIn("proof_ok", log)
+            self.assertIn("Failed rows: 1", self.table())
+        else:
+            self.assertRegex(
+                res,
+                r"^INVALID: proof_ok but unknown_samples [1-9][0-9]* in proof_contention rc3-sweep:slow$")
+            self.assertIn("no flock on this host", log)
+            self.assertIn("proof_ok", log)
+            self.assertIn("proof_contention_invalid", log)
+            self.assertNotIn("reason=containers_unknown", log)
+            self.assertIn("Failed rows: none.", self.table())
+            self.assertIn("they do not count): 1", self.table())
         # A proof's own probe line with unknown_samples over 0 makes the row invalid too.
         os.remove(os.path.join(self.tmp, "docker-fails"))
         out = self.run_sweep("row|1|Mesh|ownbad\nproof|ownbad|scripts/proof/ownbad.sh|ORBLX_PROOF_SAMPLE_SECS=0.2|-\n")
@@ -595,16 +621,24 @@ class ReleaseSweepTest(unittest.TestCase):
 
 
     def test_old_build_label_comes_from_git_not_from_version(self):
-        src = open(SWEEP).read()
-        body = src[src.index("old_label_of() {"):]
-        body = body[:body.index("\n}\n")]
-        self.assertIn('rev-parse --verify -q "$1^{commit}"', body)
-        self.assertIn("tag --points-at", body)
-        self.assertNotIn("--version", body)
+        with open(SWEEP) as f:
+            src = f.read()
+        start = src.index("old_label_of() {")
+        func = src[start:src.index("\n}\n", start) + 2]
+        self.assertIn('rev-parse --verify -q "$1^{commit}"', func)
+        self.assertIn("tag --points-at", func)
+        self.assertNotIn("--version", func)
         self.assertNotRegex(src, r"old_bin\"? +--version|\$OLD_ORBLX\"? +--version")
-        out = subprocess.run(["bash", "-c", 'REPO="$1"; eval "$(sed -n "/^old_label_of() {/,/^}/p" "$2")"; old_label_of "$3"',
-                              "x", os.path.join(HERE, "..", ".."), SWEEP, PIN], capture_output=True, text=True)
-        self.assertTrue(out.stdout.startswith("commit %s tag " % PIN), out.stdout)
+        # Run the function from the file. A bash -c string that nests quotes inside $()
+        # fails on bash 3.2 (macOS /bin/bash): the quote ends before sed runs, sed prints
+        # nothing, and old_label_of is not defined.
+        repo = os.path.abspath(os.path.join(HERE, "..", ".."))
+        out = subprocess.run(
+            ["bash", "-c", func + '\nold_label_of "$1"\n', "old_label_of", PIN],
+            env=dict(os.environ, REPO=repo),
+            capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(out.stdout.startswith("commit %s tag " % PIN), out.stdout + out.stderr)
 
     def test_abort_invalid_and_fail_are_separate_results(self):
         manifest = (
