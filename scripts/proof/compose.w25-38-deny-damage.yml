@@ -299,5 +299,9 @@ networks:
   proof:
     ipam:
       config:
+        # Static addresses must stay outside ip_range.
+        # Docker gives one-shot containers addresses from the start of ip_range.
+        # The static addresses are coord .2, idp .9, and the nodes .130-.133.
+        # The pool is .64-.127. It does not contain those addresses.
         - subnet: 172.30.18.0/24
-          ip_range: 172.30.18.0/25
+          ip_range: 172.30.18.64/26
