@@ -63,6 +63,11 @@ pub fn deny_json_for(
     let mut file = read_deny(coord, now)?;
     let (hidden, count) = coord.share_deny_for(name)?;
     file.version = file.version.saturating_add(count);
+    for uri in coord.posture_deny_uris()? {
+        if !file.revoked_uris.contains(&uri) {
+            file.revoked_uris.push(uri);
+        }
+    }
     for uri in hidden {
         if !file.revoked_uris.contains(&uri) {
             file.revoked_uris.push(uri);

@@ -36,6 +36,8 @@ pub async fn enroll_with_token(
         deny_etag: None,
         expect_sha256: None,
         unchanged_ok: false,
+        os: None,
+        client_version: None,
     };
     round_trip(coord, coord_name, bundle_pem, None, request, None, true).await
 }
@@ -92,6 +94,8 @@ pub async fn enroll_with_oidc(input: OidcEnroll<'_>) -> Result<EnrollResult, Coo
         deny_etag: None,
         expect_sha256: None,
         unchanged_ok: false,
+        os: None,
+        client_version: None,
     };
     round_trip(
         input.coord,
@@ -152,6 +156,8 @@ pub async fn advertise_routes(
         deny_etag: None,
         expect_sha256: None,
         unchanged_ok: false,
+        os: None,
+        client_version: None,
     };
     let result = round_trip(
         coord,
@@ -190,6 +196,8 @@ pub async fn fetch_netmap(
         deny_etag: None,
         expect_sha256: None,
         unchanged_ok: false,
+        os: None,
+        client_version: None,
     };
     let result = round_trip(
         coord,
@@ -244,6 +252,8 @@ pub async fn renew_svid(
         deny_etag: None,
         expect_sha256: None,
         unchanged_ok: false,
+        os: None,
+        client_version: None,
     };
     let result = round_trip(
         coord,
@@ -311,6 +321,8 @@ pub async fn publish_candidates(
         deny_etag: None,
         expect_sha256: None,
         unchanged_ok: false,
+        os: None,
+        client_version: None,
     };
     let result = round_trip(
         coord,
@@ -366,6 +378,8 @@ pub async fn advertise_exit(
         deny_etag: None,
         expect_sha256: None,
         unchanged_ok: false,
+        os: None,
+        client_version: None,
     };
     let result = round_trip(
         coord,
@@ -460,6 +474,8 @@ pub fn admin_token_expect_blocking(
             deny_etag: None,
             expect_sha256: expect.map(str::to_string),
             unchanged_ok: false,
+            os: None,
+            client_version: None,
         };
         let endpoint =
             tlsutil::client_endpoint(&client_tls, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
@@ -472,6 +488,8 @@ pub fn admin_token_expect_blocking(
             .open_bi()
             .await
             .map_err(|err| CoordError::Tls(format!("open: {err}")))?;
+        let mut request = request;
+        attach_posture(&mut request);
         proto::write_json(&mut send, &request).await?;
         let _ = send.finish();
         let response: Response = proto::read_json(&mut recv).await?;
@@ -527,6 +545,8 @@ pub fn fetch_deny_wait_blocking(
             deny_etag: etag.map(str::to_string),
             expect_sha256: None,
             unchanged_ok: false,
+            os: None,
+            client_version: None,
         };
         let limit = DENY_WAIT_HOLD + std::time::Duration::from_secs(10);
         tokio::time::timeout(
@@ -603,6 +623,8 @@ async fn admin_call(
         deny_etag: None,
         expect_sha256: None,
         unchanged_ok: false,
+        os: None,
+        client_version: None,
     };
     authed_detail(coord, coord_name, bundle_pem, material, request).await
 }
@@ -628,6 +650,8 @@ async fn fetch_deny(
         deny_etag: None,
         expect_sha256: None,
         unchanged_ok: false,
+        os: None,
+        client_version: None,
     };
     authed_detail(coord, coord_name, bundle_pem, material, request).await
 }
@@ -691,6 +715,28 @@ async fn node_connect(
     Ok((endpoint, connection))
 }
 
+/// Fill the self-reported operating system and client version.
+///
+/// `ORBLX_CLIENT_OS=unknown` and `ORBLX_CLIENT_VERSION=unknown` omit the fact.
+/// Any other set value is sent only when it is a known token.
+fn attach_posture(request: &mut Request) {
+    request.os = reported_token("ORBLX_CLIENT_OS", std::env::consts::OS);
+    request.client_version = reported_token("ORBLX_CLIENT_VERSION", env!("CARGO_PKG_VERSION"));
+}
+
+fn reported_token(key: &str, fallback: &str) -> Option<String> {
+    let text = match std::env::var(key) {
+        Ok(value) if value == "unknown" => return None,
+        Ok(value) => value,
+        Err(_) => fallback.to_string(),
+    };
+    if key == "ORBLX_CLIENT_OS" {
+        orblx_identity::clean_os(&text)
+    } else {
+        orblx_identity::clean_version(&text)
+    }
+}
+
 /// Send one request on a new stream of `connection` and read the reply.
 async fn exchange(
     connection: &quinn::Connection,
@@ -700,7 +746,9 @@ async fn exchange(
         .open_bi()
         .await
         .map_err(|err| CoordError::Tls(format!("open: {err}")))?;
-    proto::write_json(&mut send, request).await?;
+    let mut request = request.clone();
+    attach_posture(&mut request);
+    proto::write_json(&mut send, &request).await?;
     let _ = send.finish();
     proto::read_json(&mut recv).await
 }
@@ -886,6 +934,8 @@ fn policy_wait_request(name: &str, etag: Option<&str>) -> Request {
         deny_etag: etag.map(str::to_string),
         expect_sha256: None,
         unchanged_ok: false,
+        os: None,
+        client_version: None,
     }
 }
 
@@ -931,6 +981,8 @@ pub fn agent_grant_request_blocking(
             deny_etag: None,
             expect_sha256: None,
             unchanged_ok: false,
+            os: None,
+            client_version: None,
         };
         authed_detail(coord, coord_name, bundle_pem, material, request).await
     })
@@ -979,6 +1031,8 @@ pub fn agent_grant_fetch_blocking(
             deny_etag: None,
             expect_sha256: None,
             unchanged_ok: false,
+            os: None,
+            client_version: None,
         };
         let response = authed_response(coord, coord_name, bundle_pem, material, request).await?;
         let invalid = || CoordError::Protocol("The grant reply is not valid.".to_string());
@@ -1067,6 +1121,8 @@ async fn round_trip(
         .open_bi()
         .await
         .map_err(|err| CoordError::Tls(format!("open: {err}")))?;
+    let mut request = request;
+    attach_posture(&mut request);
     proto::write_json(&mut send, &request).await?;
     let _ = send.finish();
     let response: Response = proto::read_json(&mut recv).await?;

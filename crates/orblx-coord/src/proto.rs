@@ -5,7 +5,7 @@ use crate::netmap::{SignedEndpoint, SignedGrants, SignedNetmap};
 
 pub const MAX_MESSAGE: usize = 256 * 1024;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Request {
     pub op: String,
     pub name: String,
@@ -40,6 +40,12 @@ pub struct Request {
     /// ETag, without the view. An old coordinator ignores the field and sends the full reply.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unchanged_ok: bool,
+    /// Self-reported operating system. The coordinator does not attest this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    /// Self-reported client version. The coordinator does not attest this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
 }
 
 /// One agent grant request.

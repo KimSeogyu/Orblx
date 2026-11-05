@@ -25,6 +25,7 @@ mod ippool;
 mod issuer_test;
 mod netmap;
 pub mod nodelock;
+mod posture;
 mod proto;
 #[cfg(test)]
 mod renew_test;

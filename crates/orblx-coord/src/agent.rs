@@ -151,6 +151,7 @@ pub(crate) fn request(
     if ask.ttl_secs == 0 || ask.ttl_secs > MAX_GRANT_SECS {
         return Err(bad("The grant life must be 1 to 300 seconds."));
     }
+    coord.refuse_if_out_of_posture(requester, now)?;
     let path_prefix = ask.path_prefix.clone().unwrap_or_else(|| "/".to_string());
     if !path_prefix_ok(&path_prefix) {
         return Err(bad("The path prefix is not valid."));
@@ -216,6 +217,7 @@ pub(crate) fn fetch(
     if !grant_id_ok(id) {
         return Err(bad("The grant id is not valid."));
     }
+    coord.refuse_if_out_of_posture(requester, now)?;
     let _guard = GRANT_LOCK.lock().map_err(|_| CoordError::State)?;
     let mut file = load(coord)?;
     let index = file
@@ -507,6 +509,33 @@ pub(crate) fn revoke_principal(
         nonces: nonces.len(),
         deny_version,
     })
+}
+
+/// Revoke issued grants of these requesters. The caller writes the deny file and the audit record.
+///
+/// A second call finds no issued grant, so a flap does not add a second nonce.
+pub(crate) fn take_issued_for_posture(
+    coord: &Coordinator,
+    requesters: &[String],
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, CoordError> {
+    let _guard = GRANT_LOCK.lock().map_err(|_| CoordError::State)?;
+    let mut file = load(coord)?;
+    let mut out: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut changed = false;
+    for record in &mut file.grants {
+        if record.state != ISSUED || !requesters.iter().any(|name| name == &record.requester) {
+            continue;
+        }
+        let nonce = record.nonce.clone().ok_or(CoordError::State)?;
+        record.state = REVOKED.to_string();
+        out.entry(record.requester.clone()).or_default().push(nonce);
+        changed = true;
+    }
+    if changed {
+        save(coord, &file)?;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

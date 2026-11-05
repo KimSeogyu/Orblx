@@ -10,8 +10,8 @@ use orblx_identity::{OidcMode, GOOGLE_CLIENT_ID_ENV, MAX_USER_TTL};
 use super::{parse_socket, take_value};
 use orblx_coord::{
     advertise_routes_blocking, enroll_with_oidc_blocking, enroll_with_token_blocking,
-    fetch_netmap_blocking, oidc_config, serve_blocking, CoordConfig, Coordinator, OidcConfig,
-    OidcEnroll,
+    fetch_netmap_blocking, oidc_config, renew_svid_blocking, serve_blocking, CoordConfig,
+    Coordinator, OidcConfig, OidcEnroll,
 };
 
 const DEFAULT_PORT: u16 = 443;
@@ -64,6 +64,13 @@ pub(crate) enum Command {
         /// W25-6: keep the files current with `policy-wait`.
         watch: bool,
     },
+    /// Renew the node leaf and the capability ticket.
+    Renew {
+        coord: SocketAddr,
+        coord_name: String,
+        bundle: PathBuf,
+        state: PathBuf,
+    },
     Advertise {
         coord: SocketAddr,
         coord_name: String,
@@ -83,6 +90,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         "token" => parse_token(&args[1..]),
         "enroll" => parse_enroll(&args[1..]),
         "netmap" => parse_netmap(&args[1..]),
+        "renew" => parse_renew(&args[1..]),
         "advertise" => parse_advertise(&args[1..]),
         other => Err(format!("The mode {other} is not valid.\n{}", help())),
     }
@@ -294,6 +302,27 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             println!("grants {}", view.signed_grants.grants.grants.len());
             Ok(())
         }
+        Command::Renew {
+            coord,
+            coord_name,
+            bundle,
+            state,
+        } => {
+            let bundle_pem = fs::read_to_string(&bundle)
+                .map_err(|err| format!("The file {} did not open. {err}", bundle.display()))?;
+            let result = renew_svid_blocking(coord, &coord_name, &bundle_pem, &state)
+                .map_err(|err| err.to_string())?;
+            print_enrolled(&result);
+            println!(
+                "ticket {}",
+                if result.ticket.is_some() {
+                    "issued"
+                } else {
+                    "withheld"
+                }
+            );
+            Ok(())
+        }
     }
 }
 
@@ -390,6 +419,14 @@ fn print_enrolled(result: &orblx_coord::EnrollResult) {
     println!("overlay_ip {}", result.overlay_ip);
     println!("svid {}", result.svid);
     println!("peers {}", result.signed_netmap.netmap.peers.len());
+    println!(
+        "ticket {}",
+        if result.ticket.is_some() {
+            "issued"
+        } else {
+            "withheld"
+        }
+    );
 }
 
 fn write_secret(path: &std::path::Path, text: &str) -> Result<(), String> {
@@ -633,6 +670,32 @@ fn parse_advertise(args: &[String]) -> Result<Command, String> {
     })
 }
 
+fn parse_renew(args: &[String]) -> Result<Command, String> {
+    let mut coord = None;
+    let mut coord_name = None;
+    let mut bundle = None;
+    let mut state = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        index += 1;
+        let value = take_value(args, &mut index)?;
+        match flag {
+            "--coord" => coord = Some(parse_socket(&value, DEFAULT_PORT)?),
+            "--coord-name" => coord_name = Some(value),
+            "--bundle" => bundle = Some(PathBuf::from(value)),
+            "--state" => state = Some(PathBuf::from(value)),
+            other => return Err(format!("The flag {other} is not valid.\n{}", help())),
+        }
+    }
+    Ok(Command::Renew {
+        coord: coord.ok_or_else(|| "The command needs --coord.".to_string())?,
+        coord_name: coord_name.unwrap_or_else(|| "coord".to_string()),
+        bundle: bundle.ok_or_else(|| "The command needs --bundle.".to_string())?,
+        state: state.ok_or_else(|| "The command needs --state.".to_string())?,
+    })
+}
+
 fn parse_netmap(args: &[String]) -> Result<Command, String> {
     let mut watch = false;
     let mut coord = None;
@@ -672,6 +735,7 @@ orblx coord token create --state DIR --out FILE [--ttl SECS]
 orblx coord enroll --name NAME --coord ADDR --bundle FILE (--token-file FILE | --id-token-file FILE [--nonce HEX] [--wait-approval SECS]) --state DIR [--coord-name NAME] [--endpoint HOST:PORT] [--route CIDR]
 orblx coord advertise --coord ADDR --bundle FILE --state DIR [--route CIDR]... [--exit-node on|off] [--coord-name NAME]
 orblx coord netmap --coord ADDR --bundle FILE --state DIR [--coord-name NAME] [--watch]
+orblx coord renew --coord ADDR --bundle FILE --state DIR [--coord-name NAME]
 
 The coordinator listens with QUIC.
 The default listen address is 0.0.0.0:443.
@@ -813,7 +877,8 @@ mod tests {
             | Command::TokenCreate { .. }
             | Command::Enroll { .. }
             | Command::Netmap { .. }
-            | Command::Advertise { .. } => {
+            | Command::Advertise { .. }
+            | Command::Renew { .. } => {
                 panic!("the parser did not select serve");
             }
         }

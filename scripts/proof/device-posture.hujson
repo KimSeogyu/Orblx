@@ -1,0 +1,44 @@
+{
+  "nodeApproval": false,
+  "postures": {
+    "desk": [
+      "os == linux",
+      "clientVersion >= 0.1.0",
+      "lastSeen <= 120s"
+    ]
+  },
+  "postureTests": [
+    {
+      "name": "desk",
+      "os": "linux",
+      "clientVersion": "0.1.0",
+      "nodeLock": "unsigned",
+      "lastSeen": "5s",
+      "action": "allow"
+    },
+    {
+      "name": "desk",
+      "os": "windows",
+      "clientVersion": "0.1.0",
+      "nodeLock": "unsigned",
+      "lastSeen": "5s",
+      "action": "deny"
+    },
+    {
+      "name": "desk",
+      "clientVersion": "0.1.0",
+      "nodeLock": "unsigned",
+      "lastSeen": "5s",
+      "action": "deny"
+    }
+  ],
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a"],
+      "proto": "tcp",
+      "dst": ["spiffe://orblx.local/node/b:22"],
+      "srcPosture": ["desk"]
+    }
+  ]
+}

@@ -273,6 +273,18 @@ fn host_from_prefix_32(cidr: &str) -> Result<Ipv4Addr, IdentityError> {
     Ok(Ipv4Addr::from(octets))
 }
 
+/// Return the ticket nonce from version-1 ticket bytes.
+///
+/// The caller must not write the nonce to a log.
+pub fn ticket_nonce(ticket_bytes: &[u8]) -> Result<[u8; 16], IdentityError> {
+    if ticket_bytes.len() < SIGNATURE_LEN + 1 {
+        return Err(IdentityError::Ticket);
+    }
+    let split = ticket_bytes.len() - SIGNATURE_LEN;
+    let body = ticket_bytes.get(..split).ok_or(IdentityError::Ticket)?;
+    Ok(decode_body(body)?.nonce)
+}
+
 /// Return `SHA-256(ticket_bytes)[0..16]`.
 pub fn ticket_hash(ticket_bytes: &[u8]) -> [u8; 16] {
     let digest = Sha256::digest(ticket_bytes);
