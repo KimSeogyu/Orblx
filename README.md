@@ -127,6 +127,13 @@ The script runs a netns source-NAT lab when `ip` and `iptables` are present.
 The netns lab puts two peers behind one MASQUERADE NAT.
 The QUIC server binds UDP port 443.
 
+The node can ask the gateway for a mapped UDP port.
+The protocols are PCP, NAT-PMP, and UPnP IGD.
+A mapped port is a candidate. The peer can punch that port.
+Two symmetric NATs use that path when one router grants a map.
+The probe budget is 750 ms. `--port-map off` skips the probe.
+Read the lab record in [docs/port-mapping.md](docs/port-mapping.md).
+
 Gather against a STUN server:
 
 ```bash

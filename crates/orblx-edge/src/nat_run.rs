@@ -36,6 +36,10 @@ use crate::nat_path::{
     OverlayPath, PathSelect, SendPlan, KIND_DATA, KIND_PROBE, PROBE_GAP_MS, PROBE_HEARS, RESEND_MS,
     STALE_MS,
 };
+use crate::portmap::{
+    candidate_texts, probe_port_map, ActiveMap, PortMapChoice, ProbeRequest, PORT_MAP_BUDGET,
+    PORT_MAP_LIFETIME_SECS,
+};
 use crate::punch::{decode_punch, encode_punch, exchange_same_ip, PunchKind, PunchToken};
 use crate::signed::{encode_hex, verify_signed_candidate, SignedCandidate};
 use crate::{EdgeError, StunClient, DIRECT_ATTEMPT_BUDGET, DIRECT_QUIC_PORT};
@@ -153,6 +157,10 @@ pub struct NatConfig {
     pub relay_tcp: SocketAddr,
     /// Replace the default route with this gateway before the TUN device opens.
     pub gateway: Option<Ipv4Addr>,
+    /// Ask the gateway for a mapped UDP port. `Off` skips the probe.
+    pub port_map: PortMapChoice,
+    /// The lifetime to request, in seconds. Zero selects 7200 seconds.
+    pub port_map_lifetime: u32,
     /// The coordinator netmap public key.
     pub netmap_public: [u8; 32],
     /// The SVID material for the signed hello.
@@ -180,13 +188,26 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
     if let Some(gateway) = config.gateway {
         set_default_route(gateway)?;
     }
+    let port_map = open_port_map(&config);
+    let mapped_addr = port_map.as_ref().map(ActiveMap::external);
     let (socket, reflexive, alt) = gather_reflexive(config.stun, config.stun_alt)?;
     println!("The reflexive endpoint is {reflexive}.");
     if let Some(alt) = alt {
         println!("The second reflexive endpoint is {alt}.");
     }
-    let nat_kind = local_kind(reflexive, alt);
+    let stun_kind = local_kind(reflexive, alt);
+    println!("The STUN mapping is {}.", stun_kind.as_str());
+    // A mapped port accepts packets from every peer. The punch plan treats it as easy.
+    let nat_kind = if mapped_addr.is_some() {
+        MappingKind::Easy
+    } else {
+        stun_kind
+    };
     println!("The local NAT mapping is {}.", nat_kind.as_str());
+    let mut stun_texts = vec![reflexive.to_string()];
+    if let Some(alt) = alt {
+        stun_texts.push(alt.to_string());
+    }
     let leaf_der = config.hello.cert_der.clone();
     let session = session_id(&config.name, &config.peer_name)?;
     println!("session {}", encode_hex(&session));
@@ -225,6 +246,9 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         relay_tcp: config.relay_tcp,
         netmap_public: config.netmap_public,
         nat_kind,
+        stun_texts,
+        mapped: Mutex::new(mapped_addr),
+        port_map: Mutex::new(port_map),
         session,
         token: session_punch_token(&session),
         relay_id: RelaySessionId::from_bytes(session),
@@ -250,15 +274,18 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
     hub.write_status(None);
 
     let publish_hub = Arc::clone(&hub);
-    let mut reflexive_text = vec![reflexive.to_string()];
-    if let Some(alt) = alt {
-        reflexive_text.push(alt.to_string());
-    }
     let mut publish = config.publish;
     thread::Builder::new()
         .name("orblx-nat-publish".to_string())
-        .spawn(move || publish_loop(publish_hub, reflexive_text, &mut publish))
+        .spawn(move || publish_loop(publish_hub, &mut publish))
         .map_err(|err| EdgeError::Io(err.to_string()))?;
+    if lock(&hub.port_map).is_some() {
+        let renew_hub = Arc::clone(&hub);
+        thread::Builder::new()
+            .name("orblx-nat-portmap".to_string())
+            .spawn(move || renew_port_map(renew_hub))
+            .map_err(|err| EdgeError::Io(err.to_string()))?;
+    }
     let relay_hub = Arc::clone(&hub);
     thread::Builder::new()
         .name("orblx-nat-relay".to_string())
@@ -296,7 +323,49 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         thread::sleep(Duration::from_millis(200));
     }
     println!("The NAT node is stopping.");
+    // Drop deletes the map. The router removes the port.
+    drop(lock(&hub.port_map).take());
     Ok(())
+}
+
+fn open_port_map(config: &NatConfig) -> Option<ActiveMap> {
+    if matches!(config.port_map, PortMapChoice::Off) {
+        println!("The port map is off.");
+        println!("The port map probe took 0 ms.");
+        return None;
+    }
+    println!(
+        "The port map probe budget is {} ms.",
+        PORT_MAP_BUDGET.as_millis()
+    );
+    let lifetime = if config.port_map_lifetime == 0 {
+        PORT_MAP_LIFETIME_SECS
+    } else {
+        config.port_map_lifetime
+    };
+    let report = probe_port_map(ProbeRequest {
+        choice: config.port_map,
+        gateway: config.gateway,
+        internal_port: DIRECT_QUIC_PORT,
+        lifetime_secs: lifetime,
+        budget: PORT_MAP_BUDGET,
+    });
+    println!("The port map probe took {} ms.", report.elapsed.as_millis());
+    match report.mapping {
+        Some(mapping) => {
+            println!(
+                "The port map is {} {} lifetime {}.",
+                mapping.protocol().as_str(),
+                mapping.external(),
+                mapping.lifetime_secs()
+            );
+            Some(mapping)
+        }
+        None => {
+            println!("The port map probe ended. No router answered.");
+            None
+        }
+    }
 }
 
 struct PidGuard {
@@ -416,6 +485,12 @@ struct Hub {
     relay_tcp: SocketAddr,
     netmap_public: [u8; 32],
     nat_kind: MappingKind,
+    /// The STUN endpoints. A mapped port replaces them in the published list.
+    stun_texts: Vec<String>,
+    /// The mapped external socket, when the router granted one.
+    mapped: Mutex<Option<SocketAddr>>,
+    /// The live map. Drop removes it from the router.
+    port_map: Mutex<Option<ActiveMap>>,
     session: [u8; 16],
     token: PunchToken,
     relay_id: RelaySessionId,
@@ -503,9 +578,16 @@ impl Hub {
 
     fn mark_rx(&self, slot: Slot) {
         let now = self.now_ms().max(1);
-        match slot {
-            Slot::Direct => self.direct_rx.store(now, Ordering::Relaxed),
-            Slot::Relay => self.relay_rx.store(now, Ordering::Relaxed),
+        let first = match slot {
+            Slot::Direct => self.direct_rx.swap(now, Ordering::Relaxed) == 0,
+            Slot::Relay => self.relay_rx.swap(now, Ordering::Relaxed) == 0,
+        };
+        if first {
+            let name = match slot {
+                Slot::Direct => "direct",
+                Slot::Relay => "relay",
+            };
+            println!("The first {name} packet arrived at {now} ms.");
         }
     }
 
@@ -961,11 +1043,12 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 fn publish_loop(
     hub: Arc<Hub>,
-    reflexive: Vec<String>,
     publish: &mut dyn FnMut(Vec<String>) -> Result<Vec<SignedCandidate>, String>,
 ) {
     while !stopped() {
-        match publish(reflexive.clone()) {
+        let mapped = *lock(&hub.mapped);
+        let texts = candidate_texts(&hub.stun_texts, mapped);
+        match publish(texts) {
             Ok(list) => store_peer(&hub, &list),
             Err(err) => {
                 eprintln!("The candidate update failed. The node will retry. {err}");
@@ -1410,6 +1493,51 @@ fn relay_loop(hub: Arc<Hub>) {
         }
     }
     hub.set_relay_out(None);
+}
+
+fn renew_port_map(hub: Arc<Hub>) {
+    loop {
+        let wait = {
+            let guard = lock(&hub.port_map);
+            let Some(mapping) = guard.as_ref() else {
+                return;
+            };
+            Duration::from_secs(u64::from(mapping.lifetime_secs().max(2) / 2))
+        };
+        if !sleep_for(wait) {
+            return;
+        }
+        let renewed = {
+            let mut guard = lock(&hub.port_map);
+            let Some(mapping) = guard.as_mut() else {
+                return;
+            };
+            let before = mapping.external();
+            match mapping.renew() {
+                Ok(()) => {
+                    let external = mapping.external();
+                    let lifetime = mapping.lifetime_secs();
+                    Some((before, external, lifetime))
+                }
+                Err(err) => {
+                    eprintln!("The port map renew failed. The node will try again. {err}");
+                    None
+                }
+            }
+        };
+        let Some((before, external, lifetime)) = renewed else {
+            if !sleep_for(Duration::from_secs(1)) {
+                return;
+            }
+            continue;
+        };
+        println!(
+            "The port map was renewed. The endpoint is {external}. The lifetime is {lifetime} s."
+        );
+        if external != before {
+            *lock(&hub.mapped) = Some(external);
+        }
+    }
 }
 
 fn renew_loop(hub: Arc<Hub>, first_der: Vec<u8>, mut renew: RenewFn) {
