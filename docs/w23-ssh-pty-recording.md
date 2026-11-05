@@ -15,7 +15,7 @@ Labels:
 ## Client
 
 ```
-orblx ssh rec@b --identity <dir> --netmap <netmap.json> --peer-cert <cert.pem> --shell
+sudo orblx ssh rec@b --state <dir> --peer-cert <cert.pem> --shell
 ```
 
 - `--shell` takes no value. `--shell` with `--command` is an error.

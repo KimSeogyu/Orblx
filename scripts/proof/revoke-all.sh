@@ -359,9 +359,6 @@ dc exec -T b cat "$STATE/cert.pem" >"$WORK/b-cert.pem"
 for name in a c; do
   dc exec -T "$name" sh -c "cat > /tmp/b-cert.pem" <"$WORK/b-cert.pem"
   dc exec -T "$name" sh -c "rm -rf /tmp/svid && mkdir -p /tmp/svid && cp -a $STATE/. /tmp/svid/"
-  # The node state holds a node ticket.bin. An SSH login with a node SVID has no ticket,
-  # so the SSH identity directory holds only the SVID and the bundle.
-  dc exec -T "$name" sh -c "rm -rf /tmp/sshid && mkdir -p /tmp/sshid && cp $STATE/cert.pem $STATE/key.pem $STATE/bundle.pem /tmp/sshid/"
   dc exec -T "$name" sh -c "cat > /tmp/probe.py" <"$ROOT/scripts/proof/revoke-probe.py"
 done
 
@@ -372,7 +369,7 @@ for name in a c; do
   dc exec -T "$name" orblx coord netmap --coord "${coord_ip}:443" \
     --bundle /tmp/svid/bundle.pem --state /tmp/svid >/dev/null
   echo "svid ${name} coordinator netmap ok"
-  dc exec -T "$name" orblx ssh root@b --identity /tmp/sshid --netmap "$STATE/netmap.json" \
+  dc exec -T "$name" orblx ssh root@b --state "$STATE" \
     --peer-cert /tmp/b-cert.pem --command 'echo ssh_ok'
   dc exec -T "$name" sh -c "head -c 4096 /dev/urandom >/tmp/probe.bin"
   dc exec -T "$name" orblx file send /tmp/probe.bin --to b --name "before-${name}.bin" \
@@ -412,7 +409,7 @@ surface_cmds() {
   probe "$name" "$mode" "${name}-svid" "$secs" "$every" \
     orblx coord netmap --coord "${coord_ip}:443" --bundle /tmp/svid/bundle.pem --state /tmp/svid
   probe "$name" "$mode" "${name}-ssh" "$secs" "$every" \
-    orblx ssh root@b --identity /tmp/sshid --netmap "$STATE/netmap.json" \
+    orblx ssh root@b --state "$STATE" \
     --peer-cert /tmp/b-cert.pem --command true
   probe "$name" "$mode" "${name}-file" "$secs" "$every" \
     orblx file send /tmp/probe.bin --to b --name "${mode}-${name}-{n}.bin" --state "$STATE"
@@ -476,7 +473,7 @@ grep -q "^grant ${grant_c1} issued " "$WORK/grants-after.txt"
 c_after="$(dc exec -T c orblx agent connect --grant "$STATE/agent-c1" --send "$GET")"
 printf '%s\n' "$c_after" | read_all grep -q '^reply HTTP/1.0 200'
 echo "c grant c1 after revoke 200"
-dc exec -T c orblx ssh root@b --identity /tmp/sshid --netmap "$STATE/netmap.json" \
+dc exec -T c orblx ssh root@b --state "$STATE" \
   --peer-cert /tmp/b-cert.pem --command 'echo ssh_ok'
 dc exec -T c orblx file send /tmp/probe.bin --to b --name after-c.bin --state "$STATE" \
   | grep '^file_sent '

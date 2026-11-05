@@ -344,7 +344,7 @@ fn idle_timeout_lines() -> [&'static str; 4] {
         "idle_timeout_ms=30000 src=crates/orblx-datapath/src/quic.rs:1016",
         "idle_timeout_ms=10000 src=crates/orblx-datapath/src/quic.rs:1019",
         "idle_timeout_ms=1000 src=crates/orblx-relay/src/server.rs:25",
-        "idle_timeout_ms=60000 src=crates/orblx-coord/src/tlsutil.rs:100",
+        "idle_timeout_ms=60000 src=crates/orblx-coord/src/tlsutil.rs:208",
     ]
 }
 
@@ -679,8 +679,8 @@ mod tests {
         assert_eq!(orblx_relay::PEER_IDLE, Duration::from_secs(1));
         let coord = include_str!("../../orblx-coord/src/tlsutil.rs");
         assert!(
-            coord.lines().nth(99).unwrap().contains("from_secs(60)"),
-            "tlsutil.rs:100"
+            coord.lines().nth(207).unwrap().contains("from_secs(60)"),
+            "tlsutil.rs:208"
         );
         let lines = idle_timeout_lines();
         assert_eq!(
@@ -697,7 +697,7 @@ mod tests {
         );
         assert_eq!(
             lines[3],
-            "idle_timeout_ms=60000 src=crates/orblx-coord/src/tlsutil.rs:100"
+            "idle_timeout_ms=60000 src=crates/orblx-coord/src/tlsutil.rs:208"
         );
     }
 }
