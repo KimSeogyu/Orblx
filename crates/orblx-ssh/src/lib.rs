@@ -2,12 +2,11 @@
 //!
 //! The node daemon runs an in-process russh server.
 //! The server binds the node overlay address.
-//! The client signs in with an SVID.
+//! The client checks the host key against the node SVID.
+//! The client signs in with a user certificate from the coordinator SSH user CA (W25-31).
+//! The server refuses each password login.
 //! The server does not read `authorized_keys`.
 //! The server does not write an SSH key file.
-//! An agent presents one `FLAG_AGENT_JIT` and `FLAG_ONE_SHOT` ticket.
-//! The ticket names one host.
-//! The SSH policy names one user for that agent.
 //! A rule with `"recording": "required"` records the session to a file.
 //! The audit chain then holds the SHA-256 of that file.
 

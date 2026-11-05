@@ -191,7 +191,7 @@ pub async fn run_shell(
     Ok(exit_status)
 }
 
-async fn open_channel(
+pub(crate) async fn open_channel(
     request: &SessionRequest,
 ) -> Result<(client::Handle<ClientHandler>, russh::Channel<client::Msg>), String> {
     let bundle_pem = read_text(&request.identity_dir.join("bundle.pem"))?;
@@ -248,7 +248,7 @@ fn read_text(path: &std::path::Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|_| format!("The file {} did not open.", path.display()))
 }
 
-struct ClientHandler {
+pub(crate) struct ClientHandler {
     expect: [u8; 32],
 }
 
@@ -271,7 +271,7 @@ impl Handler for ClientHandler {
 ///
 /// The text does not include keys or proofs.
 #[derive(Debug)]
-struct ClientFail;
+pub(crate) struct ClientFail;
 
 impl std::fmt::Display for ClientFail {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

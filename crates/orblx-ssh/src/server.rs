@@ -78,8 +78,6 @@ struct Admitted {
 #[derive(Clone)]
 struct SshHandler {
     shared: Arc<Shared>,
-    /// The public host key of this connection: the node SVID key when the connection opened.
-    host_key: [u8; 32],
     /// The TCP peer address. The certificate `source-address` must contain it.
     peer: Option<SocketAddr>,
     admitted: Option<Admitted>,
@@ -1077,7 +1075,7 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) -> Result<(), S
             .map_err(|_| "The SSH server did not accept a session.".to_string())?;
         // The SVID renewal writes a new node key. Each connection reads the current key, so
         // the host key matches the current cert.pem that the client pins.
-        let (private, host_key) = match current_host_key(&shared) {
+        let (private, _) = match current_host_key(&shared) {
             Ok(pair) => pair,
             Err(err) => {
                 eprintln!("{err} The SSH session is refused.");
@@ -1094,7 +1092,6 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) -> Result<(), S
         });
         let handler = SshHandler {
             shared: Arc::clone(&shared),
-            host_key,
             peer: Some(peer),
             admitted: None,
             pty: None,
@@ -1261,20 +1258,19 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime};
 
     use orblx_audit::verify_file;
-    use orblx_identity::{
-        sign_ticket, DenySet, MiniCa, SpiffeId, TicketClaims, TicketFlags, TicketSigner,
-        MAX_AGENT_TTL, MAX_USER_TTL,
-    };
+    use orblx_identity::{DenySet, MiniCa, SpiffeId, MAX_USER_TTL};
     use tokio::net::TcpListener;
 
     use super::{LiveShell, Shared, ShellRecord};
     use crate::client::{run_session, SessionRequest};
     use crate::record::{Recorder, Utf8Carry};
 
-    /// R4a: a password attempt is rejected and the audit chain records the deny.
+    /// R4a: a valid signed ticket as the password is rejected and the audit chain records the
+    /// deny. The server offers no password method and does not read the password.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_password_login_is_rejected_and_audited() {
         use crate::cert::testkit;
+        use base64::Engine;
         use russh::client::{self, Handler};
         let dir = recording_fixture("pw-reject");
         let now = SystemTime::now()
@@ -1284,6 +1280,12 @@ mod tests {
         let ca = testkit::key(21);
         testkit::write_netmap(&dir, &[testkit::ca_line(&ca)], &[], now);
         let addr = start_server(&dir).await;
+        let ticket = valid_ticket(SystemTime::now());
+        // The ticket as base64 (the old SVID proof field) and as hex.
+        let passwords = [
+            base64::engine::general_purpose::STANDARD.encode(&ticket),
+            orblx_coord::encode_hex(&ticket),
+        ];
         struct AcceptAll;
         impl Handler for AcceptAll {
             type Error = russh::Error;
@@ -1298,20 +1300,58 @@ mod tests {
         let mut handle = client::connect(config, addr, AcceptAll)
             .await
             .expect("connect");
-        let auth = handle
-            .authenticate_password("alice", "not-a-real-password")
-            .await
-            .expect("auth call");
-        assert!(!auth.success(), "password login must not succeed");
+        for password in &passwords {
+            let auth = handle
+                .authenticate_password("alice", password)
+                .await
+                .expect("auth call");
+            assert!(!auth.success(), "a ticket as the password must not log in");
+        }
         // Give the server time to flush the audit record.
         tokio::time::sleep(Duration::from_millis(100)).await;
         let chain = std::fs::read_to_string(dir.join("ssh-audit.jsonl")).unwrap();
-        assert!(
-            chain.contains("\"reason\":\"missing\"") || chain.contains("\"reason\":\"Missing\""),
-            "audit must record the password reject: {chain}"
+        assert_eq!(
+            chain.matches("\"reason\":\"missing\"").count(),
+            passwords.len(),
+            "audit must record each password reject: {chain}"
         );
+        for password in &passwords {
+            assert!(
+                !chain.contains(password.as_str()),
+                "the audit has the ticket"
+            );
+        }
         assert!(verify_file(&dir.join("ssh-audit.jsonl")).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One valid signed agent ticket for this host: agent JIT, one-shot, 127.0.0.1/32, port 22.
+    ///
+    /// The test signs it with a test key from the identity crate and checks it with
+    /// `verify_ticket` before it returns the bytes.
+    fn valid_ticket(now: SystemTime) -> Vec<u8> {
+        use orblx_identity::{
+            sign_ticket, verify_ticket, TicketClaims, TicketFlags, TicketSigner, TicketVerifier,
+        };
+        let signer = TicketSigner::generate();
+        let secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let claims = TicketClaims {
+            issuer: SpiffeId::coord("ssh").unwrap(),
+            subject: SpiffeId::agent("helper").unwrap(),
+            not_before: secs,
+            expires: secs + 60,
+            dst_cidr: "127.0.0.1/32".to_string(),
+            proto: 6,
+            dst_port: crate::auth::SSH_PORT,
+            flags: TicketFlags::new(true, true),
+        };
+        let signed = sign_ticket(&signer, &claims).unwrap();
+        let verifier = TicketVerifier::from_public_pem(&signer.public_key_pem()).unwrap();
+        let verified = verify_ticket(&verifier, &signed.bytes, now, &DenySet::empty())
+            .expect("the test ticket is valid");
+        assert_eq!(verified.subject, claims.subject);
+        assert!(verified.flags.agent_jit() && verified.flags.one_shot());
+        signed.bytes
     }
 
     /// R4b: a shell request without a certificate admission is refused.
@@ -1362,6 +1402,126 @@ mod tests {
         };
         let err = super::session_gate(&shared, &admitted, super::unix_now_ms()).unwrap_err();
         assert_ne!(err.reason, orblx_audit::DenyReason::Missing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R3 end to end: a certificate login with a fresh netmap. Then the netmap becomes stale
+    /// (120 s old, then 120 s in the future). Then exec and shell_request on the open login
+    /// are both refused with the stale netmap reason.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_netmap_after_login_refuses_exec_and_shell() {
+        use crate::cert::{fresh_netmap, testkit, CertRefuse};
+        use russh::ChannelMsg;
+        let dir = recording_fixture("stale-e2e");
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ca = testkit::key(41);
+        let ca_lines = [testkit::ca_line(&ca)];
+        testkit::write_netmap(&dir, &ca_lines, &[], now);
+        let addr = start_server(&dir).await;
+        let key = testkit::key(42);
+        // The certificate is valid from now - 60 s to now + 900 s. Thus the only time
+        // refusal in this test is the netmap age.
+        let spec = testkit::Spec::user("oidc:alice", "laptop", 801, now);
+        let cert = testkit::sign(&ca, &key, &spec);
+        let request = SessionRequest {
+            user: "alice".to_string(),
+            addr,
+            dst: SpiffeId::node("box").unwrap(),
+            identity_dir: dir.join("alice"),
+            peer_cert: dir.join("peer.pem"),
+            command: "printf '%s\\n' \"$ORBLX_SSH_USER\"".to_string(),
+            cert_login: crate::client::CertLogin { key, cert },
+        };
+        // The netmap stamps that make the netmap stale, and the refuse that each one gives.
+        let stale = [
+            ((now - 120) * 1000, CertRefuse::StaleNetmap),
+            ((now + 120) * 1000, CertRefuse::FutureNetmap),
+        ];
+        let expired = |chain: &str| chain.matches("\"reason\":\"expired\"").count();
+        let audit = dir.join("ssh-audit.jsonl");
+        let read_chain = || std::fs::read_to_string(&audit).unwrap_or_default();
+        // Wait for the first reply to a channel request: true for success, false for failure.
+        async fn reply(channel: &mut russh::Channel<russh::client::Msg>) -> bool {
+            let wait = async {
+                loop {
+                    match channel.wait().await {
+                        Some(ChannelMsg::Success) => return true,
+                        Some(ChannelMsg::Failure) | None => return false,
+                        Some(_) => {}
+                    }
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(15), wait)
+                .await
+                .expect("the server did not reply")
+        }
+        let mut count = 0;
+        for (issued_at_ms, refuse) in stale {
+            assert_eq!(refuse.audit_reason(), orblx_audit::DenyReason::Expired);
+
+            // exec: log in with a fresh netmap, then make the netmap stale.
+            testkit::write_netmap(&dir, &ca_lines, &[], now);
+            let (handle, mut channel) = crate::client::open_channel(&request)
+                .await
+                .expect("the certificate login with a fresh netmap");
+            testkit::write_netmap_at(&dir, &ca_lines, &[], issued_at_ms);
+            assert_eq!(
+                fresh_netmap(&dir, super::unix_now_ms()).unwrap_err(),
+                refuse
+            );
+            channel
+                .exec(true, request.command.clone().into_bytes())
+                .await
+                .unwrap();
+            assert!(!reply(&mut channel).await, "exec ran with a {refuse:?}");
+            count += 1;
+            assert_eq!(expired(&read_chain()), count, "exec {refuse:?}");
+            let _ = handle
+                .disconnect(russh::Disconnect::ByApplication, "", "")
+                .await;
+
+            // shell_request: log in with a fresh netmap, get a PTY, then make the netmap stale.
+            testkit::write_netmap(&dir, &ca_lines, &[], now);
+            let (handle, mut channel) = crate::client::open_channel(&request)
+                .await
+                .expect("the certificate login with a fresh netmap");
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+            assert!(reply(&mut channel).await, "the PTY request failed");
+            testkit::write_netmap_at(&dir, &ca_lines, &[], issued_at_ms);
+            channel.request_shell(true).await.unwrap();
+            assert!(
+                !reply(&mut channel).await,
+                "the shell ran with a {refuse:?}"
+            );
+            count += 1;
+            assert_eq!(expired(&read_chain()), count, "shell {refuse:?}");
+            let _ = handle
+                .disconnect(russh::Disconnect::ByApplication, "", "")
+                .await;
+        }
+        let chain = read_chain();
+        // Each row is a stale netmap deny. No session started and no other deny is there.
+        let rows: Vec<serde_json::Value> = chain
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), count, "{chain}");
+        for row in &rows {
+            assert_eq!(row["kind"], "deny", "{chain}");
+            assert_eq!(row["reason"], "expired", "{chain}");
+            assert_eq!(row["peer"], "spiffe://orblx.local/user/alice", "{chain}");
+        }
+        assert!(verify_file(&audit).is_ok());
+        // A fresh netmap again: the same login runs the command.
+        testkit::write_netmap(&dir, &ca_lines, &[], now);
+        let ok = session_within(request).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&ok.stdout), "alice\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
