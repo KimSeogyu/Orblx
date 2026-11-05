@@ -1,9 +1,27 @@
 # W25-40: SSH logins across node SVID renewals.
 # The proof script sets the SSH_RENEW_* paths and the node SVID life SSH_RENEW_TTL.
+# idp is the test OIDC issuer. The coordinator reads the [oidc] section from the config file.
+# Names resolve from /etc/hosts. The stack does not use Docker DNS at 127.0.0.11.
 
 name: orblx-ssh-renew
 
 services:
+  idp:
+    image: orblx-ssh-renew:local
+    entrypoint: ["orblx-test-idp"]
+    command: [serve, --dir, /idp, --issuer, "https://idp:8443", --listen, "0.0.0.0:8443"]
+    volumes:
+      - ${SSH_RENEW_IDP_DIR}:/idp
+      - ${SSH_RENEW_TOKENS}:/tokens
+    extra_hosts: &proof-hosts
+      - "idp:172.28.19.9"
+      - "coord:172.28.19.10"
+      - "node-a:172.28.19.11"
+      - "node-b:172.28.19.12"
+    networks:
+      proof:
+        ipv4_address: 172.28.19.9
+
   coord:
     image: orblx-ssh-renew:local
     command:
@@ -15,11 +33,15 @@ services:
       - 0.0.0.0:443
       - --name
       - coord
+      - --config
+      - /etc/orblx/coord.toml
     environment:
-      ORBLX_OIDC_MODE: google
       ORBLX_SVID_TTL: "${SSH_RENEW_TTL}"
     volumes:
       - ${SSH_RENEW_COORD_STATE}:/var/lib/orblx
+      - ${SSH_RENEW_CONFIG}:/etc/orblx/coord.toml:ro
+      - ${SSH_RENEW_IDP_CA}:/etc/orblx/idp-ca.pem:ro
+    extra_hosts: *proof-hosts
     networks:
       proof:
         ipv4_address: 172.28.19.10
@@ -48,6 +70,7 @@ services:
       - 172.28.19.10:443
       - --coord-name
       - coord
+    extra_hosts: *proof-hosts
     networks:
       proof:
         ipv4_address: 172.28.19.11
@@ -76,6 +99,7 @@ services:
       - 172.28.19.10:443
       - --coord-name
       - coord
+    extra_hosts: *proof-hosts
     networks:
       proof:
         ipv4_address: 172.28.19.12
