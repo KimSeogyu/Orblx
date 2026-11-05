@@ -82,7 +82,7 @@ cargo build --release -p orblx-cli --bin orblx --locked
 # shellcheck source=stage-image.sh
 source "$root/scripts/proof/stage-image.sh"
 image_dir="$(stage_proof_image "$root" "$bin")"
-docker build --no-cache -q -t orblx-ssh-renew:local "$image_dir" >/dev/null
+docker build --network host --no-cache -q -t orblx-ssh-renew:local "$image_dir" >/dev/null
 rm -rf "$image_dir"
 image_dir=""
 open_legacy_forward
