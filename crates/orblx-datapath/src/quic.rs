@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orblx_crypto::TicketRing;
 use orblx_identity::{decode_certificate_pem, leaf_not_after, DenySet, SpiffeId, TrustBundle};
@@ -23,6 +23,7 @@ const ALPN: &[u8] = b"orblx-hello";
 const SERVER_NAME: &str = "orblx.local";
 const PEER_REJECT_CODE: u32 = 1;
 const TICKET_REJECT_CODE: u32 = 2;
+const DEADLINE_REJECT_CODE: u32 = 3;
 const TICKET_MAC_LEN: usize = 32;
 
 /// Leaf material and the capability ticket for one hello-quic endpoint.
@@ -798,6 +799,20 @@ async fn bind_session(
     }
     let local_hash = orblx_crypto::ticket_hash(&presented.bytes);
     let ticket_expires = gate.ticket_expires().ok_or(HelloError::TicketMissing)?;
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    // Refuse a deadline that is already past. Do not start the session.
+    // The ticket end stays strict. The ±60 s skew stays on ticket `not_before`.
+    // This check does not change the verifiers. The session rule is: end <= now.
+    if session_deadline_is_past(ticket_expires, peer_not_after, now_unix) {
+        trace_renew(&format!(
+            "session_refused reason=deadline_past ticket_end={ticket_expires} cert_end={peer_not_after} now={now_unix}"
+        ));
+        reject_deadline(&connection);
+        return Err(HelloError::SessionDeadline);
+    }
     let sender_gate = PeerGate::bound(peer.clone());
     Ok(HelloSession {
         connection,
@@ -938,6 +953,28 @@ fn reject_ticket(connection: &quinn::Connection) {
         quinn::VarInt::from_u32(TICKET_REJECT_CODE),
         b"ticket rejected",
     );
+}
+
+fn reject_deadline(connection: &quinn::Connection) {
+    connection.close(
+        quinn::VarInt::from_u32(DEADLINE_REJECT_CODE),
+        b"session deadline past",
+    );
+}
+
+/// True when min(ticket end, peer certificate end) is at or before `now`.
+pub(crate) fn session_deadline_is_past(ticket_end: u64, cert_end: u64, now: u64) -> bool {
+    ticket_end.min(cert_end) <= now
+}
+
+fn trace_renew(message: &str) {
+    if std::env::var_os("ORBLX_TRACE_RENEW").is_some() {
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or(0);
+        eprintln!("trace {ms} {message}");
+    }
 }
 
 fn peer_leaf(connection: &quinn::Connection) -> Result<Vec<u8>, HelloError> {
