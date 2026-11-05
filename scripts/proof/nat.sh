@@ -210,7 +210,7 @@ now_s() {
 . "$PROOF_LIB_DIR/proof-lock.sh"
 PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap 'cleanup; proof_lock_end' EXIT
-proof_lock_take "nat"
+proof_lock_take "nat" "orblx-nat-proof"
 # W25-14b: start from a clean compose state (all profiles, all volumes).
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
