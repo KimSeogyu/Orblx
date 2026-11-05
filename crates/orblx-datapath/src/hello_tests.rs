@@ -1728,9 +1728,12 @@ struct W2538Node {
 fn w25_38_memory_node(
     config: HelloConfig,
     netmap: Netmap,
-    listen: SocketAddr,
+    listen_socket: UdpSocket,
     state_dir: PathBuf,
 ) -> W2538Node {
+    let listen = listen_socket
+        .local_addr()
+        .expect("The reserved UDP socket has no local port.");
     let (stop_tx, stop_rx) = watch::channel(false);
     let (from_tx, from_rx) = mpsc::channel(64);
     let (to_tx, to_rx) = mpsc::channel(64);
@@ -1745,6 +1748,7 @@ fn w25_38_memory_node(
                     config,
                     netmap,
                     listen,
+                    listen_socket: Some(listen_socket),
                     state_dir,
                     renew: None,
                     stop: Some(stop_rx),
@@ -1761,6 +1765,7 @@ fn w25_38_memory_node(
                     on_ready: None,
                     on_listen: None,
                     metrics: None,
+                    metrics_listener: None,
                     filter: None,
                 },
                 MemoryDevice {
@@ -1829,8 +1834,11 @@ fn w25_38_a_young_link_that_lost_its_peer_ends_after_the_orphan_limit() {
 fn w25_38_same_svid_ping_case(settle: Duration, after_limit: Duration) {
     let now = SystemTime::now();
     let (_ca, pair) = issue_node_pair(now);
-    let a_listen = free_udp();
-    let b_listen = free_udp();
+    let mut udp = crate::reserve_udp_sockets(2);
+    let socket_b = udp.pop().unwrap();
+    let socket_a = udp.pop().unwrap();
+    let a_listen = socket_a.local_addr().unwrap();
+    let b_listen = socket_b.local_addr().unwrap();
     let base = std::env::temp_dir().join(format!(
         "orblx-w25-38-same-svid-{}-{}",
         std::process::id(),
@@ -1875,8 +1883,8 @@ fn w25_38_same_svid_ping_case(settle: Duration, after_limit: Duration) {
         .as_bytes(),
     )
     .unwrap();
-    let b_node = w25_38_memory_node(pair.server.clone(), b_netmap, b_listen, b_dir);
-    let mut a_node = w25_38_memory_node(pair.client.clone(), a_netmap, a_listen, a_dir);
+    let b_node = w25_38_memory_node(pair.server.clone(), b_netmap, socket_b, b_dir);
+    let mut a_node = w25_38_memory_node(pair.client.clone(), a_netmap, socket_a, a_dir);
     let before = w25_38_echo_ok(
         &a_node.from_host,
         &mut a_node.to_host,
