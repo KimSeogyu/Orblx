@@ -11,7 +11,8 @@
 //! The only login method is a user certificate from the coordinator SSH user CA (W25-31).
 //! The server refuses each password login, also an SVID proof or a ticket as the password.
 //! A new shell or a command needs a certificate admission and a netmap that is at most 60 s old.
-//! An open shell stays up when that stamp only ages. The deny check still stops it.
+//! An open shell stays up while the stamp is at most `OPEN_SHELL_NETMAP_MAX_AGE_MS` (900 s) old.
+//! A stamp more than 60 s ahead of the node clock ends the shell. The deny check still stops it.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -36,7 +37,9 @@ use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use tokio::net::TcpListener;
 
 use crate::auth::{command_ok, overlay_listen_addr, RefusedLogin};
-use crate::cert::{check_cert, fresh_netmap, verified_netmap, CertInput, CertRefuse};
+use crate::cert::{
+    check_cert, fresh_netmap, open_shell_netmap_age, verified_netmap, CertInput, CertRefuse,
+};
 use crate::hostkey::host_key_from_seed;
 use crate::pty::{kill_group, PtyShell, PtySpec};
 use crate::record::{Recorder, Utf8Carry};
@@ -692,9 +695,9 @@ impl SshHandler {
             }
             if Instant::now() >= next_check {
                 next_check += period;
-                // Age of a verified netmap does not end the shell. A new shell
-                // still uses `recheck`. The deny list and the policy still do.
-                if recheck_open_shell(&self.shared, admitted).is_err() {
+                // The open shell allows a verified stamp up to the 900 s ceiling.
+                // A new shell still uses `recheck`. The deny list and the policy still do.
+                if recheck_open_shell(&self.shared, admitted, unix_now_ms()).is_err() {
                     live.fail(orblx_audit::DenyReason::Revoked);
                 }
             }
@@ -876,12 +879,27 @@ fn recheck(shared: &Shared, admitted: &Admitted) -> Result<(), RefusedLogin> {
 /// Recheck an open shell.
 ///
 /// A new shell still needs a netmap that is at most 60 s old (`recheck_at`).
-/// An open shell stays up when the signed stamp is only old or ahead. The
-/// coordinator can be down and the shell keeps the mesh session. A netmap
-/// that does not verify still ends the shell. The deny list and the policy
-/// still end the shell.
-fn recheck_open_shell(shared: &Shared, admitted: &Admitted) -> Result<(), RefusedLogin> {
-    if let Err(refused) = verified_netmap(&shared.state_dir) {
+/// An open shell checks the signature with [`verified_netmap`], then the age
+/// with [`open_shell_netmap_age`] (`OPEN_SHELL_NETMAP_MAX_AGE_MS`, 900 s).
+/// A stamp more than 60 s ahead of `now_ms` ends the shell. A netmap that does
+/// not verify still ends the shell. The deny list, the revoked serial, and
+/// the policy still end the shell.
+fn recheck_open_shell(
+    shared: &Shared,
+    admitted: &Admitted,
+    now_ms: u64,
+) -> Result<(), RefusedLogin> {
+    let netmap = match verified_netmap(&shared.state_dir) {
+        Ok(netmap) => netmap,
+        Err(refused) => {
+            return Err(RefusedLogin {
+                peer: admitted.src.clone(),
+                reason: refused.audit_reason(),
+                ticket_hash: admitted.ticket_hash,
+            });
+        }
+    };
+    if let Err(refused) = open_shell_netmap_age(netmap.issued_at_ms, now_ms) {
         return Err(RefusedLogin {
             peer: admitted.src.clone(),
             reason: refused.audit_reason(),
@@ -1578,26 +1596,86 @@ mod tests {
             "a new shell still needs a fresh netmap"
         );
         assert!(
-            super::recheck_open_shell(&shared, &admitted).is_ok(),
-            "an open shell stays up when the stamp is only old"
+            super::recheck_open_shell(&shared, &admitted, now_ms).is_ok(),
+            "an open shell stays up when the stamp is inside the 900 s ceiling"
         );
         testkit::write_netmap_at(&dir, &[testkit::ca_line(&ca)], &[], (now + 120) * 1000);
         assert!(super::session_gate(&shared, &admitted, now_ms).is_err());
-        assert!(super::recheck_open_shell(&shared, &admitted).is_ok());
+        assert!(
+            super::recheck_open_shell(&shared, &admitted, now_ms).is_err(),
+            "a stamp more than 60 s ahead ends the open shell"
+        );
+        testkit::write_netmap_at(&dir, &[testkit::ca_line(&ca)], &[], now_ms);
         std::fs::write(
             dir.join("deny.json"),
             r#"{"version":1,"generated_at":1,"revoked_uris":["spiffe://orblx.local/user/alice"],"revoked_ticket_nonces":[]}"#,
         )
         .unwrap();
         assert!(
-            super::recheck_open_shell(&shared, &admitted).is_err(),
+            super::recheck_open_shell(&shared, &admitted, now_ms).is_err(),
             "the deny list still stops the open shell"
         );
         std::fs::write(dir.join("deny.json"), W25_38_VALID).unwrap();
         std::fs::write(dir.join("netmap.signed.json"), b"not a netmap").unwrap();
         assert!(
-            super::recheck_open_shell(&shared, &admitted).is_err(),
+            super::recheck_open_shell(&shared, &admitted, now_ms).is_err(),
             "a netmap that does not verify still stops the open shell"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An open shell ends when the signed netmap is older than the 900 s ceiling.
+    ///
+    /// A stamp at the ceiling stays up. A new shell still refuses a stamp that
+    /// is 120 s old.
+    #[test]
+    fn an_open_shell_refuses_a_netmap_older_than_the_ceiling() {
+        use crate::cert::{testkit, OPEN_SHELL_NETMAP_MAX_AGE_MS};
+        let dir = recording_fixture("open-ceiling");
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let now_ms = now * 1000;
+        let ca = testkit::key(23);
+        let shared = Shared::load(&dir, Ipv4Addr::LOCALHOST).unwrap();
+        let admitted = super::Admitted {
+            src: SpiffeId::user("alice").unwrap(),
+            user: "alice".to_string(),
+            check_period: 30,
+            ticket_hash: [0u8; 16],
+            frame: 1,
+            recording: false,
+            cert: Some(super::CertSession {
+                client_node: SpiffeId::node("laptop").unwrap(),
+                stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                pty: true,
+            }),
+        };
+        testkit::write_netmap_at(
+            &dir,
+            &[testkit::ca_line(&ca)],
+            &[],
+            now_ms - OPEN_SHELL_NETMAP_MAX_AGE_MS,
+        );
+        assert!(
+            super::recheck_open_shell(&shared, &admitted, now_ms).is_ok(),
+            "a stamp at the ceiling stays up"
+        );
+        testkit::write_netmap_at(
+            &dir,
+            &[testkit::ca_line(&ca)],
+            &[],
+            now_ms - OPEN_SHELL_NETMAP_MAX_AGE_MS - 1_000,
+        );
+        assert!(
+            super::recheck_open_shell(&shared, &admitted, now_ms).is_err(),
+            "a stamp older than 900 s ends the open shell"
+        );
+        testkit::write_netmap_at(&dir, &[testkit::ca_line(&ca)], &[], (now - 120) * 1000);
+        assert!(
+            super::session_gate(&shared, &admitted, now_ms).is_err(),
+            "a new shell still refuses a stamp that is 120 s old"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

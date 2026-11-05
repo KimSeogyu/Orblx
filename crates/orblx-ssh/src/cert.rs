@@ -33,6 +33,19 @@ pub const CERT_SKEW_SECS: u64 = 60;
 /// The oldest signed netmap for a new certificate login in seconds (W25-34 `NETMAP_MAX_AGE_MS`).
 pub const NETMAP_MAX_AGE_SECS: u64 = orblx_datapath::NETMAP_MAX_AGE_MS / 1000;
 
+/// The oldest signed netmap for an open shell, in milliseconds.
+///
+/// A new shell uses [`fresh_netmap`] (`NETMAP_MAX_AGE_MS`, 60 s). An open shell
+/// stays up until the stamp is older than this ceiling, so gate 3 can hold a
+/// session while the coordinator is down. The ceiling stays at or above the
+/// `ORBLX_DENY_OFFLINE_SECS` default of 600 s.
+///
+/// A stamp more than [`orblx_datapath::NETMAP_MAX_SKEW_MS`] ahead of local time
+/// is refused. That is the same skew rule as [`fresh_netmap`].
+pub const OPEN_SHELL_NETMAP_MAX_AGE_MS: u64 = 900_000;
+
+const _: () = assert!(OPEN_SHELL_NETMAP_MAX_AGE_MS >= 600_000);
+
 /// Why the server refused one certificate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CertRefuse {
@@ -281,14 +294,32 @@ pub fn fresh_netmap(state_dir: &std::path::Path, now_ms: u64) -> Result<Netmap, 
     Ok(signed.netmap)
 }
 
-/// Read a signed netmap for an open shell, without the 60 s age check.
+/// Read a signed netmap and check the signature only.
 ///
-/// A new shell uses [`fresh_netmap`]. An open shell stays up when the stamp is
-/// only old or ahead. A file that does not verify still fails.
+/// An open shell then applies [`open_shell_netmap_age`]. A new shell uses
+/// [`fresh_netmap`]. A file that does not verify fails here.
 pub fn verified_netmap(state_dir: &std::path::Path) -> Result<Netmap, CertRefuse> {
     orblx_coord::read_verified_netmap(state_dir)
         .map(|signed| signed.netmap)
         .map_err(|_| CertRefuse::StaleNetmap)
+}
+
+/// Apply the open-shell age ceiling to a stamp that already verified.
+///
+/// The stamp may be at most [`OPEN_SHELL_NETMAP_MAX_AGE_MS`] old. A stamp of 0
+/// is refused. A stamp more than [`orblx_datapath::NETMAP_MAX_SKEW_MS`] ahead
+/// of `now_ms` is refused, the same skew rule as [`fresh_netmap`].
+pub fn open_shell_netmap_age(issued_at_ms: u64, now_ms: u64) -> Result<(), CertRefuse> {
+    if issued_at_ms == 0 {
+        return Err(CertRefuse::StaleNetmap);
+    }
+    if issued_at_ms > now_ms.saturating_add(orblx_datapath::NETMAP_MAX_SKEW_MS) {
+        return Err(CertRefuse::FutureNetmap);
+    }
+    if now_ms.saturating_sub(issued_at_ms) > OPEN_SHELL_NETMAP_MAX_AGE_MS {
+        return Err(CertRefuse::StaleNetmap);
+    }
+    Ok(())
 }
 
 /// Refuse a caller that is not root (W25-31).
@@ -448,6 +479,23 @@ pub(crate) mod testkit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_shell_netmap_age_uses_the_ceiling_and_the_skew() {
+        let now = 1_000_000_000_000;
+        assert!(open_shell_netmap_age(now - 120_000, now).is_ok());
+        assert!(open_shell_netmap_age(now - OPEN_SHELL_NETMAP_MAX_AGE_MS, now).is_ok());
+        assert_eq!(
+            open_shell_netmap_age(now - OPEN_SHELL_NETMAP_MAX_AGE_MS - 1, now),
+            Err(CertRefuse::StaleNetmap)
+        );
+        assert_eq!(open_shell_netmap_age(0, now), Err(CertRefuse::StaleNetmap));
+        assert!(open_shell_netmap_age(now + orblx_datapath::NETMAP_MAX_SKEW_MS, now).is_ok());
+        assert_eq!(
+            open_shell_netmap_age(now + orblx_datapath::NETMAP_MAX_SKEW_MS + 1, now),
+            Err(CertRefuse::FutureNetmap)
+        );
+    }
 
     fn policy() -> Policy {
         Policy::from_hujson(
