@@ -25,10 +25,11 @@ if [ -x /usr/lib/systemd/systemd-resolved ]; then
 fi
 
 if [ -f /etc/nsswitch.conf ]; then
+  # files is first. /etc/hosts wins over systemd-resolved and DNS.
   if grep -q '^hosts:' /etc/nsswitch.conf; then
-    sed -i 's/^hosts:.*/hosts: resolve [!UNAVAIL=return] files dns/' /etc/nsswitch.conf || true
+    sed -i 's/^hosts:.*/hosts: files resolve [!UNAVAIL=return] dns/' /etc/nsswitch.conf || true
   else
-    echo 'hosts: resolve [!UNAVAIL=return] files dns' >> /etc/nsswitch.conf || true
+    echo 'hosts: files resolve [!UNAVAIL=return] dns' >> /etc/nsswitch.conf || true
   fi
 fi
 
