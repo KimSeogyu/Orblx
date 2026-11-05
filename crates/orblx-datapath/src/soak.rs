@@ -341,8 +341,8 @@ pub(crate) fn log_idle_timeouts() {
 
 fn idle_timeout_lines() -> [&'static str; 4] {
     [
-        "idle_timeout_ms=30000 src=crates/orblx-datapath/src/quic.rs:979",
-        "idle_timeout_ms=10000 src=crates/orblx-datapath/src/quic.rs:982",
+        "idle_timeout_ms=30000 src=crates/orblx-datapath/src/quic.rs:986",
+        "idle_timeout_ms=10000 src=crates/orblx-datapath/src/quic.rs:989",
         "idle_timeout_ms=1000 src=crates/orblx-relay/src/server.rs:25",
         "idle_timeout_ms=60000 src=crates/orblx-coord/src/tlsutil.rs:100",
     ]
@@ -664,12 +664,12 @@ mod tests {
     fn idle_timeout_lines_match_the_source() {
         let quic = include_str!("quic.rs");
         assert!(
-            quic.lines().nth(978).unwrap().contains("from_secs(30)"),
-            "quic.rs:979"
+            quic.lines().nth(985).unwrap().contains("from_secs(30)"),
+            "quic.rs:986"
         );
         assert!(
-            quic.lines().nth(981).unwrap().contains("from_secs(10)"),
-            "quic.rs:982"
+            quic.lines().nth(988).unwrap().contains("from_secs(10)"),
+            "quic.rs:989"
         );
         let relay = include_str!("../../orblx-relay/src/server.rs");
         assert!(
@@ -685,11 +685,11 @@ mod tests {
         let lines = idle_timeout_lines();
         assert_eq!(
             lines[0],
-            "idle_timeout_ms=30000 src=crates/orblx-datapath/src/quic.rs:979"
+            "idle_timeout_ms=30000 src=crates/orblx-datapath/src/quic.rs:986"
         );
         assert_eq!(
             lines[1],
-            "idle_timeout_ms=10000 src=crates/orblx-datapath/src/quic.rs:982"
+            "idle_timeout_ms=10000 src=crates/orblx-datapath/src/quic.rs:989"
         );
         assert_eq!(
             lines[2],
