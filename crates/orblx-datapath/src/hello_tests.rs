@@ -1337,6 +1337,7 @@ fn a_ticket_frame_in_an_open_session_ends_the_session() {
                     underlay: Vec::new(),
                     relay: None,
                     netmap_path: PathBuf::from("netmap.json"),
+                    netmap_text: None,
                     visibility: Arc::new(AllowPeers),
                     on_ready: None,
                     on_listen: None,
