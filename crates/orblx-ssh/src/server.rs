@@ -106,6 +106,8 @@ struct ShellRecord {
 /// so the events in the file are in time order.
 struct LiveShell {
     writer: Mutex<File>,
+    /// The slave side. The echo flag is read here.
+    slave: File,
     pid: u32,
     started: Instant,
     record: Mutex<Option<ShellRecord>>,
@@ -125,8 +127,8 @@ impl LiveShell {
     /// not the input bytes. When the recording fails, the shell stops and the
     /// input does not go to the shell.
     fn input(&self, data: &[u8]) {
-        let writer = self.writer.lock().unwrap_or_else(|err| err.into_inner());
-        let hidden = crate::pty::echo_off(&writer);
+        let mut writer = self.writer.lock().unwrap_or_else(|err| err.into_inner());
+        let hidden = crate::pty::echo_off(&self.slave);
         {
             let mut record = self.record.lock().unwrap_or_else(|err| err.into_inner());
             if let Some(state) = record.as_mut() {
@@ -156,7 +158,6 @@ impl LiveShell {
                 }
             }
         }
-        let mut writer = writer;
         if writer.write_all(data).is_err() {
             kill_group(self.pid, libc::SIGHUP);
         }
@@ -595,7 +596,9 @@ impl SshHandler {
                 return false;
             }
         };
-        let Ok(writer) = shell.master.try_clone() else {
+        let writer = shell.master.try_clone();
+        let slave = shell.slave.try_clone();
+        let (Ok(writer), Ok(slave)) = (writer, slave) else {
             let mut shell = shell;
             let _ = shell.child.kill();
             let _ = shell.child.wait();
@@ -603,6 +606,7 @@ impl SshHandler {
         };
         let live = Arc::new(LiveShell {
             writer: Mutex::new(writer),
+            slave,
             pid: shell.child.id(),
             started,
             record: Mutex::new(recorder.map(|recorder| ShellRecord {
@@ -1995,14 +1999,35 @@ mod tests {
             .collect();
         let times: Vec<f64> = events.iter().map(|row| row[0].as_f64().unwrap()).collect();
         assert!(times.windows(2).all(|pair| pair[0] <= pair[1]));
-        let first_input = events
-            .iter()
-            .position(|row| row[1] == "i" && row[2].as_str().unwrap().contains("echo pty-"))
-            .unwrap();
-        let answer = events
-            .iter()
-            .position(|row| row[1] == "o" && row[2].as_str().unwrap().contains("pty-42"))
-            .unwrap();
+        // One SSH `data` callback is one recording event. A single send can arrive
+        // as more than one callback, so the text is the join of those events.
+        let mut input_text = String::new();
+        let mut output_text = String::new();
+        let mut first_input = None;
+        let mut answer = None;
+        for (idx, row) in events.iter().enumerate() {
+            let kind = row[1].as_str().unwrap_or("");
+            let text = row[2].as_str().unwrap_or("");
+            if kind == "i" {
+                input_text.push_str(text);
+                if first_input.is_none() && input_text.contains("echo pty-") {
+                    first_input = Some(idx);
+                }
+            } else if kind == "o" {
+                output_text.push_str(text);
+                if answer.is_none() && output_text.contains("pty-42") {
+                    answer = Some(idx);
+                }
+            }
+        }
+        let first_input = match first_input {
+            Some(idx) => idx,
+            None => panic!("the recording has no echo pty- input. input={input_text:?}"),
+        };
+        let answer = match answer {
+            Some(idx) => idx,
+            None => panic!("the recording has no pty-42 output. output={output_text:?}"),
+        };
         assert!(first_input < answer);
         assert!(events
             .iter()
@@ -2063,6 +2088,7 @@ mod tests {
         let full = std::fs::File::open(&path).unwrap();
         let live = LiveShell {
             writer: Mutex::new(shell.master.try_clone().unwrap()),
+            slave: shell.slave.try_clone().unwrap(),
             pid: shell.child.id(),
             started: Instant::now(),
             record: Mutex::new(Some(ShellRecord {
