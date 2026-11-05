@@ -93,6 +93,9 @@ The project does not use Tailscale DERP protocol or map.
 The project does not use a plaintext Relay.
 The project does not build a global DERP fleet.
 The project does not use peer-relay as the primary path ladder step.
+Peer relay is the path when direct fails and the coordinator Relay is far or down.
+The first packet uses the best path that is already up.
+See [docs/peer-relay.md](../peer-relay.md).
 The project does not add enterprise GTM copy.
 
 ## Interfaces

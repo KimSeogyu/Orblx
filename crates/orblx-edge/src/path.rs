@@ -38,6 +38,12 @@ pub const STICK_AND_UPGRADE: &str = "reconnect";
 /// A failed retry starts the wait again.
 pub const DIRECT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
+/// An attach round-trip at or above this time means the coordinator Relay is far.
+///
+/// The node still sends on that Relay until a peer relay is up.
+/// The node does not wait for peer-relay discovery.
+pub const RELAY_FAR_MS: u64 = 50;
+
 /// The Allocate phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllocatePhase {
@@ -243,6 +249,39 @@ impl std::fmt::Display for DirectPhase {
             Self::Failed { .. } => formatter.write_str("Failed"),
         }
     }
+}
+
+/// What the node knows about each path at one moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathOffer {
+    /// Probes went both ways on the direct path.
+    pub direct_up: bool,
+    /// Direct is not up, and a relay may carry packets.
+    pub direct_failed: bool,
+    /// Probes went both ways on the coordinator Relay.
+    pub coordinator_up: bool,
+    /// The coordinator Relay attach round-trip, in milliseconds.
+    ///
+    /// `None` means the node has no sample. The Relay is not far yet.
+    pub coordinator_rtt_ms: Option<u64>,
+    /// Probes went both ways on the peer relay.
+    pub peer_relay_up: bool,
+}
+
+/// The path that carries the next packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathPick {
+    /// The direct path.
+    Direct,
+    /// The coordinator Relay.
+    Relay,
+    /// A peer that already has a working path.
+    PeerRelay,
+    /// No path is up.
+    ///
+    /// The caller sends on the first path that comes up.
+    /// The caller does not wait for peer-relay discovery.
+    None,
 }
 
 /// The Allocate to Direct stub.
@@ -474,6 +513,31 @@ impl PathMachine {
         Ok(candidate)
     }
 
+    /// Choose the path for the next packet.
+    ///
+    /// Direct wins when it is up.
+    /// Peer relay wins when direct has failed and the coordinator Relay is far or down,
+    /// and the peer relay is already up.
+    /// A far coordinator Relay still carries the packet when the peer relay is not up.
+    /// The function does not return a wait.
+    #[must_use]
+    pub fn pick_path(offer: PathOffer) -> PathPick {
+        if offer.direct_up {
+            return PathPick::Direct;
+        }
+        let far = offer
+            .coordinator_rtt_ms
+            .is_some_and(|rtt| rtt >= RELAY_FAR_MS);
+        let coordinator_bad = !offer.coordinator_up || far;
+        if offer.direct_failed && coordinator_bad && offer.peer_relay_up {
+            return PathPick::PeerRelay;
+        }
+        if offer.coordinator_up {
+            return PathPick::Relay;
+        }
+        PathPick::None
+    }
+
     /// Move from Allocate Ready to the Direct stub.
     ///
     /// The function does not send a packet.
@@ -507,7 +571,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AllocatePhase, DirectPhase, PathMachine, PathState, DIRECT_ATTEMPT_BUDGET, DIRECT_QUIC_PORT,
+        AllocatePhase, DirectPhase, PathMachine, PathOffer, PathPick, PathState,
+        DIRECT_ATTEMPT_BUDGET, DIRECT_QUIC_PORT, RELAY_FAR_MS,
     };
     use crate::{
         CandidateSink, EdgeError, LabStunServer, MemoryCandidateSink, StunClient,
@@ -591,5 +656,55 @@ mod tests {
                 candidate: None,
             }
         ));
+    }
+
+    fn offer(peer_up: bool, coordinator_up: bool, rtt: Option<u64>) -> PathOffer {
+        PathOffer {
+            direct_up: false,
+            direct_failed: true,
+            coordinator_up,
+            coordinator_rtt_ms: rtt,
+            peer_relay_up: peer_up,
+        }
+    }
+
+    #[test]
+    fn a_far_relay_carries_the_packet_until_the_peer_relay_is_up() {
+        assert_eq!(
+            PathMachine::pick_path(offer(false, true, Some(RELAY_FAR_MS))),
+            PathPick::Relay
+        );
+        assert_eq!(
+            PathMachine::pick_path(offer(true, true, Some(RELAY_FAR_MS))),
+            PathPick::PeerRelay
+        );
+    }
+
+    #[test]
+    fn a_down_coordinator_uses_the_peer_relay_when_it_is_up() {
+        assert_eq!(
+            PathMachine::pick_path(offer(true, false, None)),
+            PathPick::PeerRelay
+        );
+        assert_eq!(
+            PathMachine::pick_path(offer(false, false, None)),
+            PathPick::None
+        );
+    }
+
+    #[test]
+    fn a_near_coordinator_stays_ahead_of_the_peer_relay() {
+        assert_eq!(
+            PathMachine::pick_path(offer(true, true, Some(RELAY_FAR_MS - 1))),
+            PathPick::Relay
+        );
+        assert_eq!(
+            PathMachine::pick_path(offer(true, true, None)),
+            PathPick::Relay
+        );
+        let mut direct = offer(true, true, Some(1));
+        direct.direct_up = true;
+        direct.direct_failed = false;
+        assert_eq!(PathMachine::pick_path(direct), PathPick::Direct);
     }
 }
