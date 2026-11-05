@@ -395,7 +395,7 @@ async fn policy_wait_op(
     if peer != request.name {
         return Err(CoordError::Peer);
     }
-    report_posture(coord, &request.name, request, SystemTime::now())?;
+    report_posture(coord, &peer, request, SystemTime::now())?;
     policy_wait(
         coord,
         &request.name,
@@ -406,15 +406,19 @@ async fn policy_wait_op(
     .await
 }
 
-/// Store the self-report and apply posture before the request continues.
+/// Store the self-report for the authenticated peer, then apply posture.
+///
+/// `peer` is the node from the connection certificate. The report is stored
+/// only when `request.name` is that same node.
 fn report_posture(
     coord: &Coordinator,
-    name: &str,
+    peer: &str,
     request: &Request,
     now: SystemTime,
 ) -> Result<(), CoordError> {
-    coord.stage_posture(
-        name,
+    coord.accept_peer_posture(
+        peer,
+        &request.name,
         request.os.as_deref(),
         request.client_version.as_deref(),
         now,
@@ -431,14 +435,15 @@ async fn dispatch(
     let now = SystemTime::now();
     match request.op.as_str() {
         "enroll" => {
-            report_posture(coord, &request.name, &request, now)?;
             let result = match (&request.token, &request.id_token) {
-                (Some(token), None) => coord.enroll_token(
+                (Some(token), None) => coord.enroll_token_reported(
                     &request.name,
                     token,
                     &request.endpoints,
                     &request.routes,
                     now,
+                    request.os.as_deref(),
+                    request.client_version.as_deref(),
                 )?,
                 (None, Some(id_token)) => {
                     if coord.google_client_id_for_fetch()?.is_some() {
@@ -448,13 +453,15 @@ async fn dispatch(
                     if let Some(plan) = coord.issuer_fetch_plan(kid.as_deref(), now)? {
                         refresh_issuer_jwks(coord, plan).await;
                     }
-                    coord.enroll_oidc(
+                    coord.enroll_oidc_reported(
                         &request.name,
                         id_token,
                         request.nonce.as_deref(),
                         &request.endpoints,
                         &request.routes,
                         now,
+                        request.os.as_deref(),
+                        request.client_version.as_deref(),
                     )?
                 }
                 _ => {
@@ -472,7 +479,7 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
-            report_posture(coord, &request.name, &request, now)?;
+            report_posture(coord, &peer, &request, now)?;
             let result = coord.renew_node(&request.name, now)?;
             println!("renewed {}", result.name);
             coord.reconcile_posture(now)?;
@@ -483,7 +490,7 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
-            report_posture(coord, &request.name, &request, now)?;
+            report_posture(coord, &peer, &request, now)?;
             let view = coord.advertise_routes(&request.name, &request.routes)?;
             Ok(netmap_response(&view))
         }
@@ -492,7 +499,7 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
-            report_posture(coord, &request.name, &request, now)?;
+            report_posture(coord, &peer, &request, now)?;
             let view = coord.set_candidates(&request.name, &request.endpoints)?;
             Ok(netmap_response(&view))
         }
@@ -501,7 +508,7 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
-            report_posture(coord, &request.name, &request, now)?;
+            report_posture(coord, &peer, &request, now)?;
             let view = coord.advertise_exit(&request.name, request.exit_node)?;
             Ok(netmap_response(&view))
         }
@@ -510,7 +517,7 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
-            report_posture(coord, &request.name, &request, now)?;
+            report_posture(coord, &peer, &request, now)?;
             let view = coord.netmap_for(&request.name)?;
             println!("netmap {}", request.name);
             Ok(netmap_response(&view))
@@ -520,7 +527,7 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
-            report_posture(coord, &request.name, &request, now)?;
+            report_posture(coord, &peer, &request, now)?;
             let detail = admin::deny_json_for(coord, &request.name, now)?;
             Ok(Response {
                 ok: true,
@@ -533,7 +540,7 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
-            report_posture(coord, &request.name, &request, now)?;
+            report_posture(coord, &peer, &request, now)?;
             let detail =
                 deny_wait(coord, &request.name, request.deny_etag.as_deref(), stamp).await?;
             Ok(Response {
@@ -547,7 +554,7 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
-            report_posture(coord, &request.name, &request, now)?;
+            report_posture(coord, &peer, &request, now)?;
             let ask = request.grant.as_ref().ok_or_else(|| {
                 CoordError::Protocol("The grant request is not valid.".to_string())
             })?;
@@ -557,7 +564,13 @@ async fn dispatch(
         }
         "agent-grant-fetch" => {
             let peer = peer_node(coord, connection)?;
-            report_posture(coord, &peer, &request, now)?;
+            coord.stage_posture(
+                &peer,
+                request.os.as_deref(),
+                request.client_version.as_deref(),
+                now,
+            )?;
+            coord.reconcile_posture(now)?;
             match agent::fetch(coord, &peer, &request.name, now)? {
                 agent::Fetched::Pending(value) => detail_response(&value),
                 agent::Fetched::Issued(issued) => {

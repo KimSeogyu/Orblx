@@ -469,10 +469,12 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Store one self-report from the authenticated node channel.
+    /// Store one self-report after the node is enrolled.
     ///
-    /// `os` and `version` are self-reported. A text that is not a known token
-    /// clears that fact.
+    /// `os` and `version` are self-reported. An omitted field clears that fact.
+    /// A text that is not a known token also clears it. Last-seen is the
+    /// coordinator clock of this call. The caller must already know that `name`
+    /// is the authenticated peer.
     pub(crate) fn stage_posture(
         &self,
         name: &str,
@@ -481,8 +483,27 @@ impl Coordinator {
         now: SystemTime,
     ) -> Result<(), CoordError> {
         let mut inner = self.lock()?;
-        crate::posture::stage(&mut inner.posture, name, os, version, now)?;
+        if !inner.store.nodes().iter().any(|node| node.name == name) {
+            return Err(CoordError::Protocol("The node is not enrolled.".into()));
+        }
+        crate::posture::note_seen(&mut inner.posture, name, now)?;
+        crate::posture::apply_report(&mut inner.posture, name, os, version)?;
         crate::posture::save(&inner.state_dir, &inner.posture)
+    }
+
+    /// Accept a report only when `peer` is `requested`.
+    pub(crate) fn accept_peer_posture(
+        &self,
+        peer: &str,
+        requested: &str,
+        os: Option<&str>,
+        version: Option<&str>,
+        now: SystemTime,
+    ) -> Result<(), CoordError> {
+        if peer != requested {
+            return Err(CoordError::Peer);
+        }
+        self.stage_posture(peer, os, version, now)
     }
 
     /// Revoke tickets and issued grants that fail posture, and write one record per fall.
@@ -627,13 +648,31 @@ impl Coordinator {
         routes: &[String],
         now: SystemTime,
     ) -> Result<EnrollResult, CoordError> {
+        self.enroll_token_reported(name, secret, endpoints, routes, now, None, None)
+    }
+
+    /// Enroll with one token, then store the self-report for that node only.
+    ///
+    /// A bad token returns before any posture write. `os` and `version` apply
+    /// only to the name that `begin_enroll` accepted.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enroll_token_reported(
+        &self,
+        name: &str,
+        secret: &str,
+        endpoints: &[String],
+        routes: &[String],
+        now: SystemTime,
+        os: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<EnrollResult, CoordError> {
         let _ = SpiffeId::node(name)?;
         let mut inner = self.lock()?;
         reload(&mut inner)?;
         let plan = inner
             .store
             .begin_enroll(name, secret, now, endpoints, routes)?;
-        finish_enroll(&mut inner, plan, now)
+        finish_enroll(&mut inner, plan, now, os, version)
     }
 
     pub fn enroll_oidc(
@@ -645,6 +684,24 @@ impl Coordinator {
         routes: &[String],
         now: SystemTime,
     ) -> Result<EnrollResult, CoordError> {
+        self.enroll_oidc_reported(name, id_token, nonce, endpoints, routes, now, None, None)
+    }
+
+    /// Enroll with one OIDC token, then store the self-report for that node only.
+    ///
+    /// A bad token or an unapproved user returns before any posture write.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enroll_oidc_reported(
+        &self,
+        name: &str,
+        id_token: &str,
+        nonce: Option<&str>,
+        endpoints: &[String],
+        routes: &[String],
+        now: SystemTime,
+        os: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<EnrollResult, CoordError> {
         let _ = SpiffeId::node(name)?;
         let mut inner = self.lock()?;
         reload(&mut inner)?;
@@ -654,7 +711,7 @@ impl Coordinator {
         let plan = inner
             .store
             .begin_oidc(name, &login.subject, endpoints, routes)?;
-        finish_enroll(&mut inner, plan, now)
+        finish_enroll(&mut inner, plan, now, os, version)
     }
 
     /// Return the OIDC users and their nodes (W25-15).
@@ -1370,7 +1427,7 @@ impl Coordinator {
     ///
     /// The caller must not log the key or the ticket.
     ///
-    /// The function checks posture for `requester` again at issue time.
+    /// The posture check and the ticket issue hold one lock.
     pub(crate) fn issue_agent_material(
         &self,
         agent: &SpiffeId,
@@ -1380,8 +1437,36 @@ impl Coordinator {
         dest: orblx_identity::Ipv4Destination,
         deny: &DenySet,
     ) -> Result<AgentMaterial, CoordError> {
-        self.refuse_if_out_of_posture(requester, now)?;
-        let inner = self.lock()?;
+        let mut inner = self.lock()?;
+        let failure = {
+            let lock = crate::nodelock::read_store(&inner.state_dir)?;
+            let nodes = inner.store.nodes();
+            let node = nodes
+                .iter()
+                .find(|item| item.name == requester)
+                .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".into()))?;
+            crate::posture::blocked(&inner.policy, &inner.posture, node, &lock, now)?
+        };
+        if let Some(failure) = failure {
+            if let Some(audit) = crate::posture::latch_deny(&mut inner.posture, requester, &failure)
+            {
+                crate::posture::save(&inner.state_dir, &inner.posture)?;
+                let actor = coord_actor_of(&inner)?;
+                record(
+                    &mut inner,
+                    &actor,
+                    ConfigAction::PostureDeny,
+                    &audit.node,
+                    EMPTY_DIGEST,
+                    EMPTY_DIGEST,
+                    &audit.detail,
+                )?;
+                println!("coord posture deny {} {}", audit.node, audit.detail);
+            }
+            return Err(CoordError::Protocol(
+                "The node is out of posture.".to_string(),
+            ));
+        }
         let issued = inner.ca.issue(agent, now, ttl, deny)?;
         let ticket = ticket::issue_agent_ticket(
             &inner.state_dir,
@@ -1866,6 +1951,8 @@ fn finish_enroll(
     inner: &mut Inner,
     plan: crate::store::EnrollPlan,
     now: SystemTime,
+    os: Option<&str>,
+    version: Option<&str>,
 ) -> Result<EnrollResult, CoordError> {
     let id = SpiffeId::node(&plan.name)?;
     let issued = inner
@@ -1894,6 +1981,9 @@ fn finish_enroll(
         after,
         &detail,
     )?;
+    crate::posture::note_seen(&mut inner.posture, &stored.name, now)?;
+    crate::posture::apply_report(&mut inner.posture, &stored.name, os, version)?;
+    crate::posture::save(&inner.state_dir, &inner.posture)?;
     let view = sign_view(inner, &stored.name)?;
     let ticket = issue_ticket(inner, &stored.name, now)?;
     Ok(EnrollResult {

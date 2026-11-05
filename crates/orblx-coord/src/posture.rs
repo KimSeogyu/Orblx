@@ -123,15 +123,13 @@ pub(crate) fn save(dir: &std::path::Path, state: &PostureState) -> Result<(), Co
     write_text(&dir.join(FILE), &text, 0o600)
 }
 
-/// Store a self-report from the node channel.
+/// Stamp last-seen from one authenticated coordinator event.
 ///
-/// `os` and `version` of `None` leave the stored fact as it is.
-/// A text that is not a known token clears the fact, so the next check fails closed.
-pub(crate) fn stage(
+/// The caller has already checked that `name` is the authenticated peer and
+/// that the node is enrolled. A report body does not carry this clock.
+pub(crate) fn note_seen(
     state: &mut PostureState,
     name: &str,
-    os: Option<&str>,
-    version: Option<&str>,
     now: SystemTime,
 ) -> Result<(), CoordError> {
     let _ = SpiffeId::node(name)?;
@@ -139,13 +137,26 @@ pub(crate) fn stage(
         return Err(CoordError::State);
     }
     let row = state.nodes.entry(name.to_string()).or_default();
-    if let Some(os) = os {
-        row.os = clean_os(os);
-    }
-    if let Some(version) = version {
-        row.client_version = clean_version(version);
-    }
     row.last_seen_unix = Some(unix_secs(now)?);
+    Ok(())
+}
+
+/// Store one self-report on a row that `note_seen` already created.
+///
+/// An omitted field clears the stored fact. A text that is not a known token
+/// also clears it. This function does not set last-seen.
+pub(crate) fn apply_report(
+    state: &mut PostureState,
+    name: &str,
+    os: Option<&str>,
+    version: Option<&str>,
+) -> Result<(), CoordError> {
+    let row = state
+        .nodes
+        .get_mut(name)
+        .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".into()))?;
+    row.os = os.and_then(clean_os);
+    row.client_version = version.and_then(clean_version);
     Ok(())
 }
 
@@ -499,11 +510,21 @@ mod tests {
     fn enroll(
         coord: &Coordinator,
         name: &str,
+        os: Option<&str>,
+        version: Option<&str>,
         now: SystemTime,
     ) -> Option<crate::ticket::IssuedTicket> {
         let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
         let result = coord
-            .enroll_token(name, &token.secret, &[format!("{name}:443")], &[], now)
+            .enroll_token_reported(
+                name,
+                &token.secret,
+                &[format!("{name}:443")],
+                &[],
+                now,
+                os,
+                version,
+            )
             .unwrap();
         result.ticket
     }
@@ -559,14 +580,8 @@ mod tests {
         let scratch = Scratch::new();
         let now = SystemTime::now();
         let coord = open(&scratch.0, DESK);
-        coord
-            .stage_posture("a", Some("linux"), Some("0.1.0"), now)
-            .unwrap();
-        coord
-            .stage_posture("b", Some("linux"), Some("0.1.0"), now)
-            .unwrap();
-        assert!(enroll(&coord, "a", now).is_some());
-        assert!(enroll(&coord, "b", now).is_some());
+        assert!(enroll(&coord, "a", Some("linux"), Some("0.1.0"), now).is_some());
+        assert!(enroll(&coord, "b", Some("linux"), Some("0.1.0"), now).is_some());
         coord.reconcile_posture(now).unwrap();
         assert_eq!(tally(&scratch.0), (0, 0, 0));
         assert_eq!(grants_on(&coord, "b"), 1);
@@ -623,10 +638,7 @@ mod tests {
         let scratch = Scratch::new();
         let now = SystemTime::now();
         let coord = open(&scratch.0, DESK);
-        coord
-            .stage_posture("a", Some("not-an-os"), Some("0.1.0"), now)
-            .unwrap();
-        assert!(enroll(&coord, "a", now).is_none());
+        assert!(enroll(&coord, "a", Some("not-an-os"), Some("0.1.0"), now).is_none());
         coord.reconcile_posture(now).unwrap();
         assert_eq!(tally(&scratch.0), (1, 0, 0));
         coord.reconcile_posture(now).unwrap();
@@ -644,14 +656,8 @@ mod tests {
         let scratch = Scratch::new();
         let now = SystemTime::now();
         let coord = open(&scratch.0, DESK);
-        coord
-            .stage_posture("a", Some("windows"), Some("0.1.0"), now)
-            .unwrap();
-        coord
-            .stage_posture("b", Some("linux"), Some("0.1.0"), now)
-            .unwrap();
-        assert!(enroll(&coord, "a", now).is_none());
-        assert!(enroll(&coord, "b", now).is_some());
+        assert!(enroll(&coord, "a", Some("windows"), Some("0.1.0"), now).is_none());
+        assert!(enroll(&coord, "b", Some("linux"), Some("0.1.0"), now).is_some());
         let ask = GrantAsk {
             agent: "bot".to_string(),
             node: "b".to_string(),
@@ -690,14 +696,8 @@ mod tests {
           }]
         }"#;
         let coord = open(&scratch.0, policy);
-        coord
-            .stage_posture("a", Some("linux"), Some("0.1.0"), past)
-            .unwrap();
-        coord
-            .stage_posture("b", Some("linux"), Some("0.1.0"), past)
-            .unwrap();
-        assert!(enroll(&coord, "a", past).is_some());
-        assert!(enroll(&coord, "b", past).is_some());
+        assert!(enroll(&coord, "a", Some("linux"), Some("0.1.0"), past).is_some());
+        assert!(enroll(&coord, "b", Some("linux"), Some("0.1.0"), past).is_some());
         let later = SystemTime::now();
         coord.reconcile_posture(later).unwrap();
         assert_eq!(tally(&scratch.0), (0, 1, 0));
@@ -722,10 +722,7 @@ mod tests {
           }]
         }"#;
         let coord = open(&scratch.0, policy);
-        coord
-            .stage_posture("a", Some("linux"), Some("0.1.0"), now)
-            .unwrap();
-        assert!(enroll(&coord, "a", now).is_none());
+        assert!(enroll(&coord, "a", Some("linux"), Some("0.1.0"), now).is_none());
         coord.reconcile_posture(now).unwrap();
         coord.reconcile_posture(now).unwrap();
         assert_eq!(tally(&scratch.0), (1, 0, 0));
@@ -736,19 +733,21 @@ mod tests {
         let scratch = Scratch::new();
         let now = SystemTime::now();
         let coord = open(&scratch.0, DESK);
-        coord
-            .stage_posture("a", Some("linux"), Some("0.1.0"), now)
-            .unwrap();
-        coord
-            .stage_posture("b", Some("linux"), Some("0.1.0"), now)
-            .unwrap();
         let enrolled = {
             let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
             coord
-                .enroll_token("a", &token.secret, &["a:443".to_string()], &[], now)
+                .enroll_token_reported(
+                    "a",
+                    &token.secret,
+                    &["a:443".to_string()],
+                    &[],
+                    now,
+                    Some("linux"),
+                    Some("0.1.0"),
+                )
                 .unwrap()
         };
-        assert!(enroll(&coord, "b", now).is_some());
+        assert!(enroll(&coord, "b", Some("linux"), Some("0.1.0"), now).is_some());
         let ticket = enrolled.ticket.expect("the in-posture node gets a ticket");
         let leaf = orblx_identity::decode_certificate_pem(&enrolled.certificate_pem).unwrap();
         let trust = orblx_identity::TrustBundle::from_pem(&enrolled.trust_bundle_pem).unwrap();
@@ -818,14 +817,8 @@ mod tests {
         let scratch = Scratch::new();
         let now = SystemTime::now();
         let coord = open(&scratch.0, DESK);
-        coord
-            .stage_posture("a", Some("linux"), Some("0.1.0"), now)
-            .unwrap();
-        coord
-            .stage_posture("b", Some("linux"), Some("0.1.0"), now)
-            .unwrap();
-        assert!(enroll(&coord, "a", now).is_some());
-        assert!(enroll(&coord, "b", now).is_some());
+        assert!(enroll(&coord, "a", Some("linux"), Some("0.1.0"), now).is_some());
+        assert!(enroll(&coord, "b", Some("linux"), Some("0.1.0"), now).is_some());
         let ask = GrantAsk {
             agent: "bot".to_string(),
             node: "b".to_string(),
@@ -866,6 +859,135 @@ mod tests {
             )
             .is_err());
         assert_eq!(tally(&scratch.0), (1, 1, 0));
+    }
+
+    fn posture_file(dir: &Path) -> String {
+        fs::read_to_string(dir.join("posture.json")).unwrap_or_default()
+    }
+
+    fn posture_node_count(text: &str) -> usize {
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        value["nodes"]
+            .as_object()
+            .map(|nodes| nodes.len())
+            .unwrap_or(0)
+    }
+
+    fn fact(text: &str, name: &str, key: &str) -> Option<String> {
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        value["nodes"][name][key].as_str().map(str::to_string)
+    }
+
+    #[test]
+    fn an_unauthenticated_report_changes_nothing_and_writes_no_restore() {
+        let scratch = Scratch::new();
+        let now = SystemTime::now();
+        let coord = open(&scratch.0, DESK);
+        assert!(enroll(&coord, "a", Some("linux"), Some("0.1.0"), now).is_some());
+        assert!(enroll(&coord, "b", Some("linux"), Some("0.1.0"), now).is_some());
+        coord
+            .stage_posture("a", Some("windows"), Some("0.1.0"), now)
+            .unwrap();
+        coord.reconcile_posture(now).unwrap();
+        assert_eq!(tally(&scratch.0), (0, 1, 0));
+        let before = posture_file(&scratch.0);
+        assert!(coord
+            .enroll_token_reported(
+                "a",
+                "not-a-token",
+                &["a:443".to_string()],
+                &[],
+                now,
+                Some("linux"),
+                Some("0.1.0"),
+            )
+            .is_err());
+        assert!(coord
+            .enroll_token_reported(
+                "intruder",
+                "not-a-token",
+                &["intruder:443".to_string()],
+                &[],
+                now,
+                Some("linux"),
+                Some("0.1.0"),
+            )
+            .is_err());
+        assert_eq!(posture_file(&scratch.0), before);
+        coord.reconcile_posture(now).unwrap();
+        assert_eq!(tally(&scratch.0), (0, 1, 0));
+        assert!(!posture_file(&scratch.0).contains("intruder"));
+    }
+
+    #[test]
+    fn a_report_for_another_node_is_refused() {
+        let scratch = Scratch::new();
+        let now = SystemTime::now();
+        let coord = open(&scratch.0, DESK);
+        assert!(enroll(&coord, "a", Some("linux"), Some("0.1.0"), now).is_some());
+        assert!(enroll(&coord, "b", Some("linux"), Some("0.1.0"), now).is_some());
+        coord
+            .stage_posture("a", Some("windows"), Some("0.1.0"), now)
+            .unwrap();
+        coord.reconcile_posture(now).unwrap();
+        assert_eq!(tally(&scratch.0), (0, 1, 0));
+        let before = posture_file(&scratch.0);
+        let err = coord
+            .accept_peer_posture("b", "a", Some("linux"), Some("9.9.9"), now)
+            .unwrap_err();
+        assert!(matches!(err, crate::error::CoordError::Peer));
+        assert_eq!(posture_file(&scratch.0), before);
+        assert_eq!(fact(&before, "a", "os").as_deref(), Some("windows"));
+        coord.reconcile_posture(now).unwrap();
+        assert_eq!(tally(&scratch.0), (0, 1, 0));
+    }
+
+    #[test]
+    fn junk_names_do_not_consume_posture_capacity() {
+        let scratch = Scratch::new();
+        let now = SystemTime::now();
+        let coord = open(&scratch.0, DESK);
+        assert!(enroll(&coord, "a", Some("linux"), Some("0.1.0"), now).is_some());
+        assert!(enroll(&coord, "b", Some("linux"), Some("0.1.0"), now).is_some());
+        let before = posture_file(&scratch.0);
+        assert_eq!(posture_node_count(&before), 2);
+        for index in 0..5000 {
+            let name = format!("n{index}");
+            assert!(coord
+                .stage_posture(&name, Some("linux"), Some("0.1.0"), now)
+                .is_err());
+            assert!(coord
+                .accept_peer_posture("a", &name, Some("linux"), Some("0.1.0"), now)
+                .is_err());
+        }
+        assert_eq!(posture_file(&scratch.0), before);
+        assert_eq!(posture_node_count(&posture_file(&scratch.0)), 2);
+    }
+
+    #[test]
+    fn an_omitted_os_or_version_clears_the_stored_fact() {
+        let scratch = Scratch::new();
+        let now = SystemTime::now();
+        let coord = open(&scratch.0, DESK);
+        assert!(enroll(&coord, "a", Some("linux"), Some("0.1.0"), now).is_some());
+        assert!(enroll(&coord, "b", Some("linux"), Some("0.1.0"), now).is_some());
+        coord.stage_posture("a", None, Some("0.1.0"), now).unwrap();
+        let cleared = posture_file(&scratch.0);
+        assert!(fact(&cleared, "a", "os").is_none());
+        assert_eq!(
+            fact(&cleared, "a", "client_version").as_deref(),
+            Some("0.1.0")
+        );
+        coord.reconcile_posture(now).unwrap();
+        assert_eq!(tally(&scratch.0), (0, 1, 0));
+        assert_eq!(grants_on(&coord, "b"), 0);
+        coord.stage_posture("a", Some("linux"), None, now).unwrap();
+        let version = posture_file(&scratch.0);
+        assert_eq!(fact(&version, "a", "os").as_deref(), Some("linux"));
+        assert!(fact(&version, "a", "client_version").is_none());
+        coord.reconcile_posture(now).unwrap();
+        assert_eq!(tally(&scratch.0), (0, 1, 0));
+        assert!(coord.renew_node("a", now).unwrap().ticket.is_none());
     }
 
     fn nonce_count(text: &str) -> Vec<String> {

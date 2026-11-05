@@ -718,6 +718,7 @@ async fn node_connect(
 /// Fill the self-reported operating system and client version.
 ///
 /// `ORBLX_CLIENT_OS=unknown` and `ORBLX_CLIENT_VERSION=unknown` omit the fact.
+/// The coordinator clears a stored fact when the field is omitted.
 /// Any other set value is sent only when it is a known token.
 fn attach_posture(request: &mut Request) {
     request.os = reported_token("ORBLX_CLIENT_OS", std::env::consts::OS);

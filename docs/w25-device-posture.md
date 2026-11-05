@@ -20,11 +20,11 @@ The coordinator stores one row per node in `posture.json` (mode 0600) in the sta
 | `os` | Self-reported. This is not attestation. The node sends `std::env::consts::OS`, or `ORBLX_CLIENT_OS` when that variable is set. | The node sent no value, or the text is not a known token. |
 | `clientVersion` | Self-reported. This is not attestation. The node sends the package version, or `ORBLX_CLIENT_VERSION` when that variable is set. | The node sent no value, or the text has no leading `major.minor.patch`. |
 | `nodeLock` | Coordinator fact. The node-lock store says whether the current key set accepts the owner signature. Node lock off is `unsigned`. That value is known, so `nodeLock == signed` fails closed. | Node lock is on and the key set does not load. |
-| `lastSeen` | Coordinator fact. The age is the coordinator clock minus the last authenticated node message. | The node has no stored report. |
+| `lastSeen` | Coordinator fact. The age is the coordinator clock minus the last authenticated coordinator event for that node. A report body does not set this clock. | The node has no authenticated coordinator event. |
 
 Known `os` tokens: `linux`, `macos`, `windows`, `freebsd`, `openbsd`, `ios`, `android`.
 
-`ORBLX_CLIENT_OS=unknown` and `ORBLX_CLIENT_VERSION=unknown` omit that fact. A later message that omits the field leaves the stored fact as it is. A message that sends a bad token clears the fact.
+`ORBLX_CLIENT_OS=unknown` and `ORBLX_CLIENT_VERSION=unknown` omit that fact. An omitted field clears the stored fact, so the next check fails closed. A bad token also clears the fact.
 
 The version check uses the leading `major.minor.patch`. The suffix `-rc.3-dev` does not change the numbers.
 
@@ -78,6 +78,10 @@ Issued agent grants of an out node are marked revoked and their nonces go throug
 | `posture::tests::an_agent_grant_request_denies_once_while_the_node_is_out` | REAL | An agent grant request while the node is out writes exactly 1 `posture-deny`. A second request adds 0. |
 | `posture::tests::a_last_seen_age_past_the_limit_revokes_once` | REAL | A report older than the limit writes exactly 1 `posture-revoke` and removes the grant. A second check stays at 1. |
 | `posture::tests::node_lock_off_fails_a_rule_that_requires_a_signature` | REAL | Node lock off is known `unsigned`. `nodeLock == signed` fails closed: the coordinator withholds the ticket and writes exactly 1 `posture-deny`. |
+| `posture::tests::an_unauthenticated_report_changes_nothing_and_writes_no_restore` | REAL | A bad enroll token does not change `posture.json` and writes no `posture-restore`. |
+| `posture::tests::a_report_for_another_node_is_refused` | REAL | Peer `b` cannot store a report for fallen node `a`. `a` stays `windows` and the restore count stays 0. |
+| `posture::tests::junk_names_do_not_consume_posture_capacity` | REAL | 5000 names that are not enrolled add 0 rows. |
+| `posture::tests::an_omitted_os_or_version_clears_the_stored_fact` | REAL | An omitted OS clears the stored OS. An omitted client version clears the stored version. The node then fails closed. |
 | `the_siem_verifier_knows_each_action_code` | REAL | Codes 43, 44, and 45 match `posture-deny`, `posture-revoke`, and `posture-restore` in the SIEM list. |
 | `scripts/proof/device-posture.sh` | [C] | Enroll, one OS fall, a second fall, and one unknown OS. Exact record counts. Not run on this host. |
 
@@ -104,6 +108,8 @@ The script also checks that the audit chain verifies, that `orblx policy test` p
 - One ticket and the projected SVID close every open session of that node. The close is not limited to the failing port.
 - A return to posture writes one `posture-restore` record. Old ticket nonces stay denied.
 - The stored deny file does not list the node SVID. The peer deny projection does. An owner revoke of that SVID is a separate stored entry.
-- A pending agent grant is not issued while the node is out. The issue check runs again at fetch time. The first refusal in that fall writes `posture-deny` when the fall has no deny record yet.
+- A pending agent grant is not issued while the node is out. The posture check and the ticket issue hold one lock. The first refusal in that fall writes `posture-deny` when the fall has no deny record yet.
+- A posture report is stored only after authentication, and only for that peer. Last-seen changes only on that authenticated coordinator event.
+- An omitted `os` or `clientVersion` clears the stored fact.
 - Node lock off is `unsigned`. `nodeLock == signed` fails closed until an owner signs the node.
 - `os` and `clientVersion` are self-reported. They are not attestation.

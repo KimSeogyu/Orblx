@@ -29,7 +29,7 @@ WORK="$(mktemp -d)"
 ENV_FILE="$WORK/env"
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$PROOF_LIB_DIR/proof-lock.sh"
-PROOF_MIN_FREE_GIB=15
+PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap proof_lock_end EXIT
 proof_lock_take "device-posture" "$DPPROOF_PROJECT"
 # shellcheck source=scripts/proof/compose-clean.sh
@@ -94,7 +94,7 @@ grant_count() {
     --coord "$COORD" \
     --bundle /var/lib/orblx/bundle.pem \
     --state /var/lib/orblx)"
-  printf '%s\n' "$out" | awk '/^grants /{print $2; exit}'
+  printf '%s\n' "$out" | read_all awk '/^grants / && !seen {print $2; seen = 1}'
 }
 
 audit_counts() {
@@ -172,7 +172,7 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 dc exec -T coord test -s /var/lib/orblx/trust-bundle.pem || fail "no trust bundle"
-coord_ip="$(dc run --rm --no-deps -T --entrypoint getent a ahostsv4 coord | awk '{print $1; exit}')"
+coord_ip="$(dc run --rm --no-deps -T --entrypoint getent a ahostsv4 coord | read_all awk 'NR == 1 {print $1}')"
 COORD="${coord_ip}:443"
 echo "coord ${COORD}"
 

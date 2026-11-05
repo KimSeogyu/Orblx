@@ -275,7 +275,8 @@ fn host_from_prefix_32(cidr: &str) -> Result<Ipv4Addr, IdentityError> {
 
 /// Return the ticket nonce from version-1 ticket bytes.
 ///
-/// The caller must not write the nonce to a log.
+/// This reads the existing ticket body. It checks no signature, creates no key,
+/// and adds no primitive. The caller must not write the nonce to a log.
 pub fn ticket_nonce(ticket_bytes: &[u8]) -> Result<[u8; 16], IdentityError> {
     if ticket_bytes.len() < SIGNATURE_LEN + 1 {
         return Err(IdentityError::Ticket);
