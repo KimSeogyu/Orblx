@@ -10,7 +10,8 @@
 //! they already poll, so open sessions close on that path. The SVID is not
 //! stored in the deny file. The node can still reach the coordinator and report
 //! a recovery. One `posture-deny` or `posture-revoke` record is written for each
-//! fall, not for each check.
+//! fall, not for each check. One `posture-restore` record is written for each
+//! return to posture. Old ticket nonces stay in the deny file.
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -83,9 +84,16 @@ struct RowPlan {
 
 /// One audit row. The detail has no secret and no ticket nonce.
 pub(crate) struct PostureAudit {
-    pub deny: bool,
+    pub kind: PostureKind,
     pub node: String,
     pub detail: String,
+}
+
+/// The posture audit action for one row.
+pub(crate) enum PostureKind {
+    Deny,
+    Revoke,
+    Restore,
 }
 
 pub(crate) fn load(dir: &std::path::Path) -> Result<PostureState, CoordError> {
@@ -229,10 +237,21 @@ pub(crate) fn commit(
     for row in &work.rows {
         let node = state.nodes.entry(row.name.clone()).or_default();
         if !row.was_out {
-            if !node.block_key.is_empty() || node.deny_latched || node.revoke_latched {
+            let was_out = !node.block_key.is_empty() || node.deny_latched || node.revoke_latched;
+            if was_out {
+                let rule = if node.block_key.is_empty() {
+                    "restored".to_string()
+                } else {
+                    format!("rule {}", node.block_key)
+                };
                 node.block_key.clear();
                 node.deny_latched = false;
                 node.revoke_latched = false;
+                audits.push(PostureAudit {
+                    kind: PostureKind::Restore,
+                    node: row.name.clone(),
+                    detail: rule,
+                });
             }
             continue;
         }
@@ -243,14 +262,14 @@ pub(crate) fn commit(
             node.revoke_latched = true;
             let ticket = usize::from(row.was_live);
             audits.push(PostureAudit {
-                deny: false,
+                kind: PostureKind::Revoke,
                 node: row.name.clone(),
                 detail: format!("rule {} ticket {ticket} grants {grants}", row.block_key),
             });
         } else if !node.deny_latched && !node.revoke_latched {
             node.deny_latched = true;
             audits.push(PostureAudit {
-                deny: true,
+                kind: PostureKind::Deny,
                 node: row.name.clone(),
                 detail: format!("rule {} attr blocked reason mismatch", row.block_key),
             });
@@ -277,7 +296,7 @@ pub(crate) fn latch_deny(
     }
     row.deny_latched = true;
     Some(PostureAudit {
-        deny: true,
+        kind: PostureKind::Deny,
         node: name.to_string(),
         detail: format!(
             "rule {} attr {} reason {}",
@@ -489,7 +508,7 @@ mod tests {
         result.ticket
     }
 
-    fn tally(dir: &Path) -> (usize, usize) {
+    fn tally(dir: &Path) -> (usize, usize, usize) {
         let verified = verify_config_file(&dir.join(CONFIG_AUDIT_FILE)).unwrap();
         let deny = verified
             .records
@@ -501,7 +520,12 @@ mod tests {
             .iter()
             .filter(|record| record.event.action == ConfigAction::PostureRevoke)
             .count();
-        (deny, revoke)
+        let restore = verified
+            .records
+            .iter()
+            .filter(|record| record.event.action == ConfigAction::PostureRestore)
+            .count();
+        (deny, revoke, restore)
     }
 
     fn grants_on(coord: &Coordinator, name: &str) -> usize {
@@ -544,16 +568,16 @@ mod tests {
         assert!(enroll(&coord, "a", now).is_some());
         assert!(enroll(&coord, "b", now).is_some());
         coord.reconcile_posture(now).unwrap();
-        assert_eq!(tally(&scratch.0), (0, 0));
+        assert_eq!(tally(&scratch.0), (0, 0, 0));
         assert_eq!(grants_on(&coord, "b"), 1);
 
         coord
             .stage_posture("a", Some("windows"), Some("0.1.0"), now)
             .unwrap();
         coord.reconcile_posture(now).unwrap();
-        assert_eq!(tally(&scratch.0), (0, 1));
+        assert_eq!(tally(&scratch.0), (0, 1, 0));
         coord.reconcile_posture(now).unwrap();
-        assert_eq!(tally(&scratch.0), (0, 1));
+        assert_eq!(tally(&scratch.0), (0, 1, 0));
         assert_eq!(grants_on(&coord, "b"), 0);
 
         let stored = crate::admin::deny_json(&coord, now).unwrap();
@@ -573,9 +597,12 @@ mod tests {
             .stage_posture("a", Some("linux"), Some("0.1.0"), now)
             .unwrap();
         coord.reconcile_posture(now).unwrap();
+        assert_eq!(tally(&scratch.0), (0, 1, 1));
+        let kept = nonce_count(&crate::admin::deny_json(&coord, now).unwrap());
+        assert_eq!(kept, nonces);
         assert!(coord.renew_node("a", now).unwrap().ticket.is_some());
         coord.reconcile_posture(now).unwrap();
-        assert_eq!(tally(&scratch.0), (0, 1));
+        assert_eq!(tally(&scratch.0), (0, 1, 1));
         assert_eq!(grants_on(&coord, "b"), 1);
 
         coord
@@ -583,7 +610,7 @@ mod tests {
             .unwrap();
         coord.reconcile_posture(now).unwrap();
         coord.reconcile_posture(now).unwrap();
-        assert_eq!(tally(&scratch.0), (0, 2));
+        assert_eq!(tally(&scratch.0), (0, 2, 1));
         assert_eq!(grants_on(&coord, "b"), 0);
         assert_eq!(
             nonce_count(&crate::admin::deny_json(&coord, now).unwrap()).len(),
@@ -601,15 +628,15 @@ mod tests {
             .unwrap();
         assert!(enroll(&coord, "a", now).is_none());
         coord.reconcile_posture(now).unwrap();
-        assert_eq!(tally(&scratch.0), (1, 0));
+        assert_eq!(tally(&scratch.0), (1, 0, 0));
         coord.reconcile_posture(now).unwrap();
         coord
             .stage_posture("a", Some("not-an-os"), Some("0.1.0"), now)
             .unwrap();
         coord.reconcile_posture(now).unwrap();
-        assert_eq!(tally(&scratch.0), (1, 0));
+        assert_eq!(tally(&scratch.0), (1, 0, 0));
         assert!(coord.renew_node("a", now).unwrap().ticket.is_none());
-        assert_eq!(tally(&scratch.0), (1, 0));
+        assert_eq!(tally(&scratch.0), (1, 0, 0));
     }
 
     #[test]
@@ -634,11 +661,11 @@ mod tests {
             path_prefix: None,
         };
         assert!(crate::agent::request(&coord, "a", &ask, now).is_err());
-        assert_eq!(tally(&scratch.0), (1, 0));
+        assert_eq!(tally(&scratch.0), (1, 0, 0));
         assert!(crate::agent::request(&coord, "a", &ask, now).is_err());
-        assert_eq!(tally(&scratch.0), (1, 0));
+        assert_eq!(tally(&scratch.0), (1, 0, 0));
         coord.reconcile_posture(now).unwrap();
-        assert_eq!(tally(&scratch.0), (1, 0));
+        assert_eq!(tally(&scratch.0), (1, 0, 0));
     }
 
     #[test]
@@ -673,9 +700,9 @@ mod tests {
         assert!(enroll(&coord, "b", past).is_some());
         let later = SystemTime::now();
         coord.reconcile_posture(later).unwrap();
-        assert_eq!(tally(&scratch.0), (0, 1));
+        assert_eq!(tally(&scratch.0), (0, 1, 0));
         coord.reconcile_posture(later).unwrap();
-        assert_eq!(tally(&scratch.0), (0, 1));
+        assert_eq!(tally(&scratch.0), (0, 1, 0));
         assert_eq!(grants_on(&coord, "b"), 0);
     }
 
@@ -701,7 +728,144 @@ mod tests {
         assert!(enroll(&coord, "a", now).is_none());
         coord.reconcile_posture(now).unwrap();
         coord.reconcile_posture(now).unwrap();
-        assert_eq!(tally(&scratch.0), (1, 0));
+        assert_eq!(tally(&scratch.0), (1, 0, 0));
+    }
+
+    #[test]
+    fn a_peer_refuses_data_and_a_new_handshake_and_the_node_can_still_report() {
+        let scratch = Scratch::new();
+        let now = SystemTime::now();
+        let coord = open(&scratch.0, DESK);
+        coord
+            .stage_posture("a", Some("linux"), Some("0.1.0"), now)
+            .unwrap();
+        coord
+            .stage_posture("b", Some("linux"), Some("0.1.0"), now)
+            .unwrap();
+        let enrolled = {
+            let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+            coord
+                .enroll_token("a", &token.secret, &["a:443".to_string()], &[], now)
+                .unwrap()
+        };
+        assert!(enroll(&coord, "b", now).is_some());
+        let ticket = enrolled.ticket.expect("the in-posture node gets a ticket");
+        let leaf = orblx_identity::decode_certificate_pem(&enrolled.certificate_pem).unwrap();
+        let trust = orblx_identity::TrustBundle::from_pem(&enrolled.trust_bundle_pem).unwrap();
+        let verifier =
+            orblx_identity::TicketVerifier::from_public_pem(&ticket.verifier_pem).unwrap();
+        let key = orblx_crypto::TicketKey::new(
+            verifier,
+            ticket.mac_key,
+            std::time::UNIX_EPOCH + Duration::from_secs(ticket.not_before),
+            std::time::UNIX_EPOCH + Duration::from_secs(ticket.not_after),
+        )
+        .unwrap();
+        let ring = orblx_crypto::TicketRing::single(key, &ticket.svid_ca_pub).unwrap();
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45;
+        packet[3] = 20;
+        let empty = orblx_identity::DenySet::empty();
+        let mut open_session = orblx_datapath::PeerGate::new();
+        open_session.bind_leaf(&trust, &leaf, now, &empty).unwrap();
+        let hash = open_session
+            .admit_ticket(&ring, &ticket.bytes, &ticket.mac, now, &empty)
+            .unwrap();
+        let frame = open_session.encode_data(1, 1, hash, &packet).unwrap();
+        assert!(open_session.payload_from_data(&frame, now, &empty).is_ok());
+
+        coord
+            .stage_posture("a", Some("windows"), Some("0.1.0"), now)
+            .unwrap();
+        coord.reconcile_posture(now).unwrap();
+        assert_eq!(tally(&scratch.0), (0, 1, 0));
+        assert!(coord.renew_node("a", now).unwrap().ticket.is_none());
+        assert_eq!(tally(&scratch.0), (0, 1, 0));
+
+        let peer_text = crate::admin::deny_json_for(&coord, "b", now).unwrap();
+        let mut peer_deny = orblx_identity::DenySet::empty();
+        peer_deny.apply_json(peer_text.as_bytes()).unwrap();
+        let mut handshake = orblx_datapath::PeerGate::new();
+        assert!(handshake.bind_leaf(&trust, &leaf, now, &peer_deny).is_err());
+        assert!(open_session
+            .payload_from_data(&frame, now, &peer_deny)
+            .is_err());
+
+        let stored = crate::admin::deny_json(&coord, now).unwrap();
+        let mut coord_deny = orblx_identity::DenySet::empty();
+        coord_deny.apply_json(stored.as_bytes()).unwrap();
+        assert!(trust.authenticate_leaf(&leaf, now, &coord_deny).is_ok());
+        coord
+            .stage_posture("a", Some("windows"), Some("0.1.0"), now)
+            .unwrap();
+        coord.reconcile_posture(now).unwrap();
+        assert_eq!(tally(&scratch.0), (0, 1, 0));
+
+        coord
+            .stage_posture("a", Some("linux"), Some("0.1.0"), now)
+            .unwrap();
+        coord.reconcile_posture(now).unwrap();
+        assert_eq!(tally(&scratch.0), (0, 1, 1));
+        let kept = crate::admin::deny_json(&coord, now).unwrap();
+        assert!(kept.contains(&nonce_count(&stored)[0]));
+        let mut still = orblx_identity::DenySet::empty();
+        still.apply_json(kept.as_bytes()).unwrap();
+        assert!(open_session.payload_from_data(&frame, now, &still).is_err());
+    }
+
+    #[test]
+    fn a_pending_agent_grant_is_not_issued_while_the_node_is_out() {
+        let scratch = Scratch::new();
+        let now = SystemTime::now();
+        let coord = open(&scratch.0, DESK);
+        coord
+            .stage_posture("a", Some("linux"), Some("0.1.0"), now)
+            .unwrap();
+        coord
+            .stage_posture("b", Some("linux"), Some("0.1.0"), now)
+            .unwrap();
+        assert!(enroll(&coord, "a", now).is_some());
+        assert!(enroll(&coord, "b", now).is_some());
+        let ask = GrantAsk {
+            agent: "bot".to_string(),
+            node: "b".to_string(),
+            service: "web".to_string(),
+            port: 22,
+            ttl_secs: 30,
+            path_prefix: None,
+        };
+        let reply = crate::agent::request(&coord, "a", &ask, now).unwrap();
+        let id = reply["id"].as_str().unwrap();
+        let owner = SpiffeId::node("owner").unwrap();
+        crate::agent::approve(&coord, id, owner.as_uri(), now).unwrap();
+        coord
+            .stage_posture("a", Some("windows"), Some("0.1.0"), now)
+            .unwrap();
+        coord.reconcile_posture(now).unwrap();
+        assert_eq!(tally(&scratch.0), (0, 1, 0));
+        assert!(crate::agent::fetch(&coord, "a", id, now).is_err());
+        assert_eq!(tally(&scratch.0), (1, 1, 0));
+        assert!(crate::agent::fetch(&coord, "a", id, now).is_err());
+        assert_eq!(tally(&scratch.0), (1, 1, 0));
+        let listed = crate::agent::list(&coord, now).unwrap();
+        let state = listed["grants"][0]["state"].as_str().unwrap();
+        assert_eq!(state, "approved");
+        let dest = orblx_identity::Ipv4Destination {
+            addr: "100.64.0.2".parse().unwrap(),
+            proto: 6,
+            port: 22,
+        };
+        assert!(coord
+            .issue_agent_material(
+                &SpiffeId::agent("bot").unwrap(),
+                "a",
+                now,
+                Duration::from_secs(30),
+                dest,
+                &orblx_identity::DenySet::empty(),
+            )
+            .is_err());
+        assert_eq!(tally(&scratch.0), (1, 1, 0));
     }
 
     fn nonce_count(text: &str) -> Vec<String> {

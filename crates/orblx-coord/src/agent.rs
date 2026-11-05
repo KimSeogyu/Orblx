@@ -254,7 +254,7 @@ pub(crate) fn fetch(
         proto: 6,
         port: record.port,
     };
-    let material = coord.issue_agent_material(&agent, now, ttl, dest, &deny)?;
+    let material = coord.issue_agent_material(&agent, requester, now, ttl, dest, &deny)?;
     let expires = now_unix.saturating_add(record.ttl_secs);
     let grant = AgentGrant {
         version: GRANT_VERSION,

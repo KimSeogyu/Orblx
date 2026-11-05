@@ -112,6 +112,8 @@ pub enum ConfigAction {
     PostureDeny,
     /// The coordinator revoked a grant or a ticket because posture failed.
     PostureRevoke,
+    /// The coordinator recorded one return to posture. One record for each recovery.
+    PostureRestore,
 }
 
 impl ConfigAction {
@@ -122,7 +124,7 @@ impl ConfigAction {
     pub const RESERVED_CODES: [u8; 5] = [37, 39, 40, 41, 42];
 
     /// Every action in code order.
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 40] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -162,6 +164,7 @@ impl ConfigAction {
         Self::RouteFailover,
         Self::PostureDeny,
         Self::PostureRevoke,
+        Self::PostureRestore,
     ];
 
     /// Return the stable action token.
@@ -207,6 +210,7 @@ impl ConfigAction {
             Self::RouteFailover => "route-failover",
             Self::PostureDeny => "posture-deny",
             Self::PostureRevoke => "posture-revoke",
+            Self::PostureRestore => "posture-restore",
         }
     }
 
@@ -259,6 +263,7 @@ impl ConfigAction {
             Self::RouteFailover => 38,
             Self::PostureDeny => 43,
             Self::PostureRevoke => 44,
+            Self::PostureRestore => 45,
         }
     }
 

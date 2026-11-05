@@ -3,11 +3,11 @@
 # The host is REAL. coord, a, b, and c are [C] containers.
 # Gates:
 #   1. orblx policy test prints the three posture lines and policy ok.
-#   2. a and b enroll in posture: posture-deny 0, posture-revoke 0, grants on b 1, ticket nonces 0.
-#   3. a reports windows: posture-revoke 1, grants on b 0, ticket nonces 1. A second report stays at 1.
-#   4. a reports linux and renews: counts stay 0 and 1, grants on b 1, ticket nonces 1.
-#   5. a reports windows again: posture-revoke 2, grants on b 0, ticket nonces 2.
-#   6. c enrolls with an unknown OS: posture-deny 1, no ticket file. A second report stays at 1.
+#   2. a and b enroll in posture: deny 0, revoke 0, restore 0, grants on b 1, ticket nonces 0.
+#   3. a reports windows: revoke 1, grants on b 0, ticket nonces 1. A second report stays at 1.
+#   4. a reports linux and renews: restore 1, revoke stays 1, grants on b 1, ticket nonces stay 1.
+#   5. a reports windows again: revoke 2, restore stays 1, grants on b 0, ticket nonces 2.
+#   6. c enrolls with an unknown OS: deny 1, no ticket file. A second report stays at 1.
 #   7. The audit chain verifies. Logs and the audit file have 0 secret hits.
 # The script prints proof_ok. It does not print a token, a key, or a ticket nonce.
 # Environment:
@@ -99,15 +99,18 @@ grant_count() {
 
 audit_counts() {
   dc exec -T coord python3 -c 'import json
-deny=revoke=0
+deny=revoke=restore=0
 for line in open("/var/lib/orblx/config-audit.jsonl"):
     row=json.loads(line)
     if row.get("action")=="posture-deny":
         deny+=1
     elif row.get("action")=="posture-revoke":
         revoke+=1
+    elif row.get("action")=="posture-restore":
+        restore+=1
 print(deny)
-print(revoke)'
+print(revoke)
+print(restore)'
 }
 
 nonce_count() {
@@ -126,6 +129,12 @@ expect_pair() {
   local label="$1" got1="$2" want1="$3" got2="$4" want2="$5"
   echo "${label} ${got1} ${got2} want ${want1} ${want2}"
   [[ "$got1" == "$want1" && "$got2" == "$want2" ]] || fail "${label}"
+}
+
+expect_counts() {
+  local label="$1" got_deny="$2" want_deny="$3" got_revoke="$4" want_revoke="$5" got_restore="$6" want_restore="$7"
+  echo "${label} deny ${got_deny} revoke ${got_revoke} restore ${got_restore} want ${want_deny} ${want_revoke} ${want_restore}"
+  [[ "$got_deny" == "$want_deny" && "$got_revoke" == "$want_revoke" && "$got_restore" == "$want_restore" ]] || fail "${label}"
 }
 
 echo "=== [REAL] host ==="
@@ -175,7 +184,7 @@ done
 enroll_node a
 enroll_node b
 mapfile -t counts < <(audit_counts)
-expect_pair "after enroll" "${counts[0]}" 0 "${counts[1]}" 0
+expect_counts "after enroll" "${counts[0]}" 0 "${counts[1]}" 0 "${counts[2]}" 0
 grants="$(grant_count)"
 echo "grants_b ${grants} want 1"
 [[ "$grants" == 1 ]] || fail "grants after enroll"
@@ -187,7 +196,7 @@ dc run --rm --no-deps -T -e ORBLX_CLIENT_OS=windows a coord renew \
   --coord "$COORD" --bundle /var/lib/orblx/bundle.pem --state /var/lib/orblx \
   | grep -E '^(enrolled|name|ticket)'
 mapfile -t counts < <(audit_counts)
-expect_pair "after windows" "${counts[0]}" 0 "${counts[1]}" 1
+expect_counts "after windows" "${counts[0]}" 0 "${counts[1]}" 1 "${counts[2]}" 0
 grants="$(grant_count)"
 echo "grants_b ${grants} want 0"
 [[ "$grants" == 0 ]] || fail "grants after windows"
@@ -199,7 +208,7 @@ dc run --rm --no-deps -T -e ORBLX_CLIENT_OS=windows a coord renew \
   --coord "$COORD" --bundle /var/lib/orblx/bundle.pem --state /var/lib/orblx \
   | grep -E '^(enrolled|name|ticket)'
 mapfile -t counts < <(audit_counts)
-expect_pair "windows again" "${counts[0]}" 0 "${counts[1]}" 1
+expect_counts "windows again" "${counts[0]}" 0 "${counts[1]}" 1 "${counts[2]}" 0
 mapfile -t nonces < <(nonce_count)
 expect_pair "nonces windows again" "${nonces[0]}" 1 "${nonces[1]}" 0
 
@@ -208,7 +217,7 @@ dc run --rm --no-deps -T -e ORBLX_CLIENT_OS=linux a coord renew \
   --coord "$COORD" --bundle /var/lib/orblx/bundle.pem --state /var/lib/orblx \
   | grep -E '^(enrolled|name|ticket)'
 mapfile -t counts < <(audit_counts)
-expect_pair "after recovery" "${counts[0]}" 0 "${counts[1]}" 1
+expect_counts "after recovery" "${counts[0]}" 0 "${counts[1]}" 1 "${counts[2]}" 1
 grants="$(grant_count)"
 echo "grants_b ${grants} want 1"
 [[ "$grants" == 1 ]] || fail "grants after recovery"
@@ -220,7 +229,7 @@ dc run --rm --no-deps -T -e ORBLX_CLIENT_OS=windows a coord renew \
   --coord "$COORD" --bundle /var/lib/orblx/bundle.pem --state /var/lib/orblx \
   | grep -E '^(enrolled|name|ticket)'
 mapfile -t counts < <(audit_counts)
-expect_pair "second fall" "${counts[0]}" 0 "${counts[1]}" 2
+expect_counts "second fall" "${counts[0]}" 0 "${counts[1]}" 2 "${counts[2]}" 1
 grants="$(grant_count)"
 echo "grants_b ${grants} want 0"
 [[ "$grants" == 0 ]] || fail "grants after second fall"
@@ -237,13 +246,13 @@ dc run --rm --no-deps -T -e ORBLX_CLIENT_OS=unknown c coord enroll \
   --endpoint c:443 | grep -E '^(enrolled|name|ticket)'
 dc run --rm --no-deps -T c test ! -f /var/lib/orblx/ticket.bin
 mapfile -t counts < <(audit_counts)
-expect_pair "unknown enroll" "${counts[0]}" 1 "${counts[1]}" 2
+expect_counts "unknown enroll" "${counts[0]}" 1 "${counts[1]}" 2 "${counts[2]}" 1
 echo "=== [C] c reports again while still out ==="
 dc run --rm --no-deps -T -e ORBLX_CLIENT_OS=unknown c coord renew \
   --coord "$COORD" --bundle /var/lib/orblx/bundle.pem --state /var/lib/orblx \
   | grep -E '^(enrolled|name|ticket)'
 mapfile -t counts < <(audit_counts)
-expect_pair "unknown again" "${counts[0]}" 1 "${counts[1]}" 2
+expect_counts "unknown again" "${counts[0]}" 1 "${counts[1]}" 2 "${counts[2]}" 1
 mapfile -t nonces < <(nonce_count)
 expect_pair "nonces after unknown" "${nonces[0]}" 2 "${nonces[1]}" 0
 

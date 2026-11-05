@@ -512,10 +512,10 @@ impl Coordinator {
         crate::posture::save(&inner.state_dir, &inner.posture)?;
         let actor = coord_actor_of(&inner)?;
         for audit in audits {
-            let action = if audit.deny {
-                ConfigAction::PostureDeny
-            } else {
-                ConfigAction::PostureRevoke
+            let action = match audit.kind {
+                crate::posture::PostureKind::Deny => ConfigAction::PostureDeny,
+                crate::posture::PostureKind::Revoke => ConfigAction::PostureRevoke,
+                crate::posture::PostureKind::Restore => ConfigAction::PostureRestore,
             };
             record(
                 &mut inner,
@@ -1369,14 +1369,18 @@ impl Coordinator {
     /// Issue one agent SVID and one agent JIT ticket.
     ///
     /// The caller must not log the key or the ticket.
+    ///
+    /// The function checks posture for `requester` again at issue time.
     pub(crate) fn issue_agent_material(
         &self,
         agent: &SpiffeId,
+        requester: &str,
         now: SystemTime,
         ttl: Duration,
         dest: orblx_identity::Ipv4Destination,
         deny: &DenySet,
     ) -> Result<AgentMaterial, CoordError> {
+        self.refuse_if_out_of_posture(requester, now)?;
         let inner = self.lock()?;
         let issued = inner.ca.issue(agent, now, ttl, deny)?;
         let ticket = ticket::issue_agent_ticket(
