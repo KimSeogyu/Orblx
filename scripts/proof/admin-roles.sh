@@ -7,7 +7,7 @@
 # Environment:
 #   RBAC_PROJECT  Compose project (default orblx-admin-roles).
 #   RBAC_IMAGE    Image tag (default orblx-admin-roles:local).
-#   RBAC_BIN      An orblx binary. Without it, the script builds target/debug/orblx.
+#   RBAC_BIN      An orblx binary. Without it, the script builds target/release/orblx.
 set -euo pipefail
 # shellcheck source=scripts/proof/pipe-lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
