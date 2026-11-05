@@ -89,7 +89,7 @@ cleanup() {
 }
 trap 'cleanup' EXIT
 PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
-proof_lock_take "sym-sym-direct:${PROJECT}" "$PREFIX" "${PROJECT}-"
+proof_lock_take "sym-sym-direct:${PROJECT}" "${PROJECT}"
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$ROOT/scripts/proof/compose-clean.sh"
 proof_compose_clean "$PROJECT" || exit 1
