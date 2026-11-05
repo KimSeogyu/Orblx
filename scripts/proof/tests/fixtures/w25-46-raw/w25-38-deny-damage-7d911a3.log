@@ -1,0 +1,390 @@
+proof_context w25-38-deny-damage phase queued time 2026-10-31T23:09:15.875+0900 load 0.84/1.21/1.16 other_orblx_containers 3 groups orblx-ssh:3
+proof_lock w25-38-deny-damage waiting for lock, 1 s, position 9, at 2026-10-31T23:09:16.888+0900, file /workspace/.orblx-proof.lock, holder: label=ssh-renew pid=652125 user=root cwd=/workspace/orblx-w25-40 since=2026-10-31T23:05:43.114+0900 
+proof_lock w25-38-deny-damage waiting for lock, 31 s, position 9, at 2026-10-31T23:09:47.087+0900, file /workspace/.orblx-proof.lock, holder: label=ssh-renew pid=652125 user=root cwd=/workspace/orblx-w25-40 since=2026-10-31T23:05:43.114+0900 
+proof_lock w25-38-deny-damage waiting for lock, 61 s, position 9, at 2026-10-31T23:10:17.339+0900, file /workspace/.orblx-proof.lock, holder: label=ssh-renew pid=652125 user=root cwd=/workspace/orblx-w25-40 since=2026-10-31T23:05:43.114+0900 
+proof_lock w25-38-deny-damage waiting for lock, 91 s, position 9, at 2026-10-31T23:10:47.512+0900, file /workspace/.orblx-proof.lock, holder: label=ssh-renew pid=652125 user=root cwd=/workspace/orblx-w25-40 since=2026-10-31T23:05:43.114+0900 
+proof_lock w25-38-deny-damage waiting for lock, 121 s, position 9, at 2026-10-31T23:11:17.688+0900, file /workspace/.orblx-proof.lock, holder: label=ssh-renew pid=652125 user=root cwd=/workspace/orblx-w25-40 since=2026-10-31T23:05:43.114+0900 
+proof_lock w25-38-deny-damage waiting for lock, 151 s, position 9, at 2026-10-31T23:11:47.860+0900, file /workspace/.orblx-proof.lock, holder: label=ssh-renew pid=652125 user=root cwd=/workspace/orblx-w25-40 since=2026-10-31T23:05:43.114+0900 
+proof_lock w25-38-deny-damage waiting for lock, 181 s, position 9, at 2026-10-31T23:12:17.025+0900, file /workspace/.orblx-proof.lock, holder: label=ssh-renew pid=652125 user=root cwd=/workspace/orblx-w25-40 since=2026-10-31T23:05:43.114+0900 
+proof_lock w25-38-deny-damage waiting for lock, 211 s, position 8, at 2026-10-31T23:12:47.188+0900, file /workspace/.orblx-proof.lock, holder: label=serial-rtt:orblx-w2529-natr pid=672250 user=root cwd=/workspace/orblx-w25-29 since=2026-10-31T23:12:27.025+0900 
+proof_lock w25-38-deny-damage waiting for lock, 241 s, position 8, at 2026-10-31T23:13:17.378+0900, file /workspace/.orblx-proof.lock, holder: label=serial-rtt:orblx-w2529-natr pid=672250 user=root cwd=/workspace/orblx-w25-29 since=2026-10-31T23:12:27.025+0900 
+proof_lock w25-38-deny-damage waiting for lock, 271 s, position 8, at 2026-10-31T23:13:47.533+0900, file /workspace/.orblx-proof.lock, holder: label=serial-rtt:orblx-w2529-natr pid=672250 user=root cwd=/workspace/orblx-w25-29 since=2026-10-31T23:12:27.025+0900 
+proof_lock w25-38-deny-damage waiting for lock, 301 s, position 8, at 2026-10-31T23:14:17.694+0900, file /workspace/.orblx-proof.lock, holder: label=serial-rtt:orblx-w2529-natr pid=672250 user=root cwd=/workspace/orblx-w25-29 since=2026-10-31T23:12:27.025+0900 
+proof_lock w25-38-deny-damage waiting for lock, 331 s, position 7, at 2026-10-31T23:14:47.859+0900, file /workspace/.orblx-proof.lock, holder: label=serial-rtt:orblx-w2529-natr pid=672250 user=root cwd=/workspace/orblx-w25-29 since=2026-10-31T23:12:27.025+0900 
+proof_lock w25-38-deny-damage waiting for lock, 361 s, position 7, at 2026-10-31T23:15:17.011+0900, file /workspace/.orblx-proof.lock, holder: label=serial-rtt:orblx-w2529-natr pid=672250 user=root cwd=/workspace/orblx-w25-29 since=2026-10-31T23:12:27.025+0900 
+proof_lock w25-38-deny-damage waiting for lock, 391 s, position 7, at 2026-10-31T23:15:47.201+0900, file /workspace/.orblx-proof.lock, holder: label=serial-rtt:orblx-w2529-natr pid=672250 user=root cwd=/workspace/orblx-w25-29 since=2026-10-31T23:12:27.025+0900 
+proof_lock w25-38-deny-damage waiting for lock, 421 s, position 7, at 2026-10-31T23:16:17.353+0900, file /workspace/.orblx-proof.lock, holder: label=serial-rtt:orblx-w2529-natr pid=672250 user=root cwd=/workspace/orblx-w25-29 since=2026-10-31T23:12:27.025+0900 
+proof_lock w25-38-deny-damage waiting for lock, 451 s, position 7, at 2026-10-31T23:16:47.511+0900, file /workspace/.orblx-proof.lock, holder: label=serial-rtt:orblx-w2529-natr pid=672250 user=root cwd=/workspace/orblx-w25-29 since=2026-10-31T23:12:27.025+0900 
+proof_lock w25-38-deny-damage waiting for lock, 481 s, position 7, at 2026-10-31T23:17:17.682+0900, file /workspace/.orblx-proof.lock, holder: label=serial-rtt:orblx-w2529-natr pid=672250 user=root cwd=/workspace/orblx-w25-29 since=2026-10-31T23:12:27.025+0900 
+proof_lock w25-38-deny-damage waiting for lock, 511 s, position 6, at 2026-10-31T23:17:47.878+0900, file /workspace/.orblx-proof.lock, holder: label=coord-enroll pid=1270232 user=root cwd=/workspace/orblx-w25ng-main since=2026-10-31T23:17:41.704+0900 
+proof_lock w25-38-deny-damage waiting for lock, 541 s, position 6, at 2026-10-31T23:18:17.074+0900, file /workspace/.orblx-proof.lock, holder: label=coord-enroll pid=1270232 user=root cwd=/workspace/orblx-w25ng-main since=2026-10-31T23:17:41.704+0900 
+proof_lock w25-38-deny-damage waiting for lock, 571 s, position 6, at 2026-10-31T23:18:47.240+0900, file /workspace/.orblx-proof.lock, holder: label=coord-enroll pid=1270232 user=root cwd=/workspace/orblx-w25ng-main since=2026-10-31T23:17:41.704+0900 
+proof_lock w25-38-deny-damage waiting for lock, 601 s, position 6, at 2026-10-31T23:19:17.397+0900, file /workspace/.orblx-proof.lock, holder: label=coord-enroll pid=1270232 user=root cwd=/workspace/orblx-w25ng-main since=2026-10-31T23:17:41.704+0900 
+proof_lock w25-38-deny-damage waiting for lock, 631 s, position 6, at 2026-10-31T23:19:47.557+0900, file /workspace/.orblx-proof.lock, holder: label=coord-enroll pid=1270232 user=root cwd=/workspace/orblx-w25ng-main since=2026-10-31T23:17:41.704+0900 
+proof_lock w25-38-deny-damage waiting for lock, 661 s, position 6, at 2026-10-31T23:20:17.715+0900, file /workspace/.orblx-proof.lock, holder: label=coord-enroll pid=1270232 user=root cwd=/workspace/orblx-w25ng-main since=2026-10-31T23:17:41.704+0900 
+proof_lock w25-38-deny-damage waiting for lock, 691 s, position 5, at 2026-10-31T23:20:47.871+0900, file /workspace/.orblx-proof.lock, holder: label=ephemeral-nodes:orblx-w25q-eph-proof pid=1312680 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:20:43.893+0900 
+proof_lock w25-38-deny-damage waiting for lock, 721 s, position 5, at 2026-10-31T23:21:17.030+0900, file /workspace/.orblx-proof.lock, holder: label=ephemeral-nodes:orblx-w25q-eph-proof pid=1312680 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:20:43.893+0900 
+proof_lock w25-38-deny-damage waiting for lock, 751 s, position 5, at 2026-10-31T23:21:47.260+0900, file /workspace/.orblx-proof.lock, holder: label=ephemeral-nodes:orblx-w25q-eph-proof pid=1312680 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:20:43.893+0900 
+proof_lock w25-38-deny-damage waiting for lock, 781 s, position 5, at 2026-10-31T23:22:17.426+0900, file /workspace/.orblx-proof.lock, holder: label=ephemeral-nodes:orblx-w25q-eph-proof pid=1312680 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:20:43.893+0900 
+proof_lock w25-38-deny-damage waiting for lock, 811 s, position 5, at 2026-10-31T23:22:47.584+0900, file /workspace/.orblx-proof.lock, holder: label=ephemeral-nodes:orblx-w25q-eph-proof pid=1312680 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:20:43.893+0900 
+proof_lock w25-38-deny-damage waiting for lock, 841 s, position 4, at 2026-10-31T23:23:17.782+0900, file /workspace/.orblx-proof.lock, holder: label=nat-realism:orblx-w25q-natr-proof pid=1313302 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:23:11.115+0900 
+proof_lock w25-38-deny-damage waiting for lock, 871 s, position 4, at 2026-10-31T23:23:47.128+0900, file /workspace/.orblx-proof.lock, holder: label=nat-realism:orblx-w25q-natr-proof pid=1313302 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:23:11.115+0900 
+proof_lock w25-38-deny-damage waiting for lock, 901 s, position 4, at 2026-10-31T23:24:17.493+0900, file /workspace/.orblx-proof.lock, holder: label=nat-realism:orblx-w25q-natr-proof pid=1313302 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:23:11.115+0900 
+proof_lock w25-38-deny-damage waiting for lock, 931 s, position 4, at 2026-10-31T23:24:47.661+0900, file /workspace/.orblx-proof.lock, holder: label=nat-realism:orblx-w25q-natr-proof pid=1313302 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:23:11.115+0900 
+proof_lock w25-38-deny-damage waiting for lock, 961 s, position 4, at 2026-10-31T23:25:17.873+0900, file /workspace/.orblx-proof.lock, holder: label=nat-realism:orblx-w25q-natr-proof pid=1313302 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:23:11.115+0900 
+proof_lock w25-38-deny-damage waiting for lock, 991 s, position 4, at 2026-10-31T23:25:47.042+0900, file /workspace/.orblx-proof.lock, holder: label=nat-realism:orblx-w25q-natr-proof pid=1313302 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:23:11.115+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1021 s, position 4, at 2026-10-31T23:26:17.215+0900, file /workspace/.orblx-proof.lock, holder: label=nat-realism:orblx-w25q-natr-proof pid=1313302 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:23:11.115+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1051 s, position 4, at 2026-10-31T23:26:47.372+0900, file /workspace/.orblx-proof.lock, holder: label=nat-realism:orblx-w25q-natr-proof pid=1313302 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:23:11.115+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1081 s, position 4, at 2026-10-31T23:27:17.524+0900, file /workspace/.orblx-proof.lock, holder: label=nat-realism:orblx-w25q-natr-proof pid=1313302 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:23:11.115+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1111 s, position 4, at 2026-10-31T23:27:47.697+0900, file /workspace/.orblx-proof.lock, holder: label=nat-realism:orblx-w25q-natr-proof pid=1313302 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:23:11.115+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1141 s, position 4, at 2026-10-31T23:28:17.864+0900, file /workspace/.orblx-proof.lock, holder: label=nat-realism:orblx-w25q-natr-proof pid=1313302 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:23:11.115+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1171 s, position 4, at 2026-10-31T23:28:47.018+0900, file /workspace/.orblx-proof.lock, holder: label=nat-realism:orblx-w25q-natr-proof pid=1313302 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:23:11.115+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1201 s, position 4, at 2026-10-31T23:29:17.234+0900, file /workspace/.orblx-proof.lock, holder: label=nat-realism:orblx-w25q-natr-proof pid=1313302 user=root cwd=/workspace/orblx-w25q-wt since=2026-10-31T23:23:11.115+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1231 s, position 3, at 2026-10-31T23:29:47.513+0900, file /workspace/.orblx-proof.lock, holder: label=agent-grant-renew pid=1808678 user=root cwd=/workspace/orblx-w25-39 since=2026-10-31T23:29:22.834+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1261 s, position 3, at 2026-10-31T23:30:17.679+0900, file /workspace/.orblx-proof.lock, holder: label=agent-grant-renew pid=1808678 user=root cwd=/workspace/orblx-w25-39 since=2026-10-31T23:29:22.834+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1291 s, position 3, at 2026-10-31T23:30:47.860+0900, file /workspace/.orblx-proof.lock, holder: label=agent-grant-renew pid=1808678 user=root cwd=/workspace/orblx-w25-39 since=2026-10-31T23:29:22.834+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1321 s, position 3, at 2026-10-31T23:31:17.036+0900, file /workspace/.orblx-proof.lock, holder: label=agent-grant-renew pid=1808678 user=root cwd=/workspace/orblx-w25-39 since=2026-10-31T23:29:22.834+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1351 s, position 3, at 2026-10-31T23:31:47.196+0900, file /workspace/.orblx-proof.lock, holder: label=agent-grant-renew pid=1808678 user=root cwd=/workspace/orblx-w25-39 since=2026-10-31T23:29:22.834+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1381 s, position 3, at 2026-10-31T23:32:17.381+0900, file /workspace/.orblx-proof.lock, holder: label=agent-grant-renew pid=1808678 user=root cwd=/workspace/orblx-w25-39 since=2026-10-31T23:29:22.834+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1411 s, position 3, at 2026-10-31T23:32:47.540+0900, file /workspace/.orblx-proof.lock, holder: label=agent-grant-renew pid=1808678 user=root cwd=/workspace/orblx-w25-39 since=2026-10-31T23:29:22.834+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1441 s, position 3, at 2026-10-31T23:33:17.705+0900, file /workspace/.orblx-proof.lock, holder: label=agent-grant-renew pid=1808678 user=root cwd=/workspace/orblx-w25-39 since=2026-10-31T23:29:22.834+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1471 s, position 3, at 2026-10-31T23:33:47.873+0900, file /workspace/.orblx-proof.lock, holder: label=agent-grant-renew pid=1808678 user=root cwd=/workspace/orblx-w25-39 since=2026-10-31T23:29:22.834+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1501 s, position 3, at 2026-10-31T23:34:17.032+0900, file /workspace/.orblx-proof.lock, holder: label=agent-grant-renew pid=1808678 user=root cwd=/workspace/orblx-w25-39 since=2026-10-31T23:29:22.834+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1531 s, position 3, at 2026-10-31T23:34:47.191+0900, file /workspace/.orblx-proof.lock, holder: label=agent-grant-renew pid=1808678 user=root cwd=/workspace/orblx-w25-39 since=2026-10-31T23:29:22.834+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1561 s, position 3, at 2026-10-31T23:35:17.349+0900, file /workspace/.orblx-proof.lock, holder: label=agent-grant-renew pid=1808678 user=root cwd=/workspace/orblx-w25-39 since=2026-10-31T23:29:22.834+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1591 s, position 3, at 2026-10-31T23:35:47.513+0900, file /workspace/.orblx-proof.lock, holder: label=agent-grant-renew pid=1808678 user=root cwd=/workspace/orblx-w25-39 since=2026-10-31T23:29:22.834+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1621 s, position 2, at 2026-10-31T23:36:17.652+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1651 s, position 2, at 2026-10-31T23:36:47.796+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1681 s, position 2, at 2026-10-31T23:37:16.978+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1711 s, position 2, at 2026-10-31T23:37:47.134+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1741 s, position 2, at 2026-10-31T23:38:17.288+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1771 s, position 2, at 2026-10-31T23:38:47.445+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 1801 s, position 2, at 2026-10-31T23:39:17.419+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 56389 s, position 2, at 2026-11-01T14:49:05.545+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 56419 s, position 2, at 2026-11-01T14:49:35.057+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 56449 s, position 2, at 2026-11-01T14:50:05.291+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 56479 s, position 2, at 2026-11-01T14:50:35.476+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 56509 s, position 2, at 2026-11-01T14:51:05.713+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 56539 s, position 2, at 2026-11-01T14:51:34.886+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 56569 s, position 2, at 2026-11-01T14:52:05.072+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 56599 s, position 2, at 2026-11-01T14:52:35.273+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 56629 s, position 2, at 2026-11-01T14:53:05.454+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 56659 s, position 2, at 2026-11-01T14:53:35.779+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 56689 s, position 2, at 2026-11-01T14:54:05.009+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 56747 s, position 2, at 2026-11-01T14:55:03.122+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 291127 s, position 2, at 2026-11-04T08:01:23.110+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 291157 s, position 2, at 2026-11-04T08:01:53.602+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 291187 s, position 2, at 2026-11-04T08:02:23.803+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 291217 s, position 2, at 2026-11-04T08:02:52.988+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 291247 s, position 2, at 2026-11-04T08:03:23.161+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 291277 s, position 2, at 2026-11-04T08:03:53.330+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 291307 s, position 2, at 2026-11-04T08:04:23.486+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 291337 s, position 2, at 2026-11-04T08:04:53.605+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 339596 s, position 2, at 2026-11-04T21:29:12.086+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 339626 s, position 2, at 2026-11-04T21:29:42.551+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 339656 s, position 2, at 2026-11-04T21:30:11.954+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 339686 s, position 2, at 2026-11-04T21:30:42.111+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 339716 s, position 2, at 2026-11-04T21:31:12.266+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 339746 s, position 2, at 2026-11-04T21:31:42.428+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 339776 s, position 2, at 2026-11-04T21:32:12.592+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 339810 s, position 2, at 2026-11-04T21:32:46.279+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 339914 s, position 2, at 2026-11-04T21:34:30.631+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 339944 s, position 2, at 2026-11-04T21:34:59.939+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 339974 s, position 2, at 2026-11-04T21:35:30.101+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 340004 s, position 2, at 2026-11-04T21:36:00.270+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 340034 s, position 2, at 2026-11-04T21:36:30.439+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 340064 s, position 2, at 2026-11-04T21:37:00.602+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 340094 s, position 2, at 2026-11-04T21:37:30.764+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 342815 s, position 2, at 2026-11-04T22:22:51.149+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 342845 s, position 2, at 2026-11-04T22:23:21.374+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 342875 s, position 2, at 2026-11-04T22:23:51.582+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 342905 s, position 2, at 2026-11-04T22:24:21.784+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 342935 s, position 2, at 2026-11-04T22:24:50.984+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 342965 s, position 2, at 2026-11-04T22:25:21.183+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 342995 s, position 2, at 2026-11-04T22:25:51.390+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 343299 s, position 2, at 2026-11-04T22:30:55.242+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 344010 s, position 2, at 2026-11-04T22:42:46.328+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 344040 s, position 2, at 2026-11-04T22:43:16.560+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 344070 s, position 2, at 2026-11-04T22:43:46.852+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 344100 s, position 2, at 2026-11-04T22:44:16.018+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 344130 s, position 2, at 2026-11-04T22:44:46.202+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 344160 s, position 2, at 2026-11-04T22:45:16.357+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 344190 s, position 2, at 2026-11-04T22:45:46.520+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 344224 s, position 2, at 2026-11-04T22:46:20.754+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 377892 s, position 2, at 2026-11-05T08:07:28.741+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 377922 s, position 2, at 2026-11-05T08:07:57.977+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 377952 s, position 2, at 2026-11-05T08:08:28.181+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 377982 s, position 2, at 2026-11-05T08:08:58.403+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378012 s, position 2, at 2026-11-05T08:09:28.635+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378042 s, position 2, at 2026-11-05T08:09:58.838+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378072 s, position 2, at 2026-11-05T08:10:28.003+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378102 s, position 2, at 2026-11-05T08:10:58.170+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378132 s, position 2, at 2026-11-05T08:11:28.345+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378162 s, position 2, at 2026-11-05T08:11:58.510+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378192 s, position 2, at 2026-11-05T08:12:28.672+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378222 s, position 2, at 2026-11-05T08:12:58.828+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378252 s, position 2, at 2026-11-05T08:13:27.996+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378282 s, position 2, at 2026-11-05T08:13:58.174+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378312 s, position 2, at 2026-11-05T08:14:28.347+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378342 s, position 2, at 2026-11-05T08:14:58.509+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378372 s, position 2, at 2026-11-05T08:15:28.683+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378402 s, position 2, at 2026-11-05T08:15:58.841+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378653 s, position 2, at 2026-11-05T08:20:09.544+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378861 s, position 2, at 2026-11-05T08:23:37.051+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378891 s, position 2, at 2026-11-05T08:24:07.368+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378921 s, position 2, at 2026-11-05T08:24:37.555+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378951 s, position 2, at 2026-11-05T08:25:07.806+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 378981 s, position 2, at 2026-11-05T08:25:37.018+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379011 s, position 2, at 2026-11-05T08:26:07.243+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379041 s, position 2, at 2026-11-05T08:26:37.438+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379071 s, position 2, at 2026-11-05T08:27:07.608+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379101 s, position 2, at 2026-11-05T08:27:37.783+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379131 s, position 2, at 2026-11-05T08:28:06.966+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379161 s, position 2, at 2026-11-05T08:28:37.129+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379191 s, position 2, at 2026-11-05T08:29:07.300+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379221 s, position 2, at 2026-11-05T08:29:37.477+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379251 s, position 2, at 2026-11-05T08:30:07.647+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379281 s, position 2, at 2026-11-05T08:30:37.816+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379311 s, position 2, at 2026-11-05T08:31:06.973+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379341 s, position 2, at 2026-11-05T08:31:37.158+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379505 s, position 2, at 2026-11-05T08:34:21.166+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379535 s, position 2, at 2026-11-05T08:34:51.327+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379565 s, position 2, at 2026-11-05T08:35:21.490+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379595 s, position 2, at 2026-11-05T08:35:51.694+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379625 s, position 2, at 2026-11-05T08:36:21.868+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379655 s, position 2, at 2026-11-05T08:36:51.052+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379685 s, position 2, at 2026-11-05T08:37:21.282+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 379834 s, position 2, at 2026-11-05T08:39:50.157+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 381605 s, position 2, at 2026-11-05T09:09:21.290+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 381635 s, position 2, at 2026-11-05T09:09:51.664+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 381665 s, position 2, at 2026-11-05T09:10:21.850+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=2065982 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T23:35:49.990+0900 
+proof_lock w25-38-deny-damage waiting for lock, 381695 s, position 1, at 2026-11-05T09:10:51.032+0900, file /workspace/.orblx-proof.lock, holder: label=policy-scale:orblx-w2534-scale-proof pid=2069683 user=root cwd=/workspace/orblx-w2534-wt since=2026-11-05T09:10:35.119+0900 
+proof_lock w25-38-deny-damage waiting for lock, 381725 s, position 1, at 2026-11-05T09:11:21.211+0900, file /workspace/.orblx-proof.lock, holder: label=policy-scale:orblx-w2534-scale-proof pid=2069683 user=root cwd=/workspace/orblx-w2534-wt since=2026-11-05T09:10:35.119+0900 
+proof_lock w25-38-deny-damage waiting for lock, 381755 s, position 1, at 2026-11-05T09:11:51.380+0900, file /workspace/.orblx-proof.lock, holder: label=policy-scale:orblx-w2534-scale-proof pid=2069683 user=root cwd=/workspace/orblx-w2534-wt since=2026-11-05T09:10:35.119+0900 
+proof_lock w25-38-deny-damage waiting for lock, 381785 s, position 1, at 2026-11-05T09:12:21.743+0900, file /workspace/.orblx-proof.lock, holder: label=policy-scale:orblx-w2534-scale-proof pid=2069683 user=root cwd=/workspace/orblx-w2534-wt since=2026-11-05T09:10:35.119+0900 
+proof_lock w25-38-deny-damage waiting for lock, 381815 s, position 1, at 2026-11-05T09:12:50.908+0900, file /workspace/.orblx-proof.lock, holder: label=policy-scale:orblx-w2534-scale-proof pid=2069683 user=root cwd=/workspace/orblx-w2534-wt since=2026-11-05T09:10:35.119+0900 
+proof_lock w25-38-deny-damage waiting for lock, 381845 s, position 1, at 2026-11-05T09:13:21.073+0900, file /workspace/.orblx-proof.lock, holder: label=policy-scale:orblx-w2534-scale-proof pid=2069683 user=root cwd=/workspace/orblx-w2534-wt since=2026-11-05T09:10:35.119+0900 
+proof_lock w25-38-deny-damage acquired at 2026-11-05T09:13:31.619+0900 after 381855743 ms, file /workspace/.orblx-proof.lock
+proof_context w25-38-deny-damage phase start time 2026-11-05T09:13:31.657+0900 load 1.33/2.18/1.70 other_orblx_containers 0 groups -
+proof_compose_clean orblx-w25-38-deny-damage clean
+=== [C] remove old proof volumes ===
+=== [C] build image (release) ===
+    Finished `release` profile [optimized] target(s) in 1.04s
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+sha256:32c2623694993eff411375ec842473fcc9129468e19212a8f2cd66497073fc0f
+=== [C] start coordinator ===
+token owner written
+token a written
+token b written
+token allowed written
+coord_ip 172.18.0.2
+=== [C] enroll owner ===
+enrolled
+name owner
+overlay_ip 100.64.0.1
+deny_list ready_ms 96
+enroll owner deny_window_ms 96
+=== [C] enroll a ===
+enrolled
+name a
+overlay_ip 100.64.0.2
+deny_list ready_ms 97
+enroll a deny_window_ms 97
+=== [C] enroll b ===
+enrolled
+name b
+overlay_ip 100.64.0.3
+deny_list ready_ms 89
+enroll b deny_window_ms 89
+=== [C] enroll allowed ===
+enrolled
+name allowed
+overlay_ip 100.64.0.4
+deny_list ready_ms 99
+enroll allowed deny_window_ms 99
+netmap a written
+netmap b written
+netmap allowed written
+policy b written
+=== [C] start nodes a, b, and allowed ===
+=== [C] SSH identity and peer certificate on a and allowed ===
+=== [C] gate 0: valid deny.json on b, before the revoke ===
+check b deny.json want valid got valid
+check ssh a before revoke want accepted got accepted
+check ping a before revoke want accepted got accepted
+check ssh allowed before revoke want accepted got accepted
+check ping allowed before revoke want accepted got accepted
+=== [C] gate 0: revoke a ===
+revoked_all spiffe://orblx.local/node/a
+b deny.json revokes a, version 7
+check ssh a after revoke (valid file) want refused got refused
+check ping a after revoke (valid file) want refused got refused
+check ssh allowed after revoke (valid file) want accepted got refused
+The check ssh allowed after revoke (valid file) did not give accepted.
+---- docker logs (tail) ----
+a-1  | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+coord-1  | coord rejected: The coordinator request failed.
+b-1      | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+b-1      | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+a-1      | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+coord-1  | coord rejected: The coordinator request failed.
+a-1        | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+a-1        | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+coord-1    | coord rejected: The coordinator request failed.
+a-1        | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+coord-1    | coord rejected: The coordinator request failed.
+a-1        | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+coord-1    | coord rejected: The coordinator request failed.
+a-1        | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+coord-1    | coord rejected: The coordinator request failed.
+a-1        | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+coord-1    | coord rejected: The coordinator request failed.
+a-1        | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+a-1        | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+a-1        | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+a-1        | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+a-1        | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+coord-1    | coord rejected: The coordinator request failed.
+a-1        | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+a-1        | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+coord-1    | coord rejected: The coordinator request failed.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+coord-1    | coord rejected: The coordinator request failed.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+b-1        | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+coord-1    | coord rejected: The coordinator request failed.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+coord-1    | coord rejected: The coordinator request failed.
+a-1        | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+a-1        | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+a-1        | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to b at 172.18.0.5:443 failed. The QUIC connection failed. connection lost
+a-1        | The dial to allowed at 172.18.0.3:443 failed. The QUIC connection failed. connection lost
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+coord-1    | coord rejected: The coordinator request failed.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+coord-1    | coord rejected: The coordinator request failed.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+coord-1    | coord rejected: The coordinator request failed.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+coord-1    | coord rejected: The coordinator request failed.
+coord-1    | coord rejected: The coordinator request failed.
+b-1        | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+allowed-1  | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+allowed-1  | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The path to allowed is down.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The dial to owner at 198.18.0.1:443 failed. The attempt timed out.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+b-1        | The node did not accept a peer. The leaf check failed. The deny list contains this identifier.
+proof_context w25-38-deny-damage phase end time 2026-11-05T09:14:40.853+0900 load 0.87/1.88/1.63 other_orblx_containers 0 groups -
+proof_contention w25-38-deny-damage samples 34 contended_samples 0 unknown_samples 0 max_other_orblx_containers 0 max_load1 1.43
+proof_lock w25-38-deny-damage released at 2026-11-05T09:14:40.865+0900

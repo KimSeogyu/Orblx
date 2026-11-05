@@ -11,8 +11,11 @@ sys.path.insert(0, os.path.dirname(HERE))
 import w25_46_overlap_audit as audit
 
 FIXTURE = os.path.join(HERE, "fixtures", "w25-46-0910")
+RAW = os.path.join(HERE, "fixtures", "w25-46-raw")
+UNTIL = os.path.join(HERE, "fixtures", "w25-46-until")
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 AUDIT_TXT = os.path.join(REPO, "docs", "w25-46-overlap-audit.txt")
+SOURCE_DIR = "/workspace/orblx-w18-proof"
 
 
 def _write(directory: str, name: str, text: str) -> None:
@@ -61,8 +64,9 @@ class OverlapAuditTest(unittest.TestCase):
 
     def test_the_0910_window_matches_the_recorded_verdict(self) -> None:
         text = audit.render(audit.load_dir(FIXTURE))
-        with open(AUDIT_TXT, encoding="utf-8") as handle:
-            self.assertEqual(handle.read(), text)
+        self.assertIn("cutoff=2026-10-31T17:23:11.000+0900\n", text)
+        self.assertIn("runs_before=6\n", text)
+        self.assertIn("runs_after_dedupe=5\n", text)
         self.assertIn("overlap_pairs=0\n", text)
         self.assertIn(
             "rejudge policy-scale acquire=2026-11-05T09:10:35.126+0900 "
@@ -83,6 +87,73 @@ class OverlapAuditTest(unittest.TestCase):
             text,
         )
         self.assertNotIn("ssh-renew", text.split("rejudge_window", 1)[1])
+
+    def test_raw_logs_dedupe_the_ssh_copy_and_take_the_cancel_file(self) -> None:
+        runs = audit.load_dir(RAW)
+        copies = [
+            run
+            for run in runs
+            if run.label == "ssh-renew" and audit.fmt_ts(run.acquire) == "2026-10-31T21:05:46.638+0900"
+        ]
+        self.assertEqual(len(copies), 2)
+        self.assertIsNone(copies[0].pid)
+        self.assertEqual(audit.dedupe_key(copies[0]), audit.dedupe_key(copies[1]))
+        selected = audit.after_cutoff(runs, audit.parse_ts(audit.DEFAULT_CUTOFF))
+        self.assertEqual(len(selected), 7)
+        self.assertEqual(len(audit.dedupe(selected)), 6)
+        soak = next(run for run in runs if run.label == "coord-cert-soak")
+        self.assertEqual(soak.pid, 2065982)
+        self.assertEqual(soak.cancel_source, "w25-42-step2-cancel-20261105-091025.log")
+        self.assertEqual(soak.cancel_line, 1)
+        self.assertEqual(audit.fmt_ts(soak.cancel), "2026-11-05T09:10:25.000+0900")
+        self.assertEqual(soak.lock_released_line, 2)
+        text = audit.render(runs, source_dir=SOURCE_DIR)
+        with open(AUDIT_TXT, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), text)
+        self.assertIn(
+            "No real 2-holder flock window. "
+            "Container overlap: yes (policy-scale 09:10:35 INVALID).\n",
+            text,
+        )
+        self.assertIn("path=w25-34-proof-policy-scale-2876d63.log:169\n", text)
+        self.assertIn("path=w25-34-proof-policy-scale-2876d63.log:170\n", text)
+        self.assertIn(
+            "path=w25-42-step2-cancel-20261105-091025.log:2 "
+            "note=after_flock_free cancel_script_log_latency\n",
+            text,
+        )
+        self.assertIn("until=\n", text)
+        self.assertNotIn("containers_removed_about", text)
+        self.assertNotIn("09:10:41", text)
+
+    def test_a_subdirectory_copy_is_one_holder_and_until_drops_a_later_acquire(self) -> None:
+        runs = audit.load_dir(UNTIL)
+        sources = {run.source for run in runs}
+        self.assertIn("w25-45-152-gate-a.log", sources)
+        self.assertIn("w25-45-152/main-side.log", sources)
+        pair = [
+            run
+            for run in runs
+            if audit.fmt_ts(run.acquire) == "2026-11-05T16:44:21.995+0900"
+        ]
+        self.assertEqual(len(pair), 2)
+        self.assertEqual({run.label for run in pair}, {"gate-a"})
+        self.assertEqual(len(audit.dedupe(pair)), 1)
+        open_text = audit.render(runs)
+        self.assertIn("until=\n", open_text)
+        self.assertIn("runs_before=3\n", open_text)
+        self.assertIn("runs_after_dedupe=2\n", open_text)
+        self.assertIn("duplicate_logs=1\n", open_text)
+        closed = audit.render(runs, until=audit.parse_ts("2026-11-05T10:05:23+09:00"))
+        self.assertIn("until=2026-11-05T10:05:23.000+0900\n", closed)
+        self.assertIn("runs_before=1\n", closed)
+        self.assertIn("runs_after_dedupe=1\n", closed)
+        self.assertNotIn("16:44:21.995", closed)
+        kept = audit.at_or_before(
+            audit.after_cutoff(runs, audit.parse_ts(audit.DEFAULT_CUTOFF)),
+            audit.parse_ts("2026-11-05T10:05:23+09:00"),
+        )
+        self.assertEqual([run.source for run in kept], ["early.log"])
 
     def test_a_colon_offset_parses_to_the_same_instant(self) -> None:
         self.assertEqual(
