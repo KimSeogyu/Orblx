@@ -1652,6 +1652,18 @@ mod tests {
                 pty: true,
             }),
         };
+        for age_s in [600_u64, 899] {
+            testkit::write_netmap_at(&dir, &[testkit::ca_line(&ca)], &[], now_ms - age_s * 1000);
+            assert!(
+                super::recheck_open_shell(&shared, &admitted, now_ms).is_ok(),
+                "an open shell stays up at {age_s} s"
+            );
+        }
+        testkit::write_netmap_at(&dir, &[testkit::ca_line(&ca)], &[], now_ms + 61_000);
+        assert!(
+            super::recheck_open_shell(&shared, &admitted, now_ms).is_err(),
+            "a stamp more than 60 s ahead ends the open shell"
+        );
         testkit::write_netmap_at(
             &dir,
             &[testkit::ca_line(&ca)],

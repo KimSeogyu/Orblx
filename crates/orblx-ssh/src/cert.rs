@@ -484,6 +484,8 @@ mod tests {
     fn open_shell_netmap_age_uses_the_ceiling_and_the_skew() {
         let now = 1_000_000_000_000;
         assert!(open_shell_netmap_age(now - 120_000, now).is_ok());
+        assert!(open_shell_netmap_age(now - 600_000, now).is_ok());
+        assert!(open_shell_netmap_age(now - 899_000, now).is_ok());
         assert!(open_shell_netmap_age(now - OPEN_SHELL_NETMAP_MAX_AGE_MS, now).is_ok());
         assert_eq!(
             open_shell_netmap_age(now - OPEN_SHELL_NETMAP_MAX_AGE_MS - 1, now),
@@ -491,6 +493,10 @@ mod tests {
         );
         assert_eq!(open_shell_netmap_age(0, now), Err(CertRefuse::StaleNetmap));
         assert!(open_shell_netmap_age(now + orblx_datapath::NETMAP_MAX_SKEW_MS, now).is_ok());
+        assert_eq!(
+            open_shell_netmap_age(now + 61_000, now),
+            Err(CertRefuse::FutureNetmap)
+        );
         assert_eq!(
             open_shell_netmap_age(now + orblx_datapath::NETMAP_MAX_SKEW_MS + 1, now),
             Err(CertRefuse::FutureNetmap)
