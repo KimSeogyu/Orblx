@@ -2,7 +2,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use orblx_identity::{decode_certificate_pem, DenySet, SpiffeId, TrustBundle, WorkloadKind};
+use orblx_identity::{
+    decode_certificate_pem, leaf_validity, DenySet, SpiffeId, TrustBundle, WorkloadKind,
+};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
@@ -28,35 +30,133 @@ pub fn crypto_provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-pub fn server_endpoint(
+/// The live coordinator leaf that each new handshake shows (W25-33).
+///
+/// The coordinator replaces the leaf when it renews it. An open connection keeps
+/// its session. Only a new handshake uses the new leaf.
+pub struct LiveCert {
+    provider: Arc<CryptoProvider>,
+    current: std::sync::RwLock<(u64, Arc<rustls::sign::CertifiedKey>)>,
+}
+
+impl std::fmt::Debug for LiveCert {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LiveCert")
+            .field("not_after", &self.not_after())
+            .finish()
+    }
+}
+
+impl LiveCert {
+    fn new(provider: Arc<CryptoProvider>, material: &TlsMaterial) -> Result<Self, CoordError> {
+        let (not_after, key) = certified_key(&provider, material)?;
+        Ok(Self {
+            provider,
+            current: std::sync::RwLock::new((not_after, key)),
+        })
+    }
+
+    /// The end time of the leaf that new handshakes get.
+    pub fn not_after(&self) -> u64 {
+        self.current_key().0
+    }
+
+    /// The leaf DER that new handshakes get.
+    #[cfg(test)]
+    pub(crate) fn leaf_der(&self) -> Vec<u8> {
+        self.current_key()
+            .1
+            .cert
+            .first()
+            .map(|der| der.as_ref().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Show `material` in the next handshakes.
+    ///
+    /// The function keeps the old leaf when the new material is not valid.
+    pub fn install(&self, material: &TlsMaterial) -> Result<u64, CoordError> {
+        let (not_after, key) = certified_key(&self.provider, material)?;
+        let mut current = match self.current.write() {
+            Ok(current) => current,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *current = (not_after, key);
+        Ok(not_after)
+    }
+
+    fn current_key(&self) -> (u64, Arc<rustls::sign::CertifiedKey>) {
+        let current = match self.current.read() {
+            Ok(current) => current,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        (current.0, Arc::clone(&current.1))
+    }
+}
+
+impl rustls::server::ResolvesServerCert for LiveCert {
+    fn resolve(
+        &self,
+        _client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.current_key().1)
+    }
+}
+
+fn certified_key(
+    provider: &CryptoProvider,
     material: &TlsMaterial,
-    listen: SocketAddr,
-) -> Result<quinn::Endpoint, CoordError> {
+) -> Result<(u64, Arc<rustls::sign::CertifiedKey>), CoordError> {
+    let (chain, key) = identity_parts(&material.certificate_pem, &material.private_key_pem)?;
+    let leaf = chain
+        .first()
+        .ok_or_else(|| CoordError::Tls("The certificate chain is empty.".to_string()))?;
+    let (_, not_after) = leaf_validity(leaf.as_ref())?;
+    let signer = provider
+        .key_provider
+        .load_private_key(key)
+        .map_err(|err| CoordError::Tls(err.to_string()))?;
+    let certified = rustls::sign::CertifiedKey::new(chain, signer);
+    certified
+        .keys_match()
+        .map_err(|err| CoordError::Tls(err.to_string()))?;
+    Ok((not_after, Arc::new(certified)))
+}
+
+pub(crate) fn server_config(
+    material: &TlsMaterial,
+) -> Result<(rustls::ServerConfig, Arc<LiveCert>), CoordError> {
     let provider = crypto_provider();
     let trust = TrustBundle::from_pem(&material.trust_pem)?;
     let verifier = Arc::new(NodeClientVerifier {
         provider: Arc::clone(&provider),
         trust,
     });
-    let (chain, key) = identity_parts(&material.certificate_pem, &material.private_key_pem)?;
+    let live = Arc::new(LiveCert::new(Arc::clone(&provider), material)?);
     let mut server = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|err| CoordError::Tls(err.to_string()))?
         .with_client_cert_verifier(verifier)
-        .with_single_cert(chain, key)
-        .map_err(|err| CoordError::Tls(err.to_string()))?;
+        .with_cert_resolver(Arc::clone(&live) as Arc<dyn rustls::server::ResolvesServerCert>);
     server.alpn_protocols = vec![ALPN.to_vec()];
+    Ok((server, live))
+}
+
+pub fn server_endpoint(
+    material: &TlsMaterial,
+    listen: SocketAddr,
+) -> Result<(quinn::Endpoint, Arc<LiveCert>), CoordError> {
+    let (server, live) = server_config(material)?;
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(server)
         .map_err(|err| CoordError::Tls(err.to_string()))?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic));
     config.transport_config(transport_config());
-    quinn::Endpoint::server(config, listen).map_err(CoordError::io)
+    let endpoint = quinn::Endpoint::server(config, listen).map_err(CoordError::io)?;
+    Ok((endpoint, live))
 }
 
-pub fn client_endpoint(
-    material: &ClientTls,
-    bind: SocketAddr,
-) -> Result<quinn::Endpoint, CoordError> {
+pub(crate) fn client_config(material: &ClientTls) -> Result<rustls::ClientConfig, CoordError> {
     let provider = crypto_provider();
     let trust = TrustBundle::from_pem(&material.trust_pem)?;
     let verifier = Arc::new(CoordServerVerifier {
@@ -84,6 +184,14 @@ pub fn client_endpoint(
         }
     };
     client.alpn_protocols = vec![ALPN.to_vec()];
+    Ok(client)
+}
+
+pub fn client_endpoint(
+    material: &ClientTls,
+    bind: SocketAddr,
+) -> Result<quinn::Endpoint, CoordError> {
+    let client = client_config(material)?;
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(client)
         .map_err(|err| CoordError::Tls(err.to_string()))?;
     let mut config = quinn::ClientConfig::new(Arc::new(quic));

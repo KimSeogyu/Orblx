@@ -15,10 +15,13 @@ use orblx_identity::{
     decode_certificate_pem, leaf_validity, sign_ticket, SpiffeId, TicketClaims, TicketFlags,
     TicketSigner, TrustBundle,
 };
+use rustls::pki_types::ServerName;
+use rustls::{ClientConnection, ServerConnection};
 use tokio::sync::{mpsc, watch};
 
 use crate::client;
 use crate::server;
+use crate::tlsutil::{self, ClientTls};
 use crate::{Coordinator, OidcConfig};
 
 struct Scratch(PathBuf);
@@ -2056,6 +2059,196 @@ fn leaf_config(
         mac,
         ring.clone(),
     )
+}
+
+/// W25-33: the coordinator issues a new leaf at two thirds of the life, from the same CA.
+#[test]
+fn coordinator_leaf_renews_at_two_thirds_from_the_same_ca() {
+    let scratch = Scratch::new("coordleaf");
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.set_coord_svid_ttl(Duration::from_secs(9)).unwrap();
+    let first = coord.tls_material().unwrap();
+    let first_der = decode_certificate_pem(&first.certificate_pem).unwrap();
+    let (not_before, not_after) = leaf_validity(&first_der).unwrap();
+    assert_eq!(not_after - not_before, 9);
+    let start = UNIX_EPOCH + Duration::from_secs(not_before);
+    assert_eq!(
+        coord
+            .renew_coord_svid_if_due(start + Duration::from_secs(5))
+            .unwrap(),
+        None
+    );
+    let renewed = coord
+        .renew_coord_svid_if_due(start + Duration::from_secs(6))
+        .unwrap()
+        .unwrap();
+    assert_eq!(renewed, not_before + 6 + 9);
+    let second = coord.tls_material().unwrap();
+    assert_eq!(second.trust_pem, first.trust_pem);
+    assert_ne!(second.certificate_pem, first.certificate_pem);
+    let second_der = decode_certificate_pem(&second.certificate_pem).unwrap();
+    let trust = TrustBundle::from_pem(&first.trust_pem).unwrap();
+    let id = trust
+        .authenticate_leaf(
+            &second_der,
+            start + Duration::from_secs(14),
+            &orblx_identity::DenySet::empty(),
+        )
+        .unwrap();
+    assert_eq!(id, SpiffeId::coord("coord").unwrap());
+    assert!(coord
+        .set_coord_svid_ttl(Duration::from_secs(15 * 60 + 1))
+        .is_err());
+}
+
+/// W25-33: the resolver returns the new leaf after renewal. The server config stays.
+///
+/// The first leaf is still inside its life. Two thirds of that life have passed, so renewal
+/// is due. The handshake uses the same server config and receives the new leaf.
+#[test]
+fn resolver_serves_the_new_leaf_after_renewal() {
+    let scratch = Scratch::new("coordleaf-resolver");
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    let now = SystemTime::now();
+    coord.set_coord_svid_ttl(Duration::from_secs(9)).unwrap();
+    coord
+        .issue_coord_svid_at(now - Duration::from_secs(6))
+        .unwrap();
+    let first = coord.tls_material().unwrap();
+    let first_der = decode_certificate_pem(&first.certificate_pem).unwrap();
+    let (server, live) = tlsutil::server_config(&first).unwrap();
+    assert_eq!(live.leaf_der(), first_der);
+    coord.renew_coord_svid_if_due(now).unwrap().unwrap();
+    let second = coord.tls_material().unwrap();
+    let second_der = decode_certificate_pem(&second.certificate_pem).unwrap();
+    assert_ne!(second_der, first_der);
+    live.install(&second).unwrap();
+    assert_eq!(live.leaf_der(), second_der);
+    let client = tlsutil::client_config(&ClientTls {
+        trust_pem: first.trust_pem.clone(),
+        expect_coord: SpiffeId::coord("coord").unwrap(),
+        certificate_pem: None,
+        private_key_pem: None,
+    })
+    .unwrap();
+    let served = rustls_peer_leaf(Arc::new(server), Arc::new(client));
+    assert_eq!(served, second_der);
+    assert_ne!(served, first_der);
+}
+
+/// W25-33: a client handshake succeeds after the first coordinator leaf is past its end.
+///
+/// The endpoint is built with the first leaf. The test then renews that leaf and installs
+/// the new material. The client sees the new leaf. The test does not sleep.
+#[tokio::test]
+async fn client_handshake_succeeds_after_the_first_coord_leaf_ends() {
+    let scratch = Scratch::new("coordleaf-hs");
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    let now = SystemTime::now();
+    coord.set_coord_svid_ttl(Duration::from_secs(30)).unwrap();
+    coord
+        .issue_coord_svid_at(now - Duration::from_secs(50))
+        .unwrap();
+    let first = coord.tls_material().unwrap();
+    let first_der = decode_certificate_pem(&first.certificate_pem).unwrap();
+    let (_, first_end) = leaf_validity(&first_der).unwrap();
+    assert!(
+        unix(now) > first_end,
+        "the first coordinator leaf is past its end"
+    );
+    let (endpoint, live) =
+        tlsutil::server_endpoint(&first, SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+    assert_eq!(live.leaf_der(), first_der);
+    coord.renew_coord_svid_if_due(now).unwrap().unwrap();
+    let second = coord.tls_material().unwrap();
+    let second_der = decode_certificate_pem(&second.certificate_pem).unwrap();
+    assert_ne!(second_der, first_der);
+    live.install(&second).unwrap();
+    assert_eq!(live.leaf_der(), second_der);
+
+    let addr = endpoint.local_addr().unwrap();
+    let client = tlsutil::client_endpoint(
+        &ClientTls {
+            trust_pem: first.trust_pem,
+            expect_coord: SpiffeId::coord("coord").unwrap(),
+            certificate_pem: None,
+            private_key_pem: None,
+        },
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+    )
+    .unwrap();
+    let accept = async {
+        let incoming = endpoint.accept().await.expect("the endpoint accepts");
+        incoming.await.expect("the server handshake finishes")
+    };
+    let connect = async {
+        client
+            .connect(addr, tlsutil::SERVER_NAME)
+            .expect("the client starts")
+            .await
+            .expect("the client handshake finishes")
+    };
+    let (client_conn, _server_conn) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(connect, accept)
+    })
+    .await
+    .expect("the handshake finishes in time");
+    let identity = client_conn.peer_identity().expect("the server sent a leaf");
+    let certs = identity
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .expect("the peer identity is a certificate chain");
+    assert_eq!(certs[0].as_ref(), second_der.as_slice());
+    assert_ne!(certs[0].as_ref(), first_der.as_slice());
+}
+
+/// Complete one rustls handshake and return the server leaf.
+fn rustls_peer_leaf(
+    server_config: Arc<rustls::ServerConfig>,
+    client_config: Arc<rustls::ClientConfig>,
+) -> Vec<u8> {
+    let name = ServerName::try_from(tlsutil::SERVER_NAME).unwrap();
+    let mut client = ClientConnection::new(client_config, name).unwrap();
+    let mut server = ServerConnection::new(server_config).unwrap();
+    for _ in 0..8 {
+        shuttle_client_to_server(&mut client, &mut server);
+        shuttle_server_to_client(&mut server, &mut client);
+        if !client.is_handshaking() && !server.is_handshaking() {
+            let certs = client.peer_certificates().expect("the server sent a leaf");
+            return certs[0].as_ref().to_vec();
+        }
+    }
+    panic!("the handshake did not finish");
+}
+
+fn feed_tls(bytes: &[u8], read: impl FnMut(&mut dyn std::io::Read) -> std::io::Result<usize>) {
+    let mut read = read;
+    let mut input = bytes;
+    while !input.is_empty() {
+        let before = input.len();
+        let n = read(&mut input).unwrap();
+        assert!(
+            n > 0 && input.len() < before,
+            "the tls read made no progress"
+        );
+    }
+}
+
+fn shuttle_client_to_server(from: &mut ClientConnection, to: &mut ServerConnection) {
+    while from.wants_write() {
+        let mut buf = Vec::new();
+        from.write_tls(&mut buf).unwrap();
+        feed_tls(&buf, |input| to.read_tls(input));
+        to.process_new_packets().unwrap();
+    }
+}
+
+fn shuttle_server_to_client(from: &mut ServerConnection, to: &mut ClientConnection) {
+    while from.wants_write() {
+        let mut buf = Vec::new();
+        from.write_tls(&mut buf).unwrap();
+        feed_tls(&buf, |input| to.read_tls(input));
+        to.process_new_packets().unwrap();
+    }
 }
 
 fn netmap(name: &str, ip: &str, peer: &str, peer_ip: &str, peer_port: u16) -> Netmap {
