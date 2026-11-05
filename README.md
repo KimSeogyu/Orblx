@@ -282,6 +282,10 @@ The 12-week work is complete when all of these statements are true:
 - The system writes a log record when the system denies application B.
 - On a symmetric NAT, a direct session is valid.
 - On a symmetric NAT, a session through the orblx Relay is valid.
+
+Two symmetric NATs with a predictable port allocation can use a direct path.
+The relay stays in use when both allocations are random.
+Read the measurement in [docs/sym-sym-direct.md](docs/sym-sym-direct.md).
 - When an SVID expires, new packets stop within 60 seconds.
 - When a ticket expires, new packets stop within 60 seconds.
 - When the system revokes an SVID, new packets stop within 60 seconds.

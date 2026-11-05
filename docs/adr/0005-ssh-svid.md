@@ -27,7 +27,7 @@ Use the in-daemon russh server.
 
 The server binds `overlay:22`.
 The server rejects the unspecified address.
-The password method carries one SVID proof.
+Superseded by W25-31: the server offers no password method. Login is a user certificate from the coordinator SSH user CA. See docs/w25-ssh-user-certs.md.
 The proof is a signature.
 The server does not log the proof.
 The server does not write an SSH key file.

@@ -156,6 +156,9 @@ class ProofLockFairnessTest(unittest.TestCase):
     def test_the_plain_flock_check_is_fast_under_a_parent_with_many_fds(self):
         # A CI runner can be an ancestor with hundreds of fds. The check must not make one
         # grep per fd: that took 0.7 s with 600 fds and made the W25-5 waiter test fail on CI.
+        # date +%s%3N reads CLOCK_REALTIME. A step backward between the two calls makes a
+        # negative duration (CI printed rc=1 ms=-577) and the match on ms=(\d+) fails.
+        # rc=1 is the result when no ancestor holds a plain flock. hold_ms reads /proc/uptime.
         open(self.lock, "a").close()
         check = ('. "$0"; ' + HOLD_MS +
                  's=$(hold_ms); p="$(proof_lock_plain_parent "$1")"; rc=$?; '
@@ -172,7 +175,8 @@ class ProofLockFairnessTest(unittest.TestCase):
             os.close(held)
             for fd in fds:
                 os.close(fd)
-        m = re.search(r"rc=(\d+) ms=(\d+) pid=", free.stdout)
+        # A negative ms is a step back of the wall clock. The check was still fast.
+        m = re.search(r"rc=(\d+) ms=(-?\d+) pid=", free.stdout)
         self.assertIsNotNone(m, free.stdout + free.stderr)
         self.assertEqual(m.group(1), "1", free.stdout)
         self.assertLess(int(m.group(2)), 1000, free.stdout)
