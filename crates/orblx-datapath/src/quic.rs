@@ -615,7 +615,7 @@ impl HelloSender {
         self.send
             .write_all(&bytes)
             .await
-            .map_err(|err| HelloError::Quic(err.to_string()))?;
+            .map_err(hello_from_write)?;
         self.next_seq = self.next_seq.checked_add(1).ok_or(HelloError::BadSeq)?;
         Ok(())
     }
@@ -649,7 +649,7 @@ impl HelloSender {
         self.send
             .write_all(&bytes)
             .await
-            .map_err(|err| HelloError::Quic(err.to_string()))?;
+            .map_err(hello_from_write)?;
         self.next_seq = self.next_seq.checked_add(1).ok_or(HelloError::BadSeq)?;
         Ok(())
     }
@@ -959,7 +959,7 @@ async fn read_exact(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> Result<(), 
     match recv.read_exact(buf).await {
         Ok(()) => Ok(()),
         Err(quinn::ReadExactError::FinishedEarly(_)) => Err(HelloError::StreamClosed),
-        Err(quinn::ReadExactError::ReadError(err)) => Err(HelloError::Quic(err.to_string())),
+        Err(quinn::ReadExactError::ReadError(err)) => Err(hello_from_read(err)),
     }
 }
 
@@ -1221,5 +1221,36 @@ impl ClientCertVerifier for PresentedLeafVerifier {
         self.provider
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+pub(crate) fn hello_from_read(err: quinn::ReadError) -> HelloError {
+    if let quinn::ReadError::ConnectionLost(cause) = &err {
+        if let Some(detail) = idle_timeout_detail(cause) {
+            return HelloError::Quic(detail.to_string());
+        }
+    }
+    HelloError::Quic(err.to_string())
+}
+
+pub(crate) fn hello_from_write(err: quinn::WriteError) -> HelloError {
+    if let quinn::WriteError::ConnectionLost(cause) = &err {
+        if let Some(detail) = idle_timeout_detail(cause) {
+            return HelloError::Quic(detail.to_string());
+        }
+    }
+    HelloError::Quic(err.to_string())
+}
+
+fn idle_timeout_detail(err: &quinn::ConnectionError) -> Option<&'static str> {
+    match err {
+        quinn::ConnectionError::TimedOut => Some("idle_timeout"),
+        quinn::ConnectionError::VersionMismatch
+        | quinn::ConnectionError::TransportError(_)
+        | quinn::ConnectionError::ConnectionClosed(_)
+        | quinn::ConnectionError::ApplicationClosed(_)
+        | quinn::ConnectionError::Reset
+        | quinn::ConnectionError::LocallyClosed
+        | quinn::ConnectionError::CidsExhausted => None,
     }
 }
