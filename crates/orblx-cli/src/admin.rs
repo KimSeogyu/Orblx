@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use orblx_coord::{
     admin_blocking, admin_token_blocking, parse_admin_role, parse_api_token_ttl, parse_scopes,
+    MAX_PREAUTH_TTL_SECS,
 };
 use serde_json::Value;
 
@@ -65,6 +66,9 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         "token-create" => "admin-token-create",
         "token-list" => "admin-token-list",
         "token-revoke" => "admin-token-revoke",
+        "preauth-create" => "admin-preauth-create",
+        "preauth-list" => "admin-preauth-list",
+        "preauth-revoke" => "admin-preauth-revoke",
         "call" => "call",
         other => return Err(format!("The mode {other} is not valid.\n{}", help())),
     };
@@ -73,6 +77,11 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
     let mut out = None;
     let mut scopes = None;
     let mut ttl = None;
+    let mut preauth_uses = None;
+    let mut preauth_ephemeral = false;
+    let mut preauth_tags: Vec<String> = Vec::new();
+    let mut preauth_grant = None;
+    let mut preauth_path = None;
     let mut policy_file = None;
     let mut target = String::new();
     let mut state = None;
@@ -107,9 +116,12 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         let role = parse_admin_role(role).map_err(|err| err.to_string())?;
         target = serde_json::json!({"user": user, "role": role.as_str()}).to_string();
         index += 2;
-    } else if op == "admin-token-revoke" || op == "admin-policy-set" {
+    } else if op == "admin-token-revoke" || op == "admin-preauth-revoke" || op == "admin-policy-set"
+    {
         let what = if op == "admin-token-revoke" {
             "a token id"
+        } else if op == "admin-preauth-revoke" {
+            "a pre-auth key id"
         } else {
             "a policy file"
         };
@@ -117,7 +129,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
             .get(index)
             .filter(|name| !name.starts_with('-'))
             .ok_or_else(|| format!("The command needs {what}.\n{}", help()))?;
-        if op == "admin-token-revoke" {
+        if op == "admin-token-revoke" || op == "admin-preauth-revoke" {
             target = name.clone();
         } else {
             policy_file = Some(PathBuf::from(name));
@@ -164,17 +176,32 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
             verify_only = true;
             continue;
         }
+        if op == "admin-preauth-create" && flag == "--ephemeral" && !raw {
+            preauth_ephemeral = true;
+            continue;
+        }
         let value = take_value(args, &mut index)?;
         match flag {
             "--token-file" => token_file = Some(PathBuf::from(value)),
-            "--out" if op == "admin-token-create" && !raw => out = Some(PathBuf::from(value)),
+            "--out" if (op == "admin-token-create" || op == "admin-preauth-create") && !raw => {
+                out = Some(PathBuf::from(value))
+            }
             "--scope" if op == "admin-token-create" && !raw => {
                 let list = parse_scopes(&value).map_err(|err| err.to_string())?;
                 scopes = Some(list);
             }
-            "--ttl" if op == "admin-token-create" && !raw => {
+            "--ttl" if (op == "admin-token-create" || op == "admin-preauth-create") && !raw => {
                 ttl = Some(parse_api_token_ttl(&value)?)
             }
+            "--uses" if op == "admin-preauth-create" && !raw => {
+                let uses: u32 = value
+                    .parse()
+                    .map_err(|_| "The pre-auth key use count is not valid.".to_string())?;
+                preauth_uses = Some(uses);
+            }
+            "--tag" if op == "admin-preauth-create" && !raw => preauth_tags.push(value),
+            "--grant" if op == "admin-preauth-create" && !raw => preauth_grant = Some(value),
+            "--grant-path" if op == "admin-preauth-create" && !raw => preauth_path = Some(value),
             "--since" if op == "admin-audit" => {
                 target = parse_since(&value, now_unix()?)?.to_string();
             }
@@ -192,6 +219,30 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         let scopes = scopes.ok_or_else(|| format!("The command needs --scope.\n{}", help()))?;
         let ttl = ttl.ok_or_else(|| format!("The command needs --ttl.\n{}", help()))?;
         target = serde_json::json!({"scopes": scopes, "ttl_secs": ttl.as_secs()}).to_string();
+    }
+    if op == "admin-preauth-create" && !raw {
+        let ttl = ttl.ok_or_else(|| format!("The command needs --ttl.\n{}", help()))?;
+        let ttl_secs = ttl.as_secs();
+        if ttl_secs == 0 || ttl_secs > MAX_PREAUTH_TTL_SECS {
+            return Err(
+                "The pre-auth key life is 1 second to 1 hour. Use 90, 90s, 30m, or 1h.".to_string(),
+            );
+        }
+        if out.is_none() {
+            return Err(format!("The command needs --out.\n{}", help()));
+        }
+        let grant = match preauth_grant {
+            Some(text) => Some(parse_grant(&text, preauth_path.as_deref())?),
+            None => None,
+        };
+        target = serde_json::json!({
+            "ttl_secs": ttl_secs,
+            "max_uses": preauth_uses.unwrap_or(1),
+            "ephemeral": preauth_ephemeral,
+            "tags": preauth_tags,
+            "grant": grant,
+        })
+        .to_string();
     }
     if let Some(file) = policy_file {
         target = std::fs::read_to_string(&file)
@@ -240,6 +291,9 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             }
             if call.op == "admin-token-create" {
                 return print_created(&value, call.out.as_deref());
+            }
+            if call.op == "admin-preauth-create" {
+                return print_preauth(&value, call.out.as_deref());
             }
             print_admin(&call.op, &value)?;
             if matches!(
@@ -318,6 +372,63 @@ fn print_created(value: &Value, out: Option<&std::path::Path>) -> Result<(), Str
     Ok(())
 }
 
+/// Write the new pre-auth key to `out` with mode 0600. The command does not print the key.
+fn print_preauth(value: &Value, out: Option<&std::path::Path>) -> Result<(), String> {
+    let bad = || "The coordinator response is not valid.".to_string();
+    let key = text_field(value, "key")?;
+    let id = text_field(value, "id")?;
+    let path = out.ok_or_else(|| "The command needs --out.".to_string())?;
+    write_private(path, &format!("{key}\n"))?;
+    println!("wrote one pre-auth key");
+    println!("out {}", path.display());
+    println!("preauth_id {id}");
+    println!(
+        "uses {}",
+        value.get("max_uses").and_then(Value::as_u64).unwrap_or(1)
+    );
+    println!(
+        "ephemeral {}",
+        u8::from(value.get("ephemeral").and_then(Value::as_bool) == Some(true))
+    );
+    println!(
+        "expires_unix_ms {}",
+        value
+            .get("expires_unix_ms")
+            .and_then(Value::as_u64)
+            .ok_or_else(bad)?
+    );
+    Ok(())
+}
+
+fn parse_grant(text: &str, path: Option<&str>) -> Result<Value, String> {
+    let parts: Vec<&str> = text.split(',').collect();
+    if parts.len() != 4 {
+        return Err(
+            "The grant is NODE,SERVICE,PORT,TTL. The path is --grant-path. The default path is /."
+                .to_string(),
+        );
+    }
+    let port: u16 = parts[2]
+        .parse()
+        .map_err(|_| "The grant port is not valid.".to_string())?;
+    let ttl: u64 = parts[3]
+        .parse()
+        .map_err(|_| "The grant life is not valid.".to_string())?;
+    if port == 0 || ttl == 0 || ttl > 300 {
+        return Err(
+            "The grant port is 1 to 65535. The grant life is 1 to 300 seconds.".to_string(),
+        );
+    }
+    let path = path.unwrap_or("/");
+    Ok(serde_json::json!({
+        "node": parts[0],
+        "service": parts[1],
+        "port": port,
+        "path_prefix": path,
+        "max_ttl_secs": ttl,
+    }))
+}
+
 fn write_private(path: &std::path::Path, text: &str) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -361,6 +472,51 @@ fn print_admin(op: &str, value: &Value) -> Result<(), String> {
             }
             println!("tokens {}", tokens.len());
         }
+        "admin-preauth-list" => {
+            let keys = value
+                .get("keys")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "The coordinator response is not valid.".to_string())?;
+            for key in keys {
+                let tags = key
+                    .get("tags")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default();
+                let tag_text = if tags.is_empty() {
+                    "-".to_string()
+                } else {
+                    tags
+                };
+                println!(
+                    "preauth {} {} uses {}/{} ephemeral {} tags {} expires_unix_ms {}",
+                    text_field(key, "id")?,
+                    text_field(key, "state")?,
+                    key.get("uses").and_then(Value::as_u64).unwrap_or(0),
+                    key.get("max_uses").and_then(Value::as_u64).unwrap_or(0),
+                    u8::from(key.get("ephemeral").and_then(Value::as_bool) == Some(true)),
+                    tag_text,
+                    key.get("expires_unix_ms")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                );
+            }
+            println!("preauth_keys {}", keys.len());
+        }
+        "admin-preauth-revoke" => {
+            println!("revoked_preauth {}", text_field(value, "id")?);
+            let at = value
+                .get("revoked_unix_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            println!("revoked_unix_ms {at}");
+        }
         "admin-token-revoke" => {
             println!("revoked_token {}", text_field(value, "id")?);
             let at = value
@@ -388,7 +544,9 @@ fn print_admin(op: &str, value: &Value) -> Result<(), String> {
             for node in nodes {
                 let name = text_field(node, "name")?;
                 let ip = text_field(node, "overlay_ip")?;
-                let state = if node.get("expired").and_then(Value::as_bool) == Some(true) {
+                let state = if node.get("removed").and_then(Value::as_bool) == Some(true) {
+                    "removed"
+                } else if node.get("expired").and_then(Value::as_bool) == Some(true) {
                     "expired"
                 } else if node.get("approved").and_then(Value::as_bool) == Some(true) {
                     "approved"
@@ -736,6 +894,9 @@ orblx admin policy-set FILE --coord ADDR [--state DIR] [--coord-name NAME] [--bu
 orblx admin token-create --scope SCOPE[,SCOPE] --ttl TIME --coord ADDR [--out FILE] [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin token-list --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin token-revoke ID --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin preauth-create --ttl TIME --out FILE --coord ADDR [--uses N] [--ephemeral] [--tag TAG] [--grant NODE,SERVICE,PORT,TTL] [--grant-path PATH] [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin preauth-list --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin preauth-revoke ID --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin call OP [ARG] --coord ADDR [--token-file FILE] [--state DIR] [--coord-name NAME] [--bundle FILE]
 
 Each command except token-create, token-list, and token-revoke also accepts --token-file FILE.
@@ -743,8 +904,8 @@ With --token-file, the command sends the scoped API token in FILE and no client 
 The coordinator accepts the call only when the token has the scope of the operation.
 The command then prints `status N done_ms MS`. 401: the token is not valid, expired, or revoked.
 403: the token does not have the scope. Only an owner SVID can create, list, or revoke tokens.
-Scopes: nodes:read (nodes, users, routes),
-nodes:write (approve, revoke, revoke-all, revoke-undo, expire, user-approve, user-reject),
+Scopes: nodes:read (nodes, users, routes, preauth-list),
+nodes:write (approve, revoke, revoke-all, revoke-undo, expire, user-approve, user-reject, preauth-create, preauth-revoke),
 grants:read (grants), grants:write (grant-approve, grant-revoke), audit:read (audit),
 lock:read and lock:write (node lock), policy:read (policy), policy:write (policy-set).
 TIME for --ttl is seconds or an age such as 90s, 30m, 2h, or 7d. The maximum is 30d.
@@ -776,7 +937,7 @@ netmap-seq-reset is for a coordinator clock that went forward and then back.
 The coordinator then signs no netmap, because the stored netmap seq is more than 60 s
 ahead of its clock. The command sets the stored seq to the clock time. It works only when
 the stored seq is ahead of the clock. Only an owner SVID can run it (no API token).
-It writes one netmap-seq-reset audit record (code 42).
+It writes one netmap-seq-reset audit record (code 46).
 users lists the OIDC users with the state pending, approved, or rejected, and the role.
 roles lists the same users as `subject state role`.
 role-set changes the role of USER. USER is oidc:SUBJECT or SUBJECT.
@@ -798,7 +959,16 @@ TIME is Unix seconds, YYYY-MM-DDTHH:MM:SSZ, or an age such as 30m, 2h, or 7d.
 --json prints one JSON record on each line.
 --verify prints only the chain check.
 audit fails when the chain check fails.
-The command does not print private keys or enroll tokens.
+The command does not print private keys, enroll tokens, or pre-auth keys.
+preauth-create writes the key only to --out. The life is 1 second to 1 hour.
+The default is one use. --uses N sets a reusable key. N is 1 to 16.
+--ephemeral removes the node when it is offline for 15 seconds or when the key expires.
+--tag sets a fixed tag. The caller must own that tag. A token cannot set a tag.
+--grant sets the only agent grant the enrolled node may receive.
+A token needs grants:write to set a grant. The grant life is 1 to 300 seconds.
+preauth-list prints the key id and does not print the key.
+preauth-revoke refuses a later enroll with that key.
+Each create, use, deny, revoke, and ephemeral removal writes one audit record.
 "
     .to_string()
 }
@@ -1079,6 +1249,78 @@ mod tests {
         match command {
             Command::Call(call) => assert_eq!(call.target, "abcd"),
             Command::Help => panic!("the parser did not select token-revoke"),
+        }
+    }
+
+    #[test]
+    fn preauth_create_writes_the_ask_and_keeps_the_key_out_of_the_command() {
+        let command = parse(&args(&[
+            "preauth-create",
+            "--ttl",
+            "90s",
+            "--uses",
+            "2",
+            "--ephemeral",
+            "--tag",
+            "tag:bot",
+            "--grant",
+            "srv,web,8080,30",
+            "--grant-path",
+            "/v1",
+            "--out",
+            "/tmp/preauth-key",
+            "--coord",
+            "127.0.0.1:443",
+        ]))
+        .unwrap();
+        match command {
+            Command::Call(call) => {
+                assert_eq!(call.op, "admin-preauth-create");
+                assert_eq!(
+                    call.out.as_deref(),
+                    Some(std::path::Path::new("/tmp/preauth-key"))
+                );
+                let ask: serde_json::Value = serde_json::from_str(&call.target).unwrap();
+                assert_eq!(ask["ttl_secs"], 90);
+                assert_eq!(ask["max_uses"], 2);
+                assert_eq!(ask["ephemeral"], true);
+                assert_eq!(ask["tags"][0], "tag:bot");
+                assert_eq!(ask["grant"]["node"], "srv");
+                assert_eq!(ask["grant"]["path_prefix"], "/v1");
+                assert_eq!(ask["grant"]["max_ttl_secs"], 30);
+                assert!(!call.target.contains("orblx-pak1."));
+            }
+            Command::Help => panic!("the parser did not select preauth-create"),
+        }
+        assert!(parse(&args(&[
+            "preauth-create",
+            "--ttl",
+            "2h",
+            "--out",
+            "/tmp/preauth-key",
+            "--coord",
+            "127.0.0.1:443",
+        ]))
+        .unwrap_err()
+        .contains("1 hour"));
+        let list = parse(&args(&["preauth-list", "--coord", "127.0.0.1:443"])).unwrap();
+        match list {
+            Command::Call(call) => assert_eq!(call.op, "admin-preauth-list"),
+            Command::Help => panic!("the parser did not select preauth-list"),
+        }
+        let revoke = parse(&args(&[
+            "preauth-revoke",
+            "0123456789abcdef",
+            "--coord",
+            "127.0.0.1:443",
+        ]))
+        .unwrap();
+        match revoke {
+            Command::Call(call) => {
+                assert_eq!(call.op, "admin-preauth-revoke");
+                assert_eq!(call.target, "0123456789abcdef");
+            }
+            Command::Help => panic!("the parser did not select preauth-revoke"),
         }
     }
 }

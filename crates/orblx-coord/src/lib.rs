@@ -17,6 +17,7 @@ mod apitoken;
 mod client;
 mod config;
 mod error;
+mod preauth;
 
 mod files;
 mod http_util;
@@ -59,10 +60,11 @@ pub use apitoken::{
 pub use client::{
     admin_blocking, admin_token_blocking, admin_token_expect_blocking, advertise_exit_blocking,
     advertise_routes_blocking, agent_grant_fetch_blocking, agent_grant_request_blocking,
-    enroll_with_oidc_blocking, enroll_with_token_blocking, fetch_deny_blocking,
-    fetch_deny_wait_blocking, fetch_netmap_blocking, fetch_policy_wait_blocking, netmap_json,
-    publish_candidates_blocking, renew_svid_blocking, ssh_cert_request_blocking, AdminReply,
-    GrantFetch, OidcEnroll, PolicySync, PolicyWaiter, DENY_WAIT_HOLD, POLICY_WAIT_GAP,
+    enroll_with_oidc_blocking, enroll_with_preauth_blocking, enroll_with_token_blocking,
+    fetch_deny_blocking, fetch_deny_wait_blocking, fetch_netmap_blocking,
+    fetch_policy_wait_blocking, netmap_json, publish_candidates_blocking, renew_svid_blocking,
+    ssh_cert_request_blocking, AdminReply, GrantFetch, OidcEnroll, PolicySync, PolicyWaiter,
+    DENY_WAIT_HOLD, POLICY_WAIT_GAP,
 };
 pub use config::{CoordConfig, OidcSection};
 pub use error::{CoordError, USER_PENDING_TEXT, USER_REJECTED_TEXT};
@@ -73,6 +75,7 @@ pub use netmap::{
     verify_signed_netmap, NetmapKey, SignedEndpoint, SignedGrants, SignedGrantsWire, SignedNetmap,
     SignedNetmapWire,
 };
+pub use preauth::{MAX_PREAUTH_TTL_SECS, PREAUTH_PREFIX};
 pub use proto::{GrantAsk, SshCertAsk, NODE_PROTO, VERSION_MISMATCH};
 pub use roles::{parse_admin_role, Role};
 pub use seq::{

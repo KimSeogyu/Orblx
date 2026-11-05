@@ -155,6 +155,21 @@ pub(crate) fn request(
     if !path_prefix_ok(&path_prefix) {
         return Err(bad("The path prefix is not valid."));
     }
+    let fit = crate::preauth::fit_grant(coord, requester, ask, &path_prefix)?;
+    let (state, approver) = match fit {
+        crate::preauth::Fit::Open => (PENDING.to_string(), None),
+        crate::preauth::Fit::Ready { approver } => (APPROVED.to_string(), Some(approver)),
+        crate::preauth::Fit::Deny { key_id } => {
+            crate::preauth::record_deny(
+                coord,
+                &format!("preauth:{key_id}"),
+                &key_id,
+                "grant",
+                now,
+            )?;
+            return Err(bad("The grant is outside the pre-auth key."));
+        }
+    };
     let nodes = coord.node_list()?;
     let target = nodes
         .iter()
@@ -175,8 +190,8 @@ pub(crate) fn request(
         path_prefix,
         ttl_secs: ask.ttl_secs,
         requested_at: unix_now(now)?,
-        state: PENDING.to_string(),
-        approver: None,
+        state: state.clone(),
+        approver: approver.clone(),
         expires: None,
         nonce: None,
         ticket_hash: None,
@@ -187,6 +202,11 @@ pub(crate) fn request(
     file.grants.push(record.clone());
     save(coord, &file)?;
     let actor = SpiffeId::node(requester)?.as_uri().to_string();
+    let phase = if state == APPROVED {
+        "preauth"
+    } else {
+        "pending"
+    };
     coord.record_change(
         &actor,
         ConfigAction::AgentGrant,
@@ -194,7 +214,7 @@ pub(crate) fn request(
         EMPTY_DIGEST,
         record_digest(&record),
         &format!(
-            "agent {} node {} service {} port {} path {} ttl {} pending",
+            "agent {} node {} service {} port {} path {} ttl {} {phase}",
             record.agent,
             record.node,
             record.service,
@@ -203,7 +223,21 @@ pub(crate) fn request(
             record.ttl_secs
         ),
     )?;
-    Ok(json!({"op": "agent-grant", "id": record.id, "state": PENDING, "agent": record.agent}))
+    if state == APPROVED {
+        let approver = approver.unwrap_or_default();
+        coord.record_change(
+            &approver,
+            ConfigAction::AgentApprove,
+            &record.id,
+            EMPTY_DIGEST,
+            record_digest(&record),
+            &format!(
+                "agent {} node {} service {} port {} ttl {} preauth",
+                record.agent, record.node, record.service, record.port, record.ttl_secs
+            ),
+        )?;
+    }
+    Ok(json!({"op": "agent-grant", "id": record.id, "state": state, "agent": record.agent}))
 }
 
 /// Return the material of one approved grant one time.
@@ -379,6 +413,27 @@ pub(crate) fn approve(
     if record.state != PENDING {
         return Err(bad("The grant is not pending."));
     }
+    let ask = GrantAsk {
+        agent: record.agent.clone(),
+        node: record.node.clone(),
+        service: record.service.clone(),
+        port: record.port,
+        ttl_secs: record.ttl_secs,
+        path_prefix: Some(record.path_prefix.clone()),
+    };
+    match crate::preauth::fit_grant(coord, &record.requester, &ask, &record.path_prefix)? {
+        crate::preauth::Fit::Open | crate::preauth::Fit::Ready { .. } => {}
+        crate::preauth::Fit::Deny { key_id } => {
+            crate::preauth::record_deny(
+                coord,
+                &format!("preauth:{key_id}"),
+                &key_id,
+                "grant",
+                now,
+            )?;
+            return Err(bad("The grant is outside the pre-auth key."));
+        }
+    }
     let before = record_digest(record);
     record.state = APPROVED.to_string();
     record.approver = Some(actor.to_string());
@@ -458,6 +513,23 @@ pub(crate) struct PrincipalRevoke {
     pub(crate) nonces: usize,
     /// The deny file version after the call.
     pub(crate) deny_version: u64,
+}
+
+/// The agent names of issued grants that `requester` asked for.
+pub(crate) fn issued_agent_names(
+    coord: &Coordinator,
+    requester: &str,
+) -> Result<Vec<String>, CoordError> {
+    let _guard = GRANT_LOCK.lock().map_err(|_| CoordError::State)?;
+    let file = load(coord)?;
+    let mut names = Vec::new();
+    for record in &file.grants {
+        if record.requester == requester && record.state == ISSUED && !names.contains(&record.agent)
+        {
+            names.push(record.agent.clone());
+        }
+    }
+    Ok(names)
 }
 
 /// Revoke all grants of one principal and deny the principal SPIFFE ID.
