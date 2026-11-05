@@ -158,7 +158,6 @@ PO decision: W25-21 makes neither change, and the close wait stays.
   The workflow runs on a push to the main branch.
   The workflow runs on demand.
   On a pull request, each shard runs when a changed file is an input of the start-up test.
-  Each shard runs when the pull request has the label `full-ci`.
 - Direct: `ORBLX_STARTUP_RUNS=10 cargo test -p orblx-coord --lib startup_cost_runs -- --ignored --nocapture`.
 
 ## 7. Limits

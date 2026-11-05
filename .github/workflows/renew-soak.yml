@@ -13,11 +13,19 @@ on:
     branches:
       - main
   pull_request:
-    types:
-      - opened
-      - synchronize
-      - reopened
-      - labeled
+    paths:
+      - crates/orblx-agent/**
+      - crates/orblx-audit/**
+      - crates/orblx-coord/**
+      - crates/orblx-crypto/**
+      - crates/orblx-datapath/**
+      - crates/orblx-edge/**
+      - crates/orblx-identity/**
+      - crates/orblx-relay/**
+      - crates/orblx-test-idp/**
+      - Cargo.lock
+      - Cargo.toml
+      - .github/workflows/renew-soak.yml
 
 # A pull request run cancels the previous run in this group.
 # A push to the main branch keeps the previous run.
@@ -26,59 +34,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  paths:
-    name: renew-soak path check
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    if: github.event_name == 'pull_request'
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      run: ${{ steps.set.outputs.run }}
-    steps:
-      - name: Decide if renew-soak runs
-        id: set
-        env:
-          HAS_FULL_CI: ${{ github.event.label.name == 'full-ci' || contains(github.event.pull_request.labels.*.name, 'full-ci') }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          : "${HAS_FULL_CI:=false}"
-          : "${REPO:?}"
-          : "${PR_NUMBER:?}"
-          : "${GITHUB_OUTPUT:?}"
-          # cargo test -p orblx-coord builds these crates. The job runs no script.
-          if [[ "${HAS_FULL_CI}" == "true" ]]; then
-            echo "run=true" >> "${GITHUB_OUTPUT}"
-            echo "renew_soak_path_check run=true reason=full-ci"
-            exit 0
-          fi
-          files_text="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[] | .filename, (.previous_filename // empty)')"
-          run=false
-          while IFS= read -r file; do
-            if [[ -z "${file}" ]]; then
-              continue
-            fi
-            case "${file}" in
-              Cargo.lock|Cargo.toml|.github/workflows/renew-soak.yml|\
-              crates/orblx-agent/*|crates/orblx-audit/*|crates/orblx-coord/*|\
-              crates/orblx-crypto/*|crates/orblx-datapath/*|crates/orblx-edge/*|\
-              crates/orblx-identity/*|crates/orblx-relay/*|crates/orblx-test-idp/*)
-                run=true
-                ;;
-            esac
-          done <<< "${files_text}"
-          echo "run=${run}" >> "${GITHUB_OUTPUT}"
-          echo "renew_soak_path_check run=${run} reason=paths"
-
   renew-soak:
     name: renew-soak ${{ matrix.os }} shard ${{ matrix.shard }}
-    needs: paths
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.paths.result == 'success' && needs.paths.outputs.run == 'true')) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
