@@ -9,7 +9,7 @@ release owner copies the lines into the GitHub release.
 
 ## Known issues in v0.1.0-rc.1 and v0.1.0-rc.2
 
-- SSH logins can fail after the node certificate renews (W25-40). Fixed in rc.3.
+- SSH logins can fail after the node certificate renews (W25-40). A fix is merged (#137) but is not yet proven on a real host. Open in rc.3.
 - rc.1/rc.2: about 1 min after a node's capability ticket ends (the ticket life is the SVID life, about 16 min by default), its peers refuse it (end time has passed). New connections and existing sessions with traffic both stop. Workaround: restart the node (orblx up).
 - rc.1/rc.2 SSH login has no netmap age check and no cert serial; a node removed from the netmap but not on the deny list can still log in until its SVID expires. Upgrade to rc.3.
 
