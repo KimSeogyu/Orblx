@@ -37,13 +37,13 @@ The script does not print private keys, tickets, or SVID proofs.
 ## Commands
 
 ```bash
-orblx ssh USER@NODE --identity DIR --netmap FILE --peer-cert FILE [--command TEXT]
+sudo orblx ssh USER@NODE --state DIR --peer-cert FILE [--command TEXT|--shell]
 orblx node-issue --out DIR --node NAME=OVERLAY_IP [--user NAME] [--agent NAME --agent-parent USER --agent-host ADDR --agent-user USER]
 orblx audit verify --file FILE
 ```
 
 The client checks the SSH host key against `--peer-cert`.
-The client then sends one SVID proof.
+The client signs in with a user certificate from the coordinator (W25-31). Password and SVID-proof login are removed.
 The default command prints `ORBLX_SSH_USER`.
 
 ## Proof

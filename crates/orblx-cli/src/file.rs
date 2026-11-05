@@ -10,7 +10,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use orblx_coord::{decode_hex_32, verify_signed_grants, SignedGrants};
+use orblx_coord::{decode_hex_32, grants_from_slice};
 use orblx_datapath::Netmap;
 use orblx_file::{
     name_ok, send_file, serve, FileError, Gate, ReceiverConfig, SendIdentity, DEFAULT_MAX_BYTES,
@@ -245,11 +245,10 @@ fn load_gate(state: &Path, self_id: &SpiffeId, port: u16) -> Result<Gate, FileEr
         .ok()
         .and_then(|text| decode_hex_32(text.trim()).ok())
         .ok_or_else(|| fail("The netmap key did not open."))?;
-    let signed: SignedGrants = fs::read(state.join("grants.signed.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .ok_or_else(|| fail("The signed grants did not open."))?;
-    verify_signed_grants(&signed, &public)
+    let bytes = fs::read(state.join("grants.signed.json"))
+        .map_err(|_| fail("The signed grants did not open."))?;
+    // W25-34: check the signature over the file bytes, then parse them.
+    let signed = grants_from_slice(&bytes, &public)
         .map_err(|_| fail("The grant signature is not valid."))?;
     if signed.grants.receiver != self_id.as_uri() {
         return Err(fail("The signed grants are for another node."));

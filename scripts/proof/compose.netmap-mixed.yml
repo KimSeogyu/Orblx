@@ -1,0 +1,143 @@
+# W25-34 mixed-version and upgrade proof stack (PO option A).
+# Each service has its own image variable, so one service can run the old (rc.2) binary and
+# another the new binary. `docker compose up` starts only the coordinator.
+name: ${PROOF_PROJECT:-orblx-w2534-mix-proof}
+
+x-node: &node
+  profiles: ["nodes"]
+  entrypoint: ["orblx"]
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+  devices:
+    - /dev/net/tun:/dev/net/tun
+  sysctls:
+    net.ipv4.conf.all.rp_filter: "0"
+    net.ipv4.conf.default.rp_filter: "0"
+  stop_grace_period: 10s
+
+services:
+  coord:
+    image: ${MIX_COORD_IMAGE:?set MIX_COORD_IMAGE}
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /etc/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+    volumes:
+      - ${MIX_COORD_STATE:?set MIX_COORD_STATE}:/var/lib/orblx
+      - ${MIX_POLICY_DIR:?set MIX_POLICY_DIR}:/etc/orblx:ro
+    networks:
+      proof:
+        ipv4_address: 172.30.135.2
+
+  tool:
+    image: ${MIX_TOOL_IMAGE:?set MIX_TOOL_IMAGE}
+    profiles: ["tool"]
+    entrypoint: ["orblx"]
+    volumes:
+      - ${MIX_WORK:?set MIX_WORK}:/work
+      - ${MIX_COORD_STATE:?set MIX_COORD_STATE}:/coord-state:ro
+    networks:
+      - proof
+
+  a:
+    <<: *node
+    image: ${MIX_A_IMAGE:?set MIX_A_IMAGE}
+    volumes:
+      - ${MIX_A_STATE:?set MIX_A_STATE}:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.135.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --metrics
+      - 127.0.0.1:9464
+    networks:
+      proof:
+        ipv4_address: 172.30.135.4
+
+  b:
+    <<: *node
+    image: ${MIX_B_IMAGE:?set MIX_B_IMAGE}
+    volumes:
+      - ${MIX_B_STATE:?set MIX_B_STATE}:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.135.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --metrics
+      - 127.0.0.1:9464
+    networks:
+      proof:
+        ipv4_address: 172.30.135.5
+
+  c:
+    <<: *node
+    image: ${MIX_C_IMAGE:?set MIX_C_IMAGE}
+    volumes:
+      - ${MIX_C_STATE:?set MIX_C_STATE}:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.135.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --metrics
+      - 127.0.0.1:9464
+    networks:
+      proof:
+        ipv4_address: 172.30.135.6
+
+  d:
+    <<: *node
+    image: ${MIX_D_IMAGE:?set MIX_D_IMAGE}
+    volumes:
+      - ${MIX_D_STATE:?set MIX_D_STATE}:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.135.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --metrics
+      - 127.0.0.1:9464
+    networks:
+      proof:
+        ipv4_address: 172.30.135.7
+
+networks:
+  proof:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.135.0/24
+          gateway: 172.30.135.1
+          ip_range: 172.30.135.128/25
