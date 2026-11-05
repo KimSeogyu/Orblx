@@ -1271,7 +1271,6 @@ mod tests {
     use crate::client::{run_session, SessionRequest};
     use crate::record::{Recorder, Utf8Carry};
 
-
     /// R4a: a password attempt is rejected and the audit chain records the deny.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_password_login_is_rejected_and_audited() {
