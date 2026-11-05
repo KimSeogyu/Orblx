@@ -1374,33 +1374,46 @@ mod tests {
         let http_port = listener.local_addr().unwrap().port();
         let ssdp = UdpSocket::bind("127.0.0.1:0").unwrap();
         let ssdp_port = ssdp.local_addr().unwrap().port();
+        let (grant_tx, grant_rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
             let mut buf = [0u8; 1500];
-            let _ = ssdp.set_read_timeout(Some(Duration::from_secs(2)));
-            if let Ok((_, from)) = ssdp.recv_from(&mut buf) {
-                let text = format!(
-                    "HTTP/1.1 200 OK\r\nLOCATION: http://127.0.0.1:{http_port}/rootDesc.xml\r\n\r\n"
-                );
-                let _ = ssdp.send_to(text.as_bytes(), from);
-            }
+            // The first datagram is the test handshake. The next one is the search.
+            let _ = ssdp.set_read_timeout(None);
+            let Ok((_, from)) = ssdp.recv_from(&mut buf) else {
+                return;
+            };
+            let _ = ssdp.send_to(b"ready", from);
+            let Ok((_, from)) = ssdp.recv_from(&mut buf) else {
+                return;
+            };
+            let text = format!(
+                "HTTP/1.1 200 OK\r\nLOCATION: http://127.0.0.1:{http_port}/rootDesc.xml\r\n\r\n"
+            );
+            let _ = ssdp.send_to(text.as_bytes(), from);
         });
         thread::spawn(move || {
             let _ = listener.set_nonblocking(false);
+            // The first connection proves this thread is inside accept.
+            let Ok((mut ready, _)) = listener.accept() else {
+                return;
+            };
+            let _ = ready.write_all(b"ready");
+            drop(ready);
             for _ in 0..3 {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                let mut buf = [0u8; 4096];
-                let Ok(size) = stream.read(&mut buf) else {
+                let _ = stream.set_read_timeout(None);
+                // Read the body too. Closing with an unread POST body sends a TCP reset.
+                let Some(req) = read_http_request(&mut stream) else {
                     return;
                 };
-                let req = String::from_utf8_lossy(&buf[..size]);
                 let body = if req.contains("rootDesc.xml") {
                     "<root><service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType><controlURL>/ctl/IPConn</controlURL></service></root>".to_string()
                 } else if req.contains("GetExternalIPAddress") {
                     "<NewExternalIPAddress>203.0.113.7</NewExternalIPAddress>".to_string()
                 } else {
+                    let _ = grant_tx.send(());
                     "<ok/>".to_string()
                 };
                 let response = format!(
@@ -1410,11 +1423,67 @@ mod tests {
                 let _ = stream.write_all(response.as_bytes());
             }
         });
+        let poke = UdpSocket::bind("127.0.0.1:0").unwrap();
+        poke.send_to(b"ready?", (Ipv4Addr::LOCALHOST, ssdp_port))
+            .unwrap();
+        poke.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut ready_buf = [0u8; 8];
+        let (size, _) = poke.recv_from(&mut ready_buf).expect("ssdp mock ready");
+        assert_eq!(&ready_buf[..size], b"ready");
+        let mut http_ready = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, http_port))
+            .expect("http mock connect");
+        http_ready
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut http_buf = [0u8; 5];
+        http_ready
+            .read_exact(&mut http_buf)
+            .expect("http mock ready");
+        assert_eq!(&http_buf, b"ready");
+        drop(http_ready);
         let report =
             probe_port_map_at(PortMapChoice::Only(PortMapProto::Upnp), 9, ssdp_port, 2_000);
+        grant_rx.try_recv().expect("upnp grant");
         let mapping = report.mapping.expect("upnp map");
         assert_eq!(mapping.protocol(), PortMapProto::Upnp);
         assert_eq!(mapping.external().to_string(), "203.0.113.7:443");
+        // The mock is gone. Drop would send a delete to a closed port.
+        std::mem::forget(mapping);
+    }
+
+    /// Read one HTTP request, including a Content-Length body.
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Option<String> {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 8192];
+        let header_end = loop {
+            let size = stream.read(&mut buf).ok()?;
+            if size == 0 {
+                return None;
+            }
+            got.extend_from_slice(&buf[..size]);
+            if let Some(pos) = got.windows(4).position(|mark| mark == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&got[..header_end]);
+        let mut length = 0usize;
+        for line in headers.split(['\r', '\n']) {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        while got.len() < header_end + length {
+            let size = stream.read(&mut buf).ok()?;
+            if size == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..size]);
+        }
+        String::from_utf8(got).ok()
     }
 
     fn probe_port_map_at(
