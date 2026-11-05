@@ -71,7 +71,7 @@ cleanup() {
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$PROOF_LIB_DIR/proof-lock.sh"
 trap 'cleanup; proof_lock_end' EXIT
-proof_lock_take "ssh"
+proof_lock_take "ssh" orblx-ssh
 # W25-14b: start from a clean compose state (all profiles, all volumes).
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"

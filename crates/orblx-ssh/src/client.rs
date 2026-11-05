@@ -1,8 +1,8 @@
 //! `orblx ssh` client.
 //!
 //! The client checks the server host key against the node SVID.
-//! The client sends one SVID proof.
-//! The client does not write an SSH key file.
+//! The client signs in with one short user certificate from the coordinator (W25-31).
+//! The client has no password login. The client does not write an SSH key file.
 
 use std::fs;
 use std::net::SocketAddr;
@@ -17,7 +17,7 @@ use russh::client::{self, Handler};
 use russh::keys::PublicKeyOrCertificate;
 use russh::{ChannelMsg, Disconnect};
 
-use crate::auth::{command_ok, seal_login};
+use crate::auth::command_ok;
 use crate::hostkey::ed25519_public_bytes;
 
 /// One SSH command.
@@ -28,19 +28,20 @@ pub struct SessionRequest {
     pub addr: SocketAddr,
     /// Destination node SPIFFE ID.
     pub dst: SpiffeId,
-    /// Directory with `cert.pem`, `key.pem`, `bundle.pem`, and an optional `ticket.bin`.
+    /// Directory with `bundle.pem`, the trust bundle that checks the node SVID.
     pub identity_dir: PathBuf,
     /// Node SVID certificate PEM.
     pub peer_cert: PathBuf,
     /// Remote command.
     pub command: String,
-    /// W25-31: sign in with a user certificate from the coordinator, not with an SVID proof.
-    pub cert_login: Option<CertLogin>,
+    /// W25-31: the user certificate login. It is the only login method.
+    pub cert_login: CertLogin,
 }
 
 /// One user certificate login (W25-31).
 ///
 /// The key lives only in memory. The certificate is short. Debug output elides the key.
+#[derive(Clone)]
 pub struct CertLogin {
     /// The private key of the certificate.
     pub key: russh::keys::PrivateKey,
@@ -211,48 +212,17 @@ async fn open_channel(
         inactivity_timeout: Some(std::time::Duration::from_secs(30)),
         ..client::Config::default()
     });
-    if let Some(login) = &request.cert_login {
-        let handler = ClientHandler { expect: host_key };
-        let mut handle = client::connect(config, request.addr, handler)
-            .await
-            .map_err(|_| "The SSH session did not open.".to_string())?;
-        let auth = handle
-            .authenticate_openssh_cert(
-                &request.user,
-                Arc::new(login.key.clone()),
-                login.cert.clone(),
-            )
-            .await
-            .map_err(|_| "The SSH session did not open.".to_string())?;
-        if !auth.success() {
-            return Err("The SSH session was refused.".to_string());
-        }
-        let channel = handle
-            .channel_open_session()
-            .await
-            .map_err(|_| "The SSH session did not open.".to_string())?;
-        return Ok((handle, channel));
-    }
-    let cert_pem = read_text(&request.identity_dir.join("cert.pem"))?;
-    let key_pem = read_text(&request.identity_dir.join("key.pem"))?;
-    let leaf_der =
-        decode_certificate_pem(&cert_pem).map_err(|_| "The SVID is not valid.".to_string())?;
-    let ticket = fs::read(request.identity_dir.join("ticket.bin")).ok();
-    let password = seal_login(
-        &key_pem,
-        &leaf_der,
-        &host_key,
-        &request.user,
-        &request.dst,
-        SystemTime::now(),
-        ticket.as_deref(),
-    )?;
+    let login = &request.cert_login;
     let handler = ClientHandler { expect: host_key };
     let mut handle = client::connect(config, request.addr, handler)
         .await
         .map_err(|_| "The SSH session did not open.".to_string())?;
     let auth = handle
-        .authenticate_password(&request.user, password)
+        .authenticate_openssh_cert(
+            &request.user,
+            Arc::new(login.key.clone()),
+            login.cert.clone(),
+        )
         .await
         .map_err(|_| "The SSH session did not open.".to_string())?;
     if !auth.success() {

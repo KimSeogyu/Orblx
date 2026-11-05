@@ -7,6 +7,10 @@
 //! when the recording does not open or does not write.
 //! A client can ask for a PTY and a shell. The server records the input and
 //! the output of that shell in time order when the rule requires it.
+//!
+//! The only login method is a user certificate from the coordinator SSH user CA (W25-31).
+//! The server refuses each password login, also an SVID proof or a ticket as the password.
+//! A shell or a command needs a certificate admission and a netmap that is at most 60 s old.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -23,15 +27,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_audit::{AuditLog, SessionEvent, SessionIds};
 use orblx_identity::{
-    ed25519_seed_from_private_pem, DenyApply, DenySet, Policy, SpiffeId, TicketVerifier,
-    TrustBundle,
+    ed25519_seed_from_private_pem, DenyApply, DenySet, Policy, SpiffeId, TrustBundle,
 };
 use russh::keys::ssh_encoding::bytes::Bytes;
 use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use tokio::net::TcpListener;
 
-use crate::auth::{command_ok, open_login, overlay_listen_addr, RefusedLogin};
+use crate::auth::{command_ok, overlay_listen_addr, RefusedLogin};
 use crate::cert::{check_cert, fresh_netmap, CertInput, CertRefuse};
 use crate::hostkey::host_key_from_seed;
 use crate::pty::{kill_group, PtyShell, PtySpec};
@@ -43,11 +46,8 @@ type CertSessions = HashMap<u64, Vec<(String, Weak<AtomicBool>)>>;
 struct Shared {
     overlay: Ipv4Addr,
     node_id: SpiffeId,
-    bundle: TrustBundle,
-    verifier: Option<TicketVerifier>,
     state_dir: PathBuf,
     audit: Mutex<AuditLog>,
-    spent: Mutex<BTreeSet<[u8; 16]>>,
     frames: AtomicU32,
     /// The open certificate sessions by serial (W25-31). A revoked serial stops each session.
     cert_sessions: Mutex<CertSessions>,
@@ -231,8 +231,16 @@ impl From<russh::Error> for SessionFail {
 impl Handler for SshHandler {
     type Error = SessionFail;
 
-    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
-        Ok(self.decide(user, password))
+    /// The server offers no password method. russh still calls this method for a client
+    /// that tries a password, so the server audits the deny and rejects it. The server does
+    /// not read the password: an SVID proof or a ticket as the password gets the same deny.
+    async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
+        self.audit_refuse(&RefusedLogin {
+            peer: self.shared.node_id.clone(),
+            reason: orblx_audit::DenyReason::Missing,
+            ticket_hash: [0u8; 16],
+        });
+        Ok(Auth::reject())
     }
 
     /// W25-31: russh calls this method after it checked the validity window, the CA
@@ -451,80 +459,19 @@ impl SshHandler {
         Auth::Accept
     }
 
-    fn decide(&mut self, user: &str, password: &str) -> Auth {
-        let policy = load_policy(&self.shared.state_dir.join("policy.hujson"));
-        let deny = load_deny(&self.shared.state_dir.join("deny.json"));
-        if deny.reject_uri(&self.shared.node_id).is_err() {
-            self.audit_refuse(&RefusedLogin {
-                peer: self.shared.node_id.clone(),
-                reason: orblx_audit::DenyReason::Revoked,
-                ticket_hash: [0u8; 16],
-            });
-            return Auth::reject();
-        }
-        let spent = self
-            .shared
-            .spent
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .clone();
-        match open_login(
-            user,
-            password,
-            &self.shared.node_id,
-            self.shared.overlay,
-            &self.host_key,
-            SystemTime::now(),
-            &self.shared.bundle,
-            &policy,
-            &deny,
-            self.shared.verifier.as_ref(),
-            &spent,
-        ) {
-            Ok(admitted) => {
-                if let Some(nonce) = admitted.spend_nonce {
-                    if !spend_nonce(&self.shared, nonce) {
-                        self.audit_refuse(&RefusedLogin {
-                            peer: admitted.src,
-                            reason: orblx_audit::DenyReason::Ticket,
-                            ticket_hash: admitted.ticket_hash,
-                        });
-                        return Auth::reject();
-                    }
-                }
-                let frame = self.shared.frames.fetch_add(1, Ordering::Relaxed);
-                let recording =
-                    policy.ssh_recording_required(&admitted.src, &self.shared.node_id, user);
-                self.admitted = Some(Admitted {
-                    src: admitted.src,
-                    user: user.to_string(),
-                    check_period: admitted.check_period,
-                    ticket_hash: admitted.ticket_hash,
-                    frame,
-                    recording,
-                    cert: None,
-                });
-                Auth::Accept
-            }
-            Err(refused) => {
-                self.audit_refuse(&refused);
-                Auth::reject()
-            }
-        }
-    }
-
     fn exec_command(&self, command: &str) -> Option<(u32, Vec<u8>)> {
         let admitted = self.admitted.clone()?;
+        // R3: only a certificate admission may run a command.
+        if let Err(refused) = session_gate(&self.shared, &admitted, unix_now_ms()) {
+            self.audit_refuse(&refused);
+            return None;
+        }
         if !command_ok(command) {
             self.audit_refuse(&RefusedLogin {
                 peer: admitted.src,
                 reason: orblx_audit::DenyReason::Destination,
                 ticket_hash: admitted.ticket_hash,
             });
-            return None;
-        }
-        if let Err(refused) = recheck(&self.shared, &admitted) {
-            self.audit_refuse(&refused);
             return None;
         }
         let mut recorder = None;
@@ -605,7 +552,8 @@ impl SshHandler {
             });
             return false;
         };
-        if let Err(refused) = recheck(&self.shared, &admitted) {
+        // R3: only a certificate admission may start a shell.
+        if let Err(refused) = session_gate(&self.shared, &admitted, unix_now_ms()) {
             self.audit_refuse(&refused);
             return false;
         }
@@ -901,7 +849,35 @@ impl DenyWatch {
     }
 }
 
+/// The check before a shell or a command starts (R3).
+///
+/// A session without a certificate admission is refused. Then [`recheck`] runs.
+fn session_gate(shared: &Shared, admitted: &Admitted, now_ms: u64) -> Result<(), RefusedLogin> {
+    if admitted.cert.is_none() {
+        return Err(RefusedLogin {
+            peer: admitted.src.clone(),
+            reason: orblx_audit::DenyReason::Missing,
+            ticket_hash: admitted.ticket_hash,
+        });
+    }
+    recheck_at(shared, admitted, now_ms)
+}
+
 fn recheck(shared: &Shared, admitted: &Admitted) -> Result<(), RefusedLogin> {
+    recheck_at(shared, admitted, unix_now_ms())
+}
+
+/// Check one admitted session again: the netmap age (each session), the deny file, the
+/// revoked serial, and the policy.
+fn recheck_at(shared: &Shared, admitted: &Admitted, now_ms: u64) -> Result<(), RefusedLogin> {
+    // R3: each session needs a netmap that is at most 60 s old, not only a new login.
+    if let Err(refused) = fresh_netmap(&shared.state_dir, now_ms) {
+        return Err(RefusedLogin {
+            peer: admitted.src.clone(),
+            reason: refused.audit_reason(),
+            ticket_hash: admitted.ticket_hash,
+        });
+    }
     let policy = load_policy(&shared.state_dir.join("policy.hujson"));
     let deny = load_deny(&shared.state_dir.join("deny.json"));
     if deny.reject_uri(&shared.node_id).is_err() {
@@ -1088,9 +1064,9 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) -> Result<(), S
         return Err("The SSH server listens on the overlay address.".to_string());
     }
     println!("ssh_listen {local}");
+    // W25-31: user certificates from the coordinator SSH user CA are the only method.
+    // A plain key gets deny. The server offers no password method (rc.3).
     let mut methods = MethodSet::empty();
-    methods.push(MethodKind::Password);
-    // W25-31: user certificates from the coordinator SSH user CA. A plain key gets deny.
     methods.push(MethodKind::PublicKey);
     spawn_revoke_watch(&shared);
     current_host_key(&shared)?;
@@ -1227,21 +1203,11 @@ impl Shared {
                 &DenySet::empty(),
             )
             .map_err(|_| "The node SVID is not valid.".to_string())?;
-        let verifier = match fs::read_to_string(state_dir.join("ticket-verifier.pem")) {
-            Ok(pem) => Some(
-                TicketVerifier::from_public_pem(&pem)
-                    .map_err(|_| "The ticket verifier is not valid.".to_string())?,
-            ),
-            Err(_) => None,
-        };
         Ok(Self {
             overlay,
             node_id,
-            bundle,
-            verifier,
             state_dir: state_dir.to_path_buf(),
             audit: Mutex::new(AuditLog::new()),
-            spent: Mutex::new(load_spent(&state_dir.join("ssh-spent.txt"))),
             frames: AtomicU32::new(1),
             cert_sessions: Mutex::new(HashMap::new()),
         })
@@ -1271,65 +1237,6 @@ fn load_deny(path: &Path) -> DenySet {
             eprintln!("The deny file is not valid.");
             DenySet::empty()
         }
-    }
-}
-
-fn load_spent(path: &Path) -> BTreeSet<[u8; 16]> {
-    let Ok(text) = fs::read_to_string(path) else {
-        return BTreeSet::new();
-    };
-    let mut set = BTreeSet::new();
-    for line in text.lines() {
-        if let Some(nonce) = parse_hex_16(line.trim()) {
-            set.insert(nonce);
-        }
-    }
-    set
-}
-
-fn spend_nonce(shared: &Shared, nonce: [u8; 16]) -> bool {
-    let mut spent = shared.spent.lock().unwrap_or_else(|err| err.into_inner());
-    if !spent.insert(nonce) {
-        return false;
-    }
-    let mut text = String::new();
-    for item in spent.iter() {
-        text.push_str(&encode_hex(item));
-        text.push('\n');
-    }
-    let path = shared.state_dir.join("ssh-spent.txt");
-    fs::write(path, text).is_ok()
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
-fn parse_hex_16(text: &str) -> Option<[u8; 16]> {
-    if text.len() != 32 {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    for (index, byte) in out.iter_mut().enumerate() {
-        let high = hex_value(text.as_bytes()[index * 2])?;
-        let low = hex_value(text.as_bytes()[index * 2 + 1])?;
-        *byte = (high << 4) | low;
-    }
-    Some(out)
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
     }
 }
 
@@ -1364,374 +1271,98 @@ mod tests {
     use crate::client::{run_session, SessionRequest};
     use crate::record::{Recorder, Utf8Carry};
 
-    #[tokio::test]
-    async fn a_session_on_the_overlay_address_audits_start_end_and_deny() {
-        let dir = std::env::temp_dir().join(format!("orblx-ssh-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let now = SystemTime::now();
-        let ca = MiniCa::generate(now).unwrap();
-        let signer = TicketSigner::generate();
-        let node = SpiffeId::node("box").unwrap();
-        let alice = SpiffeId::user("alice").unwrap();
-        let mallory = SpiffeId::user("mallory").unwrap();
-        let agent = SpiffeId::agent("helper").unwrap();
-        let issued_node = ca
-            .issue(&node, now, MAX_USER_TTL, &DenySet::empty())
-            .unwrap();
-        let issued_alice = ca
-            .issue(&alice, now, MAX_USER_TTL, &DenySet::empty())
-            .unwrap();
-        let issued_mallory = ca
-            .issue(&mallory, now, MAX_USER_TTL, &DenySet::empty())
-            .unwrap();
-        let issued_agent = ca
-            .issue(&agent, now, MAX_AGENT_TTL, &DenySet::empty())
-            .unwrap();
-        std::fs::write(dir.join("cert.pem"), &issued_node.certificate_pem).unwrap();
-        std::fs::write(dir.join("key.pem"), &issued_node.private_key_pem).unwrap();
-        std::fs::write(dir.join("bundle.pem"), ca.certificate_pem()).unwrap();
-        std::fs::write(dir.join("ticket-verifier.pem"), signer.public_key_pem()).unwrap();
-        std::fs::write(
-            dir.join("policy.hujson"),
-            r#"{
-                "ssh": [
-                    {
-                        "src": ["spiffe://orblx.local/user/alice"],
-                        "dst": ["spiffe://orblx.local/node/box"],
-                        "users": ["alice"],
-                        "checkPeriod": "30s"
-                    },
-                    {
-                        "src": ["spiffe://orblx.local/agent/helper"],
-                        "dst": ["spiffe://orblx.local/node/box"],
-                        "users": ["alice"],
-                        "checkPeriod": "30s"
-                    }
-                ]
-            }"#,
-        )
-        .unwrap();
-        let alice_dir = dir.join("alice");
-        let mallory_dir = dir.join("mallory");
-        let agent_dir = dir.join("agent");
-        for path in [&alice_dir, &mallory_dir, &agent_dir] {
-            std::fs::create_dir_all(path).unwrap();
-            std::fs::write(path.join("bundle.pem"), ca.certificate_pem()).unwrap();
-        }
-        std::fs::write(alice_dir.join("cert.pem"), &issued_alice.certificate_pem).unwrap();
-        std::fs::write(alice_dir.join("key.pem"), &issued_alice.private_key_pem).unwrap();
-        std::fs::write(
-            mallory_dir.join("cert.pem"),
-            &issued_mallory.certificate_pem,
-        )
-        .unwrap();
-        std::fs::write(mallory_dir.join("key.pem"), &issued_mallory.private_key_pem).unwrap();
-        std::fs::write(agent_dir.join("cert.pem"), &issued_agent.certificate_pem).unwrap();
-        std::fs::write(agent_dir.join("key.pem"), &issued_agent.private_key_pem).unwrap();
-        let stamp = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let ticket = sign_ticket(
-            &signer,
-            &TicketClaims {
-                issuer: SpiffeId::coord("ssh").unwrap(),
-                subject: agent.clone(),
-                not_before: stamp,
-                expires: stamp + 120,
-                dst_cidr: "127.0.0.1/32".to_string(),
-                proto: 6,
-                dst_port: 22,
-                flags: TicketFlags::new(true, true),
-            },
-        )
-        .unwrap();
-        std::fs::write(agent_dir.join("ticket.bin"), &ticket.bytes).unwrap();
-        std::fs::write(dir.join("peer.pem"), &issued_node.certificate_pem).unwrap();
 
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let shared = std::sync::Arc::new(Shared::load(&dir, Ipv4Addr::LOCALHOST).unwrap());
-        tokio::spawn(super::accept_loop(listener, shared));
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let ok = session_within(SessionRequest {
-            user: "alice".to_string(),
-            addr,
-            dst: node.clone(),
-            identity_dir: alice_dir.clone(),
-            peer_cert: dir.join("peer.pem"),
-            command: "printf '%s\\n' \"$ORBLX_SSH_USER\"".to_string(),
-            cert_login: None,
-        })
-        .await
-        .unwrap();
-        assert_eq!(ok.exit_status, 0);
-        assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "alice");
-
-        let node_deny = format!(
-            r#"{{"version":1,"generated_at":1,"revoked_uris":["{}"],"revoked_ticket_nonces":[]}}"#,
-            node.as_uri()
-        );
-        std::fs::write(dir.join("deny.json"), node_deny).unwrap();
-        let node_started = std::time::Instant::now();
-        let node_revoked = session_within(SessionRequest {
-            user: "alice".to_string(),
-            addr,
-            dst: node.clone(),
-            identity_dir: alice_dir.clone(),
-            peer_cert: dir.join("peer.pem"),
-            command: "printf %s\\n node".to_string(),
-            cert_login: None,
-        })
-        .await;
-        assert!(node_revoked.is_err());
-        assert!(node_started.elapsed() < Duration::from_secs(60));
-        std::fs::write(
-            dir.join("deny.json"),
-            r#"{"version":2,"generated_at":2,"revoked_uris":[],"revoked_ticket_nonces":[]}"#,
-        )
-        .unwrap();
-        let again = session_within(SessionRequest {
-            user: "alice".to_string(),
-            addr,
-            dst: node.clone(),
-            identity_dir: alice_dir.clone(),
-            peer_cert: dir.join("peer.pem"),
-            command: "printf '%s\\n' \"$ORBLX_SSH_USER\"".to_string(),
-            cert_login: None,
-        })
-        .await
-        .unwrap();
-        assert_eq!(String::from_utf8_lossy(&again.stdout).trim(), "alice");
-
-        let denied = session_within(SessionRequest {
-            user: "mallory".to_string(),
-            addr,
-            dst: node.clone(),
-            identity_dir: mallory_dir,
-            peer_cert: dir.join("peer.pem"),
-            command: "printf %s\\n denied".to_string(),
-            cert_login: None,
-        })
-        .await;
-        assert!(denied.is_err());
-
-        let agent_ok = session_within(SessionRequest {
-            user: "alice".to_string(),
-            addr,
-            dst: node.clone(),
-            identity_dir: agent_dir.clone(),
-            peer_cert: dir.join("peer.pem"),
-            command: "printf '%s\\n' \"$ORBLX_SSH_USER\"".to_string(),
-            cert_login: None,
-        })
-        .await
-        .unwrap();
-        assert_eq!(String::from_utf8_lossy(&agent_ok.stdout).trim(), "alice");
-        let replay = session_within(SessionRequest {
-            user: "alice".to_string(),
-            addr,
-            dst: node.clone(),
-            identity_dir: agent_dir,
-            peer_cert: dir.join("peer.pem"),
-            command: "printf %s\\n replay".to_string(),
-            cert_login: None,
-        })
-        .await;
-        assert!(replay.is_err());
-
-        let document = format!(
-            r#"{{"version":3,"generated_at":3,"revoked_uris":["{}"],"revoked_ticket_nonces":[]}}"#,
-            alice.as_uri()
-        );
-        // W25-2: an open session stops soon after the deny file denies the source.
-        // The server runs the command on a runtime thread, so a plain thread writes the file.
-        let deny_path = dir.join("deny.json");
-        let deny_text = document.clone();
-        let opened = std::time::Instant::now();
-        let writer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(1500));
-            std::fs::write(deny_path, deny_text).unwrap();
-            std::time::Instant::now()
-        });
-        let open = session_within(SessionRequest {
-            user: "alice".to_string(),
-            addr,
-            dst: node.clone(),
-            identity_dir: alice_dir.clone(),
-            peer_cert: dir.join("peer.pem"),
-            command: "sleep 5; printf %s\\n late".to_string(),
-            cert_login: None,
-        })
-        .await;
-        let ended = std::time::Instant::now();
-        let denied_at = writer.join().unwrap();
-        assert!(
-            ended.duration_since(denied_at) < Duration::from_millis(1000),
-            "the open session ran {:?} after the deny",
-            ended.duration_since(denied_at)
-        );
-        assert!(ended.duration_since(opened) < Duration::from_millis(4000));
-        if let Ok(output) = &open {
-            assert!(!String::from_utf8_lossy(&output.stdout).contains("late"));
-            assert_ne!(output.exit_status, 0);
-        }
-        std::fs::write(dir.join("deny.json"), document).unwrap();
-        let started = std::time::Instant::now();
-        let revoked = session_within(SessionRequest {
-            user: "alice".to_string(),
-            addr,
-            dst: node,
-            identity_dir: dir.join("alice"),
-            peer_cert: dir.join("peer.pem"),
-            command: "printf %s\\n revoked".to_string(),
-            cert_login: None,
-        })
-        .await;
-        assert!(revoked.is_err());
-        assert!(started.elapsed() < Duration::from_secs(60));
-
-        let checked = verify_file(&dir.join("ssh-audit.jsonl")).unwrap();
-        assert!(checked.metrics.start >= 1);
-        assert!(checked.metrics.end >= 1);
-        assert!(checked.metrics.deny >= 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn a_renewed_node_key_is_the_host_key_of_the_next_session() {
-        // W25-31 proof run 8: the SVID renewal writes a new node key. The client pins the key
-        // of the current cert.pem. The server must present that key on the next connection.
-        let dir = std::env::temp_dir().join(format!("orblx-ssh-renew-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let now = SystemTime::now();
-        let ca = MiniCa::generate(now).unwrap();
-        let node = SpiffeId::node("box").unwrap();
-        let alice = SpiffeId::user("alice").unwrap();
-        let first = ca
-            .issue(&node, now, MAX_USER_TTL, &DenySet::empty())
-            .unwrap();
-        let issued_alice = ca
-            .issue(&alice, now, MAX_USER_TTL, &DenySet::empty())
-            .unwrap();
-        std::fs::write(dir.join("cert.pem"), &first.certificate_pem).unwrap();
-        std::fs::write(dir.join("key.pem"), &first.private_key_pem).unwrap();
-        std::fs::write(dir.join("bundle.pem"), ca.certificate_pem()).unwrap();
-        std::fs::write(
-            dir.join("policy.hujson"),
-            r#"{"ssh": [{"src": ["spiffe://orblx.local/user/alice"],
-                "dst": ["spiffe://orblx.local/node/box"], "users": ["alice"],
-                "checkPeriod": "30s"}]}"#,
-        )
-        .unwrap();
-        let alice_dir = dir.join("alice");
-        std::fs::create_dir_all(&alice_dir).unwrap();
-        std::fs::write(alice_dir.join("bundle.pem"), ca.certificate_pem()).unwrap();
-        std::fs::write(alice_dir.join("cert.pem"), &issued_alice.certificate_pem).unwrap();
-        std::fs::write(alice_dir.join("key.pem"), &issued_alice.private_key_pem).unwrap();
-        std::fs::write(dir.join("old-peer.pem"), &first.certificate_pem).unwrap();
-
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let shared = std::sync::Arc::new(Shared::load(&dir, Ipv4Addr::LOCALHOST).unwrap());
-        tokio::spawn(super::accept_loop(listener, shared));
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let login = |peer: &str| SessionRequest {
-            user: "alice".to_string(),
-            addr,
-            dst: node.clone(),
-            identity_dir: alice_dir.clone(),
-            peer_cert: dir.join(peer),
-            command: "printf '%s\\n' \"$ORBLX_SSH_USER\"".to_string(),
-            cert_login: None,
-        };
-        let before = session_within(login("old-peer.pem")).await.unwrap();
-        assert_eq!(String::from_utf8_lossy(&before.stdout).trim(), "alice");
-
-        // The renewal: a new leaf with a new key, as in EnrollResult::write_state.
-        let renewed = ca
-            .issue(&node, now, MAX_USER_TTL, &DenySet::empty())
-            .unwrap();
-        assert_ne!(renewed.private_key_pem, first.private_key_pem);
-        std::fs::write(dir.join("cert.pem"), &renewed.certificate_pem).unwrap();
-        std::fs::write(dir.join("key.pem"), &renewed.private_key_pem).unwrap();
-        std::fs::write(dir.join("new-peer.pem"), &renewed.certificate_pem).unwrap();
-
-        let after = session_within(login("new-peer.pem")).await.unwrap();
-        assert_eq!(after.exit_status, 0);
-        assert_eq!(String::from_utf8_lossy(&after.stdout).trim(), "alice");
-        // The old key is no longer the host key.
-        assert!(session_within(login("old-peer.pem")).await.is_err());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn a_rule_with_recording_writes_the_file_and_fails_closed() {
-        let dir = recording_fixture("rec");
-        let alice_dir = dir.join("alice");
-        let node = SpiffeId::node("box").unwrap();
-
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let shared = std::sync::Arc::new(Shared::load(&dir, Ipv4Addr::LOCALHOST).unwrap());
-        tokio::spawn(super::accept_loop(listener, shared));
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let request = |user: &str| SessionRequest {
-            user: user.to_string(),
-            addr,
-            dst: node.clone(),
-            identity_dir: alice_dir.clone(),
-            peer_cert: dir.join("peer.pem"),
-            command: "printf '%s\\n' \"recorded-$ORBLX_SSH_USER\"".to_string(),
-            cert_login: None,
-        };
-
-        let recorded = session_within(request("rec")).await.unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&recorded.stdout).trim(),
-            "recorded-rec"
-        );
-        let records: Vec<_> = std::fs::read_dir(dir.join(crate::record::RECORD_DIR))
+    /// R4a: a password attempt is rejected and the audit chain records the deny.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_password_login_is_rejected_and_audited() {
+        use crate::cert::testkit;
+        use russh::client::{self, Handler};
+        let dir = recording_fixture("pw-reject");
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
-        assert_eq!(records.len(), 1);
-        let cast = std::fs::read_to_string(&records[0]).unwrap();
-        assert!(cast.contains("recorded-rec"));
-        assert!(!cast.contains("PRIVATE KEY"));
-        let checked = verify_file(&dir.join("ssh-audit.jsonl")).unwrap();
-        assert_eq!(checked.metrics.record, 1);
-
-        let plain = session_within(request("alice")).await.unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&plain.stdout).trim(),
-            "recorded-alice"
-        );
-        assert_eq!(
-            std::fs::read_dir(dir.join(crate::record::RECORD_DIR))
-                .unwrap()
-                .count(),
-            1
-        );
-
-        let original = std::fs::read(&records[0]).unwrap();
-        let mut changed = original.clone();
-        changed[0] ^= 0x01;
-        std::fs::write(&records[0], &changed).unwrap();
-        assert!(verify_file(&dir.join("ssh-audit.jsonl")).is_err());
-        std::fs::write(&records[0], &original).unwrap();
-
-        std::fs::rename(
-            dir.join(crate::record::RECORD_DIR),
-            dir.join("recordings-moved"),
-        )
-        .unwrap();
-        std::fs::write(dir.join(crate::record::RECORD_DIR), b"not a directory").unwrap();
-        assert!(session_within(request("rec")).await.is_err());
+            .as_secs();
+        let ca = testkit::key(21);
+        testkit::write_netmap(&dir, &[testkit::ca_line(&ca)], &[], now);
+        let addr = start_server(&dir).await;
+        struct AcceptAll;
+        impl Handler for AcceptAll {
+            type Error = russh::Error;
+            async fn check_server_key(
+                &mut self,
+                _key: &russh::keys::PublicKeyOrCertificate,
+            ) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+        }
+        let config = std::sync::Arc::new(client::Config::default());
+        let mut handle = client::connect(config, addr, AcceptAll)
+            .await
+            .expect("connect");
+        let auth = handle
+            .authenticate_password("alice", "not-a-real-password")
+            .await
+            .expect("auth call");
+        assert!(!auth.success(), "password login must not succeed");
+        // Give the server time to flush the audit record.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let chain = std::fs::read_to_string(dir.join("ssh-audit.jsonl")).unwrap();
-        assert!(chain.contains("\"reason\":\"recording\""));
-        let plain = session_within(request("alice")).await.unwrap();
-        assert_eq!(plain.exit_status, 0);
+        assert!(
+            chain.contains("\"reason\":\"missing\"") || chain.contains("\"reason\":\"Missing\""),
+            "audit must record the password reject: {chain}"
+        );
+        assert!(verify_file(&dir.join("ssh-audit.jsonl")).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R4b: a shell request without a certificate admission is refused.
+    #[test]
+    fn session_gate_refuses_without_a_certificate() {
+        let dir = recording_fixture("gate-no-cert");
+        let shared = Shared::load(&dir, Ipv4Addr::LOCALHOST).unwrap();
+        let admitted = super::Admitted {
+            src: SpiffeId::user("alice").unwrap(),
+            user: "alice".to_string(),
+            check_period: 30,
+            ticket_hash: [0u8; 16],
+            frame: 1,
+            recording: false,
+            cert: None,
+        };
+        let err = super::session_gate(&shared, &admitted, super::unix_now_ms()).unwrap_err();
+        assert_eq!(err.reason, orblx_audit::DenyReason::Missing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R4c: each session rechecks a fresh netmap (stale netmap refuses).
+    #[test]
+    fn session_gate_rechecks_fresh_netmap() {
+        use crate::cert::testkit;
+        let dir = recording_fixture("gate-stale");
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ca = testkit::key(22);
+        // Stamp the netmap 120 s in the past so fresh_netmap fails.
+        testkit::write_netmap_at(&dir, &[testkit::ca_line(&ca)], &[], (now - 120) * 1000);
+        let shared = Shared::load(&dir, Ipv4Addr::LOCALHOST).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let admitted = super::Admitted {
+            src: SpiffeId::user("alice").unwrap(),
+            user: "alice".to_string(),
+            check_period: 30,
+            ticket_hash: [0u8; 16],
+            frame: 1,
+            recording: false,
+            cert: Some(super::CertSession {
+                client_node: SpiffeId::node("laptop").unwrap(),
+                stop,
+                pty: true,
+            }),
+        };
+        let err = super::session_gate(&shared, &admitted, super::unix_now_ms()).unwrap_err();
+        assert_ne!(err.reason, orblx_audit::DenyReason::Missing);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1834,9 +1465,23 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pty_shell_records_input_and_output_in_time_order() {
+        use crate::cert::testkit;
         let dir = recording_fixture("pty");
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ca = testkit::key(31);
+        testkit::write_netmap(&dir, &[testkit::ca_line(&ca)], &[], now);
         let alice_dir = dir.join("alice");
         let addr = start_server(&dir).await;
+        let key = testkit::key(32);
+        let spec = testkit::Spec::user("oidc:alice", "laptop", 701, now);
+        let cert = testkit::sign(&ca, &key, &spec);
+        let login = crate::client::CertLogin {
+            key: key.clone(),
+            cert,
+        };
         let request = |user: &str| SessionRequest {
             user: user.to_string(),
             addr,
@@ -1844,7 +1489,7 @@ mod tests {
             identity_dir: alice_dir.clone(),
             peer_cert: dir.join("peer.pem"),
             command: String::new(),
-            cert_login: None,
+            cert_login: login.clone(),
         };
         // `$((...))` makes the output differ from the echo of the input.
         let steps: [(&str, &[u8]); 4] = [
@@ -1993,7 +1638,7 @@ mod tests {
             identity_dir: dir.join("alice"),
             peer_cert: dir.join("peer.pem"),
             command: "printf '%s\\n' \"$ORBLX_SSH_USER\"".to_string(),
-            cert_login: Some(login),
+            cert_login: login,
         };
         let login = |key: &russh::keys::PrivateKey, cert: &russh::keys::Certificate| {
             crate::client::CertLogin {

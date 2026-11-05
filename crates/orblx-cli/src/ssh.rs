@@ -223,9 +223,9 @@ fn run_shell_blocking(options: SessionOptions) -> Result<u32, String> {
 ///
 /// Only root may ask: the node SVID key is root-only. The client makes a new key in memory.
 /// The coordinator takes the user from the owner of this node. The request names no user.
-fn cert_login(state: Option<&Path>) -> Result<Option<CertLogin>, String> {
+fn cert_login(state: Option<&Path>) -> Result<CertLogin, String> {
     let Some(state) = state else {
-        return Ok(None);
+        return Err("The SSH client needs --state for a certificate login.".to_string());
     };
     orblx_ssh::cert::require_root_caller(state)?;
     let coord: SocketAddr = fs::read_to_string(state.join("coord-addr"))
@@ -258,7 +258,7 @@ fn cert_login(state: Option<&Path>) -> Result<Option<CertLogin>, String> {
     .map_err(|err| err.public_text())?;
     let cert = orblx_ssh::SshUserCert::from_openssh(&text)
         .map_err(|_| "The SSH certificate is not valid.".to_string())?;
-    Ok(Some(CertLogin { key, cert }))
+    Ok(CertLogin { key, cert })
 }
 
 fn locate(netmap: &Netmap, node: &str) -> Result<(SocketAddr, SpiffeId), String> {
