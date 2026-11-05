@@ -916,8 +916,12 @@ pub(crate) const SSH_CERT_CONNECT_LIMIT: Duration = Duration::from_secs(5);
 /// The client reads the nonce, then the certificate. Each read has this limit.
 pub(crate) const SSH_CERT_READ_LIMIT: Duration = Duration::from_secs(5);
 
-fn coordinator_request_failed() -> CoordError {
-    CoordError::Protocol("The coordinator request failed.".to_string())
+/// A connect or a read that passed its limit.
+///
+/// `CoordError::Tls` prints `The coordinator request failed.` The SSH client prints that
+/// sentence. The thread join in the SSH client has no timer of its own.
+fn request_timed_out(step: &str) -> CoordError {
+    CoordError::Tls(format!("The {step} timed out."))
 }
 
 /// Ask for one SSH user certificate with the node SVID in `state_dir` (W25-31).
@@ -983,7 +987,7 @@ where
     let connection = match tokio::time::timeout(SSH_CERT_CONNECT_LIMIT, connecting).await {
         Ok(Ok(connection)) => connection,
         Ok(Err(err)) => return Err(CoordError::Tls(format!("handshake: {err}"))),
-        Err(_expired) => return Err(coordinator_request_failed()),
+        Err(_expired) => return Err(request_timed_out("connect")),
     };
     let mut read_timed_out = false;
     let result = async {
@@ -1022,7 +1026,7 @@ async fn read_reply(
         Ok(result) => result,
         Err(_expired) => {
             *read_timed_out = true;
-            Err(coordinator_request_failed())
+            Err(request_timed_out("read"))
         }
     }
 }

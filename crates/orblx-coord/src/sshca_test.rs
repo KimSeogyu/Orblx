@@ -642,7 +642,8 @@ async fn ssh_certificate_request_fails_inside_the_connect_and_read_limits() {
     // The socket stays open so the kernel does not answer with ICMP port unreachable.
     let blackhole = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
     let (err, elapsed) =
-        ssh_cert_error(blackhole.local_addr().unwrap(), &bundle, &node_dir.0).await;
+        ssh_cert_blocking_error(blackhole.local_addr().unwrap(), &bundle, &node_dir.0);
+    assert!(matches!(err, crate::CoordError::Tls(_)), "{err:?}");
     assert_eq!(err.public_text(), "The coordinator request failed.");
     assert!(
         elapsed + Duration::from_millis(50) >= connect_limit,
@@ -654,7 +655,8 @@ async fn ssh_certificate_request_fails_inside_the_connect_and_read_limits() {
     );
 
     let stall = spawn_coord_that_accepts_and_does_not_answer(lab.coord.tls_material().unwrap());
-    let (err, elapsed) = ssh_cert_error(stall, &bundle, &node_dir.0).await;
+    let (err, elapsed) = ssh_cert_blocking_error(stall, &bundle, &node_dir.0);
+    assert!(matches!(err, crate::CoordError::Tls(_)), "{err:?}");
     assert_eq!(err.public_text(), "The coordinator request failed.");
     assert!(
         elapsed + Duration::from_millis(50) >= read_limit,
@@ -666,19 +668,24 @@ async fn ssh_certificate_request_fails_inside_the_connect_and_read_limits() {
     );
 }
 
-async fn ssh_cert_error(
+/// Call `ssh_cert_request_blocking` on a plain thread, as the SSH client does.
+///
+/// The join has no timer. The connect limit and the read limit inside the request bound it.
+fn ssh_cert_blocking_error(
     addr: SocketAddr,
     bundle: &str,
     node_dir: &Path,
 ) -> (crate::CoordError, Duration) {
-    let material = crate::state::read_node_material(node_dir).unwrap();
+    let dir = node_dir.to_path_buf();
+    let bundle = bundle.to_string();
     let started = Instant::now();
-    let err =
-        crate::client::ssh_cert_request(addr, "coord", bundle, material, |_exporter, _nonce| {
-            panic!("the coordinator sent a nonce");
-        })
-        .await
-        .expect_err("the certificate request must fail");
+    let err = std::thread::spawn(move || {
+        let key = new_key();
+        crate::client::ssh_cert_request_blocking(addr, "coord", &bundle, &dir, &key)
+    })
+    .join()
+    .expect("the request thread panicked")
+    .expect_err("the certificate request must fail");
     (err, started.elapsed())
 }
 
