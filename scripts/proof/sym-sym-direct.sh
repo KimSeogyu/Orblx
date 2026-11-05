@@ -87,9 +87,12 @@ cleanup() {
   dc --profile nodes down -v --remove-orphans >/dev/null 2>&1 || true
   proof_lock_end
 }
-trap cleanup EXIT
+trap 'cleanup' EXIT
 PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 proof_lock_take "sym-sym-direct:${PROJECT}" "$PREFIX" "${PROJECT}-"
+# shellcheck source=scripts/proof/compose-clean.sh
+. "$ROOT/scripts/proof/compose-clean.sh"
+proof_compose_clean "$PROJECT" || exit 1
 open_legacy_forward
 build_image
 
@@ -107,7 +110,9 @@ wait_log() {
 }
 
 service_container() {
-  dc ps -a --format '{{.Service}} {{.Name}}' | awk -v svc="$1" '$1 == svc { print $2; exit }'
+  local names
+  names="$(dc ps -a --format '{{.Service}} {{.Name}}' | read_all awk -v svc="$1" '$1 == svc { print $2 }')"
+  printf '%s\n' "$names" | read_all awk 'NR == 1 { print }'
 }
 
 wait_bundle() {
