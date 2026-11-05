@@ -64,6 +64,9 @@ The fix adds no sleep and no retry. The test limits do not change.
   It also traces runtime stalls (`stall`) and the stalls of a plain OS thread that sleeps 5 ms in a loop (`os_stall`).
 - Linux is the gate. `ci.yml` runs the test in `cargo test --workspace`.
   `.github/workflows/renew-soak.yml` runs `cargo test -p orblx-coord` 4 times in each of 5 shards (20 runs).
+  The workflow runs on a push to the main branch.
+  On a pull request, the workflow runs when a changed file is an input of the coordinator tests.
+  The workflow runs when the pull request has the label `full-ci`.
   All the coordinator tests run in parallel, as in `ci.yml`. A failed run fails the shard. There are no reruns.
 - macOS is a report only. The macOS job of `ci.yml` skips the test in the test step and runs it in a report step
   that prints the summary and the probe stalls and does not fail. The macOS shards of `renew-soak.yml` print each run

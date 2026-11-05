@@ -154,8 +154,11 @@ PO decision: W25-21 makes neither change, and the close wait stays.
 
 - Idle gate: `scripts/proof/startup-cost.sh` (env `ORBLX_STARTUP_RUNS`, default 10;
   `ORBLX_STARTUP_OUT`). One run under the box FIFO proof lock. Prints proof_ok on a pass.
-- Busy report: `.github/workflows/startup-cost.yml` (on pull requests that change node.rs,
-  client.rs or renew_test.rs, and on demand).
+- Busy report: `.github/workflows/startup-cost.yml`.
+  The workflow runs on a push to the main branch.
+  The workflow runs on demand.
+  On a pull request, each shard runs when a changed file is an input of the start-up test.
+  Each shard runs when the pull request has the label `full-ci`.
 - Direct: `ORBLX_STARTUP_RUNS=10 cargo test -p orblx-coord --lib startup_cost_runs -- --ignored --nocapture`.
 
 ## 7. Limits

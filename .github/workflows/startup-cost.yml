@@ -9,16 +9,77 @@ name: startup-cost
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
   pull_request:
-    paths:
-      - crates/orblx-datapath/src/node.rs
-      - crates/orblx-coord/src/client.rs
-      - crates/orblx-coord/src/renew_test.rs
-      - .github/workflows/startup-cost.yml
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
+
+# A pull request run cancels the previous run in this group.
+# A push to the main branch keeps the previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  paths:
+    name: startup-cost path check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run: ${{ steps.set.outputs.run }}
+    steps:
+      - name: Decide if startup-cost runs
+        id: set
+        env:
+          HAS_FULL_CI: ${{ github.event.label.name == 'full-ci' || contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${HAS_FULL_CI:=false}"
+          : "${REPO:?}"
+          : "${PR_NUMBER:?}"
+          : "${GITHUB_OUTPUT:?}"
+          # The macOS shard and the Ubuntu shards run cargo test -p orblx-coord.
+          # The job runs no script. The same path rule applies to each shard.
+          if [[ "${HAS_FULL_CI}" == "true" ]]; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+            echo "startup_cost_path_check run=true reason=full-ci"
+            exit 0
+          fi
+          files_text="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[] | .filename, (.previous_filename // empty)')"
+          run=false
+          while IFS= read -r file; do
+            if [[ -z "${file}" ]]; then
+              continue
+            fi
+            case "${file}" in
+              Cargo.lock|Cargo.toml|.github/workflows/startup-cost.yml|\
+              crates/orblx-agent/*|crates/orblx-audit/*|crates/orblx-coord/*|\
+              crates/orblx-crypto/*|crates/orblx-datapath/*|crates/orblx-edge/*|\
+              crates/orblx-identity/*|crates/orblx-relay/*|crates/orblx-test-idp/*)
+                run=true
+                ;;
+            esac
+          done <<< "${files_text}"
+          echo "run=${run}" >> "${GITHUB_OUTPUT}"
+          echo "startup_cost_path_check run=${run} reason=paths"
+
   startup-cost:
     name: startup-cost ${{ matrix.os }} shard ${{ matrix.shard }}
+    needs: paths
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.paths.result == 'success' && needs.paths.outputs.run == 'true')) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
