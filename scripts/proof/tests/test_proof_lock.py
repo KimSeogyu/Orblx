@@ -159,6 +159,48 @@ bash -c "$CHILD"
         self.assertRegex(res.stdout, r"(?m)^proof_contention clear samples [1-9]\d* contended_samples 0 unknown_samples 0 ")
         self.assertNotIn("proof_contention_invalid", res.stdout)
 
+
+    def test_a_killed_holder_gets_a_release_line_with_its_pid(self):
+        # W25-46: SIGKILL skips the EXIT trap. The next taker must print
+        # "proof_lock LABEL released at TIME pid=PID reason=killed_holder_cleared_by_next".
+        holder = self.start("victim", 30)
+        time.sleep(0.5)
+        out_so_far = ""
+        # Wait until the holder has the lock and wrote its holder file.
+        victim_pid = None
+        for _ in range(50):
+            time.sleep(0.1)
+            if holder.poll() is not None:
+                break
+            holder_file = self.env["ORBLX_PROOF_LOCK"] + ".holder"
+            if os.path.isfile(holder_file):
+                with open(holder_file) as hf:
+                    text = hf.read()
+                if "label=victim" in text and "pid=" in text:
+                    m = re.search(r"(?m)^pid=(\d+)$", text)
+                    if m:
+                        victim_pid = int(m.group(1))
+                        break
+        else:
+            holder.kill()
+            self.fail("holder did not write the holder file")
+        self.assertIsNotNone(victim_pid)
+        holder.kill()  # SIGKILL: no EXIT trap, no proof_lock_end
+        holder.wait(timeout=10)
+        # Next taker clears the dead holder record and must log the release.
+        res = self.run_holder(self.env, "next", 0.2)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertRegex(
+            res.stdout,
+            rf"(?m)^proof_lock victim released at \S+ pid={victim_pid} reason=killed_holder_cleared_by_next$",
+            res.stdout,
+        )
+        self.assertRegex(
+            res.stdout,
+            r"(?m)^proof_lock next released at \S+ pid=\d+$",
+            res.stdout,
+        )
+
     def test_the_lock_is_free_after_the_holder_ends(self):
         first = self.start("one", 0.1)
         first.communicate(timeout=30)

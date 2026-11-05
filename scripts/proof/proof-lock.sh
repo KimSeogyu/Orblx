@@ -23,6 +23,9 @@
 #                          that this pid is the pid in the holder file and that it runs.
 # The lock uses flock(1). Without flock (macOS), the proof runs without the lock and says so.
 # The script must call proof_lock_end in its EXIT trap.
+# proof_lock_end prints "proof_lock LABEL released at TIME pid=PID". When SIGKILL
+# skips the trap, the next proof_lock_take prints the same form with
+# reason=killed_holder_cleared_by_next for the dead holder pid (W25-46).
 # W25-19: a proof from an old checkout takes the lock file with a plain flock. While a FIFO
 # proof runs or waits first in the queue, a keeper process holds that flock, so the old
 # proof cannot pass the queue. The FIFO proofs take turns on a second lock, "${file}.fifo".
@@ -145,6 +148,22 @@ proof_lock_holder() {
   else
     printf 'unknown'
   fi
+}
+
+
+# W25-46: when a killed holder left the holder file, the next taker prints its release
+# line with the dead pid. SIGKILL skips the EXIT trap, so proof_lock_end never runs.
+proof_lock_note_killed_holder() {
+  local file="$1" prev_pid prev_label
+  [[ -s "${file}.holder" ]] || return 0
+  prev_pid="$(sed -n 's/^pid=//p' "${file}.holder" 2>/dev/null | head -n1)"
+  prev_label="$(sed -n 's/^label=//p' "${file}.holder" 2>/dev/null | head -n1)"
+  [[ "$prev_pid" =~ ^[0-9]+$ ]] || return 0
+  # A live process still owns the record until it releases; do not clear it.
+  if kill -0 "$prev_pid" 2>/dev/null; then
+    return 0
+  fi
+  echo "proof_lock ${prev_label:-unknown} released at $(proof_lock_now) pid=${prev_pid} reason=killed_holder_cleared_by_next"
 }
 
 # True when ORBLX_PROOF_LOCK_HELD names a running process that the holder file names.
@@ -510,6 +529,8 @@ proof_lock_take() {
     PROOF_LOCK_OWN_FILE="$(mktemp)"
     chmod 0666 "$PROOF_LOCK_OWN_FILE" 2>/dev/null || true
     export ORBLX_PROOF_OWN_FILE="$PROOF_LOCK_OWN_FILE"
+    # W25-46: log a release for a killed previous holder before we replace the record.
+    proof_lock_note_killed_holder "$file"
     {
       echo "label=${PROOF_LOCK_LABEL}"
       echo "pid=$$"
@@ -572,7 +593,7 @@ proof_lock_end() {
     PROOF_LOCK_OWNER=0
     rm -f "$PROOF_LOCK_OWN_FILE"
     PROOF_LOCK_OWN_FILE=""
-    echo "proof_lock ${PROOF_LOCK_LABEL} released at $(proof_lock_now)"
+    echo "proof_lock ${PROOF_LOCK_LABEL} released at $(proof_lock_now) pid=$$"
   fi
   PROOF_LOCK_LABEL=""
   if [[ -n "$invalid" ]]; then
