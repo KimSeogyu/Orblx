@@ -6,6 +6,12 @@ on:
     branches:
       - main
 
+# A pull request run cancels the previous run in this group.
+# A push to the main branch keeps the previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   rust:
     name: format, clippy, and test

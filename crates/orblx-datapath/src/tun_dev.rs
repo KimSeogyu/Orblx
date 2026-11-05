@@ -12,6 +12,9 @@ pub const DEFAULT_UDP_PORT: u16 = 443;
 /// The Linux TUN device name for `orblx up`.
 pub const LINUX_TUN_NAME: &str = "orblx0";
 
+/// Bound of the one queue from every link to the TUN writer.
+pub(crate) const TO_TUN_QUEUE: usize = 32;
+
 /// The operator note for the TUN privilege.
 #[must_use]
 pub fn tun_capability_note() -> &'static str {
@@ -268,7 +271,7 @@ mod linux {
             .tun_name()
             .map_err(|err| HelloError::Tun(err.to_string()))?;
         let (from_tun_tx, from_tun_rx) = mpsc::channel(32);
-        let (to_tun_tx, to_tun_rx) = mpsc::channel(32);
+        let (to_tun_tx, to_tun_rx) = mpsc::channel(super::TO_TUN_QUEUE);
         // Two threads: a read poll must not delay a write.
         let device = Arc::new(device);
         let reader = Arc::clone(&device);
@@ -334,9 +337,28 @@ mod linux {
     }
 
     /// Write packets to the TUN device as soon as they arrive.
+    ///
+    /// The flag check is outside the loop. The off path does not read the clock.
     fn tun_write_loop(device: Arc<tun::Device>, mut to_tun: mpsc::Receiver<Vec<u8>>) {
+        if crate::soak::enabled() {
+            tun_write_loop_traced(device, to_tun);
+            return;
+        }
         while let Some(packet) = to_tun.blocking_recv() {
             if let Err(err) = device.send(&packet) {
+                eprintln!("The TUN device write failed. {err}");
+                return;
+            }
+        }
+    }
+
+    fn tun_write_loop_traced(device: Arc<tun::Device>, mut to_tun: mpsc::Receiver<Vec<u8>>) {
+        let mut stats = crate::soak::TunWriteStats::new();
+        while let Some(packet) = to_tun.blocking_recv() {
+            let start = std::time::Instant::now();
+            let result = device.send(&packet);
+            stats.note(start.elapsed());
+            if let Err(err) = result {
                 eprintln!("The TUN device write failed. {err}");
                 return;
             }
