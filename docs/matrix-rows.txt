@@ -15,7 +15,7 @@
 2|partial|Coordination server / netmap
 3|partial|NAT traversal (STUN + hole punch)
 4|partial|Relay (DERP급)
-5|missing|Peer relays
+5|partial|Peer relays
 6|partial|Roaming / relay→direct 전환
 7|missing|IPv6 overlay/underlay
 8|partial|Throughput / latency (GSO·GRO·MTU)

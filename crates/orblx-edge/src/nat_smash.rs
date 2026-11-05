@@ -226,6 +226,8 @@ fn run_relay(
         audit_absent: Some(RELAY_PROOF_PAYLOAD.to_vec()),
         audit_path: None,
         udp_discard: plan.udp_discard,
+        sealed_only: false,
+        attach_delay: std::time::Duration::ZERO,
     })
     .map_err(map_relay)?;
     let udp = relay
@@ -540,7 +542,8 @@ fn map_relay(err: orblx_relay::RelayError) -> EdgeError {
         | orblx_relay::RelayError::Closed
         | orblx_relay::RelayError::TooBig
         | orblx_relay::RelayError::SessionFull
-        | orblx_relay::RelayError::NotAttached) => EdgeError::Relay(other.to_string()),
+        | orblx_relay::RelayError::NotAttached
+        | orblx_relay::RelayError::Plaintext) => EdgeError::Relay(other.to_string()),
     }
 }
 

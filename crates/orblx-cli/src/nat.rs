@@ -35,6 +35,7 @@ pub(crate) struct RunOptions {
     stun: SocketAddr,
     stun_alt: Option<SocketAddr>,
     relay: SocketAddr,
+    peer_relay: Option<SocketAddr>,
     peer: String,
     gateway: Option<Ipv4Addr>,
     port_map: PortMapChoice,
@@ -150,6 +151,7 @@ fn run_node(options: RunOptions) -> Result<(), String> {
         stun_alt: options.stun_alt,
         relay_udp: options.relay,
         relay_tcp: options.relay,
+        peer_relay: options.peer_relay,
         gateway: options.gateway,
         port_map: options.port_map,
         port_map_lifetime: options.port_map_lifetime,
@@ -219,6 +221,7 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
     let mut stun = None;
     let mut stun_alt = None;
     let mut relay = None;
+    let mut peer_relay = None;
     let mut peer = None;
     let mut gateway = None;
     let mut port_map = PortMapChoice::Auto;
@@ -236,6 +239,7 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
             "--stun" => stun = Some(parse_socket(&value, 3478)?),
             "--stun-alt" => stun_alt = Some(parse_socket(&value, 3478)?),
             "--relay" => relay = Some(parse_socket(&value, 443)?),
+            "--peer-relay" => peer_relay = Some(parse_socket(&value, 443)?),
             "--peer" => peer = Some(value),
             "--gateway" => {
                 gateway = Some(
@@ -266,6 +270,7 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
         stun: stun.ok_or_else(|| "The command needs --stun.".to_string())?,
         stun_alt,
         relay: relay.ok_or_else(|| "The command needs --relay.".to_string())?,
+        peer_relay,
         peer: peer.ok_or_else(|| "The command needs --peer.".to_string())?,
         gateway,
         port_map,
@@ -317,7 +322,7 @@ fn parse_verify(args: &[String]) -> Result<Command, String> {
 
 fn help() -> String {
     "\
-orblx nat run --state DIR --coord ADDR --bundle FILE --stun ADDR --relay ADDR --peer NAME [--stun-alt ADDR] [--gateway IP] [--coord-name NAME] [--port-map auto|off|pcp|nat-pmp|upnp] [--port-map-lifetime SECONDS]
+orblx nat run --state DIR --coord ADDR --bundle FILE --stun ADDR --relay ADDR --peer NAME [--peer-relay ADDR] [--stun-alt ADDR] [--gateway IP] [--coord-name NAME] [--port-map auto|off|pcp|nat-pmp|upnp] [--port-map-lifetime SECONDS]
 orblx nat verify-candidate --name NAME --endpoint HOST:PORT --public HEX --key-id HEX --sig BASE64
 
 The node gathers a reflexive address with STUN.
@@ -338,10 +343,14 @@ Two symmetric NATs use a bounded port spray when one allocation is predictable.
 The relay carries packets during that spray.
 A failed spray waits, then tries again.
 When the punch fails, the peers use the orblx Relay.
+--peer-relay ADDR is one peer that already has a working path.
+The node uses that peer when direct fails and the coordinator Relay is far or down.
+The first packet uses the best path that is up. The node does not wait for the peer relay.
+The peer relay forwards a sealed frame only.
 The hello carries the SVID. The peer checks it against the trust bundle.
 A later direct path keeps the same overlay session.
 orblx status prints the path kind for the peer.
-The path kind is direct or relay.
+The path kind is direct, relay, or peer-relay.
 The command does not log a private key or a signature.
 "
     .to_string()
