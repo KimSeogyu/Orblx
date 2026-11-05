@@ -18,7 +18,9 @@
 #     other orblx container, no unknown sample, and no host load1 above TR_LOAD_MAX
 #     (default: the CPU count).
 #  9. Host stall check (W25-26 PO rule). scripts/proof/host-sampler.py writes /proc/stat
-#     steal and iowait and /proc/pressure (cpu, io, memory) deltas every 100 ms. A sample is a
+#     steal and iowait and /proc/pressure (cpu, io, memory) deltas every 100 ms. The pressure
+#     fields are PSI stall time. They are not CPU time consumed. The same file records
+#     CLOCK_REALTIME, CLOCK_MONOTONIC, and CLOCK_BOOTTIME. A sample is a
 #     host stall window when one host-level value is at or above its limit: steal_ms >=
 #     TR_STALL_STEAL_MS, iowait_ms >= TR_STALL_IOWAIT_MS, io full >= TR_STALL_IO_FULL_MS or
 #     memory some >= TR_STALL_MEM_MS (all per 100 ms sample, steal and iowait over all
@@ -80,6 +82,8 @@ TR_STALL_IOWAIT_MS="${TR_STALL_IOWAIT_MS:-160}"
 TR_STALL_IO_FULL_MS="${TR_STALL_IO_FULL_MS:-90}"
 TR_STALL_MEM_MS="${TR_STALL_MEM_MS:-10}"
 SAMPLER_PID=""
+OUTD=""
+COVERAGE_DONE=0
 COORD="${TR_NET}.10:443"
 NODES=(owner a b c)
 declare -A NODE_IP=([owner]="${TR_NET}.20" [a]="${TR_NET}.11" [b]="${TR_NET}.12" [c]="${TR_NET}.13")
@@ -92,13 +96,76 @@ dc() {
   docker compose --progress quiet --profile nodes -f "$FILE" "$@"
 }
 
+stop_sampler() {
+  if [[ -n "${SAMPLER_PID:-}" ]]; then
+    kill "$SAMPLER_PID" >/dev/null 2>&1 || true
+    wait "$SAMPLER_PID" 2>/dev/null || true
+    SAMPLER_PID=""
+  fi
+}
+
+# Print observation coverage. This does not change a gate and it does not change the exit status.
+# contention unknown_samples is not an input.
+report_observation() {
+  local samples name e cov k expiry renew bound_start bound_end
+  local -a coverage_marks=()
+  local -a cov_args=()
+  [[ "${COVERAGE_DONE:-0}" == "1" ]] && return 0
+  samples="${OUTD:-}/host-samples.txt"
+  [[ -n "${OUTD:-}" && -f "$samples" ]] || return 0
+  COVERAGE_DONE=1
+  bound_start=""
+  bound_end=""
+  # Scheduled renewal intervals come from the first expiry and the period.
+  # A missing renewal event does not drop the interval.
+  if declare -p E0 >/dev/null 2>&1 && [[ -n "${PERIOD:-}" && -n "${TR_SVID_TTL:-}" && -n "${TR_ENDS:-}" ]]; then
+    for name in "${NODES[@]}"; do
+      [[ -n "${E0[$name]:-}" ]] || continue
+      for ((k = 2; k <= TR_ENDS; k++)); do
+        expiry=$(( E0[$name] + (k - 1) * PERIOD ))
+        renew=$(( expiry - (TR_SVID_TTL - PERIOD) ))
+        coverage_marks+=(--mark "${name}-sched-${k}=${renew}:${expiry}")
+        if [[ -z "$bound_start" || renew -lt bound_start ]]; then
+          bound_start=$renew
+        fi
+        if [[ -z "$bound_end" || expiry -gt bound_end ]]; then
+          bound_end=$expiry
+        fi
+      done
+    done
+  fi
+  if declare -p EXPIRIES >/dev/null 2>&1; then
+    for name in "${NODES[@]}"; do
+      for e in ${EXPIRIES[$name]:-}; do
+        coverage_marks+=(--mark "${name}-seen=${e}:$((e + 1))")
+      done
+    done
+  fi
+  cov_args=(coverage --samples "$samples" --cadence-ms 100)
+  if [[ -n "$bound_start" && -n "$bound_end" ]]; then
+    cov_args+=(--bound "${bound_start}:${bound_end}")
+  fi
+  cov_args+=("${coverage_marks[@]}")
+  cov="$(python3 "$ROOT/scripts/proof/host-sampler.py" "${cov_args[@]}")" \
+    || cov="observation_coverage command_failed"
+  printf '%s\n' "$cov"
+  if [[ -n "${TR_OUT_DIR:-}" ]]; then
+    printf '%s\n' "$cov" > "$TR_OUT_DIR/host-coverage.txt" || true
+  fi
+}
+
 cleanup() {
   local status=$?
   local pid
   for pid in "${PING_PIDS[@]}"; do
     kill "$pid" >/dev/null 2>&1 || true
   done
-  [[ -z "$SAMPLER_PID" ]] || kill "$SAMPLER_PID" >/dev/null 2>&1 || true
+  stop_sampler
+  report_observation
+  if [[ -n "${TR_OUT_DIR:-}" ]]; then
+    mkdir -p "$TR_OUT_DIR"
+    dc logs -t > "$TR_OUT_DIR/stack.log" 2>&1 || echo "stack_log_copy_failed"
+  fi
   for pid in "${DIAG_PIDS[@]}"; do
     kill "$pid" >/dev/null 2>&1 || true
   done
@@ -328,14 +395,30 @@ for name in "${NODES[@]}"; do
   echo "node ${name} overlay ${OVERLAY[$name]} pid ${PID0[$name]} svid_expiry ${E0[$name]}"
 done
 
-# The run ends TR_ENDS ticket ends + MAX_SKEW + 5 s after the latest first ticket end.
+# ticket_run_end MAX_E0 TR_ENDS PERIOD TTL SKEW
+# Gate 1 counts end e when e + SKEW < the run end. The gate still needs TR_ENDS ends.
+# Each interval before the last end uses PERIOD.
+# The last interval uses the ticket life (TTL), not PERIOD.
+# A late renewal can move that end by up to the ticket life.
+# TR_ENDS=1 has no later end. The run ends at MAX_E0 + SKEW + 5.
+ticket_run_end() {
+  local max_e0="$1" tr_ends="$2" period="$3" ttl="$4" skew="$5"
+  if (( tr_ends <= 1 )); then
+    echo $(( max_e0 + skew + 5 ))
+  else
+    echo $(( max_e0 + (tr_ends - 2) * period + ttl + skew + 5 ))
+  fi
+}
+
+# The run ends after the latest first ticket end. See ticket_run_end.
 max_e0=0
 for name in "${NODES[@]}"; do
   if (( E0[$name] > max_e0 )); then
     max_e0="${E0[$name]}"
   fi
 done
-RUN_END=$(( max_e0 + (TR_ENDS - 1) * PERIOD + SKEW + 5 ))
+RUN_END="$(ticket_run_end "$max_e0" "$TR_ENDS" "$PERIOD" "$TR_SVID_TTL" "$SKEW")"
+# ping_s follows the run end. The pings stop 3 s after RUN_END.
 PING_SECS=$(( RUN_END - $(date +%s) + 3 ))
 echo "renew_period_s ${PERIOD} run_end_unix ${RUN_END} ping_s ${PING_SECS}"
 
@@ -443,9 +526,8 @@ for pid in "${PING_PIDS[@]}"; do
   wait "$pid" || true
 done
 PING_PIDS=()
-kill "$SAMPLER_PID" >/dev/null 2>&1 || true
-wait "$SAMPLER_PID" 2>/dev/null || true
-SAMPLER_PID=""
+stop_sampler
+report_observation
 check_refusals
 echo "refusals 0"
 echo "status_samples ${samples} lost_peer_samples ${lost}"
@@ -630,6 +712,7 @@ if [[ -n "${PROOF_LOCK_SAMPLES:-}" && -f "$PROOF_LOCK_SAMPLES" ]]; then
   load_max="${TR_LOAD_MAX:-$(nproc)}"
   read -r cs_n cs_busy cs_unknown cs_maxc cs_maxl cs_load cs_lfirst cs_llast < <(awk -v lm="$load_max" '{n++; if ($2 < 0) u++; if ($2 > 0) b++; if ($2 > c) c = $2; if ($3 > l) l = $3; if ($3 + 0 > lm + 0) {h++; if (!f) f = $1; z = $1}} END {printf "%d %d %d %d %s %d %s %s\n", n, b + 0, u + 0, c + 0, (n ? l : "-"), h + 0, (f ? f : "-"), (z ? z : "-")}' "$PROOF_LOCK_SAMPLES")
   echo "contention samples ${cs_n} contended_samples ${cs_busy} unknown_samples ${cs_unknown} max_other_orblx_containers ${cs_maxc} max_load1 ${cs_maxl} cpus $(nproc)"
+  echo "observation_note contention_unknown_samples_do_not_mean_a_renewal_interval_was_fully_observed"
   echo "host_load samples_above_load_max ${cs_load} load_max ${load_max} first_ms ${cs_lfirst} last_ms ${cs_llast}"
   (( cs_n > 0 )) || LATE_FAIL+=("The proof-lock sampler has no sample.")
   (( cs_busy == 0 && cs_unknown == 0 )) || LATE_FAIL+=("${cs_busy} contended and ${cs_unknown} unknown samples. The run does not count.")

@@ -1,12 +1,146 @@
-# W25-42 step 2: METHOD (written and committed before the run)
+# W25-42 host evidence
+
+## Current release run plan
+
+This is the only current recipe.
+The historical record below is not a recipe.
+This plan does not start the proof.
+R2 on `d16e3fb` stays FAIL. The cause stays UNCLASSIFIED.
+Do not record R2 as `proof_infra_abort`.
+Do not raise a TTL. Do not raise a limit. Do not drop a stall window.
+The 200 ms reply-gap gate stays unchanged.
+
+R2 used `SOAK_S=7200`, `SOAK_COORD_ENDS=3`, and an unset `SOAK_TR_ENDS`.
+The R2 host sample file has `CLOCK_REALTIME` only.
+`dt_ms` in that file comes from that same clock.
+`cgroup_cpu_some_ms` is PSI cpu.pressure stall time. It is not CPU time consumed.
+The renewal at 06:12:58 and the leaf expiry at 06:17:58 sit inside the unsampled wall gap 06:03:50.897 to 06:25:35.131.
+`unknown_samples=0` on the R2 contention line does not mean that interval was fully observed.
+
+### Knobs
+
+- `SOAK_S=7200`
+- `SOAK_COORD_ENDS=3`
+- Leave `SOAK_TR_ENDS` unset. The script keeps `TR_ENDS` at or above `ends_for_soak`.
+- `TR_DIAG=0`. This starts the host sampler. It does not start host probers, scheduler sampling, docker events, or `ping -O`.
+- `ORBLX_SOAK_TRACE=0`. Product stall traces stay off.
+- Set a new persistent `TR_OUT_DIR`.
+- `RUSTUP_TOOLCHAIN=stable`.
+- Run under `scripts/proof/proof-lock.sh`.
+- The free-space floor stays 15 GiB. `proof_infra_abort` applies only when free space is below that floor before the lock.
+- The wrapper timeout is at least `SOAK_S + 15` minutes (8100 s). Count it from wrapper start.
+
+`TR_DIAG=0` still runs the product gates inside `ticket-renewal.sh`.
+The harness writes `host-samples.txt`, `host-coverage.txt`, and `stack.log` under `TR_OUT_DIR`.
+`stack.log` is the docker log. It is the raw renewal and refusal record.
+Ping files stay in the work directory. The script removes that directory at exit.
+
+### Clocks
+
+Each host sample stores three clocks in nanoseconds.
+
+- `clk_realtime_ns` is `CLOCK_REALTIME`. It is wall time. It can step forward or backward.
+- `clk_monotonic_ns` is `CLOCK_MONOTONIC`. It does not include Linux suspend. It does not follow a wall step.
+- `clk_boottime_ns` is `CLOCK_BOOTTIME`. It includes Linux suspend. It does not follow a wall step.
+
+The capture reads those three clocks, then reads them again.
+`clk_capture_skew_ns` is the later realtime value minus the first realtime value.
+A wall step during that capture can make `clk_capture_skew_ns` negative or very large.
+`clk_capture_skew_ns` is not an acquisition-duration bound.
+`clk_capture_monotonic_ns` and `clk_capture_boottime_ns` are the elapsed-clock bracket.
+The raw realtime values stay in the file.
+A missing clock is the token `unsupported`. The sampler does not copy another clock into that field.
+No pattern of these three clocks identifies every hypervisor pause.
+
+### What the patterns can show
+
+- `cadence`: the capture bracket is tight, and all three inter-sample deltas stay within 5 sample intervals. A pause shorter than the sample interval stays invisible.
+- `wall_forward`: realtime jumps by 1 s or more between samples, and monotonic and boottime stay small. The wall clock stepped between samples. This is not Linux suspend.
+- `wall_backward`: realtime moves backward between samples. The report keeps the negative delta.
+- `capture_wall_step`: realtime steps during one capture. The inter-sample deltas can still look short. The span is not `cadence`.
+- `capture_ambiguous`: the monotonic or boottime bracket is negative or longer than 50 ms. The reads are not one sample.
+- `capture_unsupported`: the capture bracket is missing. The span is not fully observed.
+- `suspend_shaped`: monotonic stays small, and realtime and boottime both jump by 1 s or more. This matches Linux suspend accounting. It does not name a hypervisor pause.
+- `unresolved_gap`: all three clocks jump by 1 s or more and stay close to each other. This matches a sampler delay. It also matches a guest pause that moves all three clocks. These clocks cannot separate those causes.
+- `clock_unsupported`: one clock is missing.
+- `mixed` or `clock_backward`: the span does not match a pattern above. The report keeps the raw deltas.
+
+### Coverage
+
+`fully_observed yes` means the named interval has samples at its start and at its end, within one sample cadence, and every overlapping span is `cadence`.
+It does not mean continuous observation.
+It does not change the 200 ms reply-gap gate.
+A missing sample before the interval start, or after the interval end, makes `fully_observed no`.
+A gap that covers a scheduled renewal makes `fully_observed no` even when that renewal emits no event.
+An unsupported clock, a clock rollback, or a wall step during capture makes `fully_observed no`.
+`unknown_samples=0` does not change that result.
+No samples do not produce `fully_observed yes`.
+
+The proof passes each scheduled renewal interval from the first ticket end and the renewal period.
+It also passes each recorded ticket end.
+The scheduled bound is the earliest renewal time through the latest scheduled expiry.
+
+`host-coverage.txt` and the proof log report:
+
+- `observation_samples`
+- `observation_elapsed_realtime_ns`, `observation_elapsed_monotonic_ns`, `observation_elapsed_boottime_ns` for the whole run, including every gap
+- `observation_max_unsampled_realtime_ns`, `observation_max_unsampled_monotonic_ns`, `observation_max_unsampled_boottime_ns` with `start_ns` and `end_ns`
+- `observation_negative_*_spans` and `observation_min_*_dt_ns` when a delta is negative
+- `observation_large_spans` and `observation_clock_pattern_counts`
+- `observation_max_capture_skew_ns` and `observation_min_capture_skew_ns` as raw realtime capture deltas, including negative values
+- `observation_capture_bracket_max_ns`
+- `observation_bound fully_observed yes|no reason <pattern>`
+- `observation_mark <name> fully_observed yes|no reason <pattern>` for each scheduled renewal interval and each recorded ticket end
+- `observation_fully_observed_meaning one_cadence_spacing_not_continuous_observation`
+- `observation_product_gate_unchanged reply_gap_ms 200`
+- `observation_note contention_unknown_samples_do_not_mean_a_renewal_interval_was_fully_observed`
+- `observation_pressure_note cgroup_cpu_some_ms_is_psi_stall_not_cpu_time_consumed`
+- `observation_pattern_limit no_clock_pattern_identifies_every_hypervisor_pause`
+
+### Gates and outcomes
+
+Keep every product gate and every security gate.
+A peer that rejects an expired ticket still fails the proof.
+The run keeps the full `SOAK_S` window.
+A clock gap does not delete samples and does not relabel the run as `proof_infra_abort`.
+Record `rustc -V`, the cargo release `Finished` line, and `orblx_bin_sha256` from the proof log.
+Record the `proof_lock` acquire line and the `proof_lock` release line.
+Quote the `proof_contention` line.
+`unknown_samples` remains the contention check. It is not an observation check.
+
+### Observer limit
+
+No independent observer is confirmed for this plan.
+Containers on this computer share this VM. They are not an independent clock.
+The registered Mac lists connected. No independent heartbeat is configured on it.
+The Android endpoint lists offline.
+This plan does not provision an observer. It does not send proof telemetry off the host.
+A later run may add an observer only after a separate authorization.
+The missing observer does not block the local three-clock sampler.
+The local sampler cannot replace that observer.
+
+## Historical record
+
+The sections below were written before the `d16e3fb` runs.
+They are history. They are not the current recipe.
+They are not a coverage claim.
+A historical line that treats `unknown_samples=0` as validity does not mean a renewal interval was fully observed.
+
+# W25-42 step 2: METHOD (historical, written before the run)
 
 Diagnostic run only. The gates are not changed. The 200 ms limit is not changed.
 The 20:17 failure stays counted and unproven. Step 1 (22:04:43 KST stall) stays PROVISIONAL HARNESS.
 
-## Run
+## Historical run
+
+Do not use this section as the current recipe.
+
 - Run `scripts/proof/coord-cert-soak.sh` one time.
 - Set `SOAK_S=7200`.
 - Set `SOAK_TR_ENDS=6`.
+
+The script sets the ticket-end count to the largest of `SOAK_TR_ENDS` (when set), `ends_for_soak`, and `ends_for_coord`. A set `SOAK_TR_ENDS` stays at or above `ends_for_soak`. `ticket-renewal.sh` sizes the run end from the latest first ticket end. The earlier intervals use the renewal period. The last interval uses the ticket life. Gate 1 counts an end when `e + MAX_SKEW` is before the run end. Gate 1 requires `TR_ENDS` ends. The last interval keeps a late renewal inside that count.
+
 - Set `TR_DIAG=2`.
 - Set `ORBLX_SOAK_TRACE=1` on the host before the script starts.
 - Use a new persistent `TR_OUT_DIR`.
@@ -48,19 +182,19 @@ The 20:17 failure stays counted and unproven. Step 1 (22:04:43 KST stall) stays 
      wrapper and clears the holder, then stops the project with compose down.
   A hard-limit cancel makes the diagnostic run INVALID. It must not leave the proof lock held.
 
-## Per-link stall (option (c) merge gate)
+## Historical per-link stall (option (c) merge gate)
 For each node log and each peer, take the maximum `stall_ms` on `to_tun_stall` and the maximum
 `stall_ms` on `to_tun_send_wait`. The per-link stall is the larger of those two values.
 A peer with no `stall_ms` field has no recorded `to_tun.send` wait in that log.
 
-## PASS rules
+## Historical PASS rules
 1. Direct path: max stall_ms must be clearly under the QUIC max_idle_timeout 30 s (crates/orblx-datapath/src/quic.rs:864), with the margin stated. It is preferred that max stall_ms is also under the keepalive interval 10 s (quic.rs:867), so that inbound keepalives do not wait a full period.
 2. Relayed path: max stall_ms must be under the relay PEER_IDLE 1 s (crates/orblx-relay/src/server.rs:25), with the margin stated. If the max stall on a relayed link is >= 1 s, option (c) alone FAILS for relay. Then (b) or a control-frame reader is required. A change to PEER_IDLE needs a decision from PO and Crypto first.
 3. Fields 2 and 4 are required before the soak starts.
 
 This METHOD does not change the gates. The gates stay as they are.
 
-## What is measured (all inside TR_OUT_DIR)
+## Historical measurements (not the current artifact list)
 1. In-container ping, 12 directions (`dc exec SRC ping -D -O`), unchanged: `ping-SRC-DST.txt`.
 2. Host prober, same 12 directions, raw ICMP sent from the host inside each node's net namespace
    (`nsenter --net=/proc/<node pid>/ns/net`), to the overlay IPs 100.64.0.x, 20/s per target,
@@ -78,7 +212,7 @@ This METHOD does not change the gates. The gates stay as they are.
    sched_migrate_task for comm ping, orblx*, tokio-runtime-w: `sched-trace.txt.gz`.
 8. Everything from step 1 (node diag files, host samples, docker events, dmesg).
 
-## Classification rule (per window of overlapping in-container ping gaps > 200 ms)
+## Historical classification rule (per window of overlapping in-container ping gaps > 200 ms)
 Applied by `scripts/proof/sched-analyze.py`, in this order:
 1. UNCLASSIFIED (missing data): a stalled direction has no sampled ping process, or the
    sampler has no samples in the window.
@@ -90,7 +224,7 @@ Applied by `scripts/proof/sched-analyze.py`, in this order:
 4. HARNESS-OTHER: probers and TUN counters continued, but rule 3 does not hold.
 Any host prober gap > 200 ms with no in-container gap is printed as PROBER_GAP (product evidence).
 
-## Pass / fail of this diagnostic run
+## Historical pass / fail of the step 2 diagnostic run
 - Valid: the run completes under the lock with samples >= 1, contended 0, unknown 0, and all
   files 1-7 exist and are complete (gzip readable).
 - The TR gates are reported as they are, unchanged; a gate 4 FAIL still counts.
