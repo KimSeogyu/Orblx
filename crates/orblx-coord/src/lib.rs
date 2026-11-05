@@ -19,6 +19,8 @@ mod config;
 mod error;
 mod preauth;
 
+#[cfg(test)]
+mod dial_test;
 mod files;
 mod http_util;
 mod ippool;

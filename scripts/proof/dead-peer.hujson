@@ -1,0 +1,17 @@
+{
+  // W25-28 dead peer dial proof.
+  // Node a may ping b, c, and d. The 50 dead identities and e need no rule: node a dials each
+  // peer in the netmap (a has the lower name), and a dead peer never answers.
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a"],
+      "proto": "icmp",
+      "dst": [
+        "spiffe://orblx.local/node/b:*",
+        "spiffe://orblx.local/node/c:*",
+        "spiffe://orblx.local/node/d:*",
+      ],
+    },
+  ],
+}
