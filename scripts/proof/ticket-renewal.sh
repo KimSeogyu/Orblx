@@ -328,14 +328,30 @@ for name in "${NODES[@]}"; do
   echo "node ${name} overlay ${OVERLAY[$name]} pid ${PID0[$name]} svid_expiry ${E0[$name]}"
 done
 
-# The run ends TR_ENDS ticket ends + MAX_SKEW + 5 s after the latest first ticket end.
+# ticket_run_end MAX_E0 TR_ENDS PERIOD TTL SKEW
+# Gate 1 counts end e when e + SKEW < the run end. The gate still needs TR_ENDS ends.
+# Each interval before the last end uses PERIOD.
+# The last interval uses the ticket life (TTL), not PERIOD.
+# A late renewal can move that end by up to the ticket life.
+# TR_ENDS=1 has no later end. The run ends at MAX_E0 + SKEW + 5.
+ticket_run_end() {
+  local max_e0="$1" tr_ends="$2" period="$3" ttl="$4" skew="$5"
+  if (( tr_ends <= 1 )); then
+    echo $(( max_e0 + skew + 5 ))
+  else
+    echo $(( max_e0 + (tr_ends - 2) * period + ttl + skew + 5 ))
+  fi
+}
+
+# The run ends after the latest first ticket end. See ticket_run_end.
 max_e0=0
 for name in "${NODES[@]}"; do
   if (( E0[$name] > max_e0 )); then
     max_e0="${E0[$name]}"
   fi
 done
-RUN_END=$(( max_e0 + (TR_ENDS - 1) * PERIOD + SKEW + 5 ))
+RUN_END="$(ticket_run_end "$max_e0" "$TR_ENDS" "$PERIOD" "$TR_SVID_TTL" "$SKEW")"
+# ping_s follows the run end. The pings stop 3 s after RUN_END.
 PING_SECS=$(( RUN_END - $(date +%s) + 3 ))
 echo "renew_period_s ${PERIOD} run_end_unix ${RUN_END} ping_s ${PING_SECS}"
 

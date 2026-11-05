@@ -7,6 +7,9 @@ The 20:17 failure stays counted and unproven. Step 1 (22:04:43 KST stall) stays 
 - Run `scripts/proof/coord-cert-soak.sh` one time.
 - Set `SOAK_S=7200`.
 - Set `SOAK_TR_ENDS=6`.
+
+The script sets the ticket-end count to the largest of `SOAK_TR_ENDS` (when set), `ends_for_soak`, and `ends_for_coord`. A set `SOAK_TR_ENDS` stays at or above `ends_for_soak`. `ticket-renewal.sh` sizes the run end from the latest first ticket end. The earlier intervals use the renewal period. The last interval uses the ticket life. Gate 1 counts an end when `e + MAX_SKEW` is before the run end. Gate 1 requires `TR_ENDS` ends. The last interval keeps a late renewal inside that count.
+
 - Set `TR_DIAG=2`.
 - Set `ORBLX_SOAK_TRACE=1` on the host before the script starts.
 - Use a new persistent `TR_OUT_DIR`.

@@ -70,23 +70,53 @@ clock_secs() {
   echo $(( expr ))
 }
 
+# choose_tr_ends ENDS_FOR_SOAK ENDS_FOR_COORD SOAK_TR_ENDS
+# SOAK_TR_ENDS is empty when the variable is unset.
+# The result is the largest of the three numbers.
+# An empty SOAK_TR_ENDS does not enter the comparison.
+# SOAK_TR_ENDS must not lower the result below ENDS_FOR_SOAK.
+# The result is at least 2.
+choose_tr_ends() {
+  local ends_for_soak="$1" ends_for_coord="$2" soak_tr_ends="$3" floor tr
+  if (( ends_for_soak > ends_for_coord )); then
+    floor="$ends_for_soak"
+  else
+    floor="$ends_for_coord"
+  fi
+  if [[ -n "$soak_tr_ends" ]]; then
+    if (( soak_tr_ends > floor )); then
+      tr="$soak_tr_ends"
+    else
+      tr="$floor"
+    fi
+  else
+    tr="$floor"
+  fi
+  if (( tr < 2 )); then
+    tr=2
+  fi
+  echo "$tr"
+}
+
 SKEW="$(clock_secs MAX_SKEW)"
 TTL="$(clock_secs MAX_USER_TTL)"
 export TR_SVID_TTL="$TTL"
 PERIOD=$(( TTL - TTL / 3 ))
-# ticket-renewal.sh ends the run at: first ticket end + (TR_ENDS - 1) * PERIOD + SKEW + 5 s.
 # The first ticket end is about TTL s after the coordinator start.
+# ends_for_soak is the smallest count whose period window covers SOAK_S:
+# TTL + (count - 1) * PERIOD + MAX_SKEW + 5 >= SOAK_S.
+# ticket-renewal.sh uses the ticket life on the last interval.
+# That run is longer than this period window, so this count still covers SOAK_S.
 ends_for_soak=$(( (SOAK_S - TTL - SKEW - 5 + PERIOD - 1) / PERIOD + 1 ))
 # The coordinator leaf ends at TTL, then each PERIOD s, so its end K + MAX_SKEW comes at about
 # TTL + (K - 1) * PERIOD + SKEW. The first ticket end comes after the first coordinator leaf end
 # (the nodes enroll after the coordinator start), so TR_ENDS = K is enough for K ends.
 ends_for_coord=$(( SOAK_COORD_ENDS ))
-TR_ENDS="${SOAK_TR_ENDS:-$(( ends_for_soak > ends_for_coord ? ends_for_soak : ends_for_coord ))}"
-(( TR_ENDS >= 2 )) || TR_ENDS=2
+TR_ENDS="$(choose_tr_ends "$ends_for_soak" "$ends_for_coord" "${SOAK_TR_ENDS:-}")"
 export TR_ENDS
 echo "=== [C] coord-cert-soak constants ==="
 echo "max_skew_s ${SKEW} max_user_ttl_s ${TTL} node_svid_ttl_s ${TR_SVID_TTL} coord_svid_ttl_s ${TTL}"
-echo "soak_s ${SOAK_S} soak_coord_ends ${SOAK_COORD_ENDS} tr_ends ${TR_ENDS} project ${TR_PROJECT}"
+echo "soak_s ${SOAK_S} soak_coord_ends ${SOAK_COORD_ENDS} ends_for_soak ${ends_for_soak} ends_for_coord ${ends_for_coord} soak_tr_ends ${SOAK_TR_ENDS:-unset} tr_ends ${TR_ENDS} project ${TR_PROJECT}"
 
 # Ask 127.0.0.11 for a name. An answer means the embedded DNS server is up.
 # No answer does not fail the run. The stack uses fixed addresses and hosts entries.
