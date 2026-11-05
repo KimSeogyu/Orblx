@@ -23,11 +23,11 @@ set -euo pipefail
 . "$LOCK_SH"
 trap proof_lock_end EXIT
 proof_lock_take "$LABEL" orblx-test-
-echo "hold_start $LABEL $(awk '{printf "%d", $1 * 1000}' /proc/uptime)"
+echo "hold_start $LABEL $(date +%s%3N)"
 # A proof may wait for all of its own jobs. The sampler must not be one of them.
 sleep "$HOLD" &
 wait
-echo "hold_end $LABEL $(awk '{printf "%d", $1 * 1000}' /proc/uptime)"
+echo "hold_end $LABEL $(date +%s%3N)"
 """
 
 CHILD = r"""
