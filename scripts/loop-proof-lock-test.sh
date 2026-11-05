@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Run test_proof_lock.ProofLockTest.test_two_proofs_run_one_after_the_other N times.
-# Usage: scripts/loop-proof-lock-test.sh [N] [LOG_DIR]
+# Run one proof-lock test N times.
+# Usage: scripts/loop-proof-lock-test.sh [N] [LOG_DIR] [TEST]
 # N defaults to 50. LOG_DIR defaults to /workspace/orblx-w18-proof/.
+# TEST defaults to test_proof_lock.ProofLockTest.test_two_proofs_run_one_after_the_other.
 # The loop always runs N iterations. It does not stop early. A run with no
 # output counts as a failure (it is not a pass).
 # Disk: compile the two Python modules once into LOG_DIR/build and reuse that
@@ -12,6 +13,7 @@ set -euo pipefail
 
 N="${1:-50}"
 LOG_DIR="${2:-/workspace/orblx-w18-proof/}"
+TEST="${3:-test_proof_lock.ProofLockTest.test_two_proofs_run_one_after_the_other}"
 
 if ! [[ "$N" =~ ^[1-9][0-9]*$ ]]; then
   echo "loop-proof-lock-test: N must be a positive integer, got ${N}" >&2
@@ -49,7 +51,7 @@ if [[ ! -f "$BUILD_DIR/stamp" ]]; then
   PYTHONPYCACHEPREFIX="$BUILD_DIR/pyc" python3 -m compileall -q \
     "$TEST_DIR/test_proof_lock.py" \
     "$TEST_DIR/fake_docker.py"
-  printf '%s\n' "test_proof_lock.ProofLockTest.test_two_proofs_run_one_after_the_other" >"$BUILD_DIR/stamp"
+  printf '%s\n' "$TEST" >"$BUILD_DIR/stamp"
 fi
 
 container_ids() {
@@ -89,7 +91,7 @@ for ((i = 1; i <= N; i++)); do
     cd "$TEST_DIR"
     PYTHONPYCACHEPREFIX="$BUILD_DIR/pyc" \
       TMPDIR="$run_tmp" \
-      python3 -m unittest test_proof_lock.ProofLockTest.test_two_proofs_run_one_after_the_other
+      python3 -m unittest "$TEST"
   ) >"$run_out" 2>&1
   rc=$?
   set -e
