@@ -96,8 +96,12 @@ class TicketGuardTest(unittest.TestCase):
 
     def run_proof(self, manifest, script):
         env = dict(os.environ, ORBLX_PROOF_MANIFEST=manifest, LOCK_SH=LOCK_SH,
-                   ORBLX_PROOF_LOCK=os.path.join(self.tmp, "proof.lock"))
+                   ORBLX_PROOF_LOCK=os.path.join(self.tmp, "proof.lock"),
+                   PROOF_MIN_FREE_GIB="15")
         env.pop("ORBLX_PROOF_LOCK_HELD", None)
+        # The disk check before the lock (#139) reads the stand-in df, not the host disk.
+        from fake_docker import with_fake_docker
+        env = with_fake_docker(env)
         return subprocess.run(["bash", script], env=env, capture_output=True, text=True)
 
     PROOF = ('set -euo pipefail\n. "$LOCK_SH"\ntrap proof_lock_end EXIT\n'
