@@ -200,29 +200,40 @@ ssh_cmd() {
 # Print accepted, refused, or unknown for one SSH login from FROM to b.
 # The SSH client connects over the mesh. When the datapath of b refuses the QUIC session
 # of FROM, the TCP connect gets no reply and the client stops at the 20 s limit (status
-# 124). That result is refused only when the orblx_node_refused counter of b increased
-# during the attempt. Then b refused a session or a frame in that time. Other timeouts are
-# unknown.
+# 124). That result is refused only when FROM is the revoked peer a and the
+# orblx_node_refused counter of b increased during the attempt. The counter is for the
+# whole node: the running node a dials b again each second and b refuses it, so the
+# counter also increases when the SSH login of allowed times out. Thus a timeout of
+# allowed is unknown, not refused (W25-38 gate 0 at 7d911a3).
+# For each result that is not accepted, the function prints the status and the last
+# lines of the client output to stderr.
 ssh_try() {
   local from="$1"
   local out="$WORK/ssh-${from}.out"
   local status=0
-  local before after
+  local before after result
   before="$(refused_count)"
   dc exec -T "$from" sh -c "timeout 20 $(ssh_cmd) --command 'echo ssh_ok'" >"$out" 2>&1 || status=$?
   after="$(refused_count)"
   if [[ "$status" -eq 0 ]] && grep -q '^ssh_ok' "$out"; then
-    echo accepted
+    result=accepted
   elif grep -q '^ssh_ok' "$out"; then
-    echo unknown
+    result=unknown
   elif [[ "$status" -ne 0 && "$status" -ne 124 ]]; then
-    echo refused
-  elif [[ "$status" -eq 124 && "$before" =~ ^[0-9]+$ && "$after" =~ ^[0-9]+$ ]] \
+    result=refused
+  elif [[ "$from" == a && "$status" -eq 124 && "$before" =~ ^[0-9]+$ && "$after" =~ ^[0-9]+$ ]] \
     && (( after > before )); then
-    echo refused
+    result=refused
   else
-    echo unknown
+    result=unknown
   fi
+  if [[ "$result" != accepted ]]; then
+    {
+      echo "ssh_try from ${from} result ${result} status ${status} b_refused ${before}->${after}"
+      tail -n 3 "$out" | grep -v 'PRIVATE KEY' | sed "s/^/ssh_try from ${from} out: /"
+    } >&2
+  fi
+  echo "$result"
 }
 
 # Print accepted, refused, or unknown for one `orblx ping` (a new QUIC session) from FROM to b.

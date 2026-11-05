@@ -144,7 +144,22 @@ Each 4-kind test uses corrupt, truncated, missing after enroll, and unreadable (
 5. The coordinator starts again. b gets a valid list. allowed is accepted again and a is still refused.
 6. Gate 4: `ORBLX_DENY_WINDOW_ENROLLS` (default 10) more enrolls. Each prints `deny_list ready_ms N`. Each N must be 2000 ms or less. The proof prints `summary w25_38_window ... over 0`.
 
-How the proof reads one SSH probe: `ssh_ok` in the output is accepted. A non-zero exit that is not the 20 s limit (status 124) is refused. When the datapath of b refuses the QUIC session, the TCP connect gets no reply and the probe stops at the 20 s limit. That result is refused only when the `orblx_node_refused` counter of b increased during the probe. Each other result is unknown.
+How the proof reads one SSH probe: `ssh_ok` in the output is accepted. A non-zero exit that is not the 20 s limit (status 124) is refused. When the datapath of b refuses the QUIC session, the TCP connect gets no reply and the probe stops at the 20 s limit. That result is refused only when the probe is from the revoked node a and the `orblx_node_refused` counter of b increased during the probe. The counter is for the whole node b, and the running node a dials b again each second, so a timeout of allowed is unknown, not refused. For each result that is not accepted, the proof prints the exit status, the b counter before and after, and the last client output lines (`ssh_try from ...`).
+
+### Gate 0 failure at 7d911a3 (2026-11-05 09:13:31 KST)
+
+`check ssh allowed after revoke (valid file) want accepted got refused`. The cause is in the datapath, not in the deny list. The b log shows only `The deny list contains this identifier` refusals (the revoked a) and no deny file error. Then b prints `The path to allowed is down.`
+
+1. `ping_try allowed` runs `orblx ping b` in a second container with the state (the SVID) of allowed. b accepts that session as the new session of allowed. `run_link` (`crates/orblx-datapath/src/node.rs`, the `map.insert` of the live link) retires the session of the running node allowed and ends its send stream.
+2. The running node allowed did not make the newer session. Its link got the end of the receive stream (`HelloError::StreamClosed` in `drive_session`) and stayed the live link. It could send to b, but b sent its replies on the link of the ping process, and that link stopped with the ping process. No side dialed again, so the path stayed half open.
+3. The next SSH login of allowed got no TCP reply and stopped at the 20 s limit (status 124). The proof read it as refused because the b counter increased. The counter counted the dial attempts of the revoked node a, not a refusal of allowed.
+
+Fix: when a live link gets the end of its receive stream and the link is older than `ORPHAN_LIMIT` (5 s), it asks the dial task for a new session at once (make before break). When the link is still the live link after `ORPHAN_LIMIT`, the session ends and the dial task dials again. A young link only waits for the limit, so two processes with the same SVID do not dial in a loop. Tests (both fail before the fix and pass after it):
+
+- `hello_tests::w25_38_a_ping_process_with_the_node_svid_does_not_cut_the_node_path`: old link, the path must come back in 3 s.
+- `hello_tests::w25_38_a_young_link_that_lost_its_peer_ends_after_the_orphan_limit`: young link, the session ends after 5 s and the path comes back.
+
+Known limit: while the ping process holds the session (and until the new session is up), b sends the traffic for allowed to the ping process. A reply in that time is lost.
 
 Pass: `summary ... samples N accepted 0 unknown 0` with N >= 1, then `proof_ok`, and a `proof_contention` line with `unknown_samples 0`.
 
