@@ -4,12 +4,22 @@ Diagnostic run only. The gates are not changed. The 200 ms limit is not changed.
 The 20:17 failure stays counted and unproven. Step 1 (22:04:43 KST stall) stays PROVISIONAL HARNESS.
 
 ## Run
-- One run: `coord-cert-soak.sh` with `TR_DIAG=2`, `SOAK_TR_ENDS=6`, a new persistent `TR_OUT_DIR`,
-  under `proof-lock.sh`, free space >= 15G checked first (else `proof_infra_abort`, no lock, no build).
-- RELEASE build, `RUSTUP_TOOLCHAIN=stable` (1.99.1). `rustc -V` and the cargo
-  "Finished `release` profile" line are recorded in the run log.
-- The full `proof_contention` lines are quoted. samples >= 1, contended_samples 0 and
-  unknown_samples 0 are required; unknown_samples > 0 makes the run INVALID.
+- Run `scripts/proof/coord-cert-soak.sh` one time.
+- Set `SOAK_S=7200`.
+- Set `SOAK_TR_ENDS=6`.
+- Set `TR_DIAG=2`.
+- Set `ORBLX_SOAK_TRACE=1` on the host before the script starts.
+- Use a new persistent `TR_OUT_DIR`.
+- Run the script under `scripts/proof/proof-lock.sh`.
+- Check free space before the lock. The minimum is 15 GiB.
+- When free space is below 15 GiB, the script prints `proof_infra_abort`.
+- A `proof_infra_abort` stops the run before the lock and before the build.
+- Set `RUSTUP_TOOLCHAIN=stable` for the build.
+- The run log records the text from `rustc -V`.
+- The run log records the cargo release `Finished` line.
+- Quote each full `proof_contention` line.
+- The run is valid only when `samples` is 1 or more, `contended_samples` is 0, and `unknown_samples` is 0.
+- When `unknown_samples` is more than 0, the run is INVALID.
 
 - `ORBLX_SOAK_TRACE=1` on every node (owner, a, b, …). The compose x-node block passes
   `ORBLX_SOAK_TRACE` from the host. The host exports `ORBLX_SOAK_TRACE=1` before
@@ -83,5 +93,6 @@ Any host prober gap > 200 ms with no in-container gap is printed as PROBER_GAP (
 - Valid: the run completes under the lock with samples >= 1, contended 0, unknown 0, and all
   files 1-7 exist and are complete (gzip readable).
 - The TR gates are reported as they are, unchanged; a gate 4 FAIL still counts.
+- Gate 2 is N/A on main until the #155 coord_cert_tick work lands.
 - Result reported: each window's classification with its evidence lines. Acceptance condition (a)
   for the later gate change is met only if every window > 200 ms is HARNESS-VCPU.
