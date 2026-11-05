@@ -118,7 +118,14 @@ preflight_service_names() {
     name="${names[$i]}"
     ip="${ips[$i]}"
     line="$(timeout 25 docker exec "$id" getent hosts "$name" 2>/dev/null || true)"
-    if ! printf '%s\n' "$line" | awk -v ip="$ip" '$1 == ip { ok = 1 } END { exit ok ? 0 : 1 }'; then
+    found=0
+    while IFS= read -r row || [[ -n "$row" ]]; do
+      first="${row%%[[:space:]]*}"
+      if [[ -n "$first" && "$first" == "$ip" ]]; then
+        found=1
+      fi
+    done <<< "$line"
+    if [[ "$found" -eq 0 ]]; then
       fail "The service name ${name} does not resolve to ${ip} inside the container."
     fi
   done
