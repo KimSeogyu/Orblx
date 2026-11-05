@@ -1019,10 +1019,13 @@ fn peer_id(
 
 #[cfg(test)]
 mod tests {
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
+
+    use orblx_identity::{IssueGate, MiniCa, MockOidc, MOCK_OIDC_ISSUER};
 
     use super::{dispatch_token, run_admin, Caller, Request};
     use crate::apitoken::{self, admin_ops, all_scopes, scope_of, CreateAsk};
+    use crate::roles::{self, SetAsk};
     use crate::state::{Coordinator, OidcConfig};
 
     fn call(op: &str, secret: &str) -> Request {
@@ -1602,6 +1605,173 @@ mod tests {
         assert_eq!(role_deny_count(&coord, "nodes"), 1);
         assert_eq!(deny_count(&coord, &id, "scope"), 0);
         assert!(!coord.config_audit_text().unwrap().contains(&secret));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn mtls_request(op: &str) -> Request {
+        Request {
+            op: op.to_string(),
+            name: String::new(),
+            token: None,
+            id_token: None,
+            nonce: None,
+            endpoints: Vec::new(),
+            routes: Vec::new(),
+            exit_node: false,
+            grant: None,
+            api_token: None,
+            deny_etag: None,
+            expect_sha256: None,
+            ssh: None,
+            unchanged_ok: false,
+        }
+    }
+
+    /// W25-34: only a policy owner SVID can lower the netmap seq.
+    ///
+    /// The role gate runs before `run_admin`. An API token has no scope for this
+    /// operation, and `owner_only` still refuses a token that reaches `run_admin`.
+    #[test]
+    fn only_a_policy_owner_can_reset_the_netmap_seq() {
+        let dir = std::env::temp_dir().join(format!(
+            "orblx-server-seq-reset-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        let oidc = MockOidc::generate(MOCK_OIDC_ISSUER).unwrap();
+        let gate = IssueGate::new(MiniCa::generate(now).unwrap(), &oidc).unwrap();
+        let coord = Coordinator::open(&dir, "coord", OidcConfig::Mock(Box::new(gate))).unwrap();
+        coord.enable_config_audit().unwrap();
+        let policy_path = dir.join("policy.hujson");
+        std::fs::write(&policy_path, policy_text(&[OWNER], 22)).unwrap();
+        coord.set_policy_file(&policy_path).unwrap();
+
+        let mut callers = Vec::new();
+        for (subject, role, sentence) in [
+            ("ada", "admin", "The role admin cannot call this operation."),
+            (
+                "ned",
+                "network-admin",
+                "The role network-admin cannot call this operation.",
+            ),
+            (
+                "ita",
+                "it-admin",
+                "The role it-admin cannot call this operation.",
+            ),
+            (
+                "aud",
+                "auditor",
+                "The role auditor cannot call this operation.",
+            ),
+            ("mem", "member", "The caller is not an owner."),
+        ] {
+            coord
+                .approve_user_by(&format!("oidc:{subject}"), OWNER, now)
+                .unwrap();
+            if role != "member" {
+                roles::apply(
+                    &coord,
+                    &SetAsk {
+                        user: subject.to_string(),
+                        role: role.to_string(),
+                    },
+                    OWNER,
+                    now,
+                )
+                .unwrap();
+            }
+            let id_token = oidc
+                .issue_id_token(subject, now, Duration::from_secs(600))
+                .unwrap();
+            let enrolled = coord
+                .enroll_oidc(
+                    &format!("{subject}-pc"),
+                    &id_token,
+                    None,
+                    &[format!("{subject}-pc:443")],
+                    &[],
+                    now,
+                )
+                .unwrap();
+            callers.push((enrolled.svid, role, sentence));
+        }
+
+        let ahead = crate::seq::unix_ms(now) + 86_400_000;
+        let seq_path = dir.join(crate::seq::COORD_SEQ_FILE);
+        std::fs::write(&seq_path, format!("{ahead}\n")).unwrap();
+        let op = "admin-netmap-seq-reset";
+
+        let made = apitoken::create(
+            &coord,
+            &CreateAsk {
+                scopes: all_scopes().iter().map(|scope| scope.to_string()).collect(),
+                ttl_secs: 60,
+            },
+            OWNER,
+            roles::Role::Owner,
+            now,
+        )
+        .unwrap();
+        let reply = dispatch_token(&coord, &call(op, &made.secret), &made.secret, now);
+        assert_eq!(reply.status, Some(403));
+        assert!(reply.error.unwrap().contains("does not have the scope"));
+        assert_eq!(deny_count(&coord, &made.id, "scope"), 1);
+        assert_eq!(role_deny_count(&coord, "netmap-seq-reset"), 0);
+        let token_call = run_admin(
+            &coord,
+            &mtls_request(op),
+            Caller::Token(&apitoken::actor_of(&made.id)),
+            None,
+            now,
+        );
+        assert!(token_call
+            .unwrap_err()
+            .to_string()
+            .contains("The caller is not an owner."));
+        assert_eq!(
+            std::fs::read_to_string(&seq_path).unwrap().trim(),
+            ahead.to_string()
+        );
+
+        for (svid, role, sentence) in &callers {
+            let err = roles::authorize(&coord, svid, op).unwrap_err();
+            assert_eq!(err.to_string(), *sentence, "{role}");
+        }
+        assert_eq!(role_deny_count(&coord, "netmap-seq-reset"), callers.len());
+        let audit = coord.config_audit_text().unwrap();
+        for (_, role, _) in &callers {
+            assert!(
+                audit.contains("\"action\":\"role-deny\"")
+                    && audit.contains(&format!("op netmap-seq-reset role {role} status 403")),
+                "{role} {audit}"
+            );
+        }
+        assert!(!audit.contains("\"action\":\"netmap-seq-reset\""));
+        assert_eq!(
+            std::fs::read_to_string(&seq_path).unwrap().trim(),
+            ahead.to_string()
+        );
+
+        roles::authorize(&coord, OWNER, op).unwrap();
+        let value = run_admin(&coord, &mtls_request(op), Caller::Owner(OWNER), None, now).unwrap();
+        assert_eq!(value["op"], "netmap-seq-reset");
+        assert_eq!(value["from"], ahead);
+        assert_eq!(value["to"], crate::seq::unix_ms(now));
+        assert_eq!(
+            std::fs::read_to_string(&seq_path).unwrap().trim(),
+            crate::seq::unix_ms(now).to_string()
+        );
+        let final_audit = coord.config_audit_text().unwrap();
+        let resets: Vec<&str> = final_audit
+            .lines()
+            .filter(|line| line.contains("\"action\":\"netmap-seq-reset\""))
+            .collect();
+        assert_eq!(resets.len(), 1, "{resets:?}");
+        assert!(resets[0].contains(OWNER));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
