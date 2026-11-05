@@ -291,9 +291,13 @@ The node gathers a reflexive address with STUN.
 The coordinator signs that address with the netmap Ed25519 key.
 The peer verifies the signature.
 With --stun-alt, the node measures the NAT mapping kind and publishes two endpoints.
+A hard NAT also publishes STUN port samples.
 The peers punch UDP.
 An endpoint-independent NAT and a symmetric NAT use bounded birthday probes.
-Two symmetric NATs use the orblx Relay.
+Two symmetric NATs with random port allocation use the orblx Relay.
+Two symmetric NATs use a bounded port spray when one allocation is predictable.
+The relay carries packets during that spray.
+A failed spray waits, then tries again.
 When the punch fails, the peers use the orblx Relay.
 The hello carries the SVID. The peer checks it against the trust bundle.
 A later direct path keeps the same overlay session.

@@ -1,12 +1,14 @@
 #!/bin/sh
 # NAT router for the W19 and W20 proofs.
-# The mode is cone, prc, or symmetric.
+# The mode is cone, prc, symmetric, random, sequential, or portblock.
 # cone keeps the source port and accepts new UDP to port 443.
 # prc is a port-restricted cone NAT.
 #   prc keeps the source port for all destinations (endpoint-independent mapping).
 #   prc has no port forward and no DNAT.
 #   prc accepts inbound UDP only from the IP and port that the inside host sent to.
-# symmetric uses a new source port for each destination.
+# symmetric and random use a new random source port for each destination.
+# sequential gives the next external port to each new UDP flow.
+# portblock gives a port inside a fixed 64-port block.
 
 set -eu
 
@@ -51,10 +53,15 @@ elif [ "$MODE" = "prc" ]; then
   # The conntrack 5-tuple is the filter.
   # Only a reply to a flow from the LAN passes the rule at the end of FORWARD.
   iptables -A FORWARD -i "$WAN" -o "$LAN" -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP
-elif [ "$MODE" = "symmetric" ]; then
+elif [ "$MODE" = "symmetric" ] || [ "$MODE" = "random" ]; then
   iptables -t nat -A POSTROUTING -o "$WAN" -p udp -j MASQUERADE --random-fully --to-ports 1024-65535
   iptables -t nat -A POSTROUTING -o "$WAN" -p tcp -j MASQUERADE
   iptables -t nat -A POSTROUTING -o "$WAN" -p icmp -j MASQUERADE
+elif [ "$MODE" = "sequential" ] || [ "$MODE" = "portblock" ]; then
+  # TCP and ICMP stay on the kernel NAT. UDP is moved by udp-nat.py.
+  iptables -t nat -A POSTROUTING -o "$WAN" -p tcp -j MASQUERADE
+  iptables -t nat -A POSTROUTING -o "$WAN" -p icmp -j MASQUERADE
+  iptables -A FORWARD -p udp -j DROP
 else
   echo "The router mode ${MODE} is not valid." >&2
   exit 1
@@ -76,4 +83,7 @@ echo "router node ${NODE_IP}"
 iptables -t nat -S
 iptables -S FORWARD
 iptables -S INPUT
+if [ "$MODE" = "sequential" ] || [ "$MODE" = "portblock" ]; then
+  exec python3 /udp-nat.py "$MODE" "$WAN_IP" "$LAN" "$WAN" "$NODE_IP"
+fi
 exec sleep infinity
