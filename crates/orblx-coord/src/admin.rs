@@ -30,10 +30,11 @@ struct DenyFile {
 }
 
 impl DenyFile {
-    fn empty(now: SystemTime) -> Self {
+    /// A missing file. `generated_at` is 0, so the content does not change with the clock.
+    fn empty() -> Self {
         Self {
             version: 0,
-            generated_at: unix_now(now).unwrap_or(0),
+            generated_at: 0,
             revoked_uris: Vec::new(),
             revoked_ticket_nonces: Vec::new(),
         }
@@ -74,7 +75,7 @@ pub fn deny_json_for(
 /// Return the ETag of one deny list text (W25-2).
 ///
 /// The ETag is the SHA-256 of the list with `generated_at` set to 0, in hex.
-/// A list with no file has the time of the call in `generated_at`, so the time is not in the ETag.
+/// A missing file also uses `generated_at` 0, so the clock is not in the ETag.
 pub fn deny_etag(text: &str) -> String {
     use sha2::{Digest, Sha256};
     let canonical = etag_body(text).unwrap_or_else(|| text.to_string());
@@ -124,14 +125,11 @@ pub(crate) fn deny_wire(
         return Ok(unsigned);
     }
     let file: DenyFile = serde_json::from_str(&unsigned).map_err(|_| CoordError::State)?;
+    // The stamp and the signed object use the same bytes. `generated_at` is 0,
+    // the same rule as the ETag, so an unchanged list does not get a new seq.
+    let canonical = content_identity(&file)?;
     let node_uri = SpiffeId::node(name)?.as_uri().to_string();
-    let digest = {
-        use sha2::{Digest, Sha256};
-        let bytes = Sha256::digest(unsigned.as_bytes());
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&bytes);
-        out
-    };
+    let digest = sha256_32(canonical.as_bytes());
     let book_key = crate::seq::deny_book_key(name)?;
     let now_ms = crate::seq::unix_ms(now);
     let book = crate::seq::shared_book(&coord.state_dir()?)?;
@@ -140,7 +138,7 @@ pub(crate) fn deny_wire(
     drop(book);
     let object = orblx_identity::DenyObject {
         version: file.version,
-        generated_at: file.generated_at,
+        generated_at: 0,
         revoked_uris: file.revoked_uris,
         revoked_ticket_nonces: file.revoked_ticket_nonces,
         node_uri,
@@ -669,17 +667,123 @@ pub(crate) fn revoked_uris_in(
     Ok(file.revoked_uris.into_iter().collect())
 }
 
-fn read_deny(coord: &Coordinator, now: SystemTime) -> Result<DenyFile, CoordError> {
+fn read_deny(coord: &Coordinator, _now: SystemTime) -> Result<DenyFile, CoordError> {
     let path = coord.state_dir()?.join(DENY_FILE);
     if !path.exists() {
-        return Ok(DenyFile::empty(now));
+        return Ok(DenyFile::empty());
     }
     let text = read_text(&path)?;
     serde_json::from_str(&text).map_err(|_| CoordError::State)
+}
+
+/// The deny content used for the stamp and for the signed object.
+///
+/// `generated_at` is 0. A later call with the same version and the same lists
+/// returns the same text, even when the clock or the file time is different.
+fn content_identity(file: &DenyFile) -> Result<String, CoordError> {
+    DenyFile {
+        version: file.version,
+        generated_at: 0,
+        revoked_uris: file.revoked_uris.clone(),
+        revoked_ticket_nonces: file.revoked_ticket_nonces.clone(),
+    }
+    .to_json()
+}
+
+fn sha256_32(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
 fn unix_now(now: SystemTime) -> Result<u64, CoordError> {
     now.duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|_| CoordError::Time)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use super::{content_identity, deny_wire, push_deny};
+    use crate::state::{Coordinator, OidcConfig};
+    use crate::NODE_PROTO;
+
+    fn enroll(tag: &str) -> (Dir, Coordinator) {
+        let dir = std::env::temp_dir().join(format!(
+            "orblx-deny-stamp-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
+        let now = SystemTime::now();
+        let token = coord
+            .create_token_at(Duration::from_secs(600), now)
+            .unwrap();
+        coord
+            .enroll_token("a", &token.secret, &["a:443".to_string()], &[], now)
+            .unwrap();
+        (Dir(dir), coord)
+    }
+
+    struct Dir(std::path::PathBuf);
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn seq_of(wire: &str) -> u64 {
+        let value: serde_json::Value = serde_json::from_str(wire).unwrap();
+        value["deny"]["seq"].as_u64().unwrap()
+    }
+
+    fn digest_of(coord: &Coordinator, now: SystemTime) -> [u8; 32] {
+        let unsigned = super::deny_json_for(coord, "a", now).unwrap();
+        let file: super::DenyFile = serde_json::from_str(&unsigned).unwrap();
+        super::sha256_32(content_identity(&file).unwrap().as_bytes())
+    }
+
+    #[test]
+    fn the_same_deny_content_keeps_one_stamp_across_clocks() {
+        let (dir, coord) = enroll("empty");
+        let first_at = SystemTime::now();
+        let later = first_at + Duration::from_secs(3600);
+        let empty_digest = digest_of(&coord, first_at);
+        let empty_a = deny_wire(&coord, "a", first_at, NODE_PROTO).unwrap();
+        let empty_b = deny_wire(&coord, "a", later, NODE_PROTO).unwrap();
+        assert_eq!(empty_digest, digest_of(&coord, later));
+        assert_eq!(seq_of(&empty_a), seq_of(&empty_b));
+        assert_eq!(empty_a, empty_b);
+        assert!(empty_a.contains("\"generated_at\":0"));
+
+        push_deny(
+            &coord,
+            &["spiffe://orblx.local/node/b".to_string()],
+            &[],
+            first_at,
+        )
+        .unwrap();
+        let stored = std::fs::read_to_string(dir.0.join("deny.json")).unwrap();
+        assert!(!stored.contains("\"generated_at\":0"));
+        let changed_at = later + Duration::from_secs(3600);
+        let filled_digest = digest_of(&coord, later);
+        let filled_a = deny_wire(&coord, "a", later, NODE_PROTO).unwrap();
+        let filled_b = deny_wire(&coord, "a", changed_at, NODE_PROTO).unwrap();
+        assert_eq!(filled_digest, digest_of(&coord, changed_at));
+        assert_eq!(seq_of(&filled_a), seq_of(&filled_b));
+        assert_eq!(filled_a, filled_b);
+        assert!(filled_a.contains("\"generated_at\":0"));
+        assert_ne!(seq_of(&empty_a), seq_of(&filled_a));
+        assert_ne!(empty_digest, filled_digest);
+    }
 }

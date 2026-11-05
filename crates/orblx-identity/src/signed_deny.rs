@@ -346,6 +346,50 @@ mod tests {
     }
 
     #[test]
+    fn a_non_canonical_high_s_signature_is_refused() {
+        let key = key_from(3);
+        let raw = object(NODE, 50, 1);
+        let message = deny_sign_message(&raw);
+        let good = key.sign(&message);
+        let public = key.verifying_key().to_bytes();
+        key.verifying_key().verify_strict(&message, &good).unwrap();
+        let mut bytes = good.to_bytes();
+        add_group_order(&mut bytes[32..64]);
+        let malleable = Signature::from_slice(&bytes).unwrap();
+        assert!(key
+            .verifying_key()
+            .verify_strict(&message, &malleable)
+            .is_err());
+        let text = deny_wire(&raw, &STANDARD.encode(bytes), &encode_hex(&public)).unwrap();
+        assert!(verify_signed_deny(text.as_bytes(), &public, NODE).is_err());
+        let canonical = deny_wire(
+            &raw,
+            &STANDARD.encode(good.to_bytes()),
+            &encode_hex(&public),
+        )
+        .unwrap();
+        assert!(verify_signed_deny(canonical.as_bytes(), &public, NODE).is_ok());
+    }
+
+    /// Add the Ed25519 group order L to a 32-byte little-endian scalar.
+    ///
+    /// A canonical S is below L, so S+L is a high-S signature of the same point.
+    fn add_group_order(scalar: &mut [u8]) {
+        const ORDER: [u8; 32] = [
+            0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
+            0xde, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x10,
+        ];
+        let mut carry = 0u16;
+        for (byte, order) in scalar.iter_mut().zip(ORDER) {
+            let sum = u16::from(*byte) + u16::from(order) + carry;
+            *byte = sum as u8;
+            carry = sum >> 8;
+        }
+        assert_eq!(carry, 0);
+    }
+
+    #[test]
     fn an_uppercase_key_id_is_refused() {
         let key = key_from(3);
         let raw = object(NODE, 50, 1);

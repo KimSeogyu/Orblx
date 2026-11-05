@@ -869,6 +869,49 @@ mod tests {
     }
 
     #[test]
+    fn a_netmap_grants_or_endpoint_object_is_not_a_deny_list() {
+        use orblx_identity::{verify_signed_deny, ReceiverGrant, ReceiverGrants};
+
+        let key = NetmapKey::from_seed(&[9; 32]);
+        let public = key.public();
+        let node = "spiffe://orblx.local/node/server";
+        let netmap = key.sign_netmap(&sample()).unwrap();
+        verify_signed_netmap(&netmap, &public).unwrap();
+        let netmap_wire = serde_json::to_vec(&netmap).unwrap();
+        assert!(verify_signed_deny(&netmap_wire, &public, node).is_err());
+        let netmap_as_deny =
+            orblx_identity::deny_wire(netmap.signed_bytes(), &netmap.sig, &netmap.key_id).unwrap();
+        assert!(verify_signed_deny(netmap_as_deny.as_bytes(), &public, node).is_err());
+
+        let grants = ReceiverGrants {
+            version: 1,
+            receiver: "spiffe://orblx.local/node/box".to_string(),
+            grants: vec![ReceiverGrant {
+                src: "spiffe://orblx.local/node/mac".to_string(),
+                proto: 6,
+                port_start: 22,
+                port_end: 22,
+            }],
+            reach: vec!["spiffe://orblx.local/node/mac".to_string()],
+            filter: true,
+            subnets: Vec::new(),
+            guarded: Vec::new(),
+        };
+        let grants = key.sign_grants(&grants).unwrap();
+        super::verify_signed_grants(&grants, &public).unwrap();
+        let grants_wire = serde_json::to_vec(&grants).unwrap();
+        assert!(verify_signed_deny(&grants_wire, &public, node).is_err());
+        let grants_as_deny =
+            orblx_identity::deny_wire(grants.signed_bytes(), &grants.sig, &grants.key_id).unwrap();
+        assert!(verify_signed_deny(grants_as_deny.as_bytes(), &public, node).is_err());
+
+        let endpoint = key.sign_endpoint("server", "10.0.0.2:443").unwrap();
+        verify_signed_endpoint(&endpoint, &public).unwrap();
+        let endpoint_wire = serde_json::to_vec(&endpoint).unwrap();
+        assert!(verify_signed_deny(&endpoint_wire, &public, node).is_err());
+    }
+
+    #[test]
     fn tampered_endpoint_is_rejected() {
         let key = NetmapKey::generate();
         let signed = key.sign_endpoint("server", "10.0.0.2:443").unwrap();
