@@ -6,8 +6,10 @@
 //! This is the same method as the enroll token store.
 //!
 //! The admin API accepts a token call only when the token is known, not expired,
-//! not revoked, and holds the scope of the operation. Token management
-//! (`admin-token-*`) has no scope. Only an owner SVID can do it.
+//! not revoked, and holds the scope of the operation. The token also cannot do
+//! more than the role of its creator. Token management (`admin-token-*`),
+//! `admin-role-set`, and `admin-netmap-seq-reset` have no scope. A token cannot
+//! call them.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -25,6 +27,7 @@ use sha2::{Digest, Sha256};
 use crate::error::CoordError;
 use crate::files::{read_text, write_text};
 use crate::netmap::encode_hex;
+use crate::roles::{self, Role};
 use crate::state::Coordinator;
 
 /// The file in the coordinator state directory.
@@ -42,6 +45,7 @@ pub const MAX_API_TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 pub const SCOPES: &[(&str, &str)] = &[
     ("admin-nodes", "nodes:read"),
     ("admin-users", "nodes:read"),
+    ("admin-roles", "nodes:read"),
     ("admin-user-approve", "nodes:write"),
     ("admin-user-reject", "nodes:write"),
     ("admin-routes", "nodes:read"),
@@ -62,11 +66,16 @@ pub const SCOPES: &[(&str, &str)] = &[
     ("admin-policy-set", "policy:write"),
 ];
 
-/// Admin operations that only an owner SVID can do.
+/// Admin operations that have no token scope.
+///
+/// A token cannot call these. The name is historical: the role table, not this
+/// list, decides which human role can call them.
 pub const OWNER_ONLY_OPS: &[&str] = &[
     "admin-token-create",
     "admin-token-list",
     "admin-token-revoke",
+    "admin-role-set",
+    "admin-netmap-seq-reset",
 ];
 
 /// Every admin operation name.
@@ -99,6 +108,10 @@ pub fn actor_of(id: &str) -> String {
     format!("api-token:{id}")
 }
 
+fn default_owner_role() -> String {
+    Role::Owner.as_str().to_string()
+}
+
 static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -113,6 +126,13 @@ struct TokenRecord {
     hash_hex: String,
     scopes: Vec<String>,
     created_by: String,
+    /// The OIDC user the token follows. Empty for a policy owner SVID and for an old token.
+    #[serde(default)]
+    created_user: String,
+    /// The creator role at create time. An old token has no field and reads as `owner`.
+    /// A call does not use this field. Rights come from the current policy and store.
+    #[serde(default = "default_owner_role")]
+    created_role: String,
     created_unix_ms: u64,
     expires_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -190,8 +210,14 @@ pub struct Checked {
     pub id: String,
     /// The scope of the operation, or `none`.
     pub scope: &'static str,
-    /// `Ok` when the call can go on.
+    /// `Ok` when the token and the scope allow the call.
+    ///
+    /// A `role_block` can still refuse the call. The server must check both.
     pub result: Result<(), Refusal>,
+    /// The creator role that refuses the call after the scope check.
+    ///
+    /// `None` when the role allows the call, or when `result` is already an error.
+    pub role_block: Option<Role>,
 }
 
 /// A new token. The caller shows `secret` one time and then drops it.
@@ -199,6 +225,7 @@ pub struct CreatedApiToken {
     pub id: String,
     pub secret: String,
     pub scopes: Vec<String>,
+    pub role: String,
     pub expires_unix_ms: u64,
 }
 
@@ -209,6 +236,7 @@ impl std::fmt::Debug for CreatedApiToken {
             .field("id", &self.id)
             .field("secret", &"[elided]")
             .field("scopes", &self.scopes)
+            .field("role", &self.role)
             .field("expires_unix_ms", &self.expires_unix_ms)
             .finish()
     }
@@ -257,11 +285,15 @@ pub struct CreateAsk {
     pub ttl_secs: u64,
 }
 
-/// Create one token for an owner. The call writes one `token-create` record.
+/// Create one token. The call writes one `token-create` record.
+///
+/// `role` is the creator role now. Each scope must fit that role.
+/// The token stores that role. A later call uses the creator's current role.
 pub fn create(
     coord: &Coordinator,
     ask: &CreateAsk,
     actor: &str,
+    role: Role,
     now: SystemTime,
 ) -> Result<CreatedApiToken, CoordError> {
     let scopes = parse_scopes(&ask.scopes.join(","))?;
@@ -270,6 +302,31 @@ pub fn create(
             "The token life is not valid.".to_string(),
         ));
     }
+    let live = roles::require_live(coord, actor)?;
+    if live != role {
+        roles::write_deny(coord, actor, "admin-token-create", live)?;
+        return Err(CoordError::Protocol(
+            "The token role does not match the caller.".to_string(),
+        ));
+    }
+    if !role.allows("admin-token-create") {
+        roles::write_deny(coord, actor, "admin-token-create", role)?;
+        return Err(CoordError::Protocol(format!(
+            "The role {} cannot create a token.",
+            role.as_str()
+        )));
+    }
+    for scope in &scopes {
+        if !roles::scope_fits(role, scope, SCOPES) {
+            roles::write_deny(coord, actor, "admin-token-create", role)?;
+            return Err(CoordError::Protocol(format!(
+                "The role {} cannot hold the scope {}.",
+                role.as_str(),
+                scope
+            )));
+        }
+    }
+    let created_user = roles::token_user(coord, actor)?;
     let now_ms = unix_ms(now)?;
     let expires_unix_ms = now_ms
         .checked_add(ask.ttl_secs.saturating_mul(1000))
@@ -291,6 +348,8 @@ pub fn create(
         hash_hex,
         scopes: scopes.clone(),
         created_by: actor.to_string(),
+        created_user,
+        created_role: role.as_str().to_string(),
         created_unix_ms: now_ms,
         expires_unix_ms,
         revoked_unix_ms: None,
@@ -305,14 +364,16 @@ pub fn create(
         before,
         after,
         &format!(
-            "scopes {} expires_unix_ms {expires_unix_ms}",
-            scopes.join(",")
+            "scopes {} role {} expires_unix_ms {expires_unix_ms}",
+            scopes.join(","),
+            role.as_str()
         ),
     )?;
     Ok(CreatedApiToken {
         id,
         secret,
         scopes,
+        role: role.as_str().to_string(),
         expires_unix_ms,
     })
 }
@@ -322,6 +383,7 @@ pub fn revoke(
     coord: &Coordinator,
     id: &str,
     actor: &str,
+    caller: Role,
     now: SystemTime,
 ) -> Result<Value, CoordError> {
     let now_ms = unix_ms(now)?;
@@ -338,6 +400,15 @@ pub fn revoke(
         return Err(CoordError::Protocol(
             "The API token is already revoked.".to_string(),
         ));
+    }
+    let created_by = record.created_by.clone();
+    if !roles::can_revoke(caller, actor, &created_by) {
+        drop(guard);
+        roles::write_deny(coord, actor, "admin-token-revoke", caller)?;
+        return Err(CoordError::Protocol(format!(
+            "The role {} cannot revoke this token.",
+            caller.as_str()
+        )));
     }
     record.revoked_unix_ms = Some(now_ms);
     let id = record.id.clone();
@@ -371,6 +442,8 @@ pub fn list(coord: &Coordinator, now: SystemTime) -> Result<Value, CoordError> {
                 "id": token.id,
                 "scopes": token.scopes,
                 "created_by": token.created_by,
+                "created_user": token.created_user,
+                "created_role": token.created_role,
                 "created_unix_ms": token.created_unix_ms,
                 "expires_unix_ms": token.expires_unix_ms,
                 "revoked_unix_ms": token.revoked_unix_ms,
@@ -393,7 +466,8 @@ fn state_word(token: &TokenRecord, now_ms: u64) -> &'static str {
 
 /// Check a token for one admin operation and write one audit record.
 ///
-/// An allowed call writes `token-use`. A refused call writes `token-deny`.
+/// An allowed call writes `token-use`. A refused token call writes `token-deny`.
+/// A call that the creator role refuses writes `role-deny` and not `token-deny`.
 /// The record holds the token id, never the token text.
 ///
 /// `rule` runs only when the token and the scope are good (W25-3b). When it returns
@@ -409,6 +483,13 @@ pub fn check(
     if checked.result.is_ok() {
         if let Some(refusal) = rule()? {
             checked.result = Err(refusal);
+            checked.role_block = None;
+        }
+    }
+    if checked.result.is_ok() {
+        if let Some(role) = checked.role_block {
+            roles::write_deny(coord, &actor_of(&checked.id), op, role)?;
+            return Ok(checked);
         }
     }
     let dir = coord.state_dir()?;
@@ -472,6 +553,7 @@ pub fn decide(
         id: "unknown".to_string(),
         scope,
         result: Err(Refusal::Unknown),
+        role_block: None,
     };
     if !secret.starts_with(API_TOKEN_PREFIX) || secret.len() > 128 {
         return Ok(unknown);
@@ -486,6 +568,9 @@ pub fn decide(
     let Some(token) = found else {
         return Ok(unknown);
     };
+    let created_by = token.created_by.clone();
+    let created_user = token.created_user.clone();
+    let id = token.id.clone();
     let result = if token.revoked_unix_ms.is_some() {
         Err(Refusal::Revoked)
     } else if now_ms >= token.expires_unix_ms {
@@ -495,10 +580,16 @@ pub fn decide(
     } else {
         Err(Refusal::Scope)
     };
+    let role_block = if result.is_ok() {
+        roles::blocking_role(coord, &created_by, &created_user, op)?
+    } else {
+        None
+    };
     Ok(Checked {
-        id: token.id.clone(),
+        id,
         scope,
         result,
+        role_block,
     })
 }
 
@@ -535,6 +626,12 @@ fn file_digest(dir: &Path) -> Result<[u8; 32], CoordError> {
 
 fn token_hash(secret: &str) -> String {
     encode_hex(Sha256::digest(secret.as_bytes()).as_slice())
+}
+
+/// SHA-256 hex of a token secret. Tests use it to build an old token file.
+#[cfg(test)]
+pub(crate) fn token_hash_hex(secret: &str) -> String {
+    token_hash(secret)
 }
 
 fn constant_eq(left: &str, right: &str) -> bool {
@@ -587,6 +684,7 @@ mod tests {
         admin_ops, all_scopes, check, create, decide, list, parse_scopes, parse_ttl, revoke,
         scope_of, CreateAsk, Refusal, API_TOKEN_FILE, API_TOKEN_PREFIX, OWNER_ONLY_OPS,
     };
+    use crate::roles::Role;
     use crate::state::{Coordinator, OidcConfig};
 
     const OWNER: &str = "spiffe://orblx.local/node/owner";
@@ -617,7 +715,16 @@ mod tests {
     fn audited(scratch: &Scratch) -> Coordinator {
         let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
         coord.enable_config_audit().unwrap();
+        let path = scratch.0.join("policy.hujson");
+        std::fs::write(&path, owner_policy(OWNER)).unwrap();
+        coord.set_policy_file(&path).unwrap();
         coord
+    }
+
+    fn owner_policy(owner: &str) -> String {
+        format!(
+            "{{\"owners\": [\"{owner}\"], \"acls\": [{{\"action\": \"accept\", \"src\": [\"{owner}\"], \"proto\": \"tcp\", \"dst\": [\"{owner}:1\"]}}]}}"
+        )
     }
 
     fn ask(scopes: &[&str], ttl_secs: u64) -> CreateAsk {
@@ -643,7 +750,7 @@ mod tests {
         let coord = audited(&scratch);
         let now = SystemTime::now();
         for scope in all_scopes() {
-            let made = create(&coord, &ask(&[scope], 60), OWNER, now).unwrap();
+            let made = create(&coord, &ask(&[scope], 60), OWNER, Role::Owner, now).unwrap();
             for op in admin_ops() {
                 let checked = decide(&coord, &made.secret, op, now).unwrap();
                 if scope_of(op) == Some(scope) {
@@ -664,7 +771,7 @@ mod tests {
         let coord = audited(&scratch);
         let now = SystemTime::now();
         let every = all_scopes();
-        let made = create(&coord, &ask(&every, 60), OWNER, now).unwrap();
+        let made = create(&coord, &ask(&every, 60), OWNER, Role::Owner, now).unwrap();
         for op in OWNER_ONLY_OPS {
             let checked = decide(&coord, &made.secret, op, now).unwrap();
             assert_eq!(checked.result, Err(Refusal::Scope));
@@ -682,7 +789,7 @@ mod tests {
         let scratch = Scratch::new();
         let coord = audited(&scratch);
         let now = SystemTime::now();
-        let made = create(&coord, &ask(&["nodes:read"], 1), OWNER, now).unwrap();
+        let made = create(&coord, &ask(&["nodes:read"], 1), OWNER, Role::Owner, now).unwrap();
         let before = now + Duration::from_millis(999);
         let at = now + Duration::from_millis(1000);
         assert_eq!(
@@ -706,15 +813,15 @@ mod tests {
         let scratch = Scratch::new();
         let coord = audited(&scratch);
         let now = SystemTime::now();
-        let made = create(&coord, &ask(&["nodes:read"], 60), OWNER, now).unwrap();
-        revoke(&coord, &made.id, OWNER, now).unwrap();
+        let made = create(&coord, &ask(&["nodes:read"], 60), OWNER, Role::Owner, now).unwrap();
+        revoke(&coord, &made.id, OWNER, Role::Owner, now).unwrap();
         assert_eq!(
             decide(&coord, &made.secret, "admin-nodes", now)
                 .unwrap()
                 .result,
             Err(Refusal::Revoked)
         );
-        assert!(revoke(&coord, &made.id, OWNER, now).is_err());
+        assert!(revoke(&coord, &made.id, OWNER, Role::Owner, now).is_err());
         let mut forged = made.secret.clone();
         forged.pop();
         forged.push(if made.secret.ends_with('A') { 'B' } else { 'A' });
@@ -732,7 +839,7 @@ mod tests {
         let scratch = Scratch::new();
         let coord = audited(&scratch);
         let now = SystemTime::now();
-        let made = create(&coord, &ask(&["nodes:read"], 60), OWNER, now).unwrap();
+        let made = create(&coord, &ask(&["nodes:read"], 60), OWNER, Role::Owner, now).unwrap();
         assert!(made.secret.starts_with(API_TOKEN_PREFIX));
         assert_eq!(count(&coord, "token-create", &made.id), 1);
         let used = check(&coord, &made.secret, "admin-nodes", now, no_rule).unwrap();
@@ -741,7 +848,7 @@ mod tests {
         let denied = check(&coord, &made.secret, "admin-policy-set", now, no_rule).unwrap();
         assert_eq!(denied.result, Err(Refusal::Scope));
         assert_eq!(count(&coord, "token-deny", &made.id), 1);
-        revoke(&coord, &made.id, OWNER, now).unwrap();
+        revoke(&coord, &made.id, OWNER, Role::Owner, now).unwrap();
         assert_eq!(count(&coord, "token-revoke", &made.id), 1);
         let late = check(&coord, &made.secret, "admin-nodes", now, no_rule).unwrap();
         assert_eq!(late.result, Err(Refusal::Revoked));
@@ -785,7 +892,7 @@ mod tests {
         let scratch = Scratch::new();
         let coord = audited(&scratch);
         let now = SystemTime::now();
-        assert!(create(&coord, &ask(&["nodes:read"], 0), OWNER, now).is_err());
-        assert!(create(&coord, &ask(&[], 60), OWNER, now).is_err());
+        assert!(create(&coord, &ask(&["nodes:read"], 0), OWNER, Role::Owner, now).is_err());
+        assert!(create(&coord, &ask(&[], 60), OWNER, Role::Owner, now).is_err());
     }
 }

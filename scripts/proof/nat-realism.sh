@@ -42,7 +42,7 @@ export ORBLX_NATR_IMAGE="$IMAGE" ORBLX_NATR_PUB="$PUB" ORBLX_NATR_LAN="$LAN"
 . "$ROOT/scripts/proof/proof-lock.sh"
 PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap proof_lock_end EXIT
-proof_lock_take "nat-realism:${PROJECT}" "$NATR_PREFIX" "${PROJECT}-"
+proof_lock_take "nat-realism:${PROJECT}" "${PROJECT}"
 # W25-14b: start from a clean compose state (all profiles, all volumes).
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
@@ -79,7 +79,8 @@ NODE_IDLE_CPU_PCT="${ORBLX_NODE_IDLE_CPU_PCT:-25}"
 BULK_PORT=5201
 DIRECT_AVG=""
 # The node leaf life in seconds for the renewal case.
-RENEW_TTL=60
+# W25-45: the coordinator refuses a node SVID life under 180 s.
+RENEW_TTL=180
 
 dc() {
   docker compose --progress quiet -p "$PROJECT" -f "$FILE" "$@"
@@ -615,7 +616,7 @@ check_renewal() {
   local before="$5"
   local text after other_self kind i
   echo "${label} before peer_svid_expiry ${before}"
-  for i in $(seq 1 120); do
+  for i in $(seq 1 $((RENEW_TTL * 2))); do
     text="$(status_text "$container")"
     after="$(peer_expiry_of "$text")"
     other_self="$(self_expiry_of "$(status_text "$other")")"

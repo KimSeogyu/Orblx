@@ -558,6 +558,125 @@ fn ticket_acl_drops_bad_tickets_and_allows_a_valid_ticket() {
     assert!(gate.payload_from_data(&frame, now, &refuse).is_err());
 }
 
+/// One bound gate for the W25-45 window tests: the peer leaf lives `cert_secs`.
+fn w2545_gate(
+    now: SystemTime,
+    cert_secs: u64,
+) -> (PeerGate, SpiffeId, TicketSigner, [u8; 32], TicketRing) {
+    let ca = MiniCa::generate(now).unwrap();
+    let peer = SpiffeId::user("w2545-peer").unwrap();
+    let issued = ca
+        .issue(
+            &peer,
+            now,
+            Duration::from_secs(cert_secs),
+            &DenySet::empty(),
+        )
+        .unwrap();
+    let signer = TicketSigner::generate();
+    let mac_key = [0x45; 32];
+    let ring = ring_for(&ca, &signer, mac_key, now);
+    let mut gate = PeerGate::new();
+    gate.bind_leaf(
+        ca.trust_bundle(),
+        &issued.certificate_der,
+        now,
+        &DenySet::empty(),
+    )
+    .unwrap();
+    (gate, peer, signer, mac_key, ring)
+}
+
+/// W25-45: the ticket end is strict. `expires` is valid, `expires + 1 s` is refused.
+///
+/// The certificate end grace does not apply to a ticket.
+#[test]
+fn a_ticket_is_refused_one_second_after_its_end() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let (mut gate, peer, signer, mac_key, ring) = w2545_gate(now, 900);
+    let ticket = present(&signer, &mac_key, now, &peer, 600);
+    let end = now + Duration::from_secs(600);
+    let hash = gate
+        .admit_ticket(&ring, &ticket.bytes, &ticket.mac, now, &DenySet::empty())
+        .unwrap();
+    let packet = sample_packet();
+    let frame = gate.encode_data(1, 0, hash, &packet).unwrap();
+    assert_eq!(
+        gate.payload_from_data(&frame, end, &DenySet::empty())
+            .unwrap(),
+        packet.as_slice()
+    );
+    let after = end + Duration::from_secs(1);
+    assert_eq!(
+        ticket_failure(
+            gate.payload_from_data(&frame, after, &DenySet::empty())
+                .unwrap_err()
+        ),
+        CryptoError::Identity(IdentityError::Expired)
+    );
+    assert_eq!(
+        ticket_failure(
+            gate.admit_ticket(&ring, &ticket.bytes, &ticket.mac, after, &DenySet::empty())
+                .unwrap_err()
+        ),
+        CryptoError::Identity(IdentityError::Expired)
+    );
+}
+
+/// W25-45 B2: the session ends at min(ticket expires, peer certificate not_after).
+///
+/// The ticket is still valid, but DATA after the peer certificate end is refused.
+#[test]
+fn a_session_past_the_peer_certificate_end_is_refused() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let (mut gate, peer, signer, mac_key, ring) = w2545_gate(now, 300);
+    let ticket = present(&signer, &mac_key, now, &peer, 3_600);
+    let hash = gate
+        .admit_ticket(&ring, &ticket.bytes, &ticket.mac, now, &DenySet::empty())
+        .unwrap();
+    let cert_end = gate.peer_not_after().unwrap();
+    assert_eq!(gate.ticket_expires(), Some(unix(now) + 3_600));
+    assert_eq!(gate.session_deadline(), Some(cert_end));
+    let packet = sample_packet();
+    let frame = gate.encode_data(1, 0, hash, &packet).unwrap();
+    let at_end = UNIX_EPOCH + Duration::from_secs(cert_end);
+    assert_eq!(
+        gate.payload_from_data(&frame, at_end, &DenySet::empty())
+            .unwrap(),
+        packet.as_slice()
+    );
+    let past = at_end + Duration::from_secs(1);
+    assert!(matches!(
+        gate.payload_from_data(&frame, past, &DenySet::empty())
+            .unwrap_err(),
+        HelloError::Identity(IdentityError::Expired)
+    ));
+}
+
+/// W25-45 B1: the ticket subject must be the URI of the peer certificate of this session.
+#[test]
+fn a_ticket_for_another_uri_is_refused() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let (mut gate, peer, signer, mac_key, ring) = w2545_gate(now, 900);
+    let other = SpiffeId::user("w2545-other").unwrap();
+    assert_ne!(other, peer);
+    let other_ticket = present(&signer, &mac_key, now, &other, 600);
+    assert_eq!(
+        ticket_failure(
+            gate.admit_ticket(
+                &ring,
+                &other_ticket.bytes,
+                &other_ticket.mac,
+                now,
+                &DenySet::empty()
+            )
+            .unwrap_err()
+        ),
+        CryptoError::TicketSubject
+    );
+    assert_eq!(gate.ticket_expires(), None);
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -1095,6 +1214,7 @@ fn a_ping_increments_the_overlay_counters() {
                     underlay: Vec::new(),
                     relay: None,
                     netmap_path: PathBuf::from("netmap.json"),
+                    netmap_text: None,
                     visibility: Arc::new(AllowPeers),
                     on_ready: None,
                     on_listen: None,
@@ -1164,6 +1284,127 @@ fn a_ping_increments_the_overlay_counters() {
     let rx = metric_value(&body, "orblx_node_packets_rx");
     assert!(tx > 0, "{body}");
     assert!(rx > 0, "{body}");
+}
+
+/// W25-45 D3(a): a TICKET frame in an open session ends the session.
+///
+/// A ticket is valid only in the hello. The node must not take a new ticket in an open
+/// session (no in-session swap). It ends the session, and the peer must dial again.
+#[test]
+fn a_ticket_frame_in_an_open_session_ends_the_session() {
+    let now = SystemTime::now();
+    let (_ca, pair) = issue_node_pair(now);
+    let listen = free_udp();
+    let dir = std::env::temp_dir().join(format!(
+        "orblx-ticket-frame-{}-{}",
+        std::process::id(),
+        listen.port()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let netmap = Netmap::from_slice(
+        br#"{
+            "version": 1,
+            "self": {"name": "b", "overlay_ip": "100.64.0.2"},
+            "peers": [{
+                "name": "a",
+                "overlay_ip": "100.64.0.1",
+                "svid": "spiffe://orblx.local/node/a",
+                "endpoints": ["127.0.0.1:1"],
+                "routes": []
+            }]
+        }"#,
+    )
+    .unwrap();
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let (from_tx, from_rx) = mpsc::channel(4);
+    let (to_tx, _to_rx) = mpsc::channel(16);
+    let server = pair.server;
+    let state_dir = dir.clone();
+    let node = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let _hold_host_packets = from_tx;
+            let _ = crate::run_memory_node(
+                NodeRequest {
+                    config: server,
+                    netmap,
+                    listen,
+                    state_dir,
+                    renew: None,
+                    stop: Some(stop_rx),
+                    accept_routes: false,
+                    forward_routes: Vec::new(),
+                    forward_exit: false,
+                    exit_node: None,
+                    allow_lan: false,
+                    underlay: Vec::new(),
+                    relay: None,
+                    netmap_path: PathBuf::from("netmap.json"),
+                    netmap_text: None,
+                    visibility: Arc::new(AllowPeers),
+                    on_ready: None,
+                    on_listen: None,
+                    metrics: None,
+                    filter: None,
+                },
+                MemoryDevice {
+                    from_tun: from_rx,
+                    to_tun: to_tx,
+                },
+            )
+            .await;
+        });
+    });
+    let client_config = pair.client.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome = runtime.block_on(async move {
+        let client = HelloEndpoint::bind_client(client_config, loopback(0)).unwrap();
+        let mut session = None;
+        for _ in 0..40 {
+            match client.connect_one(listen).await {
+                Ok(open) => {
+                    session = Some(open);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        let mut session = session.expect("The node did not accept the session.");
+        let src = Ipv4Addr::new(100, 64, 0, 1);
+        let dst = Ipv4Addr::new(100, 64, 0, 2);
+        let echo = |seq| crate::ipv4::icmp_echo_request(src, dst, 7, seq, b"w2545").unwrap();
+        session.send_ipv4(&echo(1)).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), session.recv_overlay()).await;
+        let first_ok = matches!(first, Ok(Ok(_)));
+        session.send_ticket_frame_for_test().await.unwrap();
+        // The node must not answer this echo: the session ended at the TICKET frame.
+        let _ = session.send_ipv4(&echo(2)).await;
+        let after = tokio::time::timeout(Duration::from_secs(3), session.recv_overlay()).await;
+        (first_ok, after)
+    });
+    let _ = stop_tx.send(true);
+    let _ = node.join();
+    let _ = std::fs::remove_dir_all(&dir);
+    let (first_ok, after) = outcome;
+    assert!(
+        first_ok,
+        "The node did not answer the echo before the TICKET frame."
+    );
+    match after {
+        Ok(Err(_)) => {}
+        Ok(Ok(packet)) => panic!(
+            "The node answered after the TICKET frame ({} bytes). The session did not end.",
+            packet.len()
+        ),
+        Err(_) => panic!("The session stayed open for 3 s after the TICKET frame."),
+    }
 }
 
 fn issue_node_pair(now: SystemTime) -> (MiniCa, IssuedPair) {
@@ -1318,6 +1559,7 @@ fn a_failed_tun_open_leaves_the_state_directory_unchanged() {
         underlay: Vec::new(),
         relay: None,
         netmap_path: dir.join("netmap.json"),
+        netmap_text: None,
         visibility: Arc::new(AllowPeers),
         on_ready: None,
         on_listen: None,
@@ -1510,6 +1752,7 @@ fn w25_38_memory_node(
                     underlay: Vec::new(),
                     relay: None,
                     netmap_path: PathBuf::from("netmap.json"),
+                    netmap_text: None,
                     visibility: Arc::new(AllowPeers),
                     on_ready: None,
                     on_listen: None,

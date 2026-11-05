@@ -65,7 +65,10 @@ cleanup() {
 . "$ROOT/scripts/proof/proof-lock.sh"
 PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap 'cleanup; proof_lock_end' EXIT
-proof_lock_take "join-time:${BASE}" "${BASE}-"
+# W25-46: the own compose projects are ${BASE}-j0 to ${BASE}-jN.
+JOIN_OWN_PROJECTS=("${BASE}-j0")
+for join_i in $(seq 1 "$N"); do JOIN_OWN_PROJECTS+=("${BASE}-j${join_i}"); done
+proof_lock_take "join-time:${BASE}" "${JOIN_OWN_PROJECTS[@]}"
 # W25-14b: each join starts from a clean compose state (all profiles, all volumes).
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$ROOT/scripts/proof/compose-clean.sh"

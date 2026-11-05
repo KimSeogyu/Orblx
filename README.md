@@ -127,6 +127,13 @@ The script runs a netns source-NAT lab when `ip` and `iptables` are present.
 The netns lab puts two peers behind one MASQUERADE NAT.
 The QUIC server binds UDP port 443.
 
+The node can ask the gateway for a mapped UDP port.
+The protocols are PCP, NAT-PMP, and UPnP IGD.
+A mapped port is a candidate. The peer can punch that port.
+Two symmetric NATs use that path when one router grants a map.
+The probe budget is 750 ms. The relay path does not wait for the probe. `--port-map off` skips the probe.
+Read the lab record in [docs/port-mapping.md](docs/port-mapping.md).
+
 Gather against a STUN server:
 
 ```bash
@@ -275,6 +282,10 @@ The 12-week work is complete when all of these statements are true:
 - The system writes a log record when the system denies application B.
 - On a symmetric NAT, a direct session is valid.
 - On a symmetric NAT, a session through the orblx Relay is valid.
+
+Two symmetric NATs with a predictable port allocation can use a direct path.
+The relay stays in use when both allocations are random.
+Read the measurement in [docs/sym-sym-direct.md](docs/sym-sym-direct.md).
 - When an SVID expires, new packets stop within 60 seconds.
 - When a ticket expires, new packets stop within 60 seconds.
 - When the system revokes an SVID, new packets stop within 60 seconds.

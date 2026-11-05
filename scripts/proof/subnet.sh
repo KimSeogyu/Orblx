@@ -5,6 +5,8 @@
 # A client container reaches a LAN device that has no overlay.
 # The script deletes the orblx-subnet-proof containers at the start.
 # The script does not print enroll tokens or private keys.
+# W25-27: the router and the client run on the state from the coordinator enroll
+# (SVID and ticket, no grants file as before). No lab tickets.
 # The Mac steps stay in docs/w18-subnet.md. This script does not run them.
 set -euo pipefail
 # shellcheck source=scripts/proof/pipe-lib.sh
@@ -38,7 +40,7 @@ cleanup() {
 . "$PROOF_LIB_DIR/proof-lock.sh"
 PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap 'cleanup; proof_lock_end' EXIT
-proof_lock_take "subnet"
+proof_lock_take "subnet" "orblx-subnet-proof"
 # W25-14b: start from a clean compose state (all profiles, all volumes).
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
@@ -183,13 +185,20 @@ if [[ -z "$router_ip" || -z "$client_ip" ]]; then
 fi
 
 echo "=== [C] node material ==="
-cargo build -p orblx-cli --bin orblx
-"$ROOT/target/debug/orblx" node-issue \
-  --out "$WORK/nodes" \
-  --node "router=${router_ip}" \
-  --node "client=${client_ip}"
-cp -a "$WORK/nodes/router/." "$SUBNET_ROUTER_STATE/"
-cp -a "$WORK/nodes/client/." "$SUBNET_CLIENT_STATE/"
+# W25-27: copy the same node files that the lab issuer wrote before (SVID, bundle, ticket),
+# now from the coordinator enroll. The nodes keep the static netmaps and get no signed
+# grants file, as before.
+copy_node_material() {
+  local src="$1" dest="$2" name
+  for name in cert.pem key.pem bundle.pem svid-ca.pub ticket.bin ticket.bin.mac \
+    ticket-verifier.pem ticket-mac.key ticket-not-before ticket-not-after; do
+    cp -a "$src/$name" "$dest/$name"
+  done
+  cmp -s "$src/ticket.bin" "$dest/ticket.bin"
+}
+proof_ticket_guard coord "$WORK/enroll-router" "$WORK/enroll-client"
+copy_node_material "$WORK/enroll-router" "$SUBNET_ROUTER_STATE"
+copy_node_material "$WORK/enroll-client" "$SUBNET_CLIENT_STATE"
 
 echo "=== [C] start lan, router, and client ==="
 dc --profile nodes up -d lan router client

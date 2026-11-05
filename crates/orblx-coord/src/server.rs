@@ -71,8 +71,14 @@ async fn expire_tick(coord: Coordinator) {
     loop {
         tokio::time::sleep(EXPIRE_TICK).await;
         let step = coord.clone();
-        let result =
-            tokio::task::spawn_blocking(move || agent::expire_due(&step, SystemTime::now())).await;
+        let result = tokio::task::spawn_blocking(move || {
+            // W25-31: rotate the SSH user CA when due, and move revoked serials to the list.
+            if let Err(err) = step.ssh_tick(SystemTime::now()) {
+                println!("coord ssh tick failed: {}", err.public_text());
+            }
+            agent::expire_due(&step, SystemTime::now())
+        })
+        .await;
         match result {
             Ok(Ok(_)) => failed = false,
             Ok(Err(err)) if !failed => {
@@ -102,6 +108,8 @@ async fn stamp_tick(coord: Coordinator, stamp: watch::Sender<u64>) {
             dir.join("deny.json"),
             dir.join(crate::state::CONFIG_AUDIT_FILE),
             dir.join("nodes.json"),
+            dir.join(crate::sshca::SSH_CA_FILE),
+            dir.join(crate::sshca::SSH_CERTS_FILE),
             policy,
         ]
         .iter()
@@ -162,12 +170,19 @@ async fn policy_wait(
         let deny = admin::deny_json_for(coord, name, SystemTime::now())?;
         let etag = policy_etag(&cached.digest, &deny);
         let changed = known != Some(etag.as_str());
-        if changed
-            || !matches!(
-                tokio::time::timeout_at(deadline, stamp.changed()).await,
-                Ok(Ok(()))
-            )
-        {
+        // W25-34: wake at the heartbeat time of the node too. At that time the cache gives a
+        // new signed view with a new stamp, so its ETag changes and the node gets the full
+        // reply. The short reply goes out only at the end of the hold, when no heartbeat is due.
+        let beat = tokio::time::Instant::now() + coord.netmap_heartbeat_in(name)?;
+        let until = deadline.min(beat);
+        let reply = changed
+            || match tokio::time::timeout_at(until, stamp.changed()).await {
+                Ok(Ok(())) => false,
+                Ok(Err(_)) => true,
+                // At the heartbeat time, sign again in the next loop, then send the full reply.
+                Err(_) => beat > deadline,
+            };
+        if reply {
             if !changed && unchanged_ok {
                 // W25-16: the node has this view. Send only the deny list and the ETag.
                 return proto::encode_json(&Response {
@@ -332,9 +347,24 @@ async fn handle_stream(
     mut recv: quinn::RecvStream,
     stamp: watch::Receiver<u64>,
 ) -> Result<(), CoordError> {
-    let request = proto::read_json::<Request>(&mut recv).await?;
+    let incoming = proto::read_json::<proto::Incoming>(&mut recv).await?;
+    let request = incoming.request;
+    // W25-34: refuse an older node with the version mismatch text.
+    let gated = proto::version_gate(&request.op, incoming.proto);
+    if gated.is_err() {
+        println!(
+            "coord rejected: {} node {} op {} protocol {} (need {})",
+            proto::VERSION_MISMATCH,
+            request.name,
+            request.op,
+            incoming.proto,
+            proto::NODE_PROTO
+        );
+    }
     // W25-16: a `policy-wait` reply comes as JSON bytes from the cached view.
-    let reply = if request.op == "policy-wait" {
+    let reply = if let Err(err) = gated {
+        Err(err)
+    } else if request.op == "policy-wait" {
         policy_wait_op(coord, connection, &request, stamp).await
     } else {
         match dispatch(coord, connection, request, stamp).await {
@@ -379,6 +409,95 @@ async fn policy_wait_op(
     .await
 }
 
+/// Authenticate the peer leaf for the SSH certificate path (W25-31).
+///
+/// The check uses an empty deny set. Thus a revoked node, an agent, or a coordinator SVID
+/// reaches the decision, and the decision writes an audit record.
+/// Return the SPIFFE ID and the end of the leaf.
+fn ssh_peer(
+    coord: &Coordinator,
+    connection: &quinn::Connection,
+) -> Result<(orblx_identity::SpiffeId, u64), CoordError> {
+    let Some(identity) = connection.peer_identity() else {
+        return Err(CoordError::Peer);
+    };
+    let chain = identity
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .map_err(|_| CoordError::Peer)?;
+    let Some(leaf) = chain.first() else {
+        return Err(CoordError::Peer);
+    };
+    let material = coord.tls_material()?;
+    let trust = TrustBundle::from_pem(&material.trust_pem)?;
+    let id = trust.authenticate_leaf(
+        leaf.as_ref(),
+        SystemTime::now(),
+        &orblx_identity::DenySet::empty(),
+    )?;
+    let not_after = orblx_identity::leaf_not_after(leaf.as_ref())?;
+    Ok((id, not_after))
+}
+
+/// The TLS exporter of one connection for the SSH request (W25-31).
+fn ssh_exporter(
+    connection: &quinn::Connection,
+) -> Result<[u8; crate::sshca::SSH_EXPORTER_LEN], CoordError> {
+    let mut out = [0u8; crate::sshca::SSH_EXPORTER_LEN];
+    connection
+        .export_keying_material(&mut out, crate::sshca::SSH_EXPORTER_LABEL, b"")
+        .map_err(|_| CoordError::Tls("The TLS exporter failed.".to_string()))?;
+    Ok(out)
+}
+
+/// Decide one `ssh-cert` request (W25-31). Each decision writes one audit record.
+async fn ssh_cert(
+    coord: &Coordinator,
+    connection: &quinn::Connection,
+    request: &Request,
+) -> Result<Response, CoordError> {
+    let (peer, not_after) = ssh_peer(coord, connection)?;
+    let exporter = ssh_exporter(connection)?;
+    let ask = request.ssh.clone().ok_or_else(|| {
+        CoordError::Protocol("The SSH certificate request is not valid.".to_string())
+    })?;
+    let step = coord.clone();
+    let connection_id = connection.stable_id() as u64;
+    let result = tokio::task::spawn_blocking(move || {
+        step.ssh_issue(
+            &peer,
+            not_after,
+            connection_id,
+            &exporter,
+            &ask,
+            SystemTime::now(),
+        )
+    })
+    .await
+    .map_err(|_| CoordError::State)?;
+    match result {
+        Ok(issued) => {
+            println!("ssh certificate issued serial {}", issued.serial);
+            Ok(Response {
+                ok: true,
+                detail: Some(issued.text),
+                ..Response::default()
+            })
+        }
+        Err(crate::state::SshIssueError::Deny(deny)) => {
+            println!("ssh certificate denied {}", deny.as_str());
+            Ok(Response {
+                ok: false,
+                error: Some(format!(
+                    "The coordinator refused the SSH certificate. reason {}",
+                    deny.as_str()
+                )),
+                ..Response::default()
+            })
+        }
+        Err(crate::state::SshIssueError::Coord(err)) => Err(err),
+    }
+}
+
 async fn dispatch(
     coord: &Coordinator,
     connection: &quinn::Connection,
@@ -387,6 +506,17 @@ async fn dispatch(
 ) -> Result<Response, CoordError> {
     let now = SystemTime::now();
     match request.op.as_str() {
+        "ssh-cert-nonce" => {
+            // W25-31: any trusted leaf gets a nonce. The decision on the next stream audits it.
+            let _ = ssh_peer(coord, connection)?;
+            let nonce = coord.ssh_nonce(connection.stable_id() as u64)?;
+            Ok(Response {
+                ok: true,
+                detail: Some(encode_hex(&nonce)),
+                ..Response::default()
+            })
+        }
+        "ssh-cert" => ssh_cert(coord, connection, &request).await,
         "enroll" => {
             let result = match (&request.token, &request.id_token) {
                 (Some(token), None) => coord.enroll_token(
@@ -541,16 +671,14 @@ fn dispatch_admin(
         return Ok(dispatch_token(coord, request, secret, now));
     }
     let caller = peer_id(coord, connection)?;
-    if !coord.caller_is_owner(&caller)? {
-        return Err(CoordError::Protocol(
-            "The caller is not an owner.".to_string(),
-        ));
-    }
+    let actor = caller.as_uri();
+    // The role gate writes one role-deny record when it refuses the call.
+    crate::roles::authorize(coord, actor, &request.op)?;
     let policy_lock = policy_lock_for(&request.op)?;
     let value = run_admin(
         coord,
         request,
-        Caller::Owner(caller.as_uri()),
+        Caller::Owner(actor),
         policy_lock.as_ref(),
         now,
     )?;
@@ -629,6 +757,14 @@ fn dispatch_token(
         );
         return status_response(refusal.status(), refusal.text().to_string());
     }
+    if let Some(role) = checked.role_block {
+        println!(
+            "admin role deny {} op {op} role {} status 403",
+            checked.id,
+            role.as_str()
+        );
+        return status_response(403, crate::roles::deny_text(role).to_string());
+    }
     let actor = apitoken::actor_of(&checked.id);
     let value = match run_admin(
         coord,
@@ -703,6 +839,10 @@ fn run_admin(
         "admin-revoke-all" => admin::revoke_all(coord, &request.name, actor, now)?,
         "admin-revoke-undo" => admin::revoke_undo(coord, &request.name, actor, now)?,
         "admin-expire" => admin::expire(coord, &request.name, actor)?,
+        "admin-netmap-seq-reset" => {
+            owner_only()?;
+            coord.netmap_seq_reset(actor, now)?
+        }
         "admin-routes" => admin::routes(coord)?,
         "admin-audit" => admin::audit(coord, parse_since(&request.name)?)?,
         "admin-grants" => agent::list(coord, now)?,
@@ -726,6 +866,18 @@ fn run_admin(
             coord.lock_update(update, actor)?
         }
         "admin-policy" => admin::policy_show(coord)?,
+        "admin-roles" => {
+            let mut value = admin::users(coord)?;
+            value["op"] = serde_json::json!("roles");
+            value
+        }
+        "admin-role-set" => {
+            // A token has no scope for this operation. This is a second gate.
+            owner_only()?;
+            let ask: crate::roles::SetAsk = serde_json::from_str(&request.name)
+                .map_err(|_| CoordError::Protocol("The role request is not valid.".to_string()))?;
+            crate::roles::apply(coord, &ask, actor, now)?
+        }
         "admin-policy-set" => {
             let lock = policy_lock.ok_or(CoordError::State)?;
             admin::policy_set(coord, lock, &request.name, request.expect_sha256.as_deref())?
@@ -734,12 +886,14 @@ fn run_admin(
             owner_only()?;
             let ask: apitoken::CreateAsk = serde_json::from_str(&request.name)
                 .map_err(|_| CoordError::Protocol("The token request is not valid.".to_string()))?;
-            let made = apitoken::create(coord, &ask, actor, now)?;
+            let role = crate::roles::require_live(coord, actor)?;
+            let made = apitoken::create(coord, &ask, actor, role, now)?;
             serde_json::json!({
                 "op": "token-create",
                 "id": made.id,
                 "token": made.secret,
                 "scopes": made.scopes,
+                "role": made.role,
                 "expires_unix_ms": made.expires_unix_ms
             })
         }
@@ -749,7 +903,8 @@ fn run_admin(
         }
         "admin-token-revoke" => {
             owner_only()?;
-            apitoken::revoke(coord, request.name.trim(), actor, now)?
+            let role = crate::roles::require_live(coord, actor)?;
+            apitoken::revoke(coord, request.name.trim(), actor, role, now)?
         }
         _ => {
             return Err(CoordError::Protocol(
@@ -810,9 +965,9 @@ fn leaf_response(result: crate::state::EnrollResult) -> Response {
         private_key_pem: Some(result.private_key_pem),
         trust_bundle_pem: Some(result.trust_bundle_pem),
         netmap_pub_hex: Some(encode_hex(&result.netmap_public)),
-        netmap: Some(result.signed_netmap),
+        netmap: Some(result.signed_netmap.to_wire()),
         endpoints: Some(result.endpoints),
-        grants: Some(result.signed_grants),
+        grants: Some(result.signed_grants.to_wire()),
         approved_routes: Some(result.approved_routes),
         advertised_routes: Some(result.advertised_routes),
         exit_approved: Some(result.exit_approved),
@@ -864,10 +1019,13 @@ fn peer_id(
 
 #[cfg(test)]
 mod tests {
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
+
+    use orblx_identity::{IssueGate, MiniCa, MockOidc, MOCK_OIDC_ISSUER};
 
     use super::{dispatch_token, run_admin, Caller, Request};
     use crate::apitoken::{self, admin_ops, all_scopes, scope_of, CreateAsk};
+    use crate::roles::{self, SetAsk};
     use crate::state::{Coordinator, OidcConfig};
 
     fn call(op: &str, secret: &str) -> Request {
@@ -888,6 +1046,7 @@ mod tests {
             api_token: Some(secret.to_string()),
             deny_etag: None,
             expect_sha256: None,
+            ssh: None,
             unchanged_ok: false,
         }
     }
@@ -922,9 +1081,10 @@ mod tests {
         full.policy_etag = Some(etag);
         assert_eq!(bytes, serde_json::to_vec(&full).unwrap());
         let parsed: super::Response = serde_json::from_slice(&bytes).unwrap();
-        let netmap = parsed.netmap.unwrap();
-        crate::netmap::verify_signed_netmap(&netmap, &cached.view.netmap_public).unwrap();
-        crate::netmap::verify_signed_grants(&parsed.grants.unwrap(), &cached.view.netmap_public)
+        let netmap =
+            crate::netmap::verify_netmap_wire(&parsed.netmap.unwrap(), &cached.view.netmap_public)
+                .unwrap();
+        crate::netmap::verify_grants_wire(&parsed.grants.unwrap(), &cached.view.netmap_public)
             .unwrap();
         assert_eq!(netmap.netmap.peers.len(), 1);
         // W25-16: when the ETag did not change at the end of the hold, a node that keeps its
@@ -987,14 +1147,23 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
         coord.enable_config_audit().unwrap();
+        let policy_path = dir.join("policy.hujson");
+        std::fs::write(&policy_path, policy_text(&[OWNER], 22)).unwrap();
+        coord.set_policy_file(&policy_path).unwrap();
         let now = SystemTime::now();
         for scope in all_scopes() {
             let ask = CreateAsk {
                 scopes: vec![scope.to_string()],
                 ttl_secs: 60,
             };
-            let made =
-                apitoken::create(&coord, &ask, "spiffe://orblx.local/node/owner", now).unwrap();
+            let made = apitoken::create(
+                &coord,
+                &ask,
+                "spiffe://orblx.local/node/owner",
+                crate::roles::Role::Owner,
+                now,
+            )
+            .unwrap();
             for op in admin_ops() {
                 let reply = dispatch_token(&coord, &call(op, &made.secret), &made.secret, now);
                 let status = reply.status.unwrap();
@@ -1014,6 +1183,7 @@ mod tests {
                 ttl_secs: 60,
             },
             "spiffe://orblx.local/node/owner",
+            crate::roles::Role::Owner,
             now,
         )
         .unwrap();
@@ -1093,6 +1263,7 @@ mod tests {
                 ttl_secs: 60,
             },
             OWNER,
+            crate::roles::Role::Owner,
             now,
         )
         .unwrap();
@@ -1138,6 +1309,7 @@ mod tests {
                 ttl_secs: 60,
             },
             OWNER,
+            crate::roles::Role::Owner,
             now,
         )
         .unwrap();
@@ -1188,6 +1360,7 @@ mod tests {
                     ttl_secs: 60,
                 },
                 OWNER,
+                crate::roles::Role::Owner,
                 now,
             )
             .unwrap();
@@ -1242,6 +1415,7 @@ mod tests {
                 ttl_secs: 60,
             },
             OWNER,
+            crate::roles::Role::Owner,
             now,
         )
         .unwrap();
@@ -1304,6 +1478,7 @@ mod tests {
                 ttl_secs: 60,
             },
             OWNER,
+            crate::roles::Role::Owner,
             now,
         )
         .unwrap();
@@ -1339,6 +1514,264 @@ mod tests {
         let reply = with_expect(&policy_text(&[OWNER], 23), &live);
         assert_eq!(reply.status, Some(409));
         assert_eq!(sha(&policy_path), applied);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn role_deny_count(coord: &Coordinator, target: &str) -> usize {
+        coord
+            .config_audit_text()
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                line.contains("\"role-deny\"") && line.contains(&format!("\"target\":\"{target}\""))
+            })
+            .count()
+    }
+
+    /// A policy owner SVID that leaves the owner list loses the token.
+    #[test]
+    fn a_removed_policy_owner_token_gets_403_and_one_role_deny() {
+        let dir = std::env::temp_dir().join(format!("orblx-server-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        let policy_path = dir.join("policy.hujson");
+        std::fs::write(&policy_path, policy_text(&[OWNER], 22)).unwrap();
+        coord.set_policy_file(&policy_path).unwrap();
+        let now = SystemTime::now();
+        let made = apitoken::create(
+            &coord,
+            &CreateAsk {
+                scopes: vec!["nodes:read".to_string()],
+                ttl_secs: 60,
+            },
+            OWNER,
+            crate::roles::Role::Owner,
+            now,
+        )
+        .unwrap();
+        let reply = dispatch_token(
+            &coord,
+            &call("admin-nodes", &made.secret),
+            &made.secret,
+            now,
+        );
+        assert_eq!(reply.status, Some(200));
+        std::fs::write(&policy_path, policy_text(&[NODE_A], 23)).unwrap();
+        coord.set_policy_file(&policy_path).unwrap();
+        let denies = role_deny_count(&coord, "nodes");
+        let token_denies = deny_count(&coord, &made.id, "scope");
+        let reply = dispatch_token(
+            &coord,
+            &call("admin-nodes", &made.secret),
+            &made.secret,
+            now,
+        );
+        assert_eq!(reply.status, Some(403));
+        assert!(reply.error.unwrap().contains("The caller is not an owner."));
+        assert_eq!(role_deny_count(&coord, "nodes"), denies + 1);
+        assert_eq!(deny_count(&coord, &made.id, "scope"), token_denies);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An old token file has no live creator. The default stored role grants nothing.
+    #[test]
+    fn a_legacy_token_without_a_live_creator_gets_403() {
+        let dir = std::env::temp_dir().join(format!("orblx-server-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        let secret = format!("{}legacy-token-value", apitoken::API_TOKEN_PREFIX);
+        let hash = apitoken::token_hash_hex(&secret);
+        let id = hash.get(..16).unwrap().to_string();
+        let file = serde_json::json!({
+            "version": 1,
+            "tokens": [{
+                "id": id,
+                "hash_hex": hash,
+                "scopes": ["nodes:read"],
+                "created_by": "spiffe://orblx.local/node/old-owner",
+                "created_unix_ms": 1,
+                "expires_unix_ms": 9_000_000_000_000u64
+            }]
+        });
+        std::fs::write(dir.join(apitoken::API_TOKEN_FILE), file.to_string()).unwrap();
+        let now = SystemTime::now();
+        let reply = dispatch_token(&coord, &call("admin-nodes", &secret), &secret, now);
+        assert_eq!(reply.status, Some(403));
+        assert!(reply.error.unwrap().contains("The caller is not an owner."));
+        assert_eq!(role_deny_count(&coord, "nodes"), 1);
+        assert_eq!(deny_count(&coord, &id, "scope"), 0);
+        assert!(!coord.config_audit_text().unwrap().contains(&secret));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn mtls_request(op: &str) -> Request {
+        Request {
+            op: op.to_string(),
+            name: String::new(),
+            token: None,
+            id_token: None,
+            nonce: None,
+            endpoints: Vec::new(),
+            routes: Vec::new(),
+            exit_node: false,
+            grant: None,
+            api_token: None,
+            deny_etag: None,
+            expect_sha256: None,
+            ssh: None,
+            unchanged_ok: false,
+        }
+    }
+
+    /// W25-34: only a policy owner SVID can lower the netmap seq.
+    ///
+    /// The role gate runs before `run_admin`. An API token has no scope for this
+    /// operation, and `owner_only` still refuses a token that reaches `run_admin`.
+    #[test]
+    fn only_a_policy_owner_can_reset_the_netmap_seq() {
+        let dir = std::env::temp_dir().join(format!(
+            "orblx-server-seq-reset-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        let oidc = MockOidc::generate(MOCK_OIDC_ISSUER).unwrap();
+        let gate = IssueGate::new(MiniCa::generate(now).unwrap(), &oidc).unwrap();
+        let coord = Coordinator::open(&dir, "coord", OidcConfig::Mock(Box::new(gate))).unwrap();
+        coord.enable_config_audit().unwrap();
+        let policy_path = dir.join("policy.hujson");
+        std::fs::write(&policy_path, policy_text(&[OWNER], 22)).unwrap();
+        coord.set_policy_file(&policy_path).unwrap();
+
+        let mut callers = Vec::new();
+        for (subject, role, sentence) in [
+            ("ada", "admin", "The role admin cannot call this operation."),
+            (
+                "ned",
+                "network-admin",
+                "The role network-admin cannot call this operation.",
+            ),
+            (
+                "ita",
+                "it-admin",
+                "The role it-admin cannot call this operation.",
+            ),
+            (
+                "aud",
+                "auditor",
+                "The role auditor cannot call this operation.",
+            ),
+            ("mem", "member", "The caller is not an owner."),
+        ] {
+            coord
+                .approve_user_by(&format!("oidc:{subject}"), OWNER, now)
+                .unwrap();
+            if role != "member" {
+                roles::apply(
+                    &coord,
+                    &SetAsk {
+                        user: subject.to_string(),
+                        role: role.to_string(),
+                    },
+                    OWNER,
+                    now,
+                )
+                .unwrap();
+            }
+            let id_token = oidc
+                .issue_id_token(subject, now, Duration::from_secs(600))
+                .unwrap();
+            let enrolled = coord
+                .enroll_oidc(
+                    &format!("{subject}-pc"),
+                    &id_token,
+                    None,
+                    &[format!("{subject}-pc:443")],
+                    &[],
+                    now,
+                )
+                .unwrap();
+            callers.push((enrolled.svid, role, sentence));
+        }
+
+        let ahead = crate::seq::unix_ms(now) + 86_400_000;
+        let seq_path = dir.join(crate::seq::COORD_SEQ_FILE);
+        std::fs::write(&seq_path, format!("{ahead}\n")).unwrap();
+        let op = "admin-netmap-seq-reset";
+
+        let made = apitoken::create(
+            &coord,
+            &CreateAsk {
+                scopes: all_scopes().iter().map(|scope| scope.to_string()).collect(),
+                ttl_secs: 60,
+            },
+            OWNER,
+            roles::Role::Owner,
+            now,
+        )
+        .unwrap();
+        let reply = dispatch_token(&coord, &call(op, &made.secret), &made.secret, now);
+        assert_eq!(reply.status, Some(403));
+        assert!(reply.error.unwrap().contains("does not have the scope"));
+        assert_eq!(deny_count(&coord, &made.id, "scope"), 1);
+        assert_eq!(role_deny_count(&coord, "netmap-seq-reset"), 0);
+        let token_call = run_admin(
+            &coord,
+            &mtls_request(op),
+            Caller::Token(&apitoken::actor_of(&made.id)),
+            None,
+            now,
+        );
+        assert!(token_call
+            .unwrap_err()
+            .to_string()
+            .contains("The caller is not an owner."));
+        assert_eq!(
+            std::fs::read_to_string(&seq_path).unwrap().trim(),
+            ahead.to_string()
+        );
+
+        for (svid, role, sentence) in &callers {
+            let err = roles::authorize(&coord, svid, op).unwrap_err();
+            assert_eq!(err.to_string(), *sentence, "{role}");
+        }
+        assert_eq!(role_deny_count(&coord, "netmap-seq-reset"), callers.len());
+        let audit = coord.config_audit_text().unwrap();
+        for (_, role, _) in &callers {
+            assert!(
+                audit.contains("\"action\":\"role-deny\"")
+                    && audit.contains(&format!("op netmap-seq-reset role {role} status 403")),
+                "{role} {audit}"
+            );
+        }
+        assert!(!audit.contains("\"action\":\"netmap-seq-reset\""));
+        assert_eq!(
+            std::fs::read_to_string(&seq_path).unwrap().trim(),
+            ahead.to_string()
+        );
+
+        roles::authorize(&coord, OWNER, op).unwrap();
+        let value = run_admin(&coord, &mtls_request(op), Caller::Owner(OWNER), None, now).unwrap();
+        assert_eq!(value["op"], "netmap-seq-reset");
+        assert_eq!(value["from"], ahead);
+        assert_eq!(value["to"], crate::seq::unix_ms(now));
+        assert_eq!(
+            std::fs::read_to_string(&seq_path).unwrap().trim(),
+            crate::seq::unix_ms(now).to_string()
+        );
+        let final_audit = coord.config_audit_text().unwrap();
+        let resets: Vec<&str> = final_audit
+            .lines()
+            .filter(|line| line.contains("\"action\":\"netmap-seq-reset\""))
+            .collect();
+        assert_eq!(resets.len(), 1, "{resets:?}");
+        assert!(resets[0].contains(OWNER));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

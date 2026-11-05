@@ -1,10 +1,29 @@
 {
-  // Alice may open SSH on node b.
+  // SSH proof policy (W25-31). The coordinator serves it. The script copies it to the
+  // SSH target nodes b and c ([C]): the SSH server reads the ssh rules from its state dir.
+  // The SSH user certificate names the user who owns the client node.
+  "owners": ["spiffe://orblx.local/node/owner"],
+  "userApproval": {
+    // alice never waits. sharee and mallory wait for the owner. rex is rejected.
+    "ownerUsers": ["oidc:alice"],
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": [
+        "spiffe://orblx.local/node/a",
+        "spiffe://orblx.local/node/s",
+        "spiffe://orblx.local/node/m",
+      ],
+      "proto": "tcp",
+      "dst": ["spiffe://orblx.local/node/b:22", "spiffe://orblx.local/node/c:22"],
+    },
+  ],
   "ssh": [
     {
       "src": ["spiffe://orblx.local/user/alice"],
       "dst": ["spiffe://orblx.local/node/b"],
-      "users": ["alice", "root"],
+      "users": ["alice"],
       "checkPeriod": "30s",
     },
     {
@@ -24,9 +43,10 @@
       "recording": "required",
     },
     {
-      "src": ["spiffe://orblx.local/agent/helper"],
+      // The sharee gets only the sharee login.
+      "src": ["spiffe://orblx.local/user/sharee"],
       "dst": ["spiffe://orblx.local/node/b"],
-      "users": ["alice"],
+      "users": ["sharee"],
       "checkPeriod": "30s",
     },
   ],
@@ -44,15 +64,15 @@
       "action": "deny",
     },
     {
-      "src": "spiffe://orblx.local/user/alice",
-      "dst": "spiffe://orblx.local/node/c",
+      "src": "spiffe://orblx.local/user/sharee",
+      "dst": "spiffe://orblx.local/node/b",
       "user": "alice",
       "action": "deny",
     },
     {
-      "src": "spiffe://orblx.local/agent/helper",
-      "dst": "spiffe://orblx.local/node/b",
-      "user": "root",
+      "src": "spiffe://orblx.local/user/alice",
+      "dst": "spiffe://orblx.local/node/c",
+      "user": "alice",
       "action": "deny",
     },
   ],

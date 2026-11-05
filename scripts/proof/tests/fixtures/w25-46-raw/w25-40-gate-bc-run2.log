@@ -1,0 +1,846 @@
+head 995ea4d8b1e00b3a8eea133ad030ba442ecc334f (the #137 merge commit; Rust code unchanged)
+local proof-script change for the PO release rule (19:50 KST):
+ scripts/proof/ssh-renew.sh | 32 +++++++++++++++++++++++---------
+ 1 file changed, 23 insertions(+), 9 deletions(-)
+diff --git a/scripts/proof/ssh-renew.sh b/scripts/proof/ssh-renew.sh
+index 5fe839d..38eb387 100755
+--- a/scripts/proof/ssh-renew.sh
++++ b/scripts/proof/ssh-renew.sh
+@@ -14,14 +14,14 @@ require_root "$@"
+ 
+ root=$(cd "$(dirname "$0")/../.." && pwd)
+ cd "$root"
+-bin="$root/target/debug/orblx"
++bin="$root/target/release/orblx"
+ compose_file="$root/scripts/proof/compose.ssh-renew.yml"
+ work=$(mktemp -d)
+ env_file="$work/ssh-renew.env"
+ image_dir=""
+ ttl="${SSH_RENEW_TTL:-120}"
+ # Gate c: the session runs this long. It opens before the first renewal of b.
+-session_secs="${SSH_RENEW_SESSION_SECS:-75}"
++session_secs="${SSH_RENEW_SESSION_SECS:-110}"
+ 
+ compose() {
+   docker compose --env-file "$env_file" --progress quiet -f "$compose_file" "$@"
+@@ -65,7 +65,7 @@ uname -m
+ rustc --version
+ 
+ echo "=== [C] build image ==="
+-cargo build -p orblx-cli --bin orblx --locked
++cargo build --release -p orblx-cli --bin orblx --locked
+ # shellcheck source=stage-image.sh
+ source "$root/scripts/proof/stage-image.sh"
+ image_dir="$(stage_proof_image "$root" "$bin")"
+@@ -188,16 +188,22 @@ echo "=== [C] gate b: login before the first renewal ==="
+ key0="$(key_b)"
+ login before
+ 
+-echo "=== [C] gate c: a session opens before the first renewal ==="
++echo "=== [C] gate c: a PTY shell session opens before the first renewal ==="
++# An exec request (--command) has a 30 s limit on the server, so gate c uses a PTY shell.
++# The input echo shows SURV""IVED. Only the shell output has SURVIVED.
+ stage_login peer-session
+ session_out="$work/session.out"
+ session_start_renewals="$(renewals_b)"
+-( ssh_b peer-session "sleep ${session_secs}; printf '%s\n' survived" >"$session_out" 2>&1
++( { printf '%s\n' "sleep ${session_secs}; echo SURV\"\"IVED at \$(date +%s); exit"; sleep $((session_secs + 30)); } \
++    | compose exec -T node-a orblx ssh alice@b --shell --identity /tmp/id \
++      --netmap /etc/orblx/netmap.json --peer-cert /tmp/peer-session.pem >"$session_out" 2>&1
+   echo "exit $?" >>"$session_out" ) &
+ session_pid=$!
+ 
+ echo "=== [C] gate b: login after renewal 1 ==="
+ wait_renewal 1
++renewal1_at="$(date +%s)"
++echo "renewal_1_seen_at ${renewal1_at}"
+ key1="$(key_b)"
+ echo "host_key_rotated_1 $([[ "$key1" != "$key0" ]] && echo yes || echo no)"
+ [[ "$key1" != "$key0" ]]
+@@ -208,16 +214,24 @@ if ssh_b peer-before 'true' >/dev/null 2>&1; then
+ fi
+ echo "denied old_host_key_1"
+ 
+-wait "$session_pid" || true
++for _ in $(seq 1 $((session_secs + 40))); do
++  grep -q '^exit ' "$session_out" 2>/dev/null && break
++  sleep 1
++done
+ session_end_renewals="$(renewals_b)"
+ echo "session_renewals_b start ${session_start_renewals} end ${session_end_renewals}"
+-sed 's/^/  session: /' "$session_out" | tr -d '\r'
++tr -d '\r' <"$session_out" | read_all grep -E 'SURVIVED|^exit |SSH' | sed 's/^/  session: /' || true
+ (( session_end_renewals > session_start_renewals )) || {
+   echo "gate_c inconclusive: the session did not span a renewal" >&2
+   exit 1
+ }
+-if grep -qx 'survived' <(tr -d '\r' <"$session_out") && grep -qx 'exit 0' "$session_out"; then
+-  echo "gate_c survived"
++survived_at="$(tr -d '\r' <"$session_out" | read_all awk '$1 == "SURVIVED" && $2 == "at" {print $3; exit}')"
++if [[ -n "$survived_at" ]] && grep -qx 'exit 0' "$session_out"; then
++  (( survived_at > renewal1_at )) || {
++    echo "gate_c inconclusive: the shell ended at ${survived_at}, before renewal 1 at ${renewal1_at}" >&2
++    exit 1
++  }
++  echo "gate_c survived shell_end ${survived_at} after renewal_1 ${renewal1_at}"
+ elif grep -qx 'exit 0' "$session_out"; then
+   echo "gate_c closed_cleanly_without_output"
+ else
+/dev/vdb        128G  104G   24G  82% /
+free_space_check ok 24G
+proof_context ssh-renew phase queued time 2026-10-31T21:12:53.313+0900 load 0.95/1.66/2.65 other_orblx_containers 8 groups orblx-w2529:8
+proof_lock ssh-renew waiting for lock, 1 s, position 8, at 2026-10-31T21:12:54.326+0900, file /workspace/.orblx-proof.lock, holder: label=serial-rtt:orblx-w2529-natr pid=268345 user=root cwd=/workspace/orblx-w25-29 since=2026-10-31T21:09:42.170+0900 
+proof_lock ssh-renew waiting for lock, 31 s, position 8, at 2026-10-31T21:13:24.493+0900, file /workspace/.orblx-proof.lock, holder: label=serial-rtt:orblx-w2529-natr pid=268345 user=root cwd=/workspace/orblx-w25-29 since=2026-10-31T21:09:42.170+0900 
+proof_lock ssh-renew waiting for lock, 61 s, position 8, at 2026-10-31T21:13:54.665+0900, file /workspace/.orblx-proof.lock, holder: label=serial-rtt:orblx-w2529-natr pid=268345 user=root cwd=/workspace/orblx-w25-29 since=2026-10-31T21:09:42.170+0900 
+proof_lock ssh-renew waiting for lock, 91 s, position 8, at 2026-10-31T21:14:24.853+0900, file /workspace/.orblx-proof.lock, holder: label=serial-rtt:orblx-w2529-natr pid=268345 user=root cwd=/workspace/orblx-w25-29 since=2026-10-31T21:09:42.170+0900 
+proof_lock ssh-renew waiting for lock, 121 s, position 7, at 2026-10-31T21:14:55.013+0900, file /workspace/.orblx-proof.lock, holder: label=siem-streaming:orblx-w25m-siem pid=306091 user=root cwd=/workspace/orblx-w25-35-main since=2026-10-31T21:14:54.791+0900 
+proof_lock ssh-renew waiting for lock, 151 s, position 7, at 2026-10-31T21:15:25.186+0900, file /workspace/.orblx-proof.lock, holder: label=siem-streaming:orblx-w25m-siem pid=306091 user=root cwd=/workspace/orblx-w25-35-main since=2026-10-31T21:14:54.791+0900 
+proof_lock ssh-renew waiting for lock, 181 s, position 7, at 2026-10-31T21:15:54.361+0900, file /workspace/.orblx-proof.lock, holder: label=siem-streaming:orblx-w25m-siem pid=306091 user=root cwd=/workspace/orblx-w25-35-main since=2026-10-31T21:14:54.791+0900 
+proof_lock ssh-renew waiting for lock, 211 s, position 7, at 2026-10-31T21:16:24.526+0900, file /workspace/.orblx-proof.lock, holder: label=siem-streaming:orblx-w25m-siem pid=306091 user=root cwd=/workspace/orblx-w25-35-main since=2026-10-31T21:14:54.791+0900 
+proof_lock ssh-renew waiting for lock, 241 s, position 7, at 2026-10-31T21:16:54.691+0900, file /workspace/.orblx-proof.lock, holder: label=siem-streaming:orblx-w25m-siem pid=306091 user=root cwd=/workspace/orblx-w25-35-main since=2026-10-31T21:14:54.791+0900 
+proof_lock ssh-renew waiting for lock, 271 s, position 6, at 2026-10-31T21:17:24.902+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 301 s, position 6, at 2026-10-31T21:17:55.063+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 331 s, position 6, at 2026-10-31T21:18:25.228+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 361 s, position 6, at 2026-10-31T21:18:54.385+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 391 s, position 6, at 2026-10-31T21:19:24.522+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 421 s, position 6, at 2026-10-31T21:19:54.677+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 451 s, position 6, at 2026-10-31T21:20:24.818+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 481 s, position 6, at 2026-10-31T21:20:54.963+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 511 s, position 6, at 2026-10-31T21:21:25.130+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 541 s, position 6, at 2026-10-31T21:21:55.296+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 571 s, position 6, at 2026-10-31T21:22:24.440+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 601 s, position 6, at 2026-10-31T21:22:54.595+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 631 s, position 6, at 2026-10-31T21:23:24.755+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 661 s, position 6, at 2026-10-31T21:23:54.918+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 691 s, position 6, at 2026-10-31T21:24:25.080+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 721 s, position 6, at 2026-10-31T21:24:55.256+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 751 s, position 6, at 2026-10-31T21:25:24.422+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 781 s, position 6, at 2026-10-31T21:25:54.605+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 811 s, position 6, at 2026-10-31T21:26:24.734+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 841 s, position 6, at 2026-10-31T21:26:54.902+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 871 s, position 6, at 2026-10-31T21:27:25.039+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 901 s, position 6, at 2026-10-31T21:27:55.198+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 931 s, position 6, at 2026-10-31T21:28:24.358+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 961 s, position 6, at 2026-10-31T21:28:54.517+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 991 s, position 6, at 2026-10-31T21:29:24.646+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1021 s, position 6, at 2026-10-31T21:29:54.805+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1051 s, position 6, at 2026-10-31T21:30:24.963+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1081 s, position 6, at 2026-10-31T21:30:55.143+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1111 s, position 6, at 2026-10-31T21:31:25.296+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1141 s, position 6, at 2026-10-31T21:31:54.444+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1171 s, position 6, at 2026-10-31T21:32:24.605+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1201 s, position 6, at 2026-10-31T21:32:54.754+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1231 s, position 6, at 2026-10-31T21:33:24.894+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1261 s, position 6, at 2026-10-31T21:33:55.067+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1291 s, position 6, at 2026-10-31T21:34:25.211+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1321 s, position 6, at 2026-10-31T21:34:54.372+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1351 s, position 6, at 2026-10-31T21:35:24.539+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1381 s, position 6, at 2026-10-31T21:35:54.698+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1411 s, position 6, at 2026-10-31T21:36:24.863+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1441 s, position 6, at 2026-10-31T21:36:55.027+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1471 s, position 6, at 2026-10-31T21:37:25.199+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1501 s, position 6, at 2026-10-31T21:37:54.368+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1531 s, position 6, at 2026-10-31T21:38:24.538+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1561 s, position 6, at 2026-10-31T21:38:54.705+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1591 s, position 6, at 2026-10-31T21:39:24.879+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1621 s, position 6, at 2026-10-31T21:39:55.028+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1651 s, position 6, at 2026-10-31T21:40:25.178+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1681 s, position 6, at 2026-10-31T21:40:54.326+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1711 s, position 6, at 2026-10-31T21:41:24.466+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1741 s, position 6, at 2026-10-31T21:41:54.614+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1771 s, position 6, at 2026-10-31T21:42:24.769+0900, file /workspace/.orblx-proof.lock, holder: label=sym-throughput:orblx-w25r-natr pid=377329 user=root cwd=/workspace/orblx-w25r since=2026-10-31T21:17:03.360+0900 
+proof_lock ssh-renew waiting for lock, 1801 s, position 5, at 2026-10-31T21:42:54.949+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 1831 s, position 5, at 2026-10-31T21:43:25.091+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 1861 s, position 5, at 2026-10-31T21:43:55.235+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 1891 s, position 5, at 2026-10-31T21:44:24.479+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 1921 s, position 5, at 2026-10-31T21:44:54.716+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 1951 s, position 5, at 2026-10-31T21:45:24.885+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 1981 s, position 5, at 2026-10-31T21:45:55.173+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2011 s, position 5, at 2026-10-31T21:46:24.324+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2041 s, position 5, at 2026-10-31T21:46:54.589+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2071 s, position 5, at 2026-10-31T21:47:24.856+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2101 s, position 5, at 2026-10-31T21:47:55.006+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2131 s, position 5, at 2026-10-31T21:48:25.148+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2161 s, position 5, at 2026-10-31T21:48:55.289+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2191 s, position 5, at 2026-10-31T21:49:24.429+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2221 s, position 5, at 2026-10-31T21:49:54.728+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2251 s, position 5, at 2026-10-31T21:50:24.947+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2281 s, position 5, at 2026-10-31T21:50:55.110+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2311 s, position 5, at 2026-10-31T21:51:25.268+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2341 s, position 5, at 2026-10-31T21:51:54.414+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2371 s, position 5, at 2026-10-31T21:52:24.579+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2401 s, position 5, at 2026-10-31T21:52:54.730+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2431 s, position 5, at 2026-10-31T21:53:24.881+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2461 s, position 5, at 2026-10-31T21:53:55.025+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2491 s, position 5, at 2026-10-31T21:54:25.172+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2521 s, position 5, at 2026-10-31T21:54:55.318+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2551 s, position 5, at 2026-10-31T21:55:24.453+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2581 s, position 5, at 2026-10-31T21:55:54.596+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2611 s, position 5, at 2026-10-31T21:56:24.738+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2641 s, position 5, at 2026-10-31T21:56:54.879+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2671 s, position 5, at 2026-10-31T21:57:25.037+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2701 s, position 5, at 2026-10-31T21:57:55.186+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2731 s, position 5, at 2026-10-31T21:58:24.328+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2761 s, position 5, at 2026-10-31T21:58:54.477+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2791 s, position 5, at 2026-10-31T21:59:24.625+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2821 s, position 5, at 2026-10-31T21:59:54.772+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2851 s, position 5, at 2026-10-31T22:00:24.926+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2881 s, position 5, at 2026-10-31T22:00:55.073+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2911 s, position 5, at 2026-10-31T22:01:25.224+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2941 s, position 5, at 2026-10-31T22:01:54.362+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 2971 s, position 5, at 2026-10-31T22:02:24.517+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3001 s, position 5, at 2026-10-31T22:02:54.663+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3031 s, position 5, at 2026-10-31T22:03:24.812+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3061 s, position 5, at 2026-10-31T22:03:54.970+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3091 s, position 5, at 2026-10-31T22:04:25.121+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3121 s, position 5, at 2026-10-31T22:04:55.271+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3151 s, position 5, at 2026-10-31T22:05:24.420+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3181 s, position 5, at 2026-10-31T22:05:54.619+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3211 s, position 5, at 2026-10-31T22:06:24.769+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3241 s, position 5, at 2026-10-31T22:06:54.914+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3271 s, position 3, at 2026-10-31T22:07:25.061+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3301 s, position 3, at 2026-10-31T22:07:55.202+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3331 s, position 3, at 2026-10-31T22:08:24.349+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3361 s, position 3, at 2026-10-31T22:08:54.501+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3391 s, position 3, at 2026-10-31T22:09:24.654+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3421 s, position 3, at 2026-10-31T22:09:54.806+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3451 s, position 3, at 2026-10-31T22:10:24.959+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3481 s, position 3, at 2026-10-31T22:10:55.121+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3511 s, position 3, at 2026-10-31T22:11:25.268+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3541 s, position 3, at 2026-10-31T22:11:54.411+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3571 s, position 3, at 2026-10-31T22:12:24.558+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3601 s, position 3, at 2026-10-31T22:12:54.700+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3631 s, position 3, at 2026-10-31T22:13:24.846+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3661 s, position 3, at 2026-10-31T22:13:54.994+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3691 s, position 3, at 2026-10-31T22:14:25.140+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3721 s, position 3, at 2026-10-31T22:14:55.284+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3751 s, position 3, at 2026-10-31T22:15:24.445+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3781 s, position 3, at 2026-10-31T22:15:54.601+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3811 s, position 3, at 2026-10-31T22:16:24.748+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3841 s, position 3, at 2026-10-31T22:16:54.899+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3871 s, position 3, at 2026-10-31T22:17:25.056+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3901 s, position 3, at 2026-10-31T22:17:55.207+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3931 s, position 3, at 2026-10-31T22:18:24.365+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3961 s, position 3, at 2026-10-31T22:18:54.525+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 3991 s, position 3, at 2026-10-31T22:19:24.680+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4021 s, position 3, at 2026-10-31T22:19:54.839+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4051 s, position 3, at 2026-10-31T22:20:24.983+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4081 s, position 3, at 2026-10-31T22:20:55.139+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4111 s, position 3, at 2026-10-31T22:21:25.289+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4141 s, position 3, at 2026-10-31T22:21:54.434+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4171 s, position 3, at 2026-10-31T22:22:24.593+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4201 s, position 3, at 2026-10-31T22:22:54.746+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4231 s, position 3, at 2026-10-31T22:23:24.901+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4261 s, position 3, at 2026-10-31T22:23:55.062+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4291 s, position 3, at 2026-10-31T22:24:25.209+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4321 s, position 3, at 2026-10-31T22:24:54.362+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4351 s, position 3, at 2026-10-31T22:25:24.508+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4381 s, position 3, at 2026-10-31T22:25:54.654+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4411 s, position 3, at 2026-10-31T22:26:24.792+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4441 s, position 3, at 2026-10-31T22:26:54.929+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4471 s, position 3, at 2026-10-31T22:27:25.068+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4501 s, position 3, at 2026-10-31T22:27:55.215+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4531 s, position 3, at 2026-10-31T22:28:24.359+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4561 s, position 3, at 2026-10-31T22:28:54.515+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4591 s, position 3, at 2026-10-31T22:29:24.656+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4621 s, position 3, at 2026-10-31T22:29:54.803+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4651 s, position 3, at 2026-10-31T22:30:24.951+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4681 s, position 3, at 2026-10-31T22:30:55.098+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4711 s, position 3, at 2026-10-31T22:31:25.241+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4741 s, position 3, at 2026-10-31T22:31:54.386+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4771 s, position 3, at 2026-10-31T22:32:24.535+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4801 s, position 3, at 2026-10-31T22:32:54.697+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4831 s, position 3, at 2026-10-31T22:33:24.865+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4861 s, position 3, at 2026-10-31T22:33:55.027+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4891 s, position 3, at 2026-10-31T22:34:25.271+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4921 s, position 3, at 2026-10-31T22:34:54.419+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4951 s, position 3, at 2026-10-31T22:35:24.686+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 4981 s, position 3, at 2026-10-31T22:35:54.834+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5011 s, position 3, at 2026-10-31T22:36:24.983+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5041 s, position 3, at 2026-10-31T22:36:55.143+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5071 s, position 3, at 2026-10-31T22:37:25.295+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5101 s, position 3, at 2026-10-31T22:37:54.457+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5131 s, position 3, at 2026-10-31T22:38:24.612+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5161 s, position 3, at 2026-10-31T22:38:54.759+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5191 s, position 3, at 2026-10-31T22:39:24.906+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5221 s, position 3, at 2026-10-31T22:39:55.050+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5251 s, position 3, at 2026-10-31T22:40:25.198+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5281 s, position 3, at 2026-10-31T22:40:54.343+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5311 s, position 3, at 2026-10-31T22:41:24.484+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5341 s, position 3, at 2026-10-31T22:41:54.624+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5371 s, position 3, at 2026-10-31T22:42:24.773+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5401 s, position 3, at 2026-10-31T22:42:54.925+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5431 s, position 3, at 2026-10-31T22:43:25.071+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5461 s, position 3, at 2026-10-31T22:43:55.212+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5491 s, position 3, at 2026-10-31T22:44:24.355+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5521 s, position 3, at 2026-10-31T22:44:54.507+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5551 s, position 3, at 2026-10-31T22:45:24.651+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5581 s, position 3, at 2026-10-31T22:45:54.798+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5611 s, position 3, at 2026-10-31T22:46:24.947+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5641 s, position 3, at 2026-10-31T22:46:55.099+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5671 s, position 3, at 2026-10-31T22:47:25.251+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5701 s, position 3, at 2026-10-31T22:47:54.409+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5731 s, position 3, at 2026-10-31T22:48:24.551+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5761 s, position 3, at 2026-10-31T22:48:54.703+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5791 s, position 3, at 2026-10-31T22:49:24.883+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5821 s, position 3, at 2026-10-31T22:49:55.053+0900, file /workspace/.orblx-proof.lock, holder: label=coord-cert-soak pid=394879 user=root cwd=/workspace/orblx-w25-42-diag since=2026-10-31T21:42:45.040+0900 
+proof_lock ssh-renew waiting for lock, 5851 s, position 2, at 2026-10-31T22:50:25.206+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 5881 s, position 2, at 2026-10-31T22:50:54.364+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 5911 s, position 2, at 2026-10-31T22:51:24.536+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 5941 s, position 2, at 2026-10-31T22:51:54.701+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 5971 s, position 2, at 2026-10-31T22:52:24.874+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6001 s, position 2, at 2026-10-31T22:52:55.041+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6031 s, position 2, at 2026-10-31T22:53:25.208+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6061 s, position 2, at 2026-10-31T22:53:54.368+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6091 s, position 2, at 2026-10-31T22:54:24.534+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6121 s, position 2, at 2026-10-31T22:54:54.701+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6151 s, position 2, at 2026-10-31T22:55:24.867+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6181 s, position 2, at 2026-10-31T22:55:55.030+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6211 s, position 2, at 2026-10-31T22:56:25.197+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6241 s, position 2, at 2026-10-31T22:56:54.354+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6271 s, position 2, at 2026-10-31T22:57:24.517+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6301 s, position 2, at 2026-10-31T22:57:54.683+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6331 s, position 2, at 2026-10-31T22:58:24.851+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6361 s, position 2, at 2026-10-31T22:58:55.029+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6391 s, position 2, at 2026-10-31T22:59:25.196+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6421 s, position 2, at 2026-10-31T22:59:54.358+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6451 s, position 2, at 2026-10-31T23:00:24.532+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6481 s, position 2, at 2026-10-31T23:00:54.701+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6511 s, position 2, at 2026-10-31T23:01:24.868+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6541 s, position 2, at 2026-10-31T23:01:55.034+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6571 s, position 2, at 2026-10-31T23:02:25.196+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6601 s, position 2, at 2026-10-31T23:02:54.372+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6631 s, position 2, at 2026-10-31T23:03:24.548+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6661 s, position 2, at 2026-10-31T23:03:54.944+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6691 s, position 2, at 2026-10-31T23:04:25.230+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6721 s, position 2, at 2026-10-31T23:04:54.399+0900, file /workspace/.orblx-proof.lock, holder: label=netmap-seq:orblx-w2534-seq-proof pid=500867 user=root cwd=/workspace/orblx-w2534-wt since=2026-10-31T22:49:56.049+0900 
+proof_lock ssh-renew waiting for lock, 6751 s, position 1, at 2026-10-31T23:05:24.558+0900, file /workspace/.orblx-proof.lock, holder: label=w25-38-deny-damage pid=621494 user=box cwd=/workspace/orblx-w25-38 since=2026-10-31T23:04:55.013+0900 
+proof_lock ssh-renew acquired at 2026-10-31T23:05:43.118+0900 after 6769803 ms, file /workspace/.orblx-proof.lock
+proof_context ssh-renew phase start time 2026-10-31T23:05:43.136+0900 load 1.63/1.48/1.22 other_orblx_containers 0 groups -
+proof_compose_clean orblx-ssh-renew clean
+=== [REAL] one Linux host ===
+Linux
+x86_64
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+=== [C] build image ===
+    Finished `release` profile [optimized] target(s) in 0.45s
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+=== [C] start coordinator (node SVID life 120 s) ===
+=== [C] enroll a ===
+=== [C] enroll b ===
+=== [C] start nodes ===
+=== [C] gate b: login before the first renewal ===
+login before renewals_b 0 host_key bf8a68b537176426 out alice
+=== [C] gate c: a PTY shell session opens before the first renewal ===
+=== [C] gate b: login after renewal 1 ===
+renewal_1_seen_at 1793455649
+host_key_rotated_1 yes
+login after-1 renewals_b 1 host_key eaef97a9a60eb96e out alice
+denied old_host_key_1
+session_renewals_b start 0 end 2
+  session: # The SSH shell exited with status 1.
+gate_c closed # The SSH shell exited with status 1.
+=== [C] gate b: login after renewal 2 ===
+host_key_rotated_2 yes
+login after-2 renewals_b 4 host_key 9c3a3ffc87cd7b53 out The SSH session did not open.
+---- docker logs ----
+coord-1  | node svid ttl 120
+coord-1  | state /var/lib/orblx
+coord-1  | config audit 0 policy-load policy.hujson spiffe://orblx.local/coord/coord
+coord-1  | coord listen 0.0.0.0:443
+coord-1  | coord svid spiffe://orblx.local/coord/coord
+coord-1  | config audit 1 enroll a token:REDACTED
+coord-1  | enrolled a
+coord-1  | config audit 2 enroll b token:REDACTED
+coord-1  | enrolled b
+coord-1  | renewed b
+coord-1  | renewed a
+coord-1  | renewed b
+coord-1  | renewed a
+coord-1  | renewed a
+coord-1  | renewed b
+coord-1  | renewed a
+coord-1   | renewed b
+node-b-1  | The DNS responder uses the signed grants. This node can reach 2 peers.
+node-b-1  | The packet filter is on. The node drops packets that no grant allows.
+node-b-1  | The node installs route 100.64.0.1/32.
+node-b-1  | The node did not set rp_filter for orblx0. Read-only file system (os error 30)
+node-b-1  | The overlay IP is 100.64.0.2.
+node-b-1  | The state directory is /var/lib/orblx.
+node-b-1  | The TUN device is orblx0.
+node-b-1  | The node renews the SVID at two thirds of the certificate life.
+node-b-1  | ssh_listen 100.64.0.2:22
+node-a-1  | The DNS responder uses the signed grants. This node can reach 2 peers.
+node-b-1  | The node b listens on UDP 0.0.0.0:443.
+node-b-1  | The node b listener started at unix_ms 1793455569707.
+node-b-1  | The node b start-up took prepare_ms 0 to_bind_ms 11 bind_ms 0.
+node-b-1  | metrics 127.0.0.1:9464
+node-b-1  | The DNS responder listens on 100.64.0.2:53.
+node-b-1  | The DNS resolver for orblx0 uses 100.64.0.2 and the domain ~orblx.
+node-a-1  | The packet filter is on. The node drops packets that no grant allows.
+node-a-1  | The node installs route 100.64.0.2/32.
+node-a-1  | The overlay IP is 100.64.0.1.
+node-a-1  | The state directory is /var/lib/orblx.
+node-a-1  | The TUN device is orblx0.
+node-b-1  | The path to a is stale.
+node-b-1  | The path to a is direct.
+node-b-1  | The node renewed the SVID. The new expiry is 1793455769.
+node-b-1  | The node renewed the SVID. The new expiry is 1793455849.
+node-b-1  | The path to a is down.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-a-1  | The node renews the SVID at two thirds of the certificate life.
+node-a-1  | The node did not set rp_filter for orblx0. Read-only file system (os error 30)
+node-a-1  | ssh_listen 100.64.0.1:22
+node-a-1  | The node a listens on UDP 0.0.0.0:443.
+node-a-1  | The node a listener started at unix_ms 1793455569844.
+node-a-1  | The node a start-up took prepare_ms 0 to_bind_ms 5 bind_ms 0.
+node-a-1  | metrics 127.0.0.1:9464
+node-a-1  | The DNS responder listens on 100.64.0.1:53.
+node-a-1  | The path to b is stale.
+node-a-1  | The path to b is direct.
+node-a-1  | The DNS resolver for orblx0 uses 100.64.0.1 and the domain ~orblx.
+node-a-1  | The node renewed the SVID. The new expiry is 1793455769.
+node-a-1  | The node renewed the SVID. The new expiry is 1793455849.
+node-a-1  | The path to b is down.
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node renewed the SVID. The new expiry is 1793455929.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node renewed the SVID. The new expiry is 1793456010.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-b-1  | The node did not accept a peer. The capability ticket check rejected the peer. The end time has passed.
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The node renewed the SVID. The new expiry is 1793455929.
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The node renewed the SVID. The new expiry is 1793456009.
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+node-a-1  | The dial to b at 172.28.19.12:443 failed. The QUIC connection failed. connection lost
+proof_context ssh-renew phase end time 2026-10-31T23:12:27.000+0900 load 0.31/0.83/1.02 other_orblx_containers 0 groups -
+proof_contention ssh-renew samples 199 contended_samples 186 unknown_samples 0 max_other_orblx_containers 3 max_load1 1.78
+proof_lock ssh-renew released at 2026-10-31T23:12:27.013+0900
+exit 1

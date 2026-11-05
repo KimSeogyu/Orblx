@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # W25-40: SSH logins across node SVID renewals, on one Linux host with containers.
 #
-# The coordinator issues node SVIDs with a short life (SSH_RENEW_TTL, default 120 s).
+# The coordinator issues node SVIDs with a short life (SSH_RENEW_TTL, default 180 s).
+# W25-45: the coordinator refuses a node SVID life under 180 s.
 # The node renews at 2/3 of the life, and each renewal writes a new node key.
 # Gate b: node a logs in to node b before the first renewal of b, after it, and after the
 # second renewal. The client pins the key of the current cert.pem of node b each time.
@@ -19,9 +20,9 @@ compose_file="$root/scripts/proof/compose.ssh-renew.yml"
 work=$(mktemp -d)
 env_file="$work/ssh-renew.env"
 image_dir=""
-ttl="${SSH_RENEW_TTL:-120}"
+ttl="${SSH_RENEW_TTL:-180}"
 # Gate c: the session runs this long. It opens before the first renewal of b.
-session_secs="${SSH_RENEW_SESSION_SECS:-75}"
+session_secs="${SSH_RENEW_SESSION_SECS:-$((ttl * 2 / 3))}"
 
 compose() {
   docker compose --env-file "$env_file" --progress quiet -f "$compose_file" "$@"
@@ -45,7 +46,7 @@ cleanup() {
 . "$PROOF_LIB_DIR/proof-lock.sh"
 PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap 'cleanup; proof_lock_end' EXIT
-proof_lock_take "ssh-renew"
+proof_lock_take "ssh-renew" "orblx-ssh-renew"
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
 proof_compose_clean "orblx-ssh-renew" || exit 1

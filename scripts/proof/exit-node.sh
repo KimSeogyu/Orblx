@@ -5,6 +5,8 @@
 # The echo body is the exit node address on the internet network.
 # The script deletes the orblx-exit-proof containers at the start.
 # The script does not print enroll tokens or private keys.
+# W25-27: the exit node and the client run on the state from the coordinator
+# enroll (SVID, ticket, signed grants). No lab tickets.
 set -euo pipefail
 # shellcheck source=scripts/proof/pipe-lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
@@ -56,7 +58,7 @@ cleanup() {
 . "$PROOF_LIB_DIR/proof-lock.sh"
 PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap 'cleanup; proof_lock_end' EXIT
-proof_lock_take "exit-node"
+proof_lock_take "exit-node" "orblx-exit-proof"
 # W25-14b: start from a clean compose state (all profiles, all volumes).
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
@@ -138,18 +140,12 @@ overlay_ip() {
   python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["self"]["overlay_ip"])' "$1"
 }
 
-merge_node() {
+copy_node() {
   local enroll="$1"
-  local issued="$2"
-  local dest="$3"
-  local name
+  local dest="$2"
   as_root rm -rf "$dest"
   as_root mkdir -p "$dest"
   as_root cp -a "$enroll/." "$dest/"
-  for name in cert.pem key.pem bundle.pem ticket.bin ticket.bin.mac \
-    ticket-verifier.pem ticket-mac.key svid-ca.pub ticket-not-before ticket-not-after; do
-    as_root cp -a "$issued/$name" "$dest/$name"
-  done
   as_root chown -R "$(id -u):$(id -g)" "$dest"
 }
 
@@ -237,12 +233,9 @@ echo "exit ${exit_overlay}"
 echo "client ${client_overlay}"
 
 echo "=== [C] node material ==="
-"$ROOT/target/debug/orblx" node-issue \
-  --out "$WORK/nodes" \
-  --node "exit=${exit_overlay}" \
-  --node "client=${client_overlay}"
-merge_node "$WORK/enroll-exit" "$WORK/nodes/exit" "$EXIT_NODE_STATE"
-merge_node "$WORK/enroll-client" "$WORK/nodes/client" "$EXIT_CLIENT_STATE"
+copy_node "$WORK/enroll-exit" "$EXIT_NODE_STATE"
+copy_node "$WORK/enroll-client" "$EXIT_CLIENT_STATE"
+proof_ticket_guard coord "$EXIT_NODE_STATE" "$EXIT_CLIENT_STATE"
 
 echo "=== [C] orblx set --exit-node exit ==="
 "$ROOT/target/debug/orblx" set --exit-node exit --state-dir "$EXIT_CLIENT_STATE"

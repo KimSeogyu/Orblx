@@ -114,7 +114,7 @@ SILENT_PASS_CHECKS = [
     ("scripts/proof/serve-hardening.sh", "PRIVATE KEY|BEGIN CERTIFICATE", "-----BEGIN PRIVATE KEY-----", "leak"),
     ("scripts/proof/split-dns.sh", "if dc exec -T c ip route show dev orblx0", "10.88.24.0/24 dev orblx0 scope link", "deny"),
     ("scripts/proof/split-dns.sh", "-e '10.88.24.20' -e '192.0.2.1'", "db.corp.lan 10.88.24.20", "deny"),
-    ("scripts/proof/ssh.sh", "grep -q leaked", "leaked", "deny"),
+    ("scripts/proof/ssh.sh", "grep -Eq 'PRIVATE KEY|ssh-ed25519-cert-v01", "-----BEGIN PRIVATE KEY-----", "leak"),
     ("scripts/proof/subnet.sh", "\"$route_text\" | read_all grep -q '10.99.0.0/24'", "10.99.0.0/24 dev orblx0", "deny"),
     ("scripts/proof/subnet.sh", "grep -q '0.0.0.0/0'", "0.0.0.0/0 dev orblx0", "deny"),
     ("scripts/proof/subnet.sh", "\"$inet_path\" | read_all grep -q 'orblx0'", "1.1.1.1 dev orblx0 src 100.64.0.2", "deny"),
@@ -142,9 +142,9 @@ AUDIT_CHECKS = [
     ("scripts/proof/policy.sh", "\"$verify\" | read_all grep -qx 'ok'", "ok"),
     ("scripts/proof/split-dns.sh", "packet-audit.jsonl | read_all grep -qx ok", "ok"),
     ("scripts/proof/serve-funnel.sh", "echo \"$audit\" | read_all grep -qx 'ok'", "ok"),
-    ("scripts/proof/ssh.sh", "echo \"$b_audit\" | read_all grep -q '^ok$'", "ok"),
-    ("scripts/proof/ssh.sh", "echo \"$b_audit\" | read_all grep -Eq '^deny [1-9]'", "deny 2"),
-    ("scripts/proof/ssh.sh", "echo \"$c_audit\" | read_all grep -Eq '^deny [1-9]'", "deny 1"),
+    ("scripts/proof/ssh.sh", "echo \"$b_audit\" | read_all grep -qx 'record 1'", "record 1"),
+    ("scripts/proof/ssh.sh", "dc exec -T c orblx audit verify", "ok"),
+    ("scripts/proof/ssh.sh", "| read_all grep -E '^verify ok'", "verify ok records 9 tip ab"),
 ]
 
 GEN = r'{ printf "%s\n" "$BAD_LINE"; awk "BEGIN {for (i = 0; i < 300000; i++) print \"clean line\"}"; }'
@@ -212,6 +212,8 @@ PROOFS_WITH_OWN_LOCK = sorted(
     f for f in os.listdir(os.path.join(REPO, "scripts", "proof"))
     if f.endswith(".sh") and f not in {
         "proof-lock.sh", "pipe-lib.sh", "compose-clean.sh", "serve-lib.sh", "stage-image.sh", "entrypoint.sh", "nat-router.sh",
+        # W25-27 libraries: sourced by proofs, they take no lock of their own.
+        "ticket-guard.sh", "enroll-lib.sh",
         # The rc.3 release sweep is a driver, not a proof. It builds before the lock (so no proof
         # waits for a build) and takes the lock for each proof it runs (test_release_sweep.py).
         "release-sweep.sh"}
