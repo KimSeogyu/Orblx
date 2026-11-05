@@ -3,8 +3,15 @@
 //! Set `ORBLX_SOAK_TRACE=1` before the node starts.
 //! The packet path reads one cached bool.
 //! When the flag is off, that path does not read the clock, allocate, or format a log line.
+//!
+//! A per-link stall is one `to_tun.send` that is still waiting, or that just finished.
+//! The line is `to_tun_stall peer=NAME stall_ms=N`.
+//! `unix_ms` is the time the line is printed.
+//! `stall_ms` is whole milliseconds, rounded down.
+//! The same max wait for one second is also on `to_tun_send_wait` as `stall_ms`.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
@@ -38,6 +45,27 @@ fn log_at(unix_ms: u128, body: &str) {
 
 fn log(body: &str) {
     log_at(unix_ms(), body);
+}
+
+/// An open or finished `to_tun.send` at or above this time prints `to_tun_stall`.
+const STALL_LOG_AFTER: Duration = Duration::from_secs(1);
+
+fn send_wait_line(peer: &str, max: Duration) -> String {
+    format!(
+        "to_tun_send_wait peer={peer} max_us={} stall_ms={}",
+        max.as_micros(),
+        max.as_millis()
+    )
+}
+
+fn stall_line(peer: &str, stall_ms: u128) -> String {
+    format!("to_tun_stall peer={peer} stall_ms={stall_ms}")
+}
+
+fn log_stall(peer: &str, waited: Duration) {
+    if waited >= STALL_LOG_AFTER {
+        log(&stall_line(peer, waited.as_millis()));
+    }
 }
 
 /// Run `body` and, when the flag is on, log its duration.
@@ -91,14 +119,7 @@ impl SendWait {
         if self.samples == 0 {
             return;
         }
-        log_at(
-            self.window_ms,
-            &format!(
-                "to_tun_send_wait peer={} max_us={}",
-                self.peer,
-                self.max.as_micros()
-            ),
-        );
+        log_at(self.window_ms, &send_wait_line(&self.peer, self.max));
         self.max = Duration::ZERO;
         self.samples = 0;
     }
@@ -124,10 +145,96 @@ pub(crate) async fn forward_to_tun(
     if !trace {
         return to_tun.send(packet).await.is_ok();
     }
-    let start = Instant::now();
+    let mut open = OpenWait::start(peer);
     let ok = to_tun.send(packet).await.is_ok();
-    wait.note(peer, start.elapsed());
+    let waited = open.finish();
+    log_stall(peer, waited);
+    wait.note(peer, waited);
     ok
+}
+
+struct OpenSlot {
+    id: u64,
+    peer: String,
+    start: Instant,
+    next_log_at: Duration,
+}
+
+fn open_slots() -> MutexGuard<'static, Vec<OpenSlot>> {
+    static OPEN: Mutex<Vec<OpenSlot>> = Mutex::new(Vec::new());
+    OPEN.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+fn next_open_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// One in-flight `to_tun.send` while the soak flag is on for this link.
+///
+/// The 100 ms queue probe prints the wait once per second after [`STALL_LOG_AFTER`].
+/// Drop of this guard removes the slot, including when the link task stops mid-send.
+struct OpenWait {
+    id: u64,
+    done: bool,
+}
+
+impl OpenWait {
+    fn start(peer: &str) -> Self {
+        let id = next_open_id();
+        open_slots().push(OpenSlot {
+            id,
+            peer: peer.to_string(),
+            start: Instant::now(),
+            next_log_at: STALL_LOG_AFTER,
+        });
+        Self { id, done: false }
+    }
+
+    fn finish(&mut self) -> Duration {
+        self.done = true;
+        let Some(slot) = take_slot(self.id) else {
+            return Duration::ZERO;
+        };
+        slot.start.elapsed()
+    }
+}
+
+impl Drop for OpenWait {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let Some(slot) = take_slot(self.id) else {
+            return;
+        };
+        log_stall(&slot.peer, slot.start.elapsed());
+    }
+}
+
+fn take_slot(id: u64) -> Option<OpenSlot> {
+    let mut slots = open_slots();
+    let index = slots.iter().position(|slot| slot.id == id)?;
+    Some(slots.swap_remove(index))
+}
+
+fn log_open_stalls() {
+    let mut due = Vec::new();
+    {
+        let mut slots = open_slots();
+        let now = Instant::now();
+        for slot in slots.iter_mut() {
+            let elapsed = now.saturating_duration_since(slot.start);
+            if elapsed < slot.next_log_at {
+                continue;
+            }
+            due.push((slot.peer.clone(), elapsed.as_millis()));
+            slot.next_log_at = elapsed.saturating_add(Duration::from_secs(1));
+        }
+    }
+    for (peer, stall_ms) in due {
+        log(&stall_line(&peer, stall_ms));
+    }
 }
 
 /// Per-write TUN timings for one writer thread. Build this only when the flag is on.
@@ -201,6 +308,7 @@ pub(crate) fn spawn_to_tun_probe(to_tun: mpsc::Sender<Vec<u8>>) -> Option<JoinHa
             let cap = to_tun.max_capacity();
             let queued = cap.saturating_sub(to_tun.capacity());
             log(&format!("to_tun_queued={queued} cap={cap}"));
+            log_open_stalls();
         }
     }))
 }
@@ -224,4 +332,109 @@ pub(crate) fn spawn_runtime_watchdog() -> Option<JoinHandle<()>> {
             }
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    use super::*;
+
+    fn idle_waker() -> Waker {
+        fn clone(ptr: *const ()) -> RawWaker {
+            RawWaker::new(ptr, &VTABLE)
+        }
+        fn wake(_: *const ()) {}
+        fn wake_by_ref(_: *const ()) {}
+        fn drop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+        // SAFETY: the vtable does not read the pointer.
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    #[test]
+    fn stall_lines_use_whole_milliseconds() {
+        assert_eq!(
+            send_wait_line("a", Duration::from_millis(1_300)),
+            "to_tun_send_wait peer=a max_us=1300000 stall_ms=1300"
+        );
+        assert_eq!(
+            send_wait_line("a", Duration::from_micros(500)),
+            "to_tun_send_wait peer=a max_us=500 stall_ms=0"
+        );
+        assert_eq!(
+            stall_line("b", 30_000),
+            "to_tun_stall peer=b stall_ms=30000"
+        );
+    }
+
+    #[test]
+    fn a_traced_send_on_a_full_queue_stays_open_until_one_read() {
+        open_slots().clear();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(vec![1]).unwrap();
+        let mut wait = SendWait::new();
+        let mut send = Box::pin(forward_to_tun(&tx, vec![9], true, "peer-a", &mut wait));
+        let waker = idle_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(send.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(open_slots().len(), 1);
+        {
+            let mut slots = open_slots();
+            let slot = &mut slots[0];
+            slot.start = slot
+                .start
+                .checked_sub(Duration::from_millis(1_500))
+                .expect("the test clock can move back 1500 ms");
+        }
+        log_open_stalls();
+        {
+            let slots = open_slots();
+            assert_eq!(slots.len(), 1);
+            assert!(slots[0].next_log_at > Duration::from_millis(1_500));
+        }
+        let before = open_slots()[0].next_log_at;
+        log_open_stalls();
+        assert_eq!(open_slots()[0].next_log_at, before);
+
+        rx.try_recv().unwrap();
+        assert!(matches!(send.as_mut().poll(&mut cx), Poll::Ready(true)));
+        drop(send);
+        assert_eq!(wait.samples, 1);
+        assert!(wait.max >= Duration::from_millis(1_500));
+        assert!(open_slots().is_empty());
+
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(vec![1]).unwrap();
+        let mut quiet = SendWait::new();
+        let mut quiet_send = Box::pin(forward_to_tun(&tx, vec![8], false, "peer-b", &mut quiet));
+        assert!(matches!(quiet_send.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(open_slots().is_empty());
+        rx.try_recv().unwrap();
+        assert!(matches!(
+            quiet_send.as_mut().poll(&mut cx),
+            Poll::Ready(true)
+        ));
+        drop(quiet_send);
+        assert_eq!(quiet.samples, 0);
+        assert!(open_slots().is_empty());
+
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
+        tx.try_send(vec![1]).unwrap();
+        let mut dropped = SendWait::new();
+        let mut dropped_send = Box::pin(forward_to_tun(&tx, vec![7], true, "peer-c", &mut dropped));
+        assert!(matches!(dropped_send.as_mut().poll(&mut cx), Poll::Pending));
+        {
+            let mut slots = open_slots();
+            let slot = &mut slots[0];
+            slot.start = slot
+                .start
+                .checked_sub(STALL_LOG_AFTER)
+                .expect("the test clock can move back 1 s");
+        }
+        drop(dropped_send);
+        assert!(open_slots().is_empty());
+        assert_eq!(dropped.samples, 0);
+    }
 }
