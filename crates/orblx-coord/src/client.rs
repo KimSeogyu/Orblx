@@ -1,5 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
+use std::time::Duration;
 
 use orblx_identity::SpiffeId;
 
@@ -904,6 +905,21 @@ fn response_ok(response: Response) -> Result<Response, CoordError> {
     Ok(response)
 }
 
+/// The longest time to open the QUIC connection for one SSH certificate request.
+///
+/// A stopped coordinator sends no reply. Without this limit the handshake waits for the
+/// QUIC idle timeout (60 s) in `tlsutil::transport_config`.
+pub(crate) const SSH_CERT_CONNECT_LIMIT: Duration = Duration::from_secs(5);
+
+/// The longest time to read one reply of an SSH certificate request.
+///
+/// The client reads the nonce, then the certificate. Each read has this limit.
+pub(crate) const SSH_CERT_READ_LIMIT: Duration = Duration::from_secs(5);
+
+fn coordinator_request_failed() -> CoordError {
+    CoordError::Protocol("The coordinator request failed.".to_string())
+}
+
 /// Ask for one SSH user certificate with the node SVID in `state_dir` (W25-31).
 ///
 /// The caller gives the SSH private key. The function signs the TLS exporter of the mTLS
@@ -961,15 +977,19 @@ where
     };
     let endpoint =
         tlsutil::client_endpoint(&client_tls, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
-    let connection = endpoint
+    let connecting = endpoint
         .connect(coord, tlsutil::SERVER_NAME)
-        .map_err(|err| CoordError::Tls(format!("connect: {err}")))?
-        .await
-        .map_err(|err| CoordError::Tls(format!("handshake: {err}")))?;
+        .map_err(|err| CoordError::Tls(format!("connect: {err}")))?;
+    let connection = match tokio::time::timeout(SSH_CERT_CONNECT_LIMIT, connecting).await {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(err)) => return Err(CoordError::Tls(format!("handshake: {err}"))),
+        Err(_expired) => return Err(coordinator_request_failed()),
+    };
+    let mut read_timed_out = false;
     let result = async {
         let mut nonce_request = blank_request("ssh-cert-nonce");
         nonce_request.name = String::new();
-        let reply = stream_trip(&connection, &nonce_request).await?;
+        let reply = read_reply(&connection, &nonce_request, &mut read_timed_out).await?;
         let nonce = decode_hex_32(reply.detail.as_deref().unwrap_or_default())
             .map_err(|_| CoordError::Protocol("The SSH nonce is not valid.".to_string()))?;
         let mut exporter = [0u8; crate::sshca::SSH_EXPORTER_LEN];
@@ -978,14 +998,33 @@ where
             .map_err(|_| CoordError::Tls("The TLS exporter failed.".to_string()))?;
         let mut cert_request = blank_request("ssh-cert");
         cert_request.ssh = Some(make_ask(&exporter, &nonce)?);
-        let reply = stream_trip(&connection, &cert_request).await?;
+        let reply = read_reply(&connection, &cert_request, &mut read_timed_out).await?;
         reply
             .detail
             .ok_or_else(|| CoordError::Protocol("The SSH certificate is missing.".to_string()))
     }
     .await;
-    close_and_wait(&connection, &endpoint).await;
+    if read_timed_out {
+        connection.close(quinn::VarInt::from_u32(0), b"done");
+    } else {
+        close_and_wait(&connection, &endpoint).await;
+    }
     result
+}
+
+/// Read one SSH certificate reply. A read that passes [`SSH_CERT_READ_LIMIT`] fails the request.
+async fn read_reply(
+    connection: &quinn::Connection,
+    request: &Request,
+    read_timed_out: &mut bool,
+) -> Result<Response, CoordError> {
+    match tokio::time::timeout(SSH_CERT_READ_LIMIT, stream_trip(connection, request)).await {
+        Ok(result) => result,
+        Err(_expired) => {
+            *read_timed_out = true;
+            Err(coordinator_request_failed())
+        }
+    }
 }
 
 fn blank_request(op: &str) -> Request {
