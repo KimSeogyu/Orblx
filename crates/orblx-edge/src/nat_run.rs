@@ -17,7 +17,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_datapath::{
     format_node_status, is_ipv4_packet, open_tun_port, NodeStatus, PacketFilter, StatusPeer,
@@ -28,8 +28,10 @@ use orblx_relay::{
 };
 
 use crate::birthday::{
-    local_kind, peer_kind, strategy, MappingKind, RateGate, Spray, Strategy, BIRTHDAY_SOCKETS,
-    BIRTHDAY_WINDOW, PROBE_BURST, PROBE_RATE, SOCKET_REFRESH,
+    classify_ports, local_kind, peer_kind, predict_continues, predict_targets, retry_delay,
+    strategy_for, MappingKind, PortAlloc, PredictSpray, RateGate, Spray, Strategy, ALLOC_SAMPLES,
+    BIRTHDAY_SOCKETS, BIRTHDAY_WINDOW, PREDICT_ATTEMPTS, PREDICT_PACKET_BUDGET, PREDICT_PORT_MAX,
+    PROBE_BURST, PROBE_RATE, SOCKET_REFRESH, SPRAY_MAX,
 };
 use crate::nat_path::{
     relay_allowed, select_path, session_id, session_punch_token, HelloAuth, KeyGate, Opened,
@@ -40,7 +42,9 @@ use crate::portmap::{
     candidate_texts, load_port_map_nonce, probe_port_map, ActiveMap, PortMapChoice, ProbeReport,
     ProbeRequest, PORT_MAP_BUDGET,
 };
-use crate::punch::{decode_punch, encode_punch, exchange_same_ip, PunchKind, PunchToken};
+use crate::punch::{
+    admit_punch, decode_punch, encode_punch, exchange_same_ip, PunchDecision, PunchKind, PunchToken,
+};
 use crate::signed::{encode_hex, verify_signed_candidate, SignedCandidate};
 use crate::{EdgeError, StunClient, DIRECT_ATTEMPT_BUDGET, DIRECT_QUIC_PORT};
 
@@ -185,6 +189,11 @@ pub struct NatConfig {
 /// Run one NAT node until SIGINT or SIGTERM.
 pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
     let started = Instant::now();
+    let origin_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    println!("clock_origin unix_ms {origin_ms}");
     install_signals();
     // The status file is from the previous process until this process writes it.
     // Write `down` before the probe so a reader does not treat the old path as live.
@@ -238,6 +247,7 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         direct_out: Mutex::new(None),
         relay_out: Mutex::new(None),
         relay_broken: AtomicBool::new(false),
+        relay_data_noted: AtomicBool::new(false),
         peer_name: config.peer_name,
         peer_overlay: config.peer_overlay,
         peer_svid: config.peer_svid,
@@ -245,6 +255,9 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         relay_tcp: config.relay_tcp,
         netmap_public: config.netmap_public,
         nat_kind: Mutex::new(stun_kind),
+        stun: config.stun,
+        reflexive: Mutex::new(stun_texts.clone()),
+        local_alloc: Mutex::new(PortAlloc::Unknown),
         stun_texts,
         mapped: Mutex::new(None),
         port_map: Mutex::new(None),
@@ -317,6 +330,15 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         thread::Builder::new()
             .name("orblx-nat-renew".to_string())
             .spawn(move || renew_loop(renew_hub, leaf_der, renew))
+            .map_err(|err| EdgeError::Io(err.to_string()))?;
+    }
+    if stun_kind == MappingKind::Hard {
+        // The relay threads are already up. These samples must not hold the first packet.
+        let sample_hub = Arc::clone(&hub);
+        let stun = config.stun;
+        thread::Builder::new()
+            .name("orblx-nat-sample".to_string())
+            .spawn(move || sample_allocation(&sample_hub, stun))
             .map_err(|err| EdgeError::Io(err.to_string()))?;
     }
     let direct_hub = Arc::clone(&hub);
@@ -511,6 +533,8 @@ struct Hub {
     relay_out: Mutex<Option<RelaySender>>,
     /// A send on the relay handle failed. The relay loop attaches again.
     relay_broken: AtomicBool,
+    /// True after the first data frame on the relay.
+    relay_data_noted: AtomicBool,
     peer_name: String,
     peer_overlay: Ipv4Addr,
     peer_svid: String,
@@ -519,6 +543,12 @@ struct Hub {
     netmap_public: [u8; 32],
     /// The punch kind. A granted map replaces the STUN kind.
     nat_kind: Mutex<MappingKind>,
+    /// The STUN server used for allocation samples.
+    stun: SocketAddr,
+    /// Reflexive endpoints, in sample order. A mapped port replaces this list.
+    reflexive: Mutex<Vec<String>>,
+    /// The local port allocation class.
+    local_alloc: Mutex<PortAlloc>,
     /// The STUN endpoints. A mapped port replaces them in the published list.
     stun_texts: Vec<String>,
     /// The mapped external socket, when the router granted one.
@@ -612,6 +642,18 @@ impl Hub {
 
     fn peer_kind(&self) -> MappingKind {
         peer_kind(&lock(&self.peer_endpoints))
+    }
+
+    fn local_alloc(&self) -> PortAlloc {
+        *lock(&self.local_alloc)
+    }
+
+    fn kind(&self) -> MappingKind {
+        *lock(&self.nat_kind)
+    }
+
+    fn peer_alloc(&self) -> PortAlloc {
+        classify_ports(&self.peer_ports())
     }
 
     fn mark_rx(&self, slot: Slot) {
@@ -934,6 +976,9 @@ impl Hub {
                 return true;
             }
             let (sent, result) = sender.send_many(&frames);
+            if sent > 0 && !self.relay_data_noted.swap(true, Ordering::Relaxed) {
+                println!("first_packet relay ms {}", self.now_ms());
+            }
             if result.is_err() {
                 self.push_front_many(OverlayPath::Relay, frames.split_off(sent));
                 *out = None;
@@ -1109,7 +1154,12 @@ fn publish_loop(
     while !stopped() {
         let gen = hub.publish_gen.load(Ordering::Relaxed);
         let mapped = *lock(&hub.mapped);
-        let texts = candidate_texts(&hub.stun_texts, mapped);
+        // A granted map replaces the STUN list. Otherwise publish the sample list.
+        let texts = if mapped.is_some() {
+            candidate_texts(&hub.stun_texts, mapped)
+        } else {
+            lock(&hub.reflexive).clone()
+        };
         match publish(texts.clone()) {
             Ok(list) => {
                 store_peer(&hub, &list);
@@ -1278,37 +1328,23 @@ fn direct_loop(hub: Arc<Hub>, socket: UdpSocket) {
     let _ = socket.set_read_timeout(Some(DIRECT_READ));
     let mut spray: Option<Spray> = None;
     let mut fleet: Option<Fleet> = None;
+    let mut predict: Option<PredictCycle> = None;
     arm_punch(&hub, plan, &mut spray, &mut fleet);
+    if plan == Strategy::Predict {
+        predict = Some(PredictCycle::start(&hub, Instant::now()));
+    }
     let check = encode_punch(PunchKind::Check, hub.token);
     let ack = encode_punch(PunchKind::Ack, hub.token);
     let mut punch_gap = punch_gap_for(plan);
     let mut last_hello = Instant::now() - HELLO_GAP;
     let mut last_probe = Instant::now() - PROBE_GAP;
-    let mut last_punch = Instant::now() - punch_gap;
+    let mut last_punch = Instant::now() - PUNCH_GAP;
     // One recvmmsg call takes the datagrams that wait, up to one batch.
     let mut batch = RecvBatch::new(UDP_BATCH, DIRECT_SLOT);
     let mut opened: Vec<Vec<u8>> = Vec::with_capacity(UDP_BATCH);
     // The direct peer and socket that the router uses. A change stores them again.
     let mut shared: Option<(SocketAddr, Option<SocketAddr>)> = None;
     while !stopped() {
-        if direct_peer.is_none() {
-            let next = strategy(*lock(&hub.nat_kind), hub.peer_kind());
-            if next != plan {
-                let local_nat = *lock(&hub.nat_kind);
-                println!(
-                    "The punch plan is {}. The local mapping is {}. The peer mapping is {}.",
-                    next.as_str(),
-                    local_nat.as_str(),
-                    hub.peer_kind().as_str()
-                );
-                println!("The punch plan time is {} ms.", hub.now_ms());
-                plan = next;
-                punch_gap = punch_gap_for(plan);
-                spray = None;
-                fleet = None;
-                arm_punch(&hub, plan, &mut spray, &mut fleet);
-            }
-        }
         if let Some(peer) = direct_peer {
             let key = (peer, socket.local_addr().ok());
             if shared != Some(key) {
@@ -1317,11 +1353,26 @@ fn direct_loop(hub: Arc<Hub>, socket: UdpSocket) {
             }
         }
         let now = Instant::now();
+        if direct_peer.is_none() && current_strategy(&hub) != plan {
+            plan = log_plan(&hub);
+            punch_gap = punch_gap_for(plan);
+            spray = None;
+            fleet = None;
+            arm_punch(&hub, plan, &mut spray, &mut fleet);
+            predict = if plan == Strategy::Predict {
+                Some(PredictCycle::start(&hub, now))
+            } else {
+                None
+            };
+        }
         let fresh = hub.fresh(Slot::Direct, hub.now_ms());
         if (direct_peer.is_none() || !fresh) && last_punch.elapsed() >= punch_gap {
             let signed = hub.peer_addr();
-            if let Some(peer) = signed {
-                let _ = socket.send_to(&check, peer);
+            // A random hard pair does not send punch probes.
+            if plan != Strategy::RelayOnly {
+                if let Some(peer) = signed {
+                    let _ = socket.send_to(&check, peer);
+                }
             }
             // The last working address can differ from the signed address.
             // A symmetric NAT maps a new port for this flow.
@@ -1331,6 +1382,9 @@ fn direct_loop(hub: Arc<Hub>, socket: UdpSocket) {
             last_punch = now;
         }
         if direct_peer.is_none() {
+            if let Some(cycle) = predict.as_mut() {
+                cycle.drive(&hub, &socket, &check, now);
+            }
             if let Some(active) = spray.as_mut() {
                 match active.due(now) {
                     Ok(targets) => {
@@ -1380,37 +1434,54 @@ fn direct_loop(hub: Arc<Hub>, socket: UdpSocket) {
                     let Some((bytes, Some(from))) = batch.get(index) else {
                         continue;
                     };
-                    if let Some(kind) = decode_punch(bytes, hub.token) {
-                        if let Some(signed) = hub.peer_addr() {
-                            if from.ip() == signed.ip() {
-                                if direct_peer.is_none() {
-                                    if let Some(active) = spray.take() {
-                                        println!(
-                                            "The port spray reached {from} after {} probes.",
-                                            active.sent()
-                                        );
-                                    }
-                                    println!("The hole punch reached {from}.");
+                    match admit_punch(
+                        bytes,
+                        hub.token,
+                        from.ip(),
+                        hub.peer_addr().map(|addr| addr.ip()),
+                    ) {
+                        Some(PunchDecision::DropToken) => {
+                            println!("punch_drop {from} token");
+                        }
+                        Some(PunchDecision::DropNetmap) => {
+                            println!("punch_drop {from} netmap");
+                        }
+                        Some(PunchDecision::Accept(kind)) => {
+                            if direct_peer.is_none() {
+                                if let Some(active) = spray.take() {
+                                    println!(
+                                        "The port spray reached {from} after {} probes.",
+                                        active.sent()
+                                    );
                                 }
-                                direct_peer = Some(from);
-                                if kind == PunchKind::Check {
-                                    let _ = socket.send_to(&ack, from);
+                                if let Some(active) = predict.take() {
+                                    let sent = active.spray.sent();
+                                    println!(
+                                        "The predict spray reached {from} after {sent} probes."
+                                    );
+                                    println!("predict_probes {sent}");
                                 }
+                                println!("The hole punch reached {from}.");
+                            }
+                            direct_peer = Some(from);
+                            if kind == PunchKind::Check {
+                                let _ = socket.send_to(&ack, from);
                             }
                         }
-                    } else {
-                        let (packet, fresh_frame) = hub.accept(bytes, Slot::Direct);
-                        // A fresh sealed frame shows the current address of the peer.
-                        if fresh_frame
-                            && direct_peer.is_some_and(|known| known != from)
-                            && hub
-                                .peer_addr()
-                                .is_some_and(|signed| signed.ip() == from.ip())
-                        {
-                            direct_peer = Some(from);
-                        }
-                        if let Some(packet) = packet {
-                            opened.push(packet);
+                        None => {
+                            let (packet, fresh_frame) = hub.accept(bytes, Slot::Direct);
+                            // A fresh sealed frame shows the current address of the peer.
+                            if fresh_frame
+                                && direct_peer.is_some_and(|known| known != from)
+                                && hub
+                                    .peer_addr()
+                                    .is_some_and(|signed| signed.ip() == from.ip())
+                            {
+                                direct_peer = Some(from);
+                            }
+                            if let Some(packet) = packet {
+                                opened.push(packet);
+                            }
                         }
                     }
                 }
@@ -1429,6 +1500,182 @@ fn direct_loop(hub: Arc<Hub>, socket: UdpSocket) {
             drain_direct(&hub, &socket, peer);
         }
     }
+}
+
+fn endpoint_ports(texts: &[String]) -> Vec<u16> {
+    texts
+        .iter()
+        .filter_map(|text| text.parse::<SocketAddr>().ok())
+        .map(|addr| addr.port())
+        .collect()
+}
+
+fn sample_allocation(hub: &Hub, stun: SocketAddr) {
+    let samples = alloc_samples(stun, ALLOC_SAMPLES);
+    if samples.is_empty() {
+        return;
+    }
+    let mut list = lock(&hub.reflexive);
+    for addr in &samples {
+        println!("The allocation sample is {addr}.");
+        if list.len() < 8 {
+            list.push(addr.to_string());
+        }
+    }
+    let ports = endpoint_ports(&list);
+    drop(list);
+    let alloc = classify_ports(&ports);
+    *lock(&hub.local_alloc) = alloc;
+    println!("The local port allocation is {alloc}.");
+    hub.publish_gen.fetch_add(1, Ordering::Relaxed);
+}
+
+fn alloc_samples(server: SocketAddr, count: usize) -> Vec<SocketAddr> {
+    let mut found = Vec::new();
+    for _ in 0..count {
+        if stopped() {
+            break;
+        }
+        let Ok(client) = StunClient::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))) else {
+            break;
+        };
+        if let Ok(addr) = client.gather(server, Duration::from_millis(800)) {
+            found.push(addr);
+        }
+    }
+    found
+}
+
+fn current_strategy(hub: &Hub) -> Strategy {
+    strategy_for(
+        hub.kind(),
+        hub.peer_kind(),
+        hub.local_alloc(),
+        hub.peer_alloc(),
+    )
+}
+
+fn log_plan(hub: &Hub) -> Strategy {
+    let peer_nat = hub.peer_kind();
+    let local_nat = hub.kind();
+    let local_alloc = hub.local_alloc();
+    let peer_alloc = hub.peer_alloc();
+    let chosen = strategy_for(local_nat, peer_nat, local_alloc, peer_alloc);
+    println!(
+        "The punch plan is {}. The local mapping is {}. The peer mapping is {}.",
+        chosen.as_str(),
+        local_nat.as_str(),
+        peer_nat.as_str()
+    );
+    println!("The punch plan time is {} ms.", hub.now_ms());
+    if local_nat == MappingKind::Hard || peer_nat == MappingKind::Hard {
+        println!("The local port allocation is {local_alloc}.");
+        println!("The peer port allocation is {peer_alloc}.");
+    }
+    chosen
+}
+
+/// One predict attempt, then a bounded wait, then another attempt.
+///
+/// The cycle stops after [`PREDICT_ATTEMPTS`]. It does not start another spray.
+struct PredictCycle {
+    spray: PredictSpray,
+    attempt: u32,
+    resume_at: Option<Instant>,
+    stopped: bool,
+}
+
+impl PredictCycle {
+    fn start(hub: &Hub, now: Instant) -> Self {
+        println!(
+            "predict_budget attempts {PREDICT_ATTEMPTS} packets_per_attempt {SPRAY_MAX} port_cap {PREDICT_PORT_MAX} rate {PROBE_RATE} packet_budget {PREDICT_PACKET_BUDGET}"
+        );
+        println!("The predict attempt 1 starts.");
+        Self {
+            spray: spray_for(hub, now),
+            attempt: 1,
+            resume_at: None,
+            stopped: false,
+        }
+    }
+
+    fn drive(&mut self, hub: &Hub, socket: &UdpSocket, check: &[u8], now: Instant) {
+        if self.stopped {
+            return;
+        }
+        if let Some(until) = self.resume_at {
+            if now < until {
+                return;
+            }
+            if !predict_continues(self.attempt) {
+                self.stopped = true;
+                println!(
+                    "The predict budget is spent after {} attempts.",
+                    self.attempt
+                );
+                return;
+            }
+            self.spray = spray_for(hub, now);
+            self.resume_at = None;
+            self.attempt = self.attempt.saturating_add(1);
+            println!("The predict attempt {} starts.", self.attempt);
+        }
+        if let Some(peer) = hub.peer_addr() {
+            self.spray
+                .set_targets(peer.ip(), predict_targets(hub.peer_alloc()));
+        }
+        for target in self.spray.due(now) {
+            let _ = socket.send_to(check, target);
+        }
+        if self.spray.done(now) {
+            let sent = self.spray.sent();
+            println!("The predict attempt ended after {sent} probes. The node uses the relay.");
+            println!("predict_probes {sent}");
+            if !predict_continues(self.attempt) {
+                self.stopped = true;
+                println!(
+                    "The predict budget is spent after {} attempts.",
+                    self.attempt
+                );
+                return;
+            }
+            let delay = retry_delay(self.attempt);
+            println!(
+                "The predict attempt will retry after {} seconds.",
+                delay.as_secs()
+            );
+            self.resume_at = Some(now + delay);
+            refresh_alloc_samples(hub);
+        }
+    }
+}
+
+fn spray_for(hub: &Hub, now: Instant) -> PredictSpray {
+    match hub.peer_addr() {
+        Some(peer) => PredictSpray::new(peer.ip(), predict_targets(hub.peer_alloc()), now),
+        None => PredictSpray::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), Vec::new(), now),
+    }
+}
+
+fn refresh_alloc_samples(hub: &Hub) {
+    let samples = alloc_samples(hub.stun, ALLOC_SAMPLES);
+    if samples.len() < 4 {
+        return;
+    }
+    let ports: Vec<u16> = samples.iter().map(|addr| addr.port()).collect();
+    let alloc = classify_ports(&ports);
+    *lock(&hub.local_alloc) = alloc;
+    println!("The local port allocation is {alloc}.");
+    let mut list = lock(&hub.reflexive);
+    let keep = 2.min(list.len());
+    list.truncate(keep);
+    for addr in samples {
+        if list.len() >= 8 {
+            break;
+        }
+        list.push(addr.to_string());
+    }
+    hub.publish_gen.fetch_add(1, Ordering::Relaxed);
 }
 
 fn punch_gap_for(plan: Strategy) -> Duration {
@@ -1454,31 +1701,29 @@ fn arm_punch(hub: &Hub, plan: Strategy, spray: &mut Option<Spray>, fleet: &mut O
             Ok(opened) => *fleet = Some(opened),
             Err(err) => eprintln!("The birthday sockets did not open. {err}"),
         },
-        Strategy::Plain | Strategy::RelayOnly => {}
+        Strategy::Plain | Strategy::RelayOnly | Strategy::Predict => {}
     }
 }
 
 fn coordinated_punch(hub: &Hub, socket: &UdpSocket) -> (Option<SocketAddr>, Strategy) {
     let mut started: Option<Instant> = None;
     let mut plan: Option<Strategy> = None;
+    let mut hard_wait: Option<Instant> = None;
     while !stopped() {
         let Some(peer) = hub.peer_addr() else {
             thread::sleep(Duration::from_millis(50));
             continue;
         };
-        let chosen = *plan.get_or_insert_with(|| {
-            let peer_nat = hub.peer_kind();
-            let local_nat = *lock(&hub.nat_kind);
-            let chosen = strategy(local_nat, peer_nat);
-            println!(
-                "The punch plan is {}. The local mapping is {}. The peer mapping is {}.",
-                chosen.as_str(),
-                local_nat.as_str(),
-                peer_nat.as_str()
-            );
-            println!("The punch plan time is {} ms.", hub.now_ms());
-            chosen
-        });
+        // One signed endpoint is not enough to class a hard peer.
+        // Wait briefly so the allocation samples can arrive before the plan is fixed.
+        if hub.kind() == MappingKind::Hard && hub.peer_kind() == MappingKind::Unknown {
+            let waited = hard_wait.get_or_insert_with(Instant::now);
+            if waited.elapsed() < Duration::from_secs(2) {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        }
+        let chosen = *plan.get_or_insert_with(|| log_plan(hub));
         if chosen != Strategy::Plain {
             return (None, chosen);
         }
@@ -1834,9 +2079,12 @@ fn router_loop(hub: Arc<Hub>) {
         let now = hub.now_ms();
         let direct_ok = hub.both_ways(Slot::Direct, now);
         let relay_ok = hub.both_ways(Slot::Relay, now);
-        let budget_done = lock(&hub.candidate_at)
-            .map(|start| start.elapsed() >= DIRECT_ATTEMPT_BUDGET)
-            .unwrap_or(false);
+        // A hard pair starts on the relay at once. The predict spray must not hold the first packet.
+        let hard_pair = hub.kind() == MappingKind::Hard && hub.peer_kind() == MappingKind::Hard;
+        let budget_done = hard_pair
+            || lock(&hub.candidate_at)
+                .map(|start| start.elapsed() >= DIRECT_ATTEMPT_BUDGET)
+                .unwrap_or(false);
         let allowed = relay_allowed(
             hub.saw_direct.load(Ordering::Relaxed),
             direct_ok,
@@ -1874,6 +2122,7 @@ fn router_loop(hub: Arc<Hub>) {
         if !known || next != reported {
             if let Some(path) = next {
                 println!("The path to {} is {}.", hub.peer_name, path.as_str());
+                println!("path_up {} ms {now}", path.as_str());
                 println!(
                     "session {} path {}",
                     encode_hex(&hub.session),
