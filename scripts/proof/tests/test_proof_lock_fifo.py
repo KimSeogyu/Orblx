@@ -151,9 +151,17 @@ class ProofLockFairnessTest(unittest.TestCase):
     def test_the_plain_flock_check_is_fast_under_a_parent_with_many_fds(self):
         # A CI runner can be an ancestor with hundreds of fds. The check must not make one
         # grep per fd: that took 0.7 s with 600 fds and made the W25-5 waiter test fail on CI.
+        # date +%s%3N reads CLOCK_REALTIME. A step backward between the two calls makes a
+        # negative duration (CI printed rc=1 ms=-577) and the match on ms=(\d+) fails.
+        # rc=1 is the result when no ancestor holds a plain flock. /proc/uptime is monotonic.
         open(self.lock, "a").close()
-        check = ('. "$0"; s=$(date +%s%3N); p="$(proof_lock_plain_parent "$1")"; rc=$?; '
-                 'echo "rc=$rc ms=$(( $(date +%s%3N) - s )) pid=${p%% *}"')
+        check = (
+            '. "$0"; read -r s _ </proc/uptime; '
+            'p="$(proof_lock_plain_parent "$1")"; rc=$?; '
+            'read -r e _ </proc/uptime; '
+            'ms=$(awk -v s="$s" -v e="$e" \'BEGIN {printf "%d\\n", (e - s) * 1000}\'); '
+            'echo "rc=$rc ms=$ms pid=${p%% *}"'
+        )
         fds = [os.open(os.devnull, os.O_RDONLY) for _ in range(2000)]
         held = os.open(self.lock, os.O_RDWR)
         try:
