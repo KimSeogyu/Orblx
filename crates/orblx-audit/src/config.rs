@@ -108,15 +108,19 @@ pub enum ConfigAction {
     UserReject,
     /// A client moved an HA subnet route to another router (W25-10).
     RouteFailover,
+    /// An owner set the stored netmap `seq` to the coordinator clock time after a
+    /// clock-forward error (W25-34).
+    NetmapSeqReset,
 }
 
 impl ConfigAction {
     /// Codes that no action in this build uses. Code 37 is reserved for `node-remove` (W25-18).
+    /// Codes 39 and 40 are reserved for other open work items. W25-34 takes code 41.
     /// The SIEM verifier has the placeholder `reserved-N` for each of these codes.
-    pub const RESERVED_CODES: [u8; 1] = [37];
+    pub const RESERVED_CODES: [u8; 3] = [37, 39, 40];
 
     /// Every action in code order.
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 38] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -154,6 +158,7 @@ impl ConfigAction {
         Self::UserApprove,
         Self::UserReject,
         Self::RouteFailover,
+        Self::NetmapSeqReset,
     ];
 
     /// Return the stable action token.
@@ -197,6 +202,7 @@ impl ConfigAction {
             Self::UserApprove => "user-approve",
             Self::UserReject => "user-reject",
             Self::RouteFailover => "route-failover",
+            Self::NetmapSeqReset => "netmap-seq-reset",
         }
     }
 
@@ -247,6 +253,7 @@ impl ConfigAction {
             Self::UserApprove => 35,
             Self::UserReject => 36,
             Self::RouteFailover => 38,
+            Self::NetmapSeqReset => 41,
         }
     }
 
