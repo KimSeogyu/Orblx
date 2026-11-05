@@ -215,7 +215,9 @@ ends="$(awk -v e="$RUN_END" -v s="$SKEW" '
   }
   END {print n + 0}' "$COORD_LOG")"
 renewals="$(awk '/ coord svid renewed, new expiry / {n++} END {print n + 0}' "$COORD_LOG")"
-handshake_fail="$(awk '/ coord handshake failed$/ {n++} END {print n + 0}' "$COORD_LOG")"
+# The product line is "coord handshake failed: <error> remote <address>".
+# The phrase stays. The error and the address follow it. Count that line.
+handshake_fail="$(awk '/ coord handshake failed/ {n++} END {print n + 0}' "$COORD_LOG")"
 renew_fail="$(awk '/ coord svid renewal failed/ {n++} END {print n + 0}' "$COORD_LOG")"
 echo "coord_start_utc ${coord_start_utc} run_end_unix ${RUN_END} soak_run_s ${soak_run_s}"
 echo "coord_svid_ends_crossed ${ends} coord_svid_renewals ${renewals} coord_handshake_failed ${handshake_fail} coord_svid_renewal_failed ${renew_fail}"
