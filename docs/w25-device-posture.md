@@ -113,3 +113,7 @@ The script also checks that the audit chain verifies, that `orblx policy test` p
 - An omitted `os` or `clientVersion` clears the stored fact.
 - Node lock off is `unsigned`. `nodeLock == signed` fails closed until an owner signs the node.
 - `os` and `clientVersion` are self-reported. They are not attestation.
+
+## Release notes
+
+An omitted `os` or `clientVersion` clears the stored fact. A node on an older client that omits either field fails every rule that checks that fact. The check fails closed until the node upgrades and sends the fact.
