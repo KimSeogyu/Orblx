@@ -1,0 +1,17 @@
+{
+  // Pre-auth key proof (W25).
+  // The owner node is an OIDC user in ownerUsers, so the first enroll is approved.
+  // nodeApproval is on, so a token node waits. A pre-auth node does not wait.
+  // tag:bot is owned by the owner node. A token cannot set a tag.
+  "owners": ["spiffe://orblx.local/node/owner"],
+  "nodeApproval": true,
+  "tags": {
+    "tag:bot": ["spiffe://orblx.local/node/owner"]
+  },
+  "tagOwners": {
+    "tag:bot": ["spiffe://orblx.local/node/owner"]
+  },
+  "userApproval": {
+    "ownerUsers": ["oidc:owner"]
+  }
+}
