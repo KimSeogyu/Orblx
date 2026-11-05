@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Issue 2 minute node SVIDs and keep one session up for at least 6 minutes.
+# Issue 3 minute node SVIDs and keep one session up for at least 9 minutes.
+# W25-45: the coordinator refuses a node SVID life under 180 s.
 # The script pings once per second and reports loss.
 # The script skips the proof when it is not root or when Docker is absent.
 set -euo pipefail
@@ -24,7 +25,7 @@ compose_file="$root/scripts/proof/compose.svid.yml"
 work=$(mktemp -d)
 env_file=""
 image_dir=""
-ping_count=370
+ping_count=550
 
 require_toolchain() {
   if ! command -v cargo >/dev/null 2>&1; then

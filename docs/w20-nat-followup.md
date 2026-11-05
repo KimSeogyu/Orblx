@@ -22,7 +22,7 @@ All extra hosts are [C] containers on the same host. The topology is the W20 top
 ### Proof
 
 The renewal case is the last case in `nat-realism.sh`.
-The script restarts the coordinator with `ORBLX_SVID_TTL=60`, so a node leaf lives 60 s.
+The script restarts the coordinator with `ORBLX_SVID_TTL=180`, so a node leaf lives 180 s (W25-45: the coordinator refuses a value under 180 s).
 The coordinator does not allow a second enrollment of a name, so four new names enroll in the LANs of the four routers:
 
 - node-e (behind prc router-a) and node-f (behind prc router-b) use the direct path.

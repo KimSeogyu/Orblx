@@ -334,8 +334,19 @@ fn watch_netmap(
     }
 }
 
+/// The shortest node SVID life that `ORBLX_SVID_TTL` accepts (W25-45).
+///
+/// The node renews at a lead of at least 60 s for this life. A shorter life leaves too
+/// little time to renew and dial a new session before the ticket end, and a node clock
+/// that is a little ahead makes each renewal due at once.
+const MIN_NODE_SVID_TTL_SECS: u64 = 180;
+
 fn node_svid_ttl_from_env() -> Result<Option<Duration>, String> {
-    let Ok(text) = std::env::var("ORBLX_SVID_TTL") else {
+    parse_node_svid_ttl(std::env::var("ORBLX_SVID_TTL").ok().as_deref())
+}
+
+fn parse_node_svid_ttl(text: Option<&str>) -> Result<Option<Duration>, String> {
+    let Some(text) = text else {
         return Ok(None);
     };
     let text = text.trim();
@@ -345,9 +356,9 @@ fn node_svid_ttl_from_env() -> Result<Option<Duration>, String> {
     let secs: u64 = text
         .parse()
         .map_err(|_| "ORBLX_SVID_TTL is not a number of seconds.".to_string())?;
-    if secs == 0 || secs > MAX_USER_TTL.as_secs() {
+    if !(MIN_NODE_SVID_TTL_SECS..=MAX_USER_TTL.as_secs()).contains(&secs) {
         return Err(format!(
-            "ORBLX_SVID_TTL must be from 1 to {} seconds.",
+            "ORBLX_SVID_TTL is {secs}. It must be from {MIN_NODE_SVID_TTL_SECS} to {} seconds. A life under {MIN_NODE_SVID_TTL_SECS} seconds does not give the node enough time to renew before its capability ticket ends.",
             MAX_USER_TTL.as_secs()
         ));
     }
@@ -681,7 +692,7 @@ The coordinator SVID is spiffe://orblx.local/coord/{name}.
 An enroll token is one use.
 The command writes the token only to --out.
 The command does not print the token.
-ORBLX_SVID_TTL sets the node leaf life in seconds.
+ORBLX_SVID_TTL sets the node leaf life in seconds, from 180 to 900.
 The default life is 900 seconds.
 The enroll command stores the coordinator address in the state directory.
 The default policy file is DIR/policy.hujson.
@@ -706,6 +717,28 @@ A waiting or rejected user gets no SVID.
 
 #[cfg(test)]
 mod tests {
+    /// W25-45 D1: the coordinator refuses a node SVID life under 180 s at start.
+    #[test]
+    fn svid_ttl_under_180_seconds_is_refused() {
+        use std::time::Duration;
+        assert_eq!(super::parse_node_svid_ttl(None), Ok(None));
+        assert_eq!(super::parse_node_svid_ttl(Some(" ")), Ok(None));
+        for short in ["0", "1", "60", "120", "179"] {
+            let err = super::parse_node_svid_ttl(Some(short)).unwrap_err();
+            assert!(err.contains("from 180 to 900 seconds"), "{short}: {err}");
+        }
+        assert_eq!(
+            super::parse_node_svid_ttl(Some("180")),
+            Ok(Some(Duration::from_secs(180)))
+        );
+        assert_eq!(
+            super::parse_node_svid_ttl(Some("900")),
+            Ok(Some(Duration::from_secs(900)))
+        );
+        assert!(super::parse_node_svid_ttl(Some("901")).is_err());
+        assert!(super::parse_node_svid_ttl(Some("2m")).is_err());
+    }
+
     use super::{parse, Command};
 
     #[test]

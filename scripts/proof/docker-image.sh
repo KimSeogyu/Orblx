@@ -20,7 +20,8 @@ cd "$ROOT"
 PREFIX="${ORBLX_DIMG_PREFIX:-orblx-w25h-dimg}"
 IMAGE="${ORBLX_DIMG_IMAGE:-orblx-w25h-image:local}"
 MAX_BYTES="${ORBLX_DIMG_MAX_BYTES:-60000000}"
-TTL="${ORBLX_DIMG_SVID_TTL:-60}"
+# W25-45: the coordinator refuses a node SVID life under 180 s.
+TTL="${ORBLX_DIMG_SVID_TTL:-180}"
 PINGS="${ORBLX_DIMG_PINGS:-20}"
 NET="${PREFIX}-net"
 STATE=/var/lib/orblx

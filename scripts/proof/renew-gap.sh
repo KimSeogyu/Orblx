@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # W25-11: the SVID renewal packet gap proof on the box.
 # Two orblx node daemons ([C] containers, node.rs on TUN) and one [C] coordinator with a short
-# node leaf life (ORBLX_RG_TTL, default 30 s, so a node renews every 20 s).
+# node leaf life (ORBLX_RG_TTL, default 180 s, so a node renews every 90 s; W25-45: the
+# coordinator refuses a life under 180 s).
 # Each run pings from node-a to the node-b overlay address every 50 ms for ORBLX_RG_SECS
-# (default 75 s), with no other load (idle). node-b answers the echo in the datapath.
+# (default 300 s), with no other load (idle). node-b answers the echo in the datapath.
 # renew-gap-table.py puts every ping next to the nearest SVID renewal of node-a or node-b
 # (the docker log time of "The node renewed the SVID") and writes runN.samples.tsv (W25-5 format).
 # Gate per run: each node renews 2 times or more during the pings, and in the renewal
@@ -20,8 +21,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT" || exit 1
 RUNS="${ORBLX_RG_RUNS:-10}"
-TTL="${ORBLX_RG_TTL:-30}"
-SECS="${ORBLX_RG_SECS:-75}"
+TTL="${ORBLX_RG_TTL:-180}"
+SECS="${ORBLX_RG_SECS:-300}"
 LIMIT_MS="${ORBLX_RG_LIMIT_MS:-20}"
 INTERVAL="0.05"
 PROJECT="${ORBLX_RG_PROJECT:-orblx-renew-gap}"
