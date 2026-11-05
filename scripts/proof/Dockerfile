@@ -9,6 +9,8 @@ RUN printf '%s\n' '#!/bin/sh' 'exit 101' > /usr/sbin/policy-rc.d \
         iproute2 \
         iputils-ping \
         iptables \
+        nftables \
+        miniupnpd \
         curl \
         jq \
         python3 \
