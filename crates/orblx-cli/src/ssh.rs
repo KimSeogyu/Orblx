@@ -1,6 +1,6 @@
 //! `orblx ssh`.
 //!
-//! The client signs in with an SVID.
+//! The client signs in with one short user certificate from the coordinator.
 //! The client does not read or write an SSH key file.
 
 use std::fs;
@@ -30,11 +30,9 @@ pub(crate) enum Command {
 pub(crate) struct SessionOptions {
     user: String,
     node: String,
-    identity: PathBuf,
-    netmap: PathBuf,
-    /// W25-31: the node state directory. The client then signs in with a user certificate
-    /// from the coordinator.
-    state: Option<PathBuf>,
+    /// W25-31: the node state directory. The client signs in with a user certificate
+    /// from the coordinator. The netmap is `netmap.json` in this directory.
+    state: PathBuf,
     peer_cert: PathBuf,
     command: String,
     shell: bool,
@@ -45,8 +43,6 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         return Ok(Command::Help);
     }
     let mut target = None;
-    let mut identity = None;
-    let mut netmap = None;
     let mut state = None;
     let mut peer_cert = None;
     let mut command = None;
@@ -61,8 +57,6 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
             index += 1;
             let value = take_value(args, &mut index)?;
             match item {
-                "--identity" => identity = Some(PathBuf::from(value)),
-                "--netmap" => netmap = Some(PathBuf::from(value)),
                 "--state" => state = Some(PathBuf::from(value)),
                 "--peer-cert" => peer_cert = Some(PathBuf::from(value)),
                 "--command" => command = Some(value),
@@ -78,21 +72,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
     }
     let target = target.ok_or_else(|| format!("The command needs USER@NODE.\n{}", help()))?;
     let (user, node) = split_target(&target)?;
-    let (identity, netmap) = match &state {
-        Some(dir) => {
-            if identity.is_some() || netmap.is_some() {
-                return Err(format!(
-                    "The flag --state does not go with --identity or --netmap.\n{}",
-                    help()
-                ));
-            }
-            (dir.clone(), dir.join("netmap.json"))
-        }
-        None => (
-            identity.ok_or_else(|| format!("The command needs --identity.\n{}", help()))?,
-            netmap.ok_or_else(|| format!("The command needs --netmap.\n{}", help()))?,
-        ),
-    };
+    let state = state.ok_or_else(|| format!("The command needs --state.\n{}", help()))?;
     let peer_cert =
         peer_cert.ok_or_else(|| format!("The command needs --peer-cert.\n{}", help()))?;
     if shell && command.is_some() {
@@ -104,8 +84,6 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
     Ok(Command::Session(SessionOptions {
         user,
         node,
-        identity,
-        netmap,
         state,
         peer_cert,
         command: command.unwrap_or_else(|| DEFAULT_COMMAND.to_string()),
@@ -116,9 +94,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
 pub(crate) fn run(command: Command) -> Result<(), String> {
     if let Command::Session(options) = &command {
         // W25-31: refuse a non-root caller before the client reads any node state file.
-        if let Some(state) = options.state.as_deref() {
-            orblx_ssh::cert::require_root_caller(state)?;
-        }
+        orblx_ssh::cert::require_root_caller(&options.state)?;
     }
     match command {
         Command::Help => {
@@ -155,14 +131,15 @@ fn run_blocking(options: SessionOptions) -> Result<orblx_ssh::SessionOutput, Str
         .build()
         .map_err(|_| "The SSH client did not start.".to_string())?;
     runtime.block_on(async move {
-        let netmap = Netmap::from_path(&options.netmap).map_err(|err| err.to_string())?;
+        let netmap =
+            Netmap::from_path(&options.state.join("netmap.json")).map_err(|err| err.to_string())?;
         let (addr, dst) = locate(&netmap, &options.node)?;
-        let cert_login = cert_login(options.state.as_deref())?;
+        let cert_login = cert_login(&options.state)?;
         run_session(SessionRequest {
             user: options.user,
             addr,
             dst,
-            identity_dir: options.identity,
+            identity_dir: options.state,
             peer_cert: options.peer_cert,
             command: options.command,
             cert_login,
@@ -176,9 +153,10 @@ fn run_shell_blocking(options: SessionOptions) -> Result<u32, String> {
         .enable_all()
         .build()
         .map_err(|_| "The SSH client did not start.".to_string())?;
-    let netmap = Netmap::from_path(&options.netmap).map_err(|err| err.to_string())?;
+    let netmap =
+        Netmap::from_path(&options.state.join("netmap.json")).map_err(|err| err.to_string())?;
     let (addr, dst) = locate(&netmap, &options.node)?;
-    let cert_login = cert_login(options.state.as_deref())?;
+    let cert_login = cert_login(&options.state)?;
     let (cols, rows) = local_terminal_size();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm".to_string());
     let (sender, receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -202,7 +180,7 @@ fn run_shell_blocking(options: SessionOptions) -> Result<u32, String> {
             user: options.user,
             addr,
             dst,
-            identity_dir: options.identity,
+            identity_dir: options.state,
             peer_cert: options.peer_cert,
             command: String::new(),
             cert_login,
@@ -223,10 +201,7 @@ fn run_shell_blocking(options: SessionOptions) -> Result<u32, String> {
 ///
 /// Only root may ask: the node SVID key is root-only. The client makes a new key in memory.
 /// The coordinator takes the user from the owner of this node. The request names no user.
-fn cert_login(state: Option<&Path>) -> Result<CertLogin, String> {
-    let Some(state) = state else {
-        return Err("The SSH client needs --state for a certificate login.".to_string());
-    };
+fn cert_login(state: &Path) -> Result<CertLogin, String> {
     orblx_ssh::cert::require_root_caller(state)?;
     let coord: SocketAddr = fs::read_to_string(state.join("coord-addr"))
         .map_err(|_| "The node has no coordinator address.".to_string())?
@@ -288,19 +263,16 @@ fn split_target(text: &str) -> Result<(String, String), String> {
 
 fn help() -> String {
     "\
-orblx ssh USER@NODE --identity DIR --netmap FILE --peer-cert FILE [--command TEXT | --shell]
 orblx ssh USER@NODE --state DIR --peer-cert FILE [--command TEXT | --shell]
 
-With --state, the client asks the coordinator for one short SSH user certificate with the
+The client asks the coordinator for one short SSH user certificate with the
 node SVID in DIR, and signs in with that certificate. Only root can use --state.
 The certificate names the user who owns this node. Do not enroll a multi-user host as a
 personal node.
 
 The client connects to the node overlay address on port 22.
+The client reads the netmap from DIR/netmap.json.
 The client checks the SSH host key against the node SVID in --peer-cert.
-The client signs the login with the SVID in --identity.
-An agent directory also holds ticket.bin.
-The ticket is one shot for one host.
 The command does not read authorized_keys.
 The command does not write an SSH key file.
 The default command prints ORBLX_SSH_USER.
@@ -312,6 +284,8 @@ The client sends standard input to the shell and prints the shell output.
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{parse, run, Command};
 
     /// W25-31: a non-root caller gets the root error before the client reads node state.
@@ -342,13 +316,11 @@ mod tests {
     }
 
     #[test]
-    fn the_parser_requires_the_svid_paths() {
+    fn the_parser_requires_state() {
         let command = parse(&[
             "alice@box".to_string(),
-            "--identity".to_string(),
-            "id".to_string(),
-            "--netmap".to_string(),
-            "netmap.json".to_string(),
+            "--state".to_string(),
+            "/var/lib/orblx".to_string(),
             "--peer-cert".to_string(),
             "peer.pem".to_string(),
         ])
@@ -357,10 +329,50 @@ mod tests {
             Command::Session(options) => {
                 assert_eq!(options.user, "alice");
                 assert_eq!(options.node, "box");
+                assert_eq!(options.state, PathBuf::from("/var/lib/orblx"));
                 assert!(options.command.contains("ORBLX_SSH_USER"));
             }
             Command::Help => panic!("the parser did not select a session"),
         }
+        let missing = parse(&[
+            "alice@box".to_string(),
+            "--peer-cert".to_string(),
+            "peer.pem".to_string(),
+        ])
+        .unwrap_err();
+        assert!(missing.contains("The command needs --state."), "{missing}");
+    }
+
+    #[test]
+    fn the_identity_and_netmap_flags_fail_at_parse() {
+        let err = parse(&[
+            "alice@box".to_string(),
+            "--identity".to_string(),
+            "id".to_string(),
+            "--netmap".to_string(),
+            "netmap.json".to_string(),
+            "--peer-cert".to_string(),
+            "peer.pem".to_string(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("The flag --identity is not valid."), "{err}");
+        assert!(err.contains("--state"), "{err}");
+        assert!(!err.contains("--identity DIR"), "{err}");
+
+        let netmap_only = parse(&[
+            "alice@box".to_string(),
+            "--netmap".to_string(),
+            "netmap.json".to_string(),
+            "--state".to_string(),
+            "/var/lib/orblx".to_string(),
+            "--peer-cert".to_string(),
+            "peer.pem".to_string(),
+        ])
+        .unwrap_err();
+        assert!(
+            netmap_only.contains("The flag --netmap is not valid."),
+            "{netmap_only}"
+        );
     }
 
     #[test]
@@ -368,10 +380,8 @@ mod tests {
         let base = [
             "alice@box",
             "--shell",
-            "--identity",
-            "id",
-            "--netmap",
-            "netmap.json",
+            "--state",
+            "/var/lib/orblx",
             "--peer-cert",
             "peer.pem",
         ];
