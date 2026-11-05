@@ -272,7 +272,7 @@ mod device {
         apply_overlay(&mut installer, &name, config.address, config.netmask)
             .map_err(HelloError::Tun)?;
         let (from_tun_tx, from_tun_rx) = mpsc::channel(32);
-        let (to_tun_tx, to_tun_rx) = mpsc::channel(32);
+        let (to_tun_tx, to_tun_rx) = mpsc::channel(crate::tun_dev::TO_TUN_QUEUE);
         // Two threads: a read poll must not delay a write.
         let fd = Arc::new(fd);
         let reader = Arc::clone(&fd);
@@ -490,10 +490,30 @@ mod device {
     }
 
     /// Write packets to the utun device as soon as they arrive.
+    ///
+    /// The flag check is outside the loop. The off path does not read the clock.
     fn utun_write_loop(fd: Arc<OwnedFd>, mut to_tun: mpsc::Receiver<Vec<u8>>) {
+        if crate::soak::enabled() {
+            utun_write_loop_traced(fd, to_tun);
+            return;
+        }
         let raw = fd.as_raw_fd();
         while let Some(packet) = to_tun.blocking_recv() {
             if let Err(err) = write_ipv4(raw, &packet) {
+                eprintln!("The utun device write failed. {err}");
+                return;
+            }
+        }
+    }
+
+    fn utun_write_loop_traced(fd: Arc<OwnedFd>, mut to_tun: mpsc::Receiver<Vec<u8>>) {
+        let raw = fd.as_raw_fd();
+        let mut stats = crate::soak::TunWriteStats::new();
+        while let Some(packet) = to_tun.blocking_recv() {
+            let start = std::time::Instant::now();
+            let result = write_ipv4(raw, &packet);
+            stats.note(start.elapsed());
+            if let Err(err) = result {
                 eprintln!("The utun device write failed. {err}");
                 return;
             }
