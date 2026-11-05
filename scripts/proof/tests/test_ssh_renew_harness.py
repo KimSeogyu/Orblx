@@ -36,6 +36,29 @@ def function_text(src, name):
     return "\n".join(out) + "\n"
 
 
+def orblx_ssh_commands(src):
+    """Return each continued orblx ssh command as one string."""
+    lines = src.splitlines()
+    commands = []
+    index = 0
+    while index < len(lines):
+        if "orblx ssh" not in lines[index]:
+            index += 1
+            continue
+        parts = []
+        while True:
+            part = lines[index].strip()
+            continued = part.endswith("\\")
+            if continued:
+                part = part[:-1].rstrip()
+            parts.append(part)
+            index += 1
+            if not continued:
+                break
+        commands.append(" ".join(parts))
+    return commands
+
+
 class SshRenewHarnessTest(unittest.TestCase):
     def setUp(self):
         self.src = source()
@@ -60,6 +83,18 @@ class SshRenewHarnessTest(unittest.TestCase):
             builds,
             ['docker build --network host --no-cache -q -t orblx-ssh-renew:local "$image_dir" >/dev/null'],
         )
+
+    def test_each_orblx_ssh_line_uses_state_and_not_identity_or_netmap(self):
+        commands = orblx_ssh_commands(self.src)
+        self.assertEqual(len(commands), 2)
+        for command in commands:
+            self.assertNotIn("--identity", command)
+            self.assertNotIn("--netmap", command)
+            self.assertIn("--state /var/lib/orblx", command)
+        self.assertIn("--command", commands[0])
+        self.assertIn("--shell", commands[1])
+        self.assertIn("--peer-cert", commands[0])
+        self.assertIn("--peer-cert", commands[1])
 
     def test_the_build_is_release_and_the_log_names_the_profile(self):
         src = self.src
