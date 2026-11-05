@@ -20,7 +20,9 @@ FILE="scripts/proof/compose.nat-realism.yml"
 NATR_PREFIX="${ORBLX_NATR_PREFIX:-orblx-pmap-}"
 PROJECT="${ORBLX_NATR_PROJECT:-orblx-pmap-proof}"
 IMAGE="${ORBLX_NATR_IMAGE:-orblx-pmap:portmap}"
-PUB="${ORBLX_NATR_PUB:-172.29.31}"
+# 23.31.0.0/24 is a public range on this Docker network only.
+# miniupnpd refuses a private WAN address, so the lab WAN is not in 172.16.0.0/12.
+PUB="${ORBLX_NATR_PUB:-23.31.0}"
 LAN="${ORBLX_NATR_LAN:-10.31}"
 export ORBLX_NATR_IMAGE="$IMAGE" ORBLX_NATR_PUB="$PUB" ORBLX_NATR_LAN="$LAN"
 export ORBLX_ROUTER_C="${ORBLX_ROUTER_C:-symmetric}"
@@ -130,6 +132,9 @@ start_nat() {
   local container
   container="$(container_of "$name")"
   stop_node "$container"
+  # Drop the previous status before this process starts. A reader must not see the old path.
+  dc --profile nodes run --rm --no-deps --entrypoint /bin/sh "$name" -c \
+    'rm -f /var/lib/orblx/status.txt /var/lib/orblx/status.txt.tmp' >/dev/null
   dc --profile nodes run -d --name "$container" --no-deps "$name" \
     nat run \
     --state /var/lib/orblx \
@@ -161,7 +166,9 @@ wait_path() {
     text="$(status_text "$container")"
     if printf '%s\n' "$text" | has_line "^peer ${peer} "; then
       kind="$(path_of "$text")"
-      if [[ "$kind" == "$want" ]]; then
+      # The status file is on the volume. The previous process can leave `relay` there.
+      # This container's log line is the proof that this run carried the packet.
+      if [[ "$kind" == "$want" ]] && docker logs "$container" 2>&1 | read_all grep -q "The first ${want} packet arrived at"; then
         printf '%s\n' "$text"
         return 0
       fi
@@ -207,10 +214,10 @@ first_ms() {
 ping_loss() {
   local out transmitted received
   out="$(docker exec "$1" ping -n -i 0.2 -c "$PINGS" -W 1 "$2" || true)"
-  printf '%s\n' "$out" | tail -2
+  printf '%s\n' "$out" | tail -2 >&2
   transmitted="$(printf '%s\n' "$out" | awk '/packets transmitted/ {print $1; exit}')"
   received="$(printf '%s\n' "$out" | awk '/packets transmitted/ {print $4; exit}')"
-  if [[ -z "$transmitted" || -z "$received" ]]; then
+  if [[ ! "$transmitted" =~ ^[0-9]+$ || ! "$received" =~ ^[0-9]+$ ]]; then
     echo "none"
     return 0
   fi
@@ -268,11 +275,19 @@ run_case() {
   log_lines "$container_d"
   direct_ms="$(first_ms direct "$container_c")"
   relay_ms="$(first_ms relay "$container_c")"
+  # Ping after this run has carried a packet. A stale status file must not start the ping.
   loss="$(ping_loss "$container_c" "$IP_D")"
   ok="no"
-  if [[ "$path_c" == "$want" && "$path_d" == "$want" ]]; then
-    local lost_n="${loss%%/*}"
-    if [[ "$lost_n" != "none" && "$lost_n" -le "$MAX_LOSS" ]]; then
+  local packet_ms="none"
+  if [[ "$want" == "direct" ]]; then
+    packet_ms="$direct_ms"
+  elif [[ "$want" == "relay" ]]; then
+    packet_ms="$relay_ms"
+  fi
+  if [[ "$path_c" == "$want" && "$path_d" == "$want" && "$packet_ms" =~ ^[0-9]+$ ]]; then
+    local lost_n="${loss##*$'\n'}"
+    lost_n="${lost_n%%/*}"
+    if [[ "$lost_n" =~ ^[0-9]+$ && "$lost_n" -le "$MAX_LOSS" ]]; then
       ok="yes"
     fi
   fi
@@ -354,7 +369,7 @@ PY
 echo "=== REAL rustc and image ==="
 open_legacy_forward
 build_image
-dc up -d coord relay
+dc up -d coord relay router-c router-d
 wait_bundle
 dc exec -T coord orblx coord token create --state /var/lib/orblx --ttl 3600 --out /var/lib/orblx/tokens/node-c | sed 's/[A-Za-z0-9_-]\{32,\}/<redacted>/g'
 dc exec -T coord orblx coord token create --state /var/lib/orblx --ttl 3600 --out /var/lib/orblx/tokens/node-d | sed 's/[A-Za-z0-9_-]\{32,\}/<redacted>/g'

@@ -28,8 +28,9 @@ iface_for() {
 start_mapping_daemon() {
   wan_iface="$1"
   wan_ip="$2"
-  lan_ip="$3"
-  node_ip="$4"
+  lan_iface="$3"
+  lan_ip="$4"
+  node_ip="$5"
   if ! command -v miniupnpd >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1; then
     echo "miniupnpd or nft is not installed." >&2
     exit 1
@@ -60,8 +61,7 @@ EOF
   nft -f /tmp/orblx-map.nft
   cat > /tmp/miniupnpd.conf <<EOF
 ext_ifname=${wan_iface}
-ext_ip=${wan_ip}
-listening_ip=${lan_ip}
+listening_ip=${lan_iface}
 http_port=5000
 enable_pcp_pmp=yes
 enable_upnp=yes
@@ -78,6 +78,7 @@ allow 1-65535 ${node_ip}/32 1-65535
 deny 0-65535 0.0.0.0/0 0-65535
 EOF
   miniupnpd -d -f /tmp/miniupnpd.conf > /tmp/miniupnpd.log 2>&1 &
+  echo "mapping wan ${wan_ip} lan ${lan_iface} ${lan_ip} node ${node_ip}"
   echo "miniupnpd pid $!"
   i=0
   while [ "$i" -lt 50 ]; do
@@ -130,18 +131,18 @@ elif [ "$MODE" = "symmetric" ] || [ "$MODE" = "symmap" ]; then
   iptables -t nat -A POSTROUTING -o "$WAN" -p tcp -j MASQUERADE
   iptables -t nat -A POSTROUTING -o "$WAN" -p icmp -j MASQUERADE
   if [ "$MODE" = "symmap" ]; then
-    start_mapping_daemon "$WAN" "$WAN_IP" "$LAN_IP" "$NODE_IP"
+    start_mapping_daemon "$WAN" "$WAN_IP" "$LAN" "$LAN_IP" "$NODE_IP"
   fi
 else
   echo "The router mode ${MODE} is not valid." >&2
   exit 1
 fi
 
-# The proof LANs are 10.19.0.0/16.
 # The router does not forward between two LANs.
 # A node can reach another node only through the public address of that node's router.
-iptables -I FORWARD 1 -d 10.19.0.0/16 ! -o "$LAN" -j DROP
-iptables -I FORWARD 2 -s 10.19.0.0/16 ! -i "$LAN" -j DROP
+LAN_NET="$(printf '%s\n' "$LAN_IP" | awk -F. '{print $1"."$2".0.0/16"}')"
+iptables -I FORWARD 1 -d "$LAN_NET" ! -o "$LAN" -j DROP
+iptables -I FORWARD 2 -s "$LAN_NET" ! -i "$LAN" -j DROP
 
 iptables -A FORWARD -i "$LAN" -o "$WAN" -j ACCEPT
 iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT

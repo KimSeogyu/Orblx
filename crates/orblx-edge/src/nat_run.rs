@@ -184,7 +184,11 @@ pub struct NatConfig {
 
 /// Run one NAT node until SIGINT or SIGTERM.
 pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
+    let started = Instant::now();
     install_signals();
+    // The status file is from the previous process until this process writes it.
+    // Write `down` before the probe so a reader does not treat the old path as live.
+    write_status_file(&config.state_dir, &starting_status(&config));
     if let Some(gateway) = config.gateway {
         set_default_route(gateway)?;
     }
@@ -252,7 +256,7 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         session,
         token: session_punch_token(&session),
         relay_id: RelaySessionId::from_bytes(session),
-        started: Instant::now(),
+        started,
         keys: Mutex::new(gate),
         select: Mutex::new(PathSelect::default()),
         queues: Mutex::new(Queues::default()),
@@ -999,12 +1003,34 @@ impl Hub {
                 svid_expiry: peer_expiry,
             }],
         };
-        let text = format_node_status(&status);
-        let path = self.state_dir.join(NODE_STATUS_FILE);
-        let tmp = self.state_dir.join("status.txt.tmp");
-        if fs::write(&tmp, text.as_bytes()).is_ok() {
-            let _ = fs::rename(&tmp, &path);
-        }
+        write_status_file(&self.state_dir, &status);
+    }
+}
+
+fn starting_status(config: &NatConfig) -> NodeStatus {
+    NodeStatus {
+        state: "starting".to_string(),
+        name: config.name.clone(),
+        overlay_ip: config.overlay.to_string(),
+        svid: config.svid.clone(),
+        svid_expiry: config.svid_expiry,
+        exit_node: None,
+        peers: vec![StatusPeer {
+            name: config.peer_name.clone(),
+            overlay_ip: config.peer_overlay.to_string(),
+            path: "down".to_string(),
+            svid: config.peer_svid.clone(),
+            svid_expiry: None,
+        }],
+    }
+}
+
+fn write_status_file(dir: &Path, status: &NodeStatus) {
+    let text = format_node_status(status);
+    let path = dir.join(NODE_STATUS_FILE);
+    let tmp = dir.join("status.txt.tmp");
+    if fs::write(&tmp, text.as_bytes()).is_ok() {
+        let _ = fs::rename(&tmp, &path);
     }
 }
 
