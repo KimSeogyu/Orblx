@@ -21,6 +21,8 @@ x-node: &node
     # W25-42 diagnostic only: empty means off.
     ORBLX_DIAG_FILE: ${TR_DIAG_FILE:-}
     ORBLX_DIAG_TICK_MS: "10"
+    # W25-42 step 2: host exports ORBLX_SOAK_TRACE=1; empty/other = off (no forward-path cost).
+    ORBLX_SOAK_TRACE: ${ORBLX_SOAK_TRACE:-}
 
 x-up: &up
   - up

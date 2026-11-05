@@ -11,6 +11,21 @@ The 20:17 failure stays counted and unproven. Step 1 (22:04:43 KST stall) stays 
 - The full `proof_contention` lines are quoted. samples >= 1, contended_samples 0 and
   unknown_samples 0 are required; unknown_samples > 0 makes the run INVALID.
 
+- `ORBLX_SOAK_TRACE=1` on every node (owner, a, b, …). The compose x-node block passes
+  `ORBLX_SOAK_TRACE` from the host. The host exports `ORBLX_SOAK_TRACE=1` before
+  `coord-cert-soak.sh`. Any other value, or an unset variable, leaves the traces off
+  (no clock, no allocate, no log on the forward path). The soak lines
+  (`tun_write`, `to_tun_queued`, `to_tun_send_wait`, `runtime_tick_late`) are required
+  for the stall report. This needs the ORBLX_SOAK_TRACE code from main (PR #153).
+- Hard wall-clock limit: `SOAK_S + 15` minutes (8100 s when `SOAK_S=7200`), counted from
+  wrapper start (lock wait included). A cancel for that limit:
+  1. prints `proof_cancel reason=hard_limit_<N>s INVALID` to the run log,
+  2. sends TERM to the soak process group so the soak EXIT trap runs `proof_lock_end`
+     and prints `proof_lock <label> released at <time> pid=<pid>`,
+  3. if the lock is still held after a short wait, prints the same release line from the
+     wrapper and clears the holder, then stops the project with compose down.
+  A hard-limit cancel makes the diagnostic run INVALID. It must not leave the proof lock held.
+
 ## What is measured (all inside TR_OUT_DIR)
 1. In-container ping, 12 directions (`dc exec SRC ping -D -O`), unchanged: `ping-SRC-DST.txt`.
 2. Host prober, same 12 directions, raw ICMP sent from the host inside each node's net namespace
