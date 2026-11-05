@@ -418,6 +418,7 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
         config,
         netmap,
         listen: options.listen,
+        listen_socket: None,
         state_dir: options.state_dir,
         renew,
         stop: None,
@@ -439,6 +440,7 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
         })),
         on_listen: None,
         metrics: options.metrics,
+        metrics_listener: None,
         filter,
     })
     .map_err(|err| err.to_string())

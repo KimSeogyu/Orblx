@@ -39,7 +39,10 @@ pub use demo::{
 };
 pub use error::AuditError;
 pub use event::{DenyReason, EventKind, SessionEvent, SessionIds};
-pub use expose::{default_metrics_addr, sample_line, spawn_metrics_server, DEFAULT_METRICS_PORT};
+pub use expose::{
+    default_metrics_addr, sample_line, spawn_metrics_listener, spawn_metrics_server,
+    DEFAULT_METRICS_PORT,
+};
 pub use metrics::SessionMetrics;
 pub use siem::{
     datadog_batch, ndjson_batch, splunk_hec_batch, syslog_frame, syslog_host, SIEM_SOURCE,

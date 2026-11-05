@@ -14,6 +14,7 @@ mod netmap;
 mod node;
 mod quic;
 mod relay_path;
+mod reserve;
 mod router;
 mod run;
 mod soak;
@@ -55,6 +56,7 @@ pub use quic::{
     measure_hello_rtt, prove_hello_socket, HelloConfig, HelloEndpoint, HelloReceiver, HelloSender,
     HelloSession, HelloSocketRole,
 };
+pub use reserve::{reserve_tcp_listeners, reserve_udp_sockets};
 pub use router::{route_packet, RouteMatch, RouterError, RouterTable};
 pub use run::{run_hello, HelloRequest, HelloRole};
 pub use tun_bench::{run_local_tun_bench, TunBenchOutcome, TunBenchReport};
