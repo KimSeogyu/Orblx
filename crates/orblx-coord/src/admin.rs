@@ -273,9 +273,11 @@ pub fn nodes(coord: &Coordinator) -> Result<Value, CoordError> {
                 "overlay_ip": node.overlay_ip,
                 "svid": node.svid,
                 "owner": node.owner,
-                "approved": node.approved && !node.expired,
+                "approved": node.approved && !node.expired && !node.removed,
                 "expired": node.expired,
-                "pending": !node.approved && !node.expired
+                "removed": node.removed,
+                "ephemeral": node.ephemeral,
+                "pending": !node.approved && !node.expired && !node.removed
             })
         })
         .collect();
