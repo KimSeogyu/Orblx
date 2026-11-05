@@ -22,7 +22,7 @@ SCRIPT = r"""
 set -euo pipefail
 . "$LOCK_SH"
 trap proof_lock_end EXIT
-proof_lock_take disk-test orblx-test-
+proof_lock_take disk-test orblx-test
 echo proof_step_ran
 """
 

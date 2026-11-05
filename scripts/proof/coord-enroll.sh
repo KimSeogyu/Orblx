@@ -32,7 +32,7 @@ cleanup() {
 # W25-14b: the build is a proof step. A build that stops on a full disk is a FAIL.
 # proof_lock_take runs proof_disk_check (proof-lock.sh) before the lock and before the build.
 trap 'cleanup; proof_lock_end' EXIT
-proof_lock_take "coord-enroll" "orblx-coord-proof-"
+proof_lock_take "coord-enroll" "orblx-coord-proof"
 proof_compose_clean "orblx-coord-proof" || exit 1
 # The test hook ORBLX_COORD_ENROLL_FAIL_AT=start makes the proof fail on purpose after it
 # starts the coordinator. The cleanup test uses it.

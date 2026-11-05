@@ -486,7 +486,7 @@ case "$LOCK_MODE" in
     . "$LOCK_LIB"
     trap 'proof_lock_end; rm -f "$MANIFEST_TMP"' EXIT
     note "lock mode sweep: wait for the lock"
-    proof_lock_take "rc3-sweep:$SHORT" orblx-rc3sw-
+    proof_lock_take "rc3-sweep:$SHORT" orblx-rc3sw
     note "lock mode sweep: lock taken $(now)"
     ;;
   *) die "ORBLX_SWEEP_LOCK_MODE must be proof or sweep" ;;
@@ -529,7 +529,7 @@ for i in "${!P_NAME[@]}"; do
       bash -c '
         . "$1" || exit 98
         trap "echo \"release_sweep: proof run end epoch \$(date +%s)\"; proof_lock_end" EXIT
-        proof_lock_take "$2" orblx-rc3sw-
+        proof_lock_take "$2" orblx-rc3sw
         echo "release_sweep: proof run start epoch $(date +%s)"
         cd "$3"
         if command -v timeout >/dev/null 2>&1; then

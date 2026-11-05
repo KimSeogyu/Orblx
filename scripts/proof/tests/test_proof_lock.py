@@ -22,7 +22,7 @@ HOLDER = r"""
 set -euo pipefail
 . "$LOCK_SH"
 trap proof_lock_end EXIT
-proof_lock_take "$LABEL" orblx-test-
+proof_lock_take "$LABEL" orblx-test
 echo "hold_start $LABEL $(date +%s%3N)"
 # A proof may wait for all of its own jobs. The sampler must not be one of them.
 sleep "$HOLD" &
@@ -34,7 +34,7 @@ CHILD = r"""
 set -euo pipefail
 . "$LOCK_SH"
 trap proof_lock_end EXIT
-proof_lock_take child orblx-test-
+proof_lock_take child orblx-test
 echo child_ran
 """
 
@@ -97,7 +97,7 @@ class ProofLockTest(unittest.TestCase):
 set -euo pipefail
 . "$LOCK_SH"
 trap proof_lock_end EXIT
-proof_lock_take parent orblx-test-
+proof_lock_take parent orblx-test
 bash -c "$CHILD"
 """
         env = dict(self.env, CHILD=CHILD)
@@ -120,35 +120,38 @@ bash -c "$CHILD"
                               text=True, timeout=60)
 
     def test_a_run_with_unknown_samples_fails_and_says_it_is_not_valid(self):
-        # W25-35: docker ps fails and sudo -n fails, so the sampler cannot count the containers.
+        # W25-35 + W25-46: when docker ps fails at acquire, proof_foreign_check aborts with
+        # containers_unknown (exit 5) before any proof step. The lock is released.
         env = with_fake_docker(self.env, docker=FAILS, sudo=SUDO_FAILS)
         res = self.run_holder(env, "blind", 1.5)
-        self.assertEqual(res.returncode, 3, res.stdout)
-        found = re.search(r"^proof_contention blind samples (\d+) contended_samples 0 unknown_samples (\d+) ", res.stdout, re.M)
-        self.assertIsNotNone(found, res.stdout)
-        samples, unknown = int(found.group(1)), int(found.group(2))
-        self.assertGreater(unknown, 0, res.stdout)
-        self.assertEqual(unknown, samples, res.stdout)
-        self.assertRegex(res.stdout, rf"(?m)^proof_contention_invalid blind unknown_samples {unknown} samples {samples}$")
+        self.assertEqual(res.returncode, 5, res.stdout)
+        self.assertIn("proof_infra_abort blind reason=containers_unknown names=none. No proof step ran.",
+                      res.stdout + (res.stderr or ""))
         self.assertIn("other_orblx_containers unknown", res.stdout)
-        # The lock is released before the script stops.
         self.assertIn("proof_lock blind released", res.stdout)
         free = subprocess.run(["flock", "-n", self.env["ORBLX_PROOF_LOCK"], "true"])
         self.assertEqual(free.returncode, 0)
 
     @unittest.skipIf(os.geteuid() == 0, "the sudo fallback is for a user that is not root")
     def test_the_sampler_uses_sudo_when_the_user_cannot_use_docker(self):
-        # W25-35: the root cause. The proof user is not in the docker group, but sudo -n docker works.
-        docker = '#!/bin/sh\n[ -n "$FAKE_VIA_SUDO" ] || exit 1\necho orblx-other-1\necho other-project\n'
+        # W25-35 + W25-46: sudo -n docker is used when docker ps fails. A foreign orblx
+        # container at acquire aborts with foreign_containers (exit 5). That proves the
+        # sudo path returned names (not containers_unknown).
+        docker = (
+            "#!/bin/sh\n"
+            '[ -n "$FAKE_VIA_SUDO" ] || exit 1\n'
+            'printf "orblx-other-1\tother-project\n"\n'
+            'printf "other-app\t\n"\n'
+        )
         env = with_fake_docker(self.env, docker=docker, sudo=SUDO)
         res = self.run_holder(env, "seen", 1.5)
-        self.assertEqual(res.returncode, 0, res.stdout)
-        found = re.search(r"^proof_contention seen samples (\d+) contended_samples (\d+) unknown_samples 0 "
-                          r"max_other_orblx_containers 1 ", res.stdout, re.M)
-        self.assertIsNotNone(found, res.stdout)
-        self.assertEqual(found.group(1), found.group(2), res.stdout)
-        self.assertNotIn("proof_contention_invalid", res.stdout)
-        self.assertRegex(res.stdout, r"proof_context seen phase start time \S+ load \S+ other_orblx_containers 1 groups orblx-other:1")
+        self.assertEqual(res.returncode, 5, res.stdout)
+        self.assertIn("proof_infra_abort seen reason=foreign_containers names=orblx-other-1",
+                      res.stdout + (res.stderr or ""))
+        self.assertIn("proof_lock seen released", res.stdout)
+        free = subprocess.run(["flock", "-n", self.env["ORBLX_PROOF_LOCK"], "true"])
+        self.assertEqual(free.returncode, 0)
+
 
     def test_a_run_with_known_samples_has_no_invalid_line(self):
         res = self.run_holder(self.env, "clear", 1.5)
