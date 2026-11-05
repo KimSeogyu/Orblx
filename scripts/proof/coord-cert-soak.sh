@@ -108,9 +108,9 @@ except Exception:
   fi
 }
 
-# Each soak service name must resolve inside the coordinator container.
+# Each soak service name must resolve inside this container.
 preflight_service_names() {
-  local id="$1" name ip line
+  local id="$1" role="$2" name ip line found first row
   local names=(coord owner a b c)
   local ips=("${TR_NET}.10" "${TR_NET}.20" "${TR_NET}.11" "${TR_NET}.12" "${TR_NET}.13")
   local i
@@ -126,14 +126,22 @@ preflight_service_names() {
       fi
     done <<< "$line"
     if [[ "$found" -eq 0 ]]; then
-      fail "The service name ${name} does not resolve to ${ip} inside the container."
+      fail "The service name ${name} does not resolve to ${ip} inside the ${role} container."
     fi
   done
 }
 
-coord_container() {
-  docker ps -q --filter "label=com.docker.compose.project=${TR_PROJECT}" \
-    --filter "label=com.docker.compose.service=coord" 2>/dev/null || true
+# The long-running service container. An enroll one-shot uses entrypoint sh.
+service_container() {
+  local svc="$1" id ep
+  for id in $(docker ps -q --filter "label=com.docker.compose.project=${TR_PROJECT}" \
+      --filter "label=com.docker.compose.service=${svc}" 2>/dev/null || true); do
+    ep="$(docker inspect -f '{{index .Config.Entrypoint 0}}' "$id" 2>/dev/null || true)"
+    if [[ "$ep" == /usr/local/bin/orblx-entrypoint ]]; then
+      printf '%s\n' "$id"
+      return 0
+    fi
+  done
 }
 
 echo "=== [C] run ${TR_SCRIPT} ==="
@@ -143,17 +151,29 @@ TR_PID="$!"
 # proof_compose_clean in ticket-renewal.sh removes an old stack. Follow only a coordinator
 # container that starts after the proof says "start coordinator".
 followed=""
+declare -A NAME_CHECKED=()
 while kill -0 "$TR_PID" >/dev/null 2>&1; do
   if [[ -z "$followed" ]] && read_all grep -q "start coordinator" < "$WORK/tr.log"; then
-    id="$(coord_container)"
+    id="$(service_container coord)"
     if [[ -n "$id" ]]; then
       preflight_docker_dns "$id"
-      preflight_service_names "$id"
+      preflight_service_names "$id" coord
+      NAME_CHECKED[coord]=1
       docker logs -f -t "$id" > "$COORD_LOG" 2>&1 &
       FOLLOW_PID="$!"
       followed="$id"
       echo "coord_log_follow container ${id:0:12}"
     fi
+  fi
+  # owner, a, b, and c dial with the name coord. Check each one after it starts.
+  if read_all grep -q "start owner, a, b, c" < "$WORK/tr.log"; then
+    for role in owner a b c; do
+      [[ -n "${NAME_CHECKED[$role]:-}" ]] && continue
+      id="$(service_container "$role")"
+      [[ -z "$id" ]] && continue
+      preflight_service_names "$id" "$role"
+      NAME_CHECKED[$role]=1
+    done
   fi
   sleep 2
 done
