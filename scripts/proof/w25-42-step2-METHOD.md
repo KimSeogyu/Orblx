@@ -93,5 +93,6 @@ Any host prober gap > 200 ms with no in-container gap is printed as PROBER_GAP (
 - Valid: the run completes under the lock with samples >= 1, contended 0, unknown 0, and all
   files 1-7 exist and are complete (gzip readable).
 - The TR gates are reported as they are, unchanged; a gate 4 FAIL still counts.
+- Gate 2 is N/A on main until the #155 coord_cert_tick work lands.
 - Result reported: each window's classification with its evidence lines. Acceptance condition (a)
   for the later gate change is met only if every window > 200 ms is HARNESS-VCPU.

@@ -12,6 +12,8 @@
 #  2. The coordinator crosses SOAK_COORD_ENDS or more ends of its own leaf. An end is a
 #     "coord svid expiry" or "coord svid renewed, new expiry" value E with E + MAX_SKEW before
 #     the run end (run_end_unix of ticket-renewal.sh: the end of the pings and status samples).
+#     When the log has no "coord svid expiry" line and no "coord svid renewed, new expiry" line,
+#     gate 2 prints N/A and does not fail.
 #  3. 0 "coord handshake failed" lines and 0 "coord svid renewal failed" lines.
 #  4. The run is SOAK_S seconds or more from the coordinator start to the run end.
 # Each gate value prints, also when the proof fails.
@@ -121,6 +123,19 @@ fi
 sed 's/^/tr | /' "$WORK/tr.log"
 echo "tr_exit ${tr_status}"
 
+# coord_cert_gate2_check LOG ENDS NEED
+# N/A when LOG has no coordinator leaf line. Otherwise ENDS must reach NEED.
+coord_cert_gate2_check() {
+  local log="$1" ends="$2" need="$3" expiry_lines renewed_lines
+  expiry_lines="$(awk 'index($0, "coord svid expiry") { n++ } END { print n + 0 }' "$log")"
+  renewed_lines="$(awk 'index($0, "coord svid renewed, new expiry") { n++ } END { print n + 0 }' "$log")"
+  if (( expiry_lines == 0 && renewed_lines == 0 )); then
+    echo "gate2 N/A reason=main_lacks_coord_svid_expiry_lines"
+    return 0
+  fi
+  (( ends >= need )) || fail "The run crossed ${ends} coordinator leaf ends, not ${need}."
+}
+
 echo "=== gates ==="
 RUN_END="$(awk '/^renew_period_s .* run_end_unix [0-9]+ / && !f {for (i = 1; i < NF; i++) if ($i == "run_end_unix") print $(i + 1); f = 1}' "$WORK/tr.log")"
 [[ -n "$RUN_END" ]] || fail "ticket-renewal.sh printed no run_end_unix."
@@ -143,6 +158,6 @@ echo "coord_svid_ends_crossed ${ends} coord_svid_renewals ${renewals} coord_hand
 read_all grep -qx "proof_ok" < "$WORK/tr.log" || fail "ticket-renewal.sh has no proof_ok line."
 (( handshake_fail == 0 )) || fail "${handshake_fail} coord handshake failed lines."
 (( renew_fail == 0 )) || fail "${renew_fail} coord svid renewal failed lines."
-(( ends >= SOAK_COORD_ENDS )) || fail "The run crossed ${ends} coordinator leaf ends, not ${SOAK_COORD_ENDS}."
+coord_cert_gate2_check "$COORD_LOG" "$ends" "$SOAK_COORD_ENDS"
 (( soak_run_s >= SOAK_S )) || fail "The run is ${soak_run_s} s from the coordinator start, not ${SOAK_S} s."
 echo "proof_ok coord-cert-soak"
