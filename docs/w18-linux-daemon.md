@@ -22,7 +22,7 @@ The process keeps the stored IP.
 The path kind is `direct` when the session received a frame in the last 2 seconds.
 The path kind is `stale` when the session is up and that frame is older.
 The path kind is `down` when the session is down.
-A coordinator address in `--coord` or in `coord-addr` makes the node renew the SVID at two thirds of the certificate life.
+A coordinator address in `--coord` or in `coord-addr` makes the node renew the SVID and the capability ticket. The renewal starts at least 5 minutes or one third of the certificate life before the end (half the life when the life is less than 10 minutes). After a renewal the node opens a new connection with the new ticket and closes the old one.
 The router sends each outbound TUN packet to the peer that owns the destination overlay IP.
 The TUN device name is `orblx0`.
 The systemd unit is `scripts/orblxd.service`.

@@ -69,12 +69,27 @@ static LINK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// A new leaf from the coordinator.
 ///
-/// Debug output elides the private key.
+/// Debug output elides the private key and the ticket.
 pub struct RenewedLeaf {
     /// PEM certificate for this node.
     pub certificate_pem: String,
     /// PEM private key for this node.
     pub private_key_pem: String,
+    /// The capability ticket that the coordinator issued with the leaf (W25-45).
+    ///
+    /// `None` keeps the current ticket. Use `None` only for a ticket that the
+    /// coordinator did not issue, for example a lab ticket.
+    pub ticket: Option<RenewedTicket>,
+}
+
+/// A capability ticket from a renewal.
+///
+/// Debug output elides the ticket bytes and the tag.
+pub struct RenewedTicket {
+    /// Identity version-1 ticket bytes.
+    pub bytes: Vec<u8>,
+    /// HMAC-SHA256 tag over `bytes`.
+    pub mac: [u8; 32],
 }
 
 impl std::fmt::Debug for RenewedLeaf {
@@ -82,6 +97,7 @@ impl std::fmt::Debug for RenewedLeaf {
         formatter
             .debug_struct("RenewedLeaf")
             .field("private_key_pem", &"[elided]")
+            .field("ticket", &self.ticket.as_ref().map(|_| "[elided]"))
             .finish()
     }
 }
@@ -609,7 +625,7 @@ fn prepare_node(request: NodeRequest, entered_at: Instant) -> Result<PreparedNod
 
 fn announce_renew(request: &NodeRequest) {
     if request.renew.is_some() {
-        println!("The node renews the SVID at two thirds of the certificate life.");
+        println!("The node renews the SVID before the end of the certificate life.");
     } else {
         println!(
             "The node does not renew the SVID. The state directory has no coordinator address."
@@ -1708,7 +1724,7 @@ async fn run_link(
     let (ask_tx, ask_rx) = watch::channel(0u64);
     let (tx, rx) = mpsc::channel(32);
     let generation = LINK_GENERATION.fetch_add(1, Ordering::Relaxed);
-    let expiry = session.peer_not_after();
+    let expiry = session.session_deadline();
     {
         let mut map = lock(&mesh.links);
         if mesh.endpoint.denies(session.peer_id()) {
@@ -2148,12 +2164,31 @@ fn apply_leaf(mesh: &Mesh, leaf: &RenewedLeaf) -> Result<u64, HelloError> {
     }
     let (not_before, not_after) = leaf_validity(&der).map_err(HelloError::Identity)?;
     let previous = lock(&mesh.identity).clone();
+    if let Some(ticket) = &leaf.ticket {
+        // B1: ticket.sub must be this node's URI (same check a peer runs).
+        let _checked = orblx_crypto::verify_ticket(
+            &previous.ticket_ring,
+            &ticket.bytes,
+            &ticket.mac,
+            &id,
+            SystemTime::now(),
+            &DenySet::empty(),
+        )
+        .map_err(HelloError::Ticket)?;
+    }
     let next = {
         let mut config = lock(&mesh.identity);
         config.certificate_pem = leaf.certificate_pem.clone();
         config.private_key_pem = leaf.private_key_pem.clone();
+        if let Some(ticket) = &leaf.ticket {
+            config.ticket_bytes = ticket.bytes.clone();
+            config.ticket_mac = ticket.mac;
+        }
         config.clone()
     };
+    // install_identity updates TLS and the presented ticket for NEW handshakes only.
+    // Open sessions keep the ticket they presented. Renewal then signals rekey so the
+    // node opens a new connection with the new cert+ticket and closes the old one.
     if let Err(err) = mesh.endpoint.install_identity(&next) {
         *lock(&mesh.identity) = previous;
         return Err(err);
@@ -2190,9 +2225,16 @@ fn retry_delay(attempt: u32) -> Duration {
 }
 
 fn renew_unix(not_before: u64, not_after: u64) -> u64 {
+    // W25-45 (Crypto): the renewal lead is at least max(life / 3, 5 min).
+    // A life under 10 min cannot keep a 5 min lead without a renewal loop near
+    // not_before, so for those lives the lead is half the life.
     let life = not_after.saturating_sub(not_before);
-    not_before.saturating_add(life.saturating_mul(2) / 3)
+    let lead = (life / 3).max(RENEW_LEAD_MIN_SECS.min(life / 2));
+    not_after.saturating_sub(lead).max(not_before)
 }
+
+/// The minimum renewal lead (W25-45) for a life of 10 min or more.
+const RENEW_LEAD_MIN_SECS: u64 = 5 * 60;
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -2836,10 +2878,24 @@ mod tests {
     }
 
     #[test]
-    fn renewal_starts_at_two_thirds_of_the_life() {
-        assert_eq!(super::renew_unix(1_000, 1_060), 1_040);
+    fn renewal_starts_at_half_of_a_short_life() {
+        assert_eq!(super::renew_unix(1_000, 1_060), 1_030);
         assert_eq!(super::renew_unix(0, 3), 2);
+        assert_eq!(super::renew_unix(0, 9), 5);
+        // 5 min: half the life, not a renewal at not_before.
+        assert_eq!(super::renew_unix(100, 400), 250);
         assert_eq!(super::renew_unix(50, 50), 50);
+    }
+
+    /// W25-45: the renewal lead is at least max(life / 3, 5 min) for a life of 10 min or more.
+    #[test]
+    fn renewal_lead_is_at_least_five_minutes_or_a_third_of_the_life() {
+        // Default node SVID life (15 min): lead 5 min.
+        assert_eq!(super::renew_unix(0, 900), 600);
+        // 10 min: a third is 200 s, so the lead is 5 min.
+        assert_eq!(super::renew_unix(0, 600), 300);
+        // 1 h: a third is 20 min.
+        assert_eq!(super::renew_unix(0, 3_600), 2_400);
     }
 
     #[test]

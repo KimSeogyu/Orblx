@@ -22,6 +22,8 @@ use crate::{is_ipv4_packet, Frame, FrameType, HelloError};
 pub struct PeerGate {
     peer: Option<SpiffeId>,
     admitted: Option<AdmittedTicket>,
+    /// Peer leaf `not_after` from bind_leaf (Unix seconds). None until bound.
+    peer_not_after: Option<u64>,
     /// `None` keeps the legacy human path.
     /// `Some` enforces the receiver grant set, including an empty set.
     grants: Option<ReceiverGrants>,
@@ -32,6 +34,8 @@ struct AdmittedTicket {
     bytes: Vec<u8>,
     mac: [u8; 32],
     ring: TicketRing,
+    /// Ticket `expires` as Unix seconds (strict end).
+    expires: u64,
 }
 
 impl fmt::Debug for PeerGate {
@@ -61,6 +65,7 @@ impl PeerGate {
         Self {
             peer: None,
             admitted: None,
+            peer_not_after: None,
             grants: None,
         }
     }
@@ -74,6 +79,7 @@ impl PeerGate {
         Self {
             peer: Some(peer),
             admitted: None,
+            peer_not_after: None,
             grants: None,
         }
     }
@@ -82,6 +88,29 @@ impl PeerGate {
     #[must_use]
     pub fn peer(&self) -> Option<&SpiffeId> {
         self.peer.as_ref()
+    }
+
+    /// Ticket `expires` for the admitted ticket, if any.
+    #[must_use]
+    pub fn ticket_expires(&self) -> Option<u64> {
+        self.admitted.as_ref().map(|t| t.expires)
+    }
+
+    /// Peer leaf `not_after`, if bound.
+    #[must_use]
+    pub fn peer_not_after(&self) -> Option<u64> {
+        self.peer_not_after
+    }
+
+    /// Session deadline: min(ticket expires, peer cert not_after). B2.
+    #[must_use]
+    pub fn session_deadline(&self) -> Option<u64> {
+        match (self.ticket_expires(), self.peer_not_after) {
+            (Some(t), Some(c)) => Some(t.min(c)),
+            (Some(t), None) => Some(t),
+            (None, Some(c)) => Some(c),
+            (None, None) => None,
+        }
     }
 
     /// Check the leaf and bind the SPIFFE ID.
@@ -103,8 +132,10 @@ impl PeerGate {
         if extracted != authed {
             return Err(HelloError::PeerRejected);
         }
+        let not_after = orblx_identity::leaf_not_after(leaf_der).map_err(HelloError::Identity)?;
         self.peer = Some(authed);
         self.admitted = None;
+        self.peer_not_after = Some(not_after);
         self.peer.as_ref().ok_or(HelloError::PeerNotBound)
     }
 
@@ -156,6 +187,7 @@ impl PeerGate {
             bytes: ticket_bytes.to_vec(),
             mac: *mac,
             ring: ring.clone(),
+            expires: proof.expires(),
         });
         Ok(hash)
     }
@@ -218,6 +250,18 @@ impl PeerGate {
         if frame.ticket_hash != *proof.hash() {
             return Err(HelloError::TicketHash);
         }
+
+        // B2: refuse DATA/CTRL past the peer leaf not_after even with a fresh ticket
+        // on this same session (the leaf was authenticated at bind).
+        if let Some(not_after) = self.peer_not_after {
+            let now_unix = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if now_unix > not_after {
+                return Err(HelloError::Identity(orblx_identity::IdentityError::Expired));
+            }
+        }
         if !is_ipv4_packet(&frame.payload) {
             return Err(HelloError::NotIpv4);
         }
@@ -258,6 +302,18 @@ impl PeerGate {
         .map_err(HelloError::Ticket)?;
         if frame.ticket_hash != *proof.hash() {
             return Err(HelloError::TicketHash);
+        }
+
+        // B2: refuse DATA/CTRL past the peer leaf not_after even with a fresh ticket
+        // on this same session (the leaf was authenticated at bind).
+        if let Some(not_after) = self.peer_not_after {
+            let now_unix = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if now_unix > not_after {
+                return Err(HelloError::Identity(orblx_identity::IdentityError::Expired));
+            }
         }
         Ok(())
     }

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use orblx_crypto::{mac_input, ticket_mac, TicketKey, TicketRing};
 use orblx_datapath::{
     ipv4_packet, run_memory_node, AllowPeers, HelloEndpoint, ListenEvent, MemoryDevice, Netmap,
-    NodeRequest, RenewedLeaf, SvidRenewer, NODE_STATUS_FILE,
+    NodeRequest, RenewedLeaf, RenewedTicket, SvidRenewer, NODE_STATUS_FILE,
 };
 use orblx_identity::{
     decode_certificate_pem, leaf_validity, sign_ticket, SpiffeId, TicketClaims, TicketFlags,
@@ -364,6 +364,232 @@ async fn session_stays_up_for_three_svid_lifetimes() {
         expiries.len() >= 3,
         "svid expiries {expiries:?} over three lifetimes"
     );
+}
+
+/// W25-45: the node presents the capability ticket that the coordinator issued.
+///
+/// `session_stays_up_for_three_svid_lifetimes` uses a hand-made ticket with a life of 1 h, so it
+/// does not see the coordinator ticket expire. This test builds the node config the way
+/// `orblx up` does (`ticket_load::load_hello_config`): from the enroll ticket, whose expiry is
+/// the enroll time plus the SVID life. The nodes renew the SVID more than three times each, and
+/// the path must keep passing DATA after the first ticket expired. The run goes on for 60 s
+/// (the old ticket end grace) plus 15 s after the first ticket end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_coordinator_ticket_keeps_the_path_up_across_svid_renewals() {
+    const LIFE_SECS: u64 = 9;
+    const PROBE_MS: u64 = 50;
+    const SKEW_SECS: u64 = 60;
+    let scratch = Scratch::new("w2545");
+    let node_a = Scratch::new("w2545-a");
+    let node_b = Scratch::new("w2545-b");
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord
+        .set_node_svid_ttl(Duration::from_secs(LIFE_SECS))
+        .unwrap();
+    let token_a = coord.create_token(Duration::from_secs(600)).unwrap();
+    let token_b = coord.create_token(Duration::from_secs(600)).unwrap();
+    let (addr, handle) = server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+    let port_a = free_port();
+    let port_b = free_port();
+    let enroll = |name: &'static str, secret: String, port: u16| {
+        let bundle = bundle.clone();
+        async move {
+            client::enroll_with_token(
+                addr,
+                "coord",
+                &bundle,
+                name,
+                &secret,
+                &[format!("127.0.0.1:{port}")],
+                &[],
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let enrolled_a = enroll("a", token_a.secret.clone(), port_a).await;
+    let enrolled_b = enroll("b", token_b.secret.clone(), port_b).await;
+    enrolled_a.write_state(&node_a.0).unwrap();
+    enrolled_b.write_state(&node_b.0).unwrap();
+    let trust = TrustBundle::from_pem(&bundle).unwrap();
+    let config_a = coordinator_ticket_config(&enrolled_a, &trust);
+    let config_b = coordinator_ticket_config(&enrolled_b, &trust);
+    let first_expiry = ticket_expiry(&enrolled_a).max(ticket_expiry(&enrolled_b));
+    let map_a = netmap("a", "100.64.0.1", "b", "100.64.0.2", port_b);
+    let map_b = netmap("b", "100.64.0.2", "a", "100.64.0.1", port_a);
+
+    let renewals = Arc::new(Mutex::new(Vec::new()));
+    let (stop_tx, stop_a) = watch::channel(false);
+    let stop_b = stop_a.clone();
+    let (a_in_tx, a_in_rx) = mpsc::channel(64);
+    let (a_out_tx, mut a_out_rx) = mpsc::channel(64);
+    let (b_in_tx, b_in_rx) = mpsc::channel(64);
+    let (b_out_tx, mut b_out_rx) = mpsc::channel(64);
+    let task_a = tokio::spawn(run_memory_node(
+        node_request(
+            config_a,
+            map_a,
+            port_a,
+            node_a.0.clone(),
+            renewer_with_coord_ticket(
+                addr,
+                bundle.clone(),
+                node_a.0.clone(),
+                Arc::clone(&renewals),
+            ),
+            stop_a,
+        ),
+        MemoryDevice {
+            from_tun: a_in_rx,
+            to_tun: a_out_tx,
+        },
+    ));
+    let task_b = tokio::spawn(run_memory_node(
+        node_request(
+            config_b,
+            map_b,
+            port_b,
+            node_b.0.clone(),
+            renewer_with_coord_ticket(
+                addr,
+                bundle.clone(),
+                node_b.0.clone(),
+                Arc::clone(&renewals),
+            ),
+            stop_b,
+        ),
+        MemoryDevice {
+            from_tun: b_in_rx,
+            to_tun: b_out_tx,
+        },
+    ));
+
+    // Run until 15 s after the first ticket end plus the old 60 s end grace.
+    let end_unix = first_expiry + SKEW_SECS + 15;
+    let started = Instant::now();
+    let mut last_ab: Option<Instant> = None;
+    let mut last_ba: Option<Instant> = None;
+    let mut first_ab: Option<Instant> = None;
+    let mut max_gap = Duration::ZERO;
+    let mut gaps = Vec::new();
+    let mut got_ab = 0u64;
+    let mut got_ba = 0u64;
+    while unix(SystemTime::now()) < end_unix {
+        let _ = a_in_tx
+            .send(
+                ipv4_packet(
+                    Ipv4Addr::new(100, 64, 0, 1),
+                    Ipv4Addr::new(100, 64, 0, 2),
+                    b"ab",
+                )
+                .unwrap(),
+            )
+            .await;
+        let _ = b_in_tx
+            .send(
+                ipv4_packet(
+                    Ipv4Addr::new(100, 64, 0, 2),
+                    Ipv4Addr::new(100, 64, 0, 1),
+                    b"ba",
+                )
+                .unwrap(),
+            )
+            .await;
+        let tick = tokio::time::Instant::now() + Duration::from_millis(PROBE_MS);
+        loop {
+            tokio::select! {
+                got = b_out_rx.recv() => {
+                    if got.is_some() {
+                        note_gap("ab", &mut last_ab, &mut max_gap, &mut gaps);
+                        first_ab.get_or_insert_with(Instant::now);
+                        got_ab += 1;
+                    }
+                }
+                got = a_out_rx.recv() => {
+                    if got.is_some() {
+                        note_gap("ba", &mut last_ba, &mut max_gap, &mut gaps);
+                        got_ba += 1;
+                    }
+                }
+                () = tokio::time::sleep_until(tick) => break,
+            }
+        }
+    }
+    let now = Instant::now();
+    // A path that stopped shows as the time since the last packet.
+    let silent_ab = last_ab.map_or(now - started, |at| now - at);
+    let silent_ba = last_ba.map_or(now - started, |at| now - at);
+    let renew_calls = renewals.lock().unwrap().len();
+    println!(
+        "w2545_summary life_s {LIFE_SECS} run_s {} first_ticket_expiry {first_expiry} renew_calls {renew_calls} ab {got_ab} ba {got_ba} max_gap_ms {} silent_ab_ms {} silent_ba_ms {}",
+        started.elapsed().as_secs(),
+        max_gap.as_millis(),
+        silent_ab.as_millis(),
+        silent_ba.as_millis()
+    );
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(3), task_a).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), task_b).await;
+    handle.abort();
+
+    assert!(first_ab.is_some(), "the path never passed DATA");
+    assert!(
+        renew_calls >= 6,
+        "renew calls {renew_calls}: each node must renew at least 3 times"
+    );
+    assert!(
+        silent_ab <= Duration::from_secs(2) && silent_ba <= Duration::from_secs(2),
+        "the path stopped after the first coordinator ticket expired: no a-to-b DATA for {} ms, no b-to-a DATA for {} ms",
+        silent_ab.as_millis(),
+        silent_ba.as_millis()
+    );
+    assert!(
+        max_gap <= Duration::from_secs(2),
+        "packet gap {} ms",
+        max_gap.as_millis()
+    );
+}
+
+/// The node config from the coordinator ticket, as `ticket_load::load_hello_config` builds it.
+fn coordinator_ticket_config(
+    enrolled: &crate::EnrollResult,
+    trust: &TrustBundle,
+) -> orblx_datapath::HelloConfig {
+    let ticket = enrolled.ticket.as_ref().unwrap();
+    let verifier = orblx_identity::TicketVerifier::from_public_pem(&ticket.verifier_pem).unwrap();
+    let key = TicketKey::new(
+        verifier,
+        ticket.mac_key,
+        UNIX_EPOCH + Duration::from_secs(ticket.not_before),
+        UNIX_EPOCH + Duration::from_secs(ticket.not_after),
+    )
+    .unwrap();
+    let ring = TicketRing::single(key, &ticket.svid_ca_pub).unwrap();
+    orblx_datapath::HelloConfig::from_issued(
+        &enrolled.certificate_pem,
+        &enrolled.private_key_pem,
+        trust.clone(),
+        ticket.bytes.clone(),
+        ticket.mac,
+        ring,
+    )
+}
+
+/// The expiry (Unix s) inside the coordinator ticket of one enroll result.
+fn ticket_expiry(enrolled: &crate::EnrollResult) -> u64 {
+    let ticket = enrolled.ticket.as_ref().unwrap();
+    let verifier = orblx_identity::TicketVerifier::from_public_pem(&ticket.verifier_pem).unwrap();
+    orblx_identity::verify_ticket(
+        &verifier,
+        &ticket.bytes,
+        SystemTime::now(),
+        &orblx_identity::DenySet::empty(),
+    )
+    .unwrap()
+    .expires
 }
 
 /// The times of one late peer case (W25-6c).
@@ -1311,6 +1537,7 @@ fn renewer(
     state: PathBuf,
     calls: Arc<Mutex<Vec<Instant>>>,
 ) -> SvidRenewer {
+    // Lab / hand-made ticket tests keep the in-memory ticket (`ticket: None`).
     SvidRenewer::new(move || {
         calls.lock().unwrap().push(Instant::now());
         let result = client::renew_svid_blocking(addr, "coord", &bundle, &state)
@@ -1318,6 +1545,33 @@ fn renewer(
         Ok(RenewedLeaf {
             certificate_pem: result.certificate_pem,
             private_key_pem: result.private_key_pem,
+            ticket: None,
+        })
+    })
+}
+
+/// W25-45: renewer that reloads the coordinator-issued capability ticket.
+fn renewer_with_coord_ticket(
+    addr: SocketAddr,
+    bundle: String,
+    state: PathBuf,
+    calls: Arc<Mutex<Vec<Instant>>>,
+) -> SvidRenewer {
+    SvidRenewer::new(move || {
+        calls.lock().unwrap().push(Instant::now());
+        let result = client::renew_svid_blocking(addr, "coord", &bundle, &state)
+            .map_err(|err| err.to_string())?;
+        let ticket = result
+            .ticket
+            .as_ref()
+            .ok_or_else(|| "The renewal reply has no capability ticket.".to_string())?;
+        Ok(RenewedLeaf {
+            certificate_pem: result.certificate_pem.clone(),
+            private_key_pem: result.private_key_pem.clone(),
+            ticket: Some(RenewedTicket {
+                bytes: ticket.bytes.clone(),
+                mac: ticket.mac,
+            }),
         })
     })
 }
