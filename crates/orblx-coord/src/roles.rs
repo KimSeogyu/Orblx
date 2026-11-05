@@ -839,6 +839,67 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_token_create_writes_one_role_deny() {
+        let scratch = Scratch::new();
+        let coord = open(&scratch);
+        let now = SystemTime::now();
+        let ask = |scope: &str| CreateAsk {
+            scopes: vec![scope.to_string()],
+            ttl_secs: 60,
+        };
+        let mismatch = apitoken::create(&coord, &ask("nodes:read"), ACTOR, Role::Owner, now);
+        assert!(mismatch.unwrap_err().to_string().contains("does not match"));
+        assert_eq!(count(&coord, "role-deny", "token-create"), 1);
+
+        let member = apitoken::create(&coord, &ask("nodes:read"), ACTOR, Role::Member, now);
+        assert!(member.unwrap_err().to_string().contains("cannot create"));
+        assert_eq!(count(&coord, "role-deny", "token-create"), 2);
+
+        let oidc = MockOidc::generate(MOCK_OIDC_ISSUER).unwrap();
+        let gate = IssueGate::new(MiniCa::generate(now).unwrap(), &oidc).unwrap();
+        let scratch_b = Scratch::new();
+        let coord =
+            Coordinator::open(&scratch_b.0, "coord", OidcConfig::Mock(Box::new(gate))).unwrap();
+        coord.enable_config_audit().unwrap();
+        coord.approve_user_by("oidc:ita", ACTOR, now).unwrap();
+        apply(
+            &coord,
+            &SetAsk {
+                user: "ita".to_string(),
+                role: "it-admin".to_string(),
+            },
+            ACTOR,
+            now,
+        )
+        .unwrap();
+        let id_token = oidc
+            .issue_id_token("ita", now, Duration::from_secs(600))
+            .unwrap();
+        let enrolled = coord
+            .enroll_oidc(
+                "ita-pc",
+                &id_token,
+                None,
+                &["ita-pc:443".to_string()],
+                &[],
+                now,
+            )
+            .unwrap();
+        let scope = apitoken::create(
+            &coord,
+            &ask("policy:write"),
+            &enrolled.svid,
+            Role::ItAdmin,
+            now,
+        );
+        assert!(scope
+            .unwrap_err()
+            .to_string()
+            .contains("cannot hold the scope"));
+        assert_eq!(count(&coord, "role-deny", "token-create"), 1);
+    }
+
+    #[test]
     fn a_demoted_admin_token_follows_the_current_role() {
         let scratch = Scratch::new();
         let now = SystemTime::now();

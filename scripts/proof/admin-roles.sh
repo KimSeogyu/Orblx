@@ -144,14 +144,16 @@ uname -sm
 echo "=== [C] build image ${RBAC_IMAGE} ==="
 bin="${RBAC_BIN:-}"
 if [[ -z "$bin" ]]; then
-  cargo build -p orblx-cli --bin orblx -p orblx-test-idp --bin orblx-test-idp --locked
-  bin="$ROOT/target/debug/orblx"
+  cargo build --release -p orblx-cli --bin orblx -p orblx-test-idp --bin orblx-test-idp --locked
+  bin="$ROOT/target/release/orblx"
+else
+  cargo build --release -p orblx-test-idp --bin orblx-test-idp --locked
 fi
 [[ -x "$bin" ]] || fail "the orblx binary is missing"
 # shellcheck source=stage-image.sh
 source "$ROOT/scripts/proof/stage-image.sh"
 image_dir="$(stage_proof_image "$ROOT" "$bin")"
-cp "$ROOT/target/debug/orblx-test-idp" "$image_dir/orblx-test-idp"
+cp "$ROOT/target/release/orblx-test-idp" "$image_dir/orblx-test-idp"
 printf '%s\n' 'COPY orblx-test-idp /usr/local/bin/orblx-test-idp' >>"$image_dir/Dockerfile"
 as_root docker build -q -t "$RBAC_IMAGE" "$image_dir" >/dev/null
 rm -rf "$image_dir"

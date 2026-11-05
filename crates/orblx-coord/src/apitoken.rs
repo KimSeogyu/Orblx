@@ -300,7 +300,15 @@ pub fn create(
             "The token life is not valid.".to_string(),
         ));
     }
+    let live = roles::require_live(coord, actor)?;
+    if live != role {
+        roles::write_deny(coord, actor, "admin-token-create", live)?;
+        return Err(CoordError::Protocol(
+            "The token role does not match the caller.".to_string(),
+        ));
+    }
     if !role.allows("admin-token-create") {
+        roles::write_deny(coord, actor, "admin-token-create", role)?;
         return Err(CoordError::Protocol(format!(
             "The role {} cannot create a token.",
             role.as_str()
@@ -308,18 +316,12 @@ pub fn create(
     }
     for scope in &scopes {
         if !roles::scope_fits(role, scope, SCOPES) {
+            roles::write_deny(coord, actor, "admin-token-create", role)?;
             return Err(CoordError::Protocol(format!(
                 "The role {} cannot hold the scope {}.",
                 role.as_str(),
                 scope
             )));
-        }
-    }
-    if let Some(live) = roles::live_role(coord, actor)? {
-        if live != role {
-            return Err(CoordError::Protocol(
-                "The token role does not match the caller.".to_string(),
-            ));
         }
     }
     let created_user = roles::token_user(coord, actor)?;

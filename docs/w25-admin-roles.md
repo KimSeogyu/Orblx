@@ -88,6 +88,7 @@ orblx admin token-create --scope SCOPE --ttl 10m --coord ADDR ...
 | `server::tests::a_legacy_token_without_a_live_creator_gets_403` | REAL | An old token file has no `created_role` and no live creator. The call gets status 403 and one `role-deny`. The stored default `owner` grants nothing. |
 | `roles::tests::a_former_owner_node_uses_the_approved_user_role` | REAL | A policy owner node leaves `owners`. Its user is rejected and the stored role is still `admin`. The token gets one `role-deny` and not the stored role. |
 | `admin::tests::role_set_parses_the_user_and_the_role` | REAL | The CLI accepts a known role and refuses an unknown role. |
+| `roles::tests::a_refused_token_create_writes_one_role_deny` | REAL | A role that does not match the caller, a role that cannot create a token, and a scope outside the role each write one `role-deny`. The coordinator stores no token. |
 
 ## Proof
 
@@ -95,6 +96,7 @@ Script: `scripts/proof/admin-roles.sh`.
 Compose: `scripts/proof/compose.admin-roles.yml`.
 Policy: `scripts/proof/admin-roles.hujson`.
 The script takes the proof lock (`scripts/proof/proof-lock.sh`).
+The script builds `orblx` and `orblx-test-idp` in the release profile unless `RBAC_BIN` is set.
 The issuer is `orblx-test-idp`. The script does not read a real OAuth secret.
 This environment did not run Docker. Do not treat the [C] rows as measured results.
 
