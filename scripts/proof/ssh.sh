@@ -15,7 +15,7 @@
 #     image, [C]).
 #   - revoke of user sharee and of node a: no new certificate, and the open session ends.
 #     The script prints the ms from the revoke command to the session end on node b.
-#   - each certificate request writes exactly 1 ssh-cert record (code 39) at the coordinator.
+#   - each certificate request writes exactly 1 ssh-cert record (code 41) at the coordinator.
 #   - the session recording gates of row 41 (recording, tamper verify, read-only dir).
 # The script does not print private keys, ID tokens, enroll tokens, tickets, or certificates.
 set -euo pipefail
@@ -72,7 +72,7 @@ cleanup() {
 . "$PROOF_LIB_DIR/proof-lock.sh"
 PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap 'cleanup; proof_lock_end' EXIT
-proof_lock_take "ssh" orblx-ssh
+proof_lock_take "ssh" "orblx-ssh"
 # W25-14b: start from a clean compose state (all profiles, all volumes).
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
@@ -633,7 +633,7 @@ revoked_n="$(dc exec -T b jq '.ssh_revoked | length' "$STATE/netmap.json" | tr -
 echo "node b netmap ssh_revoked ${revoked_n}"
 (( revoked_n >= 1 ))
 
-echo "=== [C] gate: 1 ssh-cert record (code 39) for each request ==="
+echo "=== [C] gate: 1 ssh-cert record (code 41) for each request ==="
 records="$(cert_count)"
 ASKS="$(wc -l <"$WORK/asks" | tr -d ' ')"
 echo "ssh_cert_requests ${ASKS} ssh_cert_records ${records}"

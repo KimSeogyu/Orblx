@@ -20,7 +20,7 @@
 //!   as if the file is missing. Fix 2 then limits the rollback to 60 s.
 //! - Fix 4 (CLOCK-FORWARD): the coordinator refuses to sign or write a `seq` more than
 //!   60 s ahead of its clock. The owner command `orblx admin netmap-seq-reset` (audit
-//!   action `netmap-seq-reset`, code 41) sets the stored `seq` to the clock time, only when
+//!   action `netmap-seq-reset`, code 42) sets the stored `seq` to the clock time, only when
 //!   the stored `seq` is ahead of the clock. A stored `seq` above [`SEQ_MAX`] stops the load.
 //! - Fix 5 (grants binding): the signed netmap carries the SHA-256 of the signed grants
 //!   bytes. The node refuses a netmap that does not match its grants.

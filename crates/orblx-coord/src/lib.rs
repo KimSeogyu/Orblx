@@ -28,6 +28,7 @@ pub mod nodelock;
 mod proto;
 #[cfg(test)]
 mod renew_test;
+mod roles;
 mod seq;
 #[cfg(test)]
 mod seq_test;
@@ -73,6 +74,7 @@ pub use netmap::{
     SignedNetmapWire,
 };
 pub use proto::{GrantAsk, SshCertAsk, NODE_PROTO, VERSION_MISMATCH};
+pub use roles::{parse_admin_role, Role};
 pub use seq::{
     read_node_seq, reset_node_seq, unix_ms, Intake, COORD_SEQ_FILE, HEARTBEAT_MS, NODE_SEQ_FILE,
 };

@@ -25,8 +25,8 @@ Source of truth: the W25-34 PO rulings. A later ruling replaces an earlier one.
   `orblx admin netmap-seq-reset`. The command sets the stored `seq` to the coordinator clock
   time. It works only when the stored `seq` is ahead of the clock, and it never sets a value
   below the clock time. Only an owner SVID can run it (no API token). It writes one audit
-  record with the action `netmap-seq-reset`, code 41 (codes 39 and 40 are reserved for other
-  open items). The nodes never accepted the far `seq` (it was more than 60 s in the future for
+  record with the action `netmap-seq-reset`, code 42. Code 39 is `role-set`. Code 40 is
+  `role-deny`. The nodes never accepted the far `seq` (it was more than 60 s in the future for
   them), so they accept the next netmap with no step.
 - At load, the coordinator refuses a stored `seq` above `u64::MAX / 2` (`SEQ_MAX`).
 - One signing coordinator process holds the lock file `netmap-seq.lock` in the state

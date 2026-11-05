@@ -37,7 +37,7 @@ STATE=/var/lib/orblx
 . "$PROOF_LIB_DIR/proof-lock.sh"
 PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap proof_lock_end EXIT
-proof_lock_take "user-approval"
+proof_lock_take "user-approval" "orblx-w25o-users"
 mkdir -p "$POLICY_DIR"
 : >"$IDP_CA_FILE"
 

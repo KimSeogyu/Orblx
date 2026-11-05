@@ -671,16 +671,14 @@ fn dispatch_admin(
         return Ok(dispatch_token(coord, request, secret, now));
     }
     let caller = peer_id(coord, connection)?;
-    if !coord.caller_is_owner(&caller)? {
-        return Err(CoordError::Protocol(
-            "The caller is not an owner.".to_string(),
-        ));
-    }
+    let actor = caller.as_uri();
+    // The role gate writes one role-deny record when it refuses the call.
+    crate::roles::authorize(coord, actor, &request.op)?;
     let policy_lock = policy_lock_for(&request.op)?;
     let value = run_admin(
         coord,
         request,
-        Caller::Owner(caller.as_uri()),
+        Caller::Owner(actor),
         policy_lock.as_ref(),
         now,
     )?;
@@ -758,6 +756,14 @@ fn dispatch_token(
             refusal.status()
         );
         return status_response(refusal.status(), refusal.text().to_string());
+    }
+    if let Some(role) = checked.role_block {
+        println!(
+            "admin role deny {} op {op} role {} status 403",
+            checked.id,
+            role.as_str()
+        );
+        return status_response(403, crate::roles::deny_text(role).to_string());
     }
     let actor = apitoken::actor_of(&checked.id);
     let value = match run_admin(
@@ -860,6 +866,18 @@ fn run_admin(
             coord.lock_update(update, actor)?
         }
         "admin-policy" => admin::policy_show(coord)?,
+        "admin-roles" => {
+            let mut value = admin::users(coord)?;
+            value["op"] = serde_json::json!("roles");
+            value
+        }
+        "admin-role-set" => {
+            // A token has no scope for this operation. This is a second gate.
+            owner_only()?;
+            let ask: crate::roles::SetAsk = serde_json::from_str(&request.name)
+                .map_err(|_| CoordError::Protocol("The role request is not valid.".to_string()))?;
+            crate::roles::apply(coord, &ask, actor, now)?
+        }
         "admin-policy-set" => {
             let lock = policy_lock.ok_or(CoordError::State)?;
             admin::policy_set(coord, lock, &request.name, request.expect_sha256.as_deref())?
@@ -868,12 +886,14 @@ fn run_admin(
             owner_only()?;
             let ask: apitoken::CreateAsk = serde_json::from_str(&request.name)
                 .map_err(|_| CoordError::Protocol("The token request is not valid.".to_string()))?;
-            let made = apitoken::create(coord, &ask, actor, now)?;
+            let role = crate::roles::require_live(coord, actor)?;
+            let made = apitoken::create(coord, &ask, actor, role, now)?;
             serde_json::json!({
                 "op": "token-create",
                 "id": made.id,
                 "token": made.secret,
                 "scopes": made.scopes,
+                "role": made.role,
                 "expires_unix_ms": made.expires_unix_ms
             })
         }
@@ -883,7 +903,8 @@ fn run_admin(
         }
         "admin-token-revoke" => {
             owner_only()?;
-            apitoken::revoke(coord, request.name.trim(), actor, now)?
+            let role = crate::roles::require_live(coord, actor)?;
+            apitoken::revoke(coord, request.name.trim(), actor, role, now)?
         }
         _ => {
             return Err(CoordError::Protocol(
@@ -1123,14 +1144,23 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
         coord.enable_config_audit().unwrap();
+        let policy_path = dir.join("policy.hujson");
+        std::fs::write(&policy_path, policy_text(&[OWNER], 22)).unwrap();
+        coord.set_policy_file(&policy_path).unwrap();
         let now = SystemTime::now();
         for scope in all_scopes() {
             let ask = CreateAsk {
                 scopes: vec![scope.to_string()],
                 ttl_secs: 60,
             };
-            let made =
-                apitoken::create(&coord, &ask, "spiffe://orblx.local/node/owner", now).unwrap();
+            let made = apitoken::create(
+                &coord,
+                &ask,
+                "spiffe://orblx.local/node/owner",
+                crate::roles::Role::Owner,
+                now,
+            )
+            .unwrap();
             for op in admin_ops() {
                 let reply = dispatch_token(&coord, &call(op, &made.secret), &made.secret, now);
                 let status = reply.status.unwrap();
@@ -1150,6 +1180,7 @@ mod tests {
                 ttl_secs: 60,
             },
             "spiffe://orblx.local/node/owner",
+            crate::roles::Role::Owner,
             now,
         )
         .unwrap();
@@ -1229,6 +1260,7 @@ mod tests {
                 ttl_secs: 60,
             },
             OWNER,
+            crate::roles::Role::Owner,
             now,
         )
         .unwrap();
@@ -1274,6 +1306,7 @@ mod tests {
                 ttl_secs: 60,
             },
             OWNER,
+            crate::roles::Role::Owner,
             now,
         )
         .unwrap();
@@ -1324,6 +1357,7 @@ mod tests {
                     ttl_secs: 60,
                 },
                 OWNER,
+                crate::roles::Role::Owner,
                 now,
             )
             .unwrap();
@@ -1378,6 +1412,7 @@ mod tests {
                 ttl_secs: 60,
             },
             OWNER,
+            crate::roles::Role::Owner,
             now,
         )
         .unwrap();
@@ -1440,6 +1475,7 @@ mod tests {
                 ttl_secs: 60,
             },
             OWNER,
+            crate::roles::Role::Owner,
             now,
         )
         .unwrap();
@@ -1475,6 +1511,97 @@ mod tests {
         let reply = with_expect(&policy_text(&[OWNER], 23), &live);
         assert_eq!(reply.status, Some(409));
         assert_eq!(sha(&policy_path), applied);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn role_deny_count(coord: &Coordinator, target: &str) -> usize {
+        coord
+            .config_audit_text()
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                line.contains("\"role-deny\"") && line.contains(&format!("\"target\":\"{target}\""))
+            })
+            .count()
+    }
+
+    /// A policy owner SVID that leaves the owner list loses the token.
+    #[test]
+    fn a_removed_policy_owner_token_gets_403_and_one_role_deny() {
+        let dir = std::env::temp_dir().join(format!("orblx-server-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        let policy_path = dir.join("policy.hujson");
+        std::fs::write(&policy_path, policy_text(&[OWNER], 22)).unwrap();
+        coord.set_policy_file(&policy_path).unwrap();
+        let now = SystemTime::now();
+        let made = apitoken::create(
+            &coord,
+            &CreateAsk {
+                scopes: vec!["nodes:read".to_string()],
+                ttl_secs: 60,
+            },
+            OWNER,
+            crate::roles::Role::Owner,
+            now,
+        )
+        .unwrap();
+        let reply = dispatch_token(
+            &coord,
+            &call("admin-nodes", &made.secret),
+            &made.secret,
+            now,
+        );
+        assert_eq!(reply.status, Some(200));
+        std::fs::write(&policy_path, policy_text(&[NODE_A], 23)).unwrap();
+        coord.set_policy_file(&policy_path).unwrap();
+        let denies = role_deny_count(&coord, "nodes");
+        let token_denies = deny_count(&coord, &made.id, "scope");
+        let reply = dispatch_token(
+            &coord,
+            &call("admin-nodes", &made.secret),
+            &made.secret,
+            now,
+        );
+        assert_eq!(reply.status, Some(403));
+        assert!(reply.error.unwrap().contains("The caller is not an owner."));
+        assert_eq!(role_deny_count(&coord, "nodes"), denies + 1);
+        assert_eq!(deny_count(&coord, &made.id, "scope"), token_denies);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An old token file has no live creator. The default stored role grants nothing.
+    #[test]
+    fn a_legacy_token_without_a_live_creator_gets_403() {
+        let dir = std::env::temp_dir().join(format!("orblx-server-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        let secret = format!("{}legacy-token-value", apitoken::API_TOKEN_PREFIX);
+        let hash = apitoken::token_hash_hex(&secret);
+        let id = hash.get(..16).unwrap().to_string();
+        let file = serde_json::json!({
+            "version": 1,
+            "tokens": [{
+                "id": id,
+                "hash_hex": hash,
+                "scopes": ["nodes:read"],
+                "created_by": "spiffe://orblx.local/node/old-owner",
+                "created_unix_ms": 1,
+                "expires_unix_ms": 9_000_000_000_000u64
+            }]
+        });
+        std::fs::write(dir.join(apitoken::API_TOKEN_FILE), file.to_string()).unwrap();
+        let now = SystemTime::now();
+        let reply = dispatch_token(&coord, &call("admin-nodes", &secret), &secret, now);
+        assert_eq!(reply.status, Some(403));
+        assert!(reply.error.unwrap().contains("The caller is not an owner."));
+        assert_eq!(role_deny_count(&coord, "nodes"), 1);
+        assert_eq!(deny_count(&coord, &id, "scope"), 0);
+        assert!(!coord.config_audit_text().unwrap().contains(&secret));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

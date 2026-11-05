@@ -808,6 +808,12 @@ async fn run_mesh_inner(
         rekey_rx,
         filter: request.filter.clone(),
     };
+    if let Some(task) = crate::soak::spawn_to_tun_probe(to_tun.clone()) {
+        tasks.push(task);
+    }
+    if let Some(task) = crate::soak::spawn_runtime_watchdog() {
+        tasks.push(task);
+    }
     if let Some(addr) = request.metrics {
         let metrics_peers = Arc::clone(&peers);
         let metrics_counters = Arc::clone(&counters);
@@ -1365,13 +1371,15 @@ fn fresh_netmap(mesh: &Mesh) -> Netmap {
 /// The node lock pass already removed each peer without a trusted owner signature
 /// from the netmap file. Without a node lock file, the endpoint allows every trusted leaf.
 fn apply_lock_allow(mesh: &Mesh) {
-    if !mesh.state_dir.join(crate::NODE_LOCK_FILE).exists() {
-        mesh.endpoint.replace_allow(None);
-        return;
-    }
-    let netmap = fresh_netmap(mesh);
-    let allow: HashSet<String> = netmap.peers.iter().map(|peer| peer.svid.clone()).collect();
-    mesh.endpoint.replace_allow(Some(allow));
+    crate::soak::span("apply_lock_allow", || {
+        if !mesh.state_dir.join(crate::NODE_LOCK_FILE).exists() {
+            mesh.endpoint.replace_allow(None);
+            return;
+        }
+        let netmap = fresh_netmap(mesh);
+        let allow: HashSet<String> = netmap.peers.iter().map(|peer| peer.svid.clone()).collect();
+        mesh.endpoint.replace_allow(Some(allow));
+    });
 }
 
 /// Close each open session whose peer SPIFFE ID is in the deny list (W25-1).
@@ -1381,6 +1389,12 @@ fn apply_lock_allow(mesh: &Mesh) {
 /// The dial task then tries again, and the session check refuses the denied peer.
 /// When the deny list drops the peer again, the next dial brings the session back.
 fn close_denied_links(mesh: &Mesh, deny: &DenySet) {
+    crate::soak::span("close_denied_links", || {
+        close_denied_links_body(mesh, deny);
+    });
+}
+
+fn close_denied_links_body(mesh: &Mesh, deny: &DenySet) {
     let netmap = fresh_netmap(mesh);
     let svids: HashMap<&str, &str> = mesh
         .netmap
@@ -1471,7 +1485,8 @@ async fn accept_loop(mut mesh: Mesh) {
                 match accepted {
                     Ok(session) => {
                         tr!("{} accepted {}", mesh.node.name, session.peer_id().as_uri());
-                        let netmap = fresh_netmap(&mesh);
+                        let netmap =
+                            crate::soak::span("fresh_netmap path=accept", || fresh_netmap(&mesh));
                         let peer_name = netmap.peers.iter().find(|peer| peer.svid == session.peer_id().as_uri()).map(|peer| peer.name.clone());
                         let Some(peer_name) = peer_name else {
                             eprintln!(
@@ -1966,6 +1981,9 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
         peer,
         label,
     } = io;
+    // One read of the soak flag for this link. The packet loop uses the local bool.
+    let trace = crate::soak::enabled();
+    let mut send_wait = crate::soak::SendWait::new();
     let mut first_rx = true;
     let mut first_tx = true;
     // The queue is open while this link is the live link for the peer.
@@ -1975,15 +1993,22 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
     let mut ask_open = true;
     let mut rx_next: Option<NextEvent> = Some(next_event(receiver));
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    // Declared last so a drop during `to_tun.send` still sees the open stall.
+    let mut session_end = trace.then(|| crate::soak::SessionEnd {
+        peer: peer.clone(),
+        reason: String::from("dropped"),
+    });
     loop {
         if tx_done && rx_next.is_none() {
             tr!("{label} session_end reason=drained");
+            mark_session_end(&mut session_end, "drained");
             return;
         }
         tokio::select! {
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
                     tr!("{label} session_end reason=cancel");
+                    mark_session_end(&mut session_end, "cancel");
                     return;
                 }
             }
@@ -1996,11 +2021,13 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                 tr!("{label} send_rekey_req");
                 if sender.send_ctrl(FLAG_REKEY_REQ).await.is_err() {
                     tr!("{label} session_end reason=send_rekey_err");
+                    mark_session_end(&mut session_end, "send_rekey_err");
                     return;
                 }
             }
             _ = keepalive.tick(), if tx_open => {
                 if sender.send_ctrl(0).await.is_err() {
+                    mark_session_end(&mut session_end, "keepalive_err");
                     return;
                 }
             }
@@ -2021,6 +2048,7 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                 }
                 if sender.send_ipv4(&packet).await.is_err() {
                     tr!("{label} session_end reason=send_err");
+                    mark_session_end(&mut session_end, "send_err");
                     return;
                 }
                 counters.tx.fetch_add(1, Ordering::Relaxed);
@@ -2050,6 +2078,7 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                                 match inbound_action(&packet, overlay) {
                                     InboundAction::Reply(reply) if tx_open => {
                                         if sender.send_ipv4(&reply).await.is_err() {
+                                            mark_session_end(&mut session_end, "reply_err");
                                             return;
                                         }
                                         counters.tx.fetch_add(1, Ordering::Relaxed);
@@ -2064,16 +2093,33 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                                         }
                                     }
                                     InboundAction::Forward => {
-                                        if to_tun.send(packet).await.is_err() {
+                                        if !crate::soak::forward_to_tun(
+                                            &to_tun,
+                                            packet,
+                                            trace,
+                                            &peer,
+                                            &mut send_wait,
+                                        )
+                                        .await
+                                        {
+                                            mark_session_end(&mut session_end, "to_tun_closed");
                                             return;
                                         }
                                     }
                                 }
                             }
-                            SessionEvent::Keepalive => on_rx(),
+                            SessionEvent::Keepalive => {
+                                on_rx();
+                                if trace {
+                                    crate::soak::note_inbound_during_stall(&peer);
+                                }
+                            }
                             SessionEvent::Rekey => {
                                 tr!("{label} got_rekey_req");
                                 on_rx();
+                                if trace {
+                                    crate::soak::note_inbound_during_stall(&peer);
+                                }
                                 let next = remote_rekey.borrow().saturating_add(1);
                                 let _ = remote_rekey.send(next);
                             }
@@ -2085,11 +2131,22 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     }
                     Err(err) => {
                         tr!("{label} session_end reason=recv_err {err}");
+                        if trace {
+                            let reason = crate::soak::session_reason(&err);
+                            mark_session_end(&mut session_end, &reason);
+                        }
                         return;
                     }
                 }
             }
         }
+    }
+}
+
+fn mark_session_end(end: &mut Option<crate::soak::SessionEnd>, reason: &str) {
+    if let Some(end) = end.as_mut() {
+        end.reason.clear();
+        end.reason.push_str(reason);
     }
 }
 
@@ -3054,5 +3111,82 @@ mod tests {
         let text = super::safe_text("-----BEGIN PRIVATE KEY-----\nabc");
         assert_eq!(text, "The coordinator request failed.");
         assert!(!text.contains("PRIVATE"));
+    }
+
+    /// W25-42: every forwarding link waits on one bounded TUN queue.
+    ///
+    /// While the writer holds every slot, both links stay pending.
+    /// One read from the writer frees one link. The other link stays pending.
+    #[test]
+    fn a_full_tun_queue_stalls_every_forwarding_link() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        use tokio::sync::mpsc;
+
+        fn idle_waker() -> Waker {
+            fn clone(ptr: *const ()) -> RawWaker {
+                RawWaker::new(ptr, &VTABLE)
+            }
+            fn wake(_: *const ()) {}
+            fn wake_by_ref(_: *const ()) {}
+            fn drop(_: *const ()) {}
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+            // SAFETY: the vtable does not read the pointer.
+            unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+        }
+
+        let marks = AtomicU64::new(0);
+        let queue = crate::tun_dev::TO_TUN_QUEUE;
+        let (tx, mut rx) = mpsc::channel(queue);
+        for n in 0..queue {
+            tx.try_send(vec![u8::try_from(n).unwrap()]).unwrap();
+        }
+        assert_eq!(tx.max_capacity(), queue);
+        assert_eq!(tx.capacity(), 0);
+
+        let tx_a = tx.clone();
+        let tx_b = tx.clone();
+        let mut link_a = Box::pin(async {
+            let mut wait = crate::soak::SendWait::new();
+            let ok = crate::soak::forward_to_tun(&tx_a, vec![0xa1], false, "a", &mut wait).await;
+            assert!(ok);
+            marks.fetch_add(1, Ordering::Relaxed);
+        });
+        let mut link_b = Box::pin(async {
+            let mut wait = crate::soak::SendWait::new();
+            let ok = crate::soak::forward_to_tun(&tx_b, vec![0xb2], false, "b", &mut wait).await;
+            assert!(ok);
+            marks.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let waker = idle_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(link_a.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(matches!(link_b.as_mut().poll(&mut cx), Poll::Pending));
+        let marks_while_full = marks.load(Ordering::Relaxed);
+        assert_eq!(marks_while_full, 0);
+
+        rx.try_recv().unwrap();
+        let ready_a = matches!(link_a.as_mut().poll(&mut cx), Poll::Ready(()));
+        let ready_b = matches!(link_b.as_mut().poll(&mut cx), Poll::Ready(()));
+        let ready_after_one = u32::from(ready_a) + u32::from(ready_b);
+        assert_eq!(ready_after_one, 1);
+        let marks_after_one = marks.load(Ordering::Relaxed);
+        assert_eq!(marks_after_one, 1);
+
+        rx.try_recv().unwrap();
+        if !ready_a {
+            assert!(matches!(link_a.as_mut().poll(&mut cx), Poll::Ready(())));
+        }
+        if !ready_b {
+            assert!(matches!(link_b.as_mut().poll(&mut cx), Poll::Ready(())));
+        }
+        let marks_after_two = marks.load(Ordering::Relaxed);
+        assert_eq!(marks_after_two, 2);
+        println!(
+            "w25-42 h1 queue={queue} links_pending_while_full=2 marks_while_full={marks_while_full} ready_after_one_read={ready_after_one} marks_after_one_read={marks_after_one} marks_after_two_reads={marks_after_two}"
+        );
     }
 }
