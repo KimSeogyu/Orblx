@@ -23,6 +23,13 @@ x-node: &node
     ORBLX_DIAG_TICK_MS: "10"
     # W25-42 step 2: host exports ORBLX_SOAK_TRACE=1; empty/other = off (no forward-path cost).
     ORBLX_SOAK_TRACE: ${ORBLX_SOAK_TRACE:-}
+  # Names resolve from /etc/hosts. The stack does not use Docker DNS at 127.0.0.11.
+  extra_hosts: &proof-hosts
+    - "coord:${TR_NET:-172.28.48}.10"
+    - "owner:${TR_NET:-172.28.48}.20"
+    - "a:${TR_NET:-172.28.48}.11"
+    - "b:${TR_NET:-172.28.48}.12"
+    - "c:${TR_NET:-172.28.48}.13"
 
 x-up: &up
   - up
@@ -57,6 +64,7 @@ services:
     volumes:
       - coord-state:/var/lib/orblx
       - ${TR_POLICY:?set TR_POLICY}:/var/lib/orblx/policy.hujson:ro
+    extra_hosts: *proof-hosts
     networks:
       proof:
         ipv4_address: ${TR_NET:-172.28.48}.10
@@ -112,4 +120,9 @@ networks:
   proof:
     ipam:
       config:
+        # Static addresses must stay outside ip_range.
+        # Docker gives one-shot containers addresses from the start of ip_range.
+        # The static addresses are coord .10, a .11, b .12, c .13, and owner .20.
+        # The pool is .64-.127. It does not contain those addresses.
         - subnet: ${TR_NET:-172.28.48}.0/24
+          ip_range: ${TR_NET:-172.28.48}.64/26
