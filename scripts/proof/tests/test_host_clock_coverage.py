@@ -23,12 +23,14 @@ CADENCE = 100_000_000
 RENEW = os.path.join(PROOF, "ticket-renewal.sh")
 
 
-def at(base, realtime, monotonic, boottime, skew=1000):
+def at(base, realtime, monotonic, boottime, skew=2000):
     return {
         "realtime": base["realtime"] + realtime,
         "monotonic": base["monotonic"] + monotonic,
         "boottime": base["boottime"] + boottime,
         "capture_skew": skew,
+        "capture_monotonic": 2000,
+        "capture_boottime": 2000,
     }
 
 
@@ -193,7 +195,9 @@ class HostClockCoverageTest(unittest.TestCase):
     def test_the_proof_reports_coverage_without_using_unknown_samples(self):
         with open(RENEW, encoding="utf-8") as handle:
             src = handle.read()
-        self.assertIn('host-sampler.py" coverage --samples "$samples" --cadence-ms 100', src)
+        self.assertIn('cov_args=(coverage --samples "$samples" --cadence-ms 100)', src)
+        self.assertIn('"${name}-sched-${k}=${renew}:${expiry}"', src)
+        self.assertIn('--bound "${bound_start}:${bound_end}"', src)
         self.assertNotIn("--unknown-samples", src)
         self.assertIn("wait \"$SAMPLER_PID\"", src)
         self.assertIn(
@@ -206,6 +210,99 @@ class HostClockCoverageTest(unittest.TestCase):
         )
         self.assertEqual(src.count("(( crossed >= TR_ENDS ))"), 1)
         self.assertEqual(src.count("e + SKEW < RUN_END"), 1)
+        self.assertIn('TR_GAP_MS="${TR_GAP_MS:-200}"', src)
+
+    def test_a_wall_step_during_capture_is_not_fully_observed(self):
+        start = at(self.origin, 0, 0, 0)
+        end = at(self.origin, CADENCE, CADENCE, CADENCE)
+        end["capture_skew"] = 1304 * NS
+        samples = [start, end]
+        pattern, deltas = host_sampler._span(samples[0], samples[1], CADENCE)
+        self.assertEqual(pattern, "capture_wall_step")
+        self.assertEqual(deltas["realtime"], CADENCE)
+        self.assertEqual(end["capture_skew"], 1304 * NS)
+        verdict, reason = host_sampler.window_verdict(
+            samples, start["realtime"], end["realtime"], CADENCE, unknown_samples=0
+        )
+        self.assertEqual((verdict, reason), ("no", "capture_wall_step"))
+
+    def test_a_backward_wall_step_during_capture_stays_raw(self):
+        start = at(self.origin, 0, 0, 0)
+        end = at(self.origin, CADENCE, CADENCE, CADENCE)
+        end["capture_skew"] = -5 * NS
+        pattern, _deltas = host_sampler._span(start, end, CADENCE)
+        self.assertEqual(pattern, "capture_wall_step")
+        self.assertEqual(end["capture_skew"], -5 * NS)
+        text = "\n".join(
+            host_sampler.format_coverage(
+                [start, end],
+                CADENCE,
+                [("owner-sched-2", start["realtime"], end["realtime"])],
+            )
+        )
+        self.assertIn("observation_mark owner-sched-2 fully_observed no reason capture_wall_step", text)
+        self.assertIn("observation_min_capture_skew_ns -" + str(5 * NS), text)
+
+    def test_a_wide_capture_bracket_is_ambiguous(self):
+        start = at(self.origin, 0, 0, 0)
+        end = at(self.origin, CADENCE, CADENCE, CADENCE)
+        end["capture_skew"] = 2 * NS
+        end["capture_monotonic"] = 2 * NS
+        end["capture_boottime"] = 2 * NS
+        pattern, _deltas = host_sampler._span(start, end, CADENCE)
+        self.assertEqual(pattern, "capture_ambiguous")
+        verdict, reason = host_sampler.window_verdict(
+            [start, end], start["realtime"], end["realtime"], CADENCE, unknown_samples=0
+        )
+        self.assertEqual((verdict, reason), ("no", "capture_ambiguous"))
+
+    def test_missing_edges_and_a_silent_renewal_are_not_fully_observed(self):
+        start = at(self.origin, 10 * NS, 10 * NS, 10 * NS)
+        end = at(self.origin, 10 * NS + CADENCE, 10 * NS + CADENCE, 10 * NS + CADENCE)
+        samples = [start, end]
+        window_start = self.origin["realtime"]
+        window_end = self.origin["realtime"] + 20 * NS
+        leading, leading_reason = host_sampler.window_verdict(
+            samples, window_start, start["realtime"], CADENCE, unknown_samples=0
+        )
+        self.assertEqual((leading, leading_reason), ("no", "leading_unsampled"))
+        trailing, trailing_reason = host_sampler.window_verdict(
+            samples, start["realtime"], window_end, CADENCE, unknown_samples=0
+        )
+        self.assertEqual((trailing, trailing_reason), ("no", "trailing_unsampled"))
+        silent, silent_reason = host_sampler.window_verdict(
+            samples, window_start, window_end, CADENCE, unknown_samples=0
+        )
+        self.assertEqual(silent, "no")
+        self.assertNotEqual(silent_reason, "cadence")
+        empty = "\n".join(
+            host_sampler.format_coverage([], CADENCE, [("owner-sched-2", window_start, window_end)])
+        )
+        self.assertIn("observation_mark owner-sched-2 fully_observed no reason no_samples", empty)
+        self.assertNotIn("fully_observed yes", empty)
+        one = "\n".join(
+            host_sampler.format_coverage([start], CADENCE, [("owner-sched-2", window_start, window_end)])
+        )
+        self.assertIn("fully_observed no reason unbracketed", one)
+
+    def test_unsupported_clocks_and_rollback_are_not_fully_observed(self):
+        start = at(self.origin, 0, 0, 0)
+        end = at(self.origin, CADENCE, CADENCE, CADENCE)
+        end["monotonic"] = "unsupported"
+        verdict, reason = host_sampler.window_verdict(
+            [start, end], start["realtime"], end["realtime"], CADENCE, unknown_samples=0
+        )
+        self.assertEqual((verdict, reason), ("no", "clock_unsupported"))
+        back = at(self.origin, -5 * NS, CADENCE, CADENCE)
+        verdict, reason = host_sampler.window_verdict(
+            [start, back],
+            back["realtime"],
+            start["realtime"],
+            CADENCE,
+            unknown_samples=0,
+        )
+        self.assertEqual(verdict, "no")
+        self.assertNotEqual(reason, "cadence")
 
 
 if __name__ == "__main__":

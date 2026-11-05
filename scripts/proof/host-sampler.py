@@ -43,6 +43,9 @@ KST = timezone(timedelta(hours=9))
 HZ = os.sysconf("SC_CLK_TCK")
 # A span at or above this length is a large unsampled interval.
 LARGE_UNSAMPLED_NS = 1_000_000_000
+# Monotonic and boottime elapsed across one capture must stay under this limit.
+# A larger elapsed bracket means the reads are not one sample.
+CAPTURE_BRACKET_MAX_NS = 50_000_000
 CLOCK_NAMES = ("realtime", "monotonic", "boottime")
 COLUMN_HEADER = (
     "# kst_time epoch_ms dt_ms steal_ms iowait_ms cpu_some_ms io_some_ms io_full_ms "
@@ -53,8 +56,13 @@ CLOCK_NOTES = """\
 # clk_realtime_ns is CLOCK_REALTIME. It is wall time. It can step forward or backward.
 # clk_monotonic_ns is CLOCK_MONOTONIC. It does not include Linux suspend. It does not follow a wall step.
 # clk_boottime_ns is CLOCK_BOOTTIME. It includes Linux suspend. It does not follow a wall step.
-# The three reads are sequential. clk_capture_skew_ns is a later CLOCK_REALTIME read minus clk_realtime_ns.
-# clk_capture_skew_ns bounds the capture spread. It is not a pause measurement.
+# Each capture reads realtime, monotonic, and boottime, then reads those three clocks again.
+# clk_capture_skew_ns is the later CLOCK_REALTIME minus the first CLOCK_REALTIME.
+# A wall step during the capture can make clk_capture_skew_ns negative or very large.
+# clk_capture_skew_ns is not an acquisition-duration bound.
+# clk_capture_monotonic_ns and clk_capture_boottime_ns are the elapsed-clock bracket.
+# A capture is not usable when that bracket is negative, too large, unsupported, or the realtime step disagrees with it.
+# The raw realtime values stay in the file. The report does not rewrite them.
 # A clock the host cannot read is the token unsupported. The sampler does not copy another clock into that field.
 # No pattern of these three clocks identifies every hypervisor pause.
 # cpu_some_ms io_some_ms io_full_ms mem_some_ms mem_full_ms are PSI stall time in milliseconds. They are not CPU time consumed.
@@ -80,22 +88,40 @@ def read_named_clock(clock_gettime_ns, clock_id):
         return "unsupported"
 
 
+def _read_trio(clock_gettime_ns, clock_ids):
+    return {name: read_named_clock(clock_gettime_ns, clock_ids.get(name)) for name in CLOCK_NAMES}
+
+
 def read_clock_sample(clock_gettime_ns, clock_ids):
-    """Read the three clocks. A missing clock stays unsupported."""
-    realtime_1 = read_named_clock(clock_gettime_ns, clock_ids.get("realtime"))
-    monotonic = read_named_clock(clock_gettime_ns, clock_ids.get("monotonic"))
-    boottime = read_named_clock(clock_gettime_ns, clock_ids.get("boottime"))
-    realtime_2 = read_named_clock(clock_gettime_ns, clock_ids.get("realtime"))
-    if realtime_1 == "unsupported" or realtime_2 == "unsupported":
-        skew = "unsupported"
-    else:
-        skew = realtime_2 - realtime_1
+    """Read two trios. The stored clocks are the first trio. The second trio is the bracket."""
+    before = _read_trio(clock_gettime_ns, clock_ids)
+    after = _read_trio(clock_gettime_ns, clock_ids)
     return {
-        "realtime": realtime_1,
-        "monotonic": monotonic,
-        "boottime": boottime,
-        "capture_skew": skew,
+        "realtime": before["realtime"],
+        "monotonic": before["monotonic"],
+        "boottime": before["boottime"],
+        "capture_skew": clock_delta(before["realtime"], after["realtime"]),
+        "capture_monotonic": clock_delta(before["monotonic"], after["monotonic"]),
+        "capture_boottime": clock_delta(before["boottime"], after["boottime"]),
     }
+
+
+def capture_status(sample):
+    """Classify one capture. This does not change the stored realtime value."""
+    skew = sample.get("capture_skew", "unsupported")
+    monotonic = sample.get("capture_monotonic", "unsupported")
+    boottime = sample.get("capture_boottime", "unsupported")
+    if skew == "unsupported" or monotonic == "unsupported" or boottime == "unsupported":
+        return "capture_unsupported"
+    if monotonic < 0 or boottime < 0:
+        return "capture_ambiguous"
+    if monotonic > CAPTURE_BRACKET_MAX_NS or boottime > CAPTURE_BRACKET_MAX_NS:
+        return "capture_ambiguous"
+    if skew < 0 or skew > monotonic + CAPTURE_BRACKET_MAX_NS:
+        return "capture_wall_step"
+    if boottime > monotonic + CAPTURE_BRACKET_MAX_NS:
+        return "capture_ambiguous"
+    return "ok"
 
 
 def clock_delta(prev, cur):
@@ -158,6 +184,8 @@ def format_clock_fields(prev, cur):
     for name in CLOCK_NAMES:
         parts.append(f"clk_{name}_ns:{_clock_token(cur[name])}")
     parts.append(f"clk_capture_skew_ns:{_clock_token(cur['capture_skew'])}")
+    parts.append(f"clk_capture_monotonic_ns:{_clock_token(cur.get('capture_monotonic', 'unsupported'))}")
+    parts.append(f"clk_capture_boottime_ns:{_clock_token(cur.get('capture_boottime', 'unsupported'))}")
     for name in CLOCK_NAMES:
         parts.append(f"clk_{name}_dt_ns:{_clock_token(clock_delta(prev[name], cur[name]))}")
     return " ".join(parts)
@@ -318,6 +346,8 @@ def clocks_from_row(row):
             "monotonic": _parse_clock(clk.get("clk_monotonic_ns")),
             "boottime": _parse_clock(clk.get("clk_boottime_ns")),
             "capture_skew": _parse_clock(clk.get("clk_capture_skew_ns")),
+            "capture_monotonic": _parse_clock(clk.get("clk_capture_monotonic_ns")),
+            "capture_boottime": _parse_clock(clk.get("clk_capture_boottime_ns")),
         }
     if row.get("end") is None:
         realtime = "unsupported"
@@ -328,6 +358,8 @@ def clocks_from_row(row):
         "monotonic": "unsupported",
         "boottime": "unsupported",
         "capture_skew": "unsupported",
+        "capture_monotonic": "unsupported",
+        "capture_boottime": "unsupported",
         "source": "realtime_epoch_ms_only",
     }
 
@@ -347,41 +379,84 @@ def _max_positive(spans, name):
     return best
 
 
+def _span(prev, cur, cadence_ns):
+    deltas = {name: clock_delta(prev[name], cur[name]) for name in CLOCK_NAMES}
+    for sample in (prev, cur):
+        status = capture_status(sample)
+        if status != "ok":
+            return status, deltas
+    return classify_deltas(deltas, cadence_ns), deltas
+
+
+def _overlaps(realtime_0, realtime_1, start_ns, end_ns):
+    if realtime_0 == "unsupported" or realtime_1 == "unsupported":
+        return False
+    lo, hi = realtime_0, realtime_1
+    if hi < lo:
+        lo, hi = hi, lo
+    return lo < end_ns and hi > start_ns
+
+
 def window_verdict(samples, start_ns, end_ns, cadence_ns, unknown_samples=None):
-    """Return (yes|no, reason). unknown_samples does not change the result."""
+    """Return (yes|no, reason). unknown_samples does not change the result.
+
+    yes means the interval is covered at the sample cadence.
+    It does not mean the host was observed continuously.
+    A pause shorter than the cadence can sit inside one span.
+    """
     del unknown_samples
+    if end_ns < start_ns:
+        return "no", "window_backward"
+    if not samples:
+        return "no", "no_samples"
+    if len(samples) < 2:
+        return "no", "unbracketed"
+    for sample in samples:
+        if any(sample.get(name) == "unsupported" for name in CLOCK_NAMES):
+            return "no", "clock_unsupported"
     overlapped = False
     for prev, cur in _pairs(samples):
         pattern, _deltas = _span(prev, cur, cadence_ns)
-        realtime_0 = prev["realtime"]
-        realtime_1 = cur["realtime"]
-        if realtime_0 == "unsupported" or realtime_1 == "unsupported":
+        if not _overlaps(prev["realtime"], cur["realtime"], start_ns, end_ns):
             continue
-        if realtime_1 < realtime_0:
-            lo, hi = realtime_1, realtime_0
-            if lo < end_ns and hi > start_ns:
-                return "no", "wall_discontinuous"
-            continue
-        if realtime_0 < end_ns and realtime_1 > start_ns:
-            overlapped = True
-            if pattern != "cadence":
-                return "no", pattern
+        overlapped = True
+        if pattern != "cadence":
+            return "no", pattern
+    first = samples[0]["realtime"]
+    last = samples[-1]["realtime"]
+    if first == "unsupported" or last == "unsupported":
+        return "no", "clock_unsupported"
+    if first > start_ns + cadence_ns:
+        return "no", "leading_unsampled"
+    if last + cadence_ns < end_ns:
+        return "no", "trailing_unsampled"
     if not overlapped:
         return "no", "outside_or_unplaced"
     return "yes", "cadence"
 
 
-def _span(prev, cur, cadence_ns):
-    deltas = {name: clock_delta(prev[name], cur[name]) for name in CLOCK_NAMES}
-    return classify_deltas(deltas, cadence_ns), deltas
+def _window_lines(samples, cadence_ns, windows, bound):
+    lines = []
+    if bound is None:
+        lines.append("observation_bound absent")
+    else:
+        verdict, reason = window_verdict(samples, bound[0], bound[1], cadence_ns, unknown_samples=0)
+        lines.append(f"observation_bound fully_observed {verdict} reason {reason}")
+    for label, start_ns, end_ns in windows:
+        verdict, reason = window_verdict(samples, start_ns, end_ns, cadence_ns, unknown_samples=0)
+        lines.append(f"observation_mark {label} fully_observed {verdict} reason {reason}")
+    return lines
 
 
-def format_coverage(samples, cadence_ns, windows):
-    """Report the whole run. windows are (label, start_ns, end_ns)."""
+def format_coverage(samples, cadence_ns, windows, bound=None):
+    """Report the whole run. windows are (label, start_ns, end_ns). bound is (start_ns, end_ns) or None."""
     lines = [
         f"observation_cadence_ns {int(cadence_ns)}",
         f"observation_large_unsampled_ns {LARGE_UNSAMPLED_NS}",
+        f"observation_capture_bracket_max_ns {CAPTURE_BRACKET_MAX_NS}",
         f"observation_samples {len(samples)}",
+        "observation_fully_observed_meaning one_cadence_spacing_not_continuous_observation",
+        "observation_product_gate_unchanged reply_gap_ms 200",
         "observation_pattern_limit no_clock_pattern_identifies_every_hypervisor_pause",
         "observation_note contention_unknown_samples_do_not_mean_a_renewal_interval_was_fully_observed",
         "observation_pressure_note cgroup_cpu_some_ms_is_psi_stall_not_cpu_time_consumed",
@@ -394,6 +469,7 @@ def format_coverage(samples, cadence_ns, windows):
         lines.append("observation_max_unsampled_monotonic_ns none")
         lines.append("observation_max_unsampled_boottime_ns none")
         lines.append("observation_large_spans 0")
+        lines.extend(_window_lines(samples, cadence_ns, windows, bound))
         return lines
     spans = []
     counts = {}
@@ -448,9 +524,7 @@ def format_coverage(samples, cadence_ns, windows):
         lines.append(f"observation_min_capture_skew_ns {min(skews)}")
     else:
         lines.append("observation_max_capture_skew_ns unsupported")
-    for label, start_ns, end_ns in windows:
-        verdict, reason = window_verdict(samples, start_ns, end_ns, cadence_ns, unknown_samples=0)
-        lines.append(f"observation_mark {label} fully_observed {verdict} reason {reason}")
+    lines.extend(_window_lines(samples, cadence_ns, windows, bound))
     return lines
 
 
@@ -475,10 +549,17 @@ def coverage_main(argv):
     ap.add_argument("--samples", required=True)
     ap.add_argument("--cadence-ms", type=float, required=True)
     ap.add_argument("--mark", action="append", default=[])
+    ap.add_argument("--bound")
     ap.add_argument("--unknown-samples", type=int)
     args = ap.parse_args(argv)
     windows = [parse_mark(item) for item in args.mark]
-    lines = format_coverage(coverage_samples(args.samples), args.cadence_ms * 1_000_000, windows)
+    bound = None
+    if args.bound:
+        start_s, end_s = args.bound.split(":", 1)
+        bound = (int(float(start_s) * 1e9), int(float(end_s) * 1e9))
+    lines = format_coverage(
+        coverage_samples(args.samples), args.cadence_ms * 1_000_000, windows, bound
+    )
     if args.unknown_samples is not None:
         lines.append(f"observation_unknown_samples_ignored {args.unknown_samples}")
     print("\n".join(lines))

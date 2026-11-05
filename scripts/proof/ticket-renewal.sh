@@ -107,20 +107,46 @@ stop_sampler() {
 # Print observation coverage. This does not change a gate and it does not change the exit status.
 # contention unknown_samples is not an input.
 report_observation() {
-  local samples name e cov
+  local samples name e cov k expiry renew bound_start bound_end
   local -a coverage_marks=()
+  local -a cov_args=()
   [[ "${COVERAGE_DONE:-0}" == "1" ]] && return 0
   samples="${OUTD:-}/host-samples.txt"
   [[ -n "${OUTD:-}" && -f "$samples" ]] || return 0
   COVERAGE_DONE=1
-  if declare -p EXPIRIES >/dev/null 2>&1; then
+  bound_start=""
+  bound_end=""
+  # Scheduled renewal intervals come from the first expiry and the period.
+  # A missing renewal event does not drop the interval.
+  if declare -p E0 >/dev/null 2>&1 && [[ -n "${PERIOD:-}" && -n "${TR_SVID_TTL:-}" && -n "${TR_ENDS:-}" ]]; then
     for name in "${NODES[@]}"; do
-      for e in ${EXPIRIES[$name]:-}; do
-        coverage_marks+=(--mark "${name}=${e}")
+      [[ -n "${E0[$name]:-}" ]] || continue
+      for ((k = 2; k <= TR_ENDS; k++)); do
+        expiry=$(( E0[$name] + (k - 1) * PERIOD ))
+        renew=$(( expiry - (TR_SVID_TTL - PERIOD) ))
+        coverage_marks+=(--mark "${name}-sched-${k}=${renew}:${expiry}")
+        if [[ -z "$bound_start" || renew -lt bound_start ]]; then
+          bound_start=$renew
+        fi
+        if [[ -z "$bound_end" || expiry -gt bound_end ]]; then
+          bound_end=$expiry
+        fi
       done
     done
   fi
-  cov="$(python3 "$ROOT/scripts/proof/host-sampler.py" coverage --samples "$samples" --cadence-ms 100 "${coverage_marks[@]}")" \
+  if declare -p EXPIRIES >/dev/null 2>&1; then
+    for name in "${NODES[@]}"; do
+      for e in ${EXPIRIES[$name]:-}; do
+        coverage_marks+=(--mark "${name}-seen=${e}:$((e + 1))")
+      done
+    done
+  fi
+  cov_args=(coverage --samples "$samples" --cadence-ms 100)
+  if [[ -n "$bound_start" && -n "$bound_end" ]]; then
+    cov_args+=(--bound "${bound_start}:${bound_end}")
+  fi
+  cov_args+=("${coverage_marks[@]}")
+  cov="$(python3 "$ROOT/scripts/proof/host-sampler.py" "${cov_args[@]}")" \
     || cov="observation_coverage command_failed"
   printf '%s\n' "$cov"
   if [[ -n "${TR_OUT_DIR:-}" ]]; then
