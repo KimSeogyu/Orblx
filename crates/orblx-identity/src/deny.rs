@@ -19,12 +19,20 @@ pub enum DenyApply {
 ///
 /// A document replaces the whole set. A lower version does not change the set.
 /// A document that fails the parse check does not change the set.
+///
+/// A set from [`DenySet::refuse_all`] refuses each identifier and each nonce (W25-38).
+/// A node uses it when its deny file is not valid, did not open, or is missing after enroll.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenySet {
+    refuse_all: bool,
     version: Option<u64>,
     generated_at: Option<u64>,
     revoked_uris: BTreeSet<String>,
     revoked_nonces: BTreeSet<[u8; 16]>,
+    /// The seq of the signed list that this set came from. `None` for an unsigned set.
+    seq: Option<u64>,
+    /// The raw signed deny object bytes. `None` for an unsigned set.
+    raw: Option<Vec<u8>>,
 }
 
 impl Default for DenySet {
@@ -36,11 +44,46 @@ impl Default for DenySet {
 impl DenySet {
     pub fn empty() -> Self {
         Self {
+            refuse_all: false,
             version: None,
             generated_at: None,
             revoked_uris: BTreeSet::new(),
             revoked_nonces: BTreeSet::new(),
+            seq: None,
+            raw: None,
         }
+    }
+
+    /// Return a set that refuses each identifier and each nonce (W25-38).
+    ///
+    /// The set fails closed. It is not an empty list. A valid document that
+    /// [`DenySet::apply_json`] applies replaces it.
+    pub fn refuse_all() -> Self {
+        Self {
+            refuse_all: true,
+            ..Self::empty()
+        }
+    }
+
+    /// Return true when the set refuses each identifier and each nonce.
+    pub fn refuses_all(&self) -> bool {
+        self.refuse_all
+    }
+
+    /// Mark the set as stale after a failed reload (W25-38).
+    ///
+    /// The set keeps its version and its entries, as the agent guard keeps its last
+    /// good set. A stale set refuses each identifier and each nonce. A valid document
+    /// with a higher version, or the same document again, makes it current.
+    pub fn mark_stale(&mut self) {
+        self.refuse_all = true;
+    }
+
+    /// Parse one deny JSON document into a new set.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, IdentityError> {
+        let mut deny = Self::empty();
+        deny.apply_json(bytes)?;
+        Ok(deny)
     }
 
     pub fn version(&self) -> Option<u64> {
@@ -49,6 +92,32 @@ impl DenySet {
 
     pub fn generated_at(&self) -> Option<u64> {
         self.generated_at
+    }
+
+    /// The seq of the signed list that this set came from.
+    pub fn seq(&self) -> Option<u64> {
+        self.seq
+    }
+
+    /// The raw deny object bytes of the signed list that this set came from.
+    pub fn signed_raw(&self) -> Option<&[u8]> {
+        self.raw.as_deref()
+    }
+
+    /// Apply one verified signed deny object.
+    ///
+    /// The caller checked the signature over `verified` raw bytes.
+    /// A higher seq with the same version keeps the entries and stores the new seq.
+    pub fn apply_verified(
+        &mut self,
+        verified: &crate::signed_deny::VerifiedDeny,
+    ) -> Result<DenyApply, IdentityError> {
+        let result = self.apply_json(verified.raw())?;
+        if verified.seq() >= self.seq.unwrap_or(0) {
+            self.seq = Some(verified.seq());
+            self.raw = Some(verified.raw().to_vec());
+        }
+        Ok(result)
     }
 
     /// Apply one deny JSON document.
@@ -69,10 +138,21 @@ impl DenySet {
             nonces.insert(bytes);
         }
         if let Some(current) = self.version {
+            // W25-38: the same document again makes a stale set current.
+            // The set never moves to a lower version.
+            let same = document.version == current
+                && document.generated_at == self.generated_at.unwrap_or_default()
+                && uris == self.revoked_uris
+                && nonces == self.revoked_nonces;
+            if self.refuse_all && same {
+                self.refuse_all = false;
+                return Ok(DenyApply::Applied);
+            }
             if document.version <= current {
                 return Ok(DenyApply::IgnoredOlder);
             }
         }
+        self.refuse_all = false;
         self.version = Some(document.version);
         self.generated_at = Some(document.generated_at);
         self.revoked_uris = uris;
@@ -81,6 +161,9 @@ impl DenySet {
     }
 
     pub fn reject_uri(&self, id: &SpiffeId) -> Result<(), IdentityError> {
+        if self.refuse_all {
+            return Err(IdentityError::DenyDocument);
+        }
         if self.revoked_uris.contains(id.as_uri()) {
             return Err(IdentityError::Revoked);
         }
@@ -88,6 +171,9 @@ impl DenySet {
     }
 
     pub fn reject_nonce(&self, nonce: &[u8; 16]) -> Result<(), IdentityError> {
+        if self.refuse_all {
+            return Err(IdentityError::DenyDocument);
+        }
         if self.revoked_nonces.contains(nonce) {
             return Err(IdentityError::Revoked);
         }
@@ -102,4 +188,17 @@ struct DenyDocument {
     generated_at: u64,
     revoked_uris: Vec<String>,
     revoked_ticket_nonces: Vec<String>,
+    /// The node SVID URI. Absent on the coordinator file. The node checks it
+    /// before it calls [`DenySet::apply_json`].
+    #[serde(default)]
+    #[allow(dead_code)]
+    node_uri: String,
+    /// The signed seq. Absent on the coordinator file.
+    #[serde(default)]
+    #[allow(dead_code)]
+    seq: u64,
+    /// The signed issue time. Absent on the coordinator file.
+    #[serde(default)]
+    #[allow(dead_code)]
+    issued_at_ms: u64,
 }

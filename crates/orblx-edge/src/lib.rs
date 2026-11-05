@@ -39,7 +39,7 @@ mod stun;
 pub use birthday::{MappingKind, Strategy};
 pub use candidate::{
     decode_candidate, encode_candidate, endpoint_sign_payload, CandidateSink, EndpointCandidate,
-    MemoryCandidateSink, UnsignedCandidateSet,
+    MemoryCandidateSink, UnsignedCandidateSet, ENDPOINT_SIGN_PREFIX,
 };
 pub use direct::{
     issue_direct_pair, DirectIdentity, DirectMaterial, DirectProof, DirectRequest, DirectRole,

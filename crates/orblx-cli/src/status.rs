@@ -48,6 +48,8 @@ fn status_json(text: &str) -> Result<String, String> {
     let mut svid = String::new();
     let mut svid_expiry = Value::Null;
     let mut exit_node = Value::Null;
+    let mut coord = Value::Null;
+    let mut deny_fetch = Value::Null;
     let mut peers = Vec::new();
     for line in text.lines() {
         if line.is_empty() {
@@ -67,6 +69,15 @@ fn status_json(text: &str) -> Result<String, String> {
                 };
             }
             Some("exit_node") => exit_node = json!(rest(parts)),
+            Some("coord") => coord = json!(rest(parts)),
+            Some("deny_fetch_ok_ms") => {
+                let ok_ms = rest_number(parts.next())?;
+                if parts.next() != Some("age_s") {
+                    return Err("The status text is not valid.".to_string());
+                }
+                let age_s = rest_number(parts.next())?;
+                deny_fetch = json!({"ok_ms": ok_ms, "age_s": age_s});
+            }
             Some("peer") => peers.push(parse_peer(line)?),
             Some(_) | None => {}
         }
@@ -81,6 +92,8 @@ fn status_json(text: &str) -> Result<String, String> {
         "svid": svid,
         "svid_expiry": svid_expiry,
         "exit_node": exit_node,
+        "coord": coord,
+        "deny_fetch": deny_fetch,
         "peers": peers,
     });
     serde_json::to_string(&value).map_err(|_| "The status text is not valid.".to_string())
@@ -122,6 +135,12 @@ fn parse_peer(line: &str) -> Result<Value, String> {
     }))
 }
 
+fn rest_number(text: Option<&str>) -> Result<u64, String> {
+    text.ok_or_else(|| "The status text is not valid.".to_string())?
+        .parse::<u64>()
+        .map_err(|_| "The status text is not valid.".to_string())
+}
+
 fn rest<'a>(parts: impl Iterator<Item = &'a str>) -> String {
     parts.collect::<Vec<_>>().join(" ")
 }
@@ -161,5 +180,22 @@ peer b overlay_ip 100.64.0.2 path direct svid spiffe://orblx.local/node/b svid_e
             status_json("state up\nname a\noverlay_ip 100.64.0.1\nexit_node exit\n").unwrap();
         let selected: serde_json::Value = serde_json::from_str(&selected).unwrap();
         assert_eq!(selected["exit_node"], "exit");
+        assert!(selected["coord"].is_null());
+        let mismatch = status_json(
+            "state up\nname a\noverlay_ip 100.64.0.1\ncoord version mismatch, upgrade: the coordinator is older than the node\n",
+        )
+        .unwrap();
+        let mismatch: serde_json::Value = serde_json::from_str(&mismatch).unwrap();
+        assert_eq!(
+            mismatch["coord"],
+            "version mismatch, upgrade: the coordinator is older than the node"
+        );
+        assert!(value["deny_fetch"].is_null());
+        let fetched =
+            status_json("state up\nname a\noverlay_ip 100.64.0.1\ndeny_fetch_ok_ms 10 age_s 301\n")
+                .unwrap();
+        let fetched: serde_json::Value = serde_json::from_str(&fetched).unwrap();
+        assert_eq!(fetched["deny_fetch"]["ok_ms"], 10);
+        assert_eq!(fetched["deny_fetch"]["age_s"], 301);
     }
 }

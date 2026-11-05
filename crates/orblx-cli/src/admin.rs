@@ -49,6 +49,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         "revoke-all" => "admin-revoke-all",
         "revoke-undo" => "admin-revoke-undo",
         "expire" => "admin-expire",
+        "netmap-seq-reset" => "admin-netmap-seq-reset",
         "routes" => "admin-routes",
         "audit" => "admin-audit",
         "grants" => "admin-grants",
@@ -451,6 +452,19 @@ fn print_admin(op: &str, value: &Value) -> Result<(), String> {
         "admin-expire" => {
             println!("expired {}", text_field(value, "name")?);
         }
+        "admin-netmap-seq-reset" => {
+            let field = |key: &str| {
+                value
+                    .get(key)
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| "The coordinator response is not valid.".to_string())
+            };
+            println!(
+                "netmap_seq_reset from {} to {}",
+                field("from")?,
+                field("to")?
+            );
+        }
         "admin-routes" => {
             let nodes = value
                 .get("nodes")
@@ -658,6 +672,7 @@ orblx admin revoke NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle
 orblx admin revoke-all PRINCIPAL --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin revoke-undo PRINCIPAL --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin expire NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin netmap-seq-reset --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin routes --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin grants --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin grant-approve ID --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
@@ -694,6 +709,11 @@ PRINCIPAL is a node name or a SPIFFE URI of a node, a user, or an agent.
 revoke-undo removes the SVID deny entry of the principal with one deny change and one audit record.
 The grants that revoke-all revoked stay revoked.
 expire removes the node from netmaps until approve.
+netmap-seq-reset is for a coordinator clock that went forward and then back.
+The coordinator then signs no netmap, because the stored netmap seq is more than 60 s
+ahead of its clock. The command sets the stored seq to the clock time. It works only when
+the stored seq is ahead of the clock. Only an owner SVID can run it (no API token).
+It writes one netmap-seq-reset audit record (code 41).
 users lists the OIDC users with the state pending, approved, or rejected.
 A new OIDC user is pending. A pending or rejected user gets no SVID and cannot enroll a node.
 user-approve lets USER enroll nodes. USER is oidc:SUBJECT or SUBJECT.

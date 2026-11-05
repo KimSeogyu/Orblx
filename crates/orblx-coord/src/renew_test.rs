@@ -901,6 +901,147 @@ async fn a_peer_that_enrolls_later_is_reachable_in_two_seconds() {
     }
 }
 
+/// W25-34: the policy sync can write a new netmap file after `orblx up` read the start
+/// netmap and before the netmap watcher started. The watcher must apply that file.
+///
+/// Node a reads its start netmap with no peer. Then b enrolls, and the new netmap of a, with
+/// peer b, goes into the file before node a starts. Node a starts with the old netmap and
+/// the old file text, as `orblx up` gives them. Node a must add b and reach it.
+/// Before the fix, the watcher took the new file as its start text and never added b.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_netmap_file_written_before_the_watcher_starts_is_applied() {
+    let scratch = Scratch::new("startrace");
+    let node_a = Scratch::new("startrace-a");
+    let node_b = Scratch::new("startrace-b");
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    let (addr, handle) = server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+    let (port_a, port_b) = (free_port(), free_port());
+    let mut enrolled = Vec::new();
+    for (name, port) in [("a", port_a), ("b", port_b)] {
+        let token = coord.create_token(Duration::from_secs(600)).unwrap();
+        let result = client::enroll_with_token(
+            addr,
+            "coord",
+            &bundle,
+            name,
+            &token.secret,
+            &[format!("127.0.0.1:{port}")],
+            &[],
+        )
+        .await
+        .unwrap();
+        enrolled.push(result);
+    }
+    enrolled[0].write_state(&node_a.0).unwrap();
+    // What `orblx up` read: the start netmap with no peer, and its file text.
+    let old_text = fs::read(node_a.0.join("netmap.json")).unwrap();
+    let map_a = Netmap::from_slice(&old_text).unwrap();
+    assert!(map_a.peers.is_empty());
+    // The policy sync writes the new netmap of a before the node starts.
+    let sync = {
+        let (bundle, dir) = (bundle.clone(), node_a.0.clone());
+        tokio::task::spawn_blocking(move || {
+            client::fetch_policy_wait_blocking(addr, "coord", &bundle, &dir, None)
+        })
+        .await
+        .unwrap()
+        .unwrap()
+    };
+    sync.view.write_state(&node_a.0).unwrap();
+    assert_ne!(fs::read(node_a.0.join("netmap.json")).unwrap(), old_text);
+    enrolled[1].write_state(&node_b.0).unwrap();
+    let map_b = Netmap::from_path(&node_b.0.join("netmap.json")).unwrap();
+
+    let trust = TrustBundle::from_pem(&bundle).unwrap();
+    let signer = TicketSigner::generate();
+    let mac_key = [0x47; 32];
+    let now = SystemTime::now();
+    let ticket_key = TicketKey::new(
+        signer.verifier(),
+        mac_key,
+        now - Duration::from_secs(60),
+        now + Duration::from_secs(3_600),
+    )
+    .unwrap();
+    let ring = TicketRing::single(ticket_key, &[11; 32]).unwrap();
+    let config_a = leaf_config(&enrolled[0], &trust, &signer, &mac_key, &ring, now);
+    let config_b = leaf_config(&enrolled[1], &trust, &signer, &mac_key, &ring, now);
+    let (stop_tx, stop_a) = watch::channel(false);
+    let stop_b = stop_a.clone();
+    let (a_in_tx, a_in_rx) = mpsc::channel(64);
+    let (a_out_tx, _a_out_rx) = mpsc::channel(64);
+    let (_b_in_tx, b_in_rx) = mpsc::channel(64);
+    let (b_out_tx, mut b_out_rx) = mpsc::channel(64);
+    let renew = |dir: &PathBuf| {
+        renewer(
+            addr,
+            bundle.clone(),
+            dir.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+    };
+    let mut request_a = node_request(
+        config_a,
+        map_a,
+        port_a,
+        node_a.0.clone(),
+        renew(&node_a.0),
+        stop_a,
+    );
+    request_a.netmap_text = Some(old_text);
+    let task_a = tokio::spawn(run_memory_node(
+        request_a,
+        MemoryDevice {
+            from_tun: a_in_rx,
+            to_tun: a_out_tx,
+        },
+    ));
+    let task_b = tokio::spawn(run_memory_node(
+        node_request(
+            config_b,
+            map_b,
+            port_b,
+            node_b.0.clone(),
+            renew(&node_b.0),
+            stop_b,
+        ),
+        MemoryDevice {
+            from_tun: b_in_rx,
+            to_tun: b_out_tx,
+        },
+    ));
+    let started = Instant::now();
+    let mut reached = false;
+    while started.elapsed() < Duration::from_secs(8) {
+        let _ = a_in_tx
+            .send(
+                ipv4_packet(
+                    Ipv4Addr::new(100, 64, 0, 1),
+                    Ipv4Addr::new(100, 64, 0, 2),
+                    b"race",
+                )
+                .unwrap(),
+            )
+            .await;
+        if let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(50), b_out_rx.recv()).await
+        {
+            reached = true;
+            break;
+        }
+    }
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(3), task_a).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), task_b).await;
+    handle.abort();
+    assert!(
+        reached,
+        "node a did not apply the netmap file that changed before its watcher started"
+    );
+}
+
 /// W25-6c negative test: a stop of 2.5 s after the listener of b starts, before b accepts,
 /// makes the gate fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1335,6 +1476,7 @@ fn node_request(
         netmap,
         listen: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
         netmap_path: state_dir.join("netmap.json"),
+        netmap_text: None,
         state_dir,
         renew: Some(renew),
         stop: Some(stop),

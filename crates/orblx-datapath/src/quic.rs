@@ -201,6 +201,13 @@ impl HelloEndpoint {
         *slot = deny;
     }
 
+    /// A copy of the current deny set of the endpoint (W25-38).
+    #[must_use]
+    pub fn deny_set(&self) -> DenySet {
+        let slot = self.auth.deny.lock().unwrap_or_else(|err| err.into_inner());
+        slot.clone()
+    }
+
     /// True when the deny list of the endpoint revokes the peer SVID (W24).
     #[must_use]
     pub fn denies(&self, peer: &SpiffeId) -> bool {

@@ -40,13 +40,15 @@ pub use gate::PeerGate;
 pub use ha::{RouteAudit, RouteChange, RouteSelector, HA_DEAD_AFTER, ROUTE_AUDIT_FILE};
 pub use ipv4::{ipv4_destination, ipv4_packet, is_icmp_echo_reply, is_ipv4_packet};
 pub use netmap::{
-    valid_split_domain, valid_split_nameserver, LockUpdate, Netmap, NetmapError, NetmapPeer,
-    NetmapSelf, NodeLockSig, SplitDns, MAX_SPLIT_DNS_SERVERS, MAX_SPLIT_DNS_ZONES, NODE_LOCK_FILE,
+    netmap_fresh, ssh_key_id, ssh_key_id_node, valid_split_domain, valid_split_nameserver,
+    LockUpdate, Netmap, NetmapError, NetmapPeer, NetmapSelf, NodeLockSig, SplitDns, SshRevoked,
+    MAX_SPLIT_DNS_SERVERS, MAX_SPLIT_DNS_ZONES, MAX_SSH_REVOKED, MAX_SSH_USER_CA,
+    NETMAP_MAX_AGE_MS, NETMAP_MAX_SKEW_MS, NODE_LOCK_FILE,
 };
 pub use node::{
     format_node_status, read_status_text, run_memory_node, run_node, running_pid, ListenEvent,
-    MemoryDevice, NodeRequest, NodeStatus, RenewedLeaf, StatusPeer, SvidRenewer, NODE_PID_FILE,
-    NODE_RECORD_FILE, NODE_STATUS_FILE,
+    MemoryDevice, NodeRequest, NodeStatus, RenewedLeaf, StatusPeer, SvidRenewer,
+    COORD_MISMATCH_FILE, NODE_PID_FILE, NODE_RECORD_FILE, NODE_STATUS_FILE,
 };
 pub use quic::{
     measure_hello_rtt, prove_hello_socket, HelloConfig, HelloEndpoint, HelloReceiver, HelloSender,

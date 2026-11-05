@@ -159,6 +159,12 @@ pub struct NodeRequest {
     pub relay: Option<SocketAddr>,
     /// The netmap file. The node reads it again when the file changes.
     pub netmap_path: PathBuf,
+    /// The bytes of `netmap_path` that gave `netmap` (W25-34).
+    ///
+    /// The netmap watcher compares the file with these bytes, so a file that changed after
+    /// the caller read it and before the watcher started is applied. `None`: the watcher
+    /// takes the file text at its start.
+    pub netmap_text: Option<Vec<u8>>,
     /// [`crate::GrantPeers`] hides peers the signed grants do not let this node reach.
     /// [`crate::AllowPeers`] allows every peer when the node has no grant file.
     pub visibility: Arc<dyn PeerVisibility>,
@@ -368,6 +374,13 @@ fn write_status(path: &Path, text: &str) {
 struct NodeCounters {
     tx: AtomicU64,
     rx: AtomicU64,
+    /// Sessions and frames that the identity, ticket, or deny check refused (W25-38).
+    refused: AtomicU64,
+}
+
+/// True when the identity, the ticket, or the deny check refused a session or a frame.
+fn is_refusal(err: &HelloError) -> bool {
+    matches!(err, HelloError::Identity(_) | HelloError::Ticket(_))
 }
 
 #[derive(Clone)]
@@ -425,6 +438,68 @@ pub fn format_node_status(status: &NodeStatus) -> String {
 /// A live pid returns the status file.
 /// A stopped node returns the overlay IP from the state directory.
 pub fn read_status_text(state_dir: &Path) -> Result<String, HelloError> {
+    let mut text = read_node_status_text(state_dir)?;
+    push_coord_warning(state_dir, &mut text);
+    push_deny_fetch(state_dir, &mut text);
+    Ok(text)
+}
+
+/// Add `deny_fetch_ok_ms` and `age_s` when the node has a good deny fetch (W25-37).
+fn push_deny_fetch(state_dir: &Path, text: &mut String) {
+    let Some(ok_ms) = orblx_identity::read_deny_fetch_ok(state_dir) else {
+        return;
+    };
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    text.push_str(&orblx_identity::deny_fetch_status_line(ok_ms, now_ms));
+    text.push('\n');
+}
+
+/// Add the line `coord TEXT` when the node wrote a version mismatch text (W25-34).
+fn push_coord_warning(state_dir: &Path, text: &mut String) {
+    if let Ok(warning) = fs::read_to_string(state_dir.join(COORD_MISMATCH_FILE)) {
+        let line = warning.lines().next().unwrap_or("").trim();
+        if !line.is_empty() && line.len() <= 200 && !line.chars().any(char::is_control) {
+            text.push_str(&format!("coord {line}\n"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod coord_warning_tests {
+    use super::{push_coord_warning, COORD_MISMATCH_FILE};
+
+    #[test]
+    fn status_shows_the_version_mismatch_text() {
+        let dir = std::env::temp_dir().join(format!("orblx-coord-warning-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut text = "state up\n".to_string();
+        push_coord_warning(&dir, &mut text);
+        assert_eq!(text, "state up\n");
+        std::fs::write(
+            dir.join(COORD_MISMATCH_FILE),
+            "version mismatch, upgrade: the coordinator is older than the node\n",
+        )
+        .unwrap();
+        push_coord_warning(&dir, &mut text);
+        assert_eq!(
+            text,
+            "state up\ncoord version mismatch, upgrade: the coordinator is older than the node\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The node file with the last version mismatch text from the coordinator (W25-34).
+///
+/// `orblx status` shows it as the line `coord TEXT`. The node removes the file when the
+/// coordinator replies with a signed netmap seq again.
+pub const COORD_MISMATCH_FILE: &str = "coord-mismatch";
+
+fn read_node_status_text(state_dir: &Path) -> Result<String, HelloError> {
     let record = read_status_record(state_dir)?;
     if running_pid(state_dir).is_some() {
         let path = state_dir.join(NODE_STATUS_FILE);
@@ -696,6 +771,7 @@ async fn run_mesh_inner(
     let counters = Arc::new(NodeCounters {
         tx: AtomicU64::new(0),
         rx: AtomicU64::new(0),
+        refused: AtomicU64::new(0),
     });
 
     let tun_shutdown = shutdown_rx.clone();
@@ -764,7 +840,7 @@ async fn run_mesh_inner(
                 .count();
             let sessions = u64::try_from(sessions).unwrap_or(u64::MAX);
             format!(
-                "{}{}{}",
+                "{}{}{}{}",
                 orblx_audit::sample_line(
                     "orblx_node_packets_tx",
                     "counter",
@@ -776,6 +852,11 @@ async fn run_mesh_inner(
                     metrics_counters.rx.load(Ordering::Relaxed)
                 ),
                 orblx_audit::sample_line("orblx_node_sessions", "gauge", sessions),
+                orblx_audit::sample_line(
+                    "orblx_node_refused",
+                    "counter",
+                    metrics_counters.refused.load(Ordering::Relaxed)
+                ),
             )
         }) {
             Ok(bound) => println!("metrics {bound}"),
@@ -795,7 +876,9 @@ async fn run_mesh_inner(
         // The node applies the list only when the file text changes. Thus the
         // tick does not touch the endpoint or the links when nothing changed.
         let mut ticks: u64 = 0;
-        let mut last_text: Option<Vec<u8>> = None;
+        let mut deny_cache = orblx_identity::DenyCache::with_set(deny_endpoint.deny_set());
+        let mut last_netmap: Option<Vec<u8>> = None;
+        let mut ssh_closed: HashSet<(u64, String)> = HashSet::new();
         loop {
             tokio::select! {
                 changed = deny_shutdown.changed() => {
@@ -806,17 +889,45 @@ async fn run_mesh_inner(
                 _ = tick.tick() => {
                     // The read runs on a blocking thread, so a slow disk does not stop
                     // the packet runtime (W25-11).
-                    let path = deny_dir.join("deny.json");
-                    let read = tokio::task::spawn_blocking(move || fs::read(path)).await;
-                    if let Ok(Ok(bytes)) = read {
-                        if last_text.as_deref() != Some(bytes.as_slice()) {
-                            if let Some(deny) = parse_deny(&bytes) {
-                                // Replace first, so a session that starts now uses the new list.
-                                // Then close the open sessions of the denied peers.
-                                deny_endpoint.replace_deny(deny.clone());
-                                close_denied_links(&lock_mesh, &deny);
-                                last_text = Some(bytes);
+                    let dir = Arc::clone(&deny_dir);
+                    let read = tokio::task::spawn_blocking(move || {
+                        orblx_identity::read_deny_file(&dir)
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(orblx_identity::DenyFileError::Unreadable(
+                            deny_dir.join(orblx_identity::DENY_FILE),
+                            std::io::ErrorKind::Other,
+                        ))
+                    });
+                    // W25-38: a deny file that is not valid, did not open, or is missing
+                    // after enroll makes the set stale. The stale set keeps the last good
+                    // entries and refuses new sessions, as the agent guard does. The node
+                    // never uses an empty list in place of such a file.
+                    match deny_cache.apply_read(&deny_dir, read) {
+                        orblx_identity::DenyReload::Same => {}
+                        orblx_identity::DenyReload::Changed => {
+                            // Replace first, so a session that starts now uses the new list.
+                            // Then close the open sessions of the denied peers.
+                            let deny = deny_cache.set().clone();
+                            deny_endpoint.replace_deny(deny.clone());
+                            close_denied_links(&lock_mesh, &deny);
+                        }
+                        orblx_identity::DenyReload::Stale { error, first } => {
+                            if first {
+                                eprintln!("{error} The node refuses new sessions.");
+                                deny_endpoint.replace_deny(deny_cache.set().clone());
                             }
+                        }
+                    }
+                    // W25-31: a revoked SSH user certificate closes the mesh sessions of the
+                    // node that asked for it. The node reads the netmap only when its text changes.
+                    if let Ok(bytes) = fs::read(&lock_mesh.netmap_path) {
+                        if last_netmap.as_deref() != Some(bytes.as_slice()) {
+                            if let Ok(netmap) = Netmap::from_slice(&bytes) {
+                                close_ssh_revoked_links(&lock_mesh, &netmap, &mut ssh_closed);
+                            }
+                            last_netmap = Some(bytes);
                         }
                     }
                     if ticks.is_multiple_of(100) {
@@ -838,12 +949,15 @@ async fn run_mesh_inner(
         }
     }
     let peer_tasks = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
+    // W25-43: the peer watcher and the DNS watcher both start from the start netmap text.
+    let start_text = request.netmap_text.take();
     let peer_watch = PeerWatch {
         mesh: mesh.clone(),
         router: router_tx,
         accept_routes,
         interface: interface.clone(),
         tasks: Arc::clone(&peer_tasks),
+        start_text: start_text.clone(),
     };
     tasks.push(tokio::spawn(async move {
         watch_netmap_peers(peer_watch).await;
@@ -887,6 +1001,7 @@ async fn run_mesh_inner(
                 visibility,
                 shutdown: dns_shutdown,
                 exit_dns,
+                start_text,
             },
             &netmap,
         )
@@ -1159,6 +1274,8 @@ struct PeerWatch {
     accept_routes: bool,
     interface: Option<String>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// The file text that gave the start netmap, from [`NodeRequest::netmap_text`].
+    start_text: Option<Vec<u8>>,
 }
 
 /// Apply a new netmap file without a restart (W25-6).
@@ -1170,7 +1287,13 @@ struct PeerWatch {
 /// A peer that leaves the netmap loses its routes. The deny list and the node lock
 /// stop its sessions, as before.
 async fn watch_netmap_peers(watch: PeerWatch) {
-    let mut last = fs::read(&watch.mesh.netmap_path).ok();
+    // W25-34: `orblx up --coord` can write a new file after it read the start netmap and
+    // before this task starts. The start text is the text of the start netmap, so that
+    // change is applied at the first tick.
+    let mut last = watch
+        .start_text
+        .clone()
+        .or_else(|| fs::read(&watch.mesh.netmap_path).ok());
     let mut started: HashSet<String> = watch
         .mesh
         .netmap
@@ -1338,11 +1461,38 @@ fn close_denied_links(mesh: &Mesh, deny: &DenySet) {
     }
 }
 
-fn parse_deny(bytes: &[u8]) -> Option<DenySet> {
-    let mut deny = DenySet::empty();
-    match deny.apply_json(bytes) {
-        Ok(_) => Some(deny),
-        Err(_) => None,
+/// Close the open mesh sessions of each node with a new revoked SSH certificate (W25-31).
+///
+/// The key ID of the certificate names the node SVID. The node closes the session one time
+/// for each revoked entry. A node that is not in the deny list can open a new session.
+fn close_ssh_revoked_links(mesh: &Mesh, netmap: &Netmap, seen: &mut HashSet<(u64, String)>) {
+    let mut nodes = HashSet::new();
+    for item in &netmap.ssh_revoked {
+        if seen.insert((item.serial, item.key_id.clone())) {
+            if let Some(node) = crate::netmap::ssh_key_id_node(&item.key_id) {
+                nodes.insert(node.to_string());
+            }
+        }
+    }
+    if nodes.is_empty() {
+        return;
+    }
+    let svids: HashMap<&str, &str> = mesh
+        .netmap
+        .peers
+        .iter()
+        .chain(netmap.peers.iter())
+        .map(|peer| (peer.name.as_str(), peer.svid.as_str()))
+        .collect();
+    let links = lock(&mesh.links);
+    for (name, link) in links.iter() {
+        let Some(svid) = svids.get(name.as_str()) else {
+            continue;
+        };
+        if nodes.contains(*svid) && !*link.cancel.borrow() {
+            println!("The peer {name} has a revoked SSH certificate. The node closes the session.");
+            let _ = link.cancel.send(true);
+        }
     }
 }
 
@@ -1383,7 +1533,12 @@ async fn accept_loop(mut mesh: Mesh) {
                     // The error is for one connection only. The next accept waits for a new
                     // connection, so the loop does not spin. A pause here would delay each
                     // connection behind it, for example after a peer stops its extra dial attempts.
-                    Err(err) => eprintln!("The node did not accept a peer. {err}"),
+                    Err(err) => {
+                        if is_refusal(&err) {
+                            mesh.counters.refused.fetch_add(1, Ordering::Relaxed);
+                        }
+                        eprintln!("The node did not accept a peer. {err}");
+                    }
                 }
             }
         }
@@ -1971,6 +2126,9 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                         tr!("{label} rx_end");
                     }
                     Err(err) => {
+                        if is_refusal(&err) {
+                            counters.refused.fetch_add(1, Ordering::Relaxed);
+                        }
                         tr!("{label} session_end reason=recv_err {err}");
                         return;
                     }
@@ -2444,6 +2602,8 @@ struct DnsSpawn {
     visibility: Arc<dyn PeerVisibility>,
     shutdown: watch::Receiver<bool>,
     exit_dns: Option<ExitDns>,
+    /// The file text that gave the start netmap, from [`NodeRequest::netmap_text`] (W25-43).
+    start_text: Option<Vec<u8>>,
 }
 
 fn exit_dns_target(netmap: &Netmap, exit_node: Option<&str>) -> Option<ExitDns> {
@@ -2507,6 +2667,7 @@ async fn spawn_overlay_dns(
     let armed = guard.armed_flag();
     tasks.push(tokio::spawn(async move {
         watch_netmap_dns(DnsWatch {
+            start_text: dns.start_text,
             path: dns.netmap_path,
             node_name: dns.node_name,
             node_overlay: dns.node_overlay,
@@ -2524,6 +2685,8 @@ async fn spawn_overlay_dns(
 }
 
 struct DnsWatch {
+    /// The file text that gave the start DNS table (W25-43).
+    start_text: Option<Vec<u8>>,
     path: PathBuf,
     node_name: String,
     node_overlay: String,
@@ -2537,7 +2700,7 @@ struct DnsWatch {
 }
 
 async fn watch_netmap_dns(mut watch_state: DnsWatch) {
-    let mut last = fs::read(&watch_state.path).unwrap_or_default();
+    let mut last = dns_start_text(watch_state.start_text.take(), &watch_state.path);
     let mut last_error = String::new();
     let mut grant_revision = watch_state.visibility.revision();
     loop {
@@ -2582,19 +2745,48 @@ fn refresh_resolver_in_background(watch_state: &DnsWatch, table: DnsTable) {
     });
 }
 
+/// The text that the DNS watcher compares the netmap file with at its start (W25-43).
+///
+/// `orblx up --coord` can write a new file after it read the start netmap and before this
+/// task starts. The start text is the text of the start netmap, so the first tick applies
+/// that change. `None`: the file text at the start.
+fn dns_start_text(start_text: Option<Vec<u8>>, path: &Path) -> Vec<u8> {
+    start_text.unwrap_or_else(|| fs::read(path).unwrap_or_default())
+}
+
 fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut String) {
-    match fs::read(&watch_state.path) {
-        Ok(bytes) if bytes == *last => {}
+    let Some(map) = changed_dns_netmap(
+        &watch_state.path,
+        &watch_state.node_name,
+        &watch_state.node_overlay,
+        last,
+        last_error,
+    ) else {
+        return;
+    };
+    let table = DnsTable::from_netmap(&map);
+    // W25-6: the responder uses the new table first. A slow host resolver command
+    // (up to COMMAND_WAIT for each call) must not hold the new answers.
+    let _ = watch_state.tables.send(table.clone());
+    refresh_resolver_in_background(watch_state, table);
+    println!("The DNS answers follow the new netmap.");
+}
+
+/// Read the netmap file. Return the new netmap for the DNS table when the file changed.
+fn changed_dns_netmap(
+    path: &Path,
+    node_name: &str,
+    node_overlay: &str,
+    last: &mut Vec<u8>,
+    last_error: &mut String,
+) -> Option<Netmap> {
+    match fs::read(path) {
+        Ok(bytes) if bytes == *last => None,
         Ok(bytes) => match Netmap::from_slice(&bytes) {
-            Ok(map) if self_matches(&map, &watch_state.node_name, &watch_state.node_overlay) => {
+            Ok(map) if self_matches(&map, node_name, node_overlay) => {
                 last.clone_from(&bytes);
                 last_error.clear();
-                let table = DnsTable::from_netmap(&map);
-                // W25-6: the responder uses the new table first. A slow host resolver command
-                // (up to COMMAND_WAIT for each call) must not hold the new answers.
-                let _ = watch_state.tables.send(table.clone());
-                refresh_resolver_in_background(watch_state, table);
-                println!("The DNS answers follow the new netmap.");
+                Some(map)
             }
             Ok(_) => {
                 *last = bytes;
@@ -2603,6 +2795,7 @@ fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut 
                     eprintln!("The node keeps the current DNS answers. {text}");
                     *last_error = text;
                 }
+                None
             }
             Err(err) => {
                 *last = bytes;
@@ -2611,6 +2804,7 @@ fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut 
                     eprintln!("The node did not load the netmap for DNS. {text}");
                     *last_error = text;
                 }
+                None
             }
         },
         Err(err) => {
@@ -2619,6 +2813,7 @@ fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut 
                 eprintln!("The node did not read the netmap for DNS. {text}");
                 *last_error = text;
             }
+            None
         }
     }
 }
@@ -2663,7 +2858,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        format_node_status, load_state, read_status_text, store_record, NodeStatus, StatusPeer,
+        changed_dns_netmap, dns_start_text, format_node_status, load_state, read_status_text,
+        store_record, NodeStatus, StatusPeer,
     };
     use crate::netmap::Netmap;
 
@@ -2683,6 +2879,27 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// W25-43 (Datapath review): the policy sync can write a new netmap file after `orblx up`
+    /// read the start netmap and before the DNS watcher starts. The first DNS tick must give
+    /// the new table, with the new peer name.
+    #[test]
+    fn the_dns_watcher_applies_a_netmap_file_written_before_it_starts() {
+        let dir = test_dir("dns-start-race");
+        let path = dir.join("netmap.json");
+        let start =
+            br#"{"version": 1, "self": {"name": "a", "overlay_ip": "100.64.0.1"}, "peers": []}"#;
+        let new = br#"{"version": 1, "self": {"name": "a", "overlay_ip": "100.64.0.1"}, "peers": [{"name": "b", "overlay_ip": "100.64.0.2", "owner": "lab", "svid": "spiffe://orblx.local/node/b", "endpoints": ["172.28.18.12:443"], "routes": []}]}"#;
+        fs::write(&path, new).unwrap();
+        let mut last = dns_start_text(Some(start.to_vec()), &path);
+        let mut last_error = String::new();
+        let map = changed_dns_netmap(&path, "a", "100.64.0.1", &mut last, &mut last_error)
+            .expect("the first DNS tick did not apply the netmap file that changed before the DNS watcher started");
+        assert!(map.peers.iter().any(|peer| peer.name == "b"));
+        assert_eq!(last, new.to_vec());
+        assert!(changed_dns_netmap(&path, "a", "100.64.0.1", &mut last, &mut last_error).is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

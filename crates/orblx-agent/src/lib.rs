@@ -30,7 +30,7 @@ pub use gateway::{
 };
 pub use grant::{
     grant_id_ok, path_prefix_ok, service_name_ok, sign_grant, verify_grant, AgentGrant,
-    SignedAgentGrant, GRANT_VERSION, MAX_GRANT_SECS,
+    SignedAgentGrant, AGENT_GRANT_DOC_PREFIX, GRANT_VERSION, MAX_GRANT_SECS,
 };
 pub use guard::{run_guard, DenyFetch, GuardConfig, GuardCore, GuardDecision, RequestCheck};
 pub use nonce_store::default_nonce_path;

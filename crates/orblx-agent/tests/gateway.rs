@@ -16,9 +16,6 @@ use orblx_identity::{
 
 const ADDR: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 3);
 const PORT: u16 = 8080;
-const EMPTY_DENY: &str =
-    r#"{"version":1,"generated_at":1,"revoked_uris":[],"revoked_ticket_nonces":[]}"#;
-
 struct Fixture {
     ca: MiniCa,
     signer: TicketSigner,
@@ -105,11 +102,26 @@ fn open_core(
     fixture: &Fixture,
     audit: &std::path::Path,
 ) -> Result<GuardCore, orblx_agent::AgentError> {
+    let dir = audit
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let issued = fixture
+        .ca
+        .issue(
+            &fixture.node,
+            fixture.start,
+            Duration::from_secs(600),
+            &DenySet::empty(),
+        )
+        .unwrap();
+    std::fs::write(dir.join("node.crt.pem"), issued.certificate_pem).unwrap();
     let config = GuardConfig {
         listen: SocketAddr::from((ADDR, PORT)),
         service: "api".to_string(),
         target: SocketAddr::from(([127, 0, 0, 1], 9)),
         node: fixture.node.clone(),
+        node_state: dir,
         bundle: fixture.ca.trust_bundle().clone(),
         verifier: fixture.signer.verifier(),
         netmap_public: fixture.netmap.verifying_key().to_bytes(),
@@ -168,6 +180,20 @@ fn sealed_with(
     .unwrap()
 }
 
+fn signed_deny(fixture: &Fixture) -> String {
+    let object = orblx_identity::DenyObject {
+        version: 1,
+        generated_at: 1,
+        revoked_uris: Vec::new(),
+        revoked_ticket_nonces: Vec::new(),
+        node_uri: fixture.node.as_uri().to_string(),
+        seq: 1_000,
+        issued_at_ms: 1_000,
+    };
+    let raw = serde_json::to_vec(&object).unwrap();
+    orblx_identity::seal_deny(&fixture.netmap, &raw).unwrap()
+}
+
 fn decide(core: &GuardCore, bytes: &[u8], at: SystemTime) -> GatewayDecision {
     let (head, body) = parse_request(bytes).unwrap();
     check_request(core, &head, &body, "api", PORT, peer(), at).unwrap()
@@ -178,7 +204,7 @@ fn the_gateway_admits_scope_and_refuses_the_rest() {
     let fixture = fixture(30);
     let (core, audit) = core(&fixture, "all");
     let at = after(&fixture, 1000);
-    core.apply_deny(EMPTY_DENY, at).unwrap();
+    core.apply_deny(&signed_deny(&fixture), at).unwrap();
 
     let ok = sealed(&fixture, "api", "GET", "/api/items?q=1", 1, at);
     assert!(matches!(
@@ -219,7 +245,7 @@ fn the_gateway_admits_scope_and_refuses_the_rest() {
     );
     // At the end time: expired.
     let end = after(&fixture, 30_000);
-    core.apply_deny(EMPTY_DENY, end).unwrap();
+    core.apply_deny(&signed_deny(&fixture), end).unwrap();
     let late = sealed(&fixture, "api", "GET", "/api/items", 7, end);
     assert_eq!(
         decide(&core, &late, end),
@@ -249,7 +275,7 @@ fn a_bad_nonce_is_refused_and_recorded() {
     let fixture = fixture(30);
     let (core, audit) = core(&fixture, "nonce");
     let at = after(&fixture, 1000);
-    core.apply_deny(EMPTY_DENY, at).unwrap();
+    core.apply_deny(&signed_deny(&fixture), at).unwrap();
     let bytes = sealed(&fixture, "api", "GET", "/api", 1, at);
     let text = String::from_utf8(bytes).unwrap();
     let start = text.find("orblx-agent-nonce: ").unwrap() + "orblx-agent-nonce: ".len();
@@ -274,7 +300,7 @@ fn a_restart_keeps_the_used_nonces() {
     let fixture = fixture(60);
     let (first, audit) = core(&fixture, "restart");
     let at = after(&fixture, 1000);
-    first.apply_deny(EMPTY_DENY, at).unwrap();
+    first.apply_deny(&signed_deny(&fixture), at).unwrap();
     let bytes = sealed(&fixture, "api", "GET", "/api/items", 1, at);
     assert!(matches!(
         decide(&first, &bytes, at),
@@ -287,7 +313,7 @@ fn a_restart_keeps_the_used_nonces() {
     let second = open_core(&fixture, &audit).unwrap();
     assert_eq!(second.seen_count(), 1);
     let later = after(&fixture, 5000);
-    second.apply_deny(EMPTY_DENY, later).unwrap();
+    second.apply_deny(&signed_deny(&fixture), later).unwrap();
     assert_eq!(
         decide(&second, &bytes, later),
         GatewayDecision::Refuse(403, "replay")
@@ -311,7 +337,7 @@ fn a_restart_without_the_audit_file_keeps_the_used_nonces() {
     let fixture = fixture(60);
     let (first, audit) = core(&fixture, "noaudit");
     let at = after(&fixture, 1000);
-    first.apply_deny(EMPTY_DENY, at).unwrap();
+    first.apply_deny(&signed_deny(&fixture), at).unwrap();
     let bytes = sealed(&fixture, "api", "GET", "/api/items", 1, at);
     assert!(matches!(
         decide(&first, &bytes, at),
@@ -326,7 +352,7 @@ fn a_restart_without_the_audit_file_keeps_the_used_nonces() {
     let second = open_core(&fixture, &audit).unwrap();
     assert_eq!(second.seen_count(), 1);
     let later = after(&fixture, 5000);
-    second.apply_deny(EMPTY_DENY, later).unwrap();
+    second.apply_deny(&signed_deny(&fixture), later).unwrap();
     assert_eq!(
         decide(&second, &bytes, later),
         GatewayDecision::Refuse(403, "replay")
@@ -342,7 +368,7 @@ fn a_changed_header_is_refused() {
     let fixture = fixture(30);
     let (core, _audit) = core(&fixture, "header");
     let at = after(&fixture, 1000);
-    core.apply_deny(EMPTY_DENY, at).unwrap();
+    core.apply_deny(&signed_deny(&fixture), at).unwrap();
     let kind = vec![("X-Kind".to_string(), "read".to_string())];
     let base = |nonce: u8| {
         String::from_utf8(sealed_with(

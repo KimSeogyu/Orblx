@@ -554,6 +554,7 @@ fn run_guard_command(guard: Guard, http: bool) -> Result<i32, String> {
     let netmap_public = decode_hex_32(read_text(&guard.state.join("netmap.pub"))?.trim())
         .map_err(|_| "The netmap public key is not valid.".to_string())?;
     let state = guard.state.clone();
+    let node_state = state.clone();
     let fetch: orblx_agent::DenyFetch = match guard.coord.clone() {
         Some((coord, coord_name, bundle_path)) => {
             let coord_bundle = read_text(&bundle_path)?;
@@ -574,6 +575,7 @@ fn run_guard_command(guard: Guard, http: bool) -> Result<i32, String> {
         service: guard.service,
         target: guard.target,
         node,
+        node_state,
         bundle,
         verifier,
         netmap_public,

@@ -249,11 +249,26 @@ fn temp_path(name: &str) -> PathBuf {
 }
 
 fn core(fixture: &Fixture, audit: PathBuf) -> GuardCore {
+    let dir = audit
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let issued = fixture
+        .ca
+        .issue(
+            &fixture.node,
+            fixture.start,
+            Duration::from_secs(600),
+            &DenySet::empty(),
+        )
+        .unwrap();
+    std::fs::write(dir.join("node.crt.pem"), issued.certificate_pem).unwrap();
     let config = GuardConfig {
         listen: SocketAddr::from((ADDR, PORT)),
         service: "web".to_string(),
         target: SocketAddr::from(([127, 0, 0, 1], 9)),
         node: fixture.node.clone(),
+        node_state: dir,
         bundle: fixture.ca.trust_bundle().clone(),
         verifier: fixture.signer.verifier(),
         netmap_public: fixture.netmap.verifying_key().to_bytes(),
@@ -265,8 +280,25 @@ fn core(fixture: &Fixture, audit: PathBuf) -> GuardCore {
     GuardCore::new(&config).unwrap()
 }
 
-const EMPTY_DENY: &str =
-    r#"{"version":1,"generated_at":1,"revoked_uris":[],"revoked_ticket_nonces":[]}"#;
+fn signed_deny(
+    fixture: &Fixture,
+    version: u64,
+    uris: &[&str],
+    nonces: &[&str],
+    seq: u64,
+) -> String {
+    let object = orblx_identity::DenyObject {
+        version,
+        generated_at: version,
+        revoked_uris: uris.iter().map(|item| (*item).to_string()).collect(),
+        revoked_ticket_nonces: nonces.iter().map(|item| (*item).to_string()).collect(),
+        node_uri: fixture.node.as_uri().to_string(),
+        seq,
+        issued_at_ms: seq,
+    };
+    let raw = serde_json::to_vec(&object).unwrap();
+    orblx_identity::seal_deny(&fixture.netmap, &raw).unwrap()
+}
 
 fn peer() -> SocketAddr {
     SocketAddr::from(([100, 64, 0, 1], 40000))
@@ -278,16 +310,20 @@ fn the_guard_logs_grant_use_deny_expiry_and_revoke() {
     let audit = temp_path("chain");
     let core = core(&fixture, audit.clone());
     let at = after(&fixture, 1000);
-    core.apply_deny(EMPTY_DENY, at).unwrap();
+    core.apply_deny(&signed_deny(&fixture, 1, &[], &[], 1_000), at)
+        .unwrap();
     let line = seal(&fixture, "web", PORT, at);
     let decision = core.admit(&line, "web", PORT, &[], peer(), at).unwrap();
     assert!(matches!(decision, GuardDecision::Admit(_)));
     let decision = core.admit("", "web", PORT, &[], peer(), at).unwrap();
     assert!(matches!(decision, GuardDecision::Refuse("missing")));
     let revoke_at = after(&fixture, 2000);
-    let revoke = format!(
-        r#"{{"version":2,"generated_at":2,"revoked_uris":["spiffe://orblx.local/agent/bot"],"revoked_ticket_nonces":["{}"]}}"#,
-        fixture.nonce_hex
+    let revoke = signed_deny(
+        &fixture,
+        2,
+        &["spiffe://orblx.local/agent/bot"],
+        &[&fixture.nonce_hex],
+        2_000,
     );
     core.apply_deny(&revoke, revoke_at).unwrap();
     let line = seal(&fixture, "web", PORT, revoke_at);
@@ -328,7 +364,8 @@ fn a_stale_deny_set_refuses_each_use() {
     // No deny read yet.
     let decision = core.admit(&line, "web", PORT, &[], peer(), at).unwrap();
     assert!(matches!(decision, GuardDecision::Refuse("stale")));
-    core.apply_deny(EMPTY_DENY, at).unwrap();
+    core.apply_deny(&signed_deny(&fixture, 1, &[], &[], 1_000), at)
+        .unwrap();
     let later = after(&fixture, 3500);
     let line = seal(&fixture, "web", PORT, later);
     let decision = core.admit(&line, "web", PORT, &[], peer(), later).unwrap();
