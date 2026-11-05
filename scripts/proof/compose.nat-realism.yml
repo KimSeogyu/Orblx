@@ -31,9 +31,11 @@ services:
 
   relay:
     image: ${ORBLX_NATR_IMAGE:-orblx-natr:w20}
+    cap_add:
+      - NET_ADMIN
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - "orblx stun-serve --listen 0.0.0.0:3478 & orblx stun-serve --listen 0.0.0.0:3479 & exec orblx relay --udp 0.0.0.0:443 --tcp 0.0.0.0:443"
+      - "orblx stun-serve --listen 0.0.0.0:3478 & orblx stun-serve --listen 0.0.0.0:3479 & exec orblx relay --udp 0.0.0.0:443 --tcp 0.0.0.0:443 --attach-delay-ms ${ORBLX_RELAY_DELAY_MS:-0}"
     networks:
       public:
         ipv4_address: ${ORBLX_NATR_PUB:-172.29.20}.20
@@ -141,6 +143,19 @@ services:
     networks:
       lanc:
         ipv4_address: ${ORBLX_NATR_LAN:-10.19}.23.10
+
+  peer:
+    image: ${ORBLX_NATR_IMAGE:-orblx-natr:w20}
+    profiles: ["peer"]
+    cap_add:
+      - NET_ADMIN
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["sleep infinity"]
+    volumes:
+      - coord:/coord-state:ro
+    networks:
+      public:
+        ipv4_address: ${ORBLX_NATR_PUB:-172.29.20}.30
 
   node-d:
     image: ${ORBLX_NATR_IMAGE:-orblx-natr:w20}

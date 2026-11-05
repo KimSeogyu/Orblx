@@ -58,8 +58,9 @@ pub use nat_path::{select_path, session_id, HelloAuth, OverlayPath, PathSelect, 
 pub use nat_run::{prepare_nat_gateway, run_nat_node, NatConfig, RenewFn, RenewedLeaf};
 pub use nat_smash::{run_nat_smash, NatSmash, NatSmashReport};
 pub use path::{
-    AllocatePhase, DirectPhase, PathId, PathMachine, PathState, RelayPhase, DIRECT_ATTEMPT_BUDGET,
-    DIRECT_QUIC_PORT, DIRECT_RETRY_INTERVAL, STICK_AND_UPGRADE,
+    AllocatePhase, DirectPhase, PathId, PathMachine, PathOffer, PathPick, PathState, RelayPhase,
+    DIRECT_ATTEMPT_BUDGET, DIRECT_QUIC_PORT, DIRECT_RETRY_INTERVAL, RELAY_FAR_MS,
+    STICK_AND_UPGRADE,
 };
 pub use portmap::{PortMapChoice, PortMapProto, PORT_MAP_BUDGET, PORT_MAP_LIFETIME_SECS};
 pub use punch::PunchToken;
