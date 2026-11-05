@@ -259,7 +259,7 @@ mod device {
         validate_utun_name, CtlInfo, OverlayRoute, RouteInstaller, ShellInstaller, SockaddrCtl,
         IPV4_UTUN_HEADER,
     };
-    use crate::tun_dev::{TunBridge, TunConfig};
+    use crate::tun_dev::{TunBridge, TunConfig, TO_TUN_QUEUE};
     use crate::HelloError;
 
     const CONTROL_NAME: &[u8] = b"com.apple.net.utun_control";
@@ -272,7 +272,7 @@ mod device {
         apply_overlay(&mut installer, &name, config.address, config.netmask)
             .map_err(HelloError::Tun)?;
         let (from_tun_tx, from_tun_rx) = mpsc::channel(32);
-        let (to_tun_tx, to_tun_rx) = mpsc::channel(32);
+        let (to_tun_tx, to_tun_rx) = mpsc::channel(TO_TUN_QUEUE);
         // Two threads: a read poll must not delay a write.
         let fd = Arc::new(fd);
         let reader = Arc::clone(&fd);

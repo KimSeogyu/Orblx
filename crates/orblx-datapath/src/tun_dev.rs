@@ -9,6 +9,12 @@ use crate::HelloError;
 /// The default UDP port for hello-quic.
 pub const DEFAULT_UDP_PORT: u16 = 443;
 
+/// Packets the shared queue to the TUN writer holds.
+///
+/// Each link forwarder sends into this one queue.
+/// One writer thread drains the queue and blocks in the device write.
+pub(crate) const TO_TUN_QUEUE: usize = 32;
+
 /// The Linux TUN device name for `orblx up`.
 pub const LINUX_TUN_NAME: &str = "orblx0";
 
@@ -268,7 +274,7 @@ mod linux {
             .tun_name()
             .map_err(|err| HelloError::Tun(err.to_string()))?;
         let (from_tun_tx, from_tun_rx) = mpsc::channel(32);
-        let (to_tun_tx, to_tun_rx) = mpsc::channel(32);
+        let (to_tun_tx, to_tun_rx) = mpsc::channel(super::TO_TUN_QUEUE);
         // Two threads: a read poll must not delay a write.
         let device = Arc::new(device);
         let reader = Arc::clone(&device);

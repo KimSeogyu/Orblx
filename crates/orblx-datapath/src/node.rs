@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_identity::{decode_certificate_pem, extract_spiffe_id, leaf_validity, DenySet, SpiffeId};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -64,6 +65,15 @@ const STALE_AFTER: Duration = Duration::from_secs(2);
 /// W25 HA subnet routers: a short interval lets a client see a failed router in
 /// [`crate::HA_DEAD_AFTER`] (four intervals). The frame is the same control frame.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Data frames one link may queue before the session stops reading.
+///
+/// The session does not wait on the shared TUN sender.
+/// A forwarder task for this link does that wait.
+/// The session holds one more frame when this queue is full, and the forwarder
+/// holds one frame while `to_tun.send` waits.
+/// Keepalive, control, and outbound traffic stay on the session loop.
+const LINK_TO_TUN_QUEUE: usize = 32;
 
 static LINK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -1809,9 +1819,9 @@ async fn run_link(
     }
 }
 
-struct SessionIo {
-    sender: HelloSender,
-    receiver: crate::HelloReceiver,
+struct SessionIo<S, R> {
+    sender: S,
+    receiver: R,
     packets: mpsc::Receiver<Vec<u8>>,
     cancel: watch::Receiver<bool>,
     to_tun: mpsc::Sender<Vec<u8>>,
@@ -1827,22 +1837,95 @@ struct SessionIo {
     label: String,
 }
 
-type NextEvent = std::pin::Pin<
-    Box<
-        dyn std::future::Future<Output = (crate::HelloReceiver, Result<SessionEvent, HelloError>)>
-            + Send,
-    >,
+/// Bytes the session writes on the hello stream.
+trait LinkSend: Send {
+    fn send_ctrl(
+        &mut self,
+        flags: u8,
+    ) -> impl std::future::Future<Output = Result<(), HelloError>> + Send;
+    fn send_ipv4<'a>(
+        &'a mut self,
+        packet: &'a [u8],
+    ) -> impl std::future::Future<Output = Result<(), HelloError>> + Send;
+    fn finish(&mut self) -> impl std::future::Future<Output = ()> + Send + 'static;
+}
+
+/// Frames the session reads from the hello stream.
+trait LinkRecv: Send {
+    fn recv_event(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<SessionEvent, HelloError>> + Send;
+}
+
+impl LinkSend for HelloSender {
+    async fn send_ctrl(&mut self, flags: u8) -> Result<(), HelloError> {
+        HelloSender::send_ctrl(self, flags).await
+    }
+
+    async fn send_ipv4(&mut self, packet: &[u8]) -> Result<(), HelloError> {
+        HelloSender::send_ipv4(self, packet).await
+    }
+
+    fn finish(&mut self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        HelloSender::finish(self)
+    }
+}
+
+impl LinkRecv for crate::HelloReceiver {
+    async fn recv_event(&mut self) -> Result<SessionEvent, HelloError> {
+        crate::HelloReceiver::recv_event(self).await
+    }
+}
+
+type NextEvent<R> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = (R, Result<SessionEvent, HelloError>)> + Send>,
 >;
 
 /// Read one frame to the end.
 ///
 /// The future owns the receiver, so `select!` can poll it again after another branch
 /// wins. A dropped read would lose the bytes it already took from the stream (W25-11).
-fn next_event(mut receiver: crate::HelloReceiver) -> NextEvent {
+fn next_event<R>(mut receiver: R) -> NextEvent<R>
+where
+    R: LinkRecv + 'static,
+{
     Box::pin(async move {
         let event = receiver.recv_event().await;
         (receiver, event)
     })
+}
+
+/// One link's TUN forwarder. Drop aborts the task.
+///
+/// The task is the only wait on the shared TUN sender for this link.
+/// Abort on drop keeps the packet bound on the live session.
+/// Frames still in the hand-off are dropped when the session ends.
+struct TunForwarder {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TunForwarder {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Drain one link's hand-off into the shared TUN queue.
+///
+/// The session read loop does not await this send.
+/// When the shared queue is full, only this task waits.
+fn forward_link_to_tun(
+    mut packets: mpsc::Receiver<Vec<u8>>,
+    to_tun: mpsc::Sender<Vec<u8>>,
+) -> TunForwarder {
+    let task = tokio::spawn(async move {
+        while let Some(packet) = packets.recv().await {
+            if to_tun.send(packet).await.is_err() {
+                return;
+            }
+        }
+    });
+    TunForwarder { task }
 }
 
 async fn poll_slot<T>(
@@ -1854,7 +1937,11 @@ async fn poll_slot<T>(
     }
 }
 
-async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
+async fn drive_session<S, R>(io: SessionIo<S, R>, on_rx: impl Fn() + Send)
+where
+    S: LinkSend,
+    R: LinkRecv + 'static,
+{
     let SessionIo {
         mut sender,
         receiver,
@@ -1871,6 +1958,10 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
         peer,
         label,
     } = io;
+    let (forward_tx, forward_rx) = mpsc::channel(LINK_TO_TUN_QUEUE);
+    let _forwarder = forward_link_to_tun(forward_rx, to_tun);
+    // One data frame that did not fit in the hand-off. The read arm stays idle until it fits.
+    let mut parked: Option<Vec<u8>> = None;
     let mut first_rx = true;
     let mut first_tx = true;
     // The queue is open while this link is the live link for the peer.
@@ -1878,7 +1969,7 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
     let mut tx_end: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> = None;
     let mut tx_done = false;
     let mut ask_open = true;
-    let mut rx_next: Option<NextEvent> = Some(next_event(receiver));
+    let mut rx_next: Option<NextEvent<R>> = Some(next_event(receiver));
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     loop {
         if tx_done && rx_next.is_none() {
@@ -1934,7 +2025,16 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                 tx_end = None;
                 tx_done = true;
             }
-            (receiver, incoming) = poll_slot(&mut rx_next), if rx_next.is_some() => {
+            permit = forward_tx.reserve(), if parked.is_some() => {
+                let Some(packet) = parked.take() else {
+                    continue;
+                };
+                match permit {
+                    Ok(permit) => permit.send(packet),
+                    Err(_closed) => return,
+                }
+            }
+            (receiver, incoming) = poll_slot(&mut rx_next), if rx_next.is_some() && parked.is_none() => {
                 rx_next = None;
                 match incoming {
                     Ok(event) => {
@@ -1969,8 +2069,12 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                                         }
                                     }
                                     InboundAction::Forward => {
-                                        if to_tun.send(packet).await.is_err() {
-                                            return;
+                                        match forward_tx.try_send(packet) {
+                                            Ok(()) => {}
+                                            Err(TrySendError::Full(packet)) => {
+                                                parked = Some(packet);
+                                            }
+                                            Err(TrySendError::Closed(_packet)) => return,
                                         }
                                     }
                                 }
@@ -2713,15 +2817,26 @@ impl Drop for PidGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
+    use std::net::Ipv4Addr;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use tokio::sync::{mpsc, watch};
+
     use super::{
-        changed_dns_netmap, dns_start_text, format_node_status, load_state, read_status_text,
-        store_record, NodeStatus, StatusPeer,
+        changed_dns_netmap, dns_start_text, drive_session, format_node_status, load_state,
+        read_status_text, store_record, LinkRecv, LinkSend, NodeCounters, NodeStatus, SessionIo,
+        StatusPeer, LINK_TO_TUN_QUEUE,
     };
+    use crate::ipv4::{icmp_echo_request, inbound_action, InboundAction};
     use crate::netmap::Netmap;
+    use crate::quic::SessionEvent;
+    use crate::tun_dev::TO_TUN_QUEUE;
+    use crate::HelloError;
 
     fn sample_map(ip: &str) -> Netmap {
         let text = format!(
@@ -2959,5 +3074,233 @@ mod tests {
         let text = super::safe_text("-----BEGIN PRIVATE KEY-----\nabc");
         assert_eq!(text, "The coordinator request failed.");
         assert!(!text.contains("PRIVATE"));
+    }
+
+    enum OutMsg {
+        Ctrl(u8),
+        Ipv4(Vec<u8>),
+    }
+
+    struct FakeSend {
+        tx: mpsc::UnboundedSender<OutMsg>,
+    }
+
+    impl LinkSend for FakeSend {
+        async fn send_ctrl(&mut self, flags: u8) -> Result<(), HelloError> {
+            self.tx
+                .send(OutMsg::Ctrl(flags))
+                .map_err(|_| HelloError::DeviceClosed)
+        }
+
+        async fn send_ipv4(&mut self, packet: &[u8]) -> Result<(), HelloError> {
+            self.tx
+                .send(OutMsg::Ipv4(packet.to_vec()))
+                .map_err(|_| HelloError::DeviceClosed)
+        }
+
+        fn finish(&mut self) -> impl std::future::Future<Output = ()> + Send + 'static {
+            std::future::ready(())
+        }
+    }
+
+    struct FakeRecv {
+        rx: mpsc::Receiver<SessionEvent>,
+    }
+
+    impl LinkRecv for FakeRecv {
+        async fn recv_event(&mut self) -> Result<SessionEvent, HelloError> {
+            self.rx.recv().await.ok_or(HelloError::StreamClosed)
+        }
+    }
+
+    struct Probe {
+        events: mpsc::Sender<SessionEvent>,
+        outbound: mpsc::Sender<Vec<u8>>,
+        sent: mpsc::UnboundedReceiver<OutMsg>,
+        frames: Arc<AtomicU64>,
+        remote: watch::Receiver<u64>,
+        counters: Arc<NodeCounters>,
+        _hold: (watch::Sender<bool>, watch::Sender<u64>),
+    }
+
+    fn host_packet(seq: u16) -> Vec<u8> {
+        icmp_echo_request(
+            Ipv4Addr::new(100, 64, 0, 2),
+            Ipv4Addr::new(100, 64, 0, 9),
+            1,
+            seq,
+            &seq.to_be_bytes(),
+        )
+        .unwrap()
+    }
+
+    fn spawn_link(name: &str, to_tun: mpsc::Sender<Vec<u8>>) -> Probe {
+        let (events, events_rx) = mpsc::channel(LINK_TO_TUN_QUEUE + 16);
+        let (outbound, packets) = mpsc::channel(4);
+        let (sent_tx, sent) = mpsc::unbounded_channel();
+        let frames = Arc::new(AtomicU64::new(0));
+        let on_rx = Arc::clone(&frames);
+        let (remote_tx, remote) = watch::channel(0u64);
+        let (cancel_tx, cancel) = watch::channel(false);
+        let (ask_tx, ask_rekey) = watch::channel(0u64);
+        let counters = Arc::new(NodeCounters {
+            tx: AtomicU64::new(0),
+            rx: AtomicU64::new(0),
+        });
+        tokio::spawn(drive_session(
+            SessionIo {
+                sender: FakeSend { tx: sent_tx },
+                receiver: FakeRecv { rx: events_rx },
+                packets,
+                cancel,
+                to_tun,
+                overlay: Ipv4Addr::new(100, 64, 0, 1),
+                ask_rekey,
+                remote_rekey: remote_tx,
+                counters: Arc::clone(&counters),
+                filter: None,
+                peer_svid: format!("spiffe://orblx.local/node/{name}"),
+                links: Arc::new(Mutex::new(HashMap::new())),
+                peer: name.to_string(),
+                label: name.to_string(),
+            },
+            move || {
+                on_rx.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        Probe {
+            events,
+            outbound,
+            sent,
+            frames,
+            remote,
+            counters,
+            _hold: (cancel_tx, ask_tx),
+        }
+    }
+
+    fn drain(sent: &mut mpsc::UnboundedReceiver<OutMsg>) -> Vec<OutMsg> {
+        let mut out = Vec::new();
+        while let Ok(msg) = sent.try_recv() {
+            out.push(msg);
+        }
+        out
+    }
+
+    fn has_ipv4(msgs: &[OutMsg], packet: &[u8]) -> bool {
+        msgs.iter().any(|msg| match msg {
+            OutMsg::Ipv4(body) => body.as_slice() == packet,
+            OutMsg::Ctrl(_) => false,
+        })
+    }
+
+    fn ctrl_zero(msgs: &[OutMsg]) -> usize {
+        msgs.iter()
+            .filter(|msg| match msg {
+                OutMsg::Ctrl(flags) => *flags == 0,
+                OutMsg::Ipv4(_) => false,
+            })
+            .count()
+    }
+
+    /// W25-42: a full shared TUN queue must not stop every link.
+    ///
+    /// The writer does not run. `to_tun` stays full.
+    /// Link A still takes keepalive and rekey frames, and it still sends outbound.
+    /// After A's own hand-off is full, A still sends keepalive and outbound.
+    /// Link B still reads. A's extra data does not enter the read of B.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_full_tun_queue_does_not_stall_keepalive_or_the_other_link() {
+        let overlay = Ipv4Addr::new(100, 64, 0, 1);
+        let sample = host_packet(1);
+        assert_eq!(inbound_action(&sample, overlay), InboundAction::Forward);
+
+        let (to_tx, mut to_rx) = mpsc::channel(TO_TUN_QUEUE);
+        for _ in 0..TO_TUN_QUEUE {
+            to_tx.try_send(vec![0xEE]).unwrap();
+        }
+        assert_eq!(to_tx.capacity(), 0);
+
+        let mut link_a = spawn_link("a", to_tx.clone());
+        link_a
+            .events
+            .send(SessionEvent::Packet(sample.clone()))
+            .await
+            .unwrap();
+        link_a.events.send(SessionEvent::Keepalive).await.unwrap();
+        link_a.events.send(SessionEvent::Rekey).await.unwrap();
+        let early_out = host_packet(2);
+        link_a.outbound.try_send(early_out.clone()).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        assert_eq!(to_tx.capacity(), 0);
+        assert_eq!(link_a.frames.load(Ordering::SeqCst), 3);
+        assert_eq!(link_a.counters.rx.load(Ordering::SeqCst), 1);
+        assert_eq!(*link_a.remote.borrow(), 1);
+        let early_sent = drain(&mut link_a.sent);
+        assert!(has_ipv4(&early_sent, &early_out));
+        let early_ctrl = ctrl_zero(&early_sent);
+
+        for seq in 0..LINK_TO_TUN_QUEUE + 8 {
+            link_a
+                .events
+                .send(SessionEvent::Packet(host_packet(100 + seq as u16)))
+                .await
+                .unwrap();
+        }
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let data_bound = u64::try_from(LINK_TO_TUN_QUEUE + 2).unwrap();
+        assert_eq!(link_a.counters.rx.load(Ordering::SeqCst), data_bound);
+        assert_eq!(to_tx.capacity(), 0);
+
+        let late_out = host_packet(3);
+        link_a.outbound.try_send(late_out.clone()).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::time::advance(super::KEEPALIVE_INTERVAL).await;
+        let late_sent = drain(&mut link_a.sent);
+        assert!(has_ipv4(&late_sent, &late_out));
+        assert!(
+            ctrl_zero(&late_sent) >= 1,
+            "early keepalive count was {early_ctrl}"
+        );
+        assert_eq!(link_a.counters.rx.load(Ordering::SeqCst), data_bound);
+
+        let mut link_b = spawn_link("b", to_tx.clone());
+        link_b.events.send(SessionEvent::Keepalive).await.unwrap();
+        let b_data = host_packet(4);
+        link_b
+            .events
+            .send(SessionEvent::Packet(b_data.clone()))
+            .await
+            .unwrap();
+        link_b.events.send(SessionEvent::Rekey).await.unwrap();
+        let b_out = host_packet(5);
+        link_b.outbound.try_send(b_out.clone()).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        assert_eq!(link_b.frames.load(Ordering::SeqCst), 3);
+        assert_eq!(link_b.counters.rx.load(Ordering::SeqCst), 1);
+        assert_eq!(*link_b.remote.borrow(), 1);
+        assert!(has_ipv4(&drain(&mut link_b.sent), &b_out));
+        assert_eq!(link_a.counters.rx.load(Ordering::SeqCst), data_bound);
+        assert_eq!(link_a.frames.load(Ordering::SeqCst), 3 + data_bound - 1);
+        assert_eq!(to_tx.capacity(), 0);
+
+        let mut queued = Vec::new();
+        while let Ok(packet) = to_rx.try_recv() {
+            queued.push(packet);
+        }
+        assert_eq!(queued.len(), TO_TUN_QUEUE);
+        assert!(queued.iter().all(|packet| packet.as_slice() == [0xEE]));
+        println!(
+            "w25-42 handoff to_tun={} link_queue={} a_data={} a_frames={} b_frames={} b_data={} queued_fillers={}",
+            TO_TUN_QUEUE,
+            LINK_TO_TUN_QUEUE,
+            link_a.counters.rx.load(Ordering::SeqCst),
+            link_a.frames.load(Ordering::SeqCst),
+            link_b.frames.load(Ordering::SeqCst),
+            link_b.counters.rx.load(Ordering::SeqCst),
+            queued.len()
+        );
     }
 }
