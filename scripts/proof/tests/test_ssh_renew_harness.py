@@ -84,6 +84,34 @@ class SshRenewHarnessTest(unittest.TestCase):
             ['docker build --network host --no-cache -q -t orblx-ssh-renew:local "$image_dir" >/dev/null'],
         )
 
+    def test_node_a_enrolls_via_oidc_and_the_ssh_src_is_a_user_id(self):
+        user = function_text(self.src, "enroll_user")
+        token = function_text(self.src, "enroll_token")
+        self.assertIn("--id-token-file", user)
+        self.assertNotIn("--token-file", user)
+        self.assertNotIn("--wait-approval", user)
+        self.assertIn("owner user, no wait", user)
+        self.assertIn("--token-file", token)
+        self.assertNotIn("--id-token-file", token)
+        self.assertIn("enroll_user a 172.28.19.11 alice", self.src)
+        self.assertIn("enroll_token b 172.28.19.12", self.src)
+        self.assertIn('wait_log coord "oidc issuer"', self.src)
+        policy_path = os.path.join(os.path.dirname(HERE), "ssh-renew.hujson")
+        with open(policy_path, encoding="utf-8") as handle:
+            policy = handle.read()
+        self.assertIn('"ownerUsers": ["oidc:alice"]', policy)
+        acls, ssh = policy.split('"ssh"', 1)
+        self.assertIn("spiffe://orblx.local/node/a", acls)
+        self.assertNotIn("spiffe://orblx.local/node/a", ssh)
+        self.assertIn('"src": ["spiffe://orblx.local/user/alice"]', ssh)
+        self.assertIn('"dst": ["spiffe://orblx.local/node/b"]', ssh)
+        compose_path = os.path.join(os.path.dirname(HERE), "compose.ssh-renew.yml")
+        with open(compose_path, encoding="utf-8") as handle:
+            compose = handle.read()
+        self.assertIn("orblx-test-idp", compose)
+        self.assertIn("https://idp:8443", compose)
+        self.assertIn('"idp:172.28.19.9"', compose)
+
     def test_each_orblx_ssh_line_uses_state_and_not_identity_or_netmap(self):
         commands = orblx_ssh_commands(self.src)
         self.assertEqual(len(commands), 2)
@@ -103,7 +131,10 @@ class SshRenewHarnessTest(unittest.TestCase):
         self.assertLess(src.index("rustc -V"), src.index('echo "cargo profile=release"'))
         self.assertLess(src.index('echo "cargo profile=release"'), src.index("cargo build --release"))
         builds = [line.strip() for line in src.splitlines() if line.strip().startswith("cargo build")]
-        self.assertEqual(builds, ["cargo build --release -p orblx-cli --bin orblx --locked"])
+        self.assertEqual(
+            builds,
+            ["cargo build --release -p orblx-cli --bin orblx -p orblx-test-idp --bin orblx-test-idp --locked"],
+        )
 
     def test_gate_c_uses_a_pty_shell_and_reads_the_output_word(self):
         shell = function_text(self.src, "ssh_shell")
