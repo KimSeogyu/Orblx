@@ -1,0 +1,13 @@
+{
+  // W25-34 netmap seq proof. Node a is the owner, so it can revoke and expire c.
+  // Nodes a, b, and c may ping each other.
+  "owners": ["spiffe://orblx.local/node/a"],
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a", "spiffe://orblx.local/node/b", "spiffe://orblx.local/node/c"],
+      "proto": "icmp",
+      "dst": ["spiffe://orblx.local/node/a:*", "spiffe://orblx.local/node/b:*", "spiffe://orblx.local/node/c:*"],
+    },
+  ],
+}

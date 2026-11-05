@@ -18,6 +18,7 @@ from fake_docker import fake_cargo_home, with_fake_docker
 HERE = os.path.dirname(os.path.abspath(__file__))
 SWEEP = os.path.join(HERE, "..", "release-sweep.sh")
 REAL_MANIFEST = os.path.join(HERE, "..", "sweep-manifest.txt")
+REAL_ROWS = os.path.join(HERE, "..", "..", "..", "docs", "matrix-rows.txt")
 
 PROOFS = {
     "ok.sh": "echo step one\necho proof_ok\n",
@@ -31,6 +32,8 @@ PROOFS = {
     "gatefail.sh": "echo proof_ok\necho 'gate_x failed: median low'\n",
     "natr.sh": "echo 'steady_warn prc_prc sample 140 ms over 100 ms'\necho proof_ok\n",
     "natrq.sh": "echo 'prc_prc steady lost 0/20 max_ms 40 limit_ms 1000'\necho proof_ok\n",
+    "ssh.sh": "echo 'proof_ticket_guard FAIL ssh: the manifest proof makes lab tickets'\nexit 1\n",
+    "old.sh": 'OLD_ORBLX="${OLD_ORBLX:?set OLD_ORBLX}"\necho "old=$OLD_ORBLX"\necho proof_ok\n',
     "loud.sh": "seq 1 100000\necho 'to stderr' >&2\nprintf 'no newline at end'\necho\necho proof_ok\n",
 }
 
@@ -70,6 +73,18 @@ proof|nat-realism|scripts/proof/natr.sh|-|-
 proof|steps|scripts/proof/steps.sh|-|-|^gate_x ok: |target/st/run*.log
 """
 
+SKIP_MARK = "not in rc.3 sweep: no coordinator SSH certs"
+
+# W25-27 PO ruling 2026-10-31: the SSH rows stay partial for rc.3. The fake ssh proof fails
+# like the real one does (the lab-ticket guard), so a run that does not skip it fails.
+SSH = GOOD + """partial|40|Tailscale SSH|ssh
+partial|41|SSH session recording|ssh
+proof|ssh|scripts/proof/ssh.sh|-|-
+"""
+
+PIN = "d9704cfb2f63bebbd3890f5b1accff30b2cace1f"
+OLD = GOOD + "row|32|User approval|old\nproof|old|scripts/proof/old.sh|OLD_ORBLX=@OLD:%s@|-\n"
+
 SWEEP_LINE = re.compile(r"^(proof_(lock|context|contention) |release_sweep: )")
 
 
@@ -86,10 +101,30 @@ class ReleaseSweepTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp)
 
-    def run_sweep(self, manifest, only=None, mode=None, plan=False, min_free_gb=None):
+    @staticmethod
+    def rows_for(manifest, notes=None):
+        """The rows file that matches MANIFEST: each row line shipped, each partial line partial.
+        NOTES maps a row id to its 4th field."""
+        notes = notes or {}
+        out = []
+        for line in manifest.splitlines():
+            kind = line.split("|")[0]
+            if kind in ("row", "partial"):
+                status = "shipped" if kind == "row" else "partial"
+                rid = line.split("|")[1]
+                cells = [rid, status, line.split("|")[2]] + ([notes[rid]] if rid in notes else [])
+                out.append("|".join(cells))
+        return "# test rows\n" + "\n".join(out) + "\n"
+
+    def run_sweep(self, manifest, only=None, mode=None, plan=False, min_free_gb=None, rows=None,
+                  extra_env=None):
         path = os.path.join(self.tmp, "manifest.txt")
         with open(path, "w") as f:
             f.write(manifest)
+        # W25-27: the rows file. By default the test root has one that matches the manifest.
+        os.makedirs(os.path.join(self.root, "docs"), exist_ok=True)
+        with open(os.path.join(self.root, "docs", "matrix-rows.txt"), "w") as f:
+            f.write(self.rows_for(manifest))
         # W25-35: the sampler of the proof lock uses a docker stand-in, which prints no names.
         env = with_fake_docker(dict(os.environ))
         env.update({
@@ -102,12 +137,20 @@ class ReleaseSweepTest(unittest.TestCase):
             # release-sweep.sh sets PATH for each proof; its first dir is "$CARGO_HOME/bin".
             "CARGO_HOME": fake_cargo_home(),
         })
+        env.pop("OLD_ORBLX", None)
+        env["ORBLX_SWEEP_WORK"] = os.path.join(self.tmp, "work")
+        env.update(extra_env or {})
         if only is not None:
             env["ORBLX_SWEEP_ONLY"] = only
         if mode is not None:
             env["ORBLX_SWEEP_LOCK_MODE"] = mode
         if min_free_gb is not None:
             env["ORBLX_SWEEP_MIN_FREE_GB"] = min_free_gb
+        if rows is not None:
+            rows_path = os.path.join(self.tmp, "rows.txt")
+            with open(rows_path, "w") as f:
+                f.write(rows)
+            env["ORBLX_SWEEP_ROWS"] = rows_path
         args = ["bash", SWEEP] + (["--plan"] if plan else []) + ["testsha"]
         return subprocess.run(args, env=env, capture_output=True, text=True)
 
@@ -243,15 +286,206 @@ class ReleaseSweepTest(unittest.TestCase):
         with open(REAL_MANIFEST) as f:
             lines = [l.rstrip("\n") for l in f if l.strip() and not l.startswith("#")]
         rows = {l.split("|")[1]: l.split("|")[3] for l in lines if l.startswith("row|")}
+        partial = {l.split("|")[1]: l.split("|")[3] for l in lines if l.startswith("partial|")}
         proofs = {l.split("|")[1] for l in lines if l.startswith("proof|")}
-        for row in ["1", "9", "10", "11", "16", "17", "19", "21", "24", "28", "29", "30", "31", "33", "35",
-                    "38", "40", "41", "45", "49", "51", "52", "53", "54", "58", "61", "62"]:
-            self.assertIn(row, rows)
-        self.assertIn("policy-sync", rows["17"].split())
-        for row, names in rows.items():
+        # W25-27: the shipped rows of docs/matrix-rows.txt (Page snapshot 2026-10-31 08:10 KST
+        # and the PO list). Rows 28 and 29 are not shipped: 28 has no sweep line, 29 is partial.
+        self.assertEqual(sorted(rows, key=int), ["19", "21", "24", "30", "31", "32", "33", "35", "38", "45",
+                                                 "49", "51", "52", "53", "58", "62"])
+        self.assertEqual(sorted(partial, key=int), ["1", "9", "10", "11", "16", "17", "29", "40", "41",
+                                                    "54", "61"])
+        self.assertNotIn("28", rows)
+        self.assertNotIn("28", partial)
+        self.assertIn("policy-sync", partial["17"].split())
+        self.assertIn("svid-renew", partial["29"].split())
+        for row, names in list(rows.items()) + list(partial.items()):
+            self.assertNotEqual(names, "-", row)
             for name in names.split():
-                if name != "-":
-                    self.assertIn(name, proofs, row)
+                self.assertIn(name, proofs, row)
+
+    def test_the_real_manifest_matches_the_real_rows_file(self):
+        with open(REAL_ROWS) as f:
+            status = {l.split("|")[0]: l.split("|")[1] for l in f if l.strip() and not l.startswith("#")}
+        self.assertEqual(len(status), 65)
+        for row in ["1", "9", "10", "11", "16", "17", "28", "29", "40", "41", "43", "44", "54", "61"]:
+            self.assertEqual(status[row], "partial", row)
+        with open(REAL_MANIFEST) as f:
+            lines = [l.rstrip("\n") for l in f if l.strip() and not l.startswith("#")]
+        shipped = {l.split("|")[1] for l in lines if l.startswith("row|")}
+        self.assertEqual(shipped, {r for r, s in status.items() if s == "shipped"})
+        for l in lines:
+            if l.startswith("partial|"):
+                self.assertEqual(status[l.split("|")[1]], "partial", l)
+
+    def test_negative_rows_mismatch_stops_the_sweep_before_any_proof(self):
+        good_rows = self.rows_for(GOOD)
+        cases = [
+            # The manifest says shipped, the rows file says partial.
+            (good_rows.replace("3|shipped", "3|partial"), "row 3: manifest row, rows file partial"),
+            # The rows file has a shipped row with no manifest line.
+            (good_rows + "7|shipped|Seven\n", "row 7: rows file shipped, no manifest row line"),
+            # The manifest has a row that the rows file does not list.
+            (good_rows.replace("1|shipped|Mesh\n", ""), "row 1: manifest row, rows file not in the rows file"),
+        ]
+        for rows, want in cases:
+            for plan in (False, True):
+                shutil.rmtree(self.out, ignore_errors=True)
+                out = self.run_sweep(GOOD, rows=rows, plan=plan)
+                self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+                self.assertIn("rows mismatch", out.stderr)
+                self.assertIn(want, out.stderr)
+                self.assertFalse(os.path.exists(os.path.join(self.out, "rc3-sweep-testsha-ok.log")))
+        # A partial manifest line for a shipped row is a mismatch too.
+        out = self.run_sweep(GOOD.replace("row|3|", "partial|3|"), rows=good_rows)
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("row 3: manifest partial, rows file shipped", out.stderr)
+        # The same manifest with a matching rows file runs.
+        self.assertEqual(self.run_sweep(GOOD, rows=good_rows).returncode, 0)
+
+    def test_no_rows_file_or_a_bad_one_is_a_setup_error(self):
+        out = self.run_sweep(GOOD, rows="")
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        out = self.run_sweep(GOOD, rows=self.rows_for(GOOD) + "4|done|Bad status\n")
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("rows: bad status", out.stderr)
+        out = self.run_sweep(GOOD, rows=self.rows_for(GOOD) + "1|shipped|Twice\n")
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("row 1 is listed twice", out.stderr)
+
+    def test_a_partial_row_runs_its_proofs_and_reports_them(self):
+        manifest = GOOD + "partial|29|SVID|lock\n"
+        out = self.run_sweep(manifest)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.rows()[("29 (partial)", "lock")][3], "proof_ok")
+        with open(os.path.join(self.root, "scripts", "proof", "lock.sh"), "w") as f:
+            f.write("#!/usr/bin/env bash\necho 'FAIL: injected'\nexit 1\n")
+        out = self.run_sweep(manifest)
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("Failed rows: 3, 29.", self.table())
+        # A partial row with no proof is not a sweep row.
+        self.assertEqual(self.run_sweep(GOOD + "partial|28|Key expiry|-\n").returncode, 2)
+
+
+    def test_the_ssh_proof_is_skipped_only_when_the_rows_file_has_the_mark(self):
+        marked = self.rows_for(SSH, {"40": SKIP_MARK, "41": SKIP_MARK})
+        for plan in (True, False):  # the run last: its summary is read below
+            shutil.rmtree(self.out, ignore_errors=True)
+            out = self.run_sweep(SSH, rows=marked, plan=plan)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertIn("release_sweep skip: proof ssh (rows 40 41 ): " + SKIP_MARK, out.stdout)
+            self.assertFalse(os.path.exists(os.path.join(self.out, "rc3-sweep-testsha-ssh.log")))
+        rows = self.rows()
+        for row in ("40 (partial)", "41 (partial)"):
+            self.assertEqual(rows[(row, "ssh")][3], "skipped (%s)" % SKIP_MARK)
+        self.assertEqual(rows[("1", "ok")][3], "proof_ok")
+        self.assertIn("Failed rows: none.", self.table())
+        self.assertIn("Skipped (rows file mark): 1.", self.table())
+
+    def test_negative_without_the_mark_the_ssh_proof_runs_and_fails(self):
+        cases = [
+            self.rows_for(SSH),                       # no mark
+            self.rows_for(SSH, {"40": SKIP_MARK}),    # the mark on one of the two rows only
+        ]
+        for rows in cases:
+            shutil.rmtree(self.out, ignore_errors=True)
+            out = self.run_sweep(SSH, rows=rows)
+            self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+            self.assertNotIn("skip: proof ssh", out.stdout)
+            self.assertTrue(os.path.exists(os.path.join(self.out, "rc3-sweep-testsha-ssh.log")))
+            self.assertIn("Failed rows: 40, 41.", self.table())
+
+    def test_negative_ssh_row_40_or_41_claiming_shipped_stops_the_sweep(self):
+        marked = {"40": SKIP_MARK, "41": SKIP_MARK}
+        for row in ("40", "41"):
+            # The rows file claims shipped (the manifest still says partial).
+            rows = self.rows_for(SSH, marked).replace(row + "|partial|", row + "|shipped|")
+            rows = rows.replace("|" + SKIP_MARK, "")
+            for plan in (False, True):
+                out = self.run_sweep(SSH, rows=rows, plan=plan)
+                self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+                self.assertIn("rows: row %s (SSH) claims shipped" % row, out.stderr)
+            # Both files claim shipped.
+            manifest = SSH.replace("partial|%s|" % row, "row|%s|" % row)
+            out = self.run_sweep(manifest, rows=self.rows_for(manifest))
+            self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+            self.assertIn("(SSH) claims shipped", out.stderr)
+            # Only the manifest claims shipped.
+            out = self.run_sweep(manifest, rows=self.rows_for(SSH, marked))
+            self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+            self.assertIn("manifest: row %s (SSH) claims shipped" % row, out.stderr)
+            self.assertFalse(os.path.exists(os.path.join(self.out, "rc3-sweep-testsha-ok.log")))
+
+    def test_negative_a_bad_4th_field_or_the_mark_on_a_shipped_row_is_a_setup_error(self):
+        out = self.run_sweep(SSH, rows=self.rows_for(SSH, {"40": "skip me", "41": SKIP_MARK}))
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("rows: row 40 has an unknown 4th field", out.stderr)
+        out = self.run_sweep(SSH, rows=self.rows_for(SSH, {"1": SKIP_MARK, "40": SKIP_MARK, "41": SKIP_MARK}))
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("rows: row 1 is shipped and has the skip mark", out.stderr)
+
+    def test_the_real_rows_file_marks_both_ssh_rows(self):
+        with open(REAL_ROWS) as f:
+            lines = [l.rstrip("\n").split("|") for l in f if l.strip() and not l.startswith("#")]
+        marked = sorted(c[0] for c in lines if len(c) > 3)
+        self.assertEqual(marked, ["40", "41"])
+        for c in lines:
+            if c[0] in ("40", "41"):
+                self.assertEqual(c[1:], ["partial", c[2], SKIP_MARK])
+
+
+    def test_plan_shows_the_old_binary_build_step_of_a_pinned_proof(self):
+        out = self.run_sweep(OLD % PIN, plan=True)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        want = "| old | build old orblx (debug) at %s in a temp worktree, cache %s |" % (
+            PIN, os.path.join(self.tmp, "work", "old-orblx", PIN, "orblx"))
+        self.assertIn(want, out.stdout)
+        # OLD_ORBLX from the caller wins: no build.
+        out = self.run_sweep(OLD % PIN, plan=True, extra_env={"OLD_ORBLX": "/bin/true"})
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("| old | OLD_ORBLX from the environment: /bin/true (no build) |", out.stdout)
+        # A plan with no pinned proof has no old-binary table.
+        self.assertNotIn("old-binary step", self.run_sweep(GOOD, plan=True).stdout)
+
+    def test_negative_a_missing_or_bad_old_binary_pin_stops_the_sweep(self):
+        cases = [
+            (GOOD + "row|32|User approval|old\nproof|old|scripts/proof/old.sh|-|-\n",
+             "proof old needs OLD_ORBLX (its script requires it), and its manifest line has no"),
+            (OLD % PIN[:8], "bad old-binary pin '%s'" % PIN[:8]),
+            (OLD % PIN.upper(), "bad old-binary pin"),
+            (OLD % ("g" + PIN[1:]), "bad old-binary pin"),
+            (OLD % "", "bad old-binary pin ''"),
+            (OLD.replace("OLD_ORBLX=@OLD:", "OTHER=@OLD:") % PIN, "must be the value of OLD_ORBLX"),
+        ]
+        for manifest, want in cases:
+            for plan in (True, False):
+                shutil.rmtree(self.out, ignore_errors=True)
+                out = self.run_sweep(manifest, plan=plan)
+                self.assertEqual(out.returncode, 2, want + out.stdout + out.stderr)
+                self.assertIn(want, out.stderr)
+                self.assertFalse(os.path.exists(os.path.join(self.out, "rc3-sweep-testsha-ok.log")))
+
+    def test_the_proof_gets_the_old_binary_and_a_bad_OLD_ORBLX_stops_the_run(self):
+        fake = os.path.join(self.tmp, "old-orblx")
+        with open(fake, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(fake, 0o755)
+        out = self.run_sweep(OLD % PIN, extra_env={"OLD_ORBLX": fake})
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        with open(os.path.join(self.out, "rc3-sweep-testsha-old.log")) as f:
+            self.assertIn("old=" + fake + "\n", f.read())
+        # With no OLD_ORBLX the proof gets the cache path of the pin.
+        out = self.run_sweep(OLD % PIN)
+        with open(os.path.join(self.out, "rc3-sweep-testsha-old.log")) as f:
+            self.assertIn("old=" + os.path.join(self.tmp, "work", "old-orblx", PIN, "orblx"), f.read())
+        out = self.run_sweep(OLD % PIN, extra_env={"OLD_ORBLX": os.path.join(self.tmp, "nothing")})
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("is not an executable file", out.stderr)
+
+    def test_the_real_manifest_pins_user_approval_to_the_pre_w25_15_commit(self):
+        with open(REAL_MANIFEST) as f:
+            line = [l.rstrip("\n") for l in f if l.startswith("proof|user-approval|")]
+        self.assertEqual(len(line), 1)
+        self.assertEqual(line[0].split("|")[3], "OLD_ORBLX=@OLD:%s@" % PIN)
 
 
 if __name__ == "__main__":

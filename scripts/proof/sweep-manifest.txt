@@ -1,11 +1,14 @@
 # W25-17 proof sweep manifest (rc.3 condition 4). scripts/proof/release-sweep.sh reads it.
-# Source of the rows: the "shipped" rows of the gap matrix (the Page "Orblx vs Tailscale
-# 기능 격차 매트릭스 + Wave 계획"), with the row numbers of the matrix, and the PO list of
-# 2026-10-31 (rows 17, 24, 38, 51 and 52 are shipped). Change this file when a row changes.
+# W25-27: the row status has one source, docs/matrix-rows.txt (copied from the gap matrix
+# Page "Orblx vs Tailscale 기능 격차 매트릭스 + Wave 계획"; the PO keeps the Page in sync).
+# The "row" lines must be exactly the shipped rows of that file, and each "partial" line a
+# partial row of it. The sweep stops (exit 2) when they differ. Change both files together.
 #
-# row|NUMBER|FEATURE|PROOFS   One line for each shipped row. PROOFS: space list of proof
-#                             names, or "-". A row with "-" makes the sweep fail.
-# gate|NAME|TEXT|PROOFS       A gate with no shipped row of its own (it runs and can fail).
+# row|NUMBER|FEATURE|PROOFS      One line for each shipped row. PROOFS: space list of proof
+#                                names, or "-". A row with "-" makes the sweep fail.
+# partial|NUMBER|FEATURE|PROOFS  A partial row whose proofs still run in the sweep. A failed
+#                                proof fails the row. A partial row with no proof has no line.
+# gate|NAME|TEXT|PROOFS          A gate with no shipped row of its own (it runs and can fail).
 # proof|NAME|SCRIPT|ENV|IMAGES[|PASS ERE[|STEP LOGS]]
 #   ENV: space list of NAME=VALUE ("-" for none). @BIN@ is the release orblx binary.
 #   IMAGES: the image tags that the proof builds. The sweep removes them after the proof.
@@ -13,32 +16,32 @@
 #   STEP LOGS: a glob under the worktree for the logs that the proof writes to files of its
 #     own. The sweep adds each file, whole, to the sweep log of the proof.
 
-row|1|P2P mesh datapath|w18-linux-daemon
-row|9|Subnet routers|subnet
-row|10|Split tunneling / accept-routes|subnet
-row|11|Exit nodes|exit-node
-row|16|MagicDNS|w18-names
-row|17|Split DNS / policy sync (Linux only)|split-dns policy-sync
+partial|1|P2P mesh datapath|w18-linux-daemon
+partial|9|Subnet routers|subnet
+partial|10|Split tunneling / accept-routes|subnet
+partial|11|Exit nodes|exit-node
+partial|16|MagicDNS|w18-names
+partial|17|Split DNS / policy sync (Linux only)|split-dns policy-sync
 row|19|ACL policy file|policy datapath-acl
 row|21|ACL tests|policy
 row|24|GitOps for ACLs|policy-gitops
-row|28|Node key expiry / auth period|-
-row|29|Key / SVID rotation UX|svid-renew nat-realism
+partial|29|Key / SVID rotation UX|svid-renew nat-realism
 row|30|Revocation / device removal|admin revoke-all revoke-followup
 row|31|Device approval|admin
+row|32|User approval|user-approval
 row|33|Auth keys (headless enroll)|coord-enroll
 row|35|OAuth clients / API tokens|api-tokens token-no-escalation
 row|38|Node sharing|node-share
-row|40|Tailscale SSH|ssh
-row|41|SSH session recording|ssh
+partial|40|Tailscale SSH|ssh
+partial|41|SSH session recording|ssh
 row|45|Taildrop|file-send
 row|49|Configuration audit logs|config-audit
 row|51|Log streaming (SIEM)|siem-streaming
 row|52|Webhooks|audit-webhooks
 row|53|status / netcheck / ping / metrics|admin
-row|54|Linux client|w18-linux-daemon
+partial|54|Linux client|w18-linux-daemon
 row|58|Docker image|docker-image
-row|61|CLI UX (login/up/down/set)|w18-linux-daemon coord-enroll exit-node
+partial|61|CLI UX (login/up/down/set)|w18-linux-daemon coord-enroll exit-node
 row|62|Admin CLI / console|admin
 gate|W23-4|sym relay throughput: sym_sym median of 5 runs of 30 s >= 1113 Mbit/s (W25-12)|sym-throughput
 gate|join-time|join time: 20 late-peer joins from a clean state, each 2000 ms or less from the listener start to the first packet (enroll to first packet is report only)|join-time
@@ -61,6 +64,7 @@ proof|revoke-followup|scripts/proof/revoke-followup.sh|ORBLX_PROOF_PROFILE=relea
 proof|api-tokens|scripts/proof/api-tokens.sh|ATPROOF_BIN=@BIN@ ATPROOF_PROJECT=orblx-rc3sw-tokens ATPROOF_IMAGE=orblx-rc3sw-tokens:local|orblx-rc3sw-tokens:local
 proof|token-no-escalation|scripts/proof/token-no-escalation.sh|ESC_BIN=@BIN@ ESC_PROJECT=orblx-rc3sw-escalation ESC_IMAGE=orblx-rc3sw-escalation:local|orblx-rc3sw-escalation:local
 proof|node-share|scripts/proof/node-share.sh|-|orblx-w25a-share:w25
+proof|user-approval|scripts/proof/user-approval.sh|OLD_ORBLX=@OLD:d9704cfb2f63bebbd3890f5b1accff30b2cace1f@|orblx-w25o-users:old orblx-w25o-users:new
 proof|ssh|scripts/proof/ssh.sh|-|orblx-ssh:local
 proof|file-send|scripts/proof/file-send.sh|-|orblx-w23a-file:w23
 proof|config-audit|scripts/proof/config-audit.sh|-|orblx-audit:w20
