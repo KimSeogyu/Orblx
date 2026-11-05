@@ -50,6 +50,10 @@ pub async fn spawn(
     tokio::spawn(async move {
         expire_tick(tick_coord).await;
     });
+    let posture_coord = coord.clone();
+    tokio::spawn(async move {
+        posture_tick(posture_coord).await;
+    });
     let (stamp_tx, stamp_rx) = watch::channel(0u64);
     let stamp_coord = coord.clone();
     tokio::spawn(async move {
@@ -64,6 +68,27 @@ pub async fn spawn(
 
 /// The time between two agent grant expiry checks.
 const EXPIRE_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Check last-seen posture on the same period as grant expiry.
+///
+/// A node that stops reporting falls out of a last-seen rule without a new request.
+async fn posture_tick(coord: Coordinator) {
+    let mut failed = false;
+    loop {
+        tokio::time::sleep(EXPIRE_TICK).await;
+        let step = coord.clone();
+        let result =
+            tokio::task::spawn_blocking(move || step.reconcile_posture(SystemTime::now())).await;
+        match result {
+            Ok(Ok(_)) => failed = false,
+            Ok(Err(err)) if !failed => {
+                failed = true;
+                println!("coord posture tick failed: {}", err.public_text());
+            }
+            _ => {}
+        }
+    }
+}
 
 /// Record agent grant expiry in the config chain without an admin call.
 async fn expire_tick(coord: Coordinator) {
@@ -102,6 +127,7 @@ async fn stamp_tick(coord: Coordinator, stamp: watch::Sender<u64>) {
             dir.join("deny.json"),
             dir.join(crate::state::CONFIG_AUDIT_FILE),
             dir.join("nodes.json"),
+            dir.join(crate::posture::FILE),
             policy,
         ]
         .iter()
@@ -369,6 +395,7 @@ async fn policy_wait_op(
     if peer != request.name {
         return Err(CoordError::Peer);
     }
+    report_posture(coord, &peer, request, SystemTime::now())?;
     policy_wait(
         coord,
         &request.name,
@@ -377,6 +404,26 @@ async fn policy_wait_op(
         stamp,
     )
     .await
+}
+
+/// Store the self-report for the authenticated peer, then apply posture.
+///
+/// `peer` is the node from the connection certificate. The report is stored
+/// only when `request.name` is that same node.
+fn report_posture(
+    coord: &Coordinator,
+    peer: &str,
+    request: &Request,
+    now: SystemTime,
+) -> Result<(), CoordError> {
+    coord.accept_peer_posture(
+        peer,
+        &request.name,
+        request.os.as_deref(),
+        request.client_version.as_deref(),
+        now,
+    )?;
+    coord.reconcile_posture(now)
 }
 
 async fn dispatch(
@@ -389,12 +436,14 @@ async fn dispatch(
     match request.op.as_str() {
         "enroll" => {
             let result = match (&request.token, &request.id_token) {
-                (Some(token), None) => coord.enroll_token(
+                (Some(token), None) => coord.enroll_token_reported(
                     &request.name,
                     token,
                     &request.endpoints,
                     &request.routes,
                     now,
+                    request.os.as_deref(),
+                    request.client_version.as_deref(),
                 )?,
                 (None, Some(id_token)) => {
                     if coord.google_client_id_for_fetch()?.is_some() {
@@ -404,13 +453,15 @@ async fn dispatch(
                     if let Some(plan) = coord.issuer_fetch_plan(kid.as_deref(), now)? {
                         refresh_issuer_jwks(coord, plan).await;
                     }
-                    coord.enroll_oidc(
+                    coord.enroll_oidc_reported(
                         &request.name,
                         id_token,
                         request.nonce.as_deref(),
                         &request.endpoints,
                         &request.routes,
                         now,
+                        request.os.as_deref(),
+                        request.client_version.as_deref(),
                     )?
                 }
                 _ => {
@@ -420,6 +471,7 @@ async fn dispatch(
                 }
             };
             println!("enrolled {}", result.name);
+            coord.reconcile_posture(now)?;
             Ok(leaf_response(result))
         }
         "renew" => {
@@ -427,8 +479,10 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
+            report_posture(coord, &peer, &request, now)?;
             let result = coord.renew_node(&request.name, now)?;
             println!("renewed {}", result.name);
+            coord.reconcile_posture(now)?;
             Ok(leaf_response(result))
         }
         "advertise" => {
@@ -436,6 +490,7 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
+            report_posture(coord, &peer, &request, now)?;
             let view = coord.advertise_routes(&request.name, &request.routes)?;
             Ok(netmap_response(&view))
         }
@@ -444,6 +499,7 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
+            report_posture(coord, &peer, &request, now)?;
             let view = coord.set_candidates(&request.name, &request.endpoints)?;
             Ok(netmap_response(&view))
         }
@@ -452,6 +508,7 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
+            report_posture(coord, &peer, &request, now)?;
             let view = coord.advertise_exit(&request.name, request.exit_node)?;
             Ok(netmap_response(&view))
         }
@@ -460,6 +517,7 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
+            report_posture(coord, &peer, &request, now)?;
             let view = coord.netmap_for(&request.name)?;
             println!("netmap {}", request.name);
             Ok(netmap_response(&view))
@@ -469,6 +527,7 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
+            report_posture(coord, &peer, &request, now)?;
             let detail = admin::deny_json_for(coord, &request.name, now)?;
             Ok(Response {
                 ok: true,
@@ -481,6 +540,7 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
+            report_posture(coord, &peer, &request, now)?;
             let detail =
                 deny_wait(coord, &request.name, request.deny_etag.as_deref(), stamp).await?;
             Ok(Response {
@@ -494,6 +554,7 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
+            report_posture(coord, &peer, &request, now)?;
             let ask = request.grant.as_ref().ok_or_else(|| {
                 CoordError::Protocol("The grant request is not valid.".to_string())
             })?;
@@ -503,6 +564,13 @@ async fn dispatch(
         }
         "agent-grant-fetch" => {
             let peer = peer_node(coord, connection)?;
+            coord.stage_posture(
+                &peer,
+                request.os.as_deref(),
+                request.client_version.as_deref(),
+                now,
+            )?;
+            coord.reconcile_posture(now)?;
             match agent::fetch(coord, &peer, &request.name, now)? {
                 agent::Fetched::Pending(value) => detail_response(&value),
                 agent::Fetched::Issued(issued) => {
@@ -889,6 +957,8 @@ mod tests {
             deny_etag: None,
             expect_sha256: None,
             unchanged_ok: false,
+            os: None,
+            client_version: None,
         }
     }
 

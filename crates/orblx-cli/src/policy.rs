@@ -71,6 +71,9 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             for assertion in policy.ssh_assertions() {
                 println!("{}", assertion.line());
             }
+            for assertion in policy.posture_assertions() {
+                println!("{}", assertion.line());
+            }
             println!("policy ok");
             Ok(())
         }

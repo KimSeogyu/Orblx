@@ -10,6 +10,9 @@
 //! An agent SSH source needs one destination and one user.
 //! `tests` lists allow and deny assertions.
 //! `sshTests` lists SSH allow and deny assertions.
+//! `postures` names device checks. `srcPosture` on an accept rule or an SSH rule
+//! points at those names. `postureTests` checks the rules.
+//! `os` and `clientVersion` are self-reported. `nodeLock` and `lastSeen` are coordinator facts.
 //! A failed assertion rejects the file.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,6 +22,9 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::posture::{
+    self, GrantRow, PostureFacts, PosturePlan, PostureTestFile, SshRow, SubnetRow,
+};
 use crate::share::{compile_guests, compile_shares, Share, ShareFile};
 use crate::sink::{compile_audit_sinks, AuditSink, AuditSinkFile};
 use crate::spiffe::{SpiffeId, WorkloadKind};
@@ -359,6 +365,8 @@ pub struct Policy {
     acl_set: bool,
     /// OIDC user approval (W25-15).
     user_approval: UserApproval,
+    /// Named posture rules and the grants that reference them.
+    posture: PosturePlan,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -396,6 +404,7 @@ impl std::fmt::Debug for Policy {
             .field("audit_sinks", &self.audit_sinks.len())
             .field("owner_users", &self.user_approval.owner_users_len())
             .field("auto_approve", &self.user_approval.auto_approve_on())
+            .field("postures", &self.posture.len_rules())
             .finish()
     }
 }
@@ -423,6 +432,7 @@ impl Policy {
             audit_sinks: Vec::new(),
             acl_set: false,
             user_approval: UserApproval::default(),
+            posture: PosturePlan::empty(),
         }
     }
 
@@ -502,6 +512,71 @@ impl Policy {
     #[must_use]
     pub fn is_owner(&self, id: &SpiffeId) -> bool {
         self.owners.iter().any(|owner| owner == id)
+    }
+
+    /// Return true when posture allows this grant, or the grant has no posture.
+    ///
+    /// A missing fact fails closed.
+    #[must_use]
+    pub fn posture_allows_grant(
+        &self,
+        src: &SpiffeId,
+        dst: &SpiffeId,
+        proto: u8,
+        port_start: u16,
+        port_end: u16,
+        facts: &PostureFacts,
+    ) -> bool {
+        self.posture
+            .allows_grant(src, dst, proto, port_start, port_end, facts)
+    }
+
+    /// Return true when posture allows this subnet grant, or the grant has no posture.
+    #[must_use]
+    pub fn posture_allows_subnet(
+        &self,
+        src: &SpiffeId,
+        prefix: Ipv4Addr,
+        prefix_len: u8,
+        proto: u8,
+        ports: (u16, u16),
+        facts: &PostureFacts,
+    ) -> bool {
+        self.posture
+            .allows_subnet(src, prefix, prefix_len, proto, ports, facts)
+    }
+
+    /// Return true when posture allows this node to reach `dst`.
+    #[must_use]
+    pub fn posture_allows_reach(
+        &self,
+        src: &SpiffeId,
+        dst: &SpiffeId,
+        facts: &PostureFacts,
+    ) -> bool {
+        self.posture.allows_reach(src, dst, facts)
+    }
+
+    /// Return the first posture failure that blocks a ticket for `src`.
+    #[must_use]
+    pub fn posture_ticket_failure(
+        &self,
+        src: &SpiffeId,
+        facts: &PostureFacts,
+    ) -> Option<crate::posture::PostureFailure> {
+        self.posture.ticket_failure(src, facts)
+    }
+
+    /// Return the failing posture names for `src`, in order. Empty means in posture.
+    #[must_use]
+    pub fn posture_block_key(&self, src: &SpiffeId, facts: &PostureFacts) -> String {
+        self.posture.block_key(src, facts)
+    }
+
+    /// Return the inline posture tests.
+    #[must_use]
+    pub fn posture_assertions(&self) -> Vec<crate::posture::PostureAssertion> {
+        self.posture.assertions()
     }
 
     /// Read one HuJSON policy file and run its tests.
@@ -726,6 +801,7 @@ impl Policy {
                 ));
             }
         }
+        self.posture.run_tests()?;
         Ok(())
     }
 }
@@ -795,6 +871,10 @@ struct PolicyFile {
     audit_sinks: Vec<AuditSinkFile>,
     #[serde(default, rename = "userApproval")]
     user_approval: UserApprovalFile,
+    #[serde(default)]
+    postures: BTreeMap<String, Vec<String>>,
+    #[serde(default, rename = "postureTests")]
+    posture_tests: Vec<PostureTestFile>,
 }
 
 #[derive(Deserialize)]
@@ -807,6 +887,8 @@ struct SshRuleFile {
     check_period: String,
     #[serde(default)]
     recording: Option<String>,
+    #[serde(default, rename = "srcPosture")]
+    src_posture: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -842,6 +924,8 @@ struct AclFile {
     dst: Vec<String>,
     #[serde(default)]
     proto: Option<String>,
+    #[serde(default, rename = "srcPosture")]
+    src_posture: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -865,7 +949,10 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
     let catalog = catalog(file)?;
     let mut grants = Vec::new();
     let mut subnet_grants = Vec::new();
+    let mut posture_grants = Vec::new();
+    let mut posture_subnets = Vec::new();
     for rule in file.acls.as_deref().unwrap_or(&[]) {
+        let posture_names = posture::posture_names(&file.postures, &rule.src_posture)?;
         if rule.action != "accept" {
             return Err(PolicyError::new(
                 "The policy action is accept. Other actions are rejected.",
@@ -911,6 +998,15 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
                                     port_start: *start,
                                     port_end: *end,
                                 });
+                                posture_subnets.push(SubnetRow {
+                                    src: src.clone(),
+                                    prefix,
+                                    prefix_len,
+                                    proto: *proto,
+                                    port_start: *start,
+                                    port_end: *end,
+                                    names: posture_names.clone(),
+                                });
                             }
                         }
                     }
@@ -944,6 +1040,14 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
                                     port_start: *start,
                                     port_end: *end,
                                 });
+                                posture_grants.push(GrantRow {
+                                    src: src.clone(),
+                                    dst: dst.clone(),
+                                    proto: *proto,
+                                    port_start: *start,
+                                    port_end: *end,
+                                    names: posture_names.clone(),
+                                });
                             }
                         }
                     }
@@ -975,7 +1079,7 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
     let routes = compile_routes(&catalog, file)?;
     let exit_nodes = compile_exit_nodes(&catalog, &file.auto_approvers.exit_node)?;
     let owners = compile_owners(&file.owners)?;
-    let ssh = compile_ssh(&catalog, &file.ssh)?;
+    let (ssh, posture_ssh) = compile_ssh(&catalog, &file.ssh, &file.postures)?;
     let mut ssh_tests = Vec::new();
     for test in &file.ssh_tests {
         ssh_tests.push(compile_ssh_test(&catalog, test)?);
@@ -986,6 +1090,13 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
     let audit_webhooks = compile_audit_webhooks(&file.audit_webhooks)?;
     let audit_sinks = compile_audit_sinks(&file.audit_sinks)?;
     let user_approval = compile_user_approval(&file.user_approval)?;
+    let posture = PosturePlan::compile(
+        &file.postures,
+        &file.posture_tests,
+        posture_grants,
+        posture_subnets,
+        posture_ssh,
+    )?;
     Ok(Policy {
         grants,
         subnet_grants,
@@ -1003,6 +1114,7 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
         audit_sinks,
         acl_set: file.acls.is_some(),
         user_approval,
+        posture,
     })
 }
 
@@ -1160,9 +1272,15 @@ fn compile_exit_nodes(
     Ok(exit_nodes)
 }
 
-fn compile_ssh(catalog: &Catalog, rules: &[SshRuleFile]) -> Result<Vec<SshGrant>, PolicyError> {
+fn compile_ssh(
+    catalog: &Catalog,
+    rules: &[SshRuleFile],
+    postures: &BTreeMap<String, Vec<String>>,
+) -> Result<(Vec<SshGrant>, Vec<SshRow>), PolicyError> {
     let mut grants = Vec::new();
+    let mut posture_rows = Vec::new();
     for rule in rules {
+        let posture_names = posture::posture_names(postures, &rule.src_posture)?;
         if rule.src.is_empty() || rule.dst.is_empty() || rule.users.is_empty() {
             return Err(PolicyError::new(
                 "The SSH rule needs a source, a destination, a user, and a check period.",
@@ -1208,6 +1326,12 @@ fn compile_ssh(catalog: &Catalog, rules: &[SshRuleFile]) -> Result<Vec<SshGrant>
                                 check_period: period,
                                 recording,
                             });
+                            posture_rows.push(SshRow {
+                                src: src.clone(),
+                                dst: dst.clone(),
+                                user: user.clone(),
+                                names: posture_names.clone(),
+                            });
                         }
                     }
                 }
@@ -1231,7 +1355,7 @@ fn compile_ssh(catalog: &Catalog, rules: &[SshRuleFile]) -> Result<Vec<SshGrant>
             ))
     });
     grants.dedup();
-    Ok(grants)
+    Ok((grants, posture_rows))
 }
 
 fn compile_ssh_test(catalog: &Catalog, test: &SshTestFile) -> Result<StoredSshTest, PolicyError> {

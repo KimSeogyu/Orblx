@@ -164,6 +164,8 @@ struct Inner {
     /// Ed25519 signatures are deterministic. The same key and the same endpoint give the same
     /// signature, so the coordinator signs each endpoint one time.
     endpoint_sigs: RefCell<HashMap<(String, String), SignedEndpoint>>,
+    /// Device posture reports and the fall latches.
+    posture: crate::posture::PostureState,
 }
 
 /// The time after which the coordinator reads a state file again, also when its metadata
@@ -212,6 +214,7 @@ struct ViewKey {
     nodes: [u8; 32],
     policy_gen: u64,
     lock: [u8; 32],
+    posture_gen: u64,
 }
 
 #[derive(Default)]
@@ -429,6 +432,7 @@ impl Coordinator {
                 lock_loaded: None,
                 views: ViewCache::default(),
                 endpoint_sigs: RefCell::new(HashMap::new()),
+                posture: crate::posture::load(dir)?,
             })),
         };
         {
@@ -463,6 +467,143 @@ impl Coordinator {
         let mut inner = self.lock()?;
         inner.svid_ttl = ttl;
         Ok(())
+    }
+
+    /// Store one self-report after the node is enrolled.
+    ///
+    /// `os` and `version` are self-reported. An omitted field clears that fact.
+    /// A text that is not a known token also clears it. Last-seen is the
+    /// coordinator clock of this call. The caller must already know that `name`
+    /// is the authenticated peer.
+    pub(crate) fn stage_posture(
+        &self,
+        name: &str,
+        os: Option<&str>,
+        version: Option<&str>,
+        now: SystemTime,
+    ) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        if !inner.store.nodes().iter().any(|node| node.name == name) {
+            return Err(CoordError::Protocol("The node is not enrolled.".into()));
+        }
+        crate::posture::note_seen(&mut inner.posture, name, now)?;
+        crate::posture::apply_report(&mut inner.posture, name, os, version)?;
+        crate::posture::save(&inner.state_dir, &inner.posture)
+    }
+
+    /// Accept a report only when `peer` is `requested`.
+    pub(crate) fn accept_peer_posture(
+        &self,
+        peer: &str,
+        requested: &str,
+        os: Option<&str>,
+        version: Option<&str>,
+        now: SystemTime,
+    ) -> Result<(), CoordError> {
+        if peer != requested {
+            return Err(CoordError::Peer);
+        }
+        self.stage_posture(peer, os, version, now)
+    }
+
+    /// Revoke tickets and issued grants that fail posture, and write one record per fall.
+    pub(crate) fn reconcile_posture(&self, now: SystemTime) -> Result<(), CoordError> {
+        let work = {
+            let inner = self.lock()?;
+            let lock = crate::nodelock::read_store(&inner.state_dir)?;
+            let nodes = inner.store.nodes();
+            crate::posture::plan(&inner.policy, &inner.posture, &nodes, &lock, now)?
+        };
+        let taken = if work.requesters.is_empty() {
+            std::collections::BTreeMap::new()
+        } else {
+            crate::agent::take_issued_for_posture(self, &work.requesters)?
+        };
+        let mut nonces = work.ticket_nonces.clone();
+        let mut counts = std::collections::BTreeMap::new();
+        for (name, grant_nonces) in &taken {
+            counts.insert(name.clone(), grant_nonces.len());
+            nonces.extend(grant_nonces.iter().cloned());
+        }
+        if !nonces.is_empty() {
+            crate::admin::push_deny(self, &[], &nonces, now)?;
+        }
+        let mut inner = self.lock()?;
+        let audits = crate::posture::commit(&mut inner.posture, &work, &counts);
+        crate::posture::save(&inner.state_dir, &inner.posture)?;
+        let actor = coord_actor_of(&inner)?;
+        for audit in audits {
+            let action = match audit.kind {
+                crate::posture::PostureKind::Deny => ConfigAction::PostureDeny,
+                crate::posture::PostureKind::Revoke => ConfigAction::PostureRevoke,
+                crate::posture::PostureKind::Restore => ConfigAction::PostureRestore,
+            };
+            record(
+                &mut inner,
+                &actor,
+                action,
+                &audit.node,
+                EMPTY_DIGEST,
+                EMPTY_DIGEST,
+                &audit.detail,
+            )?;
+            println!(
+                "coord posture {} {} {}",
+                action.as_str(),
+                audit.node,
+                audit.detail
+            );
+        }
+        Ok(())
+    }
+
+    /// Refuse a new grant when `name` is out of posture. Write one deny record per fall.
+    pub(crate) fn refuse_if_out_of_posture(
+        &self,
+        name: &str,
+        now: SystemTime,
+    ) -> Result<(), CoordError> {
+        let failure = {
+            let inner = self.lock()?;
+            let lock = crate::nodelock::read_store(&inner.state_dir)?;
+            let nodes = inner.store.nodes();
+            let node = nodes
+                .iter()
+                .find(|node| node.name == name)
+                .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+            crate::posture::blocked(&inner.policy, &inner.posture, node, &lock, now)?
+        };
+        let Some(failure) = failure else {
+            return Ok(());
+        };
+        let mut inner = self.lock()?;
+        if let Some(audit) = crate::posture::latch_deny(&mut inner.posture, name, &failure) {
+            crate::posture::save(&inner.state_dir, &inner.posture)?;
+            let actor = coord_actor_of(&inner)?;
+            record(
+                &mut inner,
+                &actor,
+                ConfigAction::PostureDeny,
+                &audit.node,
+                EMPTY_DIGEST,
+                EMPTY_DIGEST,
+                &audit.detail,
+            )?;
+            println!("coord posture deny {} {}", audit.node, audit.detail);
+        }
+        Err(CoordError::Protocol(
+            "The node is out of posture.".to_string(),
+        ))
+    }
+
+    /// Node SVIDs that peers must treat as revoked because posture failed.
+    ///
+    /// The URIs are added to the deny list the node polls. They are not stored
+    /// in the deny file, so the node can still reach the coordinator.
+    pub(crate) fn posture_deny_uris(&self) -> Result<Vec<String>, CoordError> {
+        let inner = self.lock()?;
+        let nodes = inner.store.nodes();
+        Ok(crate::posture::deny_uris(&inner.posture, &nodes))
     }
 
     /// Issue a new leaf for an enrolled node.
@@ -507,13 +648,31 @@ impl Coordinator {
         routes: &[String],
         now: SystemTime,
     ) -> Result<EnrollResult, CoordError> {
+        self.enroll_token_reported(name, secret, endpoints, routes, now, None, None)
+    }
+
+    /// Enroll with one token, then store the self-report for that node only.
+    ///
+    /// A bad token returns before any posture write. `os` and `version` apply
+    /// only to the name that `begin_enroll` accepted.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enroll_token_reported(
+        &self,
+        name: &str,
+        secret: &str,
+        endpoints: &[String],
+        routes: &[String],
+        now: SystemTime,
+        os: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<EnrollResult, CoordError> {
         let _ = SpiffeId::node(name)?;
         let mut inner = self.lock()?;
         reload(&mut inner)?;
         let plan = inner
             .store
             .begin_enroll(name, secret, now, endpoints, routes)?;
-        finish_enroll(&mut inner, plan, now)
+        finish_enroll(&mut inner, plan, now, os, version)
     }
 
     pub fn enroll_oidc(
@@ -525,6 +684,24 @@ impl Coordinator {
         routes: &[String],
         now: SystemTime,
     ) -> Result<EnrollResult, CoordError> {
+        self.enroll_oidc_reported(name, id_token, nonce, endpoints, routes, now, None, None)
+    }
+
+    /// Enroll with one OIDC token, then store the self-report for that node only.
+    ///
+    /// A bad token or an unapproved user returns before any posture write.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enroll_oidc_reported(
+        &self,
+        name: &str,
+        id_token: &str,
+        nonce: Option<&str>,
+        endpoints: &[String],
+        routes: &[String],
+        now: SystemTime,
+        os: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<EnrollResult, CoordError> {
         let _ = SpiffeId::node(name)?;
         let mut inner = self.lock()?;
         reload(&mut inner)?;
@@ -534,7 +711,7 @@ impl Coordinator {
         let plan = inner
             .store
             .begin_oidc(name, &login.subject, endpoints, routes)?;
-        finish_enroll(&mut inner, plan, now)
+        finish_enroll(&mut inner, plan, now, os, version)
     }
 
     /// Return the OIDC users and their nodes (W25-15).
@@ -650,6 +827,7 @@ impl Coordinator {
             nodes,
             policy_gen: inner.policy_gen,
             lock: lock_digest,
+            posture_gen: crate::posture::generation(&inner.posture),
         };
         if inner.views.key != Some(key) || inner.views.inputs.is_none() {
             inner.views.key = Some(key);
@@ -1248,15 +1426,47 @@ impl Coordinator {
     /// Issue one agent SVID and one agent JIT ticket.
     ///
     /// The caller must not log the key or the ticket.
+    ///
+    /// The posture check and the ticket issue hold one lock.
     pub(crate) fn issue_agent_material(
         &self,
         agent: &SpiffeId,
+        requester: &str,
         now: SystemTime,
         ttl: Duration,
         dest: orblx_identity::Ipv4Destination,
         deny: &DenySet,
     ) -> Result<AgentMaterial, CoordError> {
-        let inner = self.lock()?;
+        let mut inner = self.lock()?;
+        let failure = {
+            let lock = crate::nodelock::read_store(&inner.state_dir)?;
+            let nodes = inner.store.nodes();
+            let node = nodes
+                .iter()
+                .find(|item| item.name == requester)
+                .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".into()))?;
+            crate::posture::blocked(&inner.policy, &inner.posture, node, &lock, now)?
+        };
+        if let Some(failure) = failure {
+            if let Some(audit) = crate::posture::latch_deny(&mut inner.posture, requester, &failure)
+            {
+                crate::posture::save(&inner.state_dir, &inner.posture)?;
+                let actor = coord_actor_of(&inner)?;
+                record(
+                    &mut inner,
+                    &actor,
+                    ConfigAction::PostureDeny,
+                    &audit.node,
+                    EMPTY_DIGEST,
+                    EMPTY_DIGEST,
+                    &audit.detail,
+                )?;
+                println!("coord posture deny {} {}", audit.node, audit.detail);
+            }
+            return Err(CoordError::Protocol(
+                "The node is out of posture.".to_string(),
+            ));
+        }
         let issued = inner.ca.issue(agent, now, ttl, deny)?;
         let ticket = ticket::issue_agent_ticket(
             &inner.state_dir,
@@ -1741,6 +1951,8 @@ fn finish_enroll(
     inner: &mut Inner,
     plan: crate::store::EnrollPlan,
     now: SystemTime,
+    os: Option<&str>,
+    version: Option<&str>,
 ) -> Result<EnrollResult, CoordError> {
     let id = SpiffeId::node(&plan.name)?;
     let issued = inner
@@ -1769,6 +1981,9 @@ fn finish_enroll(
         after,
         &detail,
     )?;
+    crate::posture::note_seen(&mut inner.posture, &stored.name, now)?;
+    crate::posture::apply_report(&mut inner.posture, &stored.name, os, version)?;
+    crate::posture::save(&inner.state_dir, &inner.posture)?;
     let view = sign_view(inner, &stored.name)?;
     let ticket = issue_ticket(inner, &stored.name, now)?;
     Ok(EnrollResult {
@@ -1785,7 +2000,7 @@ fn finish_enroll(
         approved_routes: view.approved_routes,
         advertised_routes: view.advertised_routes,
         exit_approved: view.exit_approved,
-        ticket: Some(ticket),
+        ticket,
     })
 }
 
@@ -1799,15 +2014,30 @@ fn initial_approved(policy: &Policy, name: &str) -> bool {
     }
 }
 
-fn issue_ticket(inner: &Inner, name: &str, now: SystemTime) -> Result<IssuedTicket, CoordError> {
-    ticket::issue_node_ticket(
+fn issue_ticket(
+    inner: &mut Inner,
+    name: &str,
+    now: SystemTime,
+) -> Result<Option<IssuedTicket>, CoordError> {
+    let lock = crate::nodelock::read_store(&inner.state_dir)?;
+    let nodes = inner.store.nodes();
+    if let Some(node) = nodes.iter().find(|node| node.name == name) {
+        if crate::posture::blocked(&inner.policy, &inner.posture, node, &lock, now)?.is_some() {
+            return Ok(None);
+        }
+    }
+    let ticket = ticket::issue_node_ticket(
         &inner.state_dir,
         inner.ca.public_key(),
         &inner.coord_name,
         name,
         now,
         inner.svid_ttl,
-    )
+    )?;
+    let nonce = orblx_identity::ticket_nonce(&ticket.bytes).map_err(|_| CoordError::State)?;
+    crate::posture::note_ticket(&mut inner.posture, name, &crate::netmap::encode_hex(&nonce));
+    crate::posture::save(&inner.state_dir, &inner.posture)?;
+    Ok(Some(ticket))
 }
 
 fn issue_leaf(inner: &mut Inner, name: &str, now: SystemTime) -> Result<EnrollResult, CoordError> {
@@ -1832,7 +2062,7 @@ fn issue_leaf(inner: &mut Inner, name: &str, now: SystemTime) -> Result<EnrollRe
         approved_routes: view.approved_routes,
         advertised_routes: view.advertised_routes,
         exit_approved: view.exit_approved,
-        ticket: Some(ticket),
+        ticket,
     })
 }
 
@@ -1904,7 +2134,16 @@ fn sign_view_with(
     };
     let signed_netmap = inner.netmap_key.sign_netmap_owned(payload)?;
     let receiver = SpiffeId::node(&self_node.name)?;
-    let grants = filtered_grants(inner, &receiver, self_node, self_visible, nodes);
+    let mut grants = filtered_grants(inner, &receiver, self_node, self_visible, nodes);
+    crate::posture::apply_grants(
+        &inner.policy,
+        &inner.posture,
+        nodes,
+        &inputs.lock,
+        &receiver,
+        &mut grants,
+        SystemTime::now(),
+    )?;
     let signed_grants = inner.netmap_key.sign_grants_owned(grants)?;
     let netmap_public = inner.netmap_key.public();
     let (approved_routes, exit_approved) = inputs.published(&self_node.name);

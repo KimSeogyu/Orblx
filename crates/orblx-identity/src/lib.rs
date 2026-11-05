@@ -37,6 +37,7 @@ mod google;
 mod issuer;
 mod oidc;
 mod policy;
+mod posture;
 mod share;
 mod sink;
 mod spiffe;
@@ -63,6 +64,7 @@ pub use policy::{
     Policy, PolicyAssertion, PolicyError, ReceiverGrant, ReceiverGrants, SplitDnsZone,
     SshAssertion, SubnetGrant,
 };
+pub use posture::{clean_os, clean_version, PostureAssertion, PostureFacts, PostureFailure};
 
 /// Return the Ed25519 seed from a PKCS#8 private key PEM.
 ///
@@ -92,7 +94,7 @@ pub use share::{rules_without_shares, Share, ShareGuest};
 pub use sink::{parse_https_url, AuditSink, SinkFormat, SinkTarget, MAX_AUDIT_SINKS};
 pub use spiffe::{SpiffeId, WorkloadKind, TRUST_DOMAIN};
 pub use ticket::{
-    allow_agent_jit, sign_agent_jit_ticket, sign_ticket, ticket_hash, verify_ticket,
+    allow_agent_jit, sign_agent_jit_ticket, sign_ticket, ticket_hash, ticket_nonce, verify_ticket,
     Ipv4Destination, SignedTicket, TicketClaims, TicketFlags, TicketSigner, TicketVerifier,
     VerifiedTicket, FLAG_AGENT_JIT, FLAG_ONE_SHOT,
 };

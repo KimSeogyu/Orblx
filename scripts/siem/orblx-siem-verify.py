@@ -40,6 +40,8 @@ ACTIONS = [
     "token-create", "token-use", "token-deny", "token-revoke", "share",
     "unshare", "packet-deny", "unrevoke", "sink-error", "user-approve",
     "user-reject", "reserved-37", "route-failover",
+    "reserved-39", "reserved-40", "reserved-41", "reserved-42",
+    "posture-deny", "posture-revoke", "posture-restore",
 ]
 
 SYSLOG_HEAD = re.compile(

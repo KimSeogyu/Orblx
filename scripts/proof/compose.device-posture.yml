@@ -1,0 +1,63 @@
+# Device posture proof stack.
+# coord: the coordinator. a, b, and c: nodes. Each node has its own state volume.
+name: orblx-device-posture-proof
+
+services:
+  coord:
+    image: ${DPPROOF_IMAGE:?set DPPROOF_IMAGE}
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /var/lib/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+    volumes:
+      - store:/var/lib/orblx
+    networks:
+      - proof
+
+  a:
+    image: ${DPPROOF_IMAGE:?set DPPROOF_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    volumes:
+      - store:/coord-state:ro
+      - node-a:/var/lib/orblx
+    networks:
+      - proof
+
+  b:
+    image: ${DPPROOF_IMAGE:?set DPPROOF_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    volumes:
+      - store:/coord-state:ro
+      - node-b:/var/lib/orblx
+    networks:
+      - proof
+
+  c:
+    image: ${DPPROOF_IMAGE:?set DPPROOF_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    volumes:
+      - store:/coord-state:ro
+      - node-c:/var/lib/orblx
+    networks:
+      - proof
+
+volumes:
+  store:
+  node-a:
+  node-b:
+  node-c:
+
+networks:
+  proof:
