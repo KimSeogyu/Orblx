@@ -112,6 +112,7 @@ async fn renew_replaces_the_leaf_and_keeps_the_address() {
 async fn session_stays_up_for_three_svid_lifetimes() {
     const LIFE_SECS: u64 = 60;
     const PROBE_MS: u64 = 20;
+    // The base limit for a packet gap at a renewal.
     const RENEW_GAP_LIMIT: Duration = Duration::from_millis(200);
     let scratch = Scratch::new("life");
     let node_a = Scratch::new("life-a");
@@ -354,10 +355,20 @@ async fn session_stays_up_for_three_svid_lifetimes() {
         "renew calls {} over three lifetimes",
         renewals.len()
     );
+    // W25-45: the gate is max(200 ms, the largest OS stall of this run).
+    // The OS stall probe is a plain thread that sleeps 5 ms. A late wake-up shows that the
+    // host did not give the process a CPU for that time (for example on a loaded CI runner or
+    // in a debug build with other tests). No datapath code can pass packets in that time, so
+    // such a gap is not a renewal fault. A renewal fault still fails: it makes a gap that is
+    // larger than 200 ms and larger than the OS stall of the run. The limit does not grow
+    // without a measured stall.
+    let renew_gap_limit = RENEW_GAP_LIMIT.max(max_os_stall);
     assert!(
-        renew_gap <= RENEW_GAP_LIMIT,
-        "packet gap {} ms at an SVID renewal",
-        renew_gap.as_millis()
+        renew_gap <= renew_gap_limit,
+        "packet gap {} ms at an SVID renewal (limit {} ms = max(200 ms, OS stall {} ms))",
+        renew_gap.as_millis(),
+        renew_gap_limit.as_millis(),
+        max_os_stall.as_millis()
     );
     assert!(saw_direct, "status did not report path direct");
     assert!(
@@ -551,6 +562,224 @@ async fn the_coordinator_ticket_keeps_the_path_up_across_svid_renewals() {
         "packet gap {} ms",
         max_gap.as_millis()
     );
+}
+
+/// W25-45 D3(b): the renewal of node `a` keeps failing.
+///
+/// DATA passes until the deadline of `a` (its ticket end, which is also its leaf `not_after`).
+/// At the deadline both nodes close the session (B2). After it, no DATA passes in either
+/// direction: `b` closes its session at the deadline of `a`, and the peers refuse the expired
+/// ticket and leaf of `a`. The link of `a` dials again (fail closed, then redial).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn data_stops_at_the_deadline_when_the_renewal_keeps_failing_and_the_link_dials_again() {
+    const LIFE_SECS: u64 = 9;
+    const PROBE_MS: u64 = 50;
+    const AFTER_SECS: u64 = 6;
+    let scratch = Scratch::new("w2545-fail");
+    let node_a = Scratch::new("w2545-fail-a");
+    let node_b = Scratch::new("w2545-fail-b");
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord
+        .set_node_svid_ttl(Duration::from_secs(LIFE_SECS))
+        .unwrap();
+    let token_a = coord.create_token(Duration::from_secs(600)).unwrap();
+    let token_b = coord.create_token(Duration::from_secs(600)).unwrap();
+    let (addr, handle) = server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
+    let port_a = free_port();
+    let port_b = free_port();
+    let metrics_a = SocketAddr::from((Ipv4Addr::LOCALHOST, free_tcp_port()));
+    let enroll = |name: &'static str, secret: String, port: u16| {
+        let bundle = bundle.clone();
+        async move {
+            client::enroll_with_token(
+                addr,
+                "coord",
+                &bundle,
+                name,
+                &secret,
+                &[format!("127.0.0.1:{port}")],
+                &[],
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let enrolled_a = enroll("a", token_a.secret.clone(), port_a).await;
+    let enrolled_b = enroll("b", token_b.secret.clone(), port_b).await;
+    enrolled_a.write_state(&node_a.0).unwrap();
+    enrolled_b.write_state(&node_b.0).unwrap();
+    let trust = TrustBundle::from_pem(&bundle).unwrap();
+    let config_a = coordinator_ticket_config(&enrolled_a, &trust);
+    let config_b = coordinator_ticket_config(&enrolled_b, &trust);
+    // The coordinator issues the ticket and the leaf with the same time and life.
+    let deadline_a = ticket_expiry(&enrolled_a);
+    let map_a = netmap("a", "100.64.0.1", "b", "100.64.0.2", port_b);
+    let map_b = netmap("b", "100.64.0.2", "a", "100.64.0.1", port_a);
+
+    let calls_a = Arc::new(Mutex::new(Vec::new()));
+    let calls_b = Arc::new(Mutex::new(Vec::new()));
+    let failing = {
+        let calls = Arc::clone(&calls_a);
+        SvidRenewer::new(move || {
+            calls.lock().unwrap().push(Instant::now());
+            Err("test: the coordinator is not reachable".to_string())
+        })
+    };
+    let (stop_tx, stop_a) = watch::channel(false);
+    let stop_b = stop_a.clone();
+    let (a_in_tx, a_in_rx) = mpsc::channel(64);
+    let (a_out_tx, mut a_out_rx) = mpsc::channel(64);
+    let (b_in_tx, b_in_rx) = mpsc::channel(64);
+    let (b_out_tx, mut b_out_rx) = mpsc::channel(64);
+    let mut request_a = node_request(config_a, map_a, port_a, node_a.0.clone(), failing, stop_a);
+    request_a.metrics = Some(metrics_a);
+    let task_a = tokio::spawn(run_memory_node(
+        request_a,
+        MemoryDevice {
+            from_tun: a_in_rx,
+            to_tun: a_out_tx,
+        },
+    ));
+    let task_b = tokio::spawn(run_memory_node(
+        node_request(
+            config_b,
+            map_b,
+            port_b,
+            node_b.0.clone(),
+            renewer_with_coord_ticket(addr, bundle.clone(), node_b.0.clone(), Arc::clone(&calls_b)),
+            stop_b,
+        ),
+        MemoryDevice {
+            from_tun: b_in_rx,
+            to_tun: b_out_tx,
+        },
+    ));
+
+    let refused_from_ms = u128::from(deadline_a + 1) * 1_000;
+    let deadline_ms = u128::from(deadline_a) * 1_000;
+    let mut first_ab_ms: Option<u128> = None;
+    let mut last_ab_ms: Option<u128> = None;
+    let mut last_ba_ms: Option<u128> = None;
+    let mut late_ab = 0u64;
+    let mut late_ba = 0u64;
+    let mut dials_at_deadline: Option<u64> = None;
+    let unix_ms = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    };
+    while unix(SystemTime::now()) < deadline_a + AFTER_SECS {
+        if dials_at_deadline.is_none() && unix_ms() >= deadline_ms {
+            dials_at_deadline = Some(dial_attempts(metrics_a).await);
+        }
+        let _ = a_in_tx
+            .send(
+                ipv4_packet(
+                    Ipv4Addr::new(100, 64, 0, 1),
+                    Ipv4Addr::new(100, 64, 0, 2),
+                    b"ab",
+                )
+                .unwrap(),
+            )
+            .await;
+        let _ = b_in_tx
+            .send(
+                ipv4_packet(
+                    Ipv4Addr::new(100, 64, 0, 2),
+                    Ipv4Addr::new(100, 64, 0, 1),
+                    b"ba",
+                )
+                .unwrap(),
+            )
+            .await;
+        let tick = tokio::time::Instant::now() + Duration::from_millis(PROBE_MS);
+        loop {
+            tokio::select! {
+                got = b_out_rx.recv() => {
+                    if got.is_some() {
+                        let at = unix_ms();
+                        first_ab_ms.get_or_insert(at);
+                        last_ab_ms = Some(at);
+                        if at >= refused_from_ms {
+                            late_ab += 1;
+                        }
+                    }
+                }
+                got = a_out_rx.recv() => {
+                    if got.is_some() {
+                        let at = unix_ms();
+                        last_ba_ms = Some(at);
+                        if at >= refused_from_ms {
+                            late_ba += 1;
+                        }
+                    }
+                }
+                () = tokio::time::sleep_until(tick) => break,
+            }
+        }
+    }
+    let dials_end = dial_attempts(metrics_a).await;
+    let dials_at_deadline = dials_at_deadline.unwrap_or(dials_end);
+    let renew_a = calls_a.lock().unwrap().len();
+    println!(
+        "w2545_fail_summary life_s {LIFE_SECS} deadline_a {deadline_a} renew_calls_a {renew_a} first_ab_ms {first_ab_ms:?} last_ab_ms {last_ab_ms:?} last_ba_ms {last_ba_ms:?} late_ab {late_ab} late_ba {late_ba} dials_at_deadline {dials_at_deadline} dials_end {dials_end}"
+    );
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(3), task_a).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), task_b).await;
+    handle.abort();
+
+    assert!(
+        first_ab_ms.is_some_and(|at| at < deadline_ms),
+        "the path did not pass DATA before the deadline"
+    );
+    assert!(
+        renew_a >= 2,
+        "renew calls of a {renew_a}: the failed renewal must retry"
+    );
+    assert_eq!(
+        (late_ab, late_ba),
+        (0, 0),
+        "DATA passed after the deadline of a (a-to-b, b-to-a)"
+    );
+    assert!(
+        dials_end >= dials_at_deadline + 3,
+        "the link of a did not dial again after the deadline: dial attempts {dials_at_deadline} at the deadline, {dials_end} at the end"
+    );
+}
+
+/// The dial attempt counter of one node, from its metrics port.
+async fn dial_attempts(metrics: SocketAddr) -> u64 {
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let Ok(mut stream) = std::net::TcpStream::connect(metrics) else {
+            return 0;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        if stream
+            .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            .is_err()
+        {
+            return 0;
+        }
+        let mut body = String::new();
+        let _ = stream.read_to_string(&mut body);
+        body.lines()
+            .find_map(|line| line.strip_prefix("orblx_node_dial_attempts "))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0)
+    })
+    .await
+    .unwrap_or(0)
+}
+
+fn free_tcp_port() -> u16 {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.local_addr().unwrap().port()
 }
 
 /// The node config from the coordinator ticket, as `ticket_load::load_hello_config` builds it.

@@ -384,6 +384,8 @@ fn write_status(path: &Path, text: &str) {
 struct NodeCounters {
     tx: AtomicU64,
     rx: AtomicU64,
+    /// Direct dial attempts to peer endpoints (W25-45: shows that a closed link dials again).
+    dials: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -712,6 +714,7 @@ async fn run_mesh_inner(
     let counters = Arc::new(NodeCounters {
         tx: AtomicU64::new(0),
         rx: AtomicU64::new(0),
+        dials: AtomicU64::new(0),
     });
 
     let tun_shutdown = shutdown_rx.clone();
@@ -780,7 +783,7 @@ async fn run_mesh_inner(
                 .count();
             let sessions = u64::try_from(sessions).unwrap_or(u64::MAX);
             format!(
-                "{}{}{}",
+                "{}{}{}{}",
                 orblx_audit::sample_line(
                     "orblx_node_packets_tx",
                     "counter",
@@ -792,6 +795,11 @@ async fn run_mesh_inner(
                     metrics_counters.rx.load(Ordering::Relaxed)
                 ),
                 orblx_audit::sample_line("orblx_node_sessions", "gauge", sessions),
+                orblx_audit::sample_line(
+                    "orblx_node_dial_attempts",
+                    "counter",
+                    metrics_counters.dials.load(Ordering::Relaxed)
+                ),
             )
         }) {
             Ok(bound) => println!("metrics {bound}"),
@@ -1555,6 +1563,7 @@ async fn dial_once(
                 continue;
             }
         };
+        mesh.counters.dials.fetch_add(1, Ordering::Relaxed);
         let endpoint = Arc::clone(&mesh.endpoint);
         let connect = async move {
             if fast {
@@ -1787,6 +1796,7 @@ async fn run_link(
             links: Arc::clone(&mesh.links),
             peer: name.clone(),
             label: format!("{} peer={} gen={}", mesh.node.name, name, generation),
+            deadline: expiry,
         },
         move || note_rx(&peers, &status, &node, &peer_name),
     )
@@ -1823,6 +1833,9 @@ struct SessionIo {
     links: Arc<Mutex<HashMap<String, LiveLink>>>,
     peer: String,
     label: String,
+    /// B2 (W25-45): unix seconds of min(peer ticket end, peer leaf not_after).
+    /// The session closes at this time, and the link dials again.
+    deadline: u64,
 }
 
 type NextEvent = std::pin::Pin<
@@ -1868,7 +1881,13 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
         links,
         peer,
         label,
+        deadline,
     } = io;
+    // B2 (W25-45): close the session at its deadline. A renewal normally replaces the link
+    // before this time. When the renewal keeps failing, the session ends here, and the
+    // peer refuses DATA after the deadline.
+    let at_deadline = tokio::time::sleep_until(deadline_instant(deadline, SystemTime::now()));
+    tokio::pin!(at_deadline);
     let mut first_rx = true;
     let mut first_tx = true;
     // The queue is open while this link is the live link for the peer.
@@ -1889,6 +1908,13 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     tr!("{label} session_end reason=cancel");
                     return;
                 }
+            }
+            () = &mut at_deadline => {
+                println!(
+                    "The session with {peer} reached its deadline (ticket or certificate end). The node closes it."
+                );
+                tr!("{label} session_end reason=deadline");
+                return;
             }
             changed = ask_rekey.changed(), if tx_open && ask_open => {
                 if changed.is_err() {
@@ -2137,6 +2163,26 @@ async fn renew_loop(mut mesh: Mesh, renewer: SvidRenewer) {
                     signal_rekey(&mesh);
                     publish(&mesh.status, &mesh.node, &mesh.peers, "up");
                     println!("The node renewed the SVID. The new expiry is {expiry}.");
+                    // D2 (W25-45): the new leaf is valid and stays installed, because the
+                    // peers check it with their own clocks. But a leaf that is due again at
+                    // once by this node's clock counts as a failed renewal. The node waits
+                    // the retry delay, so the loop never renews with no delay.
+                    let now = unix_now();
+                    let (not_before, not_after) = (
+                        mesh.node.not_before.load(Ordering::Relaxed),
+                        mesh.node.not_after.load(Ordering::Relaxed),
+                    );
+                    if let Some(delay) = clock_ahead_delay(not_before, not_after, now, attempt) {
+                        eprintln!(
+                            "ALERT: The renewed SVID is due for renewal at once (not_before {not_before}, not_after {not_after}, node time {now}). The node clock is possibly ahead of the coordinator clock. The node will retry in {} s.",
+                            delay.as_secs()
+                        );
+                        if !sleep_retry(&mut mesh, delay).await {
+                            return;
+                        }
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
                     break;
                 }
                 Err(err) => {
@@ -2219,9 +2265,28 @@ async fn sleep_retry(mesh: &mut Mesh, delay: Duration) -> bool {
     }
 }
 
+/// D2 (W25-45): the retry delay when a just-renewed leaf is due for renewal within 1 s.
+///
+/// This occurs when the node clock is ahead of the coordinator clock. `None` means the
+/// renewal is good and the node waits for the normal renewal time.
+fn clock_ahead_delay(not_before: u64, not_after: u64, now: u64, attempt: u32) -> Option<Duration> {
+    if renew_unix(not_before, not_after) <= now.saturating_add(1) {
+        Some(retry_delay(attempt))
+    } else {
+        None
+    }
+}
+
 fn retry_delay(attempt: u32) -> Duration {
     let secs = 1u64.checked_shl(attempt).unwrap_or(30).min(30);
     Duration::from_secs(secs)
+}
+
+/// The Tokio instant of the unix time `deadline` (seconds), seen from `now`.
+fn deadline_instant(deadline: u64, now: SystemTime) -> tokio::time::Instant {
+    let at = UNIX_EPOCH + Duration::from_secs(deadline);
+    let left = at.duration_since(now).unwrap_or(Duration::ZERO);
+    tokio::time::Instant::now() + left
 }
 
 fn renew_unix(not_before: u64, not_after: u64) -> u64 {
@@ -2896,6 +2961,59 @@ mod tests {
         assert_eq!(super::renew_unix(0, 600), 300);
         // 1 h: a third is 20 min.
         assert_eq!(super::renew_unix(0, 3_600), 2_400);
+    }
+
+    /// D2 (W25-45): the node clock is ahead of the coordinator clock.
+    ///
+    /// The coordinator issues a 180 s leaf at its time 1_000 (lead 90 s, so the renewal is due at 1_090).
+    /// A node clock 150 s ahead reads 1_150, so the new leaf is due at once. The node must
+    /// count this as a failure and wait the retry delay, never 0 s.
+    #[test]
+    fn a_renewed_leaf_due_at_once_waits_the_retry_delay() {
+        let (not_before, not_after) = (1_000, 1_180);
+        assert_eq!(super::renew_unix(not_before, not_after), 1_090);
+        // The clocks agree: a normal renewal.
+        assert_eq!(
+            super::clock_ahead_delay(not_before, not_after, 1_000, 0),
+            None
+        );
+        assert_eq!(
+            super::clock_ahead_delay(not_before, not_after, 1_088, 0),
+            None
+        );
+        // Due within 1 s, or past due: the node clock is ahead.
+        assert_eq!(
+            super::clock_ahead_delay(not_before, not_after, 1_089, 0),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            super::clock_ahead_delay(not_before, not_after, 1_150, 0),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            super::clock_ahead_delay(not_before, not_after, 1_150, 3),
+            Some(Duration::from_secs(8))
+        );
+        // The delay grows to 30 s and is never 0 s.
+        for attempt in 0..64 {
+            let delay = super::clock_ahead_delay(not_before, not_after, 5_000, attempt).unwrap();
+            assert!(delay >= Duration::from_secs(1), "attempt {attempt}");
+            assert!(delay <= Duration::from_secs(30), "attempt {attempt}");
+        }
+    }
+
+    /// B2 (W25-45): the session closes at its deadline, not later.
+    #[tokio::test]
+    async fn the_session_deadline_maps_to_the_right_instant() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+        let before = tokio::time::Instant::now();
+        let at = super::deadline_instant(1_005, now);
+        let left = at.saturating_duration_since(before);
+        assert!(left >= Duration::from_secs(5), "{left:?}");
+        assert!(left < Duration::from_secs(6), "{left:?}");
+        // A deadline in the past closes the session at once.
+        let past = super::deadline_instant(990, now);
+        assert!(past <= tokio::time::Instant::now());
     }
 
     #[test]
