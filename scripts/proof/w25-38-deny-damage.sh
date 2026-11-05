@@ -11,6 +11,8 @@
 #   and deny.json on b stays valid. A valid list never goes stale with age. Before the
 #   stop, allowed opens one SSH shell to b. The shell prints one line each 10 s. The
 #   session must stay up for the full OFFLINE_SECS. The gap bound is 20 s (two intervals).
+#   The deny version and the sha256 of deny.json are recorded after the coordinator
+#   stops. Both must stay the same for the offline window.
 #   One interval is the normal space between two lines. A gap above two intervals means
 #   one line is missing. The harness does not add slack to this bound. A new SSH login
 #   needs the coordinator (W25-31), so this gate does not open a new login after the stop.
@@ -573,13 +575,22 @@ dc stop a >/dev/null
 sleep 2
 refused_before="$(refused_count)"
 errors_before="$(deny_error_lines)"
-version_before="$(dc exec -T b jq -r .version "$DENY" | tr -d '\r\n')"
-echo "gate3 b refused_before ${refused_before} deny_error_lines_before ${errors_before} deny_version ${version_before}"
+version_while_up="$(dc exec -T b jq -r .version "$DENY" | tr -d '\r\n')"
+echo "gate3 b refused_before ${refused_before} deny_error_lines_before ${errors_before} deny_version_while_coord_up ${version_while_up}"
 [[ -n "$refused_before" ]]
 open_ssh_hold
 wait_ssh_hold
 dc stop coord >/dev/null
+# The SSH hold asks for a certificate while the coordinator is up.
+# That request appends one config record. The served deny version is the
+# deny file version plus the config record count, so the version can rise
+# with no change to the revoked set. The baseline is the file after the
+# coordinator has stopped. The offline window must not change it.
 offline_start="$(date +%s)"
+version_before="$(dc exec -T b jq -r .version "$DENY" | tr -d '\r\n')"
+hash_before="$(dc exec -T b sha256sum "$DENY" | read_all awk '{print $1}' | tr -d '\r\n')"
+echo "gate3 deny baseline version ${version_before} sha256 ${hash_before}"
+[[ -n "$version_before" && -n "$hash_before" ]]
 icmp_count=$(( OFFLINE_SECS * 2 ))
 dc exec -T allowed ping -n -i 0.5 -W 2 -c "$icmp_count" "$b_overlay" >"$WORK/gate3-icmp.out" 2>&1 &
 icmp_pid=$!
@@ -611,6 +622,7 @@ refused_after="$(refused_count)"
 errors_after="$(deny_error_lines)"
 g3_state="$(deny_state)"
 version_after="$(dc exec -T b jq -r .version "$DENY" | tr -d '\r\n')"
+hash_after="$(dc exec -T b sha256sum "$DENY" | read_all awk '{print $1}' | tr -d '\r\n')"
 g3_refused=$(( refused_after - refused_before ))
 end_ms="$(date +%s%3N)"
 read -r tick_count max_out_gap_ms < <(ssh_hold_gap "$(( offline_start * 1000 ))" "$end_ms")
@@ -624,12 +636,13 @@ else
   ssh_held_s=0
 fi
 echo "gate3 ssh_held_s=${ssh_held_s} max_out_gap_ms=${max_out_gap_ms} exited=${ssh_exited}"
-echo "summary w25_38_gate3 offline_s ${offline_secs_done} icmp_tx ${icmp_tx} icmp_rx ${icmp_rx} probes ${g3_probes} accepted ${g3_accepted} unknown ${g3_unknown} refused_frames ${g3_refused} deny_error_lines ${errors_before}->${errors_after} deny_state ${g3_state} deny_version ${version_before}->${version_after}"
+echo "summary w25_38_gate3 offline_s ${offline_secs_done} icmp_tx ${icmp_tx} icmp_rx ${icmp_rx} probes ${g3_probes} accepted ${g3_accepted} unknown ${g3_unknown} refused_frames ${g3_refused} deny_error_lines ${errors_before}->${errors_after} deny_state ${g3_state} deny_version ${version_before}->${version_after} deny_sha256 ${hash_before}->${hash_after}"
 close_ssh_hold
 if [[ "$offline_secs_done" -lt "$OFFLINE_SECS" || -z "$icmp_tx" || "$icmp_tx" -lt 1 \
   || "$icmp_rx" != "$icmp_tx" || "$g3_probes" -lt 2 || "$g3_accepted" -ne "$g3_probes" \
   || "$g3_unknown" -ne 0 || "$g3_refused" -ne 0 || "$errors_after" != "$errors_before" \
-  || "$g3_state" != valid || "$version_after" != "$version_before" ]]; then
+  || "$g3_state" != valid || "$version_after" != "$version_before" \
+  || -z "$hash_after" || "$hash_after" != "$hash_before" ]]; then
   dump_ssh_hold
   echo "The gate 3 (coordinator offline, valid deny.json) failed." >&2
   exit 1
