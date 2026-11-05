@@ -10,6 +10,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::EdgeError;
@@ -86,9 +87,41 @@ pub struct ProbeRequest {
     /// The local UDP port to map.
     pub internal_port: u16,
     /// The lifetime to request, in seconds. Zero selects [`PORT_MAP_LIFETIME_SECS`].
+    ///
+    /// A value above [`PORT_MAP_LIFETIME_SECS`] is capped.
     pub lifetime_secs: u32,
     /// The longest wait for the whole probe.
     pub budget: Duration,
+    /// A nonce kept across process starts.
+    ///
+    /// `Some` sends a delete for the previous map before the new map.
+    /// The same nonce lets PCP remove the map after a crash.
+    /// `None` creates a new nonce and does not send that delete.
+    pub nonce: Option<[u8; 12]>,
+}
+
+/// Keep a nonce in `dir` so a later process can delete the same PCP map.
+pub fn load_port_map_nonce(dir: &Path) -> Result<[u8; 12], EdgeError> {
+    let path = dir.join("port-map-nonce");
+    if let Ok(bytes) = fs::read(&path) {
+        if let Ok(nonce) = bytes.try_into() {
+            return Ok(nonce);
+        }
+    }
+    let nonce = random_nonce()?;
+    fs::write(&path, nonce).map_err(|err| EdgeError::Io(err.to_string()))?;
+    Ok(nonce)
+}
+
+/// The lifetime the client may request.
+///
+/// Zero and any value above [`PORT_MAP_LIFETIME_SECS`] become 7200 seconds.
+fn bound_lifetime(requested: u32) -> u32 {
+    if requested == 0 || requested > PORT_MAP_LIFETIME_SECS {
+        PORT_MAP_LIFETIME_SECS
+    } else {
+        requested
+    }
 }
 
 /// The result of one probe.
@@ -294,11 +327,7 @@ fn probe_with_ports(request: ProbeRequest, pxp_port: u16, upnp_port: u16) -> Pro
             mapping: None,
         };
     }
-    let lifetime = if request.lifetime_secs == 0 {
-        PORT_MAP_LIFETIME_SECS
-    } else {
-        request.lifetime_secs
-    };
+    let lifetime = bound_lifetime(request.lifetime_secs);
     let Some(gateway) = request.gateway.or_else(default_gateway) else {
         return ProbeReport {
             elapsed: started.elapsed(),
@@ -317,9 +346,11 @@ fn probe_with_ports(request: ProbeRequest, pxp_port: u16, upnp_port: u16) -> Pro
         local_ip,
         internal_port: request.internal_port,
         lifetime,
+        nonce: request.nonce,
         pxp_port,
         upnp_port,
     };
+    release_previous(&ctx, request.choice, deadline);
     let mapping = match request.choice {
         PortMapChoice::Off => None,
         PortMapChoice::Only(proto) => try_proto(&ctx, proto, deadline),
@@ -331,13 +362,71 @@ fn probe_with_ports(request: ProbeRequest, pxp_port: u16, upnp_port: u16) -> Pro
     }
 }
 
+/// How long a delete of a previous map may wait.
+///
+/// The delete runs before the new map. It does not block the relay path.
+const RELEASE_WAIT: Duration = Duration::from_millis(100);
+
 struct ProbeCtx {
     gateway: Ipv4Addr,
     local_ip: Ipv4Addr,
     internal_port: u16,
     lifetime: u32,
+    nonce: Option<[u8; 12]>,
     pxp_port: u16,
     upnp_port: u16,
+}
+
+/// Delete a map left by a crashed process.
+///
+/// PCP matches the saved nonce. NAT-PMP matches the internal UDP port.
+/// UPnP deletes the same external port the client requests.
+fn release_previous(ctx: &ProbeCtx, choice: PortMapChoice, deadline: Instant) {
+    let Some(nonce) = ctx.nonce else {
+        return;
+    };
+    let limit = (Instant::now() + RELEASE_WAIT).min(deadline);
+    println!("The previous port map delete was sent.");
+    if matches!(
+        choice,
+        PortMapChoice::Auto | PortMapChoice::Only(PortMapProto::Pcp)
+    ) {
+        if let Ok(socket) = udp_client(ctx.local_ip, SocketAddr::from((ctx.gateway, ctx.pxp_port)))
+        {
+            let body = PcpBody {
+                local_ip: ctx.local_ip,
+                internal_port: ctx.internal_port,
+                suggest_port: ctx.internal_port,
+                lifetime: 0,
+                nonce,
+            };
+            let _ = pcp_exchange(&socket, &body, limit, false);
+        }
+    }
+    if matches!(
+        choice,
+        PortMapChoice::Auto | PortMapChoice::Only(PortMapProto::NatPmp)
+    ) {
+        if let Ok(socket) = udp_client(ctx.local_ip, SocketAddr::from((ctx.gateway, ctx.pxp_port)))
+        {
+            let _ = natpmp_map(&socket, ctx.internal_port, ctx.internal_port, 0, limit);
+        }
+    }
+    if matches!(
+        choice,
+        PortMapChoice::Auto | PortMapChoice::Only(PortMapProto::Upnp)
+    ) {
+        if let Ok(location) = upnp_location(ctx.local_ip, ctx.gateway, ctx.upnp_port, limit) {
+            if let Ok((urn, control)) = upnp_control(&location, limit) {
+                let _ = upnp_delete(
+                    &control,
+                    &urn,
+                    ctx.internal_port,
+                    limit.saturating_duration_since(Instant::now()),
+                );
+            }
+        }
+    }
 }
 
 fn try_auto(ctx: &ProbeCtx, deadline: Instant) -> Option<ActiveMap> {
@@ -370,7 +459,10 @@ struct Granted {
 
 fn try_pcp(ctx: &ProbeCtx, deadline: Instant) -> Option<ActiveMap> {
     let socket = udp_client(ctx.local_ip, SocketAddr::from((ctx.gateway, ctx.pxp_port))).ok()?;
-    let nonce = random_nonce().ok()?;
+    let nonce = match ctx.nonce {
+        Some(nonce) => nonce,
+        None => random_nonce().ok()?,
+    };
     let body = PcpBody {
         local_ip: ctx.local_ip,
         internal_port: ctx.internal_port,
@@ -1023,9 +1115,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        candidate_texts, gateway_from_route_line, pcp_request, probe_port_map, ssdp_location,
-        PortMapChoice, PortMapProto, ProbeRequest, PCP_PACKET_LEN, PORT_MAP_BUDGET,
-        PORT_MAP_SERVICE_WAIT,
+        bound_lifetime, candidate_texts, gateway_from_route_line, pcp_request, probe_port_map,
+        ssdp_location, PortMapChoice, PortMapProto, ProbeRequest, PCP_PACKET_LEN, PORT_MAP_BUDGET,
+        PORT_MAP_LIFETIME_SECS, PORT_MAP_SERVICE_WAIT,
     };
     use crate::birthday::{peer_kind, strategy, MappingKind, Strategy};
 
@@ -1037,6 +1129,13 @@ mod tests {
             Some(Ipv4Addr::new(192, 168, 1, 1))
         );
         assert_eq!(gateway_from_route_line("eth0 00000001 0101A8C0"), None);
+    }
+
+    #[test]
+    fn lifetime_request_is_capped_at_two_hours() {
+        assert_eq!(bound_lifetime(0), PORT_MAP_LIFETIME_SECS);
+        assert_eq!(bound_lifetime(40), 40);
+        assert_eq!(bound_lifetime(u32::MAX), PORT_MAP_LIFETIME_SECS);
     }
 
     #[test]
@@ -1096,6 +1195,7 @@ mod tests {
             internal_port: 443,
             lifetime_secs: 40,
             budget: PORT_MAP_BUDGET,
+            nonce: None,
         });
         assert!(report.mapping.is_none());
         assert!(report.elapsed.is_zero());
@@ -1162,6 +1262,77 @@ mod tests {
         assert_eq!(lifetimes.first().copied(), Some(40));
         assert!(lifetimes.contains(&40));
         assert!(lifetimes.contains(&0));
+    }
+
+    #[test]
+    fn a_restart_sends_a_pcp_delete_with_the_saved_nonce() {
+        let seen = Arc::new(Mutex::new(Vec::<(u32, [u8; 12])>::new()));
+        let seen_thread = Arc::clone(&seen);
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            let _ = socket.set_read_timeout(Some(Duration::from_secs(3)));
+            for _ in 0..4 {
+                let Ok((size, from)) = socket.recv_from(&mut buf) else {
+                    return;
+                };
+                if size < 48 {
+                    continue;
+                }
+                let lifetime = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                let mut nonce = [0u8; 12];
+                nonce.copy_from_slice(&buf[24..36]);
+                seen_thread.lock().unwrap().push((lifetime, nonce));
+                let mut reply = [0u8; 60];
+                reply[0] = 2;
+                reply[1] = 0x81;
+                reply[4..8].copy_from_slice(&lifetime.to_be_bytes());
+                reply[24..36].copy_from_slice(&nonce);
+                reply[36] = 17;
+                reply[40..42].copy_from_slice(&buf[40..42]);
+                if lifetime == 0 {
+                    reply[42..44].copy_from_slice(&0u16.to_be_bytes());
+                } else {
+                    reply[42..44].copy_from_slice(&40000u16.to_be_bytes());
+                    reply[44 + 10] = 0xff;
+                    reply[44 + 11] = 0xff;
+                    reply[44 + 12] = 203;
+                    reply[44 + 13] = 0;
+                    reply[44 + 14] = 113;
+                    reply[44 + 15] = 9;
+                }
+                let _ = socket.send_to(&reply, from);
+            }
+        });
+        let nonce = [7u8; 12];
+        let mut request = ProbeRequest {
+            choice: PortMapChoice::Only(PortMapProto::Pcp),
+            gateway: Some(Ipv4Addr::LOCALHOST),
+            internal_port: 443,
+            lifetime_secs: 40,
+            budget: Duration::from_millis(2_000),
+            nonce: Some(nonce),
+        };
+        let report = super::probe_with_ports(request, port, port);
+        let mapping = report.mapping.expect("pcp map");
+        assert_eq!(mapping.external().port(), 40_000);
+        // A crash skips Drop. The next start must delete the old map.
+        std::mem::forget(mapping);
+        request.lifetime_secs = 9_999;
+        let report = super::probe_with_ports(request, port, port);
+        let mapping = report.mapping.expect("pcp map after restart");
+        assert_eq!(mapping.lifetime_secs(), PORT_MAP_LIFETIME_SECS);
+        std::mem::forget(mapping);
+        let rows = seen.lock().unwrap().clone();
+        assert!(rows.len() >= 4);
+        assert_eq!(rows[0], (0, nonce));
+        assert_eq!(rows[1].0, 40);
+        assert_eq!(rows[1].1, nonce);
+        assert_eq!(rows[2], (0, nonce));
+        assert_eq!(rows[3].0, PORT_MAP_LIFETIME_SECS);
+        assert_eq!(rows[3].1, nonce);
+        assert_eq!(rows[1].1, rows[0].1);
     }
 
     #[test]
@@ -1259,6 +1430,7 @@ mod tests {
                 internal_port: 443,
                 lifetime_secs: 40,
                 budget: Duration::from_millis(budget_ms),
+                nonce: None,
             },
             pxp_port,
             upnp_port,

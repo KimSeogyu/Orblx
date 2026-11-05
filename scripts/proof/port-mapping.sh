@@ -7,7 +7,8 @@
 #   baseline: symmetric to symmetric, UDP 5351 and 1900 dropped. Expect relay.
 #   mapped: symmap to symmetric, --port-map auto. Expect direct.
 #   disabled: symmap to symmetric, --port-map off. Expect relay.
-# One extra run asks for NAT-PMP only. One extra run asks for UPnP only.
+# NAT-PMP only and UPnP only use the same N.
+# One crash restart checks that a killed node does not leave an orphan map.
 # The script prints rustc -V, the build profile, and the proof_contention line.
 set -euo pipefail
 
@@ -200,7 +201,7 @@ drop_map_ports() {
 }
 
 log_lines() {
-  docker logs "$1" 2>&1 | read_all grep -E 'port map|punch plan|first |hole punch|STUN mapping|local NAT|reflexive endpoint|mapping daemon|deleted' || true
+  docker logs "$1" 2>&1 | read_all grep -E 'port map|punch plan|first |hole punch|STUN mapping|local NAT|reflexive endpoint|mapping daemon|deleted|published' || true
 }
 
 first_ms() {
@@ -314,6 +315,12 @@ run_case() {
     echo "=== [C] map rules after delete ==="
     dc exec -T router-c nft list chain inet filter postrouting_miniupnpd || true
   fi
+  if [[ "$label" == "mapped" || "$label" == "nat-pmp" || "$label" == "upnp" ]]; then
+    if ! docker logs "$container_c" 2>&1 | read_all grep -q 'The port map is .*[:.]443 lifetime'; then
+      echo "${label} run ${run} map port is not 443"
+      ok="no"
+    fi
+  fi
   if [[ "$label" == "disabled" ]]; then
     if docker logs "$container_c" 2>&1 | read_all grep -q 'The port map is off.'; then
       echo "disabled run ${run} off yes"
@@ -335,13 +342,97 @@ while True:
     s.sendto(("%s:%d" % addr).encode(), addr)
 '
 
+wait_echo_server() {
+  local name="$1"
+  local port="$2"
+  local i line
+  for i in $(seq 1 20); do
+    line="$(dc exec -T "$name" ss -H -uln "sport = :${port}" 2>/dev/null || true)"
+    if printf '%s\n' "$line" | has_line ":${port}"; then
+      echo "echo ${name} udp ${port} ready"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "The echo server on ${name} did not listen on UDP ${port}." >&2
+  dc exec -T "$name" ss -uln >&2 || true
+  return 1
+}
+
+wait_log() {
+  local container="$1"
+  local pattern="$2"
+  local i
+  for i in $(seq 1 30); do
+    if docker logs "$container" 2>&1 | read_all grep -q "$pattern"; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "The log on ${container} did not show: ${pattern}" >&2
+  docker logs "$container" >&2 || true
+  return 1
+}
+
+map_rule_count() {
+  local text count
+  text="$(dc exec -T router-c nft list chain inet filter prerouting_miniupnpd 2>/dev/null || true)"
+  count="$(printf '%s\n' "$text" | awk '/443/ {n++} END {print n+0}')"
+  echo "$count"
+}
+
+# Kill the node with SIGKILL so Drop does not delete the map.
+# The next start must delete that map. One UDP 443 rule remains, then shutdown removes it.
+check_crash_restart() {
+  local container count
+  echo "=== [C] crash restart ==="
+  set_routers symmap symmetric
+  start_nat node-c node-d auto
+  container="$(container_of node-c)"
+  wait_log "$container" "The port map is "
+  count="$(map_rule_count)"
+  echo "crash map rules before kill ${count}"
+  docker kill "$container" >/dev/null
+  count="$(map_rule_count)"
+  echo "crash map rules after kill ${count}"
+  if [[ "$count" -lt 1 ]]; then
+    echo "The killed node left no map rule." >&2
+    return 1
+  fi
+  start_nat node-c node-d auto
+  container="$(container_of node-c)"
+  wait_log "$container" "The previous port map delete was sent."
+  wait_log "$container" "The port map was granted at "
+  count="$(map_rule_count)"
+  echo "crash map rules after restart ${count}"
+  if [[ "$count" -ne 1 ]]; then
+    echo "The restart left ${count} map rules." >&2
+    dc exec -T router-c nft list table inet filter >&2 || true
+    return 1
+  fi
+  docker stop -t 15 "$container" >/dev/null
+  if ! docker logs "$container" 2>&1 | read_all grep -q "The port map was deleted."; then
+    echo "The restarted node did not delete the map." >&2
+    return 1
+  fi
+  count="$(map_rule_count)"
+  echo "crash map rules after delete ${count}"
+  if [[ "$count" -ne 0 ]]; then
+    echo "A map rule stayed after shutdown." >&2
+    return 1
+  fi
+  echo "crash_restart orphan_cleared yes"
+  stop_node "$container"
+}
+
 check_unmapped_is_symmetric() {
   local map
   echo "=== [C] unmapped socket on symmap ==="
   set_routers symmap symmetric
   dc exec -d -T coord python3 -c "$ECHO_PY"
   dc exec -d -T relay python3 -c "$ECHO_PY"
-  sleep 1
+  wait_echo_server coord 5001
+  wait_echo_server relay 5001
   map="$(dc --profile nodes run --rm --no-deps -T --entrypoint /bin/sh node-c -c \
     "ip route replace default via $(gateway_of node-c) && python3 - ${PUB}" <<'PY'
 import socket, sys
@@ -385,9 +476,10 @@ for run in $(seq 1 "$N"); do
   run_case baseline "$run" symmetric symmetric auto relay yes
   run_case mapped "$run" symmap symmetric auto direct no
   run_case disabled "$run" symmap symmetric off relay no
+  run_case nat-pmp "$run" symmap symmetric nat-pmp direct no
+  run_case upnp "$run" symmap symmetric upnp direct no
 done
-run_case nat-pmp 1 symmap symmetric nat-pmp direct no
-run_case upnp 1 symmap symmetric upnp direct no
+check_crash_restart
 
 echo "=== [C] case table ==="
 printf '%s\n' "${ROWS[@]}"
@@ -405,7 +497,7 @@ MAP_OK="$(count_ok mapped)"
 OFF_OK="$(count_ok disabled)"
 PMP_OK="$(count_ok nat-pmp)"
 UPNP_OK="$(count_ok upnp)"
-echo "success baseline ${BASE_OK}/${N} mapped ${MAP_OK}/${N} disabled ${OFF_OK}/${N} nat-pmp ${PMP_OK}/1 upnp ${UPNP_OK}/1"
+echo "success baseline ${BASE_OK}/${N} mapped ${MAP_OK}/${N} disabled ${OFF_OK}/${N} nat-pmp ${PMP_OK}/${N} upnp ${UPNP_OK}/${N}"
 echo "wan_c ${WAN_C} wan_d ${WAN_D}"
 if [[ "$FAILS" -ne 0 ]]; then
   echo "proof_failed fails ${FAILS}"

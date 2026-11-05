@@ -249,8 +249,10 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
                 port_map_lifetime = value.parse::<u32>().map_err(|_| {
                     format!("The port map lifetime {value} is not a number of seconds.")
                 })?;
-                if port_map_lifetime == 0 {
-                    return Err("The port map lifetime must be at least 1 second.".to_string());
+                if port_map_lifetime == 0 || port_map_lifetime > PORT_MAP_LIFETIME_SECS {
+                    return Err(format!(
+                        "The port map lifetime must be from 1 to {PORT_MAP_LIFETIME_SECS} seconds."
+                    ));
                 }
             }
             other => return Err(format!("The flag {other} is not valid.\n{}", help())),

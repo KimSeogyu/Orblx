@@ -131,7 +131,7 @@ The node can ask the gateway for a mapped UDP port.
 The protocols are PCP, NAT-PMP, and UPnP IGD.
 A mapped port is a candidate. The peer can punch that port.
 Two symmetric NATs use that path when one router grants a map.
-The probe budget is 750 ms. `--port-map off` skips the probe.
+The probe budget is 750 ms. The relay path does not wait for the probe. `--port-map off` skips the probe.
 Read the lab record in [docs/port-mapping.md](docs/port-mapping.md).
 
 Gather against a STUN server:

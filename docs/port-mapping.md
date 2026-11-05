@@ -5,8 +5,9 @@ The protocols are PCP, NAT-PMP, and UPnP IGD.
 The client is Orblx code in `crates/orblx-edge/src/portmap.rs`.
 It does not use a Tailscale crate.
 
-A mapped port is a signed candidate.
-The node publishes that port twice.
+The probe runs beside STUN and the relay.
+A silent gateway does not delay the first relay packet.
+A granted port is published twice.
 The peer then treats the node as endpoint-independent and punches that port.
 The node renews the map at half the granted lifetime.
 Clean shutdown deletes the map.
@@ -14,25 +15,86 @@ Clean shutdown deletes the map.
 `--port-map auto` tries PCP, then NAT-PMP, then UPnP IGD.
 Each try waits at most 250 ms.
 The whole probe waits at most 750 ms.
-One silent gateway does not add more delay than that budget.
-`--port-map off` does not send a probe. The probe time is 0 ms.
+`--port-map off` does not send a probe.
 `--port-map pcp`, `--port-map nat-pmp`, and `--port-map upnp` try one protocol.
-The default lifetime request is 7200 s.
+The requested lifetime is from 1 s to 7200 s.
 This lab requests 40 s so a renew is visible in one run.
+
+## Why the two relay times differed
+
+An earlier lab waited for the probe before the relay started.
+The baseline drops UDP 5351 and UDP 1900, so each try uses its full wait.
+That probe took about 755 ms.
+The first relay packet then arrived at 1190–1245 ms.
+`--port-map off` took 0 ms to probe, and the first relay packet arrived at 480–496 ms.
+
+This lab does not wait.
+The baseline probe still takes about 757 ms, and it ends after the first relay packet.
+Run 1 on node-c:
+
+```text
+The port map probe started at 0 ms.
+The first relay packet arrived at 489 ms.
+The port map probe took 757 ms.
+The port map probe ended. No router answered.
+```
+
+`--port-map off` on the same router, run 1:
+
+```text
+The port map is off.
+The port map probe took 0 ms.
+The port map probe did not start.
+The first relay packet arrived at 494 ms.
+```
+
+The two relay cases now match.
+The old gap was the blocked probe, not a different relay path.
+
+## Time split
+
+Mapped run 1, node-c, PCP. The clock starts when the process starts.
+
+```text
+The port map probe started at 0 ms.
+The port map probe took 50 ms.
+The port map was granted at 51 ms.
+The port map is pcp 23.31.0.13:443 lifetime 40.
+The endpoints were published at 89 ms.
+The punch plan time is 103 ms.
+The endpoints were published at 175 ms.
+The first relay packet arrived at 489 ms.
+The hole punch reached 23.31.0.14:56817.
+The first direct packet arrived at 605 ms.
+```
+
+The first packet is the relay packet at 489 ms.
+The direct packet is at 605 ms.
+The map grant is at 51 ms.
+The extra time after the grant is publish and punch, not the probe budget.
 
 ## Lab
 
 The host is Linux. Every router, node, coordinator, and relay is a container.
 The script is `scripts/proof/port-mapping.sh`.
 It uses `scripts/proof/compose.nat-realism.yml` and `scripts/proof/nat-router.sh`.
-The new router mode is `symmap`.
-`symmap` is the symmetric `MASQUERADE --random-fully` rule plus miniupnpd.
+The router mode `symmap` is symmetric NAT plus miniupnpd.
 miniupnpd serves NAT-PMP, PCP, and UPnP IGD.
-Its nft SNAT chain runs before the MASQUERADE rule.
-A socket that is not mapped still gets a new external port for each destination.
+An unmapped socket still gets a new external port for each destination.
 
-The lab WAN is `23.31.0.0/24` on the Docker network only.
-miniupnpd refuses a private WAN address, so this lab does not use `172.16.0.0/12`.
+```text
+mapping 23.31.0.10 23.31.0.13:7403
+mapping 23.31.0.20 23.31.0.13:39346
+same False
+unmapped_socket symmetric true
+```
+
+The echo servers are ready before that check:
+
+```text
+echo coord udp 5001 ready
+echo relay udp 5001 ready
+```
 
 The proof ran under `scripts/proof/proof-lock.sh`.
 The build is the release profile.
@@ -40,118 +102,76 @@ The build is the release profile.
 ```text
 rustc rustc 1.99.1 (58cf8f9c3 2026-10-13)
 build profile release
+proof_contention port-mapping:orblx-pmap-proof samples 392 contended_samples 0 unknown_samples 0 max_other_orblx_containers 0 max_load1 1.02
 ```
 
-```text
-proof_contention port-mapping:orblx-pmap-proof samples 251 contended_samples 0 unknown_samples 0 max_other_orblx_containers 0 max_load1 0.70
-```
-
-The lock line uses the field names `contended_samples` and `unknown_samples`.
+The lock line uses `contended_samples` and `unknown_samples`.
 Both values are 0.
-
-An unmapped socket on the `symmap` router still has two external ports:
-
-```text
-mapping 23.31.0.10 23.31.0.13:27387
-mapping 23.31.0.20 23.31.0.13:54830
-same False
-unmapped_socket symmetric true
-```
 
 ## Cases
 
-N is 5 for the three main cases.
-NAT-PMP only and UPnP only each ran once.
-The clock starts when the node process starts.
-The time includes the probe.
-Ping is 50 packets at 0.2 s. The loss limit is 1 packet.
-Every run lost 0 packets.
+N is 5 for every protocol.
+Ping is 50 packets. Every run lost 0 packets.
+`direct_ms` is none when the path stays on the relay.
 
-| Case | Routers | Config | N | Success | Path | First packet on node-c | Loss |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| baseline | symmetric to symmetric, UDP 5351 and 1900 dropped | `--port-map auto` | 5 | 5/5 | relay | 1235, 1239, 1190, 1245, 1237 ms | 0/50 |
-| mapped | symmap to symmetric | `--port-map auto` | 5 | 5/5 | direct | 866, 876, 865, 889, 846 ms | 0/50 |
-| disabled | symmap to symmetric | `--port-map off` | 5 | 5/5 | relay | 496, 485, 480, 493, 490 ms | 0/50 |
-| nat-pmp | symmap to symmetric | `--port-map nat-pmp` | 1 | 1/1 | direct | 629 ms | 0/50 |
-| upnp | symmap to symmetric | `--port-map upnp` | 1 | 1/1 | direct | 1425 ms | 0/50 |
-
-The mapped runs used PCP. The probe took 0 ms because the router answered in the same millisecond.
-Each mapped run renewed the map and deleted it.
-After delete, the miniupnpd nft chain was empty.
-
-Baseline has no answer, so the probe uses the 750 ms budget.
-The first relay packet is about 750 ms later than the disabled case.
-That is the bound. The path stays relay.
-
-## Log lines
-
-Baseline, node-c, run 1:
+| Case | N | Success | Path | First packet (node-c) | Time to direct (node-c) | Loss |
+| --- | --- | --- | --- | --- | --- | --- |
+| baseline, symmetric to symmetric, UDP 5351 and 1900 dropped | 5 | 5/5 | relay | 421, 423, 478, 489, 550 ms | none | 0/50 |
+| symmap to symmetric, `--port-map off` | 5 | 5/5 | relay | 479, 489, 494, 495, 541 ms | none | 0/50 |
+| symmap to symmetric, `--port-map auto` (PCP) | 5 | 5/5 | direct | 483, 489, 490, 494, 494 ms | 575, 588, 596, 605, 630 ms | 0/50 |
+| `--port-map nat-pmp` | 5 | 5/5 | direct | 476, 487, 487, 553, 555 ms | 617, 619, 628, 653, 655 ms | 0/50 |
+| `--port-map upnp` | 5 | 5/5 | direct | 479, 483, 484, 486, 495 ms | 596, 601, 610, 633, 635 ms | 0/50 |
 
 ```text
-The port map probe budget is 750 ms.
-The port map probe took 755 ms.
-The port map probe ended. No router answered.
-The STUN mapping is endpoint-dependent.
-The local NAT mapping is endpoint-dependent.
-The first relay packet arrived at 1235 ms.
-The punch plan is relay-only. The local mapping is endpoint-dependent. The peer mapping is endpoint-dependent.
+success baseline 5/5 mapped 5/5 disabled 5/5 nat-pmp 5/5 upnp 5/5
+proof_ok
 ```
 
-Mapped, node-c, run 1:
+## Security
+
+The map is for one UDP port. The client requests `DIRECT_QUIC_PORT` (UDP 443).
+The lab log shows that port:
 
 ```text
-The port map probe budget is 750 ms.
-The port map probe took 0 ms.
 The port map is pcp 23.31.0.13:443 lifetime 40.
-The STUN mapping is endpoint-dependent.
-The local NAT mapping is endpoint-independent.
-The punch plan is port-spray. The local mapping is endpoint-independent. The peer mapping is endpoint-dependent.
-The first relay packet arrived at 729 ms.
-The hole punch reached 23.31.0.14:47109.
-The first direct packet arrived at 866 ms.
 ```
 
-The peer punched the mapped port:
+`pcp_request_uses_the_rfc_fields` checks that the PCP packet carries internal port 443.
+The proof rejects a grant line that is not port 443.
+
+The lifetime request is capped at 7200 s.
+`bound_lifetime` maps 0 and any larger value to 7200.
+The CLI rejects a value outside 1 to 7200.
+`lifetime_request_is_capped_at_two_hours` checks the cap.
+`a_restart_sends_a_pcp_delete_with_the_saved_nonce` asks for 9999 s and the grant is 7200 s.
+
+A crash skips the delete on shutdown.
+The nonce is stored in `port-map-nonce`.
+The next start sends a delete with that nonce before the new map.
+PCP matches the nonce. NAT-PMP matches the internal UDP port.
+UPnP deletes the same external port the client requests.
+A crash with no restart still expires at the capped lifetime.
+
+The unit test records the packets. The first packet of a restart is lifetime 0 with the saved nonce. The next packet is the new map with the same nonce.
+
+The lab kills the node with SIGKILL, then starts it again:
 
 ```text
-The hole punch reached 23.31.0.13:443.
-The first direct packet arrived at 552 ms.
+crash map rules before kill 1
+crash map rules after kill 1
+crash map rules after restart 1
+crash map rules after delete 0
+crash_restart orphan_cleared yes
 ```
 
-Disabled, node-c, run 1:
+One UDP 443 rule remains after the restart. Shutdown removes it.
+
+`--port-map off` sends no probe:
 
 ```text
 The port map is off.
 The port map probe took 0 ms.
-The STUN mapping is endpoint-dependent.
-The local NAT mapping is endpoint-dependent.
-The punch plan is relay-only. The local mapping is endpoint-dependent. The peer mapping is endpoint-dependent.
-The first relay packet arrived at 496 ms.
-```
-
-NAT-PMP, node-c:
-
-```text
-The port map probe took 1 ms.
-The port map is nat-pmp 23.31.0.13:443 lifetime 40.
-The first direct packet arrived at 629 ms.
-```
-
-UPnP, node-c:
-
-```text
-The port map probe took 50 ms.
-The port map is upnp 23.31.0.13:443 lifetime 40.
-The first direct packet arrived at 1425 ms.
-```
-
-Renew and delete, from the proof log:
-
-```text
-mapped run 1 renewed yes
-mapped run 1 deleted yes
-success baseline 5/5 mapped 5/5 disabled 5/5 nat-pmp 1/1 upnp 1/1
-proof_ok
+The port map probe did not start.
 ```
 
 ## Tailscale
@@ -163,11 +183,11 @@ This table compares behavior. It does not invent Tailscale timings.
 | --- | --- | --- |
 | Protocols | PCP, then NAT-PMP, then UPnP IGD | NAT-PMP, PCP, and UPnP on the default gateway. PCP is preferred when NAT-PMP was not seen recently. UPnP is the fallback. |
 | Wait for one protocol | 250 ms | `portMapServiceTimeout` is 250 ms |
-| Probe budget when nothing answers | 750 ms | No single published budget. Each service wait is 250 ms. |
-| Requested lifetime | 7200 s (this proof used 40 s) | `pmpMapLifetimeSec` and `pcpMapLifetimeSec` are 7200 |
+| Probe when nothing answers | 750 ms, and the relay path does not wait | No single published budget. Each service wait is 250 ms. |
+| Requested lifetime | 1–7200 s (this proof used 40 s) | `pmpMapLifetimeSec` and `pcpMapLifetimeSec` are 7200 |
 | Renew | Half the granted lifetime | `renewAfter` is half the granted lifetime |
-| Delete | Lifetime 0 on clean shutdown | `pmpMapLifetimeDelete` is 0 |
-| Effect on two hard NATs | Direct when one router grants a map. 5/5 in this lab. First direct packet 846–889 ms. | A mapping makes one NAT easier for the peer. If mapping and hairpinning both fail, the path stays on a relay. No lab latency is published. |
+| Delete | Lifetime 0 on clean shutdown. A restart deletes the saved map first. | `pmpMapLifetimeDelete` is 0 |
+| Effect on two hard NATs | Direct when one router grants a map. 5/5 for PCP, NAT-PMP, and UPnP. First relay packet about 420–555 ms. Direct packet about 575–655 ms. | A mapping makes one NAT easier for the peer. If mapping and hairpinning both fail, the path stays on a relay. No lab latency is published. |
 
 Primary source for the constants: [net/portmapper/portmapper.go](https://github.com/tailscale/tailscale/blob/main/net/portmapper/portmapper.go) and [net/portmapper/pcp.go](https://github.com/tailscale/tailscale/blob/main/net/portmapper/pcp.go).
 The behavior text is from [How NAT traversal works](https://tailscale.com/blog/how-nat-traversal-works).
@@ -176,6 +196,5 @@ The behavior text is from [How NAT traversal works](https://tailscale.com/blog/h
 
 - The router is miniupnpd in a container, not a home router.
 - The lab has one NAT layer. A second NAT in front of the gateway is not mapped.
-- The mapped external port in this lab is UDP 443, the same as the local punch port.
-- The UPnP run is one sample. Its first direct packet was 1425 ms. The path was direct and the loss was 0/50.
-- The status file is cleared before each start. The wait accepts a path only after this process logs the first packet. That keeps a previous `relay` status from starting the ping early.
+- The mapped external port in this lab is UDP 443.
+- The punch plan can stay relay-only until the map is granted. The relay packet does not wait for that grant.
