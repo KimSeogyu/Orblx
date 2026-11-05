@@ -528,10 +528,10 @@ proof_foreign_check() {
 }
 
 proof_lock_take() {
-  # The disk check runs before the lock, also when the script ran it before its build.
-  proof_disk_check "$1"
   # W25-27: a manifest proof that makes lab tickets fails before it waits for the lock.
   proof_lab_ticket_static_guard "$0" || exit 1
+  # The disk check runs before the lock, also when the script ran it before its build.
+  proof_disk_check "$1"
   PROOF_LOCK_LABEL="$1"
   shift
   PROOF_LOCK_OWN=("$@")
