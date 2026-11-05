@@ -1,0 +1,236 @@
+# W25-18 ephemeral node proof stack (scripts/proof/ephemeral-nodes.sh).
+# `docker compose up` starts only the coordinator. The nodes use the nodes profile.
+# a, b, and n1 are not ephemeral. e1 to e4 are ephemeral. The load container runs
+# 20 ephemeral `orblx coord netmap --watch` clients.
+name: ${PROOF_PROJECT:-orblx-w25q-eph-proof}
+
+x-node: &node
+  image: ${EPH_IMAGE:-orblx-w25q-eph:local}
+  profiles: ["nodes"]
+  entrypoint: ["orblx"]
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+  devices:
+    - /dev/net/tun:/dev/net/tun
+  sysctls:
+    net.ipv4.conf.all.rp_filter: "0"
+    net.ipv4.conf.default.rp_filter: "0"
+  stop_grace_period: 2s
+
+services:
+  coord:
+    image: ${EPH_IMAGE:-orblx-w25q-eph:local}
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /etc/orblx/policy.hujson
+      - --ephemeral-offline
+      - "${EPH_T:-6}"
+    environment:
+      ORBLX_OIDC_MODE: mock
+      ORBLX_SVID_TTL: "${EPH_SVID_TTL:-120}"
+    volumes:
+      - ${EPH_LAB:?set EPH_LAB}/coord:/var/lib/orblx
+      - ${EPH_LAB:?set EPH_LAB}/policy:/etc/orblx:ro
+    networks:
+      proof:
+        ipv4_address: 172.30.218.2
+
+  tool:
+    image: ${EPH_IMAGE:-orblx-w25q-eph:local}
+    profiles: ["tool"]
+    entrypoint: ["orblx"]
+    volumes:
+      - ${EPH_LAB:?set EPH_LAB}:/work
+      - ${EPH_LAB:?set EPH_LAB}/coord:/coord-state:ro
+    networks:
+      - proof
+
+  load:
+    image: ${EPH_IMAGE:-orblx-w25q-eph:local}
+    profiles: ["load"]
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - ${EPH_LAB:?set EPH_LAB}/coord:/coord-state:ro
+    networks:
+      proof:
+        ipv4_address: 172.30.218.9
+
+  a:
+    <<: *node
+    volumes:
+      - ${EPH_LAB:?set EPH_LAB}/a:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.218.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+    networks:
+      proof:
+        ipv4_address: 172.30.218.4
+
+  b:
+    <<: *node
+    volumes:
+      - ${EPH_LAB:?set EPH_LAB}/b:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.218.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+    networks:
+      proof:
+        ipv4_address: 172.30.218.5
+
+  c:
+    <<: *node
+    volumes:
+      - ${EPH_LAB:?set EPH_LAB}/c:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.218.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+    networks:
+      proof:
+        ipv4_address: 172.30.218.7
+
+  d:
+    <<: *node
+    volumes:
+      - ${EPH_LAB:?set EPH_LAB}/d:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.218.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+    networks:
+      proof:
+        ipv4_address: 172.30.218.8
+
+  n1:
+    <<: *node
+    volumes:
+      - ${EPH_LAB:?set EPH_LAB}/n1:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.218.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+    networks:
+      proof:
+        ipv4_address: 172.30.218.6
+
+  e1:
+    <<: *node
+    volumes:
+      - ${EPH_LAB:?set EPH_LAB}/e1:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.218.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+    networks:
+      proof:
+        ipv4_address: 172.30.218.11
+
+  e2:
+    <<: *node
+    volumes:
+      - ${EPH_LAB:?set EPH_LAB}/e2:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.218.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+    networks:
+      proof:
+        ipv4_address: 172.30.218.12
+
+  e3:
+    <<: *node
+    volumes:
+      - ${EPH_LAB:?set EPH_LAB}/e3:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.218.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+    networks:
+      proof:
+        ipv4_address: 172.30.218.13
+
+  e4:
+    <<: *node
+    volumes:
+      - ${EPH_LAB:?set EPH_LAB}/e4:/var/lib/orblx
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.30.218.2:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+    networks:
+      proof:
+        ipv4_address: 172.30.218.14
+
+networks:
+  proof:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.218.0/24
+          gateway: 172.30.218.1
+          ip_range: 172.30.218.128/25

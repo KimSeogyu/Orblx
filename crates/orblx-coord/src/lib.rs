@@ -16,6 +16,7 @@ mod agent;
 mod apitoken;
 mod client;
 mod config;
+mod ephemeral;
 mod error;
 
 mod files;
