@@ -1,0 +1,15 @@
+w25-46 overlap audit
+dedupe_key=acquire_time+pid
+runs_before=6
+runs_after_dedupe=5
+duplicate_logs=1
+soak_label=coord-cert-soak
+soak_pid=2065982
+soak_nominal_end=2026-11-05T09:30:00.000+0900
+soak_real_end=2026-11-05T09:10:25.000+0900
+soak_real_end_source=proof_cancel
+overlap_pairs=0
+rejudge_window=2026-11-05T09:10:00.000+0900/2026-11-05T09:15:00.000+0900
+rejudge policy-scale acquire=2026-11-05T09:10:35.126+0900 log=w25-34-proof-policy-scale-2876d63.log verdict=INVALID reason=soak_containers_still_running contended_samples=3 other=1
+rejudge deny-damage acquire=2026-11-05T09:13:31.657+0900 log=w25-38-deny-damage.log verdict=VALID_for_container_overlap reason=clear contended_samples=0 other=0
+rejudge policy-scale acquire=2026-11-05T09:14:40.000+0900 log=w25-34-proof-policy-scale-091440.log verdict=VALID_for_container_overlap reason=clear contended_samples=0 other=0
