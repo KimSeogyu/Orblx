@@ -50,6 +50,17 @@ class SshRenewHarnessTest(unittest.TestCase):
         self.assertIn('bin="$root/target/release/orblx"', src)
         self.assertLess(src.index('bin="$root/target/release/orblx"'), src.index("cargo build --release"))
 
+    def test_the_image_build_uses_the_host_network_and_keeps_no_cache(self):
+        builds = [
+            line.strip()
+            for line in self.src.splitlines()
+            if line.strip().startswith("docker build")
+        ]
+        self.assertEqual(
+            builds,
+            ['docker build --network host --no-cache -q -t orblx-ssh-renew:local "$image_dir" >/dev/null'],
+        )
+
     def test_the_build_is_release_and_the_log_names_the_profile(self):
         src = self.src
         self.assertRegex(src, r'(?m)^rustc -V$')
