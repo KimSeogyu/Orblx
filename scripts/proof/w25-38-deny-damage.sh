@@ -21,10 +21,11 @@
 #   orblx_node_refused of b does not change (0 refused sessions and frames).
 #   Node a (revoked) stops during gate 3, so its dial attempts do not change the counter.
 # Gate 1: the coordinator stays stopped, so b cannot get a new deny list. For each damage kind
-#   (corrupt, truncated, missing, unreadable), the proof takes SAMPLES samples. Each sample
-#   is one SSH login and one ping (a new QUIC session) from a to b. Each must be refused.
-#   The file on b must still be damaged after the samples.
-#   With a fallback to an empty deny list, a would be accepted.
+#   (corrupt, truncated, missing, unreadable), the proof takes SAMPLES samples from a.
+#   Each ping must be refused, and orblx_node_refused on b must rise during that ping.
+#   Each SSH login from a must be no_cert. no_cert is not a deny refusal.
+#   An accepted SSH login fails the gate. The file on b must still be damaged after the samples.
+#   With a fallback to an empty deny list, the ping would be accepted.
 # Gate 2: the coordinator starts again. b gets a valid deny.json again. allowed can SSH to b
 #   again, and a is still refused.
 # Gate 4: the refuse-all window after enroll. The enroll reply has no deny list, and the
@@ -32,7 +33,8 @@
 #   enroll` prints `deny_list ready_ms N`. WINDOW_ENROLLS (default 10) more enrolls run,
 #   and each window must be 2000 ms or less.
 #
-# Result rules: accepted 0, unknown 0, and samples >= 1 for each kind.
+# Gate 1 result rules: each ping from a is refused with a positive refused-counter delta,
+# each SSH login from a is no_cert, and each kind has at least one sample.
 # The proof takes the box proof lock (proof-lock.sh). The proof_contention line must
 # show unknown_samples 0.
 # The script does not print enroll tokens, private keys, or SVID material.
@@ -272,6 +274,7 @@ ssh_cmd() {
 }
 
 # Print accepted, refused, or unknown for one SSH login from FROM to b.
+# Gate 1 does not call this function. It uses ssh_gate1.
 # The SSH client connects over the mesh. When the datapath of b refuses the QUIC session
 # of FROM, the TCP connect gets no reply and the client stops at the 20 s limit (status
 # 124). That result is refused only when FROM is the revoked peer a and the
@@ -305,6 +308,40 @@ ssh_try() {
     {
       echo "ssh_try from ${from} result ${result} status ${status} b_refused ${before}->${after}"
       tail -n 3 "$out" | grep -v 'PRIVATE KEY' | sed "s/^/ssh_try from ${from} out: /"
+    } >&2
+  fi
+  echo "$result"
+}
+
+# Gate 1 only. The coordinator is stopped, so a new login cannot get a certificate.
+# no_cert matches the client sentences for that failure. It is not a deny refusal.
+# Gate 0 and gate 2 keep ssh_try.
+ssh_gate1() {
+  local from="$1"
+  local out="$WORK/ssh-${from}.out"
+  local status=0
+  local result text
+  dc exec -T "$from" sh -c "timeout 20 $(ssh_cmd) --command 'echo ssh_ok'" >"$out" 2>&1 || status=$?
+  text="$(tr -d '\r' <"$out")"
+  if [[ "$status" -eq 0 ]] && grep -q '^ssh_ok' <<<"$text"; then
+    result=accepted
+  elif grep -q '^ssh_ok' <<<"$text"; then
+    result=unknown
+  elif grep -F -x -e 'The coordinator request failed.' \
+    -e 'The SSH certificate request failed.' \
+    -e 'The node has no coordinator address.' \
+    -e 'The coordinator address is not valid.' \
+    -e 'The trust bundle did not open.' <<<"$text" >/dev/null; then
+    result=no_cert
+  elif [[ "$status" -eq 124 ]]; then
+    result=timeout
+  else
+    result=refused
+  fi
+  if [[ "$result" != no_cert ]]; then
+    {
+      echo "ssh_gate1 from ${from} result ${result} status ${status}"
+      tail -n 5 "$out" | grep -v 'PRIVATE KEY' | sed "s/^/ssh_gate1 from ${from} out: /"
     } >&2
   fi
   echo "$result"
@@ -672,9 +709,7 @@ wait_log a 'The TUN device'
 require_coord_stopped "node a is up"
 
 echo "=== [C] gate 1: the coordinator stays stopped, so b cannot get a new deny list ==="
-accepted=0
-unknown=0
-total=0
+ping_samples=0
 rows=()
 for kind in $KINDS; do
   require_coord_stopped "gate 1 ${kind}"
@@ -685,31 +720,37 @@ for kind in $KINDS; do
   # The SSH deny watch reads each 100 ms. The datapath reload reads each 100 ms.
   sleep 1
   k_samples=0
-  k_accepted=0
-  k_unknown=0
-  # A new SSH login needs the coordinator (W25-31). While it is stopped, the
-  # client fails before b sees the login. ssh_try labels a non-124 client error
-  # refused. The pass rule is unchanged: each sample from a must be refused.
   for i in $(seq 1 "$SAMPLES"); do
-    for probe in ssh ping; do
-      if [[ "$probe" == ssh ]]; then
-        got="$(ssh_try a)"
-      else
-        got="$(ping_try a)"
-      fi
-      echo "sample kind ${kind} n ${i} probe ${probe} peer a result ${got}"
-      k_samples=$(( k_samples + 1 ))
-      case "$got" in
-        accepted) k_accepted=$(( k_accepted + 1 )) ;;
-        refused) ;;
-        *) k_unknown=$(( k_unknown + 1 )) ;;
-      esac
-    done
+    ssh_got="$(ssh_gate1 a)"
+    echo "sample kind ${kind} n ${i} probe ssh peer a result ${ssh_got}"
+    if [[ "$ssh_got" != no_cert ]]; then
+      echo "The gate 1 SSH sample from a is ${ssh_got}. It must be no_cert." >&2
+      exit 1
+    fi
+    refused_at="$(refused_count)"
+    ping_got="$(ping_try a)"
+    refused_now="$(refused_count)"
+    if ! [[ "$refused_at" =~ ^[0-9]+$ && "$refused_now" =~ ^[0-9]+$ ]]; then
+      echo "The gate 1 refused counter is not a number." >&2
+      exit 1
+    fi
+    refused_delta=$(( refused_now - refused_at ))
+    echo "sample kind ${kind} n ${i} probe ping peer a result ${ping_got} b_refused ${refused_at}->${refused_now} delta ${refused_delta}"
+    if [[ "$ping_got" != refused || "$refused_delta" -lt 1 ]]; then
+      echo "The gate 1 ping sample did not show a deny refusal." >&2
+      exit 1
+    fi
+    k_samples=$(( k_samples + 1 ))
+    ping_samples=$(( ping_samples + 1 ))
   done
-  # A peer that is not revoked is also refused: the node fails closed, it does not use
-  # the old list without a check.
-  c_ssh="$(ssh_try allowed)"
+  # allowed also cannot get a certificate while the coordinator is stopped.
+  # This line is not a pass rule. Gate 2 checks allowed after the coordinator starts.
+  c_ssh="$(ssh_gate1 allowed)"
   echo "sample kind ${kind} probe ssh peer allowed result ${c_ssh}"
+  if [[ "$c_ssh" == accepted ]]; then
+    echo "The gate 1 SSH sample is accepted while deny is damaged." >&2
+    exit 1
+  fi
   after="$(deny_state)"
   echo "damage ${kind} deny_state_after ${after}"
   # The refusals must come from the running node b, not from a stopped node.
@@ -721,11 +762,8 @@ for kind in $KINDS; do
     echo "The deny.json of b became valid during the ${kind} samples." >&2
     exit 1
   fi
-  echo "kind ${kind} samples ${k_samples} accepted ${k_accepted} unknown ${k_unknown} peer_allowed_ssh ${c_ssh}"
-  rows+=("${kind}:${k_samples}/${k_accepted}/${k_unknown}")
-  total=$(( total + k_samples ))
-  accepted=$(( accepted + k_accepted ))
-  unknown=$(( unknown + k_unknown ))
+  echo "kind ${kind} ping_samples ${k_samples} ssh_no_cert ${k_samples} peer_allowed_ssh ${c_ssh}"
+  rows+=("${kind}:ping ${k_samples} ssh_no_cert ${k_samples}")
   if [[ "$k_samples" -lt 1 ]]; then
     echo "The kind ${kind} has no sample." >&2
     exit 1
@@ -790,9 +828,9 @@ hits="$(grep -cF 'PRIVATE KEY' "$WORK/all-logs.log" || true)"
 echo "secret_grep 'PRIVATE KEY' ${hits}"
 [[ "$hits" -eq 0 ]]
 
-echo "summary w25_38_deny_damage revoked_peer a kinds ${rows[*]} (samples/accepted/unknown) samples ${total} accepted ${accepted} unknown ${unknown}"
-if [[ "$total" -lt 1 || "$accepted" -ne 0 || "$unknown" -ne 0 ]]; then
-  echo "The deny damage gate failed: samples ${total} accepted ${accepted} unknown ${unknown}." >&2
+echo "summary w25_38_deny_damage revoked_peer a kinds ${rows[*]} ping_samples ${ping_samples} ssh_no_cert ${ping_samples}"
+if [[ "$ping_samples" -lt 1 ]]; then
+  echo "The deny damage gate failed: ping_samples ${ping_samples}." >&2
   exit 1
 fi
 echo "proof_ok"
