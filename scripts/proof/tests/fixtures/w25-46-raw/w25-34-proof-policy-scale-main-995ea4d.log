@@ -1,0 +1,42 @@
+proof_context policy-scale:orblx-w2534-scale-proof phase queued time 2026-11-05T09:13:31.666+0900 load 1.33/2.18/1.70 other_orblx_containers 0 groups -
+proof_lock policy-scale:orblx-w2534-scale-proof waiting for lock, 1 s, position 1, at 2026-11-05T09:13:32.676+0900, file /workspace/.orblx-proof.lock, holder: label=w25-38-deny-damage pid=2115117 user=box cwd=/workspace/orblx-w25-38 since=2026-11-05T09:13:31.616+0900 
+proof_lock policy-scale:orblx-w2534-scale-proof waiting for lock, 31 s, position 1, at 2026-11-05T09:14:02.838+0900, file /workspace/.orblx-proof.lock, holder: label=w25-38-deny-damage pid=2115117 user=box cwd=/workspace/orblx-w25-38 since=2026-11-05T09:13:31.616+0900 
+proof_lock policy-scale:orblx-w2534-scale-proof waiting for lock, 61 s, position 1, at 2026-11-05T09:14:32.994+0900, file /workspace/.orblx-proof.lock, holder: label=w25-38-deny-damage pid=2115117 user=box cwd=/workspace/orblx-w25-38 since=2026-11-05T09:13:31.616+0900 
+proof_lock policy-scale:orblx-w2534-scale-proof acquired at 2026-11-05T09:14:40.878+0900 after 69211 ms, file /workspace/.orblx-proof.lock
+proof_context policy-scale:orblx-w2534-scale-proof phase start time 2026-11-05T09:14:40.896+0900 load 0.87/1.88/1.63 other_orblx_containers 0 groups -
+proof_compose_clean orblx-w2534-scale-proof clean
+=== [C] remove old proof containers ===
+=== [C] build image (release) ===
+binary /workspace/orblx-w2534-bins4/orblx-main sha256 c8bd12537617ca8f2ec7e3f9bb111a93202d01b939b4632b0ba9257cdd5d5b83
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+sha256:bfcd551c0c5ac4c0a615c3b657edbfc49e0ac263c7f99866a67edc64503c6d1d
+=== [C] start coordinator and load container ===
+allow spiffe://orblx.local/node/a udp spiffe://orblx.local/node/router 9500
+deny spiffe://orblx.local/node/a udp spiffe://orblx.local/node/router 9501
+policy ok
+=== [C] 50 policy-wait clients ===
+load_first_updates 50
+scale_bytes idle nodes 50 seconds 60.432 coord_eth0_bytes 128881 bytes_per_node_per_hour 153552
+scale_cpu idle nodes 50 seconds 60.432 hz 100 coord_ticks 14 coord_cpu_pct 0.23 clients_ticks 0 clients_cpu_pct_total 0.00 client_cpu_pct_each 0.0000 policy_updates 0 wait_failures 0 load_udp_sockets 51
+scale_bytes change_each_10s nodes 50 seconds 60.607 coord_eth0_bytes 5972866 bytes_per_node_per_hour 7095655
+scale_cpu change_each_10s nodes 50 seconds 60.607 hz 100 coord_ticks 31 coord_cpu_pct 0.51 clients_ticks 106 clients_cpu_pct_total 1.75 client_cpu_pct_each 0.0350 policy_updates 300 wait_failures 0 load_udp_sockets 51
+=== [C] 200 policy-wait clients ===
+load_first_updates 7503
+scale_bytes idle nodes 200 seconds 60.578 coord_eth0_bytes 522042 bytes_per_node_per_hour 155118
+scale_cpu idle nodes 200 seconds 60.578 hz 100 coord_ticks 36 coord_cpu_pct 0.59 clients_ticks 32 clients_cpu_pct_total 0.53 client_cpu_pct_each 0.0027 policy_updates 0 wait_failures 0 load_udp_sockets 201
+scale_bytes change_each_10s nodes 200 seconds 60.641 coord_eth0_bytes 90625628 bytes_per_node_per_hour 26900303
+scale_cpu change_each_10s nodes 200 seconds 60.641 hz 100 coord_ticks 185 coord_cpu_pct 3.05 clients_ticks 1119 clients_cpu_pct_total 18.45 client_cpu_pct_each 0.0922 policy_updates 1200 wait_failures 0 load_udp_sockets 201
+gate idle nodes 50 coord_cpu_pct 0.23 limit 0.5
+gate change nodes 50 coord_cpu_pct 0.51 limit 2
+projection idle nodes 50 0.23 nodes 200 0.59 pct_per_node 0.00240 nodes 500 coord_cpu_pct 1.31
+projection change nodes 50 0.51 nodes 200 3.05 pct_per_node 0.01693 nodes 500 coord_cpu_pct 8.13
+gate projected change nodes 500 coord_cpu_pct 8.13 limit 10
+=== [C] logs hold no key or enroll token ===
+secret_grep 'PRIVATE KEY' 0
+proof_ok
+proof_context policy-scale:orblx-w2534-scale-proof phase end time 2026-11-05T09:20:14.690+0900 load 1.03/1.92/1.72 other_orblx_containers 0 groups -
+proof_contention policy-scale:orblx-w2534-scale-proof samples 165 contended_samples 0 unknown_samples 0 max_other_orblx_containers 0 max_load1 9.25
+proof_lock policy-scale:orblx-w2534-scale-proof released at 2026-11-05T09:20:14.705+0900
