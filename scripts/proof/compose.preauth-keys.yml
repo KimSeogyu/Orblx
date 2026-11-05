@@ -1,0 +1,70 @@
+# Pre-auth key proof stack.
+# idp is the test OIDC issuer. coord is the coordinator.
+# owner enrolls with an ID token. srv enrolls with a one-use enroll token.
+# agent enrolls nodes with pre-auth keys. It does not start the datapath.
+name: orblx-preauth-keys
+
+services:
+  idp:
+    image: ${PAK_IMAGE:?set PAK_IMAGE}
+    entrypoint: ["orblx-test-idp"]
+    command: [serve, --dir, /idp, --issuer, "https://idp:8443", --listen, "0.0.0.0:8443"]
+    volumes:
+      - idp:/idp
+      - tokens:/tokens
+    networks: [proof]
+
+  coord:
+    image: ${PAK_IMAGE:?set PAK_IMAGE}
+    entrypoint: ["orblx"]
+    command:
+      [coord, serve, --state, /var/lib/orblx, --listen, "0.0.0.0:443", --name, coord,
+       --policy, /policy/policy.hujson, --config, /etc/orblx/coord.toml]
+    volumes:
+      - store:/var/lib/orblx
+      - ${POLICY_DIR:?set POLICY_DIR}:/policy:ro
+      - ${CONFIG_FILE:?set CONFIG_FILE}:/etc/orblx/coord.toml:ro
+      - ${IDP_CA_FILE:?set IDP_CA_FILE}:/etc/orblx/idp-ca.pem:ro
+    networks: [proof]
+
+  owner:
+    image: ${PAK_IMAGE:?set PAK_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    volumes:
+      - store:/coord-state:ro
+      - tokens:/tokens:ro
+      - owner:/var/lib/orblx
+      - keys:/keys
+    networks: [proof]
+
+  srv:
+    image: ${PAK_IMAGE:?set PAK_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    volumes:
+      - store:/coord-state:ro
+      - srv:/var/lib/orblx
+    networks: [proof]
+
+  agent:
+    image: ${PAK_IMAGE:?set PAK_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    volumes:
+      - store:/coord-state:ro
+      - keys:/keys:ro
+      - work:/work
+    networks: [proof]
+
+volumes:
+  idp:
+  tokens:
+  store:
+  owner:
+  srv:
+  keys:
+  work:
+
+networks:
+  proof:

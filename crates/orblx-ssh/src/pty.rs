@@ -134,13 +134,67 @@ fn close_on_exec(fd: &OwnedFd) -> io::Result<()> {
 /// Return true when the terminal echo is off.
 ///
 /// A shell turns the echo off for a password prompt.
+/// The check reads the slave terminal. On macOS the master side does not
+/// carry the slave `ECHO` flag, so a master-only check hides every input.
 /// When the call fails, the function returns false.
 pub(crate) fn echo_off(master: &File) -> bool {
+    if let Some(path) = slave_path(master) {
+        if let Ok(slave) = File::open(path) {
+            return term_echo_off(&slave);
+        }
+    }
+    term_echo_off(master)
+}
+
+fn term_echo_off(file: &File) -> bool {
     // SAFETY: termios is plain data. tcgetattr fills it.
     let mut modes: libc::termios = unsafe { std::mem::zeroed() };
     // SAFETY: the descriptor is open and the pointer is valid.
-    let status = unsafe { libc::tcgetattr(master.as_raw_fd(), &mut modes) };
+    let status = unsafe { libc::tcgetattr(file.as_raw_fd(), &mut modes) };
     status == 0 && modes.c_lflag & libc::ECHO == 0
+}
+
+/// The slave path for `master`.
+fn slave_path(master: &File) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut buf = [0u8; 64];
+        // SAFETY: the buffer is valid for the call.
+        let rc = unsafe { libc::ptsname_r(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if rc != 0 {
+            return None;
+        }
+        let text = std::ffi::CStr::from_bytes_until_nul(&buf)
+            .ok()?
+            .to_str()
+            .ok()?;
+        Some(std::path::PathBuf::from(text))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = [0u8; 128];
+        // SAFETY: the buffer is 128 bytes, the size in TIOCPTYGNAME.
+        let rc = unsafe {
+            libc::ioctl(
+                master.as_raw_fd(),
+                libc::TIOCPTYGNAME as _,
+                buf.as_mut_ptr(),
+            )
+        };
+        if rc < 0 {
+            return None;
+        }
+        let text = std::ffi::CStr::from_bytes_until_nul(&buf)
+            .ok()?
+            .to_str()
+            .ok()?;
+        Some(std::path::PathBuf::from(text))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = master;
+        None
+    }
 }
 
 /// Set the terminal size.

@@ -247,6 +247,14 @@ fn a_pending_or_rejected_owner_gets_no_cert() {
         exit_node: false,
         approved: true,
         expired: false,
+        enrolled_unix: 0,
+        tags: Vec::new(),
+        ephemeral: false,
+        removed: false,
+        preauth_id: String::new(),
+        preauth_actor: String::new(),
+        auth_expires_unix_ms: 0,
+        grant_bound: None,
     };
     let policy = Policy::from_hujson(
         br#"{"ssh":[{"src":["spiffe://orblx.local/user/nina"],"dst":["spiffe://orblx.local/node/b"],"users":["nina"],"checkPeriod":"30s"}]}"#,
