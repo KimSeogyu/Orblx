@@ -642,17 +642,38 @@ impl Coordinator {
         let mut inner = self.lock()?;
         reload(&mut inner)?;
         crate::store::check_user(user)?;
-        let parsed = parse_admin_role(role)?;
+        let parsed = match parse_admin_role(role) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                return Err(refuse_role_set(
+                    &mut inner,
+                    actor,
+                    "bad-role",
+                    err.to_string(),
+                ));
+            }
+        };
         let Some(current) = inner.store.user(user) else {
-            return Err(CoordError::Protocol("The user is not known.".to_string()));
+            return Err(refuse_role_set(
+                &mut inner,
+                actor,
+                "unknown-user",
+                "The user is not known.".to_string(),
+            ));
         };
         if current.role == parsed.as_str() {
-            return Err(CoordError::Protocol(
+            return Err(refuse_role_set(
+                &mut inner,
+                actor,
+                "same-role",
                 "The user already has this role.".to_string(),
             ));
         }
         if inner.policy.user_approval().is_owner_user(user) && parsed != Role::Owner {
-            return Err(CoordError::Protocol(
+            return Err(refuse_role_set(
+                &mut inner,
+                actor,
+                "owner-user",
                 "An owner user stays an owner.".to_string(),
             ));
         }
@@ -664,7 +685,10 @@ impl Coordinator {
                 .filter(|stored| stored.role == Role::Owner.as_str())
                 .count();
             if owners <= 1 {
-                return Err(CoordError::Protocol(
+                return Err(refuse_role_set(
+                    &mut inner,
+                    actor,
+                    "last-owner",
                     "The last owner cannot change role.".to_string(),
                 ));
             }
@@ -1690,6 +1714,24 @@ fn lock_value(
         "keys": state.keys,
         "signed": signed,
     })
+}
+
+/// Write one `role-deny` for a refused role change, then return `sentence`.
+///
+/// The role does not change. A failed audit write returns that error instead.
+fn refuse_role_set(inner: &mut Inner, actor: &str, reason: &str, sentence: String) -> CoordError {
+    if let Err(err) = record(
+        inner,
+        actor,
+        ConfigAction::RoleDeny,
+        "role-set",
+        EMPTY_DIGEST,
+        EMPTY_DIGEST,
+        &format!("op role-set reason {reason} status 403"),
+    ) {
+        return err;
+    }
+    CoordError::Protocol(sentence)
 }
 
 /// Append one record when the chain is open.

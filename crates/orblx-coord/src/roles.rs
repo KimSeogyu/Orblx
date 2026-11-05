@@ -318,9 +318,9 @@ pub fn apply(
     actor: &str,
     now: std::time::SystemTime,
 ) -> Result<serde_json::Value, CoordError> {
-    let role = parse_admin_role(&ask.role)?;
     let user = canonical_user(&ask.user)?;
-    let from = coord.set_user_role_by(&user, role.as_str(), actor, now)?;
+    let from = coord.set_user_role_by(&user, &ask.role, actor, now)?;
+    let role = parse_admin_role(&ask.role)?;
     Ok(serde_json::json!({
         "op": "role-set",
         "user": user,
@@ -427,6 +427,23 @@ mod tests {
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|value| value["action"] == action && value["target"] == target)
+            .count()
+    }
+
+    fn deny_reasons(coord: &Coordinator, reason: &str) -> usize {
+        let needle = format!("reason {reason} ");
+        coord
+            .config_audit_text()
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| {
+                value["action"] == "role-deny"
+                    && value["target"] == "role-set"
+                    && value["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains(&needle))
+            })
             .count()
     }
 
@@ -547,7 +564,8 @@ mod tests {
         assert_eq!(role_of(&coord, "oidc:ada"), "admin");
         assert_eq!(count(&coord, "role-set", "oidc:ada"), 2);
         assert_eq!(count(&coord, "role-set", "oidc:ned"), 1);
-        assert_eq!(count(&coord, "role-deny", "role-set"), 0);
+        assert_eq!(count(&coord, "role-deny", "role-set"), 1);
+        assert_eq!(deny_reasons(&coord, "last-owner"), 1);
         let detail = coord
             .config_audit_text()
             .unwrap()
@@ -586,6 +604,118 @@ mod tests {
         assert!(err.to_string().contains("owner user"), "{err}");
         assert_eq!(role_of(&coord, "oidc:olivia"), "owner");
         assert_eq!(count(&coord, "role-set", "oidc:olivia"), 0);
+        assert_eq!(count(&coord, "role-deny", "role-set"), 1);
+        assert_eq!(deny_reasons(&coord, "owner-user"), 1);
+    }
+
+    #[test]
+    fn each_refused_role_change_writes_one_role_deny() {
+        let scratch = Scratch::new();
+        let coord = open(&scratch);
+        let now = SystemTime::now();
+        coord.approve_user_by("oidc:ada", ACTOR, now).unwrap();
+        coord.approve_user_by("oidc:ned", ACTOR, now).unwrap();
+        apply(
+            &coord,
+            &SetAsk {
+                user: "ada".to_string(),
+                role: "admin".to_string(),
+            },
+            ACTOR,
+            now,
+        )
+        .unwrap();
+        apply(
+            &coord,
+            &SetAsk {
+                user: "ned".to_string(),
+                role: "owner".to_string(),
+            },
+            ACTOR,
+            now,
+        )
+        .unwrap();
+
+        let same = apply(
+            &coord,
+            &SetAsk {
+                user: "oidc:ada".to_string(),
+                role: "admin".to_string(),
+            },
+            ACTOR,
+            now,
+        )
+        .unwrap_err();
+        assert!(same.to_string().contains("already has this role"), "{same}");
+        assert_eq!(deny_reasons(&coord, "same-role"), 1);
+
+        let unknown = apply(
+            &coord,
+            &SetAsk {
+                user: "oidc:missing".to_string(),
+                role: "admin".to_string(),
+            },
+            ACTOR,
+            now,
+        )
+        .unwrap_err();
+        assert!(unknown.to_string().contains("not known"), "{unknown}");
+        assert_eq!(deny_reasons(&coord, "unknown-user"), 1);
+
+        let bad = apply(
+            &coord,
+            &SetAsk {
+                user: "ada".to_string(),
+                role: "nope".to_string(),
+            },
+            ACTOR,
+            now,
+        )
+        .unwrap_err();
+        assert!(bad.to_string().contains("not valid"), "{bad}");
+        assert_eq!(deny_reasons(&coord, "bad-role"), 1);
+        assert_eq!(role_of(&coord, "oidc:ada"), "admin");
+
+        let path = scratch.0.join("policy.hujson");
+        fs::write(
+            &path,
+            r#"{"owners": [], "userApproval": {"ownerUsers": ["oidc:ada"]}}"#,
+        )
+        .unwrap();
+        coord.set_policy_file(&path).unwrap();
+        let owner_user = apply(
+            &coord,
+            &SetAsk {
+                user: "ada".to_string(),
+                role: "member".to_string(),
+            },
+            ACTOR,
+            now,
+        )
+        .unwrap_err();
+        assert!(
+            owner_user.to_string().contains("owner user"),
+            "{owner_user}"
+        );
+        assert_eq!(deny_reasons(&coord, "owner-user"), 1);
+        assert_eq!(role_of(&coord, "oidc:ada"), "admin");
+
+        let last = apply(
+            &coord,
+            &SetAsk {
+                user: "ned".to_string(),
+                role: "member".to_string(),
+            },
+            ACTOR,
+            now,
+        )
+        .unwrap_err();
+        assert!(last.to_string().contains("last owner"), "{last}");
+        assert_eq!(deny_reasons(&coord, "last-owner"), 1);
+        assert_eq!(role_of(&coord, "oidc:ned"), "owner");
+        assert_eq!(count(&coord, "role-deny", "role-set"), 5);
+        assert_eq!(count(&coord, "role-set", "oidc:ada"), 1);
+        assert_eq!(count(&coord, "role-set", "oidc:ned"), 1);
     }
 
     #[test]

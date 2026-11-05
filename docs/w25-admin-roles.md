@@ -21,7 +21,7 @@ Marks: **REAL** means `cargo test` on this host. **[C]** means the container pro
 | `orblx admin role-set USER ROLE` | One `role-set` record (code 39). Only an owner can call it. |
 | Last user with role `owner` | The coordinator refuses a change to another role. The role does not change. No `role-set` record. |
 | User in `userApproval.ownerUsers` | Role `owner` at approve time. A later `role-set` cannot move that user off `owner`. |
-| Role refusal | One `role-deny` record (code 40). The operation does not run. |
+| Role refusal | One `role-deny` record (code 40). The operation does not run. A refused role change also writes one `role-deny`. The reason is `bad-role`, `unknown-user`, `same-role`, `owner-user`, or `last-owner`. |
 | API token | At each call the rights are the token scopes crossed with the creator's current role. A scope that contains one operation outside the creator role is refused at create time. |
 | `admin-role-set` with a token | No token scope. One `token-deny` record, reason `scope`. |
 
@@ -72,7 +72,8 @@ orblx admin token-create --scope SCOPE --ttl 10m --coord ADDR ...
 | Test | Mark | What it shows |
 | --- | --- | --- |
 | `roles::tests::the_role_table_covers_each_admin_operation` | REAL | The role table and the admin operation list are the same set. An auditor has only the read operations. A member has none. Scope fit matches the table. |
-| `roles::tests::the_last_owner_cannot_be_demoted_and_each_change_has_one_record` | REAL | Two owners. One demotion. The last owner stays `owner`. One `role-set` record for each change. The failed call adds no record. |
+| `roles::tests::the_last_owner_cannot_be_demoted_and_each_change_has_one_record` | REAL | Two owners. One demotion. The last owner stays `owner`. One `role-set` record for each change. The failed call writes one `role-deny` with reason `last-owner`. |
+| `roles::tests::each_refused_role_change_writes_one_role_deny` | REAL | Same role, unknown user, bad role text, owner user, and last owner each write one `role-deny` and do not change the role. Five records in total. |
 | `roles::tests::an_owner_user_stays_an_owner` | REAL | An owner user is `owner` at approve time and cannot move to `admin`. |
 | `roles::tests::a_member_deny_has_one_record_and_the_old_sentence` | REAL | One `role-deny` per call. The sentence is `The caller is not an owner.` |
 | `roles::tests::an_auditor_can_read_the_audit_log_and_cannot_write` | REAL | Audit read and node read pass. Approve and role-set each write one `role-deny`. |
