@@ -1647,14 +1647,29 @@ mod tests {
             .collect();
         let times: Vec<f64> = events.iter().map(|row| row[0].as_f64().unwrap()).collect();
         assert!(times.windows(2).all(|pair| pair[0] <= pair[1]));
-        let first_input = events
-            .iter()
-            .position(|row| row[1] == "i" && row[2].as_str().unwrap().contains("echo pty-"))
-            .unwrap();
-        let answer = events
-            .iter()
-            .position(|row| row[1] == "o" && row[2].as_str().unwrap().contains("pty-42"))
-            .unwrap();
+        // One SSH `data` callback is one recording event. A single send can arrive
+        // as more than one callback, so the text is the join of those events.
+        let mut input_text = String::new();
+        let mut output_text = String::new();
+        let mut first_input = None;
+        let mut answer = None;
+        for (idx, row) in events.iter().enumerate() {
+            let kind = row[1].as_str().unwrap_or("");
+            let text = row[2].as_str().unwrap_or("");
+            if kind == "i" {
+                input_text.push_str(text);
+                if first_input.is_none() && input_text.contains("echo pty-") {
+                    first_input = Some(idx);
+                }
+            } else if kind == "o" {
+                output_text.push_str(text);
+                if answer.is_none() && output_text.contains("pty-42") {
+                    answer = Some(idx);
+                }
+            }
+        }
+        let first_input = first_input.expect("the recording has the echo pty- input");
+        let answer = answer.expect("the recording has the pty-42 output");
         assert!(first_input < answer);
         assert!(events
             .iter()
