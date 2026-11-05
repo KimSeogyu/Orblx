@@ -1,0 +1,3 @@
+proof_lock coord-cert-soak acquired at 2026-11-05T08:40:00.000+0900 after 10 ms, file /workspace/.orblx-proof.lock
+proof_plan_end 2026-11-05T09:30:00.000+0900
+proof_cancel 2026-11-05T09:10:25.000+0900 pid=2065982
