@@ -121,6 +121,9 @@ const OPS: &[(&str, u8)] = &[
     ("admin-policy", OWNER | ADMIN | NETWORK | AUDITOR),
     ("admin-audit", OWNER | ADMIN | AUDITOR),
     ("admin-approve", OWNER | ADMIN | NETWORK | IT),
+    ("admin-preauth-list", OWNER | ADMIN | NETWORK | IT | AUDITOR),
+    ("admin-preauth-create", OWNER | ADMIN | NETWORK | IT),
+    ("admin-preauth-revoke", OWNER | ADMIN | NETWORK | IT),
     ("admin-revoke", OWNER | ADMIN | NETWORK | IT),
     ("admin-revoke-all", OWNER | ADMIN | NETWORK | IT),
     ("admin-revoke-undo", OWNER | ADMIN | NETWORK | IT),
@@ -445,6 +448,7 @@ mod tests {
         assert_eq!(from_api, from_roles);
         let reads = [
             "admin-nodes",
+            "admin-preauth-list",
             "admin-users",
             "admin-roles",
             "admin-routes",

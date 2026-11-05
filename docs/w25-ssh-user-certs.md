@@ -63,12 +63,12 @@ The certificate:
 | Extensions | only `permit-pty` |
 | Critical options | only `source-address` = the mesh IP of the client node /32 |
 
-Each decision (allow and deny) writes exactly 1 config audit record `ssh-cert` (code 41). The
+Each decision (allow and deny) writes exactly 1 config audit record `ssh-cert` (code 45). The
 detail has the decision, the reason, the serial, the key fingerprint, the node, the principal,
 and the validity. The record has no key and no certificate. The coordinator keeps an index from
 (node, owner) to the live serials.
 
-Code 37 is reserved for `node-remove` (W25-18). Code 38 is `route-failover` (W25-10).
+Code 37 is `node-remove`. Code 38 is `route-failover` (W25-10). Pre-auth actions use codes 41 to 44.
 
 ## Verify on the node
 
