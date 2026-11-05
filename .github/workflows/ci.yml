@@ -5,11 +5,16 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
-# A pull request run cancels the previous run in this group.
-# A push to the main branch keeps the previous run.
+# A pull request uses one group. The group contains the pull request number.
+# A new pull request run cancels the previous run in that group.
+# A push uses one group for that commit. The group contains the ref and the SHA.
+# A workflow_dispatch run uses one group for that commit.
+# A push run does not cancel a previous run.
+# A workflow_dispatch run does not cancel a previous run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || format('{0}-{1}', github.ref, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
