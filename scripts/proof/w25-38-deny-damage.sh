@@ -9,8 +9,10 @@
 #   change), and a is refused after `admin revoke-all a`.
 # Gate 3 (W25-38 merge blocker): the coordinator stops for OFFLINE_SECS (default 600 s)
 #   and deny.json on b stays valid. A valid list never goes stale with age. During the
-#   whole time, allowed sends ICMP to b over the mesh with no loss, and each probe (orblx ping,
-#   a new QUIC session, and an SSH login) from allowed to b is accepted. The counter
+#   whole time, allowed sends ICMP to b over the mesh with no loss, and each orblx ping
+#   (a new QUIC session) from allowed to b is accepted. A new SSH login asks the
+#   coordinator for a user certificate, so the proof does not require an SSH login
+#   while the coordinator is down. The counter
 #   orblx_node_refused of b does not change (0 refused sessions and frames).
 #   Node a (revoked) stops during gate 3, so its dial attempts do not change the counter.
 # Gate 1: the coordinator stays stopped, so b cannot get a new deny list. For each damage kind
@@ -38,7 +40,13 @@ cd "$ROOT"
 FILE="scripts/proof/compose.w25-38-deny-damage.yml"
 WORK="/workspace/orblx-w25-38-136/work-debug"; mkdir -p "$WORK"
 export POLICY_FILE="$WORK/policy.hujson"
+export CONFIG_FILE="$WORK/coord.toml"
+export IDP_CA_FILE="$WORK/idp-ca.pem"
+: >"$CONFIG_FILE"
+: >"$IDP_CA_FILE"
 export COORD_ADDR="127.0.0.1:443"
+ISSUER="https://idp:8443"
+CLIENT="orblx-proof"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 PROFILE="${ORBLX_PROOF_PROFILE:-release}"
 SAMPLES="${ORBLX_DENY_SAMPLES:-3}"
@@ -73,6 +81,7 @@ as_root() {
 dc() {
   # sudo drops the environment, so pass the Compose variables with env.
   as_root env POLICY_FILE="$POLICY_FILE" COORD_ADDR="$COORD_ADDR" \
+    CONFIG_FILE="$CONFIG_FILE" IDP_CA_FILE="$IDP_CA_FILE" \
     docker compose --profile nodes -f "$FILE" "$@"
 }
 
@@ -113,10 +122,14 @@ build_image() {
   if [[ "$PROFILE" == release ]]; then
     flag=(--release)
   fi
-  cargo build "${flag[@]}" -p orblx-cli --bin orblx --locked
+  cargo build "${flag[@]}" -p orblx-cli --bin orblx -p orblx-test-idp --bin orblx-test-idp --locked
   # shellcheck source=stage-image.sh
   source "$ROOT/scripts/proof/stage-image.sh"
   image_dir="$(stage_proof_image "$ROOT" "$TARGET_DIR/$PROFILE/orblx")"
+  cp "$TARGET_DIR/$PROFILE/orblx-test-idp" "$image_dir/orblx-test-idp"
+  printf '%s\n' \
+    'COPY orblx-test-idp /usr/local/bin/orblx-test-idp' \
+    'RUN chmod 755 /usr/local/bin/orblx-test-idp' >>"$image_dir/Dockerfile"
   as_root docker build -q -t orblx-w25-38-deny:w25 "$image_dir"
   rm -rf "$image_dir"
 }
@@ -147,6 +160,25 @@ wait_log() {
   return 1
 }
 
+# The SSH server reads the CA set from the signed netmap (W25-31).
+wait_ca() {
+  local node="$1"
+  local i
+  for i in $(seq 1 60); do
+    if dc exec -T "$node" sh -c "jq -e '.netmap.issued_at_ms > 0 and (.netmap.ssh_user_ca | length == 2)' $STATE/netmap.signed.json" >/dev/null 2>&1; then
+      echo "node ${node} netmap ssh_user_ca 2 fresh"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "The node ${node} has no fresh netmap with the SSH CA set." >&2
+  return 1
+}
+
+idp() {
+  dc run --rm --no-deps --entrypoint orblx-test-idp idp "$@"
+}
+
 run_node() {
   local service="$1"
   shift
@@ -175,13 +207,19 @@ enroll_node() {
   local name="$1"
   local out="$WORK/enroll-${name}.out"
   echo "=== [C] enroll ${name} ==="
+  local secret=()
+  if [[ "$name" == a || "$name" == allowed ]]; then
+    secret=(--id-token-file /tokens/probe)
+  else
+    secret=(--token-file "/coord-state/tokens/${name}")
+  fi
   set +e
   run_node "$name" \
     coord enroll \
     --name "$name" \
     --coord "${coord_ip}:443" \
     --bundle /coord-state/trust-bundle.pem \
-    --token-file "/coord-state/tokens/${name}" \
+    "${secret[@]}" \
     --state "$STATE" \
     --endpoint "${name}:443" >"$out" 2>&1
   local enroll_status=$?
@@ -206,7 +244,7 @@ deny_error_lines() {
 }
 
 ssh_cmd() {
-  printf '%s' "orblx ssh root@b --identity /tmp/sshid --netmap $STATE/netmap.json --peer-cert /tmp/b-cert.pem"
+  printf '%s' "orblx ssh probe@b --state $STATE --peer-cert /tmp/b-cert.pem"
 }
 
 # Print accepted, refused, or unknown for one SSH login from FROM to b.
@@ -309,11 +347,28 @@ open_legacy_forward
 echo "=== [C] build image (${PROFILE}) ==="
 build_image
 
-echo "=== [C] start coordinator ==="
+echo "=== [C] test issuer and coordinator ==="
+cat >"$CONFIG_FILE" <<CONF
+[oidc]
+issuer = "${ISSUER}"
+client_id = "${CLIENT}"
+allowed_domains = ["example.test"]
+allowed_emails = []
+ca_file = "/etc/orblx/idp-ca.pem"
+CONF
+: >"$IDP_CA_FILE"
+idp init --dir /idp --host idp >/dev/null
+dc run --rm --no-deps --entrypoint cat idp /idp/ca.pem >"$IDP_CA_FILE"
+grep -q 'BEGIN CERTIFICATE' "$IDP_CA_FILE"
+dc up -d idp
+wait_log idp "idp serve"
 dc up -d coord
 wait_bundle
+idp mint --dir /idp --kid rs1 --issuer "$ISSUER" --aud "$CLIENT" --out /tokens/probe \
+  --sub probe --email probe@example.test >/dev/null
+echo "id token probe written"
 
-for name in owner a b allowed; do
+for name in owner b; do
   dc exec -T coord orblx coord token create \
     --state "$STATE" \
     --ttl 3600 \
@@ -342,12 +397,12 @@ for name in a b allowed; do
   wait_log "$name" 'The TUN device'
 done
 wait_log b 'ssh_listen '
+wait_ca b
 
-echo "=== [C] SSH identity and peer certificate on a and allowed ==="
+echo "=== [C] peer certificate of b on a and allowed ==="
 dc exec -T b cat "$STATE/cert.pem" >"$WORK/b-cert.pem"
 for name in a allowed; do
   dc exec -T "$name" sh -c "cat > /tmp/b-cert.pem" <"$WORK/b-cert.pem"
-  dc exec -T "$name" sh -c "rm -rf /tmp/sshid && mkdir -p /tmp/sshid && cp $STATE/cert.pem $STATE/key.pem $STATE/bundle.pem /tmp/sshid/"
 done
 
 echo "=== [C] gate 0: valid deny.json on b, before the revoke ==="
@@ -402,20 +457,14 @@ g3_probes=0
 g3_accepted=0
 g3_unknown=0
 while (( $(date +%s) - offline_start < OFFLINE_SECS - 20 )); do
-  for probe in ssh ping; do
-    if [[ "$probe" == ssh ]]; then
-      got="$(ssh_try allowed)"
-    else
-      got="$(ping_try allowed)"
-    fi
-    g3_probes=$(( g3_probes + 1 ))
-    case "$got" in
-      accepted) g3_accepted=$(( g3_accepted + 1 )) ;;
-      refused) ;;
-      *) g3_unknown=$(( g3_unknown + 1 )) ;;
-    esac
-    echo "gate3 t $(( $(date +%s) - offline_start )) s probe ${probe} peer allowed result ${got}"
-  done
+  got="$(ping_try allowed)"
+  g3_probes=$(( g3_probes + 1 ))
+  case "$got" in
+    accepted) g3_accepted=$(( g3_accepted + 1 )) ;;
+    refused) ;;
+    *) g3_unknown=$(( g3_unknown + 1 )) ;;
+  esac
+  echo "gate3 t $(( $(date +%s) - offline_start )) s probe ping peer allowed result ${got}"
   sleep 30
 done
 icmp_status=0
@@ -510,6 +559,7 @@ dc start coord >/dev/null
 wait_bundle
 sleep 3
 expect "b deny.json after coord start" valid "$(deny_state)"
+wait_ca b
 expect "ssh a after restore" refused "$(ssh_try a)"
 expect "ping a after restore" refused "$(ping_try a)"
 expect "ssh allowed after restore" accepted "$(ssh_try allowed)"

@@ -4,6 +4,9 @@
   // Node b has the deny.json that the proof damages.
   "nodeApproval": false,
   "owners": ["spiffe://orblx.local/node/owner"],
+  "userApproval": {
+    "ownerUsers": ["oidc:probe"]
+  },
   "acls": [
     {
       "action": "accept",
@@ -26,9 +29,9 @@
   ],
   "ssh": [
     {
-      "src": ["spiffe://orblx.local/node/a", "spiffe://orblx.local/node/allowed"],
+      "src": ["spiffe://orblx.local/user/probe"],
       "dst": ["spiffe://orblx.local/node/b"],
-      "users": ["root"],
+      "users": ["probe"],
       "checkPeriod": "30s",
     },
   ],

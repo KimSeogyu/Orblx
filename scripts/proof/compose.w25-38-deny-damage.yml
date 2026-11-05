@@ -17,14 +17,29 @@ services:
       - coord
       - --policy
       - /var/lib/orblx/policy.hujson
-    environment:
-      ORBLX_OIDC_MODE: mock
+      - --config
+      - /etc/orblx/coord.toml
+    extra_hosts:
+      - "idp:172.30.18.9"
     volumes:
       - orblx-w25-38-dd-store:/var/lib/orblx
       - ${POLICY_FILE:?set POLICY_FILE}:/var/lib/orblx/policy.hujson:ro
+      - ${CONFIG_FILE:?set CONFIG_FILE}:/etc/orblx/coord.toml:ro
+      - ${IDP_CA_FILE:?set IDP_CA_FILE}:/etc/orblx/idp-ca.pem:ro
     networks:
       proof:
         ipv4_address: 172.30.18.2
+
+  idp:
+    image: orblx-w25-38-deny:w25
+    entrypoint: ["orblx-test-idp"]
+    command: [serve, --dir, /idp, --issuer, "https://idp:8443", --listen, "0.0.0.0:8443"]
+    volumes:
+      - orblx-w25-38-dd-idp:/idp
+      - orblx-w25-38-dd-tokens:/tokens
+    networks:
+      proof:
+        ipv4_address: 172.30.18.9
 
   owner:
     image: orblx-w25-38-deny:w25
@@ -186,6 +201,7 @@ services:
     volumes:
       - orblx-w25-38-dd-store:/coord-state:ro
       - orblx-w25-38-dd-a:/var/lib/orblx
+      - orblx-w25-38-dd-tokens:/tokens:ro
     extra_hosts:
       - "coord:172.30.18.2"
       - "owner:172.30.18.130"
@@ -260,6 +276,7 @@ services:
     volumes:
       - orblx-w25-38-dd-store:/coord-state:ro
       - orblx-w25-38-dd-allowed:/var/lib/orblx
+      - orblx-w25-38-dd-tokens:/tokens:ro
     extra_hosts:
       - "coord:172.30.18.2"
       - "owner:172.30.18.130"
@@ -275,6 +292,8 @@ volumes:
   orblx-w25-38-dd-a:
   orblx-w25-38-dd-b:
   orblx-w25-38-dd-allowed:
+  orblx-w25-38-dd-idp:
+  orblx-w25-38-dd-tokens:
 
 networks:
   proof:
