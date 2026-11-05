@@ -12,6 +12,7 @@ import w25_46_overlap_audit as audit
 
 FIXTURE = os.path.join(HERE, "fixtures", "w25-46-0910")
 RAW = os.path.join(HERE, "fixtures", "w25-46-raw")
+UNTIL = os.path.join(HERE, "fixtures", "w25-46-until")
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 AUDIT_TXT = os.path.join(REPO, "docs", "w25-46-overlap-audit.txt")
 SOURCE_DIR = "/workspace/orblx-w18-proof"
@@ -121,6 +122,38 @@ class OverlapAuditTest(unittest.TestCase):
             "note=after_flock_free cancel_script_log_latency\n",
             text,
         )
+        self.assertIn("until=\n", text)
+        self.assertNotIn("containers_removed_about", text)
+        self.assertNotIn("09:10:41", text)
+
+    def test_a_subdirectory_copy_is_one_holder_and_until_drops_a_later_acquire(self) -> None:
+        runs = audit.load_dir(UNTIL)
+        sources = {run.source for run in runs}
+        self.assertIn("w25-45-152-gate-a.log", sources)
+        self.assertIn("w25-45-152/main-side.log", sources)
+        pair = [
+            run
+            for run in runs
+            if audit.fmt_ts(run.acquire) == "2026-11-05T16:44:21.995+0900"
+        ]
+        self.assertEqual(len(pair), 2)
+        self.assertEqual({run.label for run in pair}, {"gate-a"})
+        self.assertEqual(len(audit.dedupe(pair)), 1)
+        open_text = audit.render(runs)
+        self.assertIn("until=\n", open_text)
+        self.assertIn("runs_before=3\n", open_text)
+        self.assertIn("runs_after_dedupe=2\n", open_text)
+        self.assertIn("duplicate_logs=1\n", open_text)
+        closed = audit.render(runs, until=audit.parse_ts("2026-11-05T10:05:23+09:00"))
+        self.assertIn("until=2026-11-05T10:05:23.000+0900\n", closed)
+        self.assertIn("runs_before=1\n", closed)
+        self.assertIn("runs_after_dedupe=1\n", closed)
+        self.assertNotIn("16:44:21.995", closed)
+        kept = audit.at_or_before(
+            audit.after_cutoff(runs, audit.parse_ts(audit.DEFAULT_CUTOFF)),
+            audit.parse_ts("2026-11-05T10:05:23+09:00"),
+        )
+        self.assertEqual([run.source for run in kept], ["early.log"])
 
     def test_a_colon_offset_parses_to_the_same_instant(self) -> None:
         self.assertEqual(

@@ -1,6 +1,7 @@
 w25-46 overlap audit
 dedupe_key=acquire_time+pid|label+acquire
 cutoff=2026-10-31T17:23:11.000+0900
+until=
 runs_before=7
 runs_after_dedupe=6
 duplicate_logs=1
@@ -19,6 +20,5 @@ rejudge policy-scale:orblx-w2534-scale-proof acquire=2026-11-05T09:14:40.878+090
 timeline proof_cancel time=2026-11-05T09:10:25.000+0900 path=w25-42-step2-cancel-20261105-091025.log:1
 timeline flock_free_at_or_before time=2026-11-05T09:10:35.126+0900 path=w25-34-proof-policy-scale-2876d63.log:169
 timeline containers_still_up time=2026-11-05T09:10:35.166+0900 other_orblx_containers=1 groups=orblx-w2542:1 path=w25-34-proof-policy-scale-2876d63.log:170
-timeline containers_removed_about time=2026-11-05T09:10:41.166+0900 estimate=contended_samples=3 sample_secs=2 path=w25-34-proof-policy-scale-2876d63.log:228
 timeline lock_released time=2026-11-05T09:10:44.000+0900 path=w25-42-step2-cancel-20261105-091025.log:2 note=after_flock_free cancel_script_log_latency
 No real 2-holder flock window. Container overlap: yes (policy-scale 09:10:35 INVALID).

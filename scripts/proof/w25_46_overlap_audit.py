@@ -11,7 +11,9 @@ A lock_released line in the cancel log is cancel-script latency. It is not the
 flock end.
 
 The default cutoff is the time of commit 393f7df (2026-10-31T17:23:11+09:00).
-Only acquires after that time are counted.
+Only acquires after that time are counted. --until counts acquires at or before
+that time. The scan reads .log files in the directory and in subdirectories.
+A path in the record is relative to the log directory.
 """
 
 from __future__ import annotations
@@ -48,7 +50,6 @@ WINDOW_END = "2026-11-05T09:15:00.000+0900"
 # Commit 393f7df. Acquires after this time are in the audit.
 DEFAULT_CUTOFF = "2026-10-31T17:23:11+09:00"
 SOAK_LABEL = "coord-cert-soak"
-SAMPLE_SECS = 2
 PID_MATCH = timedelta(seconds=5)
 VERDICT = (
     "No real 2-holder flock window. "
@@ -170,10 +171,10 @@ def _note_cancel(run: Run, when: datetime, source: str, line: int, pid: int | No
         run.pid = pid
 
 
-def parse_log(path: str) -> Parsed:
+def parse_log(path: str, source: str = "") -> Parsed:
     parsed = Parsed()
     current: Run | None = None
-    name = os.path.basename(path)
+    name = source or os.path.basename(path)
     with open(path, encoding="utf-8", errors="replace") as handle:
         for number, raw in enumerate(handle, start=1):
             line = raw.strip()
@@ -250,15 +251,26 @@ def parse_log(path: str) -> Parsed:
     return parsed
 
 
+def log_paths(log_dir: str) -> list[tuple[str, str]]:
+    root = os.path.abspath(log_dir)
+    found: list[tuple[str, str]] = []
+    for current, dirs, files in os.walk(root):
+        dirs.sort()
+        for name in sorted(files):
+            if not name.endswith(".log"):
+                continue
+            path = os.path.join(current, name)
+            if not os.path.isfile(path):
+                continue
+            rel = os.path.relpath(path, root).replace(os.sep, "/")
+            found.append((path, rel))
+    return found
+
+
 def load_dir(log_dir: str) -> list[Run]:
-    names = sorted(
-        name
-        for name in os.listdir(log_dir)
-        if name.endswith(".log") and os.path.isfile(os.path.join(log_dir, name))
-    )
     parsed = Parsed()
-    for name in names:
-        one = parse_log(os.path.join(log_dir, name))
+    for path, rel in log_paths(log_dir):
+        one = parse_log(path, source=rel)
         parsed.runs.extend(one.runs)
         parsed.holders.extend(one.holders)
         parsed.cancels.extend(one.cancels)
@@ -360,6 +372,10 @@ def after_cutoff(runs: list[Run], cutoff: datetime) -> list[Run]:
     return [run for run in runs if run.acquire > cutoff]
 
 
+def at_or_before(runs: list[Run], until: datetime) -> list[Run]:
+    return [run for run in runs if run.acquire <= until]
+
+
 def next_holder_acquire(run: Run, runs: list[Run]) -> datetime | None:
     later = [item.acquire for item in runs if item.acquire > run.acquire]
     if not later:
@@ -433,10 +449,17 @@ def _cite(name: str, line: int | None) -> str:
     return f"{name}:{line}"
 
 
-def render(runs: list[Run], cutoff: datetime | None = None, source_dir: str = "") -> str:
+def render(
+    runs: list[Run],
+    cutoff: datetime | None = None,
+    source_dir: str = "",
+    until: datetime | None = None,
+) -> str:
     if cutoff is None:
         cutoff = parse_ts(DEFAULT_CUTOFF)
     selected = after_cutoff(runs, cutoff)
+    if until is not None:
+        selected = at_or_before(selected, until)
     kept = dedupe(selected)
     start = parse_ts(WINDOW_START)
     end = parse_ts(WINDOW_END)
@@ -444,6 +467,7 @@ def render(runs: list[Run], cutoff: datetime | None = None, source_dir: str = ""
         "w25-46 overlap audit",
         "dedupe_key=acquire_time+pid|label+acquire",
         f"cutoff={fmt_ts(cutoff)}",
+        "until=" + (fmt_ts(until) if until is not None else ""),
         f"runs_before={len(selected)}",
         f"runs_after_dedupe={len(kept)}",
         f"duplicate_logs={len(selected) - len(kept)}",
@@ -514,20 +538,6 @@ def render(runs: list[Run], cutoff: datetime | None = None, source_dir: str = ""
                 f"groups={invalid_policy.groups} "
                 f"path={_cite(invalid_policy.source, invalid_policy.start_line)}"
             )
-        if (
-            invalid_policy.start_time is not None
-            and invalid_policy.contended is not None
-        ):
-            removed = invalid_policy.start_time + timedelta(
-                seconds=SAMPLE_SECS * invalid_policy.contended
-            )
-            lines.append(
-                "timeline containers_removed_about time="
-                f"{fmt_ts(removed)} "
-                f"estimate=contended_samples={invalid_policy.contended} "
-                f"sample_secs={SAMPLE_SECS} "
-                f"path={_cite(invalid_policy.source, invalid_policy.contention_line)}"
-            )
         if soak.lock_released is not None:
             lines.append(
                 "timeline lock_released time="
@@ -545,6 +555,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("log_dir")
     parser.add_argument("-o", "--output", default="")
     parser.add_argument("--cutoff", default=DEFAULT_CUTOFF)
+    parser.add_argument("--until", default="")
     parser.add_argument(
         "--source-dir",
         default="",
@@ -552,7 +563,13 @@ def main(argv: list[str]) -> int:
     )
     args = parser.parse_args(argv)
     source_dir = args.source_dir or os.path.abspath(args.log_dir)
-    text = render(load_dir(args.log_dir), cutoff=parse_ts(args.cutoff), source_dir=source_dir)
+    until = parse_ts(args.until) if args.until else None
+    text = render(
+        load_dir(args.log_dir),
+        cutoff=parse_ts(args.cutoff),
+        source_dir=source_dir,
+        until=until,
+    )
     if args.output:
         with open(args.output, "w", encoding="utf-8") as handle:
             handle.write(text)
