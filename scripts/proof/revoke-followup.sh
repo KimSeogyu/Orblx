@@ -180,7 +180,7 @@ enroll_node() {
 }
 
 ssh_cmd() {
-  printf '%s' "orblx ssh root@b --identity /tmp/sshid --netmap $STATE/netmap.json --peer-cert /tmp/b-cert.pem"
+  printf '%s' "orblx ssh root@b --state $STATE --peer-cert /tmp/b-cert.pem"
 }
 
 # Print the coordinator utime plus stime in clock ticks.
@@ -260,12 +260,10 @@ wait_path a b
 wait_path c b
 wait_log b 'ssh_listen '
 
-echo "=== [C] SSH identity and peer certificate on a and c ==="
+echo "=== [C] peer certificate on a and c ==="
 dc exec -T b cat "$STATE/cert.pem" >"$WORK/b-cert.pem"
 for name in a c; do
   dc exec -T "$name" sh -c "cat > /tmp/b-cert.pem" <"$WORK/b-cert.pem"
-  # An SSH login with a node SVID has no ticket, so the directory holds only the SVID and the bundle.
-  dc exec -T "$name" sh -c "rm -rf /tmp/sshid && mkdir -p /tmp/sshid && cp $STATE/cert.pem $STATE/key.pem $STATE/bundle.pem /tmp/sshid/"
   dc exec -T "$name" sh -c "$(ssh_cmd) --command 'echo ssh_ok'"
 done
 
