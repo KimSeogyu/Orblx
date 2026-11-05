@@ -46,7 +46,10 @@ use crate::punch::{
     admit_punch, decode_punch, encode_punch, exchange_same_ip, PunchDecision, PunchKind, PunchToken,
 };
 use crate::signed::{encode_hex, verify_signed_candidate, SignedCandidate};
-use crate::{EdgeError, StunClient, DIRECT_ATTEMPT_BUDGET, DIRECT_QUIC_PORT};
+use crate::{
+    EdgeError, PathMachine, PathOffer, PathPick, StunClient, DIRECT_ATTEMPT_BUDGET,
+    DIRECT_QUIC_PORT, RELAY_FAR_MS,
+};
 
 const HOLD_LIMIT: usize = 64;
 /// The router takes up to this many TUN packets for one seal and send round.
@@ -159,6 +162,11 @@ pub struct NatConfig {
     pub relay_udp: SocketAddr,
     /// The Relay TCP socket.
     pub relay_tcp: SocketAddr,
+    /// A peer relay that already has a working path.
+    ///
+    /// `None` means the node does not use a peer relay.
+    /// The node does not wait for this address before the first coordinator Relay packet.
+    pub peer_relay: Option<SocketAddr>,
     /// Replace the default route with this gateway before the TUN device opens.
     pub gateway: Option<Ipv4Addr>,
     /// Ask the gateway for a mapped UDP port. `Off` skips the probe.
@@ -248,6 +256,11 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         relay_out: Mutex::new(None),
         relay_broken: AtomicBool::new(false),
         relay_data_noted: AtomicBool::new(false),
+        peer_out: Mutex::new(None),
+        peer_broken: AtomicBool::new(false),
+        peer_data_noted: AtomicBool::new(false),
+        peer_relay: config.peer_relay,
+        coord_rtt_ms: AtomicU64::new(0),
         peer_name: config.peer_name,
         peer_overlay: config.peer_overlay,
         peer_svid: config.peer_svid,
@@ -276,8 +289,10 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         plan: AtomicU64::new(0),
         direct_rx: AtomicU64::new(0),
         relay_rx: AtomicU64::new(0),
+        peer_rx: AtomicU64::new(0),
         direct_heard: AtomicU64::new(0),
         relay_heard: AtomicU64::new(0),
+        peer_heard: AtomicU64::new(0),
         saw_direct: AtomicBool::new(false),
         peer_confirmed: AtomicBool::new(false),
         flushing: AtomicBool::new(false),
@@ -310,6 +325,14 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         .name("orblx-nat-relay".to_string())
         .spawn(move || relay_loop(relay_hub))
         .map_err(|err| EdgeError::Io(err.to_string()))?;
+    if hub.peer_relay.is_some() {
+        println!("The peer relay discovery does not delay the first packet.");
+        let peer_hub = Arc::clone(&hub);
+        thread::Builder::new()
+            .name("orblx-nat-peer-relay".to_string())
+            .spawn(move || peer_relay_loop(peer_hub))
+            .map_err(|err| EdgeError::Io(err.to_string()))?;
+    }
     let send_hub = Arc::clone(&hub);
     thread::Builder::new()
         .name("orblx-nat-send".to_string())
@@ -535,6 +558,16 @@ struct Hub {
     relay_broken: AtomicBool,
     /// True after the first data frame on the relay.
     relay_data_noted: AtomicBool,
+    /// The send handle of the peer relay attachment.
+    peer_out: Mutex<Option<RelaySender>>,
+    /// A send on the peer relay handle failed. The peer relay loop attaches again.
+    peer_broken: AtomicBool,
+    /// True after the first data frame on the peer relay.
+    peer_data_noted: AtomicBool,
+    /// The peer relay address. `None` means this node does not use a peer relay.
+    peer_relay: Option<SocketAddr>,
+    /// The coordinator Relay attach round-trip, in ms. Zero means no sample.
+    coord_rtt_ms: AtomicU64,
     peer_name: String,
     peer_overlay: Ipv4Addr,
     peer_svid: String,
@@ -573,8 +606,10 @@ struct Hub {
     plan: AtomicU64,
     direct_rx: AtomicU64,
     relay_rx: AtomicU64,
+    peer_rx: AtomicU64,
     direct_heard: AtomicU64,
     relay_heard: AtomicU64,
+    peer_heard: AtomicU64,
     saw_direct: AtomicBool,
     peer_confirmed: AtomicBool,
     /// True while one thread sends the queued frames.
@@ -607,6 +642,7 @@ struct TunLane {
 struct Queues {
     direct: VecDeque<Vec<u8>>,
     relay: VecDeque<Vec<u8>>,
+    peer: VecDeque<Vec<u8>>,
     hold: VecDeque<Vec<u8>>,
     /// Frames sent on direct, with the send time in ms.
     ///
@@ -620,6 +656,7 @@ struct Queues {
 enum Slot {
     Direct,
     Relay,
+    Peer,
 }
 
 impl Hub {
@@ -661,11 +698,13 @@ impl Hub {
         let first = match slot {
             Slot::Direct => self.direct_rx.swap(now, Ordering::Relaxed) == 0,
             Slot::Relay => self.relay_rx.swap(now, Ordering::Relaxed) == 0,
+            Slot::Peer => self.peer_rx.swap(now, Ordering::Relaxed) == 0,
         };
         if first {
             let name = match slot {
                 Slot::Direct => "direct",
                 Slot::Relay => "relay",
+                Slot::Peer => "peer-relay",
             };
             println!("The first {name} packet arrived at {now} ms.");
         }
@@ -676,6 +715,7 @@ impl Hub {
         match slot {
             Slot::Direct => self.direct_heard.store(value, Ordering::Relaxed),
             Slot::Relay => self.relay_heard.store(value, Ordering::Relaxed),
+            Slot::Peer => self.peer_heard.store(value, Ordering::Relaxed),
         }
     }
 
@@ -684,6 +724,7 @@ impl Hub {
         let rx = match slot {
             Slot::Direct => self.direct_rx.load(Ordering::Relaxed),
             Slot::Relay => self.relay_rx.load(Ordering::Relaxed),
+            Slot::Peer => self.peer_rx.load(Ordering::Relaxed),
         };
         recent_ms(rx, now)
     }
@@ -693,6 +734,7 @@ impl Hub {
         let heard = match slot {
             Slot::Direct => self.direct_heard.load(Ordering::Relaxed),
             Slot::Relay => self.relay_heard.load(Ordering::Relaxed),
+            Slot::Peer => self.peer_heard.load(Ordering::Relaxed),
         };
         self.fresh(slot, now) && recent_ms(heard, now)
     }
@@ -855,6 +897,7 @@ impl Hub {
         {
             self.flush_direct();
             self.flush_relay();
+            self.flush_peer();
             self.flushing.store(false, Ordering::Release);
         } else {
             self.wake_sender();
@@ -887,7 +930,10 @@ impl Hub {
             }
         }
         if plan.uses_relay() {
-            push_bound(&mut queues.relay, frame);
+            push_bound(&mut queues.relay, frame.clone());
+        }
+        if plan.uses_peer() {
+            push_bound(&mut queues.peer, frame);
         }
     }
 
@@ -913,6 +959,7 @@ impl Hub {
         let queue = match path {
             OverlayPath::Direct => &mut queues.direct,
             OverlayPath::Relay => &mut queues.relay,
+            OverlayPath::PeerRelay => &mut queues.peer,
         };
         let count = queue.len().min(max);
         queue.drain(..count).collect()
@@ -924,6 +971,7 @@ impl Hub {
         let queue = match path {
             OverlayPath::Direct => &mut queues.direct,
             OverlayPath::Relay => &mut queues.relay,
+            OverlayPath::PeerRelay => &mut queues.peer,
         };
         for frame in frames.into_iter().rev() {
             queue.push_front(frame);
@@ -986,6 +1034,51 @@ impl Hub {
                 return false;
             }
         }
+    }
+
+    /// Send all queued peer-relay frames now. Return false when a send fails.
+    fn flush_peer(&self) -> bool {
+        let mut out = lock(&self.peer_out);
+        let Some(sender) = out.as_mut() else {
+            return true;
+        };
+        loop {
+            let mut frames = self.pop_many(OverlayPath::PeerRelay, ROUTER_BATCH);
+            if frames.is_empty() {
+                return true;
+            }
+            let (sent, result) = sender.send_many(&frames);
+            if sent > 0 && !self.peer_data_noted.swap(true, Ordering::Relaxed) {
+                println!("first_packet peer-relay ms {}", self.now_ms());
+            }
+            if result.is_err() {
+                self.push_front_many(OverlayPath::PeerRelay, frames.split_off(sent));
+                *out = None;
+                self.peer_broken.store(true, Ordering::Relaxed);
+                return false;
+            }
+        }
+    }
+
+    /// Send control frames on the peer relay. Return false when a send fails.
+    fn send_peer(&self, frames: Vec<Vec<u8>>) -> bool {
+        let mut out = lock(&self.peer_out);
+        let Some(sender) = out.as_mut() else {
+            return frames.is_empty();
+        };
+        for frame in frames {
+            if sender.send_opaque(&frame).is_err() {
+                *out = None;
+                self.peer_broken.store(true, Ordering::Relaxed);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn set_peer_out(&self, sender: Option<RelaySender>) {
+        *lock(&self.peer_out) = sender;
+        self.peer_broken.store(false, Ordering::Relaxed);
     }
 
     /// Send control frames on the relay. Return false when a send fails.
@@ -1122,6 +1215,7 @@ fn plan_of(value: u64) -> SendPlan {
         1 => SendPlan::Direct,
         2 => SendPlan::Relay,
         3 => SendPlan::Both,
+        4 => SendPlan::Peer,
         _ => SendPlan::Hold,
     }
 }
@@ -1132,6 +1226,7 @@ fn plan_code(plan: SendPlan) -> u64 {
         SendPlan::Direct => 1,
         SendPlan::Relay => 2,
         SendPlan::Both => 3,
+        SendPlan::Peer => 4,
     }
 }
 
@@ -1840,6 +1935,82 @@ fn relay_loop(hub: Arc<Hub>) {
     hub.set_relay_out(None);
 }
 
+fn peer_relay_loop(hub: Arc<Hub>) {
+    let Some(addr) = hub.peer_relay else {
+        return;
+    };
+    println!("The peer relay address is {addr}.");
+    let mut pipe: Option<RelayPipe> = None;
+    let mut last_hello = Instant::now() - HELLO_GAP;
+    let mut last_probe = Instant::now() - PROBE_GAP;
+    while !stopped() {
+        if pipe.is_none() {
+            let attached = connect_peer(&hub, addr).and_then(|next| {
+                let sender = next.sender()?;
+                Ok((next, sender))
+            });
+            match attached {
+                Ok((next, sender)) => {
+                    println!("The peer relay transport is {}.", next.transport());
+                    hub.set_peer_out(Some(sender));
+                    pipe = Some(next);
+                }
+                Err(err) => {
+                    eprintln!("The peer relay attach failed. The node will retry. {err}");
+                    thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+            }
+        }
+        if hub.peer_broken.load(Ordering::Relaxed) {
+            hub.set_peer_out(None);
+            pipe = None;
+            continue;
+        }
+        let Some(current) = pipe.as_mut() else {
+            continue;
+        };
+        let mut broken = false;
+        let mut opened = Vec::new();
+        loop {
+            match current.recv_opaque() {
+                Ok(Some(frame)) => {
+                    if let (Some(packet), _) = hub.accept(&frame, Slot::Peer) {
+                        opened.push(packet);
+                    }
+                    if opened.len() >= UDP_BATCH {
+                        hub.deliver(std::mem::take(&mut opened));
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    broken = true;
+                    break;
+                }
+            }
+        }
+        hub.deliver(opened);
+        if broken {
+            eprintln!("The peer relay path stopped. The node will attach again.");
+            hub.set_peer_out(None);
+            pipe = None;
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        let frames = hub.send_control(Slot::Peer, &mut last_hello, &mut last_probe);
+        if !hub.send_peer(frames) || !hub.flush_peer() {
+            hub.set_peer_out(None);
+            pipe = None;
+            continue;
+        }
+        if current.wait_readable(RELAY_WAIT).is_err() {
+            hub.set_peer_out(None);
+            pipe = None;
+        }
+    }
+    hub.set_peer_out(None);
+}
+
 fn renew_port_map(hub: Arc<Hub>) {
     loop {
         let wait = {
@@ -1979,9 +2150,28 @@ fn sleep_for(time: Duration) -> bool {
 }
 
 fn connect_relay(hub: &Hub) -> Result<RelayPipe, orblx_relay::RelayError> {
-    match RelayPipe::connect_udp(hub.relay_udp, hub.relay_id, Duration::from_millis(800)) {
+    let started = Instant::now();
+    let pipe = match RelayPipe::connect_udp(hub.relay_udp, hub.relay_id, Duration::from_millis(800))
+    {
+        Ok(pipe) => pipe,
+        Err(_) => RelayPipe::connect_tcp(hub.relay_tcp, hub.relay_id, Duration::from_secs(2))?,
+    };
+    let rtt = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let rtt = rtt.max(1);
+    hub.coord_rtt_ms.store(rtt, Ordering::Relaxed);
+    println!("The coordinator relay rtt is {rtt} ms.");
+    if rtt >= RELAY_FAR_MS {
+        println!("The coordinator relay is far.");
+    } else {
+        println!("The coordinator relay is near.");
+    }
+    Ok(pipe)
+}
+
+fn connect_peer(hub: &Hub, addr: SocketAddr) -> Result<RelayPipe, orblx_relay::RelayError> {
+    match RelayPipe::connect_udp(addr, hub.relay_id, Duration::from_millis(800)) {
         Ok(pipe) => Ok(pipe),
-        Err(_) => RelayPipe::connect_tcp(hub.relay_tcp, hub.relay_id, Duration::from_secs(2)),
+        Err(_) => RelayPipe::connect_tcp(addr, hub.relay_id, Duration::from_secs(2)),
     }
 }
 
@@ -2009,6 +2199,7 @@ fn send_loop(hub: Arc<Hub>) {
         {
             hub.flush_direct();
             hub.flush_relay();
+            hub.flush_peer();
             hub.flushing.store(false, Ordering::Release);
         }
     }
@@ -2090,11 +2281,24 @@ fn router_loop(hub: Arc<Hub>) {
             direct_ok,
             budget_done,
         );
+        let peer_ok = hub.both_ways(Slot::Peer, now);
+        let rtt_ms = hub.coord_rtt_ms.load(Ordering::Relaxed);
+        let offer = PathOffer {
+            direct_up: direct_ok,
+            direct_failed: !direct_ok && allowed,
+            coordinator_up: relay_ok,
+            coordinator_rtt_ms: if rtt_ms == 0 { None } else { Some(rtt_ms) },
+            peer_relay_up: peer_ok,
+        };
+        let pick = PathMachine::pick_path(offer);
         let (before, next, plan) = {
             let mut select = lock(&hub.select);
             let before = select.current;
-            let next = select_path(&mut select, direct_ok, relay_ok, allowed, now);
-            (before, next, select.plan(now))
+            let base = select_path(&mut select, direct_ok, relay_ok, allowed, now);
+            let base_plan = select.plan(now);
+            let (next, plan) = apply_pick(base, base_plan, pick);
+            select.current = next;
+            (before, next, plan)
         };
         if next == Some(OverlayPath::Direct) {
             hub.saw_direct.store(true, Ordering::Relaxed);
@@ -2120,6 +2324,15 @@ fn router_loop(hub: Arc<Hub>) {
             hub.wake_sender();
         }
         if !known || next != reported {
+            if next == Some(OverlayPath::PeerRelay) {
+                println!("The path pick is peer-relay.");
+                if offer.coordinator_up {
+                    println!("The coordinator relay is far.");
+                } else {
+                    println!("The coordinator relay is down.");
+                }
+                println!("The direct path failed.");
+            }
             if let Some(path) = next {
                 println!("The path to {} is {}.", hub.peer_name, path.as_str());
                 println!("path_up {} ms {now}", path.as_str());
@@ -2139,6 +2352,31 @@ fn router_loop(hub: Arc<Hub>) {
         } else if last_status.elapsed() >= Duration::from_millis(500) {
             hub.write_status(next);
             last_status = Instant::now();
+        }
+    }
+}
+
+/// Keep a live direct path.
+/// Replace a relay path with the peer relay when [`PathMachine::pick_path`] says so.
+/// A pick of [`PathPick::None`] does not wait.
+fn apply_pick(
+    base: Option<OverlayPath>,
+    plan: SendPlan,
+    pick: PathPick,
+) -> (Option<OverlayPath>, SendPlan) {
+    if matches!(base, Some(OverlayPath::Direct)) {
+        return (base, plan);
+    }
+    match pick {
+        PathPick::Direct => (Some(OverlayPath::Direct), SendPlan::Direct),
+        PathPick::Relay => (Some(OverlayPath::Relay), SendPlan::Relay),
+        PathPick::PeerRelay => (Some(OverlayPath::PeerRelay), SendPlan::Peer),
+        PathPick::None => {
+            if matches!(base, Some(OverlayPath::Relay)) {
+                (base, plan)
+            } else {
+                (None, SendPlan::Hold)
+            }
         }
     }
 }

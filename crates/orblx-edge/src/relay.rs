@@ -529,6 +529,8 @@ pub fn run_relay_smoke(
         audit_absent: Some(RELAY_PROOF_PAYLOAD.to_vec()),
         audit_path: None,
         udp_discard,
+        sealed_only: false,
+        attach_delay: std::time::Duration::ZERO,
     })
     .map_err(map_relay)?;
     let udp = server

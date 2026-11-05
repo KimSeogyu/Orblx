@@ -393,6 +393,8 @@ fn setup(kind: StickNatKind) -> Result<LiveRelay, EdgeError> {
         audit_absent: Some(RELAY_PROOF_PAYLOAD.to_vec()),
         audit_path: None,
         udp_discard: kind.udp_discard(),
+        sealed_only: false,
+        attach_delay: std::time::Duration::ZERO,
     })
     .map_err(map_relay)?;
     let udp = relay
@@ -882,7 +884,8 @@ fn map_relay(err: RelayError) -> EdgeError {
         | RelayError::Closed
         | RelayError::TooBig
         | RelayError::SessionFull
-        | RelayError::NotAttached) => EdgeError::Relay(other.to_string()),
+        | RelayError::NotAttached
+        | RelayError::Plaintext) => EdgeError::Relay(other.to_string()),
     }
 }
 

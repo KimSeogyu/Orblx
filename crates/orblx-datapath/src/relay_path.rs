@@ -211,6 +211,8 @@ mod tests {
             audit_absent: None,
             audit_path: None,
             udp_discard: false,
+            sealed_only: false,
+            attach_delay: std::time::Duration::ZERO,
         })
         .unwrap();
         let session_id = relay_session_id("client", "exit");
