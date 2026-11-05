@@ -11,8 +11,7 @@ The gap matrix is not in this repo.
 `docs/rc3-release-sweep.md` names the private page "Orblx vs Tailscale 기능 격차 매트릭스 + Wave 계획".
 Row 33 is shipped. It is the one-use enroll token (`docs/w18-coord-enroll.md`).
 Row 35 is shipped. It is the scoped API token (`docs/w25-api-tokens.md`).
-This change uses row 34. That number is the unused identity slot between row 33 and row 35.
-Confirm row 34 on the private page before you treat the number as final.
+This change is row 34. Eng Lead confirmed that number.
 
 ## Marks
 
@@ -78,7 +77,11 @@ The coordinator removes an ephemeral node when either time is reached:
 
 A seen time is written at enroll and on a later peer call (netmap, renew, policy wait).
 The seen time is in memory and in `presence.json` (mode 0600). It is not in `nodes.json`.
-A restart uses the last `presence.json` value. If that file is missing, the seen time is the enroll time.
+A restart drops the memory map. The grace timer then uses the last `presence.json` write.
+It does not start again at zero. A node that was already offline is removed on the original 15 second mark.
+If `presence.json` is missing, the seen time is the enroll time.
+A node without `--ephemeral` stays after key expiry. That matches the Tailscale rule for a non-ephemeral node.
+Revoke that node with the existing admin path.
 
 Removal uses the existing revoke path (`revoke_principal`).
 That path writes the node SVID and each issued agent SVID into the deny file, so open sessions close.
@@ -91,7 +94,7 @@ If both times are reached, the record says `expiry`.
 A pre-auth node keeps the tags from its key.
 An ACL rule that names `tag:NAME` matches a node that carries that tag.
 The match is for the packet filter only.
-Route `autoApprovers` and exit nodes are not changed.
+Tag route `autoApprovers` and exit nodes are follow-up issue https://github.com/KimSeogyu/Orblx/issues/159.
 
 ## Audit
 
@@ -115,6 +118,7 @@ Deny reasons: `life`, `tag`, `grant`, `used`, `expired`, `revoked`, `unknown`.
 | `preauth::tests::one_use_reusable_expiry_revoke_and_unknown_are_refused` | One use, max uses, expiry, revoke, unknown key, hashed store, mode 0600, one audit record per event, no key text in the audit |
 | `preauth::tests::a_tag_or_grant_outside_the_caller_is_refused` | Tag owner check, token cannot set a tag, grant needs `grants:write`, life bound |
 | `preauth::tests::an_ephemeral_node_is_removed_on_grace_and_on_expiry` | Grace 15 seconds, expiry, deny list contains the SVID, one `node-remove` each |
+| `preauth::tests::a_restart_resumes_grace_from_presence_json` | REAL. After a restart, grace resumes from the last `presence.json` write. It does not start again at zero |
 | `preauth::tests::a_grant_inside_the_ceiling_is_preapproved_and_a_wider_grant_is_refused` | Ceiling auto-approve, wider grant refused, fetch issues the existing agent SVID |
 | `policy::tests::a_preauth_tag_matches_the_tag_rule` | A node tag matches an ACL tag rule |
 | `admin::tests::preauth_create_writes_the_ask_and_keeps_the_key_out_of_the_command` | CLI ask JSON, life bound, list, revoke |
@@ -129,8 +133,6 @@ It does not print key text. It was not executed here.
 
 ## Open points
 
-- Confirm that row 34 is the row on the private gap page.
 - Run the proof on a Linux host with Docker. This change does not claim `proof_ok`.
-- After a coordinator restart, the grace timer starts from the last `presence.json` write.
-- Tags do not change route `autoApprovers` or exit nodes.
+- Tag route `autoApprovers` and exit nodes are follow-up issue https://github.com/KimSeogyu/Orblx/issues/159.
 - A non-ephemeral node is not removed at key expiry. Revoke it with the existing admin path.

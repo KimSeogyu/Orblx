@@ -776,6 +776,13 @@ mod tests {
         base + Duration::from_millis(ms)
     }
 
+    /// Drop the process-local seen map for `dir`. A new process starts empty.
+    fn forget_process_seen(dir: &Path) {
+        let dir_key = dir.to_string_lossy().to_string();
+        let mut guard = super::SEEN.lock().unwrap();
+        guard.retain(|(key_dir, _), _| key_dir != &dir_key);
+    }
+
     fn policy_with_tag() -> String {
         r#"{
             "owners": ["spiffe://orblx.local/node/owner"],
@@ -1074,6 +1081,55 @@ mod tests {
                 && line["detail"].as_str().unwrap().contains("reason expiry")
         }));
         assert_eq!(remove_due(&coord, later(start, 20_000)).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_restart_resumes_grace_from_presence_json() {
+        let dir = scratch("restart");
+        let start = SystemTime::now();
+        let seen_at = later(start, 5_000);
+        let seen_ms = u64::try_from(
+            seen_at
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        {
+            let coord = open_coord(&dir.0);
+            let mut ask = ask_base();
+            ask.ephemeral = true;
+            ask.ttl_secs = 3600;
+            let made = create(&coord, &ask, "spiffe://orblx.local/node/owner", start).unwrap();
+            enroll(
+                &coord,
+                "quiet",
+                &key_text(&made),
+                &["quiet:443".to_string()],
+                &[],
+                start,
+            )
+            .unwrap();
+            super::note_seen(&coord, "quiet", seen_at).unwrap();
+            let text = fs::read_to_string(dir.0.join("presence.json")).unwrap();
+            let file: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(file["seen"]["quiet"].as_u64(), Some(seen_ms));
+            assert_eq!(remove_due(&coord, later(seen_at, 14_999)).unwrap(), 0);
+        }
+        // A process restart drops the in-memory seen map. The file remains.
+        forget_process_seen(&dir.0);
+        let coord = open_coord(&dir.0);
+        assert_eq!(remove_due(&coord, later(seen_at, 14_999)).unwrap(), 0);
+        assert_eq!(remove_due(&coord, later(seen_at, 15_000)).unwrap(), 1);
+        let nodes = coord.node_list().unwrap();
+        let quiet = nodes.iter().find(|node| node.name == "quiet").unwrap();
+        assert!(quiet.removed);
+        let lines = audit_lines(&coord);
+        assert!(lines.iter().any(|line| {
+            line["action"].as_str() == Some("node-remove")
+                && line["target"].as_str() == Some("quiet")
+                && line["detail"].as_str().unwrap().contains("reason grace")
+        }));
     }
 
     #[test]
