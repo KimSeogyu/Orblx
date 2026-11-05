@@ -1,0 +1,17 @@
+{
+  // Admin role proof. Second policy text. The comment is the only change.
+  // role proof edit
+  "nodeApproval": true,
+  "owners": ["spiffe://orblx.local/node/owner"],
+  "userApproval": {
+    "ownerUsers": ["oidc:olivia"]
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/owner"],
+      "proto": "tcp",
+      "dst": ["spiffe://orblx.local/node/owner:*"]
+    }
+  ]
+}

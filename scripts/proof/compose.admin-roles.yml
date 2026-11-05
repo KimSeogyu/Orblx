@@ -1,0 +1,46 @@
+# Admin role proof stack.
+# idp is the test OIDC issuer. coord is the coordinator.
+# tool runs enroll and admin calls. Each user has a state directory under /homes.
+name: orblx-admin-roles
+
+services:
+  idp:
+    image: ${RBAC_IMAGE:?set RBAC_IMAGE}
+    entrypoint: ["orblx-test-idp"]
+    command: [serve, --dir, /idp, --issuer, "https://idp:8443", --listen, "0.0.0.0:8443"]
+    volumes:
+      - idp:/idp
+      - tokens:/tokens
+    networks: [proof]
+
+  coord:
+    image: ${RBAC_IMAGE:?set RBAC_IMAGE}
+    entrypoint: ["orblx"]
+    command:
+      [coord, serve, --state, /var/lib/orblx, --listen, "0.0.0.0:443", --name, coord,
+       --policy, /var/lib/orblx/policy.hujson, --config, /etc/orblx/coord.toml]
+    volumes:
+      - store:/var/lib/orblx
+      - ${CONFIG_FILE:?set CONFIG_FILE}:/etc/orblx/coord.toml:ro
+      - ${IDP_CA_FILE:?set IDP_CA_FILE}:/etc/orblx/idp-ca.pem:ro
+    networks: [proof]
+
+  tool:
+    image: ${RBAC_IMAGE:?set RBAC_IMAGE}
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    volumes:
+      - store:/coord-state:ro
+      - tokens:/tokens
+      - homes:/homes
+      - ${POLICY_DIR:?set POLICY_DIR}:/policy:ro
+    networks: [proof]
+
+networks:
+  proof:
+
+volumes:
+  idp:
+  tokens:
+  store:
+  homes:
