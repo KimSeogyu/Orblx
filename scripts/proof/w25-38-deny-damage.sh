@@ -8,11 +8,14 @@
 # Gate 0: with a valid deny.json on b, allowed can SSH to b and ping b (the traffic does not
 #   change), and a is refused after `admin revoke-all a`.
 # Gate 3 (W25-38 merge blocker): the coordinator stops for OFFLINE_SECS (default 600 s)
-#   and deny.json on b stays valid. A valid list never goes stale with age. During the
-#   whole time, allowed sends ICMP to b over the mesh with no loss, and each orblx ping
-#   (a new QUIC session) from allowed to b is accepted. A new SSH login asks the
-#   coordinator for a user certificate, so the proof does not require an SSH login
-#   while the coordinator is down. The counter
+#   and deny.json on b stays valid. A valid list never goes stale with age. Before the
+#   stop, allowed opens one SSH shell to b. The shell prints one line each 10 s. The
+#   session must stay up for the full OFFLINE_SECS. The gap bound is 20 s (two intervals).
+#   One interval is the normal space between two lines. A gap above two intervals means
+#   one line is missing. The harness does not add slack to this bound. A new SSH login
+#   needs the coordinator (W25-31), so this gate does not open a new login after the stop.
+#   During the whole time, allowed sends ICMP to b over the mesh with no loss, and each
+#   orblx ping (a new QUIC session) from allowed to b is accepted. The counter
 #   orblx_node_refused of b does not change (0 refused sessions and frames).
 #   Node a (revoked) stops during gate 3, so its dial attempts do not change the counter.
 # Gate 1: the coordinator stays stopped, so b cannot get a new deny list. For each damage kind
@@ -51,6 +54,13 @@ TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 PROFILE="${ORBLX_PROOF_PROFILE:-release}"
 SAMPLES="${ORBLX_DENY_SAMPLES:-3}"
 OFFLINE_SECS="${ORBLX_DENY_OFFLINE_SECS:-600}"
+# The remote shell prints one line each 10 s.
+# The gap bound is two intervals (20 s, 20000 ms).
+# One interval is the normal space between two lines.
+# A gap above two intervals means one line is missing.
+# The harness does not add slack to this bound.
+SSH_HOLD_INTERVAL_S=10
+SSH_HOLD_GAP_MS=$(( SSH_HOLD_INTERVAL_S * 2 * 1000 ))
 WINDOW_ENROLLS="${ORBLX_DENY_WINDOW_ENROLLS:-10}"
 WINDOW_MAX_MS=2000
 STATE=/var/lib/orblx
@@ -286,6 +296,92 @@ ssh_try() {
   echo "$result"
 }
 
+# Open one SSH shell from allowed to b. The command path ends after 30 s, so gate 3
+# uses a shell. The shell prints `tick N MS` each SSH_HOLD_INTERVAL_S.
+# ssh_hold_pid is the client. hold_writer keeps the client stdin open.
+open_ssh_hold() {
+  local fifo="$WORK/gate3-ssh.in"
+  rm -f "$fifo"
+  mkfifo "$fifo"
+  : >"$WORK/gate3-ssh-hold.out"
+  {
+    printf '%s\n' "i=0; while true; do i=\$((i+1)); printf 'tick %s %s\\n' \"\$i\" \"\$(date +%s%3N)\"; sleep ${SSH_HOLD_INTERVAL_S}; done"
+    # Stay open through the first-line wait and the offline window.
+    sleep $(( OFFLINE_SECS + 180 ))
+  } >"$fifo" &
+  hold_writer=$!
+  dc exec -T allowed orblx ssh probe@b --state "$STATE" --peer-cert /tmp/b-cert.pem --shell \
+    <"$fifo" >"$WORK/gate3-ssh-hold.out" 2>&1 &
+  ssh_hold_pid=$!
+}
+
+# Wait until the shell prints one tick. Fail when the client ends or the line does not come.
+# This wait only checks that the session is open. It is not a retry of a failed login.
+wait_ssh_hold() {
+  local i
+  for i in $(seq 1 60); do
+    if tr -d '\r' <"$WORK/gate3-ssh-hold.out" | grep -qE 'tick [0-9]+ [0-9]+'; then
+      echo "ssh hold open pid ${ssh_hold_pid}"
+      return 0
+    fi
+    if ! kill -0 "$ssh_hold_pid" 2>/dev/null; then
+      echo "The SSH session ended before the coordinator stopped." >&2
+      tail -n 5 "$WORK/gate3-ssh-hold.out" >&2 || true
+      return 1
+    fi
+    sleep 1
+  done
+  echo "The SSH session did not print a line before the coordinator stopped." >&2
+  tail -n 5 "$WORK/gate3-ssh-hold.out" >&2 || true
+  return 1
+}
+
+# Print the tick count and the largest gap in ms.
+# The points are the last tick at or before the window, each later tick, and the end time.
+ssh_hold_gap() {
+  local start_ms="$1"
+  local end_ms="$2"
+  local max=0 count=0 anchor="" ms
+  while IFS= read -r ms; do
+    [[ "$ms" =~ ^[0-9]+$ ]] || continue
+    count=$(( count + 1 ))
+    if (( ms <= start_ms )); then
+      anchor=$ms
+      continue
+    fi
+    if [[ -z "$anchor" ]]; then
+      anchor=$ms
+      continue
+    fi
+    if (( ms - anchor > max )); then
+      max=$(( ms - anchor ))
+    fi
+    anchor=$ms
+  done < <(tr -d '\r' <"$WORK/gate3-ssh-hold.out" | grep -oE 'tick [0-9]+ [0-9]+' | awk '{print $3}')
+  if [[ -n "$anchor" ]]; then
+    if (( end_ms - anchor > max )); then
+      max=$(( end_ms - anchor ))
+    fi
+  fi
+  printf '%s %s\n' "$count" "$max"
+}
+
+# End the client. The server then ends the shell.
+close_ssh_hold() {
+  if [[ -n "${ssh_hold_pid:-}" ]] && kill -0 "$ssh_hold_pid" 2>/dev/null; then
+    kill "$ssh_hold_pid" 2>/dev/null || true
+  fi
+  if [[ -n "${hold_writer:-}" ]] && kill -0 "$hold_writer" 2>/dev/null; then
+    kill "$hold_writer" 2>/dev/null || true
+  fi
+  if [[ -n "${ssh_hold_pid:-}" ]]; then
+    wait "$ssh_hold_pid" 2>/dev/null || true
+  fi
+  if [[ -n "${hold_writer:-}" ]]; then
+    wait "$hold_writer" 2>/dev/null || true
+  fi
+}
+
 # Print accepted, refused, or unknown for one `orblx ping` (a new QUIC session) from FROM to b.
 # The ping uses the netmap of FROM and does not use the coordinator.
 ping_try() {
@@ -448,6 +544,8 @@ errors_before="$(deny_error_lines)"
 version_before="$(dc exec -T b jq -r .version "$DENY" | tr -d '\r\n')"
 echo "gate3 b refused_before ${refused_before} deny_error_lines_before ${errors_before} deny_version ${version_before}"
 [[ -n "$refused_before" ]]
+open_ssh_hold
+wait_ssh_hold
 dc stop coord >/dev/null
 offline_start="$(date +%s)"
 icmp_count=$(( OFFLINE_SECS * 2 ))
@@ -482,12 +580,28 @@ errors_after="$(deny_error_lines)"
 g3_state="$(deny_state)"
 version_after="$(dc exec -T b jq -r .version "$DENY" | tr -d '\r\n')"
 g3_refused=$(( refused_after - refused_before ))
+end_ms="$(date +%s%3N)"
+read -r tick_count max_out_gap_ms < <(ssh_hold_gap "$(( offline_start * 1000 ))" "$end_ms")
+if kill -0 "$ssh_hold_pid" 2>/dev/null; then
+  ssh_exited=0
+  ssh_held_s="$offline_secs_done"
+else
+  ssh_exited=1
+  ssh_held_s=0
+fi
+echo "gate3 ssh_held_s=${ssh_held_s} max_out_gap_ms=${max_out_gap_ms} exited=${ssh_exited}"
 echo "summary w25_38_gate3 offline_s ${offline_secs_done} icmp_tx ${icmp_tx} icmp_rx ${icmp_rx} probes ${g3_probes} accepted ${g3_accepted} unknown ${g3_unknown} refused_frames ${g3_refused} deny_error_lines ${errors_before}->${errors_after} deny_state ${g3_state} deny_version ${version_before}->${version_after}"
+close_ssh_hold
 if [[ "$offline_secs_done" -lt "$OFFLINE_SECS" || -z "$icmp_tx" || "$icmp_tx" -lt 1 \
   || "$icmp_rx" != "$icmp_tx" || "$g3_probes" -lt 2 || "$g3_accepted" -ne "$g3_probes" \
   || "$g3_unknown" -ne 0 || "$g3_refused" -ne 0 || "$errors_after" != "$errors_before" \
   || "$g3_state" != valid || "$version_after" != "$version_before" ]]; then
   echo "The gate 3 (coordinator offline, valid deny.json) failed." >&2
+  exit 1
+fi
+if [[ "$ssh_exited" -ne 0 || "$ssh_held_s" -lt "$OFFLINE_SECS" || "$tick_count" -lt 1 \
+  || "$max_out_gap_ms" -gt "$SSH_HOLD_GAP_MS" ]]; then
+  echo "The SSH session did not stay up for ${OFFLINE_SECS} s." >&2
   exit 1
 fi
 dc start a >/dev/null
