@@ -3,10 +3,13 @@
 #
 # The coordinator issues node SVIDs with a short life (SSH_RENEW_TTL, default 180 s).
 # W25-45: the coordinator refuses a node SVID life under 180 s.
-# The node renews at 2/3 of the life, and each renewal writes a new node key.
+# The node renews at 2/3 of the life. That gap is one renewal interval.
+# Each renewal writes a new node key.
 # Gate b: node a logs in to node b before the first renewal of b, after it, and after the
-# second renewal. The client pins the key of the current cert.pem of node b each time.
-# Gate c: one session that opens before the first renewal of b and ends after it.
+# second renewal. The login after the second renewal ends within one renewal interval.
+# The client pins the key of the current cert.pem of node b each time.
+# Gate c: one PTY shell opens before the first renewal of b and ends after it.
+# An exec command stops at 30 s, so gate c does not use --command.
 # The script does not print private keys, tickets, or SVID proofs.
 set -euo pipefail
 # shellcheck source=scripts/proof/pipe-lib.sh
@@ -15,14 +18,19 @@ require_root "$@"
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
-bin="$root/target/debug/orblx"
+bin="$root/target/release/orblx"
 compose_file="$root/scripts/proof/compose.ssh-renew.yml"
 work=$(mktemp -d)
 env_file="$work/ssh-renew.env"
 image_dir=""
 ttl="${SSH_RENEW_TTL:-180}"
-# Gate c: the session runs this long. It opens before the first renewal of b.
-session_secs="${SSH_RENEW_SESSION_SECS:-$((ttl * 2 / 3))}"
+# One renewal interval. The node renews at 2/3 of the SVID life.
+renew_interval=$((ttl * 2 / 3))
+# Gate c: the shell stays open for one renewal interval.
+# At the TTL floor of 180 s the shell runs for 120 s, so it can span renewal 1.
+session_secs="${SSH_RENEW_SESSION_SECS:-$renew_interval}"
+renewal1_at=""
+renewal_2_seen_at=""
 
 compose() {
   docker compose --env-file "$env_file" --progress quiet -f "$compose_file" "$@"
@@ -64,10 +72,11 @@ open_legacy_forward() {
 echo "=== [REAL] one Linux host ==="
 uname -s
 uname -m
-rustc --version
+rustc -V
+echo "cargo profile=release"
 
 echo "=== [C] build image ==="
-cargo build -p orblx-cli --bin orblx --locked
+cargo build --release -p orblx-cli --bin orblx --locked
 # shellcheck source=stage-image.sh
 source "$root/scripts/proof/stage-image.sh"
 image_dir="$(stage_proof_image "$root" "$bin")"
@@ -168,6 +177,28 @@ ssh_b() {
   compose exec -T node-a orblx ssh alice@b --identity /tmp/id --netmap /etc/orblx/netmap.json \
     --peer-cert "/tmp/${peer}.pem" --command "$command"
 }
+# Gate c uses a PTY shell. The exec path stops after 30 s.
+# The remote shell runs the sleep. The typed line shows SURV""IVED.
+# The shell output line shows SURVIVED and the unix time.
+ssh_shell() {
+  local peer=$1
+  printf 'sleep %s; echo SURV""IVED at $(date +%%s); exit\n' "$session_secs" \
+    | compose exec -T node-a orblx ssh alice@b --shell --identity /tmp/id \
+      --netmap /etc/orblx/netmap.json --peer-cert "/tmp/${peer}.pem"
+}
+# Print the unix time from the SURVIVED output line.
+# Skip a line that still has the typed SURV""IVED text.
+shell_end_at() {
+  local line end=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line//$'\r'/}"
+    [[ "$line" == *'SURV""IVED'* ]] && continue
+    if [[ "$line" =~ SURVIVED[[:space:]]at[[:space:]]([0-9]+) ]]; then
+      end="${BASH_REMATCH[1]}"
+    fi
+  done <"$1"
+  printf '%s\n' "$end"
+}
 login() {
   local label=$1 out
   stage_login "peer-${label}"
@@ -176,9 +207,20 @@ login() {
   [[ "$out" == "alice" ]]
 }
 wait_renewal() {
-  local want=$1 limit=$((ttl * 2))
+  local want=$1 limit=$((ttl * 2)) seen count
   for _ in $(seq 1 "$limit"); do
-    (( $(renewals_b) >= want )) && return 0
+    count="$(renewals_b)"
+    if (( count >= want )); then
+      seen="$(date +%s)"
+      if (( want == 1 )); then
+        renewal1_at="$seen"
+        echo "renewal1_at ${renewal1_at} renewals_b ${count}"
+      elif (( want == 2 )); then
+        renewal_2_seen_at="$seen"
+        echo "renewal_2_seen_at ${renewal_2_seen_at} renewals_b ${count}"
+      fi
+      return 0
+    fi
     sleep 1
   done
   echo "renewal_not_active node b renewals $(renewals_b) want ${want} after ${limit} s" >&2
@@ -190,12 +232,15 @@ echo "=== [C] gate b: login before the first renewal ==="
 key0="$(key_b)"
 login before
 
-echo "=== [C] gate c: a session opens before the first renewal ==="
+echo "=== [C] gate c: a shell opens before the first renewal ==="
 stage_login peer-session
 session_out="$work/session.out"
 session_start_renewals="$(renewals_b)"
-( ssh_b peer-session "sleep ${session_secs}; printf '%s\n' survived" >"$session_out" 2>&1
-  echo "exit $?" >>"$session_out" ) &
+(
+  set +e
+  ssh_shell peer-session >"$session_out" 2>&1
+  echo "exit $?" >>"$session_out"
+) &
 session_pid=$!
 
 echo "=== [C] gate b: login after renewal 1 ==="
@@ -212,19 +257,27 @@ echo "denied old_host_key_1"
 
 wait "$session_pid" || true
 session_end_renewals="$(renewals_b)"
+shell_end="$(shell_end_at "$session_out")"
 echo "session_renewals_b start ${session_start_renewals} end ${session_end_renewals}"
+echo "shell_end ${shell_end:-none} renewal1_at ${renewal1_at}"
 sed 's/^/  session: /' "$session_out" | tr -d '\r'
 (( session_end_renewals > session_start_renewals )) || {
   echo "gate_c inconclusive: the session did not span a renewal" >&2
   exit 1
 }
-if grep -qx 'survived' <(tr -d '\r' <"$session_out") && grep -qx 'exit 0' "$session_out"; then
-  echo "gate_c survived"
-elif grep -qx 'exit 0' "$session_out"; then
-  echo "gate_c closed_cleanly_without_output"
-else
-  echo "gate_c closed $(tail -1 "$session_out")"
-fi
+grep -qx 'exit 0' "$session_out" || {
+  echo "gate_c shell did not exit 0." >&2
+  exit 1
+}
+[[ -n "$shell_end" ]] || {
+  echo "gate_c did not show SURVIVED." >&2
+  exit 1
+}
+(( shell_end > renewal1_at )) || {
+  echo "gate_c shell_end ${shell_end} is not after renewal 1 at ${renewal1_at}." >&2
+  exit 1
+}
+echo "gate_c survived"
 
 echo "=== [C] gate b: login after renewal 2 ==="
 wait_renewal 2
@@ -232,4 +285,11 @@ key2="$(key_b)"
 echo "host_key_rotated_2 $([[ "$key2" != "$key1" ]] && echo yes || echo no)"
 [[ "$key2" != "$key1" ]]
 login after-2
+after_2_at="$(date +%s)"
+echo "after_2_login_at ${after_2_at} renewal_2_seen_at ${renewal_2_seen_at} interval ${renew_interval} renewals_b $(renewals_b)"
+if (( after_2_at > renewal_2_seen_at + renew_interval )); then
+  echo "gate_b login after renewal 2 is later than one renewal interval." >&2
+  exit 1
+fi
+echo "gate_b after-2 within one renewal interval"
 echo "proof_ok ssh-renew"
