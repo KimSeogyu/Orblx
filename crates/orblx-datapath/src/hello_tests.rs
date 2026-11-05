@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -1711,16 +1711,25 @@ fn pair_netmap(self_name: &str, self_ip: &str, peer: &str, peer_ip: &str, port: 
 fn memory_request(
     config: HelloConfig,
     netmap: Netmap,
-    listen: SocketAddr,
+    listen_socket: UdpSocket,
     state_dir: PathBuf,
     stop: watch::Receiver<bool>,
-    metrics: Option<SocketAddr>,
+    metrics_listener: Option<TcpListener>,
     on_listen: Option<Box<dyn FnOnce(crate::ListenEvent) + Send>>,
 ) -> NodeRequest {
+    let listen = listen_socket
+        .local_addr()
+        .expect("The reserved UDP socket has no local port.");
+    let metrics = metrics_listener.as_ref().map(|listener| {
+        listener
+            .local_addr()
+            .expect("The reserved TCP listener has no local port.")
+    });
     NodeRequest {
         config,
         netmap,
         listen,
+        listen_socket: Some(listen_socket),
         state_dir,
         renew: None,
         stop: Some(stop),
@@ -1737,6 +1746,7 @@ fn memory_request(
         on_ready: None,
         on_listen,
         metrics,
+        metrics_listener,
         filter: None,
     }
 }
@@ -1781,9 +1791,13 @@ async fn a_past_deadline_does_not_redial_in_a_tight_loop() {
         10,
     );
     let listener = config_at(&material, "b", now, Duration::from_secs(300), now, 600);
-    let port_a = free_udp();
-    let port_b = free_udp();
-    let metrics = free_tcp();
+    let mut udp = crate::reserve_udp_sockets(2);
+    let socket_b = udp.pop().unwrap();
+    let socket_a = udp.pop().unwrap();
+    let metrics_listener = reserve_tcp_listener();
+    let port_a = socket_a.local_addr().unwrap();
+    let port_b = socket_b.local_addr().unwrap();
+    let metrics = metrics_listener.local_addr().unwrap();
     let dir_a = std::env::temp_dir().join(format!(
         "orblx-dial-hold-a-{}-{}",
         std::process::id(),
@@ -1812,10 +1826,10 @@ async fn a_past_deadline_does_not_redial_in_a_tight_loop() {
         memory_request(
             dialer,
             pair_netmap("a", "100.64.0.1", "b", "100.64.0.2", port_b.port()),
-            port_a,
+            socket_a,
             dir_a.clone(),
             stop_a,
-            Some(metrics),
+            Some(metrics_listener),
             Some(Box::new(move |_| {
                 *dialer_mark.lock().unwrap() = Some(Instant::now());
             })),
@@ -1829,7 +1843,7 @@ async fn a_past_deadline_does_not_redial_in_a_tight_loop() {
         memory_request(
             listener,
             pair_netmap("b", "100.64.0.2", "a", "100.64.0.1", port_a.port()),
-            port_b,
+            socket_b,
             dir_b.clone(),
             stop_b,
             None,
