@@ -2,7 +2,7 @@
 
 This change adds named device posture rules to the policy. A grant or an SSH rule can name those rules. The coordinator checks the rules before it issues a capability ticket or an agent grant. When a node leaves posture, the coordinator revokes the ticket and the issued agent grants on the existing deny path.
 
-The proposed gap-matrix row is 37. The PO confirms the row number. Rows 32, 33, and 35 are on `main`. Row 34 is open pull request 158. Row 36 is open pull request 161. This change does not edit the files those pull requests add.
+The gap-matrix row is 25. Row 37 is Tailnet Lock. The target for row 25 is PARITY-partial: `os` and `clientVersion` are self-reported, and this change adds no attestation. Row 25 is not rc.3 scope. Rows 32, 33, and 35 are on `main`. Row 34 is open pull request 158. Row 36 is open pull request 161. This change does not edit the files those pull requests add.
 
 Labels:
 
