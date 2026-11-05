@@ -27,8 +27,9 @@ NODES=(a ak2 arogue b c)
 # W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$PROOF_LIB_DIR/proof-lock.sh"
+PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap proof_lock_end EXIT
-proof_lock_take "node-lock"
+proof_lock_take "node-lock" "orblx-w23a-node-lock"
 # W25-14b: start from a clean compose state (all profiles, all volumes).
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"

@@ -49,6 +49,7 @@ dc() {
 # W25-5: one box proof at a time. The lock waits.
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$ROOT/scripts/proof/proof-lock.sh"
+PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 # shellcheck source=scripts/proof/pipe-lib.sh
 . "$ROOT/scripts/proof/pipe-lib.sh"
 
@@ -61,7 +62,7 @@ cleanup() {
   fi
   proof_lock_end || true
 }
-trap cleanup EXIT
+trap 'cleanup' EXIT
 
 fail() {
   echo "FAIL: $1" >&2
@@ -291,7 +292,7 @@ restore_router() {
   wait_direct client "$router" 120 || fail "${router} did not come back."
 }
 
-proof_lock_take "ha-routers:${PROJECT}" "${PROJECT}-"
+proof_lock_take "ha-routers:${PROJECT}" "${PROJECT}"
 # W25-14b: start from a clean compose state (all profiles, all volumes).
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$ROOT/scripts/proof/compose-clean.sh"
@@ -339,7 +340,8 @@ open_legacy_forward
 
 echo "=== [C] build image ==="
 BIN="$ROOT/target/release/orblx"
-cargo build -q --release -p orblx-cli --bin orblx
+echo "rustc_version $(rustc -V)"
+cargo build --release -p orblx-cli --bin orblx
 # shellcheck source=stage-image.sh
 source "$ROOT/scripts/proof/stage-image.sh"
 image_dir="$(stage_proof_image "$ROOT" "$BIN")"

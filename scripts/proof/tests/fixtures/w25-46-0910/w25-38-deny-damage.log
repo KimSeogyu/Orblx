@@ -1,0 +1,4 @@
+proof_lock deny-damage acquired at 2026-11-05T09:13:31.657+0900 after 15 ms, file /workspace/.orblx-proof.lock
+proof_context deny-damage phase start time 2026-11-05T09:13:31.700+0900 load 0.10/0.10/0.10 other_orblx_containers 0 groups -
+proof_contention deny-damage samples 2 contended_samples 0 unknown_samples 0 max_other_orblx_containers 0 max_load1 0.10
+proof_lock deny-damage released at 2026-11-05T09:14:10.000+0900 pid=3100002

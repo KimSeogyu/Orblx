@@ -16,6 +16,7 @@ mod quic;
 mod relay_path;
 mod router;
 mod run;
+mod soak;
 mod subnet;
 mod tun_bench;
 mod tun_dev;
@@ -45,8 +46,8 @@ pub use netmap::{
 };
 pub use node::{
     format_node_status, read_status_text, run_memory_node, run_node, running_pid, ListenEvent,
-    MemoryDevice, NodeRequest, NodeStatus, RenewedLeaf, StatusPeer, SvidRenewer, NODE_PID_FILE,
-    NODE_RECORD_FILE, NODE_STATUS_FILE,
+    MemoryDevice, NodeRequest, NodeStatus, RenewedLeaf, RenewedTicket, StatusPeer, SvidRenewer,
+    NODE_PID_FILE, NODE_RECORD_FILE, NODE_STATUS_FILE,
 };
 pub use quic::{
     measure_hello_rtt, prove_hello_socket, HelloConfig, HelloEndpoint, HelloReceiver, HelloSender,

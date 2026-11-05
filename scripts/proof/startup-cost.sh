@@ -23,8 +23,9 @@ rm -f "$build_json" "$log"
 
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$ROOT/scripts/proof/proof-lock.sh"
+PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap proof_lock_end EXIT
-proof_lock_take "startup-cost" "orblx-startup-cost-"
+proof_lock_take "startup-cost"
 
 if ! cargo test -p orblx-coord --lib --no-run --message-format=json >"$build_json"; then
   echo "The build of the orblx-coord test binary failed."

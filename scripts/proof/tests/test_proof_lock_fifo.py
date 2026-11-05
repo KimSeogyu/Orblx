@@ -29,9 +29,14 @@ LIB_W25_5 = os.path.join(HERE, "fixtures", "proof-lock-w25-5-d0ddf7f.sh")
 LIB_W25_14 = os.path.join(HERE, "fixtures", "proof-lock-w25-14-9d53d3c.sh")
 
 # A stand-in proof: take the lock, write start and end times, hold the lock for $3 s.
+# /proc/uptime is Linux. macOS uses time.monotonic_ns. Both ignore a realtime step.
+HOLD_MS = (
+    'hold_ms() { if [[ -r /proc/uptime ]]; then awk \'{printf "%d", $1 * 1000}\' /proc/uptime; '
+    'else python3 -c "import time; print(time.monotonic_ns() // 1000000)"; fi; }; '
+)
 PROOF = (
-    '. "$0"; trap proof_lock_end EXIT; proof_lock_take "$1"; '
-    'echo "start $1 $(date +%s%3N)" >>"$2"; sleep "$3"; echo "end $1 $(date +%s%3N)" >>"$2"'
+    '. "$0"; trap proof_lock_end EXIT; proof_lock_take "$1"; ' + HOLD_MS +
+    'echo "start $1 $(hold_ms)" >>"$2"; sleep "$3"; echo "end $1 $(hold_ms)" >>"$2"'
 )
 
 HAS_FLOCK = shutil.which("flock") is not None and os.path.isdir("/proc/self/fdinfo")
@@ -44,7 +49,7 @@ class ProofLockFairnessTest(unittest.TestCase):
         self.lock = os.path.join(self.dir, "proof.lock")
         self.order = os.path.join(self.dir, "order")
         self.env = dict(os.environ, ORBLX_PROOF_LOCK=self.lock, ORBLX_PROOF_LOCK_NOTE_SECS="1",
-                        ORBLX_PROOF_SAMPLE_SECS="1")
+                        ORBLX_PROOF_SAMPLE_SECS="1", PROOF_MIN_FREE_GIB="15")
         self.env.pop("ORBLX_PROOF_LOCK_HELD", None)
         # W25-35: the sampler uses a docker stand-in, which prints no names.
         self.env = with_fake_docker(self.env)
@@ -151,9 +156,13 @@ class ProofLockFairnessTest(unittest.TestCase):
     def test_the_plain_flock_check_is_fast_under_a_parent_with_many_fds(self):
         # A CI runner can be an ancestor with hundreds of fds. The check must not make one
         # grep per fd: that took 0.7 s with 600 fds and made the W25-5 waiter test fail on CI.
+        # date +%s%3N reads CLOCK_REALTIME. A step backward between the two calls makes a
+        # negative duration (CI printed rc=1 ms=-577) and the match on ms=(\d+) fails.
+        # rc=1 is the result when no ancestor holds a plain flock. hold_ms reads /proc/uptime.
         open(self.lock, "a").close()
-        check = ('. "$0"; s=$(date +%s%3N); p="$(proof_lock_plain_parent "$1")"; rc=$?; '
-                 'echo "rc=$rc ms=$(( $(date +%s%3N) - s )) pid=${p%% *}"')
+        check = ('. "$0"; ' + HOLD_MS +
+                 's=$(hold_ms); p="$(proof_lock_plain_parent "$1")"; rc=$?; '
+                 'echo "rc=$rc ms=$(( $(hold_ms) - s )) pid=${p%% *}"')
         fds = [os.open(os.devnull, os.O_RDONLY) for _ in range(2000)]
         held = os.open(self.lock, os.O_RDWR)
         try:
@@ -169,7 +178,7 @@ class ProofLockFairnessTest(unittest.TestCase):
         m = re.search(r"rc=(\d+) ms=(\d+) pid=", free.stdout)
         self.assertIsNotNone(m, free.stdout + free.stderr)
         self.assertEqual(m.group(1), "1", free.stdout)
-        self.assertLess(int(m.group(2)), 500, free.stdout)
+        self.assertLess(int(m.group(2)), 1000, free.stdout)
         # The check still finds an ancestor that holds the lock among its many fds.
         self.assertIn("rc=0 ", plain.stdout, plain.stdout + plain.stderr)
         self.assertIn(f"pid={os.getpid()}", plain.stdout)

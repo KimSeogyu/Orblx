@@ -1,5 +1,5 @@
 use std::io::ErrorKind;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use crate::error::io_error;
@@ -256,6 +256,39 @@ pub(crate) fn decode_punch(buf: &[u8], token: PunchToken) -> Option<PunchKind> {
     }
 }
 
+/// What to do with one punch datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PunchDecision {
+    /// The token matches and the source IP is the signed peer.
+    Accept(PunchKind),
+    /// The datagram is a punch and the session token does not match.
+    DropToken,
+    /// The token matches and the source IP is not the signed peer.
+    DropNetmap,
+}
+
+/// Decide a punch before the node changes the direct peer.
+///
+/// A buffer that is not a punch returns `None`. The caller leaves that buffer on the data path.
+/// `Some` means the buffer is a punch. A drop variant changes no peer address.
+pub(crate) fn admit_punch(
+    buf: &[u8],
+    token: PunchToken,
+    from: IpAddr,
+    signed_ip: Option<IpAddr>,
+) -> Option<PunchDecision> {
+    if buf.len() < PUNCH_MAGIC.len() || buf[..PUNCH_MAGIC.len()] != PUNCH_MAGIC {
+        return None;
+    }
+    let Some(kind) = decode_punch(buf, token) else {
+        return Some(PunchDecision::DropToken);
+    };
+    match signed_ip {
+        Some(ip) if ip == from => Some(PunchDecision::Accept(kind)),
+        _ => Some(PunchDecision::DropNetmap),
+    }
+}
+
 fn send_packet(socket: &UdpSocket, packet: &[u8], target: SocketAddr) -> Result<(), EdgeError> {
     loop {
         match socket.send_to(packet, target) {
@@ -318,9 +351,12 @@ fn is_soft(err: &std::io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use super::{decode_punch, encode_punch, punch_plan, PunchKind, PunchToken, PUNCH_MAGIC};
+    use super::{
+        admit_punch, decode_punch, encode_punch, punch_plan, PunchDecision, PunchKind, PunchToken,
+        PUNCH_MAGIC,
+    };
     use crate::EndpointCandidate;
 
     #[test]
@@ -343,6 +379,41 @@ mod tests {
             PunchToken::parse_hex("zz").unwrap_err(),
             crate::EdgeError::BadToken
         );
+    }
+
+    #[test]
+    fn a_foreign_punch_is_dropped_before_the_peer_changes() {
+        let token = PunchToken::from_bytes([1, 2, 3, 4, 5, 6, 7, 8]);
+        let good = encode_punch(PunchKind::Check, token);
+        let mut bad = good;
+        bad[9] ^= 0xff;
+        let signed = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let peer = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 10), 40_000));
+        let stranger = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 8), 9));
+        let mut state: Option<SocketAddr> = None;
+        let apply = |state: &mut Option<SocketAddr>, buf: &[u8], from: SocketAddr| {
+            let before = *state;
+            match admit_punch(buf, token, from.ip(), Some(signed)) {
+                Some(PunchDecision::Accept(_)) => *state = Some(from),
+                Some(PunchDecision::DropToken | PunchDecision::DropNetmap) | None => {
+                    assert_eq!(*state, before);
+                }
+            }
+        };
+        apply(&mut state, &bad, peer);
+        assert_eq!(state, None);
+        assert_eq!(
+            admit_punch(&bad, token, peer.ip(), Some(signed)),
+            Some(PunchDecision::DropToken)
+        );
+        apply(&mut state, &good, stranger);
+        assert_eq!(state, None);
+        assert_eq!(
+            admit_punch(&good, token, stranger.ip(), Some(signed)),
+            Some(PunchDecision::DropNetmap)
+        );
+        apply(&mut state, &good, peer);
+        assert_eq!(state, Some(peer));
     }
 
     #[test]

@@ -69,12 +69,27 @@ static LINK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// A new leaf from the coordinator.
 ///
-/// Debug output elides the private key.
+/// Debug output elides the private key and the ticket.
 pub struct RenewedLeaf {
     /// PEM certificate for this node.
     pub certificate_pem: String,
     /// PEM private key for this node.
     pub private_key_pem: String,
+    /// The capability ticket that the coordinator issued with the leaf (W25-45).
+    ///
+    /// `None` keeps the current ticket. Use `None` only for a ticket that the
+    /// coordinator did not issue, for example a lab ticket.
+    pub ticket: Option<RenewedTicket>,
+}
+
+/// A capability ticket from a renewal.
+///
+/// Debug output elides the ticket bytes and the tag.
+pub struct RenewedTicket {
+    /// Identity version-1 ticket bytes.
+    pub bytes: Vec<u8>,
+    /// HMAC-SHA256 tag over `bytes`.
+    pub mac: [u8; 32],
 }
 
 impl std::fmt::Debug for RenewedLeaf {
@@ -82,6 +97,7 @@ impl std::fmt::Debug for RenewedLeaf {
         formatter
             .debug_struct("RenewedLeaf")
             .field("private_key_pem", &"[elided]")
+            .field("ticket", &self.ticket.as_ref().map(|_| "[elided]"))
             .finish()
     }
 }
@@ -159,6 +175,12 @@ pub struct NodeRequest {
     pub relay: Option<SocketAddr>,
     /// The netmap file. The node reads it again when the file changes.
     pub netmap_path: PathBuf,
+    /// The bytes of `netmap_path` that gave `netmap` (W25-43).
+    ///
+    /// The netmap watcher compares the file with these bytes, so a file that changed after
+    /// the caller read it and before the watcher started is applied. `None`: the watcher
+    /// takes the file text at its start.
+    pub netmap_text: Option<Vec<u8>>,
     /// [`crate::GrantPeers`] hides peers the signed grants do not let this node reach.
     /// [`crate::AllowPeers`] allows every peer when the node has no grant file.
     pub visibility: Arc<dyn PeerVisibility>,
@@ -368,6 +390,8 @@ fn write_status(path: &Path, text: &str) {
 struct NodeCounters {
     tx: AtomicU64,
     rx: AtomicU64,
+    /// Direct dial attempts to peer endpoints (W25-45: shows that a closed link dials again).
+    dials: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -609,7 +633,7 @@ fn prepare_node(request: NodeRequest, entered_at: Instant) -> Result<PreparedNod
 
 fn announce_renew(request: &NodeRequest) {
     if request.renew.is_some() {
-        println!("The node renews the SVID at two thirds of the certificate life.");
+        println!("The node renews the SVID before the end of the certificate life.");
     } else {
         println!(
             "The node does not renew the SVID. The state directory has no coordinator address."
@@ -696,6 +720,7 @@ async fn run_mesh_inner(
     let counters = Arc::new(NodeCounters {
         tx: AtomicU64::new(0),
         rx: AtomicU64::new(0),
+        dials: AtomicU64::new(0),
     });
 
     let tun_shutdown = shutdown_rx.clone();
@@ -754,6 +779,12 @@ async fn run_mesh_inner(
         rekey_rx,
         filter: request.filter.clone(),
     };
+    if let Some(task) = crate::soak::spawn_to_tun_probe(to_tun.clone()) {
+        tasks.push(task);
+    }
+    if let Some(task) = crate::soak::spawn_runtime_watchdog() {
+        tasks.push(task);
+    }
     if let Some(addr) = request.metrics {
         let metrics_peers = Arc::clone(&peers);
         let metrics_counters = Arc::clone(&counters);
@@ -764,7 +795,7 @@ async fn run_mesh_inner(
                 .count();
             let sessions = u64::try_from(sessions).unwrap_or(u64::MAX);
             format!(
-                "{}{}{}",
+                "{}{}{}{}",
                 orblx_audit::sample_line(
                     "orblx_node_packets_tx",
                     "counter",
@@ -776,6 +807,11 @@ async fn run_mesh_inner(
                     metrics_counters.rx.load(Ordering::Relaxed)
                 ),
                 orblx_audit::sample_line("orblx_node_sessions", "gauge", sessions),
+                orblx_audit::sample_line(
+                    "orblx_node_dial_attempts",
+                    "counter",
+                    metrics_counters.dials.load(Ordering::Relaxed)
+                ),
             )
         }) {
             Ok(bound) => println!("metrics {bound}"),
@@ -838,12 +874,15 @@ async fn run_mesh_inner(
         }
     }
     let peer_tasks = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
+    // W25-43: the peer watcher and the DNS watcher both start from the start netmap text.
+    let start_text = request.netmap_text.take();
     let peer_watch = PeerWatch {
         mesh: mesh.clone(),
         router: router_tx,
         accept_routes,
         interface: interface.clone(),
         tasks: Arc::clone(&peer_tasks),
+        start_text: start_text.clone(),
     };
     tasks.push(tokio::spawn(async move {
         watch_netmap_peers(peer_watch).await;
@@ -887,6 +926,7 @@ async fn run_mesh_inner(
                 visibility,
                 shutdown: dns_shutdown,
                 exit_dns,
+                start_text,
             },
             &netmap,
         )
@@ -1159,6 +1199,8 @@ struct PeerWatch {
     accept_routes: bool,
     interface: Option<String>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// The file text that gave the start netmap, from [`NodeRequest::netmap_text`].
+    start_text: Option<Vec<u8>>,
 }
 
 /// Apply a new netmap file without a restart (W25-6).
@@ -1170,7 +1212,13 @@ struct PeerWatch {
 /// A peer that leaves the netmap loses its routes. The deny list and the node lock
 /// stop its sessions, as before.
 async fn watch_netmap_peers(watch: PeerWatch) {
-    let mut last = fs::read(&watch.mesh.netmap_path).ok();
+    // W25-43: `orblx up --coord` can write a new file after it read the start netmap and
+    // before this task starts. The start text is the text of the start netmap, so that
+    // change is applied at the first tick.
+    let mut last = watch
+        .start_text
+        .clone()
+        .or_else(|| fs::read(&watch.mesh.netmap_path).ok());
     let mut started: HashSet<String> = watch
         .mesh
         .netmap
@@ -1287,13 +1335,15 @@ fn fresh_netmap(mesh: &Mesh) -> Netmap {
 /// The node lock pass already removed each peer without a trusted owner signature
 /// from the netmap file. Without a node lock file, the endpoint allows every trusted leaf.
 fn apply_lock_allow(mesh: &Mesh) {
-    if !mesh.state_dir.join(crate::NODE_LOCK_FILE).exists() {
-        mesh.endpoint.replace_allow(None);
-        return;
-    }
-    let netmap = fresh_netmap(mesh);
-    let allow: HashSet<String> = netmap.peers.iter().map(|peer| peer.svid.clone()).collect();
-    mesh.endpoint.replace_allow(Some(allow));
+    crate::soak::span("apply_lock_allow", || {
+        if !mesh.state_dir.join(crate::NODE_LOCK_FILE).exists() {
+            mesh.endpoint.replace_allow(None);
+            return;
+        }
+        let netmap = fresh_netmap(mesh);
+        let allow: HashSet<String> = netmap.peers.iter().map(|peer| peer.svid.clone()).collect();
+        mesh.endpoint.replace_allow(Some(allow));
+    });
 }
 
 /// Close each open session whose peer SPIFFE ID is in the deny list (W25-1).
@@ -1303,6 +1353,12 @@ fn apply_lock_allow(mesh: &Mesh) {
 /// The dial task then tries again, and the session check refuses the denied peer.
 /// When the deny list drops the peer again, the next dial brings the session back.
 fn close_denied_links(mesh: &Mesh, deny: &DenySet) {
+    crate::soak::span("close_denied_links", || {
+        close_denied_links_body(mesh, deny);
+    });
+}
+
+fn close_denied_links_body(mesh: &Mesh, deny: &DenySet) {
     let netmap = fresh_netmap(mesh);
     let svids: HashMap<&str, &str> = mesh
         .netmap
@@ -1358,7 +1414,8 @@ async fn accept_loop(mut mesh: Mesh) {
                 match accepted {
                     Ok(session) => {
                         tr!("{} accepted {}", mesh.node.name, session.peer_id().as_uri());
-                        let netmap = fresh_netmap(&mesh);
+                        let netmap =
+                            crate::soak::span("fresh_netmap path=accept", || fresh_netmap(&mesh));
                         let peer_name = netmap.peers.iter().find(|peer| peer.svid == session.peer_id().as_uri()).map(|peer| peer.name.clone());
                         let Some(peer_name) = peer_name else {
                             eprintln!(
@@ -1539,6 +1596,7 @@ async fn dial_once(
                 continue;
             }
         };
+        mesh.counters.dials.fetch_add(1, Ordering::Relaxed);
         let endpoint = Arc::clone(&mesh.endpoint);
         let connect = async move {
             if fast {
@@ -1708,7 +1766,7 @@ async fn run_link(
     let (ask_tx, ask_rx) = watch::channel(0u64);
     let (tx, rx) = mpsc::channel(32);
     let generation = LINK_GENERATION.fetch_add(1, Ordering::Relaxed);
-    let expiry = session.peer_not_after();
+    let expiry = session.session_deadline();
     {
         let mut map = lock(&mesh.links);
         if mesh.endpoint.denies(session.peer_id()) {
@@ -1771,6 +1829,7 @@ async fn run_link(
             links: Arc::clone(&mesh.links),
             peer: name.clone(),
             label: format!("{} peer={} gen={}", mesh.node.name, name, generation),
+            deadline: expiry,
         },
         move || note_rx(&peers, &status, &node, &peer_name),
     )
@@ -1807,6 +1866,9 @@ struct SessionIo {
     links: Arc<Mutex<HashMap<String, LiveLink>>>,
     peer: String,
     label: String,
+    /// B2 (W25-45): unix seconds of min(peer ticket end, peer leaf not_after).
+    /// The session closes at this time, and the link dials again.
+    deadline: u64,
 }
 
 type NextEvent = std::pin::Pin<
@@ -1852,7 +1914,24 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
         links,
         peer,
         label,
+        deadline,
     } = io;
+    // B2 (W25-45): close the session at its deadline. A renewal normally replaces the link
+    // before this time. When the renewal keeps failing, the session ends here, and the
+    // peer refuses DATA after the deadline. The send paths check the time too: after a host
+    // stall, `select!` can pick a ready send branch before the timer branch.
+    let deadline_at = deadline_instant(deadline, SystemTime::now());
+    let at_deadline = tokio::time::sleep_until(deadline_at);
+    tokio::pin!(at_deadline);
+    let close_at_deadline = || {
+        println!(
+            "The session with {peer} reached its deadline (ticket or certificate end). The node closes it."
+        );
+        tr!("{label} session_end reason=deadline");
+    };
+    // One read of the soak flag for this link. The packet loop uses the local bool.
+    let trace = crate::soak::enabled();
+    let mut send_wait = crate::soak::SendWait::new();
     let mut first_rx = true;
     let mut first_tx = true;
     // The queue is open while this link is the live link for the peer.
@@ -1862,17 +1941,32 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
     let mut ask_open = true;
     let mut rx_next: Option<NextEvent> = Some(next_event(receiver));
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    // Declared last so a drop during `to_tun.send` still sees the open stall.
+    let mut session_end = trace.then(|| crate::soak::SessionEnd {
+        peer: peer.clone(),
+        reason: String::from("dropped"),
+    });
     loop {
         if tx_done && rx_next.is_none() {
             tr!("{label} session_end reason=drained");
+            mark_session_end(&mut session_end, "drained");
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline_at {
+            close_at_deadline();
             return;
         }
         tokio::select! {
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
                     tr!("{label} session_end reason=cancel");
+                    mark_session_end(&mut session_end, "cancel");
                     return;
                 }
+            }
+            () = &mut at_deadline => {
+                close_at_deadline();
+                return;
             }
             changed = ask_rekey.changed(), if tx_open && ask_open => {
                 if changed.is_err() {
@@ -1883,11 +1977,13 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                 tr!("{label} send_rekey_req");
                 if sender.send_ctrl(FLAG_REKEY_REQ).await.is_err() {
                     tr!("{label} session_end reason=send_rekey_err");
+                    mark_session_end(&mut session_end, "send_rekey_err");
                     return;
                 }
             }
             _ = keepalive.tick(), if tx_open => {
                 if sender.send_ctrl(0).await.is_err() {
+                    mark_session_end(&mut session_end, "keepalive_err");
                     return;
                 }
             }
@@ -1906,8 +2002,13 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     tr!("{label} first_tx");
                     first_tx = false;
                 }
+                if tokio::time::Instant::now() >= deadline_at {
+                    close_at_deadline();
+                    return;
+                }
                 if sender.send_ipv4(&packet).await.is_err() {
                     tr!("{label} session_end reason=send_err");
+                    mark_session_end(&mut session_end, "send_err");
                     return;
                 }
                 counters.tx.fetch_add(1, Ordering::Relaxed);
@@ -1936,7 +2037,12 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                                 }
                                 match inbound_action(&packet, overlay) {
                                     InboundAction::Reply(reply) if tx_open => {
+                                        if tokio::time::Instant::now() >= deadline_at {
+                                            close_at_deadline();
+                                            return;
+                                        }
                                         if sender.send_ipv4(&reply).await.is_err() {
+                                            mark_session_end(&mut session_end, "reply_err");
                                             return;
                                         }
                                         counters.tx.fetch_add(1, Ordering::Relaxed);
@@ -1951,16 +2057,33 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                                         }
                                     }
                                     InboundAction::Forward => {
-                                        if to_tun.send(packet).await.is_err() {
+                                        if !crate::soak::forward_to_tun(
+                                            &to_tun,
+                                            packet,
+                                            trace,
+                                            &peer,
+                                            &mut send_wait,
+                                        )
+                                        .await
+                                        {
+                                            mark_session_end(&mut session_end, "to_tun_closed");
                                             return;
                                         }
                                     }
                                 }
                             }
-                            SessionEvent::Keepalive => on_rx(),
+                            SessionEvent::Keepalive => {
+                                on_rx();
+                                if trace {
+                                    crate::soak::note_inbound_during_stall(&peer);
+                                }
+                            }
                             SessionEvent::Rekey => {
                                 tr!("{label} got_rekey_req");
                                 on_rx();
+                                if trace {
+                                    crate::soak::note_inbound_during_stall(&peer);
+                                }
                                 let next = remote_rekey.borrow().saturating_add(1);
                                 let _ = remote_rekey.send(next);
                             }
@@ -1972,11 +2095,22 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     }
                     Err(err) => {
                         tr!("{label} session_end reason=recv_err {err}");
+                        if trace {
+                            let reason = crate::soak::session_reason(&err);
+                            mark_session_end(&mut session_end, &reason);
+                        }
                         return;
                     }
                 }
             }
         }
+    }
+}
+
+fn mark_session_end(end: &mut Option<crate::soak::SessionEnd>, reason: &str) {
+    if let Some(end) = end.as_mut() {
+        end.reason.clear();
+        end.reason.push_str(reason);
     }
 }
 
@@ -2121,6 +2255,26 @@ async fn renew_loop(mut mesh: Mesh, renewer: SvidRenewer) {
                     signal_rekey(&mesh);
                     publish(&mesh.status, &mesh.node, &mesh.peers, "up");
                     println!("The node renewed the SVID. The new expiry is {expiry}.");
+                    // D2 (W25-45): the new leaf is valid and stays installed, because the
+                    // peers check it with their own clocks. But a leaf that is due again at
+                    // once by this node's clock counts as a failed renewal. The node waits
+                    // the retry delay, so the loop never renews with no delay.
+                    let now = unix_now();
+                    let (not_before, not_after) = (
+                        mesh.node.not_before.load(Ordering::Relaxed),
+                        mesh.node.not_after.load(Ordering::Relaxed),
+                    );
+                    if let Some(delay) = clock_ahead_delay(not_before, not_after, now, attempt) {
+                        eprintln!(
+                            "ALERT: The renewed SVID is due for renewal at once (not_before {not_before}, not_after {not_after}, node time {now}). The node clock is possibly ahead of the coordinator clock. The node will retry in {} s.",
+                            delay.as_secs()
+                        );
+                        if !sleep_retry(&mut mesh, delay).await {
+                            return;
+                        }
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
                     break;
                 }
                 Err(err) => {
@@ -2148,12 +2302,31 @@ fn apply_leaf(mesh: &Mesh, leaf: &RenewedLeaf) -> Result<u64, HelloError> {
     }
     let (not_before, not_after) = leaf_validity(&der).map_err(HelloError::Identity)?;
     let previous = lock(&mesh.identity).clone();
+    if let Some(ticket) = &leaf.ticket {
+        // B1: ticket.sub must be this node's URI (same check a peer runs).
+        let _checked = orblx_crypto::verify_ticket(
+            &previous.ticket_ring,
+            &ticket.bytes,
+            &ticket.mac,
+            &id,
+            SystemTime::now(),
+            &DenySet::empty(),
+        )
+        .map_err(HelloError::Ticket)?;
+    }
     let next = {
         let mut config = lock(&mesh.identity);
         config.certificate_pem = leaf.certificate_pem.clone();
         config.private_key_pem = leaf.private_key_pem.clone();
+        if let Some(ticket) = &leaf.ticket {
+            config.ticket_bytes = ticket.bytes.clone();
+            config.ticket_mac = ticket.mac;
+        }
         config.clone()
     };
+    // install_identity updates TLS and the presented ticket for NEW handshakes only.
+    // Open sessions keep the ticket they presented. Renewal then signals rekey so the
+    // node opens a new connection with the new cert+ticket and closes the old one.
     if let Err(err) = mesh.endpoint.install_identity(&next) {
         *lock(&mesh.identity) = previous;
         return Err(err);
@@ -2184,15 +2357,41 @@ async fn sleep_retry(mesh: &mut Mesh, delay: Duration) -> bool {
     }
 }
 
+/// D2 (W25-45): the retry delay when a just-renewed leaf is due for renewal within 1 s.
+///
+/// This occurs when the node clock is ahead of the coordinator clock. `None` means the
+/// renewal is good and the node waits for the normal renewal time.
+fn clock_ahead_delay(not_before: u64, not_after: u64, now: u64, attempt: u32) -> Option<Duration> {
+    if renew_unix(not_before, not_after) <= now.saturating_add(1) {
+        Some(retry_delay(attempt))
+    } else {
+        None
+    }
+}
+
 fn retry_delay(attempt: u32) -> Duration {
     let secs = 1u64.checked_shl(attempt).unwrap_or(30).min(30);
     Duration::from_secs(secs)
 }
 
-fn renew_unix(not_before: u64, not_after: u64) -> u64 {
-    let life = not_after.saturating_sub(not_before);
-    not_before.saturating_add(life.saturating_mul(2) / 3)
+/// The Tokio instant of the unix time `deadline` (seconds), seen from `now`.
+fn deadline_instant(deadline: u64, now: SystemTime) -> tokio::time::Instant {
+    let at = UNIX_EPOCH + Duration::from_secs(deadline);
+    let left = at.duration_since(now).unwrap_or(Duration::ZERO);
+    tokio::time::Instant::now() + left
 }
+
+fn renew_unix(not_before: u64, not_after: u64) -> u64 {
+    // W25-45 (Crypto): the renewal lead is at least max(life / 3, 5 min).
+    // A life under 10 min cannot keep a 5 min lead without a renewal loop near
+    // not_before, so for those lives the lead is half the life.
+    let life = not_after.saturating_sub(not_before);
+    let lead = (life / 3).max(RENEW_LEAD_MIN_SECS.min(life / 2));
+    not_after.saturating_sub(lead).max(not_before)
+}
+
+/// The minimum renewal lead (W25-45) for a life of 10 min or more.
+const RENEW_LEAD_MIN_SECS: u64 = 5 * 60;
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -2444,6 +2643,8 @@ struct DnsSpawn {
     visibility: Arc<dyn PeerVisibility>,
     shutdown: watch::Receiver<bool>,
     exit_dns: Option<ExitDns>,
+    /// The file text that gave the start netmap, from [`NodeRequest::netmap_text`] (W25-43).
+    start_text: Option<Vec<u8>>,
 }
 
 fn exit_dns_target(netmap: &Netmap, exit_node: Option<&str>) -> Option<ExitDns> {
@@ -2507,6 +2708,7 @@ async fn spawn_overlay_dns(
     let armed = guard.armed_flag();
     tasks.push(tokio::spawn(async move {
         watch_netmap_dns(DnsWatch {
+            start_text: dns.start_text,
             path: dns.netmap_path,
             node_name: dns.node_name,
             node_overlay: dns.node_overlay,
@@ -2524,6 +2726,8 @@ async fn spawn_overlay_dns(
 }
 
 struct DnsWatch {
+    /// The file text that gave the start DNS table (W25-43).
+    start_text: Option<Vec<u8>>,
     path: PathBuf,
     node_name: String,
     node_overlay: String,
@@ -2537,7 +2741,7 @@ struct DnsWatch {
 }
 
 async fn watch_netmap_dns(mut watch_state: DnsWatch) {
-    let mut last = fs::read(&watch_state.path).unwrap_or_default();
+    let mut last = dns_start_text(watch_state.start_text.take(), &watch_state.path);
     let mut last_error = String::new();
     let mut grant_revision = watch_state.visibility.revision();
     loop {
@@ -2582,19 +2786,48 @@ fn refresh_resolver_in_background(watch_state: &DnsWatch, table: DnsTable) {
     });
 }
 
+/// The text that the DNS watcher compares the netmap file with at its start (W25-43).
+///
+/// `orblx up --coord` can write a new file after it read the start netmap and before this
+/// task starts. The start text is the text of the start netmap, so the first tick applies
+/// that change. `None`: the file text at the start.
+fn dns_start_text(start_text: Option<Vec<u8>>, path: &Path) -> Vec<u8> {
+    start_text.unwrap_or_else(|| fs::read(path).unwrap_or_default())
+}
+
 fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut String) {
-    match fs::read(&watch_state.path) {
-        Ok(bytes) if bytes == *last => {}
+    let Some(map) = changed_dns_netmap(
+        &watch_state.path,
+        &watch_state.node_name,
+        &watch_state.node_overlay,
+        last,
+        last_error,
+    ) else {
+        return;
+    };
+    let table = DnsTable::from_netmap(&map);
+    // W25-6: the responder uses the new table first. A slow host resolver command
+    // (up to COMMAND_WAIT for each call) must not hold the new answers.
+    let _ = watch_state.tables.send(table.clone());
+    refresh_resolver_in_background(watch_state, table);
+    println!("The DNS answers follow the new netmap.");
+}
+
+/// Read the netmap file. Return the new netmap for the DNS table when the file changed.
+fn changed_dns_netmap(
+    path: &Path,
+    node_name: &str,
+    node_overlay: &str,
+    last: &mut Vec<u8>,
+    last_error: &mut String,
+) -> Option<Netmap> {
+    match fs::read(path) {
+        Ok(bytes) if bytes == *last => None,
         Ok(bytes) => match Netmap::from_slice(&bytes) {
-            Ok(map) if self_matches(&map, &watch_state.node_name, &watch_state.node_overlay) => {
+            Ok(map) if self_matches(&map, node_name, node_overlay) => {
                 last.clone_from(&bytes);
                 last_error.clear();
-                let table = DnsTable::from_netmap(&map);
-                // W25-6: the responder uses the new table first. A slow host resolver command
-                // (up to COMMAND_WAIT for each call) must not hold the new answers.
-                let _ = watch_state.tables.send(table.clone());
-                refresh_resolver_in_background(watch_state, table);
-                println!("The DNS answers follow the new netmap.");
+                Some(map)
             }
             Ok(_) => {
                 *last = bytes;
@@ -2603,6 +2836,7 @@ fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut 
                     eprintln!("The node keeps the current DNS answers. {text}");
                     *last_error = text;
                 }
+                None
             }
             Err(err) => {
                 *last = bytes;
@@ -2611,6 +2845,7 @@ fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut 
                     eprintln!("The node did not load the netmap for DNS. {text}");
                     *last_error = text;
                 }
+                None
             }
         },
         Err(err) => {
@@ -2619,6 +2854,7 @@ fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut 
                 eprintln!("The node did not read the netmap for DNS. {text}");
                 *last_error = text;
             }
+            None
         }
     }
 }
@@ -2663,7 +2899,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        format_node_status, load_state, read_status_text, store_record, NodeStatus, StatusPeer,
+        changed_dns_netmap, dns_start_text, format_node_status, load_state, read_status_text,
+        store_record, NodeStatus, StatusPeer,
     };
     use crate::netmap::Netmap;
 
@@ -2683,6 +2920,27 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// W25-43 (Datapath review): the policy sync can write a new netmap file after `orblx up`
+    /// read the start netmap and before the DNS watcher starts. The first DNS tick must give
+    /// the new table, with the new peer name.
+    #[test]
+    fn the_dns_watcher_applies_a_netmap_file_written_before_it_starts() {
+        let dir = test_dir("dns-start-race");
+        let path = dir.join("netmap.json");
+        let start =
+            br#"{"version": 1, "self": {"name": "a", "overlay_ip": "100.64.0.1"}, "peers": []}"#;
+        let new = br#"{"version": 1, "self": {"name": "a", "overlay_ip": "100.64.0.1"}, "peers": [{"name": "b", "overlay_ip": "100.64.0.2", "owner": "lab", "svid": "spiffe://orblx.local/node/b", "endpoints": ["172.28.18.12:443"], "routes": []}]}"#;
+        fs::write(&path, new).unwrap();
+        let mut last = dns_start_text(Some(start.to_vec()), &path);
+        let mut last_error = String::new();
+        let map = changed_dns_netmap(&path, "a", "100.64.0.1", &mut last, &mut last_error)
+            .expect("the first DNS tick did not apply the netmap file that changed before the DNS watcher started");
+        assert!(map.peers.iter().any(|peer| peer.name == "b"));
+        assert_eq!(last, new.to_vec());
+        assert!(changed_dns_netmap(&path, "a", "100.64.0.1", &mut last, &mut last_error).is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2836,10 +3094,77 @@ mod tests {
     }
 
     #[test]
-    fn renewal_starts_at_two_thirds_of_the_life() {
-        assert_eq!(super::renew_unix(1_000, 1_060), 1_040);
+    fn renewal_starts_at_half_of_a_short_life() {
+        assert_eq!(super::renew_unix(1_000, 1_060), 1_030);
         assert_eq!(super::renew_unix(0, 3), 2);
+        assert_eq!(super::renew_unix(0, 9), 5);
+        // 5 min: half the life, not a renewal at not_before.
+        assert_eq!(super::renew_unix(100, 400), 250);
         assert_eq!(super::renew_unix(50, 50), 50);
+    }
+
+    /// W25-45: the renewal lead is at least max(life / 3, 5 min) for a life of 10 min or more.
+    #[test]
+    fn renewal_lead_is_at_least_five_minutes_or_a_third_of_the_life() {
+        // Default node SVID life (15 min): lead 5 min.
+        assert_eq!(super::renew_unix(0, 900), 600);
+        // 10 min: a third is 200 s, so the lead is 5 min.
+        assert_eq!(super::renew_unix(0, 600), 300);
+        // 1 h: a third is 20 min.
+        assert_eq!(super::renew_unix(0, 3_600), 2_400);
+    }
+
+    /// D2 (W25-45): the node clock is ahead of the coordinator clock.
+    ///
+    /// The coordinator issues a 180 s leaf at its time 1_000 (lead 90 s, so the renewal is due at 1_090).
+    /// A node clock 150 s ahead reads 1_150, so the new leaf is due at once. The node must
+    /// count this as a failure and wait the retry delay, never 0 s.
+    #[test]
+    fn a_renewed_leaf_due_at_once_waits_the_retry_delay() {
+        let (not_before, not_after) = (1_000, 1_180);
+        assert_eq!(super::renew_unix(not_before, not_after), 1_090);
+        // The clocks agree: a normal renewal.
+        assert_eq!(
+            super::clock_ahead_delay(not_before, not_after, 1_000, 0),
+            None
+        );
+        assert_eq!(
+            super::clock_ahead_delay(not_before, not_after, 1_088, 0),
+            None
+        );
+        // Due within 1 s, or past due: the node clock is ahead.
+        assert_eq!(
+            super::clock_ahead_delay(not_before, not_after, 1_089, 0),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            super::clock_ahead_delay(not_before, not_after, 1_150, 0),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            super::clock_ahead_delay(not_before, not_after, 1_150, 3),
+            Some(Duration::from_secs(8))
+        );
+        // The delay grows to 30 s and is never 0 s.
+        for attempt in 0..64 {
+            let delay = super::clock_ahead_delay(not_before, not_after, 5_000, attempt).unwrap();
+            assert!(delay >= Duration::from_secs(1), "attempt {attempt}");
+            assert!(delay <= Duration::from_secs(30), "attempt {attempt}");
+        }
+    }
+
+    /// B2 (W25-45): the session closes at its deadline, not later.
+    #[tokio::test]
+    async fn the_session_deadline_maps_to_the_right_instant() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+        let before = tokio::time::Instant::now();
+        let at = super::deadline_instant(1_005, now);
+        let left = at.saturating_duration_since(before);
+        assert!(left >= Duration::from_secs(5), "{left:?}");
+        assert!(left < Duration::from_secs(6), "{left:?}");
+        // A deadline in the past closes the session at once.
+        let past = super::deadline_instant(990, now);
+        assert!(past <= tokio::time::Instant::now());
     }
 
     #[test]
@@ -2882,5 +3207,82 @@ mod tests {
         let text = super::safe_text("-----BEGIN PRIVATE KEY-----\nabc");
         assert_eq!(text, "The coordinator request failed.");
         assert!(!text.contains("PRIVATE"));
+    }
+
+    /// W25-42: every forwarding link waits on one bounded TUN queue.
+    ///
+    /// While the writer holds every slot, both links stay pending.
+    /// One read from the writer frees one link. The other link stays pending.
+    #[test]
+    fn a_full_tun_queue_stalls_every_forwarding_link() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        use tokio::sync::mpsc;
+
+        fn idle_waker() -> Waker {
+            fn clone(ptr: *const ()) -> RawWaker {
+                RawWaker::new(ptr, &VTABLE)
+            }
+            fn wake(_: *const ()) {}
+            fn wake_by_ref(_: *const ()) {}
+            fn drop(_: *const ()) {}
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+            // SAFETY: the vtable does not read the pointer.
+            unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+        }
+
+        let marks = AtomicU64::new(0);
+        let queue = crate::tun_dev::TO_TUN_QUEUE;
+        let (tx, mut rx) = mpsc::channel(queue);
+        for n in 0..queue {
+            tx.try_send(vec![u8::try_from(n).unwrap()]).unwrap();
+        }
+        assert_eq!(tx.max_capacity(), queue);
+        assert_eq!(tx.capacity(), 0);
+
+        let tx_a = tx.clone();
+        let tx_b = tx.clone();
+        let mut link_a = Box::pin(async {
+            let mut wait = crate::soak::SendWait::new();
+            let ok = crate::soak::forward_to_tun(&tx_a, vec![0xa1], false, "a", &mut wait).await;
+            assert!(ok);
+            marks.fetch_add(1, Ordering::Relaxed);
+        });
+        let mut link_b = Box::pin(async {
+            let mut wait = crate::soak::SendWait::new();
+            let ok = crate::soak::forward_to_tun(&tx_b, vec![0xb2], false, "b", &mut wait).await;
+            assert!(ok);
+            marks.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let waker = idle_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(link_a.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(matches!(link_b.as_mut().poll(&mut cx), Poll::Pending));
+        let marks_while_full = marks.load(Ordering::Relaxed);
+        assert_eq!(marks_while_full, 0);
+
+        rx.try_recv().unwrap();
+        let ready_a = matches!(link_a.as_mut().poll(&mut cx), Poll::Ready(()));
+        let ready_b = matches!(link_b.as_mut().poll(&mut cx), Poll::Ready(()));
+        let ready_after_one = u32::from(ready_a) + u32::from(ready_b);
+        assert_eq!(ready_after_one, 1);
+        let marks_after_one = marks.load(Ordering::Relaxed);
+        assert_eq!(marks_after_one, 1);
+
+        rx.try_recv().unwrap();
+        if !ready_a {
+            assert!(matches!(link_a.as_mut().poll(&mut cx), Poll::Ready(())));
+        }
+        if !ready_b {
+            assert!(matches!(link_b.as_mut().poll(&mut cx), Poll::Ready(())));
+        }
+        let marks_after_two = marks.load(Ordering::Relaxed);
+        assert_eq!(marks_after_two, 2);
+        println!(
+            "w25-42 h1 queue={queue} links_pending_while_full=2 marks_while_full={marks_while_full} ready_after_one_read={ready_after_one} marks_after_one_read={marks_after_one} marks_after_two_reads={marks_after_two}"
+        );
     }
 }

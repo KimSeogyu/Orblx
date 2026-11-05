@@ -5,6 +5,17 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+
+# A pull request uses one group. The group contains the pull request number.
+# A new pull request run cancels the previous run in that group.
+# A push uses one group for that commit. The group contains the ref and the SHA.
+# A workflow_dispatch run uses one group for that commit.
+# A push run does not cancel a previous run.
+# A workflow_dispatch run does not cancel a previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || format('{0}-{1}', github.ref, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   rust:
@@ -13,6 +24,11 @@ jobs:
     steps:
       - name: Get the repository
         uses: actions/checkout@v7
+
+      - name: Check that the workspace version is not a release tag (W25-44)
+        run: |
+          git fetch --no-recurse-submodules --tags origin
+          bash scripts/check-version-not-tagged.sh
 
       - name: Install the stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable

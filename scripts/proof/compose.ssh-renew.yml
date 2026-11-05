@@ -1,0 +1,89 @@
+# W25-40: SSH logins across node SVID renewals.
+# The proof script sets the SSH_RENEW_* paths and the node SVID life SSH_RENEW_TTL.
+
+name: orblx-ssh-renew
+
+services:
+  coord:
+    image: orblx-ssh-renew:local
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+    environment:
+      ORBLX_OIDC_MODE: google
+      ORBLX_SVID_TTL: "${SSH_RENEW_TTL}"
+    volumes:
+      - ${SSH_RENEW_COORD_STATE}:/var/lib/orblx
+    networks:
+      proof:
+        ipv4_address: 172.28.19.10
+
+  node-a:
+    image: orblx-ssh-renew:local
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    volumes:
+      - ${SSH_RENEW_STATE_A}:/var/lib/orblx
+      - ${SSH_RENEW_NETMAP_A}:/etc/orblx/netmap.json:ro
+    command:
+      - up
+      - --netmap
+      - /etc/orblx/netmap.json
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.28.19.10:443
+      - --coord-name
+      - coord
+    networks:
+      proof:
+        ipv4_address: 172.28.19.11
+
+  node-b:
+    image: orblx-ssh-renew:local
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    volumes:
+      - ${SSH_RENEW_STATE_B}:/var/lib/orblx
+      - ${SSH_RENEW_NETMAP_B}:/etc/orblx/netmap.json:ro
+    command:
+      - up
+      - --netmap
+      - /etc/orblx/netmap.json
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - 172.28.19.10:443
+      - --coord-name
+      - coord
+    networks:
+      proof:
+        ipv4_address: 172.28.19.12
+
+networks:
+  proof:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.19.0/24
+          gateway: 172.28.19.1

@@ -1,0 +1,3 @@
+2026-11-05T09:10:25+0900 proof_cancel reason=soak_overrun_held_lock_since_restart INVALID holder_pid=2065982 cwd=/workspace/orblx-w25-42-diag project=orblx-w2542-diag
+2026-11-05T09:10:44+0900 lock_released next_holder=policy-scale:orblx-w2534-scale-proof pid=2069683
+2026-11-05T09:10:44+0900 lock_released next_holder=policy-scale:orblx-w2534-scale-proof pid=2069683

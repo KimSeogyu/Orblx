@@ -1,0 +1,20 @@
+{
+  // W25-40 SSH host key after node SVID renewal. Node a may open TCP to node b and back.
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a", "spiffe://orblx.local/node/b"],
+      "proto": "tcp",
+      "dst": ["spiffe://orblx.local/node/a:*", "spiffe://orblx.local/node/b:*"],
+    },
+  ],
+  // Node a may open SSH on node b as alice.
+  "ssh": [
+    {
+      "src": ["spiffe://orblx.local/node/a"],
+      "dst": ["spiffe://orblx.local/node/b"],
+      "users": ["alice"],
+      "checkPeriod": "30s",
+    },
+  ],
+}

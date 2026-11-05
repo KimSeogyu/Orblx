@@ -42,8 +42,9 @@ cleanup() {
 # W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$PROOF_LIB_DIR/proof-lock.sh"
+PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap 'cleanup; proof_lock_end' EXIT
-proof_lock_take "release-real"
+proof_lock_take "release-real" "orblx-release-real-proof"
 
 case "$TAG" in
   v[0-9]*) ;;
@@ -81,11 +82,11 @@ RUN apt-get update \
 COPY cosign /usr/local/bin/cosign
 DOCKER
 as_root docker build -q -t "$IMAGE" "$WORK/img" >/dev/null
-as_root docker run --rm "$IMAGE" sh -c 'test ! -e /usr/local/bin/orblx && echo "client has no orblx"'
+as_root docker run --rm --label "com.docker.compose.project=orblx-release-real-proof" "$IMAGE" sh -c 'test ! -e /usr/local/bin/orblx && echo "client has no orblx"'
 
 client() {
   # The containers use the default bridge, because it has egress to github.com and to the Sigstore TUF root.
-  as_root docker run --rm -e TAG="$TAG" -e BASE="$BASE" \
+  as_root docker run --rm --label "com.docker.compose.project=orblx-release-real-proof" -e TAG="$TAG" -e BASE="$BASE" \
     -e IDENTITY="$IDENTITY" -e ISSUER="$ISSUER" -e TARBALL="$TARBALL" "$IMAGE" sh -c "$1"
 }
 
@@ -143,7 +144,7 @@ chmod -R a+rX "$WORK/www"
 
 echo "=== [C] start the mirror container with the changed tarball ==="
 as_root docker rm -f "$MIRROR" >/dev/null 2>&1 || true
-as_root docker run -d --name "$MIRROR" -v "$WORK/www:/srv:ro" "$IMAGE" \
+as_root docker run -d --name "$MIRROR" --label "com.docker.compose.project=orblx-release-real-proof" -v "$WORK/www:/srv:ro" "$IMAGE" \
   python3 -m http.server 8000 --directory /srv >/dev/null
 mirror_ip="$(as_root docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$MIRROR")"
 [[ -n "$mirror_ip" ]] || { echo "The mirror container has no IP address." >&2; exit 1; }

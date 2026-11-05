@@ -654,6 +654,8 @@ fi
 # Free disk space. A proof that fails from a full disk is a box failure, and such a run never
 # counts. So the run does not start with less than ORBLX_SWEEP_MIN_FREE_GB free.
 MIN_FREE_GB="${ORBLX_SWEEP_MIN_FREE_GB:-30}"
+# proof_lock_take checks this minimum (exported for the lock of each proof).
+export PROOF_MIN_FREE_GIB=28  # reason: 30 GB (the sweep minimum above) is 27.9 GiB, rounded up.
 [[ "$MIN_FREE_GB" =~ ^[0-9]+$ ]] || die "ORBLX_SWEEP_MIN_FREE_GB must be a whole number of GB"
 free_gb_of() {
   local dir="$1" text
@@ -833,7 +835,7 @@ case "$LOCK_MODE" in
     . "$LOCK_LIB"
     trap 'proof_lock_end; rm -f "$MANIFEST_TMP" "$ROWS_TMP"' EXIT
     note "lock mode sweep: wait for the lock"
-    proof_lock_take "rc3-sweep:$SHORT" orblx-rc3sw-
+    proof_lock_take "rc3-sweep:$SHORT" orblx-rc3sw
     note "lock mode sweep: lock taken $(now)"
     ;;
   *) die "ORBLX_SWEEP_LOCK_MODE must be proof or sweep" ;;
@@ -895,7 +897,7 @@ for i in "${!P_NAME[@]}"; do
       bash -c '
         . "$1" || exit 98
         trap "echo \"release_sweep: proof run end epoch \$(date +%s)\"; proof_lock_end" EXIT
-        proof_lock_take "$2" orblx-rc3sw-
+        proof_lock_take "$2" orblx-rc3sw
         echo "release_sweep: proof run start epoch $(date +%s)"
         cd "$3"
         if command -v timeout >/dev/null 2>&1; then

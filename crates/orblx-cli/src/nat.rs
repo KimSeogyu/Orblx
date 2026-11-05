@@ -8,7 +8,8 @@ use orblx_coord::{publish_candidates_blocking, renew_svid_blocking};
 use orblx_datapath::Netmap;
 use orblx_edge::{
     decode_hex_key, prepare_nat_gateway, run_nat_node, verify_signed_candidate, HelloAuth,
-    NatConfig, RenewFn, RenewedLeaf, SignedCandidate,
+    NatConfig, PortMapChoice, PortMapProto, RenewFn, RenewedLeaf, SignedCandidate,
+    PORT_MAP_LIFETIME_SECS,
 };
 use orblx_identity::{
     decode_certificate_pem, ed25519_seed_from_private_pem, extract_spiffe_id, leaf_not_after,
@@ -36,6 +37,8 @@ pub(crate) struct RunOptions {
     relay: SocketAddr,
     peer: String,
     gateway: Option<Ipv4Addr>,
+    port_map: PortMapChoice,
+    port_map_lifetime: u32,
 }
 
 #[derive(Debug)]
@@ -148,6 +151,8 @@ fn run_node(options: RunOptions) -> Result<(), String> {
         relay_udp: options.relay,
         relay_tcp: options.relay,
         gateway: options.gateway,
+        port_map: options.port_map,
+        port_map_lifetime: options.port_map_lifetime,
         netmap_public: public,
         hello,
         publish,
@@ -216,6 +221,8 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
     let mut relay = None;
     let mut peer = None;
     let mut gateway = None;
+    let mut port_map = PortMapChoice::Auto;
+    let mut port_map_lifetime = PORT_MAP_LIFETIME_SECS;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -237,6 +244,17 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
                         .map_err(|_| format!("The gateway {value} is not valid."))?,
                 );
             }
+            "--port-map" => port_map = parse_port_map(&value)?,
+            "--port-map-lifetime" => {
+                port_map_lifetime = value.parse::<u32>().map_err(|_| {
+                    format!("The port map lifetime {value} is not a number of seconds.")
+                })?;
+                if port_map_lifetime == 0 || port_map_lifetime > PORT_MAP_LIFETIME_SECS {
+                    return Err(format!(
+                        "The port map lifetime must be from 1 to {PORT_MAP_LIFETIME_SECS} seconds."
+                    ));
+                }
+            }
             other => return Err(format!("The flag {other} is not valid.\n{}", help())),
         }
     }
@@ -250,7 +268,22 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
         relay: relay.ok_or_else(|| "The command needs --relay.".to_string())?,
         peer: peer.ok_or_else(|| "The command needs --peer.".to_string())?,
         gateway,
+        port_map,
+        port_map_lifetime,
     }))
+}
+
+fn parse_port_map(value: &str) -> Result<PortMapChoice, String> {
+    match value {
+        "auto" => Ok(PortMapChoice::Auto),
+        "off" => Ok(PortMapChoice::Off),
+        "pcp" => Ok(PortMapChoice::Only(PortMapProto::Pcp)),
+        "nat-pmp" => Ok(PortMapChoice::Only(PortMapProto::NatPmp)),
+        "upnp" => Ok(PortMapChoice::Only(PortMapProto::Upnp)),
+        other => Err(format!(
+            "The port map mode {other} is not valid. Use auto, off, pcp, nat-pmp, or upnp."
+        )),
+    }
 }
 
 fn parse_verify(args: &[String]) -> Result<Command, String> {
@@ -284,16 +317,26 @@ fn parse_verify(args: &[String]) -> Result<Command, String> {
 
 fn help() -> String {
     "\
-orblx nat run --state DIR --coord ADDR --bundle FILE --stun ADDR --relay ADDR --peer NAME [--stun-alt ADDR] [--gateway IP] [--coord-name NAME]
+orblx nat run --state DIR --coord ADDR --bundle FILE --stun ADDR --relay ADDR --peer NAME [--stun-alt ADDR] [--gateway IP] [--coord-name NAME] [--port-map auto|off|pcp|nat-pmp|upnp] [--port-map-lifetime SECONDS]
 orblx nat verify-candidate --name NAME --endpoint HOST:PORT --public HEX --key-id HEX --sig BASE64
 
 The node gathers a reflexive address with STUN.
 The coordinator signs that address with the netmap Ed25519 key.
 The peer verifies the signature.
 With --stun-alt, the node measures the NAT mapping kind and publishes two endpoints.
+The node asks the gateway for a mapped UDP port. The default mode is auto.
+auto tries PCP, then NAT-PMP, then UPnP IGD. The probe budget is 750 ms.
+off does not send a probe.
+A mapped port is published as the candidate. The peer punches that port.
+The node renews the map before the lifetime ends. The node deletes the map on shutdown.
+The default lifetime is 7200 seconds.
+A hard NAT also publishes STUN port samples.
 The peers punch UDP.
 An endpoint-independent NAT and a symmetric NAT use bounded birthday probes.
-Two symmetric NATs use the orblx Relay.
+Two symmetric NATs with random port allocation use the orblx Relay when no router grants a map.
+Two symmetric NATs use a bounded port spray when one allocation is predictable.
+The relay carries packets during that spray.
+A failed spray waits, then tries again.
 When the punch fails, the peers use the orblx Relay.
 The hello carries the SVID. The peer checks it against the trust bundle.
 A later direct path keeps the same overlay session.

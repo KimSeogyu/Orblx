@@ -24,8 +24,9 @@ OUT="${ORBLX_PERF_OUT:-$ROOT/target/perf-watch}"
 # and does not take it again.
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$ROOT/scripts/proof/proof-lock.sh"
+PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap proof_lock_end EXIT
-proof_lock_take perf-watch orblx-natr- orblx-natr-proof-
+proof_lock_take perf-watch orblx-natr-proof
 
 mkdir -p "$OUT"
 echo "cpu_model $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//' || true)"

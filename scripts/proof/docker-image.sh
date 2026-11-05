@@ -20,7 +20,8 @@ cd "$ROOT"
 PREFIX="${ORBLX_DIMG_PREFIX:-orblx-w25h-dimg}"
 IMAGE="${ORBLX_DIMG_IMAGE:-orblx-w25h-image:local}"
 MAX_BYTES="${ORBLX_DIMG_MAX_BYTES:-60000000}"
-TTL="${ORBLX_DIMG_SVID_TTL:-60}"
+# W25-45: the coordinator refuses a node SVID life under 180 s.
+TTL="${ORBLX_DIMG_SVID_TTL:-180}"
 PINGS="${ORBLX_DIMG_PINGS:-20}"
 NET="${PREFIX}-net"
 STATE=/var/lib/orblx
@@ -28,8 +29,9 @@ WORK="$(mktemp -d)"
 # W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$PROOF_LIB_DIR/proof-lock.sh"
+PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap proof_lock_end EXIT
-proof_lock_take "docker-image"
+proof_lock_take "docker-image" "$PREFIX"
 chmod 700 "$WORK"
 
 docker() {
@@ -123,6 +125,7 @@ node_run() {
   local name="$1"
   shift
   docker run -d --name "${PREFIX}-${name}" --hostname "$name" \
+    --label "com.docker.compose.project=${PREFIX}" \
     --network "$NET" --network-alias "$name" \
     --cap-add NET_ADMIN --device /dev/net/tun \
     -e "ORBLX_COORD=${coord_ip}:443" \
@@ -148,6 +151,7 @@ echo "=== [C] start the coordinator from the image (svid ttl ${TTL}) ==="
 teardown
 docker network create "$NET" >/dev/null
 docker run -d --name "${PREFIX}-coord" --hostname coord --network "$NET" --network-alias coord \
+  --label "com.docker.compose.project=${PREFIX}" \
   -e ORBLX_OIDC_MODE=mock -e "ORBLX_SVID_TTL=${TTL}" \
   -v "${PREFIX}-coord:${STATE}" \
   "$IMAGE" coord serve --state "$STATE" --listen 0.0.0.0:443 --name coord >/dev/null

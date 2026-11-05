@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Enroll two nodes at the coordinator with 1 minute node SVIDs and tickets
-# (W25-27: the tickets come from the coordinator enroll path) and keep one
-# session up for at least 6 minutes, across 2 or more ticket ends.
+# Enroll two nodes at the coordinator. The coordinator issues the tickets (W25-27).
+# The node SVID life is 180 s. The coordinator refuses a life under 180 s (W25-45).
+# Keep one session up for at least 9 minutes, across 2 or more ticket ends.
 # The script pings once per second and reports loss.
 # The script skips the proof when it is not root or when Docker is absent.
 set -euo pipefail
@@ -26,10 +26,12 @@ compose_file="$root/scripts/proof/compose.svid.yml"
 work=$(mktemp -d)
 env_file=""
 image_dir=""
-ping_count=370
-# W25-27: the coordinator SVID and ticket life (ORBLX_SVID_TTL). The ping crosses
-# 2 or more ticket ends. A ticket ends at its expires time plus 60 s clock skew.
-svid_ttl=60
+ping_count=550
+# W25-27: ORBLX_SVID_TTL is the coordinator SVID life and the ticket life.
+# The ping crosses 2 or more ticket ends.
+# A ticket ends at its expires time plus 60 s clock skew.
+# W25-45: this value is 180 s, the same value as ORBLX_SVID_TTL in compose.svid.yml.
+svid_ttl=180
 min_ticket_ends=2
 ticket_skew=60
 
@@ -87,8 +89,9 @@ cleanup() {
 # W25-14: the proof takes the box proof lock itself (proof-lock.sh, W25-5).
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$PROOF_LIB_DIR/proof-lock.sh"
+PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap 'cleanup; proof_lock_end' EXIT
-proof_lock_take "svid-renew"
+proof_lock_take "svid-renew" "orblx-svid"
 # W25-14b: start from a clean compose state (all profiles, all volumes).
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
@@ -152,7 +155,6 @@ SVID_STATE_A=$work/a
 SVID_STATE_B=$work/b
 SVID_NETMAP_A=$work/netmap-a.json
 SVID_NETMAP_B=$work/netmap-b.json
-SVID_TTL=$svid_ttl
 EOF
 echo "env_file ${env_file}"
 

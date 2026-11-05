@@ -14,6 +14,8 @@ import tempfile
 import time
 import unittest
 
+from fake_docker import with_fake_docker
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROOF_DIR = os.path.dirname(HERE)
 GUARD_SH = os.path.join(PROOF_DIR, "ticket-guard.sh")
@@ -96,8 +98,11 @@ class TicketGuardTest(unittest.TestCase):
 
     def run_proof(self, manifest, script):
         env = dict(os.environ, ORBLX_PROOF_MANIFEST=manifest, LOCK_SH=LOCK_SH,
-                   ORBLX_PROOF_LOCK=os.path.join(self.tmp, "proof.lock"))
+                   ORBLX_PROOF_LOCK=os.path.join(self.tmp, "proof.lock"),
+                   PROOF_MIN_FREE_GIB="15")
         env.pop("ORBLX_PROOF_LOCK_HELD", None)
+        # proof_lock_take runs the disk check before the lock (W25-14b).
+        env = with_fake_docker(env)
         return subprocess.run(["bash", script], env=env, capture_output=True, text=True)
 
     PROOF = ('set -euo pipefail\n. "$LOCK_SH"\ntrap proof_lock_end EXIT\n'

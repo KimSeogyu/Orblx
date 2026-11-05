@@ -1,0 +1,4 @@
+proof_lock policy-scale acquired at 2026-11-05T09:10:35.126+0900 after 20 ms, file /workspace/.orblx-proof.lock
+proof_context policy-scale phase start time 2026-11-05T09:10:35.166+0900 load 0.20/0.16/0.06 other_orblx_containers 1 groups orblx-w2542:1
+proof_contention policy-scale samples 3 contended_samples 3 unknown_samples 0 max_other_orblx_containers 1 max_load1 0.20
+proof_lock policy-scale released at 2026-11-05T09:12:00.000+0900 pid=3100001
