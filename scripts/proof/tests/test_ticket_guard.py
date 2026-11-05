@@ -14,6 +14,8 @@ import tempfile
 import time
 import unittest
 
+from fake_docker import with_fake_docker
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROOF_DIR = os.path.dirname(HERE)
 GUARD_SH = os.path.join(PROOF_DIR, "ticket-guard.sh")
@@ -99,8 +101,7 @@ class TicketGuardTest(unittest.TestCase):
                    ORBLX_PROOF_LOCK=os.path.join(self.tmp, "proof.lock"),
                    PROOF_MIN_FREE_GIB="15")
         env.pop("ORBLX_PROOF_LOCK_HELD", None)
-        # The disk check before the lock (#139) reads the stand-in df, not the host disk.
-        from fake_docker import with_fake_docker
+        # The disk check before the lock reads the stand-in df, not the host disk.
         env = with_fake_docker(env)
         return subprocess.run(["bash", script], env=env, capture_output=True, text=True)
 
