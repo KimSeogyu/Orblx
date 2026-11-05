@@ -384,6 +384,35 @@ close_ssh_hold() {
   fi
 }
 
+# Print the hold client when gate 3 fails. The gate limits stay the same.
+dump_ssh_hold() {
+  local status="running"
+  if [[ -n "${ssh_hold_pid:-}" ]]; then
+    if kill -0 "$ssh_hold_pid" 2>/dev/null; then
+      status="running"
+    else
+      set +e
+      wait "$ssh_hold_pid"
+      status=$?
+      set -e
+    fi
+  fi
+  echo "gate3 ssh hold client exit ${status}"
+  echo "gate3 ssh hold output begin"
+  if [[ -f "$WORK/gate3-ssh-hold.out" ]]; then
+    grep -v 'PRIVATE KEY' "$WORK/gate3-ssh-hold.out" || true
+  fi
+  echo "gate3 ssh hold output end"
+  echo "gate3 ssh hold lines begin"
+  if [[ -f "$WORK/gate3-ssh-hold.out" ]]; then
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      printf '%s %s\n' "$(date +%s%3N)" "$line"
+    done < <(tr -d '\r' <"$WORK/gate3-ssh-hold.out")
+  fi
+  echo "gate3 ssh hold lines end"
+}
+
 # Print accepted, refused, or unknown for one `orblx ping` (a new QUIC session) from FROM to b.
 # The ping uses the netmap of FROM and does not use the coordinator.
 ping_try() {
@@ -589,6 +618,8 @@ if kill -0 "$ssh_hold_pid" 2>/dev/null; then
   ssh_exited=0
   ssh_held_s="$offline_secs_done"
 else
+  # The process is already dead, so the printed hold time is 0.
+  # max_out_gap_ms is the time from the last tick to the end of the window.
   ssh_exited=1
   ssh_held_s=0
 fi
@@ -599,11 +630,13 @@ if [[ "$offline_secs_done" -lt "$OFFLINE_SECS" || -z "$icmp_tx" || "$icmp_tx" -l
   || "$icmp_rx" != "$icmp_tx" || "$g3_probes" -lt 2 || "$g3_accepted" -ne "$g3_probes" \
   || "$g3_unknown" -ne 0 || "$g3_refused" -ne 0 || "$errors_after" != "$errors_before" \
   || "$g3_state" != valid || "$version_after" != "$version_before" ]]; then
+  dump_ssh_hold
   echo "The gate 3 (coordinator offline, valid deny.json) failed." >&2
   exit 1
 fi
 if [[ "$ssh_exited" -ne 0 || "$ssh_held_s" -lt "$OFFLINE_SECS" || "$tick_count" -lt 1 \
   || "$max_out_gap_ms" -gt "$SSH_HOLD_GAP_MS" ]]; then
+  dump_ssh_hold
   echo "The SSH session did not stay up for ${OFFLINE_SECS} s." >&2
   exit 1
 fi
