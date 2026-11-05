@@ -17,7 +17,7 @@ services:
       - coord
     environment:
       ORBLX_OIDC_MODE: google
-      ORBLX_SVID_TTL: "120"
+      ORBLX_SVID_TTL: "180"
     volumes:
       - ${SVID_COORD_STATE}:/var/lib/orblx
     networks:
