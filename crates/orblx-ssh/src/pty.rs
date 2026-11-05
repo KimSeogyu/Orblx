@@ -2,7 +2,9 @@
 //!
 //! The server opens one pseudo-terminal pair for each shell session.
 //! The shell is the session leader of a new session and owns the terminal.
-//! The server keeps the master side. It does not share it with other sessions.
+//! The server keeps the master side and one slave descriptor. It does not
+//! share them with other sessions. The slave descriptor is how the server
+//! reads the echo flag.
 
 use std::fs::File;
 use std::io;
@@ -51,6 +53,8 @@ pub(crate) fn clamp_size(value: u32, default: u16) -> u16 {
 pub(crate) struct PtyShell {
     /// The master side of the terminal.
     pub(crate) master: File,
+    /// The slave side. The echo flag is on this side, not on the master.
+    pub(crate) slave: File,
     /// The shell process.
     pub(crate) child: Child,
 }
@@ -60,6 +64,9 @@ pub(crate) struct PtyShell {
 /// The environment has only `PATH`, `TERM`, `HOME`, and `ORBLX_SSH_USER`.
 pub(crate) fn spawn_shell(spec: &PtySpec, user: &str) -> io::Result<PtyShell> {
     let (master, slave) = open_pair(spec.cols, spec.rows)?;
+    // Keep one slave descriptor. A later open of the slave path can fail,
+    // and the master side does not show the echo flag.
+    let echo_slave = slave.try_clone()?;
     let stdin = slave.try_clone()?;
     let stdout = slave.try_clone()?;
     let mut command = Command::new("/bin/sh");
@@ -89,6 +96,7 @@ pub(crate) fn spawn_shell(spec: &PtySpec, user: &str) -> io::Result<PtyShell> {
     let child = command.spawn()?;
     Ok(PtyShell {
         master: File::from(master),
+        slave: File::from(echo_slave),
         child,
     })
 }
@@ -134,67 +142,16 @@ fn close_on_exec(fd: &OwnedFd) -> io::Result<()> {
 /// Return true when the terminal echo is off.
 ///
 /// A shell turns the echo off for a password prompt.
-/// The check reads the slave terminal. On macOS the master side does not
-/// carry the slave `ECHO` flag, so a master-only check hides every input.
-/// When the call fails, the function returns false.
-pub(crate) fn echo_off(master: &File) -> bool {
-    if let Some(path) = slave_path(master) {
-        if let Ok(slave) = File::open(path) {
-            return term_echo_off(&slave);
-        }
-    }
-    term_echo_off(master)
-}
-
-fn term_echo_off(file: &File) -> bool {
+/// `slave` is the slave side from `openpty`. On macOS the master side does
+/// not carry the slave `ECHO` flag, so a master-only check hides every input.
+/// A later open of the slave path can also fail, so this reads the descriptor
+/// that `spawn_shell` kept. When the call fails, the function returns false.
+pub(crate) fn echo_off(slave: &File) -> bool {
     // SAFETY: termios is plain data. tcgetattr fills it.
     let mut modes: libc::termios = unsafe { std::mem::zeroed() };
     // SAFETY: the descriptor is open and the pointer is valid.
-    let status = unsafe { libc::tcgetattr(file.as_raw_fd(), &mut modes) };
+    let status = unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut modes) };
     status == 0 && modes.c_lflag & libc::ECHO == 0
-}
-
-/// The slave path for `master`.
-fn slave_path(master: &File) -> Option<std::path::PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        let mut buf = [0u8; 64];
-        // SAFETY: the buffer is valid for the call.
-        let rc = unsafe { libc::ptsname_r(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-        if rc != 0 {
-            return None;
-        }
-        let text = std::ffi::CStr::from_bytes_until_nul(&buf)
-            .ok()?
-            .to_str()
-            .ok()?;
-        Some(std::path::PathBuf::from(text))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let mut buf = [0u8; 128];
-        // SAFETY: the buffer is 128 bytes, the size in TIOCPTYGNAME.
-        let rc = unsafe {
-            libc::ioctl(
-                master.as_raw_fd(),
-                libc::TIOCPTYGNAME as _,
-                buf.as_mut_ptr(),
-            )
-        };
-        if rc < 0 {
-            return None;
-        }
-        let text = std::ffi::CStr::from_bytes_until_nul(&buf)
-            .ok()?
-            .to_str()
-            .ok()?;
-        Some(std::path::PathBuf::from(text))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = master;
-        None
-    }
 }
 
 /// Set the terminal size.
@@ -274,7 +231,7 @@ mod tests {
                     Ok(len) => seen.extend_from_slice(&buf[..len]),
                 }
             }
-            if String::from_utf8_lossy(&seen).contains("user-rec") && echo_off(&shell.master) {
+            if String::from_utf8_lossy(&seen).contains("user-rec") && echo_off(&shell.slave) {
                 saw_off = true;
             }
             if shell.child.try_wait().unwrap().is_some() && !readable(&shell.master, 50) {
