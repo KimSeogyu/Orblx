@@ -21,6 +21,11 @@ pub enum RelayError {
     SessionFull,
     /// The caller is not attached to the session.
     NotAttached,
+    /// The payload is not a sealed frame.
+    ///
+    /// A peer relay returns this error.
+    /// The peer relay does not forward the bytes.
+    Plaintext,
 }
 
 impl fmt::Display for RelayError {
@@ -35,6 +40,9 @@ impl fmt::Display for RelayError {
             Self::TooBig => formatter.write_str("The Relay payload is too large."),
             Self::SessionFull => formatter.write_str("The Relay session already has two peers."),
             Self::NotAttached => formatter.write_str("The peer is not attached to the session."),
+            Self::Plaintext => {
+                formatter.write_str("The payload is not a sealed frame. The peer relay drops it.")
+            }
         }
     }
 }
