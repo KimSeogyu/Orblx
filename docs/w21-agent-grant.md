@@ -109,3 +109,10 @@ The limit is 1000 ms. All measured times are below the limit.
 - `up --coord` does not refresh the netmap. The proof runs `coord netmap` before `up`.
 - Since W22-2 a revoke denies the ticket nonce of one grant. To stop all grants for an agent, revoke each grant ID.
 - Each guard process writes its own chain file.
+
+## Renewal (W25-30)
+
+A grant is single-use. A running `connect` or `http` loop reads the grant directory again before each attempt.
+When the agent fetches a newer approved grant with the same scope into the same directory, the loop uses it without a restart.
+The loop never takes a next grant with another scope, or a next grant that `deny.json` in the node state revokes.
+See `docs/w25-30-agent-grant-renewal.md`.
