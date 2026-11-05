@@ -1,7 +1,9 @@
 """W25-40: the SSH renewal proof builds release and checks the shell gates.
 
 Gate c uses a PTY shell. An exec command stops at 30 s.
-The proof reads the SURVIVED output line. It does not read the typed SURV""IVED line.
+The shell prints keepalive every 10 s so the client receives a packet.
+The proof reads the SURVIVED output line.
+It does not read keepalive lines or the typed SURV""IVED line.
 The shell end time must be after renewal 1.
 The login after renewal 2 must end within one renewal interval.
 """
@@ -63,6 +65,9 @@ class SshRenewHarnessTest(unittest.TestCase):
         self.assertIn("--peer-cert", shell)
         self.assertNotIn("--command", shell)
         self.assertIn('echo SURV""IVED at $(date +%%s)', shell)
+        self.assertIn("echo keepalive $(date +%%s)", shell)
+        self.assertIn("sleep %s", shell)
+        self.assertIn("keep_step=10", shell)
         self.assertNotIn("password", shell.lower())
         gate = self.src.split("gate c: a shell opens", 1)[1].split("gate b: login after renewal 2", 1)[0]
         self.assertNotIn("--command", gate)
@@ -103,45 +108,75 @@ class SshRenewHarnessTest(unittest.TestCase):
         self.assertLess(seen, login)
         self.assertLess(login, check)
 
-    def test_shell_end_at_reads_survived_and_skips_the_typed_line(self):
+    def test_shell_end_at_reads_survived_and_skips_keepalive_and_the_typed_line(self):
         fn = function_text(self.src, "shell_end_at")
-        typed = 'sleep 120; echo SURV""IVED at $(date +%s); exit\r\n'
-        output = "SURVIVED at 1700000123\r\n"
-        with tempfile.NamedTemporaryFile("w", delete=False) as handle:
-            handle.write(typed)
-            handle.write(output)
-            path = handle.name
+        typed = (
+            'i=0; while [ "$i" -lt 12 ]; do echo keepalive $(date +%s); '
+            'sleep 10; i=$((i+1)); done; echo SURV""IVED at $(date +%s); exit\r\n'
+        )
+        body = (
+            typed
+            + "keepalive 1700000001\r\n"
+            + "keepalive SURVIVED at 1\r\n"
+            + "SURVIVED at 1700000123\r\n"
+        )
+        path = self.write_text(body)
         try:
-            result = subprocess.run(
-                ["bash", "-c", fn + 'shell_end_at "$1"', "bash", path],
-                capture_output=True, text=True, check=False)
+            result = self.run_shell_end(fn, path)
         finally:
             os.remove(path)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "1700000123\n")
 
-        with tempfile.NamedTemporaryFile("w", delete=False) as handle:
-            handle.write(typed)
-            path = handle.name
+        path = self.write_text(typed + "keepalive 1700000001\n")
         try:
-            result = subprocess.run(
-                ["bash", "-c", fn + 'shell_end_at "$1"', "bash", path],
-                capture_output=True, text=True, check=False)
+            result = self.run_shell_end(fn, path)
         finally:
             os.remove(path)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "\n")
 
-    def test_the_piped_line_keeps_the_quotes_for_the_remote_shell(self):
+    def test_the_piped_line_keeps_the_quotes_and_covers_the_session(self):
         fn = function_text(self.src, "ssh_shell")
+        self.assertIn("keep_count=$(( (session_secs + keep_step - 1) / keep_step ))", fn)
         match = re.search(r"printf '([^']*)'", fn)
         self.assertIsNotNone(match)
+        script = (
+            "session_secs=120; keep_step=10; "
+            "keep_count=$(( (session_secs + keep_step - 1) / keep_step )); "
+            "printf '" + match.group(1) + "' \"$keep_count\" \"$keep_step\"; "
+            "printf 'count %s step %s\\n' \"$keep_count\" \"$keep_step\""
+        )
         result = subprocess.run(
-            ["bash", "-c", "session_secs=120; printf '" + match.group(1) + "' \"$session_secs\""],
-            capture_output=True, text=True, check=False)
+            ["bash", "-c", script], capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, 'sleep 120; echo SURV""IVED at $(date +%s); exit\n')
-        self.assertNotIn("SURVIVED", result.stdout)
+        line, count = result.stdout.splitlines()
+        self.assertEqual(
+            line,
+            'i=0; while [ "$i" -lt 12 ]; do echo keepalive $(date +%s); '
+            'sleep 10; i=$((i+1)); done; echo SURV""IVED at $(date +%s); exit')
+        self.assertEqual(count, "count 12 step 10")
+        self.assertNotIn("SURVIVED", line)
+        self.assertGreaterEqual(int(count.split()[1]) * int(count.split()[3]), 120)
+
+        odd = subprocess.run(
+            ["bash", "-c",
+             "session_secs=121; keep_step=10; "
+             "keep_count=$(( (session_secs + keep_step - 1) / keep_step )); "
+             "printf '%s\\n' \"$keep_count\""],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(odd.stdout.strip(), "13")
+
+    def write_text(self, text):
+        handle = tempfile.NamedTemporaryFile("w", delete=False)
+        handle.write(text)
+        handle.close()
+        return handle.name
+
+    def run_shell_end(self, fn, path):
+        return subprocess.run(
+            ["bash", "-c", fn + 'shell_end_at "$1"', "bash", path],
+            capture_output=True, text=True, check=False)
 
 
 if __name__ == "__main__":

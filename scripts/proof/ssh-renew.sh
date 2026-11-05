@@ -10,6 +10,7 @@
 # The client pins the key of the current cert.pem of node b each time.
 # Gate c: one PTY shell opens before the first renewal of b and ends after it.
 # An exec command stops at 30 s, so gate c does not use --command.
+# The shell prints keepalive every 10 s so the client receives a packet.
 # The script does not print private keys, tickets, or SVID proofs.
 set -euo pipefail
 # shellcheck source=scripts/proof/pipe-lib.sh
@@ -28,6 +29,7 @@ ttl="${SSH_RENEW_TTL:-180}"
 renew_interval=$((ttl * 2 / 3))
 # Gate c: the shell stays open for one renewal interval.
 # At the TTL floor of 180 s the shell runs for 120 s, so it can span renewal 1.
+# The shell prints keepalive every 10 s. The client closes a quiet session after 30 s.
 session_secs="${SSH_RENEW_SESSION_SECS:-$renew_interval}"
 renewal1_at=""
 renewal_2_seen_at=""
@@ -178,21 +180,25 @@ ssh_b() {
     --peer-cert "/tmp/${peer}.pem" --command "$command"
 }
 # Gate c uses a PTY shell. The exec path stops after 30 s.
-# The remote shell runs the sleep. The typed line shows SURV""IVED.
-# The shell output line shows SURVIVED and the unix time.
+# The remote shell prints keepalive every 10 s, then prints SURVIVED.
+# The typed line shows SURV""IVED. The output line shows SURVIVED and the unix time.
 ssh_shell() {
-  local peer=$1
-  printf 'sleep %s; echo SURV""IVED at $(date +%%s); exit\n' "$session_secs" \
+  local peer=$1 keep_step=10 keep_count
+  # N sleeps of 10 s cover session_secs. Each echo sends a packet before the 30 s close.
+  keep_count=$(( (session_secs + keep_step - 1) / keep_step ))
+  printf 'i=0; while [ "$i" -lt %s ]; do echo keepalive $(date +%%s); sleep %s; i=$((i+1)); done; echo SURV""IVED at $(date +%%s); exit\n' \
+    "$keep_count" "$keep_step" \
     | compose exec -T node-a orblx ssh alice@b --shell --identity /tmp/id \
       --netmap /etc/orblx/netmap.json --peer-cert "/tmp/${peer}.pem"
 }
 # Print the unix time from the SURVIVED output line.
-# Skip a line that still has the typed SURV""IVED text.
+# Skip a keepalive line and a line that still has the typed SURV""IVED text.
 shell_end_at() {
   local line end=""
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line//$'\r'/}"
     [[ "$line" == *'SURV""IVED'* ]] && continue
+    [[ "$line" == *keepalive* ]] && continue
     if [[ "$line" =~ SURVIVED[[:space:]]at[[:space:]]([0-9]+) ]]; then
       end="${BASH_REMATCH[1]}"
     fi
