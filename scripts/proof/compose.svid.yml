@@ -1,5 +1,5 @@
 # Short SVID renewal proof.
-# The proof script sets the SVID_* paths and SVID_TTL (ORBLX_SVID_TTL, 60 s).
+# The proof script sets the SVID_* paths and SVID_TTL (ORBLX_SVID_TTL, 180 s).
 
 name: orblx-svid
 

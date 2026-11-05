@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Enroll two nodes at the coordinator with 1 minute node SVIDs and tickets
+# Enroll two nodes at the coordinator with 3 minute node SVIDs and tickets
 # (W25-27: the tickets come from the coordinator enroll path) and keep one
-# session up for at least 6 minutes, across 2 or more ticket ends.
+# session up for at least 9 minutes, across 2 or more ticket ends.
+# W25-45: the coordinator refuses a node SVID life under 180 s.
 # The script pings once per second and reports loss.
 # The script skips the proof when it is not root or when Docker is absent.
 set -euo pipefail
@@ -26,10 +27,11 @@ compose_file="$root/scripts/proof/compose.svid.yml"
 work=$(mktemp -d)
 env_file=""
 image_dir=""
-ping_count=370
+ping_count=550
 # W25-27: the coordinator SVID and ticket life (ORBLX_SVID_TTL). The ping crosses
 # 2 or more ticket ends. A ticket ends at its expires time plus 60 s clock skew.
-svid_ttl=60
+# W25-45: the life is 180 s. A shorter life is refused.
+svid_ttl=180
 min_ticket_ends=2
 ticket_skew=60
 

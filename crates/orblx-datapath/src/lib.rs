@@ -48,7 +48,7 @@ pub use netmap::{
 };
 pub use node::{
     format_node_status, read_status_text, run_memory_node, run_node, running_pid, ListenEvent,
-    MemoryDevice, NodeRequest, NodeStatus, RenewedLeaf, StatusPeer, SvidRenewer,
+    MemoryDevice, NodeRequest, NodeStatus, RenewedLeaf, RenewedTicket, StatusPeer, SvidRenewer,
     COORD_MISMATCH_FILE, NODE_PID_FILE, NODE_RECORD_FILE, NODE_STATUS_FILE,
 };
 pub use quic::{

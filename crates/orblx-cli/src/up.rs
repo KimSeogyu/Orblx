@@ -22,7 +22,7 @@ use orblx_coord::{
 use orblx_crypto::{mac_input, ticket_mac};
 use orblx_datapath::{
     read_status_text, remove_link_resolver, run_node, running_pid, AllowPeers, HelloConfig, Netmap,
-    NetmapPeer, NodeRequest, PacketFilter, PeerVisibility, RenewedLeaf, SvidRenewer,
+    NetmapPeer, NodeRequest, PacketFilter, PeerVisibility, RenewedLeaf, RenewedTicket, SvidRenewer,
     DEFAULT_UDP_PORT, LINUX_TUN_NAME, PACKET_AUDIT_FILE,
 };
 use orblx_identity::{
@@ -590,9 +590,18 @@ fn load_renewer(
 fn renew_from_coord(state: &Path, coord: SocketAddr, name: &str) -> Result<RenewedLeaf, String> {
     let bundle = read_text(&state.join(BUNDLE_FILE))?;
     let result = renew_svid_blocking(coord, name, &bundle, state).map_err(|err| err.to_string())?;
+    // W25-45: present the new coordinator ticket on each new handshake after renewal.
+    let ticket = result
+        .ticket
+        .as_ref()
+        .ok_or_else(|| "The renewal reply has no capability ticket.".to_string())?;
     Ok(RenewedLeaf {
-        certificate_pem: result.certificate_pem,
-        private_key_pem: result.private_key_pem,
+        certificate_pem: result.certificate_pem.clone(),
+        private_key_pem: result.private_key_pem.clone(),
+        ticket: Some(RenewedTicket {
+            bytes: ticket.bytes.clone(),
+            mac: ticket.mac,
+        }),
     })
 }
 
@@ -1503,7 +1512,7 @@ orblx status prints each peer, the path kind, and the SVID expiry.
 The path kind is direct when the session received a frame in the last 2 seconds.
 The path kind is stale when the session is up and that frame is older.
 The path kind is down when the session is down.
-The node renews the SVID from the coordinator at two thirds of the certificate life.
+The node renews the SVID and the capability ticket from the coordinator. The renewal starts at least 5 minutes or one third of the certificate life before the end.
 The coordinator address is --coord or the file coord-addr in the state directory.
 The command does not print the private key or a token.
 --advertise-routes sends the CIDR to the coordinator when --coord and --bundle are set.

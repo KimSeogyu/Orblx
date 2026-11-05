@@ -20,10 +20,11 @@ The Compose project name is `orblx-svid`.
 The bridge subnet is `172.28.19.0/24`.
 The gateway is `172.28.19.1`.
 
-`ORBLX_SVID_TTL=120` sets the node leaf life to 2 minutes.
+`ORBLX_SVID_TTL=180` sets the node leaf life to 3 minutes.
+W25-45: the coordinator refuses a value under 180 seconds at start.
 The coordinator SVID life stays 15 minutes.
-The proof runs for 370 seconds.
-That is longer than 6 minutes and longer than three leaf lives.
+The proof runs for 550 seconds.
+That is longer than 9 minutes and longer than three leaf lives.
 `node-a` pings `100.64.0.2` once per second.
 
 The node renews when two thirds of the leaf life has passed.
