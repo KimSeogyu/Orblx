@@ -394,7 +394,11 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
 fn run_up(mut options: UpOptions) -> Result<(), String> {
     apply_saved_exit(&mut options)?;
     let (netmap_path, forward_routes, forward_exit) = publish_routes(&options)?;
-    let netmap = locked_netmap(&options.state_dir, &netmap_path)?;
+    let netmap = if uses_signed_netmap(&options) {
+        signed_netmap(&options.state_dir)?
+    } else {
+        locked_netmap(&options.state_dir, &netmap_path)?
+    };
     let config = load_config(&options.state_dir)?;
     let overlay: Ipv4Addr = netmap
         .self_node
@@ -438,6 +442,27 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
         filter,
     })
     .map_err(|err| err.to_string())
+}
+
+/// Tell if the node must parse the signed netmap (W25-36).
+///
+/// A node with coordinator state parses only `netmap.signed.json` after the signature
+/// check, also with a `--netmap` option. No option or file mode turns the check off.
+/// A node without coordinator state (a static `orblx issue` node) keeps its netmap file.
+fn uses_signed_netmap(options: &UpOptions) -> bool {
+    orblx_datapath::has_coordinator_state(&options.state_dir)
+}
+
+/// Parse the netmap only from the signed bytes and apply node lock (W25-36).
+///
+/// The function does not read `netmap.json`.
+fn signed_netmap(state_dir: &Path) -> Result<Netmap, String> {
+    let (netmap, report) = orblx_coord::read_verified_netmap(state_dir)
+        .map_err(|err| format!("The signed netmap was not accepted. {}", err.public_text()))?;
+    if let Some(report) = report {
+        orblx_coord::nodelock::print_report(&report);
+    }
+    Ok(netmap)
 }
 
 /// Read the netmap and apply node lock (W23-1).
