@@ -22,7 +22,7 @@ use orblx_coord::{
 use orblx_crypto::{mac_input, ticket_mac};
 use orblx_datapath::{
     read_status_text, remove_link_resolver, run_node, running_pid, AllowPeers, HelloConfig, Netmap,
-    NetmapPeer, NodeRequest, PacketFilter, PeerVisibility, RenewedLeaf, SvidRenewer,
+    NetmapPeer, NodeRequest, PacketFilter, PeerVisibility, RenewedLeaf, RenewedTicket, SvidRenewer,
     DEFAULT_UDP_PORT, LINUX_TUN_NAME, PACKET_AUDIT_FILE,
 };
 use orblx_identity::{
@@ -527,9 +527,18 @@ fn load_renewer(
 fn renew_from_coord(state: &Path, coord: SocketAddr, name: &str) -> Result<RenewedLeaf, String> {
     let bundle = read_text(&state.join(BUNDLE_FILE))?;
     let result = renew_svid_blocking(coord, name, &bundle, state).map_err(|err| err.to_string())?;
+    // W25-26: the running node presents the new ticket in each new handshake.
+    let ticket = result
+        .ticket
+        .as_ref()
+        .ok_or_else(|| "The renewal reply has no capability ticket.".to_string())?;
     Ok(RenewedLeaf {
-        certificate_pem: result.certificate_pem,
-        private_key_pem: result.private_key_pem,
+        certificate_pem: result.certificate_pem.clone(),
+        private_key_pem: result.private_key_pem.clone(),
+        ticket: Some(RenewedTicket {
+            bytes: ticket.bytes.clone(),
+            mac: ticket.mac,
+        }),
     })
 }
 
