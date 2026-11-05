@@ -292,7 +292,7 @@ restore_router() {
   wait_direct client "$router" 120 || fail "${router} did not come back."
 }
 
-proof_lock_take "ha-routers:${PROJECT}" "${PROJECT}-"
+proof_lock_take "ha-routers:${PROJECT}" "${PROJECT}"
 # W25-14b: start from a clean compose state (all profiles, all volumes).
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$ROOT/scripts/proof/compose-clean.sh"
