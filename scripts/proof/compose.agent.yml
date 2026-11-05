@@ -66,6 +66,10 @@ services:
     volumes:
       - orblx-agent-store:/coord-state:ro
       - orblx-agent-a:/var/lib/orblx
+    environment:
+      # W25-39: the opt-in TUN packet trace. Empty values turn the trace off.
+      ORBLX_DP_TRACE_FILE: ${ORBLX_DP_TRACE_FILE:-}
+      ORBLX_DP_TRACE_PORTS: ${ORBLX_DP_TRACE_PORTS:-}
     networks:
       - proof
 
@@ -97,6 +101,10 @@ services:
     volumes:
       - orblx-agent-store:/coord-state:ro
       - orblx-agent-b:/var/lib/orblx
+    environment:
+      # W25-39: the opt-in TUN packet trace. Empty values turn the trace off.
+      ORBLX_DP_TRACE_FILE: ${ORBLX_DP_TRACE_FILE:-}
+      ORBLX_DP_TRACE_PORTS: ${ORBLX_DP_TRACE_PORTS:-}
     networks:
       - proof
 

@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use orblx_agent::{
-    connect, new_nonce, plain_http_request, run_gateway, run_guard, seal_http_request, send_http,
-    unix_millis, ConnectError, GrantFiles, GuardConfig,
+    connect_timed, new_nonce, plain_http_request, run_gateway, run_guard, seal_http_request,
+    send_http, unix_micros_now, unix_millis, ConnectError, ConnectTiming, GrantDir, GrantFiles,
+    GrantRefresh, GuardConfig, NodeDeny,
 };
 use orblx_coord::{
     agent_grant_fetch_blocking, agent_grant_request_blocking, decode_hex_32, fetch_deny_blocking,
@@ -37,6 +38,7 @@ pub(crate) enum Command {
 #[derive(Debug)]
 pub(crate) struct Http {
     grant: Option<PathBuf>,
+    state: PathBuf,
     to: Option<SocketAddr>,
     service: Option<String>,
     method: String,
@@ -76,12 +78,15 @@ pub(crate) struct Fetch {
 #[derive(Debug)]
 pub(crate) struct Connect {
     grant: PathBuf,
+    state: PathBuf,
     to: Option<SocketAddr>,
     service: Option<String>,
     send: Option<String>,
     timeout: Duration,
     every: Option<Duration>,
     max_wait: Duration,
+    /// Loop mode only: a file that gets one time line per attempt (W25-30).
+    trace: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -225,6 +230,8 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
                     "--timeout",
                     "--every-ms",
                     "--max-wait",
+                    "--state",
+                    "--trace-file",
                 ],
             )?;
             let to = flags
@@ -236,7 +243,9 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
                 None => None,
             };
             Ok(Command::Connect(Connect {
+                trace: flags.get("--trace-file").map(PathBuf::from),
                 grant: PathBuf::from(flags.need("--grant")?),
+                state: PathBuf::from(flags.get("--state").unwrap_or(DEFAULT_STATE)),
                 to,
                 service: flags.get("--service").map(str::to_string),
                 send: flags.get("--send").map(str::to_string),
@@ -263,6 +272,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
                     "--save-request",
                     "--send-file",
                     "--header",
+                    "--state",
                 ],
             )?;
             let to = flags
@@ -293,6 +303,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
             let path = flags.get("--path").unwrap_or("/").to_string();
             Ok(Command::Http(Http {
                 grant,
+                state: PathBuf::from(flags.get("--state").unwrap_or(DEFAULT_STATE)),
                 to,
                 service: flags.get("--service").map(str::to_string),
                 method,
@@ -460,7 +471,14 @@ fn run_connect(command: Connect) -> Result<i32, String> {
     let node = SpiffeId::parse(&grant.node).map_err(|err| err.to_string())?;
     let Some(every) = command.every else {
         let started = now_ms();
-        return match one_connect(&files, to, &node, &service, &command) {
+        return match one_connect(
+            &files,
+            to,
+            &node,
+            &service,
+            &command,
+            &mut ConnectTiming::default(),
+        ) {
             Ok(reply) => {
                 println!("connect ok to {to} service {service} at_ms {started}");
                 if let Some(line) = reply {
@@ -478,16 +496,37 @@ fn run_connect(command: Connect) -> Result<i32, String> {
         };
     };
     // Loop mode: connect until the guard denies, and print the times.
+    // Before each attempt the loop reads the grant directory again and takes
+    // a newer grant with the same scope (W25-30). No restart is necessary.
+    let mut dir = GrantDir::open(&command.grant, NodeDeny::new(&command.state))
+        .map_err(|err| err.to_string())?;
     let limit = Instant::now() + command.max_wait;
     let mut last_ok: Option<u64> = None;
+    let mut stats = LoopStats::default();
     let mut attempts = 0u64;
+    let mut trace = AttemptTrace::open(command.trace.as_deref())?;
     loop {
+        let start = now_ms();
+        refresh_grant(&mut dir, &mut stats);
         let at = now_ms();
+        let at_us = unix_micros_now();
         attempts += 1;
-        match one_connect(&files, to, &node, &service, &command) {
-            Ok(_) => last_ok = Some(at),
+        let mut timing = ConnectTiming::default();
+        let result = one_connect(dir.files(), to, &node, &service, &command, &mut timing);
+        let done = now_ms();
+        trace.line(
+            attempts,
+            (start, at, done),
+            &result,
+            &dir.files().grant.grant.id,
+            (at_us, &timing),
+        );
+        match result {
+            Ok(_) => {
+                last_ok = Some(at);
+                stats.ok(at);
+            }
             Err(ConnectError::Denied(reason)) => {
-                let done = now_ms();
                 println!("loop attempts {attempts}");
                 println!(
                     "loop last_ok_ms {}",
@@ -500,8 +539,9 @@ fn run_connect(command: Connect) -> Result<i32, String> {
                 println!("loop deny_reason {reason}");
                 println!(
                     "loop grant_expires_ms {}",
-                    grant.expires.saturating_mul(1000)
+                    dir.files().grant.grant.expires.saturating_mul(1000)
                 );
+                stats.print();
                 return Ok(0);
             }
             Err(ConnectError::Failed(text)) => {
@@ -510,10 +550,105 @@ fn run_connect(command: Connect) -> Result<i32, String> {
         }
         if Instant::now() >= limit {
             println!("loop attempts {attempts}");
+            stats.print();
             println!("loop no_deny_until_ms {}", now_ms());
             return Ok(EXIT_DENIED);
         }
         std::thread::sleep(every);
+    }
+}
+
+/// One time line per loop attempt, for the proof logs (W25-30). It holds no key or ticket.
+/// start_ms is before the grant directory read, send_ms is before the connect,
+/// done_ms is after the reply. The time from done_ms to the next start_ms is the sleep.
+struct AttemptTrace(Option<std::fs::File>);
+
+impl AttemptTrace {
+    fn open(path: Option<&Path>) -> Result<Self, String> {
+        let Some(path) = path else {
+            return Ok(Self(None));
+        };
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map(|file| Self(Some(file)))
+            .map_err(|err| format!("The trace file {} cannot be opened: {err}", path.display()))
+    }
+
+    /// `ms` holds the loop start, send and done times in ms.
+    /// `steps` holds the send time in microseconds and the step times of the connection (W25-39).
+    fn line<T>(
+        &mut self,
+        attempt: u64,
+        ms: (u64, u64, u64),
+        result: &Result<T, ConnectError>,
+        grant: &str,
+        steps: (u64, &ConnectTiming),
+    ) {
+        let (start, send, done) = ms;
+        let (send_us, timing) = steps;
+        let Some(file) = self.0.as_mut() else {
+            return;
+        };
+        let result = match result {
+            Ok(_) => "ok",
+            Err(ConnectError::Denied(_)) => "deny",
+            Err(ConnectError::Failed(_)) => "failed",
+        };
+        // A trace write error does not stop the loop. The trace is for the logs only.
+        let _ = writeln!(
+            file,
+            "trace attempt {attempt} start_ms {start} send_ms {send} done_ms {done} result {result} grant {grant} send_us {send_us} seal_us {} tcp_us {} sent_us {} reply_us {} port {}",
+            timing.seal_us,
+            timing.tcp_us,
+            timing.sent_us,
+            timing.reply_us,
+            timing.local_port
+        );
+    }
+}
+
+/// Counters of one loop. They hold no key or ticket.
+#[derive(Default)]
+struct LoopStats {
+    ok_count: u64,
+    last_ok: Option<u64>,
+    max_ok_gap_ms: u64,
+    switches: u64,
+}
+
+impl LoopStats {
+    fn ok(&mut self, at: u64) {
+        if let Some(last) = self.last_ok {
+            self.max_ok_gap_ms = self.max_ok_gap_ms.max(at.saturating_sub(last));
+        }
+        self.last_ok = Some(at);
+        self.ok_count += 1;
+    }
+
+    fn print(&self) {
+        println!("loop ok_attempts {}", self.ok_count);
+        println!("loop max_ok_gap_ms {}", self.max_ok_gap_ms);
+        println!("loop grant_switches {}", self.switches);
+    }
+}
+
+/// Read the grant directory again and print a grant change.
+fn refresh_grant(dir: &mut GrantDir, stats: &mut LoopStats) {
+    match dir.refresh() {
+        GrantRefresh::Same => {}
+        GrantRefresh::Switched { from, to } => {
+            stats.switches += 1;
+            println!(
+                "loop grant_switch from {from} to {to} at_ms {} expires_ms {}",
+                now_ms(),
+                dir.files().grant.grant.expires.saturating_mul(1000)
+            );
+        }
+        GrantRefresh::Kept(reason) => {
+            println!("loop grant_kept reason {reason} at_ms {}", now_ms());
+        }
     }
 }
 
@@ -523,8 +658,9 @@ fn one_connect(
     node: &SpiffeId,
     service: &str,
     command: &Connect,
+    timing: &mut ConnectTiming,
 ) -> Result<Option<String>, ConnectError> {
-    let mut stream = connect(files, to, node, service, command.timeout)?;
+    let mut stream = connect_timed(files, to, node, service, command.timeout, timing)?;
     let Some(text) = &command.send else {
         return Ok(None);
     };
@@ -623,8 +759,8 @@ fn run_http(command: Http) -> Result<i32, String> {
             0,
         ),
     };
-    let build = || -> Result<Vec<u8>, String> {
-        match (&files, &node) {
+    let build = |files: Option<&GrantFiles>| -> Result<Vec<u8>, String> {
+        match (files, &node) {
             (Some(files), Some(node)) => seal_http_request(
                 files,
                 to,
@@ -669,7 +805,7 @@ fn run_http(command: Http) -> Result<i32, String> {
         let bytes = match &command.send_file {
             Some(path) => std::fs::read(path)
                 .map_err(|err| format!("The file {} did not open. {err}", path.display()))?,
-            None => build()?,
+            None => build(files.as_ref())?,
         };
         if let Some(path) = &command.save_request {
             write_private(path, &bytes)?;
@@ -697,13 +833,25 @@ fn run_http(command: Http) -> Result<i32, String> {
         return Ok(code);
     };
     // Loop mode: a new nonce each time, until the gateway refuses.
+    // Before each request the loop reads the grant directory again and takes
+    // a newer grant with the same scope (W25-30). No restart is necessary.
+    let mut dir = match &command.grant {
+        Some(path) => Some(
+            GrantDir::open(path, NodeDeny::new(&command.state)).map_err(|err| err.to_string())?,
+        ),
+        None => None,
+    };
     let limit = Instant::now() + command.max_wait;
     let mut last_ok: Option<u64> = None;
+    let mut stats = LoopStats::default();
     let mut attempts = 0u64;
     loop {
+        if let Some(dir) = dir.as_mut() {
+            refresh_grant(dir, &mut stats);
+        }
         let at = now_ms();
         attempts += 1;
-        let bytes = build()?;
+        let bytes = build(dir.as_ref().map(GrantDir::files))?;
         let (status, text) = send(&bytes)?;
         if status != 200 {
             let done = now_ms();
@@ -716,12 +864,23 @@ fn run_http(command: Http) -> Result<i32, String> {
             println!("loop first_deny_ms {done}");
             println!("loop deny_status {status}");
             println!("loop deny_reason {text}");
-            println!("loop grant_expires_ms {expires_ms}");
+            println!(
+                "loop grant_expires_ms {}",
+                dir.as_ref().map_or(expires_ms, |dir| dir
+                    .files()
+                    .grant
+                    .grant
+                    .expires
+                    .saturating_mul(1000))
+            );
+            stats.print();
             return Ok(0);
         }
         last_ok = Some(at);
+        stats.ok(at);
         if Instant::now() >= limit {
             println!("loop attempts {attempts}");
+            stats.print();
             println!("loop no_deny_until_ms {}", now_ms());
             return Ok(EXIT_DENIED);
         }
@@ -752,8 +911,8 @@ fn help() -> String {
     "\
 orblx agent grant request --agent NAME --node NODE --service NAME --port N [--ttl SECS] [--path PREFIX] --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx agent grant fetch --id ID --out DIR [--wait SECS] --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
-orblx agent connect --grant DIR [--to IP:PORT] [--service NAME] [--send TEXT] [--timeout SECS] [--every-ms MS] [--max-wait SECS]
-orblx agent http [--grant DIR] [--to IP:PORT] [--service NAME] [--method M] [--path TARGET] [--body TEXT] [--repeat N] [--timeout SECS] [--every-ms MS] [--max-wait SECS] [--save-request FILE] [--send-file FILE] [--header NAME:VALUE]...
+orblx agent connect --grant DIR [--to IP:PORT] [--service NAME] [--send TEXT] [--timeout SECS] [--every-ms MS] [--max-wait SECS] [--state DIR] [--trace-file FILE]
+orblx agent http [--grant DIR] [--to IP:PORT] [--service NAME] [--method M] [--path TARGET] [--body TEXT] [--repeat N] [--timeout SECS] [--every-ms MS] [--max-wait SECS] [--save-request FILE] [--send-file FILE] [--header NAME:VALUE]... [--state DIR]
 orblx gateway --listen IP:PORT --service NAME --target ADDR [--audit FILE] [--nonce-file FILE] [--poll-ms MS] [--stale-ms MS] [--coord ADDR] [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx agent guard --listen IP:PORT --service NAME --target ADDR [--audit FILE] [--poll-ms MS] [--stale-ms MS] [--coord ADDR] [--state DIR] [--coord-name NAME] [--bundle FILE]
 
@@ -764,6 +923,10 @@ grant fetch gets the agent SVID, the agent ticket, and the signed grant one time
 grant fetch writes the files to DIR. The key and ticket files have mode 0600.
 connect sends one use proof to the guard and prints the guard decision.
 connect with --every-ms opens a new connection each MS until the guard denies.
+Before each connection it reads DIR again. A newer grant with the same scope that grant fetch wrote to DIR replaces the current grant.
+It never takes a grant that deny.json in the node state (--state, default /var/lib/orblx) revokes.
+When it cannot read deny.json or ticket-verifier.pem there, it keeps the current grant.
+With --trace-file FILE the loop adds one time line per attempt to FILE (start_ms, send_ms, done_ms).
 It prints the times in Unix ms. first_deny_ms is the time of the deny reply.
 connect exits with code 3 when the guard denies.
 guard accepts a TCP connection on --listen only with a valid use proof, then forwards it to --target.
@@ -778,7 +941,7 @@ gateway refuses a request with a header that is not the same as the signed heade
 gateway keeps used nonces in --nonce-file (default AUDIT.nonces), apart from the audit chain. A restart reads that file.
 http sends one HTTP request with a grant proof and a new nonce. Without --grant it sends no proof.
 http with --repeat N sends the same request bytes N times. The second send is a replay.
-http with --every-ms sends a new request each MS until the gateway refuses.
+http with --every-ms sends a new request each MS until the gateway refuses. It reads DIR again before each request, as connect does.
 http with --save-request FILE keeps the request bytes in FILE (mode 0600). The bytes hold a use proof.
 http with --send-file FILE --to IP:PORT sends those bytes again, for a replay test.
 Use orblx audit verify-config --file FILE to check that chain.
@@ -951,5 +1114,303 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
         std::fs::remove_file(&path).unwrap();
+    }
+}
+
+/// W25-30 regression: a running `connect --every-ms` loop takes a new grant
+/// from the grant directory and keeps access across the end of the old grant.
+/// It never takes a revoked next grant or a next grant with another scope.
+#[cfg(test)]
+mod grant_end_tests {
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use ed25519_dalek::SigningKey;
+    use orblx_agent::{run_guard, sign_grant, AgentGrant, GrantFiles, GuardConfig, GRANT_VERSION};
+    use orblx_audit::verify_config_file;
+    use orblx_identity::{
+        sign_agent_jit_ticket, ticket_hash, DenySet, Ipv4Destination, MiniCa, SpiffeId,
+        TicketSigner,
+    };
+
+    use super::{run_connect, Connect, EXIT_DENIED};
+
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// Write the node deny list with these revoked ticket nonces.
+    fn write_deny(state: &Path, nonces: &[&str]) {
+        let list: Vec<String> = nonces.iter().map(|nonce| format!("\"{nonce}\"")).collect();
+        let text = format!(
+            r#"{{"version":{},"generated_at":1,"revoked_uris":[],"revoked_ticket_nonces":[{}]}}"#,
+            nonces.len() + 1,
+            list.join(",")
+        );
+        std::fs::write(state.join("deny.json"), text).unwrap();
+    }
+
+    struct Issued {
+        files: GrantFiles,
+        end: u64,
+        nonce: String,
+    }
+
+    struct Issuer {
+        ca: MiniCa,
+        signer: TicketSigner,
+        netmap: SigningKey,
+        node: SpiffeId,
+        dest: Ipv4Destination,
+    }
+
+    impl Issuer {
+        /// Issue one grant set that starts now, as the coordinator fetch does.
+        fn issue(&self, id: &str, ttl: u64, service: &str) -> Issued {
+            let now = SystemTime::now();
+            let agent = SpiffeId::agent("bot").unwrap();
+            let coord = SpiffeId::coord("coord").unwrap();
+            let life = Duration::from_secs(ttl);
+            let svid = self.ca.issue(&agent, now, life, &DenySet::empty()).unwrap();
+            let ticket =
+                sign_agent_jit_ticket(&self.signer, &coord, &agent, now, life, self.dest).unwrap();
+            let start = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let grant = AgentGrant {
+                version: GRANT_VERSION,
+                id: id.to_string(),
+                agent: agent.as_uri().to_string(),
+                requester: SpiffeId::node("a").unwrap().as_uri().to_string(),
+                approver: SpiffeId::node("owner").unwrap().as_uri().to_string(),
+                node: self.node.as_uri().to_string(),
+                addr: self.dest.addr.to_string(),
+                service: service.to_string(),
+                port: self.dest.port,
+                path_prefix: "/".to_string(),
+                not_before: start,
+                expires: start + ttl,
+                ticket_hash: hex(&ticket_hash(&ticket.bytes)),
+            };
+            Issued {
+                files: GrantFiles {
+                    cert_pem: svid.certificate_pem,
+                    key_pem: svid.private_key_pem,
+                    ticket: ticket.bytes,
+                    grant: sign_grant(&self.netmap, &grant).unwrap(),
+                },
+                end: start + ttl,
+                nonce: hex(&ticket.nonce),
+            }
+        }
+    }
+
+    /// A guard on 127.0.0.1, a local service, a node state, and a grant directory.
+    /// The guard and the agent read the same node deny list.
+    struct Rig {
+        scratch: Scratch,
+        issuer: Issuer,
+        listen: SocketAddr,
+    }
+
+    impl Rig {
+        fn start(name: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos();
+            let scratch = Scratch(std::env::temp_dir().join(format!(
+                "orblx-w25-30-{name}-{}-{nanos}",
+                std::process::id()
+            )));
+            let _ = std::fs::remove_dir_all(&scratch.0);
+            std::fs::create_dir_all(scratch.0.join("state")).unwrap();
+
+            // The local service. Each connection closes at once.
+            let service = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let target = service.local_addr().unwrap();
+            std::thread::spawn(move || {
+                for stream in service.incoming().flatten() {
+                    drop(stream);
+                }
+            });
+
+            let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let issuer = Issuer {
+                ca: MiniCa::generate(SystemTime::now() - Duration::from_secs(60)).unwrap(),
+                signer: TicketSigner::generate(),
+                netmap: SigningKey::from_bytes(&[9u8; 32]),
+                node: SpiffeId::node("b").unwrap(),
+                dest: Ipv4Destination {
+                    addr: Ipv4Addr::LOCALHOST,
+                    proto: 6,
+                    port,
+                },
+            };
+            let state = scratch.0.join("state");
+            std::fs::write(
+                state.join("ticket-verifier.pem"),
+                issuer.signer.public_key_pem(),
+            )
+            .unwrap();
+            write_deny(&state, &[]);
+            let listen = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            let config = GuardConfig {
+                listen,
+                service: "web".to_string(),
+                target,
+                node: issuer.node.clone(),
+                bundle: issuer.ca.trust_bundle().clone(),
+                verifier: issuer.signer.verifier(),
+                netmap_public: issuer.netmap.verifying_key().to_bytes(),
+                audit_path: scratch.0.join("agent-audit.jsonl"),
+                nonce_path: None,
+                poll: Duration::from_millis(200),
+                stale_after: Duration::from_secs(2),
+            };
+            let deny_path = state.join("deny.json");
+            std::thread::spawn(move || {
+                let _ = run_guard(
+                    config,
+                    Box::new(move || {
+                        std::fs::read_to_string(&deny_path).map_err(|err| err.to_string())
+                    }),
+                );
+            });
+            Self {
+                scratch,
+                issuer,
+                listen,
+            }
+        }
+
+        fn state(&self) -> PathBuf {
+            self.scratch.0.join("state")
+        }
+
+        fn grant_dir(&self) -> PathBuf {
+            self.scratch.0.join("grant")
+        }
+
+        fn audit(&self) -> PathBuf {
+            self.scratch.0.join("agent-audit.jsonl")
+        }
+
+        /// Start a `connect --every-ms 100 --max-wait 6` loop on the grant directory.
+        fn run_loop(&self) -> std::thread::JoinHandle<Result<i32, String>> {
+            let connect = Connect {
+                grant: self.grant_dir(),
+                state: self.state(),
+                to: Some(self.listen),
+                service: None,
+                send: None,
+                timeout: Duration::from_secs(5),
+                every: Some(Duration::from_millis(100)),
+                max_wait: Duration::from_secs(6),
+                trace: None,
+            };
+            std::thread::spawn(move || run_connect(connect))
+        }
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn a_connect_loop_crosses_a_grant_end_with_a_new_grant() {
+        let rig = Rig::start("cross");
+
+        // Grant 1 ends 2 to 3 s from now.
+        let first = rig.issuer.issue("00000000000000a1", 3, "web");
+        first.files.write(&rig.grant_dir()).unwrap();
+        let agent = rig.run_loop();
+
+        // The owner approved grant 2. The agent fetches it to the same
+        // directory before grant 1 ends.
+        std::thread::sleep(Duration::from_secs(1));
+        let second = rig.issuer.issue("00000000000000a2", 10, "web");
+        assert!(second.end > first.end);
+        second.files.write(&rig.grant_dir()).unwrap();
+
+        // The loop runs for 6 s, past the end of grant 1.
+        // Exit code 3 means that the guard did not deny before --max-wait.
+        let result = agent.join().unwrap();
+        assert_eq!(
+            result,
+            Ok(EXIT_DENIED),
+            "the guard denied the loop (see the loop deny_reason line)"
+        );
+        assert!(
+            now_secs() > first.end,
+            "the loop must run past the end of grant 1"
+        );
+
+        // The guard chain is good, has uses of both grants, and has no deny.
+        let verified = verify_config_file(&rig.audit()).unwrap();
+        assert!(verified.records.len() >= 3);
+        let text = std::fs::read_to_string(rig.audit()).unwrap();
+        assert!(text.contains("00000000000000a1"));
+        assert!(text.contains("00000000000000a2"));
+        assert!(
+            !text.contains("\"agent-deny\""),
+            "the guard chain has a deny"
+        );
+    }
+
+    /// W25-30 gate: a next grant with another scope or a revoked next grant is
+    /// never taken. The loop stops at the end of grant 1 with deny `expired`.
+    #[test]
+    fn a_connect_loop_never_takes_a_revoked_or_other_scope_next_grant() {
+        let rig = Rig::start("refuse");
+        let first = rig.issuer.issue("00000000000000a1", 3, "web");
+        first.files.write(&rig.grant_dir()).unwrap();
+        let agent = rig.run_loop();
+
+        // A newer grant for another service arrives first.
+        std::thread::sleep(Duration::from_secs(1));
+        let other = rig.issuer.issue("00000000000000b1", 10, "db");
+        other.files.write(&rig.grant_dir()).unwrap();
+
+        // Then a newer grant with the same scope, which the owner revoked.
+        // The node deny list holds its ticket nonce before the agent sees it.
+        std::thread::sleep(Duration::from_secs(1));
+        let revoked = rig.issuer.issue("00000000000000a2", 10, "web");
+        assert!(revoked.end > first.end);
+        write_deny(&rig.state(), &[&revoked.nonce]);
+        revoked.files.write(&rig.grant_dir()).unwrap();
+
+        // The loop must stop with a deny (exit 0), not run to --max-wait (exit 3).
+        let result = agent.join().unwrap();
+        assert_eq!(result, Ok(0), "the loop must stop at the end of grant 1");
+        assert!(now_secs() >= first.end);
+
+        // The guard saw only grant 1. The deny reason is `expired`.
+        let verified = verify_config_file(&rig.audit()).unwrap();
+        assert!(verified.records.len() >= 2);
+        let text = std::fs::read_to_string(rig.audit()).unwrap();
+        assert!(text.contains("00000000000000a1"));
+        assert!(!text.contains("00000000000000b1"), "another scope was used");
+        assert!(
+            !text.contains("00000000000000a2"),
+            "a revoked grant was used"
+        );
+        assert!(text.contains("\"agent-deny\""));
+        assert!(text.contains("expired"), "the deny reason is not expired");
+        assert!(!text.contains("revoked"), "the guard saw a revoked grant");
     }
 }

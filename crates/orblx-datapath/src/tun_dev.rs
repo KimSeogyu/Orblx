@@ -313,6 +313,7 @@ mod linux {
         loop {
             match device.recv_timeout(&mut buf, Duration::from_millis(50)) {
                 Ok(size) => {
+                    crate::pkt_trace::trace_tun("read", &buf[..size]);
                     if from_tun.blocking_send(buf[..size].to_vec()).is_err() {
                         return;
                     }
@@ -336,6 +337,7 @@ mod linux {
     /// Write packets to the TUN device as soon as they arrive.
     fn tun_write_loop(device: Arc<tun::Device>, mut to_tun: mpsc::Receiver<Vec<u8>>) {
         while let Some(packet) = to_tun.blocking_recv() {
+            crate::pkt_trace::trace_tun("write", &packet);
             if let Err(err) = device.send(&packet) {
                 eprintln!("The TUN device write failed. {err}");
                 return;
