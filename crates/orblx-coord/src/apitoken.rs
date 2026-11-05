@@ -284,8 +284,8 @@ pub struct CreateAsk {
 
 /// Create one token. The call writes one `token-create` record.
 ///
-/// `role` is the creator role. Each scope must fit that role.
-/// The token stores the role. A later call also checks the live role.
+/// `role` is the creator role now. Each scope must fit that role.
+/// The token stores that role. A later call uses the creator's current role.
 pub fn create(
     coord: &Coordinator,
     ask: &CreateAsk,

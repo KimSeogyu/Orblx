@@ -318,6 +318,66 @@ printf '%s\n' "$late" | read_all grep -q 'The caller is not an owner.' || fail "
 # use_before is only a sanity read. The gate is the counts above.
 echo "token_use_sample ${use_before}"
 
+echo "=== [C] gate 5b: current role after demotion ==="
+# ada is admin. The token holds nodes:read and nodes:write.
+ada_out="$(admin_as ada token-create --scope nodes:read,nodes:write --ttl 10m --out /tokens/ada-nodes)"
+ada_id="$(printf '%s\n' "$ada_out" | read_all awk '/^token_id /{print $2; exit}')"
+[[ -n "$ada_id" ]] || fail "no ada token id"
+echo "ada_token ${ada_id}"
+ada_token() {
+  local op="$1"
+  shift
+  tool admin "$op" "$@" --coord "${COORD}:443" --token-file /tokens/ada-nodes \
+    --bundle /coord-state/trust-bundle.pem
+}
+admin_as owner role-set oidc:ada auditor
+set +e
+aud_read="$(ada_token nodes 2>&1)"
+aud_read_rc=$?
+set -e
+printf '%s\n' "$aud_read" | read_all grep -q '^status 200 ' || fail "auditor token read: ${aud_read_rc}"
+deny_approve="$(audit_count role-deny approve)"
+set +e
+aud_write="$(ada_token approve pend3 2>&1)"
+aud_write_rc=$?
+set -e
+[[ "$aud_write_rc" -ne 0 ]] || fail "auditor token approve passed"
+printf '%s\n' "$aud_write" | read_all grep -q '^status 403 ' || fail "auditor token status"
+printf '%s\n' "$aud_write" | read_all grep -q 'role auditor' || fail "auditor token sentence"
+[[ "$(audit_count role-deny approve)" -eq $((deny_approve + 1)) ]] || fail "auditor token role-deny"
+[[ "$(node_state pend3)" == "pending" ]] || fail "auditor token changed pend3"
+admin_as owner role-set oidc:ada member
+deny_nodes="$(audit_count role-deny nodes)"
+set +e
+mem_read="$(ada_token nodes 2>&1)"
+mem_read_rc=$?
+set -e
+[[ "$mem_read_rc" -ne 0 ]] || fail "member token read passed"
+printf '%s\n' "$mem_read" | read_all grep -q '^status 403 ' || fail "member token status"
+printf '%s\n' "$mem_read" | read_all grep -q 'The caller is not an owner.' || fail "member token sentence"
+[[ "$(audit_count role-deny nodes)" -eq $((deny_nodes + 1)) ]] || fail "member token role-deny"
+admin_as owner role-set oidc:ada admin
+set +e
+back="$(ada_token approve pend3 2>&1)"
+back_rc=$?
+set -e
+printf '%s\n' "$back" | read_all grep -q '^status 200 ' || fail "promoted token approve: ${back_rc}"
+[[ "$(node_state pend3)" == "approved" ]] || fail "promoted token did not approve pend3"
+sha_pol="$(admin_as owner policy | read_all awk '/^policy_sha256 /{print $2; exit}')"
+deny_pol="$(audit_count role-deny policy-set)"
+tdeny_pol="$(audit_count token-deny "$ada_id")"
+set +e
+pol="$(ada_token policy-set /policy/policy-next.hujson 2>&1)"
+pol_rc=$?
+set -e
+[[ "$pol_rc" -ne 0 ]] || fail "promoted token policy-set passed"
+printf '%s\n' "$pol" | read_all grep -q '^status 403 ' || fail "promoted token policy status"
+printf '%s\n' "$pol" | read_all grep -q 'does not have the scope' || fail "promoted token scope sentence"
+sha_pol2="$(admin_as owner policy | read_all awk '/^policy_sha256 /{print $2; exit}')"
+[[ "$sha_pol" == "$sha_pol2" && -n "$sha_pol" ]] || fail "promoted token changed the policy"
+[[ "$(audit_count role-deny policy-set)" -eq "$deny_pol" ]] || fail "promoted token wrote role-deny"
+[[ "$(audit_count token-deny "$ada_id")" -eq $((tdeny_pol + 1)) ]] || fail "promoted token scope record"
+
 echo "=== [C] gate 6: owner user and a second owner ==="
 set +e
 olv="$(admin_as owner role-set oidc:olivia admin 2>&1)"
@@ -329,7 +389,7 @@ admin_as owner roles | read_all grep -qx 'role olivia approved owner' || fail "o
 # ada is admin. Move ada to owner, then back to admin. olivia stays owner, so ada is not the last owner.
 admin_as owner role-set oidc:ada owner
 admin_as owner role-set oidc:ada admin
-[[ "$(audit_count role-set oidc:ada)" -eq 3 ]] || fail "ada second change count"
+[[ "$(audit_count role-set oidc:ada)" -eq 6 ]] || fail "ada second change count"
 admin_as owner roles | read_all grep -qx 'role ada approved admin' || fail "ada did not return to admin"
 set +e
 ada_set="$(admin_as ada role-set oidc:mem admin 2>&1)"

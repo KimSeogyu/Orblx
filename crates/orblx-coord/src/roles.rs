@@ -204,8 +204,11 @@ pub fn token_user(coord: &Coordinator, actor: &str) -> Result<String, CoordError
 
 /// The role that blocks one token call, when the token would pass its scope.
 ///
-/// The stored role and the live role of the creator must both allow `op`.
-/// A token of a policy owner SVID uses the stored role only.
+/// The effective rights are the token scopes crossed with the creator's role now.
+/// The stored create-time role does not keep rights after a demotion.
+/// A removed user, a rejected user, or a pending user grants nothing.
+/// A token with no user binding uses the live role of `created_by`.
+/// When that caller is not a known node, the stored role stays in force.
 pub fn blocking_role(
     coord: &Coordinator,
     created_by: &str,
@@ -213,25 +216,44 @@ pub fn blocking_role(
     created_role: &str,
     op: &str,
 ) -> Result<Option<Role>, CoordError> {
-    let snap = Role::parse(created_role).unwrap_or(Role::Member);
-    if !snap.allows(op) {
-        return Ok(Some(snap));
+    let current = creator_role_now(coord, created_by, created_user, created_role)?;
+    if current.allows(op) {
+        Ok(None)
+    } else {
+        Ok(Some(current))
     }
+}
+
+/// The role a token uses at call time.
+fn creator_role_now(
+    coord: &Coordinator,
+    created_by: &str,
+    created_user: &str,
+    created_role: &str,
+) -> Result<Role, CoordError> {
     if !created_user.is_empty() {
-        let live = user_role(coord, created_user)?;
-        if !live.allows(op) {
-            return Ok(Some(live));
-        }
-        return Ok(None);
+        return approved_user_role(coord, created_user);
     }
     if let Ok(id) = SpiffeId::parse(created_by) {
         if coord.caller_is_owner(&id)? {
-            return Ok(None);
+            return Ok(Role::Owner);
         }
     }
     match live_role(coord, created_by)? {
-        Some(live) if !live.allows(op) => Ok(Some(live)),
-        Some(_) | None => Ok(None),
+        Some(live) => Ok(live),
+        None => Ok(Role::parse(created_role).unwrap_or(Role::Member)),
+    }
+}
+
+/// The current role of an approved user. Any other state grants `member`.
+fn approved_user_role(coord: &Coordinator, user: &str) -> Result<Role, CoordError> {
+    let (users, _) = coord.user_list()?;
+    let Some(stored) = users.into_iter().find(|stored| stored.user == user) else {
+        return Ok(Role::Member);
+    };
+    match stored.state {
+        crate::store::UserState::Approved => Ok(Role::parse(&stored.role).unwrap_or(Role::Member)),
+        crate::store::UserState::Pending | crate::store::UserState::Rejected => Ok(Role::Member),
     }
 }
 
@@ -702,5 +724,153 @@ mod tests {
         let audit = coord.config_audit_text().unwrap();
         assert!(!audit.contains(body));
         assert!(!audit.contains(&token));
+    }
+
+    #[test]
+    fn a_demoted_admin_token_follows_the_current_role() {
+        let scratch = Scratch::new();
+        let now = SystemTime::now();
+        let oidc = MockOidc::generate(MOCK_OIDC_ISSUER).unwrap();
+        let gate = IssueGate::new(MiniCa::generate(now).unwrap(), &oidc).unwrap();
+        let coord =
+            Coordinator::open(&scratch.0, "coord", OidcConfig::Mock(Box::new(gate))).unwrap();
+        coord.enable_config_audit().unwrap();
+        coord.approve_user_by("oidc:ada", ACTOR, now).unwrap();
+        apply(
+            &coord,
+            &SetAsk {
+                user: "ada".to_string(),
+                role: "admin".to_string(),
+            },
+            ACTOR,
+            now,
+        )
+        .unwrap();
+        let id_token = oidc
+            .issue_id_token("ada", now, Duration::from_secs(600))
+            .unwrap();
+        let enrolled = coord
+            .enroll_oidc(
+                "ada-pc",
+                &id_token,
+                None,
+                &["ada-pc:443".to_string()],
+                &[],
+                now,
+            )
+            .unwrap();
+        let made = apitoken::create(
+            &coord,
+            &CreateAsk {
+                scopes: vec!["nodes:read".to_string(), "nodes:write".to_string()],
+                ttl_secs: 60,
+            },
+            &enrolled.svid,
+            Role::Admin,
+            now,
+        )
+        .unwrap();
+        let call = |op: &str| apitoken::check(&coord, &made.secret, op, now, || Ok(None)).unwrap();
+        let before = call("admin-nodes");
+        assert!(before.result.is_ok());
+        assert!(before.role_block.is_none());
+        let write = call("admin-approve");
+        assert!(write.result.is_ok());
+        assert!(write.role_block.is_none());
+
+        // Auditor can read nodes and cannot approve. Member can call no admin operation.
+        apply(
+            &coord,
+            &SetAsk {
+                user: "oidc:ada".to_string(),
+                role: "auditor".to_string(),
+            },
+            ACTOR,
+            now,
+        )
+        .unwrap();
+        let read = call("admin-nodes");
+        assert!(read.result.is_ok());
+        assert!(read.role_block.is_none());
+        assert_eq!(count(&coord, "token-use", &made.id), 3);
+        let denied = call("admin-approve");
+        assert!(denied.result.is_ok());
+        assert_eq!(denied.role_block, Some(Role::Auditor));
+        assert_eq!(count(&coord, "role-deny", "approve"), 1);
+        assert_eq!(count(&coord, "token-deny", &made.id), 0);
+
+        apply(
+            &coord,
+            &SetAsk {
+                user: "oidc:ada".to_string(),
+                role: "member".to_string(),
+            },
+            ACTOR,
+            now,
+        )
+        .unwrap();
+        assert!(OPS.iter().all(|(op, _)| !Role::Member.allows(op)));
+        let member = call("admin-nodes");
+        assert!(member.result.is_ok());
+        assert_eq!(member.role_block, Some(Role::Member));
+        assert_eq!(count(&coord, "role-deny", "nodes"), 1);
+        assert_eq!(count(&coord, "token-use", &made.id), 3);
+        assert_eq!(count(&coord, "token-deny", &made.id), 0);
+
+        apply(
+            &coord,
+            &SetAsk {
+                user: "oidc:ada".to_string(),
+                role: "admin".to_string(),
+            },
+            ACTOR,
+            now,
+        )
+        .unwrap();
+        let restored = call("admin-approve");
+        assert!(restored.result.is_ok());
+        assert!(restored.role_block.is_none());
+        let outside = call("admin-policy-set");
+        assert_eq!(outside.result, Err(apitoken::Refusal::Scope));
+        assert!(outside.role_block.is_none());
+        assert_eq!(count(&coord, "token-deny", &made.id), 1);
+        assert_eq!(count(&coord, "role-deny", "policy-set"), 0);
+
+        set_user_state(&scratch, "oidc:ada", Some("rejected"), true);
+        let rejected = call("admin-approve");
+        assert!(rejected.result.is_ok());
+        assert_eq!(rejected.role_block, Some(Role::Member));
+        assert_eq!(count(&coord, "role-deny", "approve"), 2);
+        assert_eq!(count(&coord, "token-deny", &made.id), 1);
+
+        set_user_state(&scratch, "oidc:ada", None, false);
+        let removed = call("admin-nodes");
+        assert!(removed.result.is_ok());
+        assert_eq!(removed.role_block, Some(Role::Member));
+        assert_eq!(count(&coord, "role-deny", "nodes"), 2);
+        let audit = coord.config_audit_text().unwrap();
+        let body = made.secret.trim_start_matches(apitoken::API_TOKEN_PREFIX);
+        assert!(!audit.contains(body));
+        assert!(!audit.contains(&id_token));
+    }
+
+    /// Edit one user in `nodes.json`. `state` sets the approval state.
+    /// `keep` false removes the user. The role field stays as stored.
+    fn set_user_state(scratch: &Scratch, user: &str, state: Option<&str>, keep: bool) {
+        let path = scratch.0.join("nodes.json");
+        let mut file: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let users = file
+            .get_mut("users")
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap();
+        if keep {
+            let row = users.iter_mut().find(|row| row["user"] == user).unwrap();
+            assert_eq!(row["role"], "admin");
+            row["state"] = serde_json::Value::String(state.unwrap().to_string());
+        } else {
+            users.retain(|row| row["user"] != user);
+        }
+        fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
     }
 }

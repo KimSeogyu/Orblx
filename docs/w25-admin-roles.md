@@ -1,6 +1,6 @@
 # Admin roles
 
-Candidate (a), human admin roles. Proposed gap matrix row 36. Eng Lead confirms the row.
+Candidate (a), human admin roles. Gap matrix row 36. Eng Lead confirmed the row.
 
 Candidate (a) is the first candidate in the check order. It is not on main.
 Main has owner SVIDs, user approval (row 32), enroll tokens (row 33), and scoped API tokens (row 35).
@@ -22,7 +22,7 @@ Marks: **REAL** means `cargo test` on this host. **[C]** means the container pro
 | Last user with role `owner` | The coordinator refuses a change to another role. The role does not change. No `role-set` record. |
 | User in `userApproval.ownerUsers` | Role `owner` at approve time. A later `role-set` cannot move that user off `owner`. |
 | Role refusal | One `role-deny` record (code 40). The operation does not run. |
-| API token | The token cannot do more than the stored creator role and the live creator role. A scope that contains one operation outside the creator role is refused at create time. |
+| API token | At each call the rights are the token scopes crossed with the creator's current role. A scope that contains one operation outside the creator role is refused at create time. |
 | `admin-role-set` with a token | No token scope. One `token-deny` record, reason `scope`. |
 
 Roles: `owner`, `admin`, `network-admin`, `it-admin`, `auditor`, `member`.
@@ -41,9 +41,14 @@ Roles: `owner`, `admin`, `network-admin`, `it-admin`, `auditor`, `member`.
 | Change a role | yes | no | no | no | no | no |
 
 An auditor is read-only. The read set includes the audit log.
+A member can call no admin operation.
 A token stores `created_role` and, for an OIDC creator, `created_user`.
-At each call the scope must match and both roles must allow the operation.
-A policy owner SVID does not bind `created_user`. That token follows the stored role.
+`created_role` is the role at create time. A later call does not use it to keep rights.
+At each call the scope must match and the creator's current role must allow the operation.
+A demotion takes effect on the next call. The token file does not change.
+A removed user, a rejected user, or a pending user grants no rights.
+A policy owner SVID does not bind `created_user`. That token uses the owner role while the SVID stays an owner.
+A token with no user and no known node keeps the stored role. That is the path for a token file from before this change when the creator was not enrolled.
 Old token files have no `created_role`. The coordinator treats them as `owner`, because only an owner could create a token before this change.
 The coordinator keeps only the token digest. Logs and audit records show the token id, not the token text.
 
@@ -72,6 +77,7 @@ orblx admin token-create --scope SCOPE --ttl 10m --coord ADDR ...
 | `roles::tests::a_member_deny_has_one_record_and_the_old_sentence` | REAL | One `role-deny` per call. The sentence is `The caller is not an owner.` |
 | `roles::tests::an_auditor_can_read_the_audit_log_and_cannot_write` | REAL | Audit read and node read pass. Approve and role-set each write one `role-deny`. |
 | `roles::tests::a_token_cannot_exceed_the_creator_role_and_a_demotion_has_one_deny` | REAL | `it-admin` cannot create a `policy:write` token. A `nodes:write` token works, then the user moves to `member`. The next call is `role-deny` once and not `token-deny`. The audit text has no token secret. |
+| `roles::tests::a_demoted_admin_token_follows_the_current_role` | REAL | An admin token has `nodes:read` and `nodes:write`. As `auditor`, `admin-nodes` still works and `admin-approve` is one `role-deny`. A member can call no admin operation, so after `member` the same read is one `role-deny`. Back as `admin`, `admin-approve` works and `admin-policy-set` stays a scope refusal. A rejected user and a removed user grant no rights. |
 | `admin::tests::role_set_parses_the_user_and_the_role` | REAL | The CLI accepts a known role and refuses an unknown role. |
 
 ## Proof
@@ -90,13 +96,12 @@ This environment did not run Docker. Do not treat the [C] rows as measured resul
 | 3. Auditor | [C] | `admin audit` and `admin nodes` pass. `admin approve` fails with `role auditor`. One `role-deny`. The node stays pending. |
 | 4. IT admin and network admin | [C] | IT admin approves a pending node. IT admin `policy-set` fails and the policy sha256 stays the same. Network admin `policy-set` of a new comment passes. Network admin cannot create a `nodes:write` token. IT admin cannot create a `policy:write` token. |
 | 5. Token cap | [C] | IT admin creates a `nodes:write` token. The token approves one node. After `role-set` to `member`, the same token gets status 403 and `The caller is not an owner.` One new `role-deny`. No new `token-deny` for that token. |
-| 6. Owner user | [C] | `role-set` of `oidc:olivia` to `admin` fails. The sentence has `owner user`. Her role stays `owner`. `ada` can move to `owner` and back to `admin` (one extra `role-set` each way, 3 records in total). `ada` cannot call `role-set`. One `role-deny` for target `role-set`. The last-owner refusal is the REAL unit test, because `olivia` is already an owner user. |
+| 5b. Current role | [C] | Admin `ada` creates a token with `nodes:read` and `nodes:write`. As `auditor`, node read returns status 200 and approve returns status 403 with one `role-deny`. As `member`, node read returns status 403 with one `role-deny`. Back as `admin`, approve returns status 200. `policy-set` stays status 403 for scope. One `token-deny`. No `role-deny` for `policy-set`. |
+| 6. Owner user | [C] | `role-set` of `oidc:olivia` to `admin` fails. The sentence has `owner user`. Her role stays `owner`. `ada` can move to `owner` and back to `admin` (one extra `role-set` each way, 6 records in total). `ada` cannot call `role-set`. One `role-deny` for target `role-set`. The last-owner refusal is the REAL unit test, because `olivia` is already an owner user. |
 | 7. Secrets | [C] | The state files, the coordinator log, and the proof log contain no `orblx-at1.` text, no `PRIVATE KEY`, and no ID token. |
 | 8. Chain | [C] | `admin audit --verify` prints `verify ok`. |
 
 ## Open questions
 
-- Eng Lead confirms proposed row 36. Rows 32, 33, and 35 are already on main. Row 34 is open PR 158.
-- A network admin cannot hold `nodes:write`, because that scope also approves users. A later split of the scope can give the network admin a node-only token.
-- An admin can revoke a token that an owner created. A network admin can revoke only a token that they created.
+- Eng Lead confirmed row 36. A network admin has no `nodes:write`. An admin may revoke a token that an owner created.
 - Candidates (b) and (c) are still open.
