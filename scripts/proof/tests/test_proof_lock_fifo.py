@@ -92,7 +92,8 @@ class ProofLockFairnessTest(unittest.TestCase):
         bin_dir = tempfile.mkdtemp()
         seen = os.path.join(bin_dir, "seen")
         with open(os.path.join(bin_dir, "docker"), "w") as f:
-            f.write(f'#!/bin/sh\nls "{queue}" 2>/dev/null | wc -l >>"{seen}"\nexit 1\n')
+            # Exit 0 with no names. A docker failure is containers_unknown (exit 5) after the lock.
+            f.write(f'#!/bin/sh\nls "{queue}" 2>/dev/null | wc -l >>"{seen}"\nexit 0\n')
         os.chmod(os.path.join(bin_dir, "docker"), 0o755)
         env = dict(env, PATH=bin_dir + os.pathsep + env["PATH"])
         res = subprocess.run(["bash", "-c", '. "$0"; trap proof_lock_end EXIT; proof_lock_take ticket', lib],

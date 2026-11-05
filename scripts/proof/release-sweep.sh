@@ -265,6 +265,8 @@ abort_verdict() {
   local log="$1" rc="$2" name="$3" out code ok=0
   out="$(awk -v mine="rc3-sweep:$name" '
     /^proof_infra_abort / && !line { line = $0; next }
+    # W25-46: this line names the previous holder. It is not a step of this proof.
+    !line && index($0, "reason=killed_holder_cleared_by_next") { next }
     !line && ($1 == "proof_lock" || $1 == "proof_context") && $2 != mine { step = 1 }
     !line && /^ *Compiling / { step = 1 }
     END {

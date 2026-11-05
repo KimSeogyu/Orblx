@@ -111,7 +111,8 @@ class ProofDiskCheckTest(unittest.TestCase):
         checked = 0
         for path in sorted(glob.glob(os.path.join(PROOF_DIR, "*.sh"))):
             src = open(path).read()
-            if os.path.basename(path) == "proof-lock.sh" or "proof_lock_take" not in src:
+            # A call, not a comment. ticket-guard.sh names the function and does not call it.
+            if os.path.basename(path) == "proof-lock.sh" or not re.search(r"(?m)^\s*proof_lock_take ", src):
                 continue
             checked += 1
             name = os.path.basename(path)

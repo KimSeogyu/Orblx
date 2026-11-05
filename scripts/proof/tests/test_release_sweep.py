@@ -536,18 +536,20 @@ class ReleaseSweepTest(unittest.TestCase):
                       self.table())
 
     def test_negative_contention_unknown_samples_over_0_makes_the_row_invalid(self):
+        # Docker ps fails. The lock stops before the proof (containers_unknown, exit 5).
+        # The contention probe does not run, so the row is not INVALID for unknown_samples.
         open(os.path.join(self.tmp, "docker-fails"), "w").close()
         out = self.run_sweep(PROBE + "row|3|Lock|ok\nproof|ok|scripts/proof/ok.sh|-|-\n")
         self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
         res = self.rows()[("1", "slow")][3]
-        self.assertRegex(res, r"^INVALID: proof_ok but unknown_samples [1-9]\d* in proof_contention rc3-sweep:slow$")
-        # W25-35: the probe printed its invalid line and stopped the wrapper with exit 3; the row
-        # is INVALID, not FAIL.
+        self.assertEqual(res, 'FAIL (exit 5): proof_infra_abort with reason "containers_unknown" '
+                         '(only disk_low and disk_unknown)')
         with open(os.path.join(self.out, "rc3-sweep-testsha-slow.log")) as f:
-            self.assertRegex(f.read(), r"(?m)^proof_contention_invalid rc3-sweep:slow unknown_samples [1-9]")
-        self.assertIn("Failed rows: none.", self.table())
-        self.assertIn("they do not count): 1", self.table())
-        self.assertIn("Invalid proofs: ", self.table())
+            log = f.read()
+        self.assertIn("proof_infra_abort rc3-sweep:slow reason=containers_unknown names=none. "
+                      "No proof step ran.", log)
+        self.assertNotIn("proof_ok", log)
+        self.assertIn("Failed rows: 1", self.table())
         # A proof's own probe line with unknown_samples over 0 makes the row invalid too.
         os.remove(os.path.join(self.tmp, "docker-fails"))
         out = self.run_sweep("row|1|Mesh|ownbad\nproof|ownbad|scripts/proof/ownbad.sh|ORBLX_PROOF_SAMPLE_SECS=0.2|-\n")
