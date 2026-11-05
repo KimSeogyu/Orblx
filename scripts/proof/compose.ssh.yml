@@ -1,96 +1,126 @@
-# Three Linux nodes on one bridge.
-# The proof script builds the image orblx-ssh:local and sets the SSH_* paths.
-# Each node accepts SSH on its overlay address.
-# The containers stand in for other hosts.
-
+# SSH proof stack (W25-31).
+# idp is the [C] OIDC test issuer. coord issues the node SVIDs, the tickets, and the SSH user
+# certificates. The nodes enroll through the normal enroll path. No lab SVIDs and no lab tickets.
+# a (alice), s (sharee), and m (mallory) are client nodes of OIDC users.
+# b and c are SSH target nodes (token enroll). owner is the admin node (token enroll).
+# The node services use the nodes profile. The containers stand in for other hosts.
 name: orblx-ssh
 
+x-node: &node
+  image: orblx-ssh:local
+  profiles: ["nodes"]
+  cap_add: [NET_ADMIN]
+  devices: ["/dev/net/tun:/dev/net/tun"]
+  sysctls:
+    net.ipv4.conf.all.rp_filter: "0"
+    net.ipv4.conf.default.rp_filter: "0"
+  entrypoint: ["orblx"]
+  command:
+    [up, --state-dir, /var/lib/orblx, --listen, "0.0.0.0:443", --coord, "172.28.19.10:443",
+     --bundle, /var/lib/orblx/bundle.pem, --coord-name, coord]
+  stop_grace_period: 10s
+
 services:
-  node-a:
+  idp:
     image: orblx-ssh:local
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    sysctls:
-      net.ipv4.conf.all.rp_filter: "0"
-      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx-test-idp"]
+    command: [serve, --dir, /idp, --issuer, "https://idp:8443", --listen, "0.0.0.0:8443"]
     volumes:
-      - ${SSH_STATE_A}:/var/lib/orblx
-      - ${SSH_NETMAP_A}:/etc/orblx/netmap.json:ro
-      - ${SSH_USERS}:/var/lib/orblx-id/users:ro
-      - ${SSH_AGENTS}:/var/lib/orblx-id/agents:ro
-      - ${SSH_PEERS}:/var/lib/orblx-peers:ro
+      - orblx-ssh-idp:/idp
+      - orblx-ssh-tokens:/tokens
+    networks:
+      orblx:
+        ipv4_address: 172.28.19.9
+
+  coord:
+    image: orblx-ssh:local
+    entrypoint: ["orblx"]
     command:
-      - up
-      - --netmap
-      - /etc/orblx/netmap.json
-      - --state-dir
-      - /var/lib/orblx
-      - --listen
-      - 0.0.0.0:443
-    stop_grace_period: 10s
+      [coord, serve, --state, /var/lib/orblx, --listen, "0.0.0.0:443", --name, coord,
+       --policy, /policy/policy.hujson, --config, /etc/orblx/coord.toml]
+    volumes:
+      - orblx-ssh-store:/var/lib/orblx
+      - ${POLICY_DIR:?set POLICY_DIR}:/policy:ro
+      - ${CONFIG_FILE:?set CONFIG_FILE}:/etc/orblx/coord.toml:ro
+      - ${IDP_CA_FILE:?set IDP_CA_FILE}:/etc/orblx/idp-ca.pem:ro
+    networks:
+      orblx:
+        ipv4_address: 172.28.19.10
+
+  owner:
+    image: orblx-ssh:local
+    profiles: ["nodes"]
+    entrypoint: ["orblx"]
+    volumes:
+      - orblx-ssh-store:/coord-state:ro
+      - orblx-ssh-tokens:/tokens:ro
+      - orblx-ssh-owner:/var/lib/orblx
+    networks:
+      orblx:
+        ipv4_address: 172.28.19.20
+
+  a:
+    <<: *node
+    volumes:
+      - orblx-ssh-store:/coord-state:ro
+      - orblx-ssh-tokens:/tokens:ro
+      - orblx-ssh-a:/var/lib/orblx
     networks:
       orblx:
         ipv4_address: 172.28.19.11
 
-  node-b:
-    image: orblx-ssh:local
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    sysctls:
-      net.ipv4.conf.all.rp_filter: "0"
-      net.ipv4.conf.default.rp_filter: "0"
+  b:
+    <<: *node
     volumes:
-      - ${SSH_STATE_B}:/var/lib/orblx
-      - ${SSH_NETMAP_B}:/etc/orblx/netmap.json:ro
-      - ${SSH_USERS}:/var/lib/orblx-id/users:ro
-      - ${SSH_AGENTS}:/var/lib/orblx-id/agents:ro
-      - ${SSH_PEERS}:/var/lib/orblx-peers:ro
-    command:
-      - up
-      - --netmap
-      - /etc/orblx/netmap.json
-      - --state-dir
-      - /var/lib/orblx
-      - --listen
-      - 0.0.0.0:443
-    stop_grace_period: 10s
+      - orblx-ssh-store:/coord-state:ro
+      - orblx-ssh-tokens:/tokens:ro
+      - orblx-ssh-b:/var/lib/orblx
     networks:
       orblx:
         ipv4_address: 172.28.19.12
 
-  node-c:
-    image: orblx-ssh:local
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    sysctls:
-      net.ipv4.conf.all.rp_filter: "0"
-      net.ipv4.conf.default.rp_filter: "0"
+  c:
+    <<: *node
     volumes:
-      - ${SSH_STATE_C}:/var/lib/orblx
+      - orblx-ssh-store:/coord-state:ro
+      - orblx-ssh-tokens:/tokens:ro
+      - orblx-ssh-c:/var/lib/orblx
       # A read-only recording directory. A rule that needs a recording fails closed.
-      - ${SSH_REC_C}:/var/lib/orblx/recordings:ro
-      - ${SSH_NETMAP_C}:/etc/orblx/netmap.json:ro
-      - ${SSH_USERS}:/var/lib/orblx-id/users:ro
-      - ${SSH_AGENTS}:/var/lib/orblx-id/agents:ro
-      - ${SSH_PEERS}:/var/lib/orblx-peers:ro
-    command:
-      - up
-      - --netmap
-      - /etc/orblx/netmap.json
-      - --state-dir
-      - /var/lib/orblx
-      - --listen
-      - 0.0.0.0:443
-    stop_grace_period: 10s
+      - ${SSH_REC_C:?set SSH_REC_C}:/var/lib/orblx/recordings:ro
     networks:
       orblx:
         ipv4_address: 172.28.19.13
+
+  s:
+    <<: *node
+    volumes:
+      - orblx-ssh-store:/coord-state:ro
+      - orblx-ssh-tokens:/tokens:ro
+      - orblx-ssh-s:/var/lib/orblx
+    networks:
+      orblx:
+        ipv4_address: 172.28.19.14
+
+  m:
+    <<: *node
+    volumes:
+      - orblx-ssh-store:/coord-state:ro
+      - orblx-ssh-tokens:/tokens:ro
+      - orblx-ssh-m:/var/lib/orblx
+    networks:
+      orblx:
+        ipv4_address: 172.28.19.15
+
+volumes:
+  orblx-ssh-idp:
+  orblx-ssh-tokens:
+  orblx-ssh-store:
+  orblx-ssh-owner:
+  orblx-ssh-a:
+  orblx-ssh-b:
+  orblx-ssh-c:
+  orblx-ssh-s:
+  orblx-ssh-m:
 
 networks:
   orblx:

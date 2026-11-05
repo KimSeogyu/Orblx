@@ -2,7 +2,7 @@
 # W25-27 lab-ticket guard.
 # proof-lock.sh sources this file, so every proof that takes the box proof lock gets it.
 #
-# 1. proof_lab_ticket_static_guard (proof_lock_take calls it):
+# 1. proof_lab_ticket_static_guard (the lock take function of proof-lock.sh calls it):
 #    a manifest proof (a proof| line in sweep-manifest.txt) fails at once when its
 #    script text makes lab material: "node-issue", "direct-issue", or "connector issue".
 # 2. proof_ticket_guard COORD_NAME STATE_DIR...: a proof calls it after the coordinator

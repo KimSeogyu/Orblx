@@ -22,7 +22,7 @@ GUARD_SH = os.path.join(PROOF_DIR, "ticket-guard.sh")
 LOCK_SH = os.path.join(PROOF_DIR, "proof-lock.sh")
 REPO = os.path.dirname(os.path.dirname(PROOF_DIR))
 MANIFEST = os.path.join(PROOF_DIR, "sweep-manifest.txt")
-CONVERTED = ["w18-linux-daemon", "w18-names", "subnet", "split-dns", "exit-node", "svid-renew"]
+CONVERTED = ["w18-linux-daemon", "w18-names", "subnet", "split-dns", "exit-node", "svid-renew", "ssh"]
 
 
 def counted(text):
@@ -101,7 +101,7 @@ class TicketGuardTest(unittest.TestCase):
                    ORBLX_PROOF_LOCK=os.path.join(self.tmp, "proof.lock"),
                    PROOF_MIN_FREE_GIB="15")
         env.pop("ORBLX_PROOF_LOCK_HELD", None)
-        # proof_lock_take runs the disk check before the lock (W25-14b).
+        # The disk check before the lock reads the stand-in df, not the host disk.
         env = with_fake_docker(env)
         return subprocess.run(["bash", script], env=env, capture_output=True, text=True)
 
@@ -144,9 +144,6 @@ class TicketGuardTest(unittest.TestCase):
             for marker in ("node-issue", "direct-issue", "connector issue"):
                 self.assertNotIn(marker, text, name)
             self.assertIn("proof_ticket_guard coord ", text, name)
-        # The ssh proof still makes lab user SVIDs and tickets: the guard fails it closed.
-        with open(scripts["ssh"]) as f:
-            self.assertIn("node-issue", f.read())
 
 
 if __name__ == "__main__":
