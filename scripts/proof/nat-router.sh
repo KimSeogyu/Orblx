@@ -1,12 +1,15 @@
 #!/bin/sh
 # NAT router for the W19 and W20 proofs.
-# The mode is cone, prc, symmetric, or symmap.
+# The mode is cone, prc, symmetric, random, sequential, portblock, shift, or symmap.
 # cone keeps the source port and accepts new UDP to port 443.
 # prc is a port-restricted cone NAT.
 #   prc keeps the source port for all destinations (endpoint-independent mapping).
 #   prc has no port forward and no DNAT.
 #   prc accepts inbound UDP only from the IP and port that the inside host sent to.
-# symmetric uses a new source port for each destination.
+# symmetric and random use a new random source port for each destination.
+# sequential gives the next external port to each new UDP flow.
+# portblock gives a port inside a fixed 64-port block.
+# shift is an iptables model. STUN ports stay sequential. Other flows jump by 4000.
 # symmap is symmetric NAT plus miniupnpd (PCP, NAT-PMP, and UPnP IGD).
 #   A granted map is DNAT and SNAT for that one internal port.
 #   Other UDP flows stay symmetric.
@@ -130,13 +133,18 @@ elif [ "$MODE" = "prc" ]; then
   # The conntrack 5-tuple is the filter.
   # Only a reply to a flow from the LAN passes the rule at the end of FORWARD.
   iptables -A FORWARD -i "$WAN" -o "$LAN" -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP
-elif [ "$MODE" = "symmetric" ] || [ "$MODE" = "symmap" ]; then
+elif [ "$MODE" = "symmetric" ] || [ "$MODE" = "random" ] || [ "$MODE" = "symmap" ]; then
   iptables -t nat -A POSTROUTING -o "$WAN" -p udp -j MASQUERADE --random-fully --to-ports 1024-65535
   iptables -t nat -A POSTROUTING -o "$WAN" -p tcp -j MASQUERADE
   iptables -t nat -A POSTROUTING -o "$WAN" -p icmp -j MASQUERADE
   if [ "$MODE" = "symmap" ]; then
     start_mapping_daemon "$WAN" "$WAN_IP" "$LAN" "$LAN_IP" "$NODE_IP"
   fi
+elif [ "$MODE" = "sequential" ] || [ "$MODE" = "portblock" ] || [ "$MODE" = "shift" ]; then
+  # TCP and ICMP stay on the kernel NAT. UDP is moved by udp-nat.py.
+  iptables -t nat -A POSTROUTING -o "$WAN" -p tcp -j MASQUERADE
+  iptables -t nat -A POSTROUTING -o "$WAN" -p icmp -j MASQUERADE
+  iptables -A FORWARD -p udp -j DROP
 else
   echo "The router mode ${MODE} is not valid." >&2
   exit 1
@@ -160,5 +168,8 @@ iptables -S FORWARD
 iptables -S INPUT
 if [ "$MODE" = "symmap" ]; then
   nft list table inet filter
+fi
+if [ "$MODE" = "sequential" ] || [ "$MODE" = "portblock" ] || [ "$MODE" = "shift" ]; then
+  exec python3 /udp-nat.py "$MODE" "$WAN_IP" "$LAN" "$WAN" "$NODE_IP"
 fi
 exec sleep infinity

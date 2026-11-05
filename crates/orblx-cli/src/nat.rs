@@ -330,8 +330,13 @@ off does not send a probe.
 A mapped port is published as the candidate. The peer punches that port.
 The node renews the map before the lifetime ends. The node deletes the map on shutdown.
 The default lifetime is 7200 seconds.
+A hard NAT also publishes STUN port samples.
+The peers punch UDP.
 An endpoint-independent NAT and a symmetric NAT use bounded birthday probes.
-Two symmetric NATs use the orblx Relay when no router grants a map.
+Two symmetric NATs with random port allocation use the orblx Relay when no router grants a map.
+Two symmetric NATs use a bounded port spray when one allocation is predictable.
+The relay carries packets during that spray.
+A failed spray waits, then tries again.
 When the punch fails, the peers use the orblx Relay.
 The hello carries the SVID. The peer checks it against the trust bundle.
 A later direct path keeps the same overlay session.
