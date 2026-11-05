@@ -1,6 +1,7 @@
 //! Admin reads and writes for the owner SVID.
 //!
-//! The coordinator checks the caller SVID against the policy owner list.
+//! The coordinator checks the caller role before these functions run.
+//! A policy owner SVID has the owner role.
 //! Approve puts a node into netmaps and grants.
 //! Revoke adds the node SVID to the deny set.
 //! Expire removes the node from netmaps until the next approve.
@@ -287,14 +288,20 @@ pub fn nodes(coord: &Coordinator) -> Result<Value, CoordError> {
 /// makes such a record, so the case is only a guard.
 pub fn users(coord: &Coordinator) -> Result<Value, CoordError> {
     let (users, nodes) = coord.user_list()?;
-    let mut groups: BTreeMap<String, (String, Option<String>, Vec<String>)> = BTreeMap::new();
+    let mut groups: BTreeMap<String, (String, String, Option<String>, Vec<String>)> =
+        BTreeMap::new();
     for user in users {
         let Some(subject) = user.user.strip_prefix("oidc:") else {
             continue;
         };
         groups.insert(
             subject.to_string(),
-            (user.state.as_str().to_string(), user.email, Vec::new()),
+            (
+                user.state.as_str().to_string(),
+                user.role,
+                user.email,
+                Vec::new(),
+            ),
         );
     }
     for node in nodes {
@@ -306,14 +313,21 @@ pub fn users(coord: &Coordinator) -> Result<Value, CoordError> {
         }
         groups
             .entry(subject.to_string())
-            .or_insert_with(|| ("approved".to_string(), None, Vec::new()))
-            .2
+            .or_insert_with(|| {
+                (
+                    "approved".to_string(),
+                    "member".to_string(),
+                    None,
+                    Vec::new(),
+                )
+            })
+            .3
             .push(node.name);
     }
     let users: Vec<Value> = groups
         .into_iter()
-        .map(|(subject, (state, email, nodes))| {
-            json!({"subject": subject, "state": state, "email": email, "nodes": nodes})
+        .map(|(subject, (state, role, email, nodes))| {
+            json!({"subject": subject, "state": state, "role": role, "email": email, "nodes": nodes})
         })
         .collect();
     Ok(json!({"op": "users", "users": users}))
