@@ -1510,7 +1510,15 @@ async fn reconnect(
     mesh.rekey_rx.borrow_and_update();
     remote_rx.borrow_and_update();
     let t0 = Instant::now();
-    let Some((session, relay_face)) = dial_once(mesh, peer, false).await else {
+    if local_credential_past(mesh) {
+        tr!(
+            "{} dial_hold reason=local_credential_past peer={}",
+            mesh.node.name,
+            peer.name
+        );
+        return;
+    }
+    let DialOnce::Session(opened) = dial_once(mesh, peer, false).await else {
         tr!(
             "{} dial_failed peer={} ms={}",
             mesh.node.name,
@@ -1525,6 +1533,7 @@ async fn reconnect(
         peer.name,
         t0.elapsed().as_millis()
     );
+    let (session, relay_face) = *opened;
     let next = spawn_link(
         mesh,
         session,
@@ -1545,24 +1554,57 @@ async fn dial_ready(
         if stopped(mesh) {
             return None;
         }
-        let fast = Instant::now() < fast_until;
-        if let Some(session) = dial_once(mesh, peer, fast).await {
-            return Some(session);
+        // The local ticket or the local certificate is already past.
+        // Wait for a renewal, or use the slow dial pause. Do not redial at once.
+        if local_credential_past(mesh) {
+            tr!(
+                "{} dial_hold reason=local_credential_past peer={}",
+                mesh.node.name,
+                peer.name
+            );
+            if !wait_to_dial(mesh, SLOW_DIAL_PAUSE).await {
+                return None;
+            }
+            continue;
         }
-        let pause = if fast {
-            FAST_DIAL_PROBE
-        } else {
-            Duration::from_secs(1)
-        };
-        tokio::select! {
-            changed = mesh.shutdown.changed() => {
-                if changed.is_err() || *mesh.shutdown.borrow() {
+        let fast = Instant::now() < fast_until;
+        match dial_once(mesh, peer, fast).await {
+            DialOnce::Session(opened) => return Some(*opened),
+            DialOnce::Stopped => return None,
+            DialOnce::DeadlinePast => {
+                tr!(
+                    "{} dial_hold reason=deadline_past peer={}",
+                    mesh.node.name,
+                    peer.name
+                );
+                if !wait_to_dial(mesh, SLOW_DIAL_PAUSE).await {
                     return None;
                 }
             }
-            _ = tokio::time::sleep(pause) => {}
+            DialOnce::Miss => {
+                let pause = if fast {
+                    FAST_DIAL_PROBE
+                } else {
+                    SLOW_DIAL_PAUSE
+                };
+                if !sleep_retry(mesh, pause).await {
+                    return None;
+                }
+            }
         }
     }
+}
+
+/// One dial attempt.
+enum DialOnce {
+    /// A new session is ready.
+    Session(Box<(HelloSession, Option<crate::relay_path::RelayFace>)>),
+    /// The handshake reached the peer. The session deadline is already past.
+    DeadlinePast,
+    /// The attempt did not open a session.
+    Miss,
+    /// The node is stopping.
+    Stopped,
 }
 
 /// The time after the start of a dial task, or after a session ends, with fast dial attempts.
@@ -1574,17 +1616,15 @@ async fn dial_ready(
 const FAST_DIAL_WINDOW: Duration = Duration::from_secs(10);
 /// The time between two QUIC attempts to one endpoint in the fast dial window.
 const FAST_DIAL_PROBE: Duration = Duration::from_millis(250);
+/// The wait after a failed dial, and the wait while the local ticket or certificate is past.
+const SLOW_DIAL_PAUSE: Duration = Duration::from_secs(1);
 /// The time limit of one dial attempt to one endpoint.
 const DIAL_ATTEMPT: Duration = Duration::from_secs(3);
 
-async fn dial_once(
-    mesh: &mut Mesh,
-    peer: &NetmapPeer,
-    fast: bool,
-) -> Option<(HelloSession, Option<crate::relay_path::RelayFace>)> {
+async fn dial_once(mesh: &mut Mesh, peer: &NetmapPeer, fast: bool) -> DialOnce {
     for endpoint_text in &peer.endpoints {
         if stopped(mesh) {
-            return None;
+            return DialOnce::Stopped;
         }
         let addr = match resolve_endpoint(endpoint_text).await {
             Ok(addr) => addr,
@@ -1608,7 +1648,7 @@ async fn dial_once(
         let result = tokio::select! {
             changed = mesh.shutdown.changed() => {
                 if changed.is_err() || *mesh.shutdown.borrow() {
-                    return None;
+                    return DialOnce::Stopped;
                 }
                 continue;
             }
@@ -1624,7 +1664,14 @@ async fn dial_once(
                     );
                     continue;
                 }
-                return Some((session, None));
+                return DialOnce::Session(Box::new((session, None)));
+            }
+            Ok(Err(HelloError::SessionDeadline)) => {
+                eprintln!(
+                    "The dial to {} at {addr} failed. The session deadline is already past.",
+                    peer.name
+                );
+                return DialOnce::DeadlinePast;
             }
             Ok(Err(err)) => {
                 eprintln!("The dial to {} at {addr} failed. {err}", peer.name);
@@ -1638,11 +1685,59 @@ async fn dial_once(
         }
     }
     if let Some(relay) = mesh.relay {
-        return dial_relay(mesh, peer, relay)
-            .await
-            .map(|(session, face)| (session, Some(face)));
+        return match dial_relay(mesh, peer, relay).await {
+            Some((session, face)) => DialOnce::Session(Box::new((session, Some(face)))),
+            None => DialOnce::Miss,
+        };
     }
-    None
+    DialOnce::Miss
+}
+
+/// True when the local certificate end or the local ticket end is at or before now.
+///
+/// The dial path waits instead of redialing.
+/// The ticket end stays strict. The ±60 s skew stays on ticket `not_before`.
+fn local_credential_past(mesh: &Mesh) -> bool {
+    let now = SystemTime::now();
+    let now_unix = unix_secs(now);
+    if mesh.node.not_after.load(Ordering::Relaxed) <= now_unix {
+        return true;
+    }
+    let Ok(id) = SpiffeId::parse(&mesh.node.svid) else {
+        return false;
+    };
+    let config = lock(&mesh.identity);
+    match orblx_crypto::verify_ticket(
+        &config.ticket_ring,
+        &config.ticket_bytes,
+        &config.ticket_mac,
+        &id,
+        now,
+        &config.deny,
+    ) {
+        Ok(proof) => proof.expires() <= now_unix,
+        Err(orblx_crypto::CryptoError::Identity(orblx_identity::IdentityError::Expired)) => true,
+        Err(_) => false,
+    }
+}
+
+fn unix_secs(now: SystemTime) -> u64 {
+    now.duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Wait for a renewal, or for `pause`. Return false when the node stops.
+async fn wait_to_dial(mesh: &mut Mesh, pause: Duration) -> bool {
+    let mut rekey = mesh.rekey_rx.clone();
+    rekey.borrow_and_update();
+    tokio::select! {
+        changed = mesh.shutdown.changed() => {
+            changed.is_ok() && !*mesh.shutdown.borrow()
+        }
+        changed = rekey.changed() => changed.is_ok() && !stopped(mesh),
+        _ = tokio::time::sleep(pause) => true,
+    }
 }
 
 async fn dial_relay(
@@ -1867,7 +1962,7 @@ struct SessionIo {
     peer: String,
     label: String,
     /// B2 (W25-45): unix seconds of min(peer ticket end, peer leaf not_after).
-    /// The session closes at this time, and the link dials again.
+    /// The session closes at this time. A past deadline does not start this loop.
     deadline: u64,
 }
 
@@ -1918,8 +2013,9 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
     } = io;
     // B2 (W25-45): close the session at its deadline. A renewal normally replaces the link
     // before this time. When the renewal keeps failing, the session ends here, and the
-    // peer refuses DATA after the deadline. The send paths check the time too: after a host
-    // stall, `select!` can pick a ready send branch before the timer branch.
+    // peer refuses DATA after the deadline. The dial path then waits. It does not redial
+    // at once. The send paths check the time too: after a host stall, `select!` can pick
+    // a ready send branch before the timer branch.
     let deadline_at = deadline_instant(deadline, SystemTime::now());
     let at_deadline = tokio::time::sleep_until(deadline_at);
     tokio::pin!(at_deadline);

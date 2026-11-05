@@ -21,6 +21,9 @@ use crate::roles::{parse_admin_role, Role};
 use crate::store::{CreatedToken, NodeStore, StoredNode, StoredUser, UserState};
 use crate::ticket::{self, IssuedTicket};
 
+/// The shortest node SVID life that production code may set (W25-45).
+const MIN_NODE_SVID_TTL: Duration = Duration::from_secs(180);
+
 const COORD_NAME_FILE: &str = "coord-name";
 const CA_CERT_FILE: &str = "ca.crt.pem";
 const CA_KEY_FILE: &str = "ca.key.pem";
@@ -456,9 +459,23 @@ impl Coordinator {
 
     /// Set the life of the next node leaf.
     ///
-    /// The value is a whole number of seconds from 1 through the user maximum.
+    /// The value is a whole number of seconds from 180 through the user maximum.
+    /// A shorter life is refused. A test build has a separate function for a short life.
     pub fn set_node_svid_ttl(&self, ttl: Duration) -> Result<(), CoordError> {
-        if ttl.is_zero() || ttl.subsec_nanos() != 0 || ttl > MAX_USER_TTL {
+        self.store_svid_ttl(ttl, MIN_NODE_SVID_TTL)
+    }
+
+    /// Set a short node leaf life for tests.
+    ///
+    /// The value is a whole number of seconds from 1 through the user maximum.
+    /// This function exists only in test builds. Production code cannot call it.
+    #[cfg(test)]
+    pub fn set_node_svid_ttl_for_test(&self, ttl: Duration) -> Result<(), CoordError> {
+        self.store_svid_ttl(ttl, Duration::from_secs(1))
+    }
+
+    fn store_svid_ttl(&self, ttl: Duration, floor: Duration) -> Result<(), CoordError> {
+        if ttl < floor || ttl.subsec_nanos() != 0 || ttl > MAX_USER_TTL {
             return Err(CoordError::Time);
         }
         let mut inner = self.lock()?;
