@@ -97,6 +97,16 @@ dc() {
     docker compose --profile nodes -f "$FILE" "$@"
 }
 
+# Compose v2 `start` also starts depends_on services. Node a depends on coord,
+# so `dc start a` starts the coordinator. Gates 1 and 2 need it stopped.
+require_coord_stopped() {
+  local where="$1"
+  if dc ps --services --status running | read_all grep -qx coord; then
+    echo "The coordinator is running at ${where}." >&2
+    exit 1
+  fi
+}
+
 cleanup() {
   local status=$?
   if [[ "$status" -ne 0 ]]; then
@@ -653,8 +663,13 @@ if [[ "$ssh_exited" -ne 0 || "$ssh_held_s" -lt "$OFFLINE_SECS" || "$tick_count" 
   echo "The SSH session did not stay up for ${OFFLINE_SECS} s." >&2
   exit 1
 fi
-dc start a >/dev/null
+# Node a is already enrolled. `orblx up` opens the TUN from the local state.
+# A failed policy-wait does not stop the node, so a does not need the coordinator.
+# `--no-deps` keeps coord stopped. `start` has no such flag.
+dc up -d --no-deps --no-recreate a >/dev/null
+require_coord_stopped "the start of node a"
 wait_log a 'The TUN device'
+require_coord_stopped "node a is up"
 
 echo "=== [C] gate 1: the coordinator stays stopped, so b cannot get a new deny list ==="
 accepted=0
@@ -662,6 +677,7 @@ unknown=0
 total=0
 rows=()
 for kind in $KINDS; do
+  require_coord_stopped "gate 1 ${kind}"
   damage "$kind"
   state="$(deny_state)"
   echo "damage ${kind} deny_state ${state}"
@@ -671,6 +687,9 @@ for kind in $KINDS; do
   k_samples=0
   k_accepted=0
   k_unknown=0
+  # A new SSH login needs the coordinator (W25-31). While it is stopped, the
+  # client fails before b sees the login. ssh_try labels a non-124 client error
+  # refused. The pass rule is unchanged: each sample from a must be refused.
   for i in $(seq 1 "$SAMPLES"); do
     for probe in ssh ping; do
       if [[ "$probe" == ssh ]]; then
@@ -718,6 +737,7 @@ done
 dc logs b 2>&1 | grep -E 'deny|Deny' | grep -v 'PRIVATE KEY' | tail -20 || true
 
 echo "=== [C] gate 2: start the coordinator, b gets a valid list again ==="
+require_coord_stopped "the start of gate 2"
 dc start coord >/dev/null
 wait_bundle
 sleep 3
