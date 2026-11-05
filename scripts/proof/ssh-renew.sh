@@ -168,16 +168,14 @@ renewals_b() {
 key_b() {
   openssl x509 -in "$work/b/cert.pem" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum | cut -c1-16
 }
-# Copy the current node a SVID (no ticket) and the current node b cert into node a.
+# Copy the current node b cert into node a. The login pins that cert.
 stage_login() {
-  compose exec -T node-a sh -c 'rm -rf /tmp/id && mkdir -m 700 /tmp/id &&
-    cp /var/lib/orblx/cert.pem /var/lib/orblx/key.pem /var/lib/orblx/bundle.pem /tmp/id/'
   compose exec -T node-b cat /var/lib/orblx/cert.pem | compose exec -T node-a sh -c "cat > /tmp/${1}.pem"
 }
 ssh_b() {
   local peer=$1 command=$2
-  compose exec -T node-a orblx ssh alice@b --identity /tmp/id --netmap /etc/orblx/netmap.json \
-    --peer-cert "/tmp/${peer}.pem" --command "$command"
+  compose exec -T node-a orblx ssh alice@b --state /var/lib/orblx --peer-cert "/tmp/${peer}.pem" \
+    --command "$command"
 }
 # Gate c uses a PTY shell. The exec path stops after 30 s.
 # The remote shell prints keepalive every 10 s, then prints SURVIVED.
@@ -188,8 +186,8 @@ ssh_shell() {
   keep_count=$(( (session_secs + keep_step - 1) / keep_step ))
   printf 'i=0; while [ "$i" -lt %s ]; do echo keepalive $(date +%%s); sleep %s; i=$((i+1)); done; echo SURV""IVED at $(date +%%s); exit\n' \
     "$keep_count" "$keep_step" \
-    | compose exec -T node-a orblx ssh alice@b --shell --identity /tmp/id \
-      --netmap /etc/orblx/netmap.json --peer-cert "/tmp/${peer}.pem"
+    | compose exec -T node-a orblx ssh alice@b --state /var/lib/orblx --peer-cert "/tmp/${peer}.pem" \
+      --shell
 }
 # Print the unix time from the SURVIVED output line.
 # Skip a keepalive line and a line that still has the typed SURV""IVED text.
