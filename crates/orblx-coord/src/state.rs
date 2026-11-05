@@ -17,6 +17,7 @@ use crate::files::{create_private_dir, read_text, write_bytes, write_text};
 use crate::netmap::{
     decode_hex_32, verify_signed_endpoint, NetmapKey, SignedEndpoint, SignedGrants, SignedNetmap,
 };
+use crate::roles::{parse_admin_role, Role};
 use crate::store::{CreatedToken, NodeStore, StoredNode, StoredUser, UserState};
 use crate::ticket::{self, IssuedTicket};
 
@@ -561,10 +562,18 @@ impl Coordinator {
                 "The user is already approved.".to_string(),
             ));
         }
+        let role = if inner.policy.user_approval().is_owner_user(user) {
+            Some("owner")
+        } else {
+            None
+        };
         set_user_recorded(
             &mut inner,
             user,
-            UserState::Approved,
+            UserChange {
+                state: UserState::Approved,
+                role,
+            },
             actor,
             ConfigAction::UserApprove,
             "owner",
@@ -605,12 +614,112 @@ impl Coordinator {
         set_user_recorded(
             &mut inner,
             user,
-            UserState::Rejected,
+            UserChange {
+                state: UserState::Rejected,
+                role: None,
+            },
             actor,
             ConfigAction::UserReject,
             "owner",
             now,
         )
+    }
+
+    /// Change the admin role of one OIDC user and write one `role-set` record.
+    ///
+    /// The user record must already exist.
+    /// An owner user in the policy stays `owner`.
+    /// The last user with role `owner` cannot move to another role.
+    /// The function returns the previous role.
+    /// When the audit write fails, the role does not change.
+    pub fn set_user_role_by(
+        &self,
+        user: &str,
+        role: &str,
+        actor: &str,
+        now: SystemTime,
+    ) -> Result<String, CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        crate::store::check_user(user)?;
+        let parsed = match parse_admin_role(role) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                return Err(refuse_role_set(
+                    &mut inner,
+                    actor,
+                    "bad-role",
+                    err.to_string(),
+                ));
+            }
+        };
+        let Some(current) = inner.store.user(user) else {
+            return Err(refuse_role_set(
+                &mut inner,
+                actor,
+                "unknown-user",
+                "The user is not known.".to_string(),
+            ));
+        };
+        if current.role == parsed.as_str() {
+            return Err(refuse_role_set(
+                &mut inner,
+                actor,
+                "same-role",
+                "The user already has this role.".to_string(),
+            ));
+        }
+        if inner.policy.user_approval().is_owner_user(user) && parsed != Role::Owner {
+            return Err(refuse_role_set(
+                &mut inner,
+                actor,
+                "owner-user",
+                "An owner user stays an owner.".to_string(),
+            ));
+        }
+        if current.role == Role::Owner.as_str() && parsed != Role::Owner {
+            let owners = inner
+                .store
+                .users()
+                .iter()
+                .filter(|stored| stored.role == Role::Owner.as_str())
+                .count();
+            if owners <= 1 {
+                return Err(refuse_role_set(
+                    &mut inner,
+                    actor,
+                    "last-owner",
+                    "The last owner cannot change role.".to_string(),
+                ));
+            }
+        }
+        if inner.audit.is_none() {
+            return Err(CoordError::Protocol(
+                "The config audit chain is off. A role change needs a record.".to_string(),
+            ));
+        }
+        let previous = current.role.clone();
+        let before = user_digest(Some(&current));
+        inner
+            .store
+            .set_user_state(user, current.state, Some(parsed.as_str()), now)?;
+        let after = user_digest(inner.store.user(user).as_ref());
+        let detail = format!("role {previous} to {}", parsed.as_str());
+        if let Err(err) = record(
+            &mut inner,
+            actor,
+            ConfigAction::RoleSet,
+            user,
+            before,
+            after,
+            &detail,
+        ) {
+            let _ = inner
+                .store
+                .set_user_state(user, current.state, Some(previous.as_str()), now);
+            return Err(err);
+        }
+        Ok(previous)
     }
 
     /// Return the SPIFFE IDs that node `name` does not see, and the config record count (W25-1).
@@ -1607,6 +1716,24 @@ fn lock_value(
     })
 }
 
+/// Write one `role-deny` for a refused role change, then return `sentence`.
+///
+/// The role does not change. A failed audit write returns that error instead.
+fn refuse_role_set(inner: &mut Inner, actor: &str, reason: &str, sentence: String) -> CoordError {
+    if let Err(err) = record(
+        inner,
+        actor,
+        ConfigAction::RoleDeny,
+        "role-set",
+        EMPTY_DIGEST,
+        EMPTY_DIGEST,
+        &format!("op role-set reason {reason} status 403"),
+    ) {
+        return err;
+    }
+    CoordError::Protocol(sentence)
+}
+
 /// Append one record when the chain is open.
 fn record(
     inner: &mut Inner,
@@ -2096,7 +2223,8 @@ fn admit_user(inner: &mut Inner, login: &OidcLogin, now: SystemTime) -> Result<(
         return Ok(());
     }
     let approval = inner.policy.user_approval();
-    let reason = if approval.is_owner_user(&user) {
+    let owner_user = approval.is_owner_user(&user);
+    let reason = if owner_user {
         Some("policy owner user".to_string())
     } else if state == Some(UserState::Rejected) {
         println!("user refused {user} rejected");
@@ -2108,10 +2236,14 @@ fn admit_user(inner: &mut Inner, login: &OidcLogin, now: SystemTime) -> Result<(
     };
     if let Some(reason) = reason {
         let actor = coord_actor_of(inner)?;
+        let role = if owner_user { Some("owner") } else { None };
         return set_user_recorded(
             inner,
             &user,
-            UserState::Approved,
+            UserChange {
+                state: UserState::Approved,
+                role,
+            },
             &actor,
             ConfigAction::UserApprove,
             &reason,
@@ -2148,13 +2280,19 @@ fn record_user_migration(inner: &mut Inner, actor: &str) -> Result<(), CoordErro
     Ok(())
 }
 
+/// One user-state write. `role` is `Some` only when the call sets the role.
+struct UserChange<'a> {
+    state: UserState,
+    role: Option<&'a str>,
+}
+
 /// Change one user state and write one config record (W25-15).
 ///
 /// The change needs the config chain. When the record write fails, the state goes back.
 fn set_user_recorded(
     inner: &mut Inner,
     user: &str,
-    state: UserState,
+    change: UserChange<'_>,
     actor: &str,
     action: ConfigAction,
     detail: &str,
@@ -2167,11 +2305,15 @@ fn set_user_recorded(
     }
     let old = inner.store.user(user);
     let before = user_digest(old.as_ref());
-    inner.store.set_user_state(user, state, now)?;
+    inner
+        .store
+        .set_user_state(user, change.state, change.role, now)?;
     let after = user_digest(inner.store.user(user).as_ref());
     if let Err(err) = record(inner, actor, action, user, before, after, detail) {
         let _ = match old {
-            Some(old) => inner.store.set_user_state(user, old.state, now),
+            Some(old) => inner
+                .store
+                .set_user_state(user, old.state, Some(old.role.as_str()), now),
             None => inner.store.remove_user(user),
         };
         return Err(err);
@@ -2186,6 +2328,7 @@ fn user_digest(user: Option<&StoredUser>) -> [u8; 32] {
     let value = serde_json::json!({
         "user": user.user,
         "state": user.state.as_str(),
+        "role": user.role,
     });
     sha256(value.to_string().as_bytes())
 }
