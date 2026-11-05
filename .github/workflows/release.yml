@@ -5,7 +5,7 @@ name: release
 # A dry run does not push an image to a registry.
 # A push of a version tag publishes the GitHub release.
 # A push to main is a dry run.
-# workflow_dispatch input dry_run defaults to true.
+# workflow_dispatch is always a dry run.
 
 on:
   push:
@@ -21,11 +21,6 @@ on:
       - "scripts/release/**"
       - "scripts/install.sh"
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: Build the artifacts. Do not publish a release. Do not push an image.
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -46,22 +41,11 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
-          # true only for workflow_dispatch with dry_run true. Other events set false.
-          INPUT_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         run: |
           set -eu
           publish=false
           if [[ "$EVENT_NAME" == "push" && "$REF" == refs/tags/v* ]]; then
             publish=true
-          fi
-          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$INPUT_DRY_RUN" == "false" ]]; then
-            case "$REF" in
-              refs/tags/v*) publish=true ;;
-              *)
-                echo "A publish needs a version tag." >&2
-                exit 1
-                ;;
-            esac
           fi
           echo "publish=${publish}" >> "$GITHUB_OUTPUT"
           if [[ "$publish" == "true" ]]; then
@@ -398,7 +382,10 @@ jobs:
   publish:
     name: sign and publish
     needs: [mode, checksums, install-e2e]
-    if: needs.mode.outputs.publish == 'true'
+    if: >-
+      needs.mode.outputs.publish == 'true' &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
