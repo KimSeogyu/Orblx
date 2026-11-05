@@ -108,6 +108,10 @@ pub enum ConfigAction {
     UserReject,
     /// A client moved an HA subnet route to another router (W25-10).
     RouteFailover,
+    /// An owner changed the admin role of one user.
+    RoleSet,
+    /// The admin API refused one call because the caller role does not allow it.
+    RoleDeny,
 }
 
 impl ConfigAction {
@@ -116,7 +120,7 @@ impl ConfigAction {
     pub const RESERVED_CODES: [u8; 1] = [37];
 
     /// Every action in code order.
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 39] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -154,6 +158,8 @@ impl ConfigAction {
         Self::UserApprove,
         Self::UserReject,
         Self::RouteFailover,
+        Self::RoleSet,
+        Self::RoleDeny,
     ];
 
     /// Return the stable action token.
@@ -197,6 +203,8 @@ impl ConfigAction {
             Self::UserApprove => "user-approve",
             Self::UserReject => "user-reject",
             Self::RouteFailover => "route-failover",
+            Self::RoleSet => "role-set",
+            Self::RoleDeny => "role-deny",
         }
     }
 
@@ -247,6 +255,8 @@ impl ConfigAction {
             Self::UserApprove => 35,
             Self::UserReject => 36,
             Self::RouteFailover => 38,
+            Self::RoleSet => 39,
+            Self::RoleDeny => 40,
         }
     }
 

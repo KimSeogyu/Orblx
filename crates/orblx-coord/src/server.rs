@@ -541,16 +541,14 @@ fn dispatch_admin(
         return Ok(dispatch_token(coord, request, secret, now));
     }
     let caller = peer_id(coord, connection)?;
-    if !coord.caller_is_owner(&caller)? {
-        return Err(CoordError::Protocol(
-            "The caller is not an owner.".to_string(),
-        ));
-    }
+    let actor = caller.as_uri();
+    // The role gate writes one role-deny record when it refuses the call.
+    crate::roles::authorize(coord, actor, &request.op)?;
     let policy_lock = policy_lock_for(&request.op)?;
     let value = run_admin(
         coord,
         request,
-        Caller::Owner(caller.as_uri()),
+        Caller::Owner(actor),
         policy_lock.as_ref(),
         now,
     )?;
@@ -628,6 +626,14 @@ fn dispatch_token(
             refusal.status()
         );
         return status_response(refusal.status(), refusal.text().to_string());
+    }
+    if let Some(role) = checked.role_block {
+        println!(
+            "admin role deny {} op {op} role {} status 403",
+            checked.id,
+            role.as_str()
+        );
+        return status_response(403, crate::roles::deny_text(role).to_string());
     }
     let actor = apitoken::actor_of(&checked.id);
     let value = match run_admin(
@@ -726,6 +732,18 @@ fn run_admin(
             coord.lock_update(update, actor)?
         }
         "admin-policy" => admin::policy_show(coord)?,
+        "admin-roles" => {
+            let mut value = admin::users(coord)?;
+            value["op"] = serde_json::json!("roles");
+            value
+        }
+        "admin-role-set" => {
+            // A token has no scope for this operation. This is a second gate.
+            owner_only()?;
+            let ask: crate::roles::SetAsk = serde_json::from_str(&request.name)
+                .map_err(|_| CoordError::Protocol("The role request is not valid.".to_string()))?;
+            crate::roles::apply(coord, &ask, actor, now)?
+        }
         "admin-policy-set" => {
             let lock = policy_lock.ok_or(CoordError::State)?;
             admin::policy_set(coord, lock, &request.name, request.expect_sha256.as_deref())?
@@ -734,12 +752,14 @@ fn run_admin(
             owner_only()?;
             let ask: apitoken::CreateAsk = serde_json::from_str(&request.name)
                 .map_err(|_| CoordError::Protocol("The token request is not valid.".to_string()))?;
-            let made = apitoken::create(coord, &ask, actor, now)?;
+            let role = crate::roles::require_live(coord, actor)?;
+            let made = apitoken::create(coord, &ask, actor, role, now)?;
             serde_json::json!({
                 "op": "token-create",
                 "id": made.id,
                 "token": made.secret,
                 "scopes": made.scopes,
+                "role": made.role,
                 "expires_unix_ms": made.expires_unix_ms
             })
         }
@@ -749,7 +769,8 @@ fn run_admin(
         }
         "admin-token-revoke" => {
             owner_only()?;
-            apitoken::revoke(coord, request.name.trim(), actor, now)?
+            let role = crate::roles::require_live(coord, actor)?;
+            apitoken::revoke(coord, request.name.trim(), actor, role, now)?
         }
         _ => {
             return Err(CoordError::Protocol(
@@ -993,8 +1014,14 @@ mod tests {
                 scopes: vec![scope.to_string()],
                 ttl_secs: 60,
             };
-            let made =
-                apitoken::create(&coord, &ask, "spiffe://orblx.local/node/owner", now).unwrap();
+            let made = apitoken::create(
+                &coord,
+                &ask,
+                "spiffe://orblx.local/node/owner",
+                crate::roles::Role::Owner,
+                now,
+            )
+            .unwrap();
             for op in admin_ops() {
                 let reply = dispatch_token(&coord, &call(op, &made.secret), &made.secret, now);
                 let status = reply.status.unwrap();
@@ -1014,6 +1041,7 @@ mod tests {
                 ttl_secs: 60,
             },
             "spiffe://orblx.local/node/owner",
+            crate::roles::Role::Owner,
             now,
         )
         .unwrap();
@@ -1093,6 +1121,7 @@ mod tests {
                 ttl_secs: 60,
             },
             OWNER,
+            crate::roles::Role::Owner,
             now,
         )
         .unwrap();
@@ -1138,6 +1167,7 @@ mod tests {
                 ttl_secs: 60,
             },
             OWNER,
+            crate::roles::Role::Owner,
             now,
         )
         .unwrap();
@@ -1188,6 +1218,7 @@ mod tests {
                     ttl_secs: 60,
                 },
                 OWNER,
+                crate::roles::Role::Owner,
                 now,
             )
             .unwrap();
@@ -1242,6 +1273,7 @@ mod tests {
                 ttl_secs: 60,
             },
             OWNER,
+            crate::roles::Role::Owner,
             now,
         )
         .unwrap();
@@ -1304,6 +1336,7 @@ mod tests {
                 ttl_secs: 60,
             },
             OWNER,
+            crate::roles::Role::Owner,
             now,
         )
         .unwrap();
