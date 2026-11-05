@@ -88,6 +88,42 @@ echo "=== [C] coord-cert-soak constants ==="
 echo "max_skew_s ${SKEW} max_user_ttl_s ${TTL} node_svid_ttl_s ${TR_SVID_TTL} coord_svid_ttl_s ${TTL}"
 echo "soak_s ${SOAK_S} soak_coord_ends ${SOAK_COORD_ENDS} tr_ends ${TR_ENDS} project ${TR_PROJECT}"
 
+# Ask 127.0.0.11 for a name. An answer means the embedded DNS server is up.
+# No answer does not fail the run. The stack uses fixed addresses and hosts entries.
+preflight_docker_dns() {
+  local id="$1"
+  if docker exec "$id" python3 -c 'import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2)
+q = bytes([0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 5]) + b"coord" + bytes([0, 0, 1, 0, 1])
+try:
+    s.sendto(q, ("127.0.0.11", 53))
+    s.recv(512)
+except Exception:
+    sys.exit(1)
+' >/dev/null 2>&1; then
+    echo "preflight docker_dns ok"
+  else
+    echo "preflight docker_dns unavailable (not needed: fixed IPs and hosts entries)"
+  fi
+}
+
+# Each soak service name must resolve inside the coordinator container.
+preflight_service_names() {
+  local id="$1" name ip line
+  local names=(coord owner a b c)
+  local ips=("${TR_NET}.10" "${TR_NET}.20" "${TR_NET}.11" "${TR_NET}.12" "${TR_NET}.13")
+  local i
+  for i in "${!names[@]}"; do
+    name="${names[$i]}"
+    ip="${ips[$i]}"
+    line="$(timeout 25 docker exec "$id" getent hosts "$name" 2>/dev/null || true)"
+    if ! printf '%s\n' "$line" | awk -v ip="$ip" '$1 == ip { ok = 1 } END { exit ok ? 0 : 1 }'; then
+      fail "The service name ${name} does not resolve to ${ip} inside the container."
+    fi
+  done
+}
+
 coord_container() {
   docker ps -q --filter "label=com.docker.compose.project=${TR_PROJECT}" \
     --filter "label=com.docker.compose.service=coord" 2>/dev/null || true
@@ -104,6 +140,8 @@ while kill -0 "$TR_PID" >/dev/null 2>&1; do
   if [[ -z "$followed" ]] && read_all grep -q "start coordinator" < "$WORK/tr.log"; then
     id="$(coord_container)"
     if [[ -n "$id" ]]; then
+      preflight_docker_dns "$id"
+      preflight_service_names "$id"
       docker logs -f -t "$id" > "$COORD_LOG" 2>&1 &
       FOLLOW_PID="$!"
       followed="$id"

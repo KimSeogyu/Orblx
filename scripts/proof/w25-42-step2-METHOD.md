@@ -17,6 +17,7 @@ The 20:17 failure stays counted and unproven. Step 1 (22:04:43 KST stall) stays 
 - Set `RUSTUP_TOOLCHAIN=stable` for the build.
 - The run log records the text from `rustc -V`.
 - The run log records the cargo release `Finished` line.
+- The stack does not use the Docker DNS server at 127.0.0.11. The subnet is `TR_NET.0/24`. This soak sets `TR_NET` to 172.28.49, so the subnet is 172.28.49.0/24. The static addresses are coord 172.28.49.10, a 172.28.49.11, b 172.28.49.12, c 172.28.49.13, and owner 172.28.49.20. The pool `ip_range` is 172.28.49.64/26, and that pool does not contain the static addresses. Each service has hosts entries for coord, owner, a, b, and c. The script prints one line, `preflight docker_dns ok` or `preflight docker_dns unavailable (not needed: fixed IPs and hosts entries)`. That line does not fail the run. The script then runs `getent hosts` for each of those names inside the coordinator container. A name that does not resolve stops the run.
 - Quote each full `proof_contention` line.
 - The run is valid only when `samples` is 1 or more, `contended_samples` is 0, and `unknown_samples` is 0.
 - When `unknown_samples` is more than 0, the run is INVALID.
