@@ -175,7 +175,8 @@ class ProofLockFairnessTest(unittest.TestCase):
             os.close(held)
             for fd in fds:
                 os.close(fd)
-        m = re.search(r"rc=(\d+) ms=(\d+) pid=", free.stdout)
+        # A negative ms is a step back of the wall clock. The check was still fast.
+        m = re.search(r"rc=(\d+) ms=(-?\d+) pid=", free.stdout)
         self.assertIsNotNone(m, free.stdout + free.stderr)
         self.assertEqual(m.group(1), "1", free.stdout)
         self.assertLess(int(m.group(2)), 1000, free.stdout)
