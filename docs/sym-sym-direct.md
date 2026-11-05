@@ -21,19 +21,23 @@ The same post says connections start on the relay:
 
 > In Tailscale, we upgrade connections on the fly as we discover better paths, and all connections start out with DERP preselected.
 
-The 0.01% figure and the 170,000-probe figure are the blog's calculation. They are not a measured Tailscale success rate. This document does not invent a Tailscale success rate.
+The 0.01% figure and the 170,000-probe figure are the blog's calculation. They are not a measured Tailscale success rate.
 
-The client classifies a hard NAT when two STUN servers return two ports. `net/netcheck/netcheck.go` (<https://github.com/tailscale/tailscale/blob/main/net/netcheck/netcheck.go>):
+`net/netcheck/netcheck.go` (<https://github.com/tailscale/tailscale/blob/main/net/netcheck/netcheck.go>):
 
 > MappingVariesByDestIP is whether STUN results depend which STUN server you're talking to (on IPv4).
 
-`GetGlobalAddrs` in the same file says it "excludes singular endpoints that are likely only the result of a hard NAT."
+`GetGlobalAddrs` in the same file:
 
-`wgengine/magicsock/magicsock.go` `determineEndpoints` (<https://github.com/tailscale/tailscale/blob/main/wgengine/magicsock/magicsock.go>) adds one extra candidate for a hard NAT, the local fixed port, and calls it an invalid candidate in the worst case:
+> GetGlobalAddrs returns the v4 and v6 global addresses observed during the netcheck, which includes the best latency endpoint first, followed by any other endpoints that were observed repeatedly. It excludes singular endpoints that are likely only the result of a hard NAT.
+
+`wgengine/magicsock/magicsock.go` `determineEndpoints` (<https://github.com/tailscale/tailscale/blob/main/wgengine/magicsock/magicsock.go>):
 
 > If they're behind a hard NAT and are using a fixed port locally, assume they might've added a static port mapping on their router to the same explicit port that tailscaled is running with. Worst case it's an invalid candidate mapping.
 
-`handleCallMeMaybe` in `wgengine/magicsock/endpoint.go` (<https://github.com/tailscale/tailscale/blob/main/wgengine/magicsock/endpoint.go>) pings the endpoints named in the message. It does not spray a predicted port range. Two hard NATs therefore stay on DERP. The blog states that a birthday search of that pair is not usable for interactive traffic.
+`handleCallMeMaybe` in `wgengine/magicsock/endpoint.go` (<https://github.com/tailscale/tailscale/blob/main/wgengine/magicsock/endpoint.go>):
+
+> handleCallMeMaybe handles a CallMeMaybe discovery message via DERP. The contract for use of this message is that the peer has already sent to us via UDP, so their stateful firewall should be open. Now we can Ping back and make it through.
 
 ## Allocation class
 
@@ -60,19 +64,39 @@ A sequential NAT sprays the next 32 ports after the origin. A port block sprays 
 
 An endpoint-independent peer still uses the existing plain punch, port spray, or birthday sockets. This work does not change those plans.
 
-`relay-only` sends no punch probes. `predict-spray` sends only the predicted ports, at the existing limit of 200 probes per second, burst 20, and at most 2048 probes in 15 seconds. A node accepts a punch only from the signed peer IP and only with the session token.
+`relay-only` sends no punch probes. `predict-spray` sends only the predicted ports.
+
+One attempt, for one peer:
+
+- Ports: at most 32 for a sequential allocation, and at most 513 for a port block (`PREDICT_PORT_MAX`).
+- Packets: at most 2048 (`SPRAY_MAX`).
+- Rate: 200 probes per second, burst 20.
+- Time: the attempt also stops at 15 seconds.
+
+The pair gets 4 attempts (`PREDICT_ATTEMPTS`). The packet budget is 4 × 2048 = 8192 probes from one node. Attempt 4 is the last. A later retry does not start. The spray also stops when the direct path comes up. The test `the_predict_budget_caps_ports_packets_and_attempts` checks this cap.
+
+A punch datagram whose session token does not match is dropped. A punch whose source IP is not the signed peer is dropped. The drop happens before the node stores a direct peer. The test is `a_foreign_punch_is_dropped_before_the_peer_changes`. The lab log line is `punch_drop <address> token` or `punch_drop <address> netmap`.
 
 The relay path is allowed as soon as both mappings are endpoint-dependent. The spray does not hold the first packet. After a move from relay to direct, the node still sends on both paths for 600 ms. A later direct failure still returns to the relay and still resends the recent direct frames.
 
 A failed predict attempt prints `predict_probes`, waits, and tries again. The first wait is 2 seconds. Each later wait doubles. The wait stops at 60 seconds. The node gathers new STUN samples before the next attempt. The process does not restart.
 
+## Clock
+
+`clock_origin unix_ms` is the node process start. `path_up relay ms`, `path_up direct ms`, and `first_packet relay ms` are milliseconds from that same start. The headline numbers are the time to the first packet on the relay and the time to the direct path.
+
+The two mapping STUN requests run first. The relay threads then start. The four allocation samples run beside the relay, so the classifier does not hold the first packet. A hard pair may use the relay as soon as both mappings are endpoint-dependent.
+
 ## Lab routers
+
+The routers are iptables and a small UDP program on Linux containers. They are models. They are not a carrier-grade NAT.
 
 `scripts/proof/nat-router.sh`:
 
 - `symmetric` and `random`: `MASQUERADE --random-fully --to-ports 1024-65535`. This is the previous symmetric router.
 - `sequential`: each new UDP flow gets the next external port from 1024 upward. `scripts/proof/udp-nat.py` moves the UDP. TCP and ICMP stay on the kernel NAT.
 - `portblock`: each new UDP flow gets a free port in 20000-20063. The choice inside the block is not a fixed step.
+- `shift`: STUN ports 3478 and 3479 stay on the sequential series, and only the STUN server can send back to those mappings. Every other destination starts at 20000 and then adds 4000. A punch aimed at the published STUN port does not enter. The predicted window misses the jumped punch port. This is the wrong-prediction model.
 
 The UDP NAT is endpoint-dependent. Two destination ports get two external ports. A reply to a source that arrived on an external port uses that same external port. Inbound UDP from an address the inside host has sent to is accepted on an allocated port.
 
@@ -98,29 +122,41 @@ rustc rustc 1.99.1 (58cf8f9c3 2026-10-13)
 build profile release
 ```
 
-`relay_ms` and `direct_ms` are `path_up` from process start. `first_packet_ms` is the first ICMP reply, measured from the host clock before the two node containers start. That clock includes container start, so it is larger than `relay_ms`. `probes` is the sum of the `predict_probes` lines from both nodes. `switch_lost` is the loss in 50 pings at 0.1 s after the first reply. `switch_gap_ms` is the longest gap between those replies.
+The three times are from node-c process start. `relay_ms` is `path_up relay`. `direct_ms` is `path_up direct`. `first_packet_ms` is `first_packet relay`. The headline numbers are `first_packet_ms` and `direct_ms`. In every direct run, `first_packet_ms` is less than or equal to `direct_ms`. `probes` is the sum of the `predict_probes` lines from both nodes. `switch_lost` is the loss in 50 pings at 0.1 s. `switch_gap_ms` is the longest gap between those replies.
+
+A foreign punch, sent from the router LAN address to the node:
 
 ```text
-case random-random-1 expect relay relay_ms 111 direct_ms none first_packet_ms 1713 probes 0 switch_lost 0/50 switch_gap_ms 108
-case sequential-random-1 expect direct relay_ms 111 direct_ms 1501 first_packet_ms 1954 probes 262 switch_lost 0/50 switch_gap_ms 108
-case sequential-sequential-1 expect direct relay_ms 232 direct_ms 1514 first_packet_ms 1917 probes 231 switch_lost 0/50 switch_gap_ms 109
-case portblock-random-1 expect direct relay_ms 111 direct_ms 1308 first_packet_ms 1838 probes 224 switch_lost 0/50 switch_gap_ms 109
-case random-random-2 expect relay relay_ms 111 direct_ms none first_packet_ms 1695 probes 0 switch_lost 0/50 switch_gap_ms 108
-case sequential-random-2 expect direct relay_ms 111 direct_ms 1560 first_packet_ms 1956 probes 261 switch_lost 0/50 switch_gap_ms 109
-case sequential-sequential-2 expect direct relay_ms 273 direct_ms 1571 first_packet_ms 1990 probes 203 switch_lost 0/50 switch_gap_ms 108
-case portblock-random-2 expect direct relay_ms 111 direct_ms 1570 first_packet_ms 1927 probes 268 switch_lost 0/50 switch_gap_ms 108
-case random-random-3 expect relay relay_ms 111 direct_ms none first_packet_ms 1713 probes 0 switch_lost 0/50 switch_gap_ms 108
-case sequential-random-3 expect direct relay_ms 111 direct_ms 1624 first_packet_ms 2021 probes 260 switch_lost 0/50 switch_gap_ms 108
-case sequential-sequential-3 expect direct relay_ms 111 direct_ms 1563 first_packet_ms 1980 probes 243 switch_lost 0/50 switch_gap_ms 109
-case portblock-random-3 expect direct relay_ms 111 direct_ms 1568 first_packet_ms 1972 probes 267 switch_lost 0/50 switch_gap_ms 108
-case random-random-4 expect relay relay_ms 111 direct_ms none first_packet_ms 1750 probes 0 switch_lost 0/50 switch_gap_ms 109
-case sequential-random-4 expect direct relay_ms 111 direct_ms 1616 first_packet_ms 1942 probes 260 switch_lost 0/50 switch_gap_ms 109
-case sequential-sequential-4 expect direct relay_ms 233 direct_ms 1419 first_packet_ms 1936 probes 185 switch_lost 0/50 switch_gap_ms 109
-case portblock-random-4 expect direct relay_ms 111 direct_ms 1666 first_packet_ms 1847 probes 268 switch_lost 0/50 switch_gap_ms 108
-case random-random-5 expect relay relay_ms 111 direct_ms none first_packet_ms 1746 probes 0 switch_lost 0/50 switch_gap_ms 108
-case sequential-random-5 expect direct relay_ms 111 direct_ms 1498 first_packet_ms 1909 probes 260 switch_lost 0/50 switch_gap_ms 108
-case sequential-sequential-5 expect direct relay_ms 181 direct_ms 1563 first_packet_ms 1918 probes 251 switch_lost 0/50 switch_gap_ms 108
-case portblock-random-5 expect direct relay_ms 111 direct_ms 1647 first_packet_ms 1947 probes 270 switch_lost 0/50 switch_gap_ms 109
+punch_drop 10.28.23.2:60238 token
+punch_drop 10.28.23.2:60238 netmap
+```
+
+```text
+case random-random-1 expect relay relay_ms 1186 direct_ms none first_packet_ms 1186 probes 0 switch_lost 0/50 switch_gap_ms 108
+case sequential-random-1 expect direct relay_ms 1369 direct_ms 1685 first_packet_ms 1369 probes 61 switch_lost 0/50 switch_gap_ms 109
+case sequential-sequential-1 expect direct relay_ms 1448 direct_ms 1561 first_packet_ms 1448 probes 0 switch_lost 0/50 switch_gap_ms 108
+case portblock-random-1 expect direct relay_ms 1496 direct_ms 1559 first_packet_ms 1496 probes 56 switch_lost 0/50 switch_gap_ms 108
+case shift-shift-1 expect miss relay_ms 1476 direct_ms none first_packet_ms 1476 probes 16384 switch_lost 0/50 switch_gap_ms 107
+case random-random-2 expect relay relay_ms 1196 direct_ms none first_packet_ms 1197 probes 0 switch_lost 0/50 switch_gap_ms 108
+case sequential-random-2 expect direct relay_ms 1342 direct_ms 1529 first_packet_ms 1342 probes 20 switch_lost 0/50 switch_gap_ms 108
+case sequential-sequential-2 expect direct relay_ms 1492 direct_ms 1624 first_packet_ms 1492 probes 0 switch_lost 0/50 switch_gap_ms 109
+case portblock-random-2 expect direct relay_ms 1472 direct_ms 1597 first_packet_ms 1473 probes 62 switch_lost 0/50 switch_gap_ms 109
+case shift-shift-2 expect miss relay_ms 1371 direct_ms none first_packet_ms 1371 probes 16384 switch_lost 0/50 switch_gap_ms 107
+case random-random-3 expect relay relay_ms 1193 direct_ms none first_packet_ms 1193 probes 0 switch_lost 0/50 switch_gap_ms 109
+case sequential-random-3 expect direct relay_ms 1475 direct_ms 1588 first_packet_ms 1476 probes 62 switch_lost 0/50 switch_gap_ms 108
+case sequential-sequential-3 expect direct relay_ms 1359 direct_ms 1461 first_packet_ms 1359 probes 0 switch_lost 0/50 switch_gap_ms 109
+case portblock-random-3 expect direct relay_ms 1502 direct_ms 1564 first_packet_ms 1502 probes 60 switch_lost 0/50 switch_gap_ms 108
+case shift-shift-3 expect miss relay_ms 1532 direct_ms none first_packet_ms 1532 probes 16384 switch_lost 0/50 switch_gap_ms 109
+case random-random-4 expect relay relay_ms 1189 direct_ms none first_packet_ms 1189 probes 0 switch_lost 0/50 switch_gap_ms 109
+case sequential-random-4 expect direct relay_ms 1529 direct_ms 1612 first_packet_ms 1530 probes 62 switch_lost 0/50 switch_gap_ms 108
+case sequential-sequential-4 expect direct relay_ms 1498 direct_ms 1622 first_packet_ms 1498 probes 0 switch_lost 0/50 switch_gap_ms 106
+case portblock-random-4 expect direct relay_ms 1503 direct_ms 1515 first_packet_ms 1503 probes 40 switch_lost 0/50 switch_gap_ms 108
+case shift-shift-4 expect miss relay_ms 1516 direct_ms none first_packet_ms 1516 probes 16384 switch_lost 0/50 switch_gap_ms 108
+case random-random-5 expect relay relay_ms 1185 direct_ms none first_packet_ms 1185 probes 0 switch_lost 0/50 switch_gap_ms 107
+case sequential-random-5 expect direct relay_ms 1360 direct_ms 1507 first_packet_ms 1360 probes 20 switch_lost 0/50 switch_gap_ms 109
+case sequential-sequential-5 expect direct relay_ms 1499 direct_ms 1622 first_packet_ms 1499 probes 0 switch_lost 0/50 switch_gap_ms 107
+case portblock-random-5 expect direct relay_ms 1504 direct_ms 1699 first_packet_ms 1505 probes 60 switch_lost 0/50 switch_gap_ms 108
+case shift-shift-5 expect miss relay_ms 1504 direct_ms none first_packet_ms 1504 probes 16384 switch_lost 0/50 switch_gap_ms 109
 ```
 
 Plan lines from the fifth run of each pair:
@@ -147,14 +183,17 @@ The local port allocation is port-block 20003-20058.
 The peer port allocation is random.
 ```
 
-| Pair | Path | Success | Relay path | First packet | Direct path | Probes | Switch loss |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| random to random | relay | 5/5 | 111 ms | 1695–1750 ms | none | 0 | 0/50 |
-| sequential to random | direct | 5/5 | 111 ms | 1909–2021 ms | 1498–1624 ms | 260–262 | 0/50 |
-| sequential to sequential | direct | 5/5 | 111–273 ms | 1917–1990 ms | 1419–1571 ms | 185–251 | 0/50 |
-| port-block to random | direct | 5/5 | 111 ms | 1838–1972 ms | 1308–1666 ms | 224–270 | 0/50 |
+| Pair | Path | Success | First packet on relay | Direct path | Probes | Switch loss |
+| --- | --- | --- | --- | --- | --- | --- |
+| random to random | relay | 5/5 | 1185–1197 ms | none | 0 | 0/50 |
+| sequential to random | direct | 5/5 | 1342–1530 ms | 1507–1685 ms | 20–62 | 0/50 |
+| sequential to sequential | direct | 5/5 | 1359–1499 ms | 1461–1624 ms | 0 | 0/50 |
+| port-block to random | direct | 5/5 | 1473–1505 ms | 1515–1699 ms | 40–62 | 0/50 |
+| shift (wrong prediction) | relay | 5/5 | 1371–1532 ms | none | 16384 | 0/50 |
 
-Every direct run has `relay_ms` below `direct_ms`. The first packets use the relay. The later path is direct. The ping gap stays at the 0.1 s interval (108 ms or 109 ms). The switch drops no ping in these 50-ping samples.
+16384 probes is 4 attempts × 2048 packets × 2 nodes. That is the packet budget. The shift runs stop there and stay on the relay. Ping loss is 0. The gap stays at the 0.1 s interval.
+
+On the sequential model the published STUN port belongs to the direct socket. A check to that port can open the path before a spray probe is counted. Those runs show 0 probes and a direct path. The shift model does not accept that check.
 
 The blocked-punch run:
 
@@ -169,23 +208,24 @@ sym_sym_direct_ok
 The script reaches `punch_open` only after a log line `The predict attempt 2 starts.` (or a later attempt) while the UDP block is still in place. `retry restarted false` means the node container start time did not change.
 
 ```text
-proof_contention sym-sym-direct:orblx-sym-proof samples 327 contended_samples 0 unknown_samples 0 max_other_orblx_containers 0 max_load1 0.87
+proof_contention sym-sym-direct:orblx-sym-proof samples 526 contended_samples 0 unknown_samples 0 max_other_orblx_containers 0 max_load1 1.03
 ```
 
 ## Comparison
 
-| Pair | Orblx, this run | Tailscale |
+| Pair | Orblx, this run | Tailscale primary text |
 | --- | --- | --- |
-| random to random | 5/5 relay. 0 predict probes. Plan `relay-only`. | DERP. The blog calculates 0.01% for a birthday search after 20 seconds. The client pings advertised endpoints only. |
-| sequential to random | 5/5 direct. Direct path 1498–1624 ms from process start. 260–262 probes. Switch loss 0/50. | DERP when both mappings vary by destination. The client pings the endpoints named in the call-me message. |
-| sequential to sequential | 5/5 direct. Direct path 1419–1571 ms from process start. 185–251 probes. Switch loss 0/50. | DERP. The blog says 170,000 probes per side for a 99.9% birthday collision, which is 28 minutes at 100 packets per second. |
-| port-block to random | 5/5 direct. Direct path 1308–1666 ms from process start. 224–270 probes. Switch loss 0/50. | DERP. The client pings the endpoints named in the call-me message. |
+| random to random | 5/5 relay. First packet 1185–1197 ms. 0 probes. | "our chance of success is… 0.01%." "all connections start out with DERP preselected." |
+| sequential to random | 5/5 direct. First packet 1342–1530 ms. Direct 1507–1685 ms. | "To hit a 99.9% chance of success, we need each side to send 170,000 probes." |
+| sequential to sequential | 5/5 direct. First packet 1359–1499 ms. Direct 1461–1624 ms. | "that’s 28 minutes of trying before we can communicate." |
+| port-block to random | 5/5 direct. First packet 1473–1505 ms. Direct 1515–1699 ms. | "Worst case it's an invalid candidate mapping." |
+| shift (wrong prediction) | 5/5 relay. First packet 1371–1532 ms. 16384 probes, the budget. Loss 0/50. | "Now we can Ping back and make it through." |
 
 Sources: <https://tailscale.com/blog/how-nat-traversal-works>, <https://github.com/tailscale/tailscale/blob/main/net/netcheck/netcheck.go>, <https://github.com/tailscale/tailscale/blob/main/wgengine/magicsock/magicsock.go>, <https://github.com/tailscale/tailscale/blob/main/wgengine/magicsock/endpoint.go>.
 
 ## Limits
 
-- The routers are Linux containers on one host. A carrier NAT can use another allocation and another filter.
+- The routers are iptables models in Linux containers. They are not a carrier-grade NAT. A carrier NAT can use another allocation and another filter.
 - The port-block router uses 64 ports. A larger block can fall outside the spray window.
 - The sequential prediction covers 32 ports after the last sample. A router that skips more than 32 ports between the sample and the punch stays on the relay until the next attempt.
 - The random router is `MASQUERADE --random-fully` over 1024-65535. Two random NATs do not punch.

@@ -3,6 +3,9 @@
 
 sequential gives each new UDP flow the next external port from 1024.
 portblock gives each new UDP flow a free port in 20000-20063.
+shift gives STUN ports 3478 and 3479 the sequential series.
+Every other destination starts at 20000 and then adds 4000.
+The punch port is not the next STUN port.
 
 The mapping is endpoint-dependent: a new destination port gets a new external port.
 A reply to a source that arrived on an external port uses that same external port.
@@ -80,6 +83,7 @@ class Table:
     def __init__(self, mode: str) -> None:
         self.mode = mode
         self.next_port = 1024
+        self.shift_port = 20000
         self.block = list(range(BLOCK_BASE, BLOCK_BASE + BLOCK_SIZE))
         random.shuffle(self.block)
         self.block_at = 0
@@ -89,8 +93,12 @@ class Table:
         self.contacted: set[str] = set()
         self.reply: dict[tuple[str, int, str, int], int] = {}
 
-    def allocate(self) -> int:
-        if self.mode == "sequential":
+    def allocate(self, dst_port: int) -> int:
+        if self.mode == "shift" and dst_port not in (3478, 3479):
+            port = self.shift_port
+            self.shift_port = 20000 if self.shift_port >= 60000 else self.shift_port + 4000
+            return port
+        if self.mode == "sequential" or self.mode == "shift":
             port = self.next_port
             self.next_port = 1024 if self.next_port >= 65535 else self.next_port + 1
             return port
@@ -109,7 +117,7 @@ class Table:
         if found is None:
             found = self.reply.get(key)
         if found is None:
-            found = self.allocate()
+            found = self.allocate(dst_port)
             self.out[key] = found
             self.exact[(found, dst_ip, dst_port)] = (lan_ip, lan_port)
             self.owner[found] = (lan_ip, lan_port)
@@ -122,6 +130,10 @@ class Table:
 
     def map_in(self, src_ip: str, src_port: int, dst_port: int) -> tuple[str, int] | None:
         found = self.exact.get((dst_port, src_ip, src_port))
+        # shift keeps the STUN mappings exact. A punch to the published STUN port
+        # is not the flow that the sample predicted, so it does not enter.
+        if found is None and self.mode == "shift" and dst_port < 20000:
+            return None
         if found is None and src_ip in self.contacted:
             found = self.owner.get(dst_port)
         if found is None:
@@ -177,7 +189,7 @@ def main() -> int:
         print("udp-nat.py MODE WAN_IP LAN_IF WAN_IF NODE_IP", file=sys.stderr)
         return 2
     mode, wan_ip, lan_if, wan_if, node_ip = sys.argv[1:]
-    if mode not in ("sequential", "portblock"):
+    if mode not in ("sequential", "portblock", "shift"):
         print(f"The UDP NAT mode {mode} is not valid.", file=sys.stderr)
         return 2
     table = Table(mode)

@@ -17,7 +17,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_datapath::{
     format_node_status, is_ipv4_packet, open_tun_port, NodeStatus, PacketFilter, StatusPeer,
@@ -28,16 +28,19 @@ use orblx_relay::{
 };
 
 use crate::birthday::{
-    classify_ports, local_kind, peer_kind, predict_targets, retry_delay, strategy_for, MappingKind,
-    PortAlloc, PredictSpray, RateGate, Spray, Strategy, ALLOC_SAMPLES, BIRTHDAY_SOCKETS,
-    BIRTHDAY_WINDOW, PROBE_BURST, PROBE_RATE, SOCKET_REFRESH,
+    classify_ports, local_kind, peer_kind, predict_continues, predict_targets, retry_delay,
+    strategy_for, MappingKind, PortAlloc, PredictSpray, RateGate, Spray, Strategy, ALLOC_SAMPLES,
+    BIRTHDAY_SOCKETS, BIRTHDAY_WINDOW, PREDICT_ATTEMPTS, PREDICT_PACKET_BUDGET, PREDICT_PORT_MAX,
+    PROBE_BURST, PROBE_RATE, SOCKET_REFRESH, SPRAY_MAX,
 };
 use crate::nat_path::{
     relay_allowed, select_path, session_id, session_punch_token, HelloAuth, KeyGate, Opened,
     OverlayPath, PathSelect, SendPlan, KIND_DATA, KIND_PROBE, PROBE_GAP_MS, PROBE_HEARS, RESEND_MS,
     STALE_MS,
 };
-use crate::punch::{decode_punch, encode_punch, exchange_same_ip, PunchKind, PunchToken};
+use crate::punch::{
+    admit_punch, decode_punch, encode_punch, exchange_same_ip, PunchDecision, PunchKind, PunchToken,
+};
 use crate::signed::{encode_hex, verify_signed_candidate, SignedCandidate};
 use crate::{EdgeError, StunClient, DIRECT_ATTEMPT_BUDGET, DIRECT_QUIC_PORT};
 
@@ -177,6 +180,12 @@ pub struct NatConfig {
 
 /// Run one NAT node until SIGINT or SIGTERM.
 pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
+    let started = Instant::now();
+    let origin_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    println!("clock_origin unix_ms {origin_ms}");
     install_signals();
     if let Some(gateway) = config.gateway {
         set_default_route(gateway)?;
@@ -192,20 +201,6 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
     if let Some(alt) = alt {
         reflexive_text.push(alt.to_string());
     }
-    let local_alloc = if nat_kind == MappingKind::Hard {
-        for addr in alloc_samples(config.stun, ALLOC_SAMPLES) {
-            println!("The allocation sample is {addr}.");
-            if reflexive_text.len() < 8 {
-                reflexive_text.push(addr.to_string());
-            }
-        }
-        let ports = endpoint_ports(&reflexive_text);
-        let alloc = classify_ports(&ports);
-        println!("The local port allocation is {alloc}.");
-        alloc
-    } else {
-        PortAlloc::Unknown
-    };
     let leaf_der = config.hello.cert_der.clone();
     let session = session_id(&config.name, &config.peer_name)?;
     println!("session {}", encode_hex(&session));
@@ -237,6 +232,7 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         direct_out: Mutex::new(None),
         relay_out: Mutex::new(None),
         relay_broken: AtomicBool::new(false),
+        relay_data_noted: AtomicBool::new(false),
         peer_name: config.peer_name,
         peer_overlay: config.peer_overlay,
         peer_svid: config.peer_svid,
@@ -246,11 +242,11 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         nat_kind,
         stun: config.stun,
         reflexive: Mutex::new(reflexive_text),
-        local_alloc: Mutex::new(local_alloc),
+        local_alloc: Mutex::new(PortAlloc::Unknown),
         session,
         token: session_punch_token(&session),
         relay_id: RelaySessionId::from_bytes(session),
-        started: Instant::now(),
+        started,
         keys: Mutex::new(gate),
         select: Mutex::new(PathSelect::default()),
         queues: Mutex::new(Queues::default()),
@@ -302,6 +298,15 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         thread::Builder::new()
             .name("orblx-nat-renew".to_string())
             .spawn(move || renew_loop(renew_hub, leaf_der, renew))
+            .map_err(|err| EdgeError::Io(err.to_string()))?;
+    }
+    if nat_kind == MappingKind::Hard {
+        // The relay threads are already up. These samples must not hold the first packet.
+        let sample_hub = Arc::clone(&hub);
+        let stun = config.stun;
+        thread::Builder::new()
+            .name("orblx-nat-sample".to_string())
+            .spawn(move || sample_allocation(&sample_hub, stun))
             .map_err(|err| EdgeError::Io(err.to_string()))?;
     }
     let direct_hub = Arc::clone(&hub);
@@ -427,6 +432,8 @@ struct Hub {
     relay_out: Mutex<Option<RelaySender>>,
     /// A send on the relay handle failed. The relay loop attaches again.
     relay_broken: AtomicBool,
+    /// True after the first data frame on the relay.
+    relay_data_noted: AtomicBool,
     peer_name: String,
     peer_overlay: Ipv4Addr,
     peer_svid: String,
@@ -846,6 +853,9 @@ impl Hub {
                 return true;
             }
             let (sent, result) = sender.send_many(&frames);
+            if sent > 0 && !self.relay_data_noted.swap(true, Ordering::Relaxed) {
+                println!("first_packet relay ms {}", self.now_ms());
+            }
             if result.is_err() {
                 self.push_front_many(OverlayPath::Relay, frames.split_off(sent));
                 *out = None;
@@ -1274,44 +1284,54 @@ fn direct_loop(hub: Arc<Hub>, socket: UdpSocket) {
                     let Some((bytes, Some(from))) = batch.get(index) else {
                         continue;
                     };
-                    if let Some(kind) = decode_punch(bytes, hub.token) {
-                        if let Some(signed) = hub.peer_addr() {
-                            if from.ip() == signed.ip() {
-                                if direct_peer.is_none() {
-                                    if let Some(active) = spray.take() {
-                                        println!(
-                                            "The port spray reached {from} after {} probes.",
-                                            active.sent()
-                                        );
-                                    }
-                                    if let Some(active) = predict.take() {
-                                        let sent = active.spray.sent();
-                                        println!(
-                                            "The predict spray reached {from} after {sent} probes."
-                                        );
-                                        println!("predict_probes {sent}");
-                                    }
-                                    println!("The hole punch reached {from}.");
+                    match admit_punch(
+                        bytes,
+                        hub.token,
+                        from.ip(),
+                        hub.peer_addr().map(|addr| addr.ip()),
+                    ) {
+                        Some(PunchDecision::DropToken) => {
+                            println!("punch_drop {from} token");
+                        }
+                        Some(PunchDecision::DropNetmap) => {
+                            println!("punch_drop {from} netmap");
+                        }
+                        Some(PunchDecision::Accept(kind)) => {
+                            if direct_peer.is_none() {
+                                if let Some(active) = spray.take() {
+                                    println!(
+                                        "The port spray reached {from} after {} probes.",
+                                        active.sent()
+                                    );
                                 }
-                                direct_peer = Some(from);
-                                if kind == PunchKind::Check {
-                                    let _ = socket.send_to(&ack, from);
+                                if let Some(active) = predict.take() {
+                                    let sent = active.spray.sent();
+                                    println!(
+                                        "The predict spray reached {from} after {sent} probes."
+                                    );
+                                    println!("predict_probes {sent}");
                                 }
+                                println!("The hole punch reached {from}.");
+                            }
+                            direct_peer = Some(from);
+                            if kind == PunchKind::Check {
+                                let _ = socket.send_to(&ack, from);
                             }
                         }
-                    } else {
-                        let (packet, fresh_frame) = hub.accept(bytes, Slot::Direct);
-                        // A fresh sealed frame shows the current address of the peer.
-                        if fresh_frame
-                            && direct_peer.is_some_and(|known| known != from)
-                            && hub
-                                .peer_addr()
-                                .is_some_and(|signed| signed.ip() == from.ip())
-                        {
-                            direct_peer = Some(from);
-                        }
-                        if let Some(packet) = packet {
-                            opened.push(packet);
+                        None => {
+                            let (packet, fresh_frame) = hub.accept(bytes, Slot::Direct);
+                            // A fresh sealed frame shows the current address of the peer.
+                            if fresh_frame
+                                && direct_peer.is_some_and(|known| known != from)
+                                && hub
+                                    .peer_addr()
+                                    .is_some_and(|signed| signed.ip() == from.ip())
+                            {
+                                direct_peer = Some(from);
+                            }
+                            if let Some(packet) = packet {
+                                opened.push(packet);
+                            }
                         }
                     }
                 }
@@ -1338,6 +1358,25 @@ fn endpoint_ports(texts: &[String]) -> Vec<u16> {
         .filter_map(|text| text.parse::<SocketAddr>().ok())
         .map(|addr| addr.port())
         .collect()
+}
+
+fn sample_allocation(hub: &Hub, stun: SocketAddr) {
+    let samples = alloc_samples(stun, ALLOC_SAMPLES);
+    if samples.is_empty() {
+        return;
+    }
+    let mut list = lock(&hub.reflexive);
+    for addr in &samples {
+        println!("The allocation sample is {addr}.");
+        if list.len() < 8 {
+            list.push(addr.to_string());
+        }
+    }
+    let ports = endpoint_ports(&list);
+    drop(list);
+    let alloc = classify_ports(&ports);
+    *lock(&hub.local_alloc) = alloc;
+    println!("The local port allocation is {alloc}.");
 }
 
 fn alloc_samples(server: SocketAddr, count: usize) -> Vec<SocketAddr> {
@@ -1384,25 +1423,43 @@ fn log_plan(hub: &Hub) -> Strategy {
 }
 
 /// One predict attempt, then a bounded wait, then another attempt.
+///
+/// The cycle stops after [`PREDICT_ATTEMPTS`]. It does not start another spray.
 struct PredictCycle {
     spray: PredictSpray,
     attempt: u32,
     resume_at: Option<Instant>,
+    stopped: bool,
 }
 
 impl PredictCycle {
     fn start(hub: &Hub, now: Instant) -> Self {
+        println!(
+            "predict_budget attempts {PREDICT_ATTEMPTS} packets_per_attempt {SPRAY_MAX} port_cap {PREDICT_PORT_MAX} rate {PROBE_RATE} packet_budget {PREDICT_PACKET_BUDGET}"
+        );
         println!("The predict attempt 1 starts.");
         Self {
             spray: spray_for(hub, now),
             attempt: 1,
             resume_at: None,
+            stopped: false,
         }
     }
 
     fn drive(&mut self, hub: &Hub, socket: &UdpSocket, check: &[u8], now: Instant) {
+        if self.stopped {
+            return;
+        }
         if let Some(until) = self.resume_at {
             if now < until {
+                return;
+            }
+            if !predict_continues(self.attempt) {
+                self.stopped = true;
+                println!(
+                    "The predict budget is spent after {} attempts.",
+                    self.attempt
+                );
                 return;
             }
             self.spray = spray_for(hub, now);
@@ -1421,6 +1478,14 @@ impl PredictCycle {
             let sent = self.spray.sent();
             println!("The predict attempt ended after {sent} probes. The node uses the relay.");
             println!("predict_probes {sent}");
+            if !predict_continues(self.attempt) {
+                self.stopped = true;
+                println!(
+                    "The predict budget is spent after {} attempts.",
+                    self.attempt
+                );
+                return;
+            }
             let delay = retry_delay(self.attempt);
             println!(
                 "The predict attempt will retry after {} seconds.",

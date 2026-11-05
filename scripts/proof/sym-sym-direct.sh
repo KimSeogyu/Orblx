@@ -194,12 +194,12 @@ bring_routers() {
   dc up -d --force-recreate --no-deps router-c router-d >/dev/null
   rc="$(service_container router-c)"
   rd="$(service_container router-d)"
-  if [[ "$mode_c" == "sequential" || "$mode_c" == "portblock" ]]; then
+  if [[ "$mode_c" == "sequential" || "$mode_c" == "portblock" || "$mode_c" == "shift" ]]; then
     wait_log "$rc" "router nat ready ${mode_c}" 40
   else
     wait_log "$rc" "router mode ${mode_c}" 40
   fi
-  if [[ "$mode_d" == "sequential" || "$mode_d" == "portblock" ]]; then
+  if [[ "$mode_d" == "sequential" || "$mode_d" == "portblock" || "$mode_d" == "shift" ]]; then
     wait_log "$rd" "router nat ready ${mode_d}" 40
   else
     wait_log "$rd" "router mode ${mode_d}" 40
@@ -301,12 +301,15 @@ direct_ms = [v for v in (path_ms(a, "direct"), path_ms(b, "direct")) if v is not
 probe_n = probes(a) + probes(b)
 plans = [line for line in a + b if line.startswith("The punch plan is ")]
 allocs = [line for line in a + b if "port allocation is " in line]
+drops = [line for line in a + b if line.startswith("punch_drop ")]
+budgets = [line for line in a + b if line.startswith("predict_budget ")]
 
+# The node clock. path_up and first_packet use the same process start.
 first_ms = None
-for line in read(first_path):
-    m = re.match(r"\[([0-9.]+)\].*bytes from", line)
+for line in a:
+    m = re.match(r"first_packet relay ms (\d+)", line)
     if m:
-        first_ms = int((float(m.group(1)) - t0) * 1000)
+        first_ms = int(m.group(1))
         break
 
 times = []
@@ -322,7 +325,17 @@ if not any("packets transmitted" in line for line in switch_lines):
     print("switch_limits_ok false")
     sys.exit(1)
 if first_ms is None:
-    print("case %s has no first packet" % label)
+    print("case %s has no first relay packet" % label)
+    print("switch_limits_ok false")
+    sys.exit(1)
+node_direct = path_ms(a, "direct")
+node_relay = path_ms(a, "relay")
+if node_relay is None or first_ms < node_relay:
+    print("case %s first packet is before the relay path" % label)
+    print("switch_limits_ok false")
+    sys.exit(1)
+if node_direct is not None and first_ms > node_direct:
+    print("case %s first packet %s is after direct %s" % (label, first_ms, node_direct))
     print("switch_limits_ok false")
     sys.exit(1)
 lost = pings - len(seqs)
@@ -331,8 +344,8 @@ gap_ms = int(max(gaps) * 1000) if gaps else -1
 
 print("case %s expect %s relay_ms %s direct_ms %s first_packet_ms %s probes %d switch_lost %s/%s switch_gap_ms %s" % (
     label, expect,
-    min(relay_ms) if relay_ms else "none",
-    max(direct_ms) if direct_ms else "none",
+    node_relay if node_relay is not None else "none",
+    node_direct if node_direct is not None else "none",
     first_ms if first_ms is not None else "none",
     probe_n,
     lost if lost >= 0 else "none",
@@ -343,6 +356,30 @@ for line in plans:
     print("plan_log " + line)
 for line in allocs:
     print("alloc_log " + line)
+for line in drops:
+    print("drop_log " + line)
+for line in budgets:
+    print("budget_log " + line)
+if expect == "miss":
+    cap = None
+    for line in budgets:
+        parts = line.split()
+        # predict_budget attempts N packets_per_attempt M ...
+        try:
+            attempts = int(parts[2])
+            per = int(parts[4])
+        except (IndexError, ValueError):
+            continue
+        cap = attempts * per * 2
+        break
+    if cap is None:
+        print("case %s has no predict budget" % label)
+        print("switch_limits_ok false")
+        sys.exit(1)
+    if probe_n == 0 or probe_n > cap:
+        print("case %s probes %s outside 1..%s" % (label, probe_n, cap))
+        print("switch_limits_ok false")
+        sys.exit(1)
 if lost >= 0 and (lost > max_loss or (gap_ms >= 0 and gap_ms > 1000)):
     print("switch_limits_ok false")
     sys.exit(1)
@@ -387,17 +424,27 @@ run_case() {
   start_ping "$CA" "$IP_D"
   text_c="$(wait_path "$CA" any node-d 80)"
   text_d="$(wait_path "$CD" any node-c 80)"
-  if [[ "$expect" == "relay" ]]; then
-    local i kind
-    for i in $(seq 1 16); do
+  if [[ "$expect" == "relay" || "$expect" == "miss" ]]; then
+    local i kind tries=16
+    if [[ "$expect" == "miss" ]]; then
+      tries=160
+    fi
+    for i in $(seq 1 "$tries"); do
       kind="$(path_of "$(status_text "$CA")")"
       if [[ "$kind" == "direct" ]]; then
-        echo "The random pair moved to direct." >&2
+        echo "The ${expect} pair moved to direct." >&2
         FAIL=1
+        break
+      fi
+      if [[ "$expect" == "miss" ]] && as_root docker logs "$CA" 2>&1 | has_line '^The predict budget is spent after '; then
         break
       fi
       sleep 0.5
     done
+    if [[ "$expect" == "miss" ]] && ! as_root docker logs "$CA" 2>&1 | has_line '^The predict budget is spent after '; then
+      echo "The predict budget did not end." >&2
+      FAIL=1
+    fi
     text_c="$(status_text "$CA")"
     text_d="$(status_text "$CD")"
   elif [[ "$(path_of "$text_c")" != "direct" || "$(path_of "$text_d")" != "direct" ]]; then
@@ -420,7 +467,11 @@ run_case() {
     sleep 0.5
   done
   summarize_run "$label" "$expect" "$CA" "$CD" "$t0" || FAIL=1
-  if [[ "$path_c" != "$expect" || "$path_d" != "$expect" ]]; then
+  local want="$expect"
+  if [[ "$expect" == "miss" ]]; then
+    want=relay
+  fi
+  if [[ "$path_c" != "$want" || "$path_d" != "$want" ]]; then
     echo "Case ${label} path was ${path_c} ${path_d}." >&2
     FAIL=1
   fi
@@ -437,6 +488,15 @@ run_case() {
       echo "Case ${label} did not log relay-only." >&2
       FAIL=1
     fi
+  elif [[ "$expect" == "miss" ]]; then
+    if as_root docker logs "$CA" 2>&1 | has_line '^The hole punch reached'; then
+      echo "Case ${label} punched with the wrong prediction." >&2
+      FAIL=1
+    fi
+    if ! as_root docker logs "$CA" 2>&1 | has_line '^The punch plan is predict-spray\.'; then
+      echo "Case ${label} did not log predict-spray." >&2
+      FAIL=1
+    fi
   else
     if ! as_root docker logs "$CA" 2>&1 | has_line '^The punch plan is predict-spray\.'; then
       echo "Case ${label} did not log predict-spray." >&2
@@ -447,11 +507,51 @@ run_case() {
   stop_node "$CD"
 }
 
+show_foreign_punch() {
+  local rc session token
+  echo "=== [C] foreign punch ==="
+  stop_node "$CA"
+  stop_node "$CD"
+  bring_routers random random
+  start_nat node-c node-d
+  start_nat node-d node-c
+  wait_log "$CA" '^The punch plan is ' 40
+  session="$(as_root docker logs "$CA" 2>&1 | awk '!found && /^session / { print $2; found = 1 }')"
+  token="${session:0:16}"
+  if [[ ! "$token" =~ ^[0-9a-f]{16}$ ]]; then
+    echo "The session token is not known." >&2
+    FAIL=1
+    stop_node "$CA"
+    stop_node "$CD"
+    return
+  fi
+  rc="$(service_container router-c)"
+  as_root docker exec "$rc" python3 -c '
+import socket, sys
+token = bytes.fromhex(sys.argv[1])
+node = sys.argv[2]
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+bad = b"ORBLXPN1" + bytes([1]) + b"\x00" * 8
+good = b"ORBLXPN1" + bytes([1]) + token
+sock.sendto(bad, (node, 443))
+sock.sendto(good, (node, 443))
+print("foreign_punch_sent")
+' "$token" "${LAN}.23.10"
+  wait_log "$CA" '^punch_drop .* token$' 20
+  wait_log "$CA" '^punch_drop .* netmap$' 20
+  as_root docker logs "$CA" 2>&1 | awk '/^punch_drop / { print }'
+  stop_node "$CA"
+  stop_node "$CD"
+}
+
+show_foreign_punch
+
 for n in $(seq 1 "$RUNS"); do
   run_case random random relay "$n"
   run_case sequential random direct "$n"
   run_case sequential sequential direct "$n"
   run_case portblock random direct "$n"
+  run_case shift shift miss "$n"
 done
 
 echo "=== [C] retry after a blocked punch ==="

@@ -67,6 +67,21 @@ pub const RETRY_MIN: Duration = Duration::from_secs(2);
 /// The longest wait between predict attempts.
 pub const RETRY_MAX: Duration = Duration::from_secs(60);
 
+/// Predict attempts for one peer pair.
+///
+/// Attempt [`PREDICT_ATTEMPTS`] is the last. The node does not start another.
+pub const PREDICT_ATTEMPTS: u32 = 4;
+
+/// The most ports in one predict list.
+///
+/// A port-block window uses a radius of at most 256, so the list has at most 513 ports.
+pub const PREDICT_PORT_MAX: usize = 513;
+
+/// The most predict probes one node sends for one peer pair.
+///
+/// The product is [`PREDICT_ATTEMPTS`] times [`SPRAY_MAX`].
+pub const PREDICT_PACKET_BUDGET: u32 = PREDICT_ATTEMPTS * SPRAY_MAX;
+
 /// The hard side sends again on each socket after this time.
 pub const SOCKET_REFRESH: Duration = Duration::from_secs(2);
 
@@ -242,11 +257,12 @@ pub fn classify_ports(samples: &[u16]) -> PortAlloc {
 /// Random and unknown allocations spray nothing.
 #[must_use]
 pub fn predict_targets(alloc: PortAlloc) -> Vec<u16> {
-    match alloc {
+    let ports = match alloc {
         PortAlloc::Sequential { step, origin } => forward_ports(origin, step),
         PortAlloc::PortBlock { low, high } => cover_block(low, high),
         PortAlloc::Random | PortAlloc::Unknown => Vec::new(),
-    }
+    };
+    ports.into_iter().take(PREDICT_PORT_MAX).collect()
 }
 
 /// The wait before predict attempt `attempt`.
@@ -257,6 +273,14 @@ pub fn predict_targets(alloc: PortAlloc) -> Vec<u16> {
 pub fn retry_delay(attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(5);
     RETRY_MIN.saturating_mul(1_u32 << shift).min(RETRY_MAX)
+}
+
+/// Return true when attempt `completed` may be followed by another attempt.
+///
+/// `completed` is the attempt that just ended. Attempt numbers start at 1.
+#[must_use]
+pub fn predict_continues(completed: u32) -> bool {
+    completed < PREDICT_ATTEMPTS
 }
 
 /// Choose the punch plan.
@@ -538,10 +562,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        classify_ports, local_kind, peer_kind, predict_targets, predicted_ports, retry_delay,
-        strategy, strategy_for, MappingKind, PortAlloc, PredictSpray, RateGate, Spray, Strategy,
-        BIRTHDAY_WINDOW, PORT_BLOCK_RADIUS, PORT_MIN, PREDICT_COUNT, PROBE_BURST, PROBE_RATE,
-        RETRY_MAX, RETRY_MIN, SPRAY_MAX,
+        classify_ports, local_kind, peer_kind, predict_continues, predict_targets, predicted_ports,
+        retry_delay, strategy, strategy_for, MappingKind, PortAlloc, PredictSpray, RateGate, Spray,
+        Strategy, BIRTHDAY_WINDOW, PORT_BLOCK_RADIUS, PORT_BLOCK_SPAN, PORT_MIN, PREDICT_ATTEMPTS,
+        PREDICT_COUNT, PREDICT_PACKET_BUDGET, PREDICT_PORT_MAX, PROBE_BURST, PROBE_RATE, RETRY_MAX,
+        RETRY_MIN, SPRAY_MAX,
     };
 
     fn addr(text: &str) -> SocketAddr {
@@ -754,5 +779,44 @@ mod tests {
         assert_eq!(ports[1], 2_003);
         assert!(predicted_ports(&[]).is_empty());
         assert!(predicted_ports(&[65_530]).len() < PREDICT_COUNT as usize);
+    }
+
+    #[test]
+    fn the_predict_budget_caps_ports_packets_and_attempts() {
+        let wide = predict_targets(PortAlloc::PortBlock {
+            low: PORT_MIN,
+            high: PORT_MIN + PORT_BLOCK_SPAN,
+        });
+        assert!(!wide.is_empty());
+        assert!(wide.len() <= PREDICT_PORT_MAX);
+        let sequential = predict_targets(PortAlloc::Sequential {
+            step: 1,
+            origin: 4_000,
+        });
+        assert!(sequential.len() <= PREDICT_COUNT as usize);
+        assert!(sequential.len() <= PREDICT_PORT_MAX);
+        let start = Instant::now();
+        let ip = addr("198.51.100.8:1").ip();
+        let mut spray = PredictSpray::new(ip, sequential, start);
+        let mut now = start;
+        let mut sent = 0usize;
+        for _ in 0..20_000 {
+            let batch = spray.due(now);
+            sent += batch.len();
+            if spray.done(now) {
+                break;
+            }
+            now += Duration::from_millis(5);
+        }
+        assert!(spray.done(now));
+        assert_eq!(spray.sent(), SPRAY_MAX);
+        assert_eq!(sent, SPRAY_MAX as usize);
+        assert!(spray.due(now + Duration::from_secs(1)).is_empty());
+        assert_eq!(PREDICT_PACKET_BUDGET, PREDICT_ATTEMPTS * SPRAY_MAX);
+        assert!(predict_continues(1));
+        assert!(predict_continues(PREDICT_ATTEMPTS - 1));
+        assert!(!predict_continues(PREDICT_ATTEMPTS));
+        assert!(!predict_continues(PREDICT_ATTEMPTS + 3));
+        assert_eq!(PROBE_RATE, 200);
     }
 }
