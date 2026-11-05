@@ -112,6 +112,15 @@ owner() {
   dc run --rm --no-deps -T --entrypoint orblx owner "$@"
 }
 
+# enroll_id SERVICE NAME ID_TOKEN_FILE STATE
+# An OIDC ID token uses --id-token-file. A pre-auth key uses --token-file.
+enroll_id() {
+  local service="$1" name="$2" token_file="$3" state="$4"
+  owner_ip_enroll "$service" coord enroll --name "$name" --coord "$COORD" \
+    --bundle /coord-state/trust-bundle.pem --id-token-file "$token_file" \
+    --state "$state" --endpoint "${name}:443"
+}
+
 # enroll_node SERVICE NAME TOKEN_FILE STATE
 enroll_node() {
   local service="$1" name="$2" token_file="$3" state="$4"
@@ -188,7 +197,7 @@ COORD="${COORD}:443"
 echo "coord ${COORD}"
 
 echo "=== [C] gate 1: owner user enrolls ==="
-show_safe "$(enroll_node owner owner /tokens/owner "$STATE")"
+show_safe "$(enroll_id owner owner /tokens/owner "$STATE")"
 [[ "$(node_state owner)" == "approved" ]] || fail "the owner user is not approved"
 
 ADMIN=(--coord "$COORD" --state "$STATE" --bundle "$STATE/bundle.pem")
@@ -354,17 +363,33 @@ echo "audit preauth-create ${creates} preauth-use ${uses} preauth-revoke ${revok
 [[ "$uses" -eq 6 ]] || fail "preauth-use count is ${uses}"
 [[ "$creates" -eq 8 ]] || fail "preauth-create count is ${creates}"
 [[ "$revokes" -eq 1 ]] || fail "preauth-revoke count is ${revokes}"
-printf '%s\n' "$removes" | read_all grep -q '^ending$' || fail "no node-remove for ending"
-printf '%s\n' "$removes" | read_all grep -q '^quiet$' || fail "no node-remove for quiet"
-coord_file config-audit.jsonl | jq -r 'select(.action == "node-remove") | .detail' | read_all grep -q 'reason expiry' \
-  || fail "no expiry removal"
-coord_file config-audit.jsonl | jq -r 'select(.action == "node-remove") | .detail' | read_all grep -q 'reason grace' \
-  || fail "no grace removal"
-for reason in used expired revoked unknown tag grant life; do
-  coord_file config-audit.jsonl | jq -r --arg reason "$reason" \
-    'select(.action == "preauth-deny" and .detail == ("reason " + $reason)) | .action' \
-    | read_all grep -q preauth-deny || fail "no preauth-deny for ${reason}"
-done
+remove_eq() {
+  local target="$1" want="$2" got
+  got="$(coord_file config-audit.jsonl | jq -r --arg target "$target" \
+    'select(.action == "node-remove" and .target == $target) | .target' | wc -l)"
+  [[ "$got" -eq "$want" ]] || fail "node-remove ${target} count is ${got}, want ${want}"
+}
+deny_eq() {
+  local reason="$1" want="$2" got
+  got="$(coord_file config-audit.jsonl | jq -r --arg reason "$reason" \
+    'select(.action == "preauth-deny" and .detail == ("reason " + $reason)) | .action' | wc -l)"
+  [[ "$got" -eq "$want" ]] || fail "preauth-deny ${reason} count is ${got}, want ${want}"
+}
+remove_eq ending 1
+remove_eq quiet 1
+[[ "$(printf '%s\n' "$removes" | wc -l)" -eq 2 ]] || fail "node-remove count is not 2"
+coord_file config-audit.jsonl | jq -r 'select(.action == "node-remove" and .target == "ending") | .detail' \
+  | read_all grep -q 'reason expiry' || fail "ending removal is not expiry"
+coord_file config-audit.jsonl | jq -r 'select(.action == "node-remove" and .target == "quiet") | .detail' \
+  | read_all grep -q 'reason grace' || fail "quiet removal is not grace"
+# One record for each single gate. Two records where the script refuses twice.
+deny_eq used 2
+deny_eq expired 1
+deny_eq revoked 1
+deny_eq unknown 1
+deny_eq tag 2
+deny_eq grant 2
+deny_eq life 1
 owner admin audit --verify "${ADMIN[@]}" | read_all grep -q '^verify ok ' || fail "the audit chain check failed"
 scan="$(
   dc logs --no-log-prefix 2>&1 || true

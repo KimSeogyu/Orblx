@@ -58,8 +58,12 @@ These checks follow the token-no-escalation rule. A key cannot grant more than t
 ## Enroll
 
 `orblx coord enroll --token-file FILE` sends `preauth-enroll` when the file text starts with `orblx-pak1.`.
-A one-use enroll token (`ge1.`) still uses `enroll`.
+An OIDC ID token uses `--id-token-file`. A one-use enroll token (`ge1.`) still uses `--token-file` and `enroll`.
 The node is approved even when `nodeApproval` is on.
+The coordinator writes the use count and the `preauth-use` record before it enrolls the node.
+If either write fails, the enroll does not run. A one-use key cannot enroll a second node.
+The use lock is inside one coordinator process. One-use is atomic for one coordinator on one state directory.
+Two coordinator processes on the same state directory are outside this rule.
 The node SVID is the existing enroll SVID. The agent SVID is issued later by the existing grant fetch.
 The agent name on that grant must be the node name.
 
@@ -110,6 +114,10 @@ A create also writes the existing `enroll` record when the node enrolls.
 A pre-approved grant also writes `agent-grant` and `agent-approve`.
 A token scope miss stays `token-deny`. A tag, grant, or life miss is `preauth-deny` only.
 Deny reasons: `life`, `tag`, `grant`, `used`, `expired`, `revoked`, `unknown`.
+`create` writes one `preauth-deny` for an owner and for a token caller.
+Unknown keys share one `preauth-deny` record per second per state directory. Each call is still refused.
+An ephemeral removal retry does not add the SVID to the deny file a second time.
+A second pass writes no second `node-remove` record.
 
 ## Tests (REAL)
 
@@ -119,6 +127,10 @@ Deny reasons: `life`, `tag`, `grant`, `used`, `expired`, `revoked`, `unknown`.
 | `preauth::tests::a_tag_or_grant_outside_the_caller_is_refused` | Tag owner check, token cannot set a tag, grant needs `grants:write`, life bound |
 | `preauth::tests::an_ephemeral_node_is_removed_on_grace_and_on_expiry` | Grace 15 seconds, expiry, deny list contains the SVID, one `node-remove` each |
 | `preauth::tests::a_restart_resumes_grace_from_presence_json` | REAL. After a restart, grace resumes from the last `presence.json` write. It does not start again at zero |
+| `preauth::tests::one_use_key_enrolls_exactly_one_node_under_parallel_calls` | REAL. Eight parallel enrolls of one one-use key. Exactly one succeeds |
+| `preauth::tests::a_token_refusal_in_create_writes_one_deny` | REAL. A token caller refusal in `create` writes one `preauth-deny` |
+| `preauth::tests::unknown_key_denies_share_one_record_per_second` | REAL. Six unknown keys in one second write one `preauth-deny`. The next second writes one more |
+| `preauth::tests::an_ephemeral_removal_retry_does_not_duplicate_the_deny_entry` | REAL. A removal retry keeps one deny entry and one `node-remove` record |
 | `preauth::tests::a_grant_inside_the_ceiling_is_preapproved_and_a_wider_grant_is_refused` | Ceiling auto-approve, wider grant refused, fetch issues the existing agent SVID |
 | `policy::tests::a_preauth_tag_matches_the_tag_rule` | A node tag matches an ACL tag rule |
 | `admin::tests::preauth_create_writes_the_ask_and_keeps_the_key_out_of_the_command` | CLI ask JSON, life bound, list, revoke |
@@ -129,7 +141,9 @@ Deny reasons: `life`, `tag`, `grant`, `used`, `expired`, `revoked`, `unknown`.
 It builds a release binary because the gates have a time limit.
 It starts `orblx-test-idp`. The owner enrolls with an ID token.
 The script checks the gates in the header of that file.
-It does not print key text. It was not executed here.
+Gate 1 enrolls the owner with `--id-token-file`.
+Each deny reason and each ephemeral removal has an exact audit count.
+It does not print key text. It was not executed on this head.
 
 ## Open points
 

@@ -54,6 +54,11 @@ const FILE_VERSION: u32 = 1;
 
 static FILE_LOCK: Mutex<()> = Mutex::new(());
 static SEEN: Mutex<BTreeMap<(String, String), u64>> = Mutex::new(BTreeMap::new());
+/// Last time an unknown key wrote one `preauth-deny`, per state directory.
+static UNKNOWN_DENY_MS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+
+/// Unknown-key denials share one audit record inside this window.
+const UNKNOWN_DENY_WINDOW_MS: u64 = 1_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct KeyFile {
@@ -264,9 +269,7 @@ pub fn create(
 ) -> Result<Value, CoordError> {
     let creator = creator_of(coord, actor)?;
     if let Err(fail) = screen(coord, &creator, ask) {
-        if !actor.starts_with("api-token:") {
-            record_deny(coord, actor, "new", fail.reason(), now)?;
-        }
+        record_deny(coord, actor, "new", fail.reason(), now)?;
         return Err(CoordError::Protocol(fail.text().to_string()));
     }
     let now_ms = unix_ms(now)?;
@@ -437,7 +440,10 @@ pub fn revoke(
 
 /// Enroll one node with a pre-auth key.
 ///
-/// The node is pre-approved. The key use count grows by one after the enroll.
+/// The node is pre-approved. The use count and the `preauth-use` record are
+/// durable before the node enroll. If either write fails, the enroll does not
+/// run. A one-use key cannot enroll a second node after a failed enroll.
+/// The lock is process-local. One coordinator per state directory is atomic.
 pub fn enroll(
     coord: &Coordinator,
     name: &str,
@@ -459,7 +465,7 @@ pub fn enroll(
     {
         Some(index) => index,
         None => {
-            record_deny(coord, "preauth:unknown", "unknown", "unknown", now)?;
+            record_unknown_deny(coord, now)?;
             return Err(CoordError::Protocol(
                 "The pre-auth key is not valid.".to_string(),
             ));
@@ -485,19 +491,23 @@ pub fn enroll(
         auth_expires_unix_ms: key.expires_unix_ms,
         grant_bound: key.grant.clone(),
     };
-    let enrolled = coord.enroll_preauth_stamp(name, &id, endpoints, routes, stamp, now)?;
     file.keys[index].uses = file.keys[index].uses.saturating_add(1);
     let uses = file.keys[index].uses;
     let max_uses = file.keys[index].max_uses;
     write_file(&dir, &file)?;
-    coord.record_change(
+    if let Err(err) = coord.record_change(
         &format!("preauth:{id}"),
         ConfigAction::PreauthUse,
         &id,
         orblx_audit::EMPTY_DIGEST,
         orblx_audit::EMPTY_DIGEST,
         &format!("node {name} uses {uses} max {max_uses}"),
-    )?;
+    ) {
+        file.keys[index].uses = file.keys[index].uses.saturating_sub(1);
+        let _ = write_file(&dir, &file);
+        return Err(err);
+    }
+    let enrolled = coord.enroll_preauth_stamp(name, &id, endpoints, routes, stamp, now)?;
     drop(_guard);
     let _ = note_seen(coord, name, now);
     println!("preauth enroll {name} key {id}");
@@ -551,6 +561,23 @@ pub(crate) fn fit_grant(
             key_id: stored.preauth_id.clone(),
         })
     }
+}
+
+/// Write one unknown-key deny, or skip it when this directory wrote one recently.
+///
+/// The enroll is still refused. The audit log grows by at most one record
+/// per second per state directory.
+fn record_unknown_deny(coord: &Coordinator, now: SystemTime) -> Result<(), CoordError> {
+    let dir = coord.state_dir()?.to_string_lossy().to_string();
+    let now_ms = unix_ms(now)?;
+    let mut guard = UNKNOWN_DENY_MS.lock().map_err(|_| CoordError::State)?;
+    let last = guard.entry(dir).or_insert(0);
+    if *last != 0 && now_ms.saturating_sub(*last) < UNKNOWN_DENY_WINDOW_MS {
+        return Ok(());
+    }
+    *last = now_ms;
+    drop(guard);
+    record_deny(coord, "preauth:unknown", "unknown", "unknown", now)
 }
 
 /// Write one `preauth-deny` record. The record has no key text.
@@ -618,12 +645,11 @@ pub fn remove_due(coord: &Coordinator, now: SystemTime) -> Result<usize, CoordEr
         let reason = if expired { "expiry" } else { "grace" };
         let node_id = SpiffeId::node(&node.name)?;
         let agents = crate::agent::issued_agent_names(coord, &node.name)?;
-        let revoked = crate::agent::revoke_principal(coord, &node_id, now)?;
-        let mut version = revoked.deny_version;
+        let (mut version, mut uris) = deny_snapshot(coord, now)?;
+        version = revoke_once(coord, &node_id, &mut uris, version, now)?;
         for agent in agents {
             let id = SpiffeId::agent(&agent)?;
-            let done = crate::agent::revoke_principal(coord, &id, now)?;
-            version = done.deny_version;
+            version = revoke_once(coord, &id, &mut uris, version, now)?;
         }
         coord.mark_removed(&node.name)?;
         let actor = coord.coord_actor()?;
@@ -642,6 +668,41 @@ pub fn remove_due(coord: &Coordinator, now: SystemTime) -> Result<usize, CoordEr
         count += 1;
     }
     Ok(count)
+}
+
+fn deny_snapshot(coord: &Coordinator, now: SystemTime) -> Result<(u64, Vec<String>), CoordError> {
+    let text = crate::admin::deny_json(coord, now)?;
+    let value: Value = serde_json::from_str(&text).map_err(|_| CoordError::State)?;
+    let version = value.get("version").and_then(Value::as_u64).unwrap_or(0);
+    let uris = value
+        .get("revoked_uris")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((version, uris))
+}
+
+/// Revoke `id` once. A later retry does not add the URI again.
+fn revoke_once(
+    coord: &Coordinator,
+    id: &SpiffeId,
+    uris: &mut Vec<String>,
+    version: u64,
+    now: SystemTime,
+) -> Result<u64, CoordError> {
+    let uri = id.as_uri().to_string();
+    if uris.iter().any(|item| item == &uri) {
+        return Ok(version);
+    }
+    let revoked = crate::agent::revoke_principal(coord, id, now)?;
+    uris.push(uri);
+    Ok(revoked.deny_version)
 }
 
 fn seen_ms(dir: &Path, name: &str, file: &BTreeMap<String, u64>) -> Option<u64> {
@@ -747,7 +808,7 @@ mod tests {
 
     use super::{
         create, enroll, fit_grant, list, remove_due, revoke, screen, CreateAsk, Creator, Fit,
-        GrantAsk, PREAUTH_FILE, PREAUTH_PREFIX,
+        GrantAsk, PREAUTH_FILE, PREAUTH_PREFIX, UNKNOWN_DENY_WINDOW_MS,
     };
     use crate::agent::{fetch, request, Fetched};
     use crate::proto::GrantAsk as AgentAsk;
@@ -1205,5 +1266,188 @@ mod tests {
         assert!(lines
             .iter()
             .any(|line| line["action"].as_str() == Some("agent-approve")));
+    }
+
+    #[test]
+    fn one_use_key_enrolls_exactly_one_node_under_parallel_calls() {
+        let dir = scratch("race");
+        let coord = open_coord(&dir.0);
+        let start = SystemTime::now();
+        let made = create(
+            &coord,
+            &ask_base(),
+            "spiffe://orblx.local/node/owner",
+            start,
+        )
+        .unwrap();
+        let secret = key_text(&made);
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let coord = coord.clone();
+            let secret = secret.clone();
+            handles.push(std::thread::spawn(move || {
+                enroll(
+                    &coord,
+                    &format!("n{index}"),
+                    &secret,
+                    &[format!("n{index}:443")],
+                    &[],
+                    start,
+                )
+                .is_ok()
+            }));
+        }
+        let wins = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(wins, 1);
+        let listed = list(&coord, start).unwrap();
+        assert_eq!(listed["keys"][0]["uses"], 1);
+        let lines = audit_lines(&coord);
+        assert_eq!(count_action(&lines, "preauth-use"), 1);
+        assert_eq!(count_action(&lines, "preauth-deny"), 7);
+        let joined = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains(PREAUTH_PREFIX));
+    }
+
+    #[test]
+    fn a_token_refusal_in_create_writes_one_deny() {
+        let dir = scratch("tokdeny");
+        let coord = open_coord(&dir.0);
+        let start = SystemTime::now();
+        let token = crate::apitoken::create(
+            &coord,
+            &crate::apitoken::CreateAsk {
+                scopes: vec!["nodes:write".to_string()],
+                ttl_secs: 60,
+            },
+            "spiffe://orblx.local/node/owner",
+            start,
+        )
+        .unwrap();
+        let mut ask = ask_base();
+        ask.tags = vec!["tag:bot".to_string()];
+        let err = create(&coord, &ask, &format!("api-token:{}", token.id), start).unwrap_err();
+        assert!(err.to_string().contains("outside the caller rights"));
+        let lines = audit_lines(&coord);
+        let denies = lines
+            .iter()
+            .filter(|line| {
+                line["action"].as_str() == Some("preauth-deny")
+                    && line["detail"].as_str() == Some("reason tag")
+            })
+            .count();
+        assert_eq!(denies, 1);
+        let joined = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains(PREAUTH_PREFIX));
+    }
+
+    #[test]
+    fn unknown_key_denies_share_one_record_per_second() {
+        let dir = scratch("unknown");
+        let coord = open_coord(&dir.0);
+        let start = SystemTime::now();
+        let bad = format!("{PREAUTH_PREFIX}not-a-real-key");
+        for index in 0..6 {
+            let err = enroll(
+                &coord,
+                &format!("u{index}"),
+                &bad,
+                &["u:443".to_string()],
+                &[],
+                start,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("not valid"));
+        }
+        let lines = audit_lines(&coord);
+        assert_eq!(count_action(&lines, "preauth-deny"), 1);
+        let err = enroll(
+            &coord,
+            "later",
+            &bad,
+            &["later:443".to_string()],
+            &[],
+            later(start, UNKNOWN_DENY_WINDOW_MS),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not valid"));
+        let lines = audit_lines(&coord);
+        assert_eq!(count_action(&lines, "preauth-deny"), 2);
+        let joined = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains(PREAUTH_PREFIX));
+    }
+
+    #[test]
+    fn an_ephemeral_removal_retry_does_not_duplicate_the_deny_entry() {
+        let dir = scratch("retry");
+        let coord = open_coord(&dir.0);
+        let start = SystemTime::now();
+        let mut ask = ask_base();
+        ask.ephemeral = true;
+        ask.ttl_secs = 3600;
+        let made = create(&coord, &ask, "spiffe://orblx.local/node/owner", start).unwrap();
+        enroll(
+            &coord,
+            "quiet",
+            &key_text(&made),
+            &["quiet:443".to_string()],
+            &[],
+            start,
+        )
+        .unwrap();
+        let due = later(start, 15_000);
+        let id = SpiffeId::node("quiet").unwrap();
+        crate::agent::revoke_principal(&coord, &id, due).unwrap();
+        let before = crate::admin::deny_json(&coord, due).unwrap();
+        let svid = coord
+            .node_list()
+            .unwrap()
+            .iter()
+            .find(|node| node.name == "quiet")
+            .unwrap()
+            .svid
+            .clone();
+        assert_eq!(before.matches(&format!("\"{svid}\"")).count(), 1);
+        assert_eq!(remove_due(&coord, due).unwrap(), 1);
+        let after = crate::admin::deny_json(&coord, due).unwrap();
+        assert_eq!(after.matches(&format!("\"{svid}\"")).count(), 1);
+        assert_eq!(
+            before
+                .split("\"version\":")
+                .nth(1)
+                .unwrap()
+                .split(',')
+                .next()
+                .unwrap()
+                .trim(),
+            after
+                .split("\"version\":")
+                .nth(1)
+                .unwrap()
+                .split(',')
+                .next()
+                .unwrap()
+                .trim()
+        );
+        assert_eq!(remove_due(&coord, due).unwrap(), 0);
+        let lines = audit_lines(&coord);
+        assert_eq!(count_action(&lines, "node-remove"), 1);
+        let final_deny = crate::admin::deny_json(&coord, due).unwrap();
+        assert_eq!(final_deny.matches(&format!("\"{svid}\"")).count(), 1);
     }
 }
