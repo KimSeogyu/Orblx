@@ -97,11 +97,12 @@ open_legacy_forward() {
 
 build_image() {
   local image_dir
-  cargo build -p orblx-cli --bin orblx -p orblx-test-idp --bin orblx-test-idp --locked
+  echo "rustc_version $(rustc -V)"
+  cargo build --release -p orblx-cli --bin orblx -p orblx-test-idp --bin orblx-test-idp --locked
   # shellcheck source=stage-image.sh
   source "$ROOT/scripts/proof/stage-image.sh"
-  image_dir="$(stage_proof_image "$ROOT" "$TARGET_DIR/debug/orblx")"
-  cp "$TARGET_DIR/debug/orblx-test-idp" "$image_dir/orblx-test-idp"
+  image_dir="$(stage_proof_image "$ROOT" "$TARGET_DIR/release/orblx")"
+  cp "$TARGET_DIR/release/orblx-test-idp" "$image_dir/orblx-test-idp"
   printf '%s\n' 'COPY orblx-test-idp /usr/local/bin/orblx-test-idp' >>"$image_dir/Dockerfile"
   as_root docker build -q -t orblx-w25a-share:w25 "$image_dir" >/dev/null
   rm -rf "$image_dir"

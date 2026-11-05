@@ -22,7 +22,7 @@
 # Environment:
 #   SIEM_PROJECT    Compose project name (default orblx-w25m-siem).
 #   SIEM_IMAGE      Image tag (default orblx-w25m-siem:local).
-#   SIEM_BIN        An orblx binary to use. Without it, the script builds target/debug/orblx.
+#   SIEM_BIN        An orblx binary to use. Without it, the script builds target/release/orblx.
 #   SIEM_EVENTS     The events in gate 1 (default 1000).
 #   SIEM_DOWN_SECS  The sink down time in gate 3 (default 60).
 #   SIEM_BENCH_N    The admin calls for each mode in gate 3 (default 40).
@@ -311,8 +311,9 @@ echo "commit $(git rev-parse HEAD)"
 echo "=== [C] build image ${SIEM_IMAGE} (project ${SIEM_PROJECT}) ==="
 bin="${SIEM_BIN:-}"
 if [[ -z "$bin" ]]; then
-  cargo build -p orblx-cli --bin orblx --locked
-  bin="$ROOT/target/debug/orblx"
+  echo "rustc_version $(rustc -V)"
+  cargo build --release -p orblx-cli --bin orblx --locked
+  bin="$ROOT/target/release/orblx"
 fi
 [[ -x "$bin" ]] || fail "the orblx binary $bin is missing"
 # shellcheck source=stage-image.sh

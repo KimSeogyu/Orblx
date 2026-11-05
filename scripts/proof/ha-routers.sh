@@ -340,7 +340,8 @@ open_legacy_forward
 
 echo "=== [C] build image ==="
 BIN="$ROOT/target/release/orblx"
-cargo build -q --release -p orblx-cli --bin orblx
+echo "rustc_version $(rustc -V)"
+cargo build --release -p orblx-cli --bin orblx
 # shellcheck source=stage-image.sh
 source "$ROOT/scripts/proof/stage-image.sh"
 image_dir="$(stage_proof_image "$ROOT" "$BIN")"
