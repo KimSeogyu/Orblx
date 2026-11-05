@@ -185,6 +185,8 @@ wait_ca() {
   return 1
 }
 
+# Use this only before the idp server starts.
+# A later `docker compose run idp` asks for 172.30.18.9 again.
 idp() {
   dc run --rm --no-deps --entrypoint orblx-test-idp idp "$@"
 }
@@ -460,8 +462,9 @@ dc up -d idp
 wait_log idp "idp serve"
 dc up -d coord
 wait_bundle
-idp mint --dir /idp --kid rs1 --issuer "$ISSUER" --aud "$CLIENT" --out /tokens/probe \
-  --sub probe --email probe@example.test >/dev/null
+# The idp server already holds 172.30.18.9. exec does not ask for that address.
+dc exec -T idp orblx-test-idp mint --dir /idp --kid rs1 --issuer "$ISSUER" --aud "$CLIENT" \
+  --out /tokens/probe --sub probe --email probe@example.test >/dev/null
 echo "id token probe written"
 
 for name in owner b; do
