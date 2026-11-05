@@ -156,8 +156,8 @@ proof_lock_holder() {
 proof_lock_note_killed_holder() {
   local file="$1" prev_pid prev_label
   [[ -s "${file}.holder" ]] || return 0
-  prev_pid="$(sed -n 's/^pid=//p' "${file}.holder" 2>/dev/null | head -n1)"
-  prev_label="$(sed -n 's/^label=//p' "${file}.holder" 2>/dev/null | head -n1)"
+  prev_pid="$(sed -n 's/^pid=//p' "${file}.holder" 2>/dev/null)"
+  prev_label="$(sed -n 's/^label=//p' "${file}.holder" 2>/dev/null)"
   [[ "$prev_pid" =~ ^[0-9]+$ ]] || return 0
   # A live process still owns the record until it releases; do not clear it.
   if kill -0 "$prev_pid" 2>/dev/null; then
