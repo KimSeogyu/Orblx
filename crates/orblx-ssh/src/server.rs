@@ -10,7 +10,8 @@
 //!
 //! The only login method is a user certificate from the coordinator SSH user CA (W25-31).
 //! The server refuses each password login, also an SVID proof or a ticket as the password.
-//! A shell or a command needs a certificate admission and a netmap that is at most 60 s old.
+//! A new shell or a command needs a certificate admission and a netmap that is at most 60 s old.
+//! An open shell stays up when that stamp only ages. The deny check still stops it.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -35,7 +36,7 @@ use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use tokio::net::TcpListener;
 
 use crate::auth::{command_ok, overlay_listen_addr, RefusedLogin};
-use crate::cert::{check_cert, fresh_netmap, CertInput, CertRefuse};
+use crate::cert::{check_cert, fresh_netmap, verified_netmap, CertInput, CertRefuse};
 use crate::hostkey::host_key_from_seed;
 use crate::pty::{kill_group, PtyShell, PtySpec};
 use crate::record::{Recorder, Utf8Carry};
@@ -691,7 +692,9 @@ impl SshHandler {
             }
             if Instant::now() >= next_check {
                 next_check += period;
-                if recheck(&self.shared, admitted).is_err() {
+                // Age of a verified netmap does not end the shell. A new shell
+                // still uses `recheck`. The deny list and the policy still do.
+                if recheck_open_shell(&self.shared, admitted).is_err() {
                     live.fail(orblx_audit::DenyReason::Revoked);
                 }
             }
@@ -870,10 +873,28 @@ fn recheck(shared: &Shared, admitted: &Admitted) -> Result<(), RefusedLogin> {
     recheck_at(shared, admitted, unix_now_ms())
 }
 
-/// Check one admitted session again: the netmap age (each session), the deny file, the
-/// revoked serial, and the policy.
+/// Recheck an open shell.
+///
+/// A new shell still needs a netmap that is at most 60 s old (`recheck_at`).
+/// An open shell stays up when the signed stamp is only old or ahead. The
+/// coordinator can be down and the shell keeps the mesh session. A netmap
+/// that does not verify still ends the shell. The deny list and the policy
+/// still end the shell.
+fn recheck_open_shell(shared: &Shared, admitted: &Admitted) -> Result<(), RefusedLogin> {
+    if let Err(refused) = verified_netmap(&shared.state_dir) {
+        return Err(RefusedLogin {
+            peer: admitted.src.clone(),
+            reason: refused.audit_reason(),
+            ticket_hash: admitted.ticket_hash,
+        });
+    }
+    recheck_rules(shared, admitted)
+}
+
+/// Check one admitted session again: the netmap age (a new shell or command),
+/// the deny file, the revoked serial, and the policy.
 fn recheck_at(shared: &Shared, admitted: &Admitted, now_ms: u64) -> Result<(), RefusedLogin> {
-    // R3: each session needs a netmap that is at most 60 s old, not only a new login.
+    // R3: a new shell or command needs a netmap that is at most 60 s old.
     if let Err(refused) = fresh_netmap(&shared.state_dir, now_ms) {
         return Err(RefusedLogin {
             peer: admitted.src.clone(),
@@ -881,6 +902,11 @@ fn recheck_at(shared: &Shared, admitted: &Admitted, now_ms: u64) -> Result<(), R
             ticket_hash: admitted.ticket_hash,
         });
     }
+    recheck_rules(shared, admitted)
+}
+
+/// The deny list and the policy for one admitted session.
+fn recheck_rules(shared: &Shared, admitted: &Admitted) -> Result<(), RefusedLogin> {
     let policy = load_policy(&shared.state_dir.join("policy.hujson"));
     let deny = shared.reload_deny("The SSH server refuses the session check.");
     if deny.reject_uri(&shared.node_id).is_err() {
@@ -1514,6 +1540,65 @@ mod tests {
         testkit::write_netmap(&dir, &ca_lines, &[], now);
         let ok = session_within(request).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&ok.stdout), "alice\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An open shell stays up when the signed netmap only ages.
+    ///
+    /// A new shell still refuses that stamp. The deny list still stops the
+    /// open shell. A netmap that does not verify still stops it.
+    #[test]
+    fn an_open_shell_stays_up_when_the_netmap_only_ages() {
+        use crate::cert::testkit;
+        let dir = recording_fixture("open-age");
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ca = testkit::key(22);
+        testkit::write_netmap_at(&dir, &[testkit::ca_line(&ca)], &[], (now - 120) * 1000);
+        let shared = Shared::load(&dir, Ipv4Addr::LOCALHOST).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let admitted = super::Admitted {
+            src: SpiffeId::user("alice").unwrap(),
+            user: "alice".to_string(),
+            check_period: 30,
+            ticket_hash: [0u8; 16],
+            frame: 1,
+            recording: false,
+            cert: Some(super::CertSession {
+                client_node: SpiffeId::node("laptop").unwrap(),
+                stop,
+                pty: true,
+            }),
+        };
+        let now_ms = now * 1000;
+        assert!(
+            super::session_gate(&shared, &admitted, now_ms).is_err(),
+            "a new shell still needs a fresh netmap"
+        );
+        assert!(
+            super::recheck_open_shell(&shared, &admitted).is_ok(),
+            "an open shell stays up when the stamp is only old"
+        );
+        testkit::write_netmap_at(&dir, &[testkit::ca_line(&ca)], &[], (now + 120) * 1000);
+        assert!(super::session_gate(&shared, &admitted, now_ms).is_err());
+        assert!(super::recheck_open_shell(&shared, &admitted).is_ok());
+        std::fs::write(
+            dir.join("deny.json"),
+            r#"{"version":1,"generated_at":1,"revoked_uris":["spiffe://orblx.local/user/alice"],"revoked_ticket_nonces":[]}"#,
+        )
+        .unwrap();
+        assert!(
+            super::recheck_open_shell(&shared, &admitted).is_err(),
+            "the deny list still stops the open shell"
+        );
+        std::fs::write(dir.join("deny.json"), W25_38_VALID).unwrap();
+        std::fs::write(dir.join("netmap.signed.json"), b"not a netmap").unwrap();
+        assert!(
+            super::recheck_open_shell(&shared, &admitted).is_err(),
+            "a netmap that does not verify still stops the open shell"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

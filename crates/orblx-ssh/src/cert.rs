@@ -281,6 +281,16 @@ pub fn fresh_netmap(state_dir: &std::path::Path, now_ms: u64) -> Result<Netmap, 
     Ok(signed.netmap)
 }
 
+/// Read a signed netmap for an open shell, without the 60 s age check.
+///
+/// A new shell uses [`fresh_netmap`]. An open shell stays up when the stamp is
+/// only old or ahead. A file that does not verify still fails.
+pub fn verified_netmap(state_dir: &std::path::Path) -> Result<Netmap, CertRefuse> {
+    orblx_coord::read_verified_netmap(state_dir)
+        .map(|signed| signed.netmap)
+        .map_err(|_| CertRefuse::StaleNetmap)
+}
+
 /// Refuse a caller that is not root (W25-31).
 ///
 /// The node SVID key signs the certificate request. Only root may use it. Thus a local user on
