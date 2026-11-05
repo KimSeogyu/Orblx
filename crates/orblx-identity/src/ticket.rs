@@ -7,7 +7,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
-use crate::clock::{in_window, unix_time, whole_seconds, MAX_AGENT_TTL};
+use crate::clock::{ticket_in_window, unix_time, whole_seconds, MAX_AGENT_TTL};
 use crate::codec::{ed25519_raw_from_spki, ed25519_spki, encode_hex, pem_blocks, pem_encode};
 use crate::deny::DenySet;
 use crate::error::IdentityError;
@@ -317,7 +317,7 @@ pub fn verify_ticket(
         .map_err(|_| IdentityError::Signature)?;
     let parsed = decode_body(body)?;
     let now_unix = unix_time(now)?;
-    in_window(now_unix, parsed.not_before, parsed.expires)?;
+    ticket_in_window(now_unix, parsed.not_before, parsed.expires)?;
     deny.reject_nonce(&parsed.nonce)?;
     Ok(VerifiedTicket {
         issuer: parsed.issuer,

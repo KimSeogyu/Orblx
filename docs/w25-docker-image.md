@@ -101,7 +101,7 @@ Limits:
 
 Script: `scripts/proof/docker-image.sh`. Run it as root, or as a user that can use `sudo -n docker`.
 The script uses the names `orblx-w25h-dimg-*` (containers, volumes, one network).
-It runs the coordinator from the same image with `ORBLX_SVID_TTL=60`.
+It runs the coordinator from the same image with `ORBLX_SVID_TTL=180` (W25-45: the coordinator refuses a value under 180 s; the result in row 4 is from the earlier run with 60 s).
 It does not print enroll tokens, keys, or certificates.
 
 Log: `/workspace/orblx-w18-proof/w25-h-docker-image-631f41cc.log` (branch commit `631f41c`, with main `372138c`).
