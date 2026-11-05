@@ -16,6 +16,8 @@ Marks: **[C]** = shown in a container. **REAL** = shown on the real Linux host o
 
 ## Steps
 
+After each tag, bump to the next -dev version on main (`docs/release-version.md`, W25-44).
+
 1. PR #67 sets the workspace version to `0.1.0-rc.2` and the default tag of `scripts/proof/release-real.sh` to `v0.1.0-rc.2`.
    PR CI run 41024281783 passed on Linux and macOS. The PR merged on 2026-10-30 at 17:14 KST.
 2. Main CI run 41025091764 on `b9cae9c` passed on Linux and macOS.
