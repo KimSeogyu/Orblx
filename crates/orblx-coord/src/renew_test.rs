@@ -901,7 +901,7 @@ async fn a_peer_that_enrolls_later_is_reachable_in_two_seconds() {
     }
 }
 
-/// W25-34: the policy sync can write a new netmap file after `orblx up` read the start
+/// W25-43: the policy sync can write a new netmap file after `orblx up` read the start
 /// netmap and before the netmap watcher started. The watcher must apply that file.
 ///
 /// Node a reads its start netmap with no peer. Then b enrolls, and the new netmap of a, with

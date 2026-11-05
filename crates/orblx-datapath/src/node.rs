@@ -159,7 +159,7 @@ pub struct NodeRequest {
     pub relay: Option<SocketAddr>,
     /// The netmap file. The node reads it again when the file changes.
     pub netmap_path: PathBuf,
-    /// The bytes of `netmap_path` that gave `netmap` (W25-34).
+    /// The bytes of `netmap_path` that gave `netmap` (W25-43).
     ///
     /// The netmap watcher compares the file with these bytes, so a file that changed after
     /// the caller read it and before the watcher started is applied. `None`: the watcher
@@ -1242,7 +1242,7 @@ struct PeerWatch {
 /// A peer that leaves the netmap loses its routes. The deny list and the node lock
 /// stop its sessions, as before.
 async fn watch_netmap_peers(watch: PeerWatch) {
-    // W25-34: `orblx up --coord` can write a new file after it read the start netmap and
+    // W25-43: `orblx up --coord` can write a new file after it read the start netmap and
     // before this task starts. The start text is the text of the start netmap, so that
     // change is applied at the first tick.
     let mut last = watch
