@@ -10,6 +10,7 @@ release owner copies the lines into the GitHub release.
 ## Known issues in v0.1.0-rc.1 and v0.1.0-rc.2
 
 - SSH logins can fail after the node certificate renews (W25-40). Fixed in rc.3.
+- rc.1/rc.2 SSH login has no netmap age check and no cert serial; a node removed from the netmap but not on the deny list can still log in until its SVID expires. Upgrade to rc.3.
 
 ## Known issues in v0.1.0-rc.2
 
