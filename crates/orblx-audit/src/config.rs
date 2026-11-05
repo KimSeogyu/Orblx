@@ -110,6 +110,10 @@ pub enum ConfigAction {
     NodeRemove,
     /// A client moved an HA subnet route to another router (W25-10).
     RouteFailover,
+    /// An owner changed the admin role of one user.
+    RoleSet,
+    /// The admin API refused one call because the caller role does not allow it.
+    RoleDeny,
     /// An owner or a scoped token created a pre-auth key.
     PreauthCreate,
     /// A pre-auth key enrolled one node.
@@ -126,7 +130,7 @@ impl ConfigAction {
     pub const RESERVED_CODES: [u8; 0] = [];
 
     /// Every action in code order.
-    pub const ALL: [Self; 42] = [
+    pub const ALL: [Self; 44] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -165,6 +169,8 @@ impl ConfigAction {
         Self::UserReject,
         Self::NodeRemove,
         Self::RouteFailover,
+        Self::RoleSet,
+        Self::RoleDeny,
         Self::PreauthCreate,
         Self::PreauthUse,
         Self::PreauthDeny,
@@ -213,6 +219,8 @@ impl ConfigAction {
             Self::UserReject => "user-reject",
             Self::NodeRemove => "node-remove",
             Self::RouteFailover => "route-failover",
+            Self::RoleSet => "role-set",
+            Self::RoleDeny => "role-deny",
             Self::PreauthCreate => "preauth-create",
             Self::PreauthUse => "preauth-use",
             Self::PreauthDeny => "preauth-deny",
@@ -268,10 +276,12 @@ impl ConfigAction {
             Self::UserReject => 36,
             Self::NodeRemove => 37,
             Self::RouteFailover => 38,
-            Self::PreauthCreate => 39,
-            Self::PreauthUse => 40,
-            Self::PreauthDeny => 41,
-            Self::PreauthRevoke => 42,
+            Self::RoleSet => 39,
+            Self::RoleDeny => 40,
+            Self::PreauthCreate => 41,
+            Self::PreauthUse => 42,
+            Self::PreauthDeny => 43,
+            Self::PreauthRevoke => 44,
         }
     }
 

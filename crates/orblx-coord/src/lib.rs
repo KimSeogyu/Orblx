@@ -29,6 +29,7 @@ pub mod nodelock;
 mod proto;
 #[cfg(test)]
 mod renew_test;
+mod roles;
 mod server;
 mod share;
 #[cfg(test)]
@@ -67,6 +68,7 @@ pub use netmap::{
 };
 pub use preauth::{MAX_PREAUTH_TTL_SECS, PREAUTH_PREFIX};
 pub use proto::GrantAsk;
+pub use roles::{parse_admin_role, Role};
 pub use server::serve_blocking;
 pub use state::{
     oidc_config, read_node_material, Coordinator, EnrollResult, IssuerFetch, NetmapView,

@@ -812,6 +812,7 @@ mod tests {
     };
     use crate::agent::{fetch, request, Fetched};
     use crate::proto::GrantAsk as AgentAsk;
+    use crate::roles::Role;
     use crate::{Coordinator, OidcConfig};
 
     struct Scratch(PathBuf);
@@ -1328,6 +1329,7 @@ mod tests {
                 ttl_secs: 60,
             },
             "spiffe://orblx.local/node/owner",
+            Role::Owner,
             start,
         )
         .unwrap();

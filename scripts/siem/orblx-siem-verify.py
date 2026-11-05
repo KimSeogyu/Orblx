@@ -39,7 +39,7 @@ ACTIONS = [
     "lock-sign", "lock-rotate", "lock-remove", "file-receive", "file-deny",
     "token-create", "token-use", "token-deny", "token-revoke", "share",
     "unshare", "packet-deny", "unrevoke", "sink-error", "user-approve",
-    "user-reject", "node-remove", "route-failover",
+    "user-reject", "node-remove", "route-failover", "role-set", "role-deny",
     "preauth-create", "preauth-use", "preauth-deny", "preauth-revoke",
 ]
 

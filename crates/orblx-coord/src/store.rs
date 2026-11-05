@@ -22,6 +22,10 @@ const MAX_USERS: usize = 4096;
 const MAX_PENDING: usize = 256;
 const MAX_EMAIL: usize = 254;
 
+fn member_role() -> String {
+    "member".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiskStore {
     version: u32,
@@ -67,6 +71,9 @@ struct UserRecord {
     first_unix: u64,
     #[serde(default)]
     changed_unix: u64,
+    /// The admin role. A store from before admin roles has no field. The role is then member.
+    #[serde(default = "member_role")]
+    role: String,
     /// The store migration approved this user and the config chain has no record yet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     migration_unrecorded: bool,
@@ -77,6 +84,8 @@ struct UserRecord {
 pub struct StoredUser {
     pub user: String,
     pub state: UserState,
+    /// `owner`, `admin`, `network-admin`, `it-admin`, `auditor`, or `member`.
+    pub role: String,
     pub email: Option<String>,
     pub first_unix: u64,
     pub changed_unix: u64,
@@ -254,6 +263,7 @@ impl NodeStore {
                 email: None,
                 first_unix: node.enrolled_unix,
                 changed_unix: node.enrolled_unix,
+                role: member_role(),
                 migration_unrecorded: true,
             });
         }
@@ -269,6 +279,7 @@ impl NodeStore {
             .map(|user| StoredUser {
                 user: user.user.clone(),
                 state: user.state,
+                role: user.role.clone(),
                 email: user.email.clone(),
                 first_unix: user.first_unix,
                 changed_unix: user.changed_unix,
@@ -313,6 +324,7 @@ impl NodeStore {
                 .map(str::to_string),
             first_unix: now_unix,
             changed_unix: now_unix,
+            role: member_role(),
             migration_unrecorded: false,
         });
         self.persist()?;
@@ -328,17 +340,34 @@ impl NodeStore {
     }
 
     /// Set the state of one OIDC user. A new user gets a record.
+    ///
+    /// `role` sets the admin role when it is `Some`. A new user with `None` is `member`.
+    /// An existing user with `None` keeps the current role.
     pub fn set_user_state(
         &mut self,
         user: &str,
         state: UserState,
+        role: Option<&str>,
         now: SystemTime,
     ) -> Result<(), CoordError> {
         check_user(user)?;
+        if let Some(role) = role {
+            if role.is_empty()
+                || role.len() > 32
+                || !role
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+            {
+                return Err(CoordError::Protocol("The role is not valid.".to_string()));
+            }
+        }
         let now_unix = unix_now(now)?;
         let list = self.disk.users.get_or_insert_with(Vec::new);
         if let Some(stored) = list.iter_mut().find(|stored| stored.user == user) {
             stored.state = state;
+            if let Some(role) = role {
+                stored.role = role.to_string();
+            }
             stored.changed_unix = now_unix;
             stored.migration_unrecorded = false;
         } else {
@@ -353,6 +382,7 @@ impl NodeStore {
                 email: None,
                 first_unix: now_unix,
                 changed_unix: now_unix,
+                role: role.unwrap_or("member").to_string(),
                 migration_unrecorded: false,
             });
         }

@@ -47,6 +47,7 @@ The caller is an owner SVID, or a scoped API token.
 | `preauth-create` | `nodes:write` |
 | `preauth-revoke` | `nodes:write` |
 
+The role table uses the same roles as a node read for `preauth-list`, and the same roles as a node approve for `preauth-create` and `preauth-revoke`.
 A grant ceiling also needs `grants:write` on a token. An owner SVID does not need that scope.
 A token cannot set a tag. A tag is allowed only when the caller SVID owns that tag in `tagOwners`.
 The tag must exist in the policy. The key can hold at most 8 tags.
@@ -104,11 +105,13 @@ Tag route `autoApprovers` and exit nodes are follow-up issue https://github.com/
 
 | Event | Action | Code |
 | --- | --- | --- |
-| Create | `preauth-create` | 39 |
-| Use (enroll) | `preauth-use` | 40 |
-| Deny | `preauth-deny` | 41 |
-| Revoke | `preauth-revoke` | 42 |
+| Create | `preauth-create` | 41 |
+| Use (enroll) | `preauth-use` | 42 |
+| Deny | `preauth-deny` | 43 |
+| Revoke | `preauth-revoke` | 44 |
 | Ephemeral removal | `node-remove` | 37 |
+
+`role-set` is code 39 and `role-deny` is code 40. Those codes belong to admin roles.
 
 A create also writes the existing `enroll` record when the node enrolls.
 A pre-approved grant also writes `agent-grant` and `agent-approve`.

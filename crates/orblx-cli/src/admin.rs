@@ -1,7 +1,8 @@
 //! `orblx admin` talks to the coordinator over the node mTLS API.
 //!
-//! The caller SVID must be an owner in the policy, or the caller gives a scoped
-//! API token with `--token-file` (W25-3).
+//! The caller SVID must have a role that allows the operation, or the caller
+//! gives a scoped API token with `--token-file` (W25-3).
+//! A token cannot do more than the role of its creator.
 //! The command does not print private keys or enroll tokens.
 //! It prints an API token only at `token-create` without `--out`.
 
@@ -9,7 +10,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use orblx_coord::{
-    admin_blocking, admin_token_blocking, parse_api_token_ttl, parse_scopes, MAX_PREAUTH_TTL_SECS,
+    admin_blocking, admin_token_blocking, parse_admin_role, parse_api_token_ttl, parse_scopes,
+    MAX_PREAUTH_TTL_SECS,
 };
 use serde_json::Value;
 
@@ -44,6 +46,8 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
     let op = match args[0].as_str() {
         "nodes" => "admin-nodes",
         "users" => "admin-users",
+        "roles" => "admin-roles",
+        "role-set" => "admin-role-set",
         "user-approve" => "admin-user-approve",
         "user-reject" => "admin-user-reject",
         "approve" => "admin-approve",
@@ -99,6 +103,18 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
             target = arg.clone();
             index += 1;
         }
+    } else if op == "admin-role-set" {
+        let user = args
+            .get(index)
+            .filter(|name| !name.starts_with('-'))
+            .ok_or_else(|| format!("The command needs a user (oidc:SUBJECT).\n{}", help()))?;
+        let role = args
+            .get(index + 1)
+            .filter(|name| !name.starts_with('-'))
+            .ok_or_else(|| format!("The command needs a role.\n{}", help()))?;
+        let role = parse_admin_role(role).map_err(|err| err.to_string())?;
+        target = serde_json::json!({"user": user, "role": role.as_str()}).to_string();
+        index += 2;
     } else if op == "admin-token-revoke" || op == "admin-preauth-revoke" || op == "admin-policy-set"
     {
         let what = if op == "admin-token-revoke" {
@@ -347,6 +363,9 @@ fn print_created(value: &Value, out: Option<&std::path::Path>) -> Result<(), Str
         }
     }
     println!("token_id {id}");
+    if let Some(role) = value.get("role").and_then(Value::as_str) {
+        println!("token_role {role}");
+    }
     println!("scopes {}", scopes.join(","));
     println!("expires_unix_ms {expires}");
     Ok(())
@@ -435,8 +454,12 @@ fn print_admin(op: &str, value: &Value) -> Result<(), String> {
                     .and_then(Value::as_array)
                     .map(|list| list.iter().filter_map(Value::as_str).collect())
                     .unwrap_or_default();
+                let role = token
+                    .get("created_role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("owner");
                 println!(
-                    "token {} {} scopes {} expires_unix_ms {}",
+                    "token {} {} role {role} scopes {} expires_unix_ms {}",
                     text_field(token, "id")?,
                     text_field(token, "state")?,
                     scopes.join(","),
@@ -552,10 +575,37 @@ fn print_admin(op: &str, value: &Value) -> Result<(), String> {
                     .get("nodes")
                     .and_then(Value::as_array)
                     .map_or(0, Vec::len);
-                println!("user {subject} {state} nodes {nodes}");
+                let role = user.get("role").and_then(Value::as_str).unwrap_or("member");
+                println!("user {subject} {state} role {role} nodes {nodes}");
             }
             println!("users {}", users.len());
             println!("users_pending {pending}");
+        }
+        "admin-roles" => {
+            let users = value
+                .get("users")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "The coordinator response is not valid.".to_string())?;
+            let mut owners = 0usize;
+            for user in users {
+                let subject = text_field(user, "subject")?;
+                let state = user
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("approved");
+                let role = user.get("role").and_then(Value::as_str).unwrap_or("member");
+                if role == "owner" {
+                    owners += 1;
+                }
+                println!("role {subject} {state} {role}");
+            }
+            println!("roles {}", users.len());
+            println!("owners {owners}");
+        }
+        "admin-role-set" => {
+            println!("role_set {}", text_field(value, "user")?);
+            println!("role {}", text_field(value, "role")?);
+            println!("role_from {}", text_field(value, "from")?);
         }
         "admin-user-approve" => {
             println!("user_approved {}", text_field(value, "user")?);
@@ -810,6 +860,8 @@ fn help() -> String {
     "\
 orblx admin nodes --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin users --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin roles --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
+orblx admin role-set USER ROLE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin user-approve USER --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin user-reject USER --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
 orblx admin approve NODE --coord ADDR [--state DIR] [--coord-name NAME] [--bundle FILE]
@@ -847,7 +899,17 @@ The coordinator keeps only the SHA-256 digest of the token.
 call sends one admin operation by its wire name, such as admin-lock-init. It is for scripts and tests.
 
 The command uses the node SVID in the state directory.
-The coordinator accepts the call when that SVID is an owner.
+The coordinator accepts the call when the caller role allows the operation.
+A policy owner SVID has the role owner.
+A node of an OIDC user uses the role of that user.
+The roles are owner, admin, network-admin, it-admin, auditor, and member.
+A member cannot call the admin API.
+An auditor can read, including the audit log, and cannot write.
+Only an owner can change a role. role-set USER ROLE does that.
+The last owner cannot change to another role.
+An owner user in the policy stays an owner.
+An API token cannot do more than the role of its creator.
+A token cannot change roles.
 approve puts the node into netmaps and grants.
 revoke adds the node to the deny set.
 revoke-all stops all access of one principal with one deny change and one audit record:
@@ -856,7 +918,12 @@ PRINCIPAL is a node name or a SPIFFE URI of a node, a user, or an agent.
 revoke-undo removes the SVID deny entry of the principal with one deny change and one audit record.
 The grants that revoke-all revoked stay revoked.
 expire removes the node from netmaps until approve.
-users lists the OIDC users with the state pending, approved, or rejected.
+users lists the OIDC users with the state pending, approved, or rejected, and the role.
+roles lists the same users as `subject state role`.
+role-set changes the role of USER. USER is oidc:SUBJECT or SUBJECT.
+ROLE is owner, admin, network-admin, it-admin, auditor, or member.
+Only an owner can change a role. The last owner cannot change role.
+Each role change writes one audit record. Each role refusal writes one audit record.
 A new OIDC user is pending. A pending or rejected user gets no SVID and cannot enroll a node.
 user-approve lets USER enroll nodes. USER is oidc:SUBJECT or SUBJECT.
 An owner can approve a user before the first sign-in.
@@ -889,6 +956,35 @@ Each create, use, deny, revoke, and ephemeral removal writes one audit record.
 #[cfg(test)]
 mod tests {
     use super::{parse, Command};
+
+    #[test]
+    fn role_set_parses_the_user_and_the_role() {
+        let command = parse(&[
+            "role-set".to_string(),
+            "oidc:ada".to_string(),
+            "network-admin".to_string(),
+            "--coord".to_string(),
+            "127.0.0.1:443".to_string(),
+        ])
+        .unwrap();
+        match command {
+            Command::Call(call) => {
+                assert_eq!(call.op, "admin-role-set");
+                assert!(call.target.contains("oidc:ada"));
+                assert!(call.target.contains("network-admin"));
+            }
+            Command::Help => panic!("help"),
+        }
+        let err = parse(&[
+            "role-set".to_string(),
+            "ada".to_string(),
+            "superuser".to_string(),
+            "--coord".to_string(),
+            "127.0.0.1:443".to_string(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("role"), "{err}");
+    }
 
     #[test]
     fn user_approve_and_reject_parse_the_user() {
