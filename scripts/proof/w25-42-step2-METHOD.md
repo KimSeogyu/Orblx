@@ -100,3 +100,102 @@ Any host prober gap > 200 ms with no in-container gap is printed as PROBER_GAP (
 - Gate 2 counts the coordinator leaf ends. This branch renews the coordinator leaf. The change is a port of ea14d77 (#155).
 - Result reported: each window's classification with its evidence lines. Acceptance condition (a)
   for the later gate change is met only if every window > 200 ms is HARNESS-VCPU.
+
+## Discriminating release run plan
+
+This section is a plan. It does not start the proof.
+R2 on `d16e3fb` stays FAIL. The cause stays UNCLASSIFIED.
+Do not record R2 as `proof_infra_abort`.
+Do not raise a TTL. Do not raise a limit. Do not drop a stall window.
+
+R2 used `SOAK_S=7200`, `SOAK_COORD_ENDS=3`, and an unset `SOAK_TR_ENDS`.
+The host sample file has `CLOCK_REALTIME` only.
+`dt_ms` comes from that same clock. A match of `dt_ms` to the wall gap is not a second clock.
+`cgroup_cpu_some_ms` is PSI cpu.pressure stall time. It is not CPU time consumed.
+The renewal at 06:12:58 and the leaf expiry at 06:17:58 sit inside the unsampled wall gap 06:03:50.897 to 06:25:35.131.
+`unknown_samples=0` on the contention line does not mean that interval was fully observed.
+
+### Knobs
+
+Use these knobs. Do not use `TR_DIAG=2`.
+
+- `SOAK_S=7200`
+- `SOAK_COORD_ENDS=3`
+- Leave `SOAK_TR_ENDS` unset. The script keeps `TR_ENDS` at or above `ends_for_soak`.
+- `TR_DIAG=0`. This starts the host sampler. It does not start host probers, scheduler sampling, docker events, or `ping -O`.
+- `ORBLX_SOAK_TRACE=0`. Product stall traces stay off.
+- Set a new persistent `TR_OUT_DIR`.
+- `RUSTUP_TOOLCHAIN=stable`.
+- Run under `scripts/proof/proof-lock.sh`.
+- The free-space floor stays 15 GiB. `proof_infra_abort` applies only when free space is below that floor before the lock.
+- The wrapper timeout is at least `SOAK_S + 15` minutes (8100 s). Count it from wrapper start.
+
+`TR_DIAG=0` still runs the product gates inside `ticket-renewal.sh`.
+The harness writes `host-samples.txt`, `host-coverage.txt`, and `stack.log` under `TR_OUT_DIR`.
+`stack.log` is the docker log. It is the raw renewal and refusal record.
+Ping files stay in the work directory. The script removes that directory at exit.
+
+### Clocks
+
+Each host sample stores three clocks in nanoseconds.
+
+- `clk_realtime_ns` is `CLOCK_REALTIME`. It is wall time. It can step forward or backward.
+- `clk_monotonic_ns` is `CLOCK_MONOTONIC`. It does not include Linux suspend. It does not follow a wall step.
+- `clk_boottime_ns` is `CLOCK_BOOTTIME`. It includes Linux suspend. It does not follow a wall step.
+
+The three reads are sequential.
+`clk_capture_skew_ns` is a later `CLOCK_REALTIME` read minus `clk_realtime_ns`.
+A gap smaller than that skew is inside the capture spread.
+A missing clock is the token `unsupported`. The sampler does not copy another clock into that field.
+No pattern of these three clocks identifies every hypervisor pause.
+
+### What the patterns can show
+
+- `cadence`: all three deltas stay within 5 sample intervals. This is the normal sample gap. A pause shorter than the gap stays invisible.
+- `wall_forward`: realtime jumps by 1 s or more, and monotonic and boottime stay small. The wall clock stepped forward. This is not Linux suspend. Suspend also moves boottime.
+- `wall_backward`: realtime moves backward and monotonic stays non-negative. The report keeps the negative delta.
+- `suspend_shaped`: monotonic stays small, and realtime and boottime both jump by 1 s or more. This matches Linux suspend accounting. It does not name a hypervisor pause.
+- `unresolved_gap`: all three clocks jump by 1 s or more and stay close to each other. This matches a sampler delay. It also matches a guest pause that moves all three clocks. These clocks cannot separate those causes.
+- `clock_unsupported`: one clock is missing. The report does not call the span fully observed.
+- `mixed` or `clock_backward`: the span does not match a pattern above. The report keeps the raw deltas.
+
+### Coverage fields
+
+`host-coverage.txt` and the proof log report:
+
+- `observation_samples`
+- `observation_elapsed_realtime_ns`, `observation_elapsed_monotonic_ns`, `observation_elapsed_boottime_ns` for the whole run, including every gap
+- `observation_max_unsampled_realtime_ns`, `observation_max_unsampled_monotonic_ns`, `observation_max_unsampled_boottime_ns` with `start_ns` and `end_ns`
+- `observation_negative_*_spans` and `observation_min_*_dt_ns` when a delta is negative
+- `observation_large_spans` and `observation_clock_pattern_counts`
+- `observation_max_capture_skew_ns` and `observation_min_capture_skew_ns`
+- `observation_mark <name> fully_observed yes|no reason <pattern>` for each recorded ticket end
+- `observation_note contention_unknown_samples_do_not_mean_a_renewal_interval_was_fully_observed`
+- `observation_pressure_note cgroup_cpu_some_ms_is_psi_stall_not_cpu_time_consumed`
+- `observation_pattern_limit no_clock_pattern_identifies_every_hypervisor_pause`
+
+A mark is `fully_observed yes` only when every overlapping span is `cadence`.
+A large unsampled gap over a renewal or expiry is `fully_observed no`.
+`unknown_samples=0` does not change that result.
+
+### Gates and outcomes
+
+Keep every product gate and every security gate.
+A peer that rejects an expired ticket still fails the proof.
+The run keeps the full `SOAK_S` window.
+A clock gap does not delete samples and does not relabel the run as `proof_infra_abort`.
+Record `rustc -V`, the cargo release `Finished` line, and `orblx_bin_sha256` from the proof log.
+Record the `proof_lock` acquire line and the `proof_lock` release line.
+Quote the `proof_contention` line.
+`unknown_samples` remains the contention check. It is not an observation check.
+
+### Observer limit
+
+No independent observer is confirmed for this plan.
+Containers on this computer share this VM. They are not an independent clock.
+The registered Mac lists connected. No independent heartbeat is configured on it.
+The Android endpoint lists offline.
+This plan does not provision an observer. It does not send proof telemetry off the host.
+A later run may add an observer only after a separate authorization.
+The missing observer does not block the local three-clock sampler.
+The local sampler cannot replace that observer.

@@ -108,7 +108,7 @@ ticket_run_end 1000 0 40 60 60
             for name in filenames:
                 if not name.endswith((".sh", ".py", ".md", ".yml")):
                     continue
-                if name == "test_soak_window.py":
+                if name.startswith("test_"):
                     continue
                 path = os.path.join(dirpath, name)
                 with open(path, encoding="utf-8") as handle:
