@@ -1,25 +1,192 @@
 name: release
 
+# Build the Orblx release artifacts.
+# A dry run builds every artifact. A dry run does not publish a GitHub release.
+# A dry run does not push an image to a registry.
+# A push of a version tag publishes the GitHub release.
+# A push to main is a dry run.
+# workflow_dispatch is always a dry run.
+
 on:
   push:
     tags:
       - "v*"
+    branches:
+      - main
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "docker/Dockerfile.release"
+      - "docker/entrypoint.sh"
+      - "scripts/release/**"
+      - "scripts/install.sh"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  build:
+  mode:
+    name: select dry run or publish
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.mode.outputs.publish }}
+    steps:
+      - name: Select the mode
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -eu
+          publish=false
+          if [[ "$EVENT_NAME" == "push" && "$REF" == refs/tags/v* ]]; then
+            publish=true
+          fi
+          echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+          if [[ "$publish" == "true" ]]; then
+            echo "mode publish"
+          else
+            echo "mode dry-run"
+          fi
+
+  linux:
+    name: linux ${{ matrix.arch }}
+    needs: mode
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            gnu: x86_64-unknown-linux-gnu
+            musl: x86_64-unknown-linux-musl
+          - arch: arm64
+            gnu: aarch64-unknown-linux-gnu
+            musl: aarch64-unknown-linux-musl
+    steps:
+      - name: Get the repository
+        uses: actions/checkout@v7
+
+      - name: Install the stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.gnu }},${{ matrix.musl }}
+
+      - name: Cache the Cargo output
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.gnu }}
+
+      - name: Install Zig 0.15.1
+        run: |
+          set -eu
+          curl -fsSL -o /tmp/zig.tar.xz https://ziglang.org/download/0.15.1/zig-x86_64-linux-0.15.1.tar.xz
+          echo "c61c5da6edeea14ca51ecd5e4520c6f4189ef5250383db33d01848293bfafe05  /tmp/zig.tar.xz" | sha256sum -c --quiet
+          sudo tar -C /usr/local -xJf /tmp/zig.tar.xz
+          sudo ln -sfn /usr/local/zig-x86_64-linux-0.15.1/zig /usr/local/bin/zig
+          zig version
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@cargo-zigbuild
+
+      - name: Install the strip tools
+        run: sudo apt-get update && sudo apt-get install -y binutils binutils-aarch64-linux-gnu
+
+      - name: Read the workspace version
+        id: version
+        env:
+          PUBLISH: ${{ needs.mode.outputs.publish }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "workspace_version ${version}"
+          if [[ "$PUBLISH" == "true" && "v${version}" != "$REF_NAME" ]]; then
+            echo "The tag ${REF_NAME} is not v${version}." >&2
+            exit 1
+          fi
+
+      - name: Build the glibc binary
+        run: cargo zigbuild --release --locked -p orblx-cli --bin orblx --target ${{ matrix.gnu }}.2.17
+
+      - name: Build the musl binary
+        run: cargo zigbuild --release --locked -p orblx-cli --bin orblx --target ${{ matrix.musl }}
+
+      - name: Strip the binaries
+        run: |
+          set -eu
+          strip_one() {
+            local bin="$1"
+            if [[ "${{ matrix.arch }}" == "arm64" ]]; then
+              aarch64-linux-gnu-strip "$bin" || echo "The strip step did not change ${bin}."
+            else
+              strip "$bin" || echo "The strip step did not change ${bin}."
+            fi
+          }
+          strip_one "target/${{ matrix.gnu }}/release/orblx"
+          strip_one "target/${{ matrix.musl }}/release/orblx"
+
+      - name: Check the binary type
+        env:
+          ARCH_WORD: ${{ matrix.arch == 'arm64' && 'aarch64' || 'x86-64' }}
+        run: |
+          set -eu
+          gnu="target/${{ matrix.gnu }}/release/orblx"
+          musl="target/${{ matrix.musl }}/release/orblx"
+          file "$gnu"
+          file "$musl"
+          file "$gnu" | grep -q "$ARCH_WORD"
+          file "$musl" | grep -q "$ARCH_WORD"
+          if [[ "${{ matrix.arch }}" == "amd64" ]]; then
+            "$gnu" --version
+            "$musl" --version
+          fi
+
+      - name: Make the tarball
+        run: >-
+          scripts/release/package.sh
+          "${{ steps.version.outputs.version }}"
+          "${{ matrix.gnu }}"
+          "target/${{ matrix.gnu }}/release/orblx"
+          dist
+
+      - name: Keep the glibc tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: orblx-${{ matrix.gnu }}
+          path: dist/orblx-${{ matrix.gnu }}.tar.gz
+          if-no-files-found: error
+
+      - name: Keep the musl binary
+        run: |
+          set -eu
+          mkdir -p image-bins
+          cp "target/${{ matrix.musl }}/release/orblx" "image-bins/orblx-${{ matrix.arch }}"
+          chmod 0755 "image-bins/orblx-${{ matrix.arch }}"
+
+      - name: Keep the musl binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: musl-orblx-${{ matrix.arch }}
+          path: image-bins/orblx-${{ matrix.arch }}
+          if-no-files-found: error
+
+  macos:
     name: build ${{ matrix.target }}
+    needs: mode
+    if: needs.mode.outputs.publish == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: true
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04-arm
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-apple-darwin
@@ -33,13 +200,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Check the tag against the workspace version
+      - name: Read the workspace version
         id: version
         shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
+          set -eu
           version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
-          if [[ "v${version}" != "${GITHUB_REF_NAME}" ]]; then
-            echo "The tag ${GITHUB_REF_NAME} is not v${version}." >&2
+          if [[ "v${version}" != "$REF_NAME" ]]; then
+            echo "The tag ${REF_NAME} is not v${version}." >&2
             exit 1
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
@@ -62,31 +232,174 @@ jobs:
           path: dist/orblx-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
-  publish:
-    name: sign and publish
-    needs: build
+  image:
+    name: image amd64 and arm64
+    needs: linux
     runs-on: ubuntu-latest
-    permissions:
-      # Write the GitHub release.
-      contents: write
-      # Get a GitHub OIDC token for the keyless cosign signature.
-      id-token: write
+    timeout-minutes: 60
     steps:
       - name: Get the repository
         uses: actions/checkout@v7
 
-      - name: Get the tarballs
+      - name: Get the musl binaries
         uses: actions/download-artifact@v8
         with:
-          path: dist
+          pattern: musl-orblx-*
+          path: musl
+          merge-multiple: true
+
+      - name: Prepare the image context
+        run: |
+          set -eu
+          mkdir -p context/bins context/docker
+          cp musl/orblx-amd64 context/bins/orblx-amd64
+          cp musl/orblx-arm64 context/bins/orblx-arm64
+          chmod 0755 context/bins/orblx-amd64 context/bins/orblx-arm64
+          cp docker/entrypoint.sh context/docker/entrypoint.sh
+          cp docker/Dockerfile.release context/Dockerfile.release
+          file context/bins/orblx-amd64
+          file context/bins/orblx-arm64
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the amd64 image
+        run: |
+          set -eu
+          mkdir -p dist
+          docker buildx build \
+            --platform linux/amd64 \
+            --file context/Dockerfile.release \
+            --tag orblx:dry-amd64 \
+            --provenance=false \
+            --sbom=false \
+            --output type=docker,dest=dist/orblx-image-linux-amd64.tar \
+            context
+          test -s dist/orblx-image-linux-amd64.tar
+          echo "image_amd64_bytes $(stat -c %s dist/orblx-image-linux-amd64.tar)"
+
+      - name: Build the arm64 image
+        run: |
+          set -eu
+          docker buildx build \
+            --platform linux/arm64 \
+            --file context/Dockerfile.release \
+            --tag orblx:dry-arm64 \
+            --provenance=false \
+            --sbom=false \
+            --output type=docker,dest=dist/orblx-image-linux-arm64.tar \
+            context
+          test -s dist/orblx-image-linux-arm64.tar
+          echo "image_arm64_bytes $(stat -c %s dist/orblx-image-linux-arm64.tar)"
+
+      - name: Check that each image runs orblx
+        run: |
+          set -eu
+          docker load -i dist/orblx-image-linux-amd64.tar
+          docker load -i dist/orblx-image-linux-arm64.tar
+          docker run --rm --platform linux/amd64 orblx:dry-amd64 --version
+          docker run --rm --platform linux/arm64 orblx:dry-arm64 --version
+
+      - name: Keep the image archives
+        uses: actions/upload-artifact@v7
+        with:
+          name: orblx-image-linux
+          path: |
+            dist/orblx-image-linux-amd64.tar
+            dist/orblx-image-linux-arm64.tar
+          if-no-files-found: error
+
+  checksums:
+    name: SHA256 checksums
+    needs: [linux, image, macos]
+    if: >-
+      always() &&
+      needs.linux.result == 'success' &&
+      needs.image.result == 'success' &&
+      (needs.macos.result == 'success' || needs.macos.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the artifacts
+        uses: actions/download-artifact@v8
+        with:
           pattern: orblx-*
+          path: dist
           merge-multiple: true
 
       - name: Write SHA256SUMS
         working-directory: dist
         run: |
-          sha256sum orblx-*.tar.gz > SHA256SUMS
-          cat SHA256SUMS
+          set -eu
+          # Do not hash the checksum file itself.
+          sha256sum orblx-* | tee SHA256SUMS
+          echo "checksum_lines $(wc -l < SHA256SUMS)"
+
+      - name: Keep SHA256SUMS
+        uses: actions/upload-artifact@v7
+        with:
+          name: orblx-SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Record the artifact result
+        working-directory: dist
+        run: |
+          set -eu
+          echo "artifact_result"
+          while read -r sum name; do
+            bytes="$(stat -c %s "$name")"
+            echo "ok ${name} bytes ${bytes} sha256 ${sum}"
+          done < SHA256SUMS
+
+  install-e2e:
+    name: install one-liner end to end
+    needs: linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Get the repository
+        uses: actions/checkout@v7
+
+      - name: Get the amd64 tarball
+        uses: actions/download-artifact@v8
+        with:
+          name: orblx-x86_64-unknown-linux-gnu
+          path: dist
+
+      - name: Check the TUN device
+        run: |
+          set -eu
+          sudo modprobe tun || true
+          test -e /dev/net/tun
+          echo "tun_device present"
+
+      - name: Run the install one-liner test
+        run: scripts/release/install-e2e.sh --artifacts dist
+
+  publish:
+    name: sign and publish
+    needs: [mode, checksums, install-e2e]
+    if: >-
+      needs.mode.outputs.publish == 'true' &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Get the repository
+        uses: actions/checkout@v7
+
+      - name: Get the artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: orblx-*
+          path: dist
+          merge-multiple: true
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v4.1.2
@@ -99,27 +412,34 @@ jobs:
 
       - name: Check the signature
         working-directory: dist
+        env:
+          REF: ${{ github.ref }}
+          REPOSITORY: ${{ github.repository }}
         run: >-
           cosign verify-blob
           --bundle SHA256SUMS.sigstore.json
-          --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}"
+          --certificate-identity "https://github.com/${REPOSITORY}/.github/workflows/release.yml@${REF}"
           --certificate-oidc-issuer https://token.actions.githubusercontent.com
           SHA256SUMS
 
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
+          set -eu
           # A tag with a '-' suffix (for example v0.1.0-rc.1) is a pre-release.
           # GitHub does not use a pre-release for the "latest" download URL.
           prerelease=()
-          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+          if [[ "$REF_NAME" == *-* ]]; then
             prerelease=(--prerelease)
           fi
-          gh release create "${GITHUB_REF_NAME}" \
+          # This step does not push an image to a registry.
+          gh release create "$REF_NAME" \
             --verify-tag \
             "${prerelease[@]}" \
-            --title "${GITHUB_REF_NAME}" \
-            --notes "Install: curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/install.sh | sh -s -- --version ${GITHUB_REF_NAME}" \
-            dist/orblx-*.tar.gz dist/SHA256SUMS dist/SHA256SUMS.sigstore.json scripts/install.sh
+            --title "$REF_NAME" \
+            --notes "Install: curl -fsSL https://github.com/${REPOSITORY}/releases/download/${REF_NAME}/install.sh | sh -s -- --version ${REF_NAME}" \
+            dist/orblx-* dist/SHA256SUMS dist/SHA256SUMS.sigstore.json scripts/install.sh
