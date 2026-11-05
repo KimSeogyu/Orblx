@@ -332,7 +332,7 @@ fn fresh_netmap_with_older_grants_is_refused() {
 
 /// Crypto Fix 4 through the coordinator: a stored seq 1 day ahead of the clock stops all
 /// signing. The owner reset sets the stored seq to the clock time and writes one
-/// `netmap-seq-reset` audit record (code 42).
+/// `netmap-seq-reset` audit record (code 46).
 #[test]
 fn coordinator_refuses_to_sign_ahead_of_the_clock_until_the_reset() {
     let coord_dir = Scratch::new("fix4-coord");

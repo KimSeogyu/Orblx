@@ -106,12 +106,22 @@ pub enum ConfigAction {
     UserApprove,
     /// An owner rejected one OIDC user (W25-15).
     UserReject,
+    /// An ephemeral pre-auth node was removed (W25-18 reserved this code).
+    NodeRemove,
     /// A client moved an HA subnet route to another router (W25-10).
     RouteFailover,
     /// An owner changed the admin role of one user.
     RoleSet,
     /// The admin API refused one call because the caller role does not allow it.
     RoleDeny,
+    /// An owner or a scoped token created a pre-auth key.
+    PreauthCreate,
+    /// A pre-auth key enrolled one node.
+    PreauthUse,
+    /// A pre-auth key or a pre-auth grant was refused.
+    PreauthDeny,
+    /// An owner or a scoped token revoked a pre-auth key.
+    PreauthRevoke,
     /// The coordinator decided one SSH user certificate request (W25-31).
     ///
     /// The coordinator writes one record for each allow and for each deny.
@@ -122,14 +132,12 @@ pub enum ConfigAction {
 }
 
 impl ConfigAction {
-    /// Codes that no action in this build uses. Code 37 is reserved for `node-remove` (W25-18).
-    /// Code 39 is `role-set`. Code 40 is `role-deny`.
-    /// W25-31 takes code 41 (`ssh-cert`). W25-34 takes code 42 (`netmap-seq-reset`).
+    /// Codes that no action in this build uses.
     /// The SIEM verifier has the placeholder `reserved-N` for each of these codes.
-    pub const RESERVED_CODES: [u8; 1] = [37];
+    pub const RESERVED_CODES: [u8; 0] = [];
 
     /// Every action in code order.
-    pub const ALL: [Self; 41] = [
+    pub const ALL: [Self; 46] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -166,9 +174,14 @@ impl ConfigAction {
         Self::SinkError,
         Self::UserApprove,
         Self::UserReject,
+        Self::NodeRemove,
         Self::RouteFailover,
         Self::RoleSet,
         Self::RoleDeny,
+        Self::PreauthCreate,
+        Self::PreauthUse,
+        Self::PreauthDeny,
+        Self::PreauthRevoke,
         Self::SshCert,
         Self::NetmapSeqReset,
     ];
@@ -213,9 +226,14 @@ impl ConfigAction {
             Self::SinkError => "sink-error",
             Self::UserApprove => "user-approve",
             Self::UserReject => "user-reject",
+            Self::NodeRemove => "node-remove",
             Self::RouteFailover => "route-failover",
             Self::RoleSet => "role-set",
             Self::RoleDeny => "role-deny",
+            Self::PreauthCreate => "preauth-create",
+            Self::PreauthUse => "preauth-use",
+            Self::PreauthDeny => "preauth-deny",
+            Self::PreauthRevoke => "preauth-revoke",
             Self::SshCert => "ssh-cert",
             Self::NetmapSeqReset => "netmap-seq-reset",
         }
@@ -267,11 +285,16 @@ impl ConfigAction {
             Self::SinkError => 34,
             Self::UserApprove => 35,
             Self::UserReject => 36,
+            Self::NodeRemove => 37,
             Self::RouteFailover => 38,
             Self::RoleSet => 39,
             Self::RoleDeny => 40,
-            Self::SshCert => 41,
-            Self::NetmapSeqReset => 42,
+            Self::PreauthCreate => 41,
+            Self::PreauthUse => 42,
+            Self::PreauthDeny => 43,
+            Self::PreauthRevoke => 44,
+            Self::SshCert => 45,
+            Self::NetmapSeqReset => 46,
         }
     }
 
