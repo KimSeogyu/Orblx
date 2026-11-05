@@ -81,7 +81,7 @@ earlier rows. The proof of each row comes from the evidence doc that the row nam
 | 19 | ACL policy file | `w18-policy.md`, `w24-port-acl.md` | `policy`, `datapath-acl` |
 | 21 | ACL tests | `w18-policy.md` | `policy` |
 | 24 | GitOps for ACLs | `w25-policy-gitops.md` | `policy-gitops` (`examples/policy-gitops/proof/proof.sh`) |
-| 28 | Node key expiry / auth period | `crates/orblx-identity/src/clock.rs` (code constants) | **none: the sweep fails on this row** |
+| 28 | Node key expiry / auth period | `w25-node-key-expiry.md` | `node-key-expiry` |
 | 29 | Key / SVID rotation UX | `w18-svid-renew.md`, `w20-nat-followup.md` | `svid-renew`, `nat-realism` |
 | 30 | Revocation / device removal | `w19-admin-cli.md`, `w24-revoke-all.md`, `w25-revoke-followup.md` | `admin`, `revoke-all`, `revoke-followup` |
 | 31 | Device approval | `w19-admin-cli.md` | `admin` |
@@ -101,9 +101,9 @@ earlier rows. The proof of each row comes from the evidence doc that the row nam
 | 62 | Admin CLI / console | `w19-admin-cli.md` | `admin` |
 | W23-4 gate | sym relay throughput: sym_sym median of at least 5 runs of 30 s at or above 1113 Mbit/s (#104) | `w25-sym-throughput.md` | `sym-throughput` |
 
-27 shipped rows, one gate, 25 proofs. Row 28 has no proof script (its evidence is the TTL
-constants in `clock.rs` and their unit tests), so every sweep fails on row 28 until a proof for
-it is in the manifest. The sweep does not hide this row.
+27 shipped rows, one gate, 26 proofs. W25-20 added the row 28 proof `node-key-expiry`.
+Before W25-20, row 28 had no proof and every sweep failed on it. The plan output below is
+from before W25-20.
 
 ## Release checklist (rc.3)
 

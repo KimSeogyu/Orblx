@@ -1,0 +1,12 @@
+{
+  "owners": ["spiffe://orblx.local/node/owner"],
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["spiffe://orblx.local/node/a", "spiffe://orblx.local/node/c",
+              "spiffe://orblx.local/node/a2"],
+      "proto": "icmp",
+      "dst": ["spiffe://orblx.local/node/b:*"]
+    }
+  ]
+}

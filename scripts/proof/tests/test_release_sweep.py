@@ -248,6 +248,7 @@ class ReleaseSweepTest(unittest.TestCase):
                     "38", "40", "41", "45", "49", "51", "52", "53", "54", "58", "61", "62"]:
             self.assertIn(row, rows)
         self.assertIn("policy-sync", rows["17"].split())
+        self.assertEqual(rows["28"], "node-key-expiry")
         for row, names in rows.items():
             for name in names.split():
                 if name != "-":

@@ -1,0 +1,120 @@
+# W25-20 node key expiry proof stack (rc.3 row 28).
+# The proof script sets NKE_* values and ORBLX_SVID_TTL.
+# The node services use the nodes profile.
+name: ${NKE_PROJECT:-orblx-w25t-nke}
+
+x-node: &node
+  image: ${NKE_IMAGE:-orblx-w25t-nke:local}
+  profiles: ["nodes"]
+  cap_add:
+    - NET_ADMIN
+  devices:
+    - /dev/net/tun:/dev/net/tun
+  sysctls:
+    net.ipv4.conf.all.rp_filter: "0"
+    net.ipv4.conf.default.rp_filter: "0"
+  depends_on:
+    - coord
+
+services:
+  coord:
+    image: ${NKE_IMAGE:-orblx-w25t-nke:local}
+    command:
+      - coord
+      - serve
+      - --state
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --name
+      - coord
+      - --policy
+      - /var/lib/orblx/policy.hujson
+    environment:
+      ORBLX_OIDC_MODE: mock
+      ORBLX_SVID_TTL: ${NKE_SVID_TTL:?set NKE_SVID_TTL}
+    volumes:
+      - coord-state:/var/lib/orblx
+      - ${NKE_POLICY:?set NKE_POLICY}:/var/lib/orblx/policy.hujson:ro
+    networks:
+      proof:
+        ipv4_address: ${NKE_NET:-172.28.47}.10
+
+  owner:
+    <<: *node
+    command: &up
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${NKE_NET:-172.28.47}.10:443
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - coord-state:/coord-state:ro
+      - owner-state:/var/lib/orblx
+    networks:
+      proof:
+        ipv4_address: ${NKE_NET:-172.28.47}.20
+
+  a:
+    <<: *node
+    command: *up
+    volumes:
+      - coord-state:/coord-state:ro
+      - a-state:/var/lib/orblx
+    networks:
+      proof:
+        ipv4_address: ${NKE_NET:-172.28.47}.11
+
+  b:
+    <<: *node
+    command: *up
+    volumes:
+      - coord-state:/coord-state:ro
+      - b-state:/var/lib/orblx
+    networks:
+      proof:
+        ipv4_address: ${NKE_NET:-172.28.47}.12
+
+  c:
+    <<: *node
+    command: *up
+    volumes:
+      - coord-state:/coord-state:ro
+      - c-state:/var/lib/orblx
+    networks:
+      proof:
+        ipv4_address: ${NKE_NET:-172.28.47}.13
+
+  # a2 runs no daemon. The proof runs one-shot hello handshakes with the a2 leaf.
+  a2:
+    image: ${NKE_IMAGE:-orblx-w25t-nke:local}
+    profiles: ["nodes"]
+    entrypoint: ["sleep", "infinity"]
+    depends_on:
+      - coord
+    volumes:
+      - coord-state:/coord-state:ro
+      - a2-state:/var/lib/orblx
+    networks:
+      proof:
+        ipv4_address: ${NKE_NET:-172.28.47}.14
+
+volumes:
+  coord-state:
+  owner-state:
+  a-state:
+  b-state:
+  c-state:
+  a2-state:
+
+networks:
+  proof:
+    ipam:
+      config:
+        - subnet: ${NKE_NET:-172.28.47}.0/24
