@@ -1467,3 +1467,197 @@ async fn w25_38_session_ok(
     session.send_ipv4(&packet).await.unwrap();
     assert_eq!(&accept.await.unwrap(), client_id);
 }
+
+/// One memory node on its own thread (W25-38 tests).
+struct W2538Node {
+    stop: watch::Sender<bool>,
+    /// Packets from the host of the node into the mesh.
+    from_host: mpsc::Sender<Vec<u8>>,
+    /// Packets from the mesh to the host of the node.
+    to_host: mpsc::Receiver<Vec<u8>>,
+    thread: thread::JoinHandle<()>,
+}
+
+/// Start one memory node on its own thread.
+fn w25_38_memory_node(
+    config: HelloConfig,
+    netmap: Netmap,
+    listen: SocketAddr,
+    state_dir: PathBuf,
+) -> W2538Node {
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let (from_tx, from_rx) = mpsc::channel(64);
+    let (to_tx, to_rx) = mpsc::channel(64);
+    let node = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let _ = crate::run_memory_node(
+                NodeRequest {
+                    config,
+                    netmap,
+                    listen,
+                    state_dir,
+                    renew: None,
+                    stop: Some(stop_rx),
+                    accept_routes: false,
+                    forward_routes: Vec::new(),
+                    forward_exit: false,
+                    exit_node: None,
+                    allow_lan: false,
+                    underlay: Vec::new(),
+                    relay: None,
+                    netmap_path: PathBuf::from("netmap.json"),
+                    visibility: Arc::new(AllowPeers),
+                    on_ready: None,
+                    on_listen: None,
+                    metrics: None,
+                    filter: None,
+                },
+                MemoryDevice {
+                    from_tun: from_rx,
+                    to_tun: to_tx,
+                },
+            )
+            .await;
+        });
+    });
+    W2538Node {
+        stop: stop_tx,
+        from_host: from_tx,
+        to_host: to_rx,
+        thread: node,
+    }
+}
+
+/// Send ICMP echo requests from the host of node a to the overlay IP of node b until
+/// a reply comes back to the host of node a, or until `limit`. Return true for a reply.
+fn w25_38_echo_ok(
+    from_tx: &mpsc::Sender<Vec<u8>>,
+    to_rx: &mut mpsc::Receiver<Vec<u8>>,
+    seq: u16,
+    limit: Duration,
+) -> bool {
+    let local = Ipv4Addr::new(100, 64, 0, 1);
+    let peer = Ipv4Addr::new(100, 64, 0, 2);
+    let request = crate::ipv4::icmp_echo_request(local, peer, 0x3838, seq, b"w25-38").unwrap();
+    let end = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < end {
+        let _ = from_tx.try_send(request.clone());
+        for _ in 0..10 {
+            while let Ok(packet) = to_rx.try_recv() {
+                if crate::ipv4::is_icmp_echo_reply(&packet, peer, local, 0x3838, seq) {
+                    return true;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    false
+}
+
+/// W25-38 gate 0: `orblx ping b` on node a (a second process with the SVID of a) must
+/// not cut the path between the running nodes a and b.
+///
+/// Node a dials node b. The ping process also dials b with the SVID of a, and b
+/// accepts it as the new session of a. After the ping process stops, the running
+/// node a must again get replies from b.
+///
+/// The link of a is older than `ORPHAN_LIMIT` (5 s), so a asks for a new session at
+/// once. The path must come back in less than the limit.
+#[test]
+fn w25_38_a_ping_process_with_the_node_svid_does_not_cut_the_node_path() {
+    w25_38_same_svid_ping_case(Duration::from_secs(6), Duration::from_secs(3));
+}
+
+/// W25-38: the same case with a young link. The link of a only waits for
+/// `ORPHAN_LIMIT` (5 s), then the session ends and a dials again.
+#[test]
+fn w25_38_a_young_link_that_lost_its_peer_ends_after_the_orphan_limit() {
+    w25_38_same_svid_ping_case(Duration::ZERO, Duration::from_secs(15));
+}
+
+fn w25_38_same_svid_ping_case(settle: Duration, after_limit: Duration) {
+    let now = SystemTime::now();
+    let (_ca, pair) = issue_node_pair(now);
+    let a_listen = free_udp();
+    let b_listen = free_udp();
+    let base = std::env::temp_dir().join(format!(
+        "orblx-w25-38-same-svid-{}-{}",
+        std::process::id(),
+        b_listen.port()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    let a_dir = base.join("a");
+    let b_dir = base.join("b");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let a_netmap = Netmap::from_slice(
+        format!(
+            r#"{{
+            "version": 1,
+            "self": {{"name": "a", "overlay_ip": "100.64.0.1"}},
+            "peers": [{{
+                "name": "b",
+                "overlay_ip": "100.64.0.2",
+                "svid": "spiffe://orblx.local/node/b",
+                "endpoints": ["{b_listen}"],
+                "routes": []
+            }}]
+        }}"#
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let b_netmap = Netmap::from_slice(
+        format!(
+            r#"{{
+            "version": 1,
+            "self": {{"name": "b", "overlay_ip": "100.64.0.2"}},
+            "peers": [{{
+                "name": "a",
+                "overlay_ip": "100.64.0.1",
+                "svid": "spiffe://orblx.local/node/a",
+                "endpoints": ["{a_listen}"],
+                "routes": []
+            }}]
+        }}"#
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let b_node = w25_38_memory_node(pair.server.clone(), b_netmap, b_listen, b_dir);
+    let mut a_node = w25_38_memory_node(pair.client.clone(), a_netmap, a_listen, a_dir);
+    let before = w25_38_echo_ok(
+        &a_node.from_host,
+        &mut a_node.to_host,
+        1,
+        Duration::from_secs(10),
+    );
+    std::thread::sleep(settle);
+    // The ping process: one new QUIC session to b with the SVID of node a.
+    let ping = measure_hello_rtt(
+        pair.client.clone(),
+        b_listen,
+        Duration::from_secs(5),
+        Ipv4Addr::new(100, 64, 0, 1),
+        Ipv4Addr::new(100, 64, 0, 2),
+    );
+    let after = w25_38_echo_ok(&a_node.from_host, &mut a_node.to_host, 2, after_limit);
+    let _ = a_node.stop.send(true);
+    let _ = b_node.stop.send(true);
+    let _ = a_node.thread.join();
+    let _ = b_node.thread.join();
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(
+        before,
+        "node a got no echo reply from b before the ping process"
+    );
+    assert!(ping.is_ok(), "the ping process failed: {ping:?}");
+    assert!(
+        after,
+        "node a got no echo reply from b in {after_limit:?} after the ping process stopped"
+    );
+}

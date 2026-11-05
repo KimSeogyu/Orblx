@@ -64,6 +64,16 @@ const STALE_AFTER: Duration = Duration::from_secs(2);
 /// W25 HA subnet routers: a short interval lets a client see a failed router in
 /// [`crate::HA_DEAD_AFTER`] (four intervals). The frame is the same control frame.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(250);
+/// The time that a live link waits for a new session after the peer ended the receive
+/// stream of the link (W25-38).
+///
+/// The peer ends the stream when it accepts a newer session with the same SVID, for
+/// example from an `orblx ping` process on this node. This node did not make that
+/// session, so the link can send but it gets no reply. When the link is older than this
+/// time, it asks for a new session at once. When the link is still the live link after
+/// this time, the session ends and the dial task dials again. Thus two long-running
+/// processes with the same SVID replace each other at most one time in this period.
+const ORPHAN_LIMIT: Duration = Duration::from_secs(5);
 
 static LINK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -1855,6 +1865,13 @@ fn next_event(mut receiver: crate::HelloReceiver) -> NextEvent {
     })
 }
 
+async fn poll_slot_sleep(slot: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>) {
+    match slot {
+        Some(sleep) => sleep.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn poll_slot<T>(
     slot: &mut Option<std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>>,
 ) -> T {
@@ -1890,6 +1907,9 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
     let mut ask_open = true;
     let mut rx_next: Option<NextEvent> = Some(next_event(receiver));
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    // W25-38: set when the peer ended the receive stream while this link is live.
+    let mut orphan_end: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    let started = tokio::time::Instant::now();
     loop {
         if tx_done && rx_next.is_none() {
             tr!("{label} session_end reason=drained");
@@ -1901,6 +1921,12 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     tr!("{label} session_end reason=cancel");
                     return;
                 }
+            }
+            () = poll_slot_sleep(&mut orphan_end), if tx_open && orphan_end.is_some() => {
+                // No newer session replaced this link in time. End it, so the dial
+                // task dials again.
+                tr!("{label} session_end reason=orphan");
+                return;
             }
             changed = ask_rekey.changed(), if tx_open && ask_open => {
                 if changed.is_err() {
@@ -1997,6 +2023,21 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     Err(HelloError::StreamClosed) => {
                         // The peer replaced this session and sent all its frames on it.
                         tr!("{label} rx_end");
+                        if tx_open {
+                            // W25-38: this link is still the live link, so this node did
+                            // not make the newer session. Another process with the same
+                            // SVID made it. The link gets no more replies. When the link
+                            // is old, ask the dial task for a new session now (make
+                            // before break). A young link only waits for the limit, so
+                            // two processes with the same SVID do not dial in a loop.
+                            let old_link = started.elapsed() >= ORPHAN_LIMIT;
+                            tr!("{label} rx_end_while_live ask_now={old_link}");
+                            if old_link {
+                                let next = remote_rekey.borrow().saturating_add(1);
+                                let _ = remote_rekey.send(next);
+                            }
+                            orphan_end = Some(Box::pin(tokio::time::sleep(ORPHAN_LIMIT)));
+                        }
                     }
                     Err(err) => {
                         if is_refusal(&err) {
