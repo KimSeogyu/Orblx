@@ -96,6 +96,7 @@ fn sanitize_protocol(text: &str) -> String {
         || text.chars().any(|ch| ch.is_control())
         || text.contains("ge1.")
         || text.contains(crate::apitoken::API_TOKEN_PREFIX)
+        || text.contains(crate::preauth::PREAUTH_PREFIX)
     {
         return "The coordinator request failed.".to_string();
     }

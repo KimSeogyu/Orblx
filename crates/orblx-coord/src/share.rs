@@ -128,6 +128,14 @@ mod tests {
             exit_node: false,
             approved: true,
             expired: false,
+            enrolled_unix: 0,
+            tags: Vec::new(),
+            ephemeral: false,
+            removed: false,
+            preauth_id: String::new(),
+            preauth_actor: String::new(),
+            auth_expires_unix_ms: 0,
+            grant_bound: None,
         }
     }
 

@@ -101,6 +101,27 @@ struct NodeRecord {
     approved: bool,
     #[serde(default)]
     expired: bool,
+    /// Fixed policy tags from a pre-auth key. Empty for every other node.
+    #[serde(default)]
+    tags: Vec<String>,
+    /// The node leaves the netmap when it is offline past the grace or at expiry.
+    #[serde(default)]
+    ephemeral: bool,
+    /// Ephemeral removal has already run.
+    #[serde(default)]
+    removed: bool,
+    /// The pre-auth key id. Empty when the node did not use a pre-auth key.
+    #[serde(default)]
+    preauth_id: String,
+    /// The actor that created the pre-auth key.
+    #[serde(default)]
+    preauth_actor: String,
+    /// Unix time in milliseconds when this pre-auth node must end. 0 means none.
+    #[serde(default)]
+    auth_expires_unix_ms: u64,
+    /// The only grant this pre-auth node may receive.
+    #[serde(default)]
+    grant_bound: Option<NodeGrantBound>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +155,27 @@ impl std::fmt::Debug for CreatedToken {
     }
 }
 
+/// The only agent grant a pre-auth enrollment may receive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeGrantBound {
+    pub node: String,
+    pub service: String,
+    pub port: u16,
+    pub path_prefix: String,
+    pub max_ttl_secs: u64,
+}
+
+/// Tags, the grant ceiling, and the ephemeral flag copied onto one node.
+#[derive(Debug, Clone)]
+pub struct PreauthStamp {
+    pub tags: Vec<String>,
+    pub ephemeral: bool,
+    pub preauth_id: String,
+    pub preauth_actor: String,
+    pub auth_expires_unix_ms: u64,
+    pub grant_bound: Option<NodeGrantBound>,
+}
+
 #[derive(Debug, Clone)]
 pub struct StoredNode {
     pub name: String,
@@ -145,6 +187,14 @@ pub struct StoredNode {
     pub exit_node: bool,
     pub approved: bool,
     pub expired: bool,
+    pub enrolled_unix: u64,
+    pub tags: Vec<String>,
+    pub ephemeral: bool,
+    pub removed: bool,
+    pub preauth_id: String,
+    pub preauth_actor: String,
+    pub auth_expires_unix_ms: u64,
+    pub grant_bound: Option<NodeGrantBound>,
 }
 
 impl NodeStore {
@@ -336,21 +386,35 @@ impl NodeStore {
     }
 
     pub fn nodes(&self) -> Vec<StoredNode> {
-        self.disk
-            .nodes
-            .iter()
-            .map(|node| StoredNode {
-                name: node.name.clone(),
-                overlay_ip: node.overlay_ip.clone(),
-                svid: node.svid.clone(),
-                owner: node.owner.clone(),
-                endpoints: node.endpoints.clone(),
-                routes: node.routes.clone(),
-                exit_node: node.exit_node,
-                approved: node.approved,
-                expired: node.expired,
-            })
-            .collect()
+        self.disk.nodes.iter().map(stored_node).collect()
+    }
+
+    /// Plan a node enrollment for a pre-auth key.
+    ///
+    /// The node is pre-approved. The stamp is stored on the node.
+    pub fn begin_preauth(
+        &self,
+        name: &str,
+        key_id: &str,
+        endpoints: &[String],
+        routes: &[String],
+        stamp: PreauthStamp,
+    ) -> Result<EnrollPlan, CoordError> {
+        if self.disk.nodes.iter().any(|node| node.name == name) {
+            return Err(CoordError::Exists);
+        }
+        if key_id.is_empty() || key_id.len() > 32 {
+            return Err(CoordError::State);
+        }
+        let mut plan = self.plan(
+            name,
+            endpoints,
+            routes,
+            format!("preauth:{key_id}"),
+            String::new(),
+        )?;
+        plan.preauth = Some(stamp);
+        Ok(plan)
     }
 
     pub fn create_token(
@@ -461,6 +525,7 @@ impl NodeStore {
             }
             token.used = true;
         }
+        let stamp = plan.preauth.clone();
         let node = NodeRecord {
             name: plan.name.clone(),
             overlay_ip: plan.overlay_ip.clone(),
@@ -472,18 +537,27 @@ impl NodeStore {
             enrolled_unix: now_unix,
             approved: true,
             expired: false,
+            tags: stamp
+                .as_ref()
+                .map(|item| item.tags.clone())
+                .unwrap_or_default(),
+            ephemeral: stamp.as_ref().is_some_and(|item| item.ephemeral),
+            removed: false,
+            preauth_id: stamp
+                .as_ref()
+                .map(|item| item.preauth_id.clone())
+                .unwrap_or_default(),
+            preauth_actor: stamp
+                .as_ref()
+                .map(|item| item.preauth_actor.clone())
+                .unwrap_or_default(),
+            auth_expires_unix_ms: stamp
+                .as_ref()
+                .map(|item| item.auth_expires_unix_ms)
+                .unwrap_or(0),
+            grant_bound: stamp.and_then(|item| item.grant_bound),
         };
-        let stored = StoredNode {
-            name: node.name.clone(),
-            overlay_ip: node.overlay_ip.clone(),
-            svid: node.svid.clone(),
-            owner: node.owner.clone(),
-            endpoints: node.endpoints.clone(),
-            routes: node.routes.clone(),
-            exit_node: node.exit_node,
-            approved: node.approved,
-            expired: node.expired,
-        };
+        let stored = stored_node(&node);
         self.disk.nodes.push(node);
         self.disk.next_index = plan.next_index;
         self.persist()?;
@@ -550,6 +624,22 @@ impl NodeStore {
         self.persist()
     }
 
+    /// Mark an ephemeral node removed.
+    ///
+    /// The node stays in the store and leaves every netmap.
+    pub fn set_removed(&mut self, name: &str) -> Result<(), CoordError> {
+        let node = self
+            .disk
+            .nodes
+            .iter_mut()
+            .find(|node| node.name == name)
+            .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        node.removed = true;
+        node.expired = true;
+        node.approved = false;
+        self.persist()
+    }
+
     /// Replace the endpoint list for an enrolled node.
     ///
     /// The caller passes the reflexive address gathered by STUN.
@@ -602,6 +692,7 @@ impl NodeStore {
             owner,
             token_id,
             next_index,
+            preauth: None,
         })
     }
 
@@ -622,6 +713,29 @@ pub struct EnrollPlan {
     owner: String,
     token_id: String,
     next_index: u32,
+    pub(crate) preauth: Option<PreauthStamp>,
+}
+
+fn stored_node(node: &NodeRecord) -> StoredNode {
+    StoredNode {
+        name: node.name.clone(),
+        overlay_ip: node.overlay_ip.clone(),
+        svid: node.svid.clone(),
+        owner: node.owner.clone(),
+        endpoints: node.endpoints.clone(),
+        routes: node.routes.clone(),
+        exit_node: node.exit_node,
+        approved: node.approved,
+        expired: node.expired,
+        enrolled_unix: node.enrolled_unix,
+        tags: node.tags.clone(),
+        ephemeral: node.ephemeral,
+        removed: node.removed,
+        preauth_id: node.preauth_id.clone(),
+        preauth_actor: node.preauth_actor.clone(),
+        auth_expires_unix_ms: node.auth_expires_unix_ms,
+        grant_bound: node.grant_bound.clone(),
+    }
 }
 
 /// Check `oidc:SUBJECT` with the same rule as [`NodeStore::begin_oidc`].

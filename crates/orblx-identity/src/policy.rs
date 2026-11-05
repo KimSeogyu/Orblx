@@ -278,6 +278,10 @@ struct CompiledGrant {
     proto: u8,
     port_start: u16,
     port_end: u16,
+    /// Tag selectors that produced `src`. Empty for a raw SPIFFE source.
+    src_tags: BTreeSet<String>,
+    /// Tag selectors that produced `dst`. Empty for a raw SPIFFE destination.
+    dst_tags: BTreeSet<String>,
 }
 
 /// One ACL row to an IPv4 prefix behind a subnet router (W24-A).
@@ -346,6 +350,8 @@ pub struct Policy {
     exit_nodes: Vec<SpiffeId>,
     node_approval: bool,
     owners: Vec<SpiffeId>,
+    /// Expanded owners of each `tag:` name.
+    tag_owners: BTreeMap<String, Vec<SpiffeId>>,
     ssh: Vec<SshGrant>,
     ssh_tests: Vec<StoredSshTest>,
     /// Guest OIDC owners, as `oidc:SUBJECT` (W25-1).
@@ -388,6 +394,7 @@ impl std::fmt::Debug for Policy {
             .field("exit_nodes", &self.exit_nodes.len())
             .field("node_approval", &self.node_approval)
             .field("owners", &self.owners.len())
+            .field("tag_owners", &self.tag_owners.len())
             .field("ssh", &self.ssh.len())
             .field("guests", &self.guests.len())
             .field("shares", &self.shares.len())
@@ -414,6 +421,7 @@ impl Policy {
             exit_nodes: Vec::new(),
             node_approval: false,
             owners: Vec::new(),
+            tag_owners: BTreeMap::new(),
             ssh: Vec::new(),
             ssh_tests: Vec::new(),
             guests: BTreeSet::new(),
@@ -502,6 +510,20 @@ impl Policy {
     #[must_use]
     pub fn is_owner(&self, id: &SpiffeId) -> bool {
         self.owners.iter().any(|owner| owner == id)
+    }
+
+    /// Return true when the policy defines `tag` (`tag:name`).
+    #[must_use]
+    pub fn known_tag(&self, tag: &str) -> bool {
+        self.tag_owners.contains_key(tag)
+    }
+
+    /// Return true when `id` is an owner of `tag`.
+    #[must_use]
+    pub fn owns_tag(&self, tag: &str, id: &SpiffeId) -> bool {
+        self.tag_owners
+            .get(tag)
+            .is_some_and(|owners| owners.iter().any(|owner| owner == id))
     }
 
     /// Read one HuJSON policy file and run its tests.
@@ -622,6 +644,59 @@ impl Policy {
     #[must_use]
     pub fn approves_exit_node(&self, node: &SpiffeId) -> bool {
         self.exit_nodes.iter().any(|id| id == node)
+    }
+
+    /// Extra allow rows for nodes that carry pre-auth tags.
+    ///
+    /// A compiled row whose source or destination came from `tag:name` also
+    /// matches a node that has that tag. The returned grants use the peer
+    /// SPIFFE ID, so the packet filter sees the enrolled node.
+    /// Rows with no tag selector are omitted. The exact SPIFFE rows stay in
+    /// [`Policy::receiver_grants`].
+    #[must_use]
+    pub fn grants_for_tags(
+        &self,
+        receiver: &SpiffeId,
+        receiver_tags: &[String],
+        peers: &[(SpiffeId, Vec<String>)],
+    ) -> (Vec<ReceiverGrant>, Vec<String>) {
+        let mut grants = Vec::new();
+        let mut reach = Vec::new();
+        for grant in &self.grants {
+            if grant.src_tags.is_empty() && grant.dst_tags.is_empty() {
+                continue;
+            }
+            let dst_hit = tag_hit(receiver, receiver_tags, &grant.dst, &grant.dst_tags);
+            if dst_hit {
+                for (peer, peer_tags) in peers {
+                    if tag_hit(peer, peer_tags, &grant.src, &grant.src_tags)
+                        && peer != receiver
+                        && !grants.iter().any(|row: &ReceiverGrant| {
+                            row.src == peer.as_uri()
+                                && row.proto == grant.proto
+                                && row.port_start == grant.port_start
+                                && row.port_end == grant.port_end
+                        })
+                    {
+                        grants.push(ReceiverGrant {
+                            src: peer.as_uri().to_string(),
+                            proto: grant.proto,
+                            port_start: grant.port_start,
+                            port_end: grant.port_end,
+                        });
+                    }
+                }
+            }
+            if tag_hit(receiver, receiver_tags, &grant.src, &grant.src_tags) {
+                push_reach(&mut reach, grant.dst.as_uri());
+                for (peer, peer_tags) in peers {
+                    if tag_hit(peer, peer_tags, &grant.dst, &grant.dst_tags) {
+                        push_reach(&mut reach, peer.as_uri());
+                    }
+                }
+            }
+        }
+        (grants, reach)
     }
 
     /// Return the inline assertions.
@@ -943,6 +1018,8 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
                                     proto: *proto,
                                     port_start: *start,
                                     port_end: *end,
+                                    src_tags: tag_selector(src_text),
+                                    dst_tags: tag_selector(selector),
                                 });
                             }
                         }
@@ -967,7 +1044,7 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
                 right.port_end,
             ))
     });
-    grants.dedup();
+    grants = merge_grant_tags(grants);
     let mut tests = Vec::new();
     for test in &file.tests {
         tests.push(compile_test(&catalog, test)?);
@@ -975,6 +1052,7 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
     let routes = compile_routes(&catalog, file)?;
     let exit_nodes = compile_exit_nodes(&catalog, &file.auto_approvers.exit_node)?;
     let owners = compile_owners(&file.owners)?;
+    let tag_owners = compile_tag_owners(&catalog, file)?;
     let ssh = compile_ssh(&catalog, &file.ssh)?;
     let mut ssh_tests = Vec::new();
     for test in &file.ssh_tests {
@@ -994,6 +1072,7 @@ fn compile(file: &PolicyFile) -> Result<Policy, PolicyError> {
         exit_nodes,
         node_approval: file.node_approval,
         owners,
+        tag_owners,
         ssh,
         ssh_tests,
         guests,
@@ -1578,6 +1657,64 @@ fn catalog(file: &PolicyFile) -> Result<Catalog, PolicyError> {
         }
     }
     Ok(catalog)
+}
+
+fn tag_selector(selector: &str) -> BTreeSet<String> {
+    let mut tags = BTreeSet::new();
+    if selector.starts_with("tag:") {
+        tags.insert(selector.to_string());
+    }
+    tags
+}
+
+fn tag_hit(id: &SpiffeId, tags: &[String], grant_id: &SpiffeId, via: &BTreeSet<String>) -> bool {
+    id == grant_id || tags.iter().any(|tag| via.contains(tag))
+}
+
+fn push_reach(reach: &mut Vec<String>, uri: &str) {
+    if !reach.iter().any(|item| item == uri) {
+        reach.push(uri.to_string());
+    }
+}
+
+fn merge_grant_tags(grants: Vec<CompiledGrant>) -> Vec<CompiledGrant> {
+    let mut out: Vec<CompiledGrant> = Vec::new();
+    for grant in grants {
+        if let Some(last) = out.last_mut() {
+            let same = last.src == grant.src
+                && last.dst == grant.dst
+                && last.proto == grant.proto
+                && last.port_start == grant.port_start
+                && last.port_end == grant.port_end;
+            if same {
+                last.src_tags.extend(grant.src_tags);
+                last.dst_tags.extend(grant.dst_tags);
+                continue;
+            }
+        }
+        out.push(grant);
+    }
+    out
+}
+
+fn compile_tag_owners(
+    catalog: &Catalog,
+    file: &PolicyFile,
+) -> Result<BTreeMap<String, Vec<SpiffeId>>, PolicyError> {
+    let mut owners = BTreeMap::new();
+    for (name, selectors) in &file.tag_owners {
+        let mut ids = Vec::new();
+        for selector in selectors {
+            for id in expand(catalog, selector)? {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids.sort_by(|left, right| left.as_uri().cmp(right.as_uri()));
+        owners.insert(name.clone(), ids);
+    }
+    Ok(owners)
 }
 
 fn expand(catalog: &Catalog, selector: &str) -> Result<Vec<SpiffeId>, PolicyError> {
@@ -2359,5 +2496,28 @@ mod tests {
         assert!(Policy::from_hujson(exit.as_bytes()).is_err());
         let bad = text.replace("10.99.0.0/16:443", "10.99.0.1/16:443");
         assert!(Policy::from_hujson(bad.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn a_preauth_tag_matches_the_tag_rule() {
+        let text = r#"{
+          "tags": {"tag:bot": ["spiffe://orblx.local/node/static"]},
+          "tagOwners": {"tag:bot": ["spiffe://orblx.local/node/owner"]},
+          "acls": [{"action": "accept", "src": ["tag:bot"], "proto": "tcp", "dst": ["spiffe://orblx.local/node/srv:8080"]}]
+        }"#;
+        let policy = Policy::from_hujson(text.as_bytes()).unwrap();
+        let owner = super::SpiffeId::parse("spiffe://orblx.local/node/owner").unwrap();
+        assert!(policy.owns_tag("tag:bot", &owner));
+        assert!(!policy.owns_tag("tag:bot", &super::SpiffeId::parse(BOX).unwrap()));
+        let bot = super::SpiffeId::parse("spiffe://orblx.local/node/bot").unwrap();
+        let srv = super::SpiffeId::parse("spiffe://orblx.local/node/srv").unwrap();
+        let peers = vec![(bot.clone(), vec!["tag:bot".to_string()])];
+        let (grants, reach) = policy.grants_for_tags(&srv, &[], &peers);
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].src, bot.as_uri());
+        assert_eq!(grants[0].port_start, 8080);
+        assert!(reach.is_empty());
+        let (_grants, reach) = policy.grants_for_tags(&bot, &["tag:bot".to_string()], &peers);
+        assert_eq!(reach, vec![srv.as_uri().to_string()]);
     }
 }

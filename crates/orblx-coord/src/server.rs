@@ -11,6 +11,7 @@ use crate::apitoken;
 use crate::error::CoordError;
 use crate::http_util::{fetch_google_jwks, https_get};
 use crate::netmap::encode_hex;
+use crate::preauth;
 use crate::proto::{self, Request, Response};
 use crate::state::{Coordinator, IssuerFetch};
 use crate::ticket::ticket_response_fields;
@@ -71,8 +72,13 @@ async fn expire_tick(coord: Coordinator) {
     loop {
         tokio::time::sleep(EXPIRE_TICK).await;
         let step = coord.clone();
-        let result =
-            tokio::task::spawn_blocking(move || agent::expire_due(&step, SystemTime::now())).await;
+        let result = tokio::task::spawn_blocking(move || {
+            let now = SystemTime::now();
+            let expired = agent::expire_due(&step, now)?;
+            let removed = preauth::remove_due(&step, now)?;
+            Ok::<usize, CoordError>(expired.saturating_add(removed))
+        })
+        .await;
         match result {
             Ok(Ok(_)) => failed = false,
             Ok(Err(err)) if !failed => {
@@ -387,16 +393,25 @@ async fn dispatch(
 ) -> Result<Response, CoordError> {
     let now = SystemTime::now();
     match request.op.as_str() {
-        "enroll" => {
-            let result = match (&request.token, &request.id_token) {
-                (Some(token), None) => coord.enroll_token(
+        "enroll" | "preauth-enroll" => {
+            let preauth = request.op == "preauth-enroll";
+            let result = match (&request.token, &request.id_token, preauth) {
+                (Some(token), None, true) => preauth::enroll(
+                    coord,
                     &request.name,
                     token,
                     &request.endpoints,
                     &request.routes,
                     now,
                 )?,
-                (None, Some(id_token)) => {
+                (Some(token), None, false) => coord.enroll_token(
+                    &request.name,
+                    token,
+                    &request.endpoints,
+                    &request.routes,
+                    now,
+                )?,
+                (None, Some(id_token), false) => {
                     if coord.google_client_id_for_fetch()?.is_some() {
                         warm_jwks(coord).await;
                     }
@@ -420,6 +435,7 @@ async fn dispatch(
                 }
             };
             println!("enrolled {}", result.name);
+            let _ = preauth::note_seen(coord, &result.name, now);
             Ok(leaf_response(result))
         }
         "renew" => {
@@ -611,6 +627,9 @@ fn dispatch_token(
         Some(lock) if !admin::policy_keeps_sinks(coord, lock, &request.name)? => {
             Ok(Some(apitoken::Refusal::Sinks))
         }
+        _ if request.op == "admin-preauth-create" => {
+            preauth::screen_token(coord, secret, &request.name, now)
+        }
         _ => Ok(None),
     };
     let checked = match apitoken::check(coord, secret, &request.op, now, rule) {
@@ -751,6 +770,14 @@ fn run_admin(
             owner_only()?;
             apitoken::revoke(coord, request.name.trim(), actor, now)?
         }
+        "admin-preauth-create" => {
+            let ask: preauth::CreateAsk = serde_json::from_str(&request.name).map_err(|_| {
+                CoordError::Protocol("The pre-auth key request is not valid.".to_string())
+            })?;
+            preauth::create(coord, &ask, actor, now)?
+        }
+        "admin-preauth-list" => preauth::list(coord, now)?,
+        "admin-preauth-revoke" => preauth::revoke(coord, request.name.trim(), actor, now)?,
         _ => {
             return Err(CoordError::Protocol(
                 "The request is not valid.".to_string(),
@@ -836,7 +863,9 @@ fn peer_node(coord: &Coordinator, connection: &quinn::Connection) -> Result<Stri
     if id.kind() != WorkloadKind::Node {
         return Err(CoordError::Peer);
     }
-    Ok(id.name().to_string())
+    let name = id.name().to_string();
+    let _ = preauth::note_seen(coord, &name, SystemTime::now());
+    Ok(name)
 }
 
 fn peer_id(

@@ -22,14 +22,81 @@ pub async fn enroll_with_token(
     endpoints: &[String],
     routes: &[String],
 ) -> Result<EnrollResult, CoordError> {
+    enroll_op(EnrollOp {
+        op: "enroll",
+        coord,
+        coord_name,
+        bundle_pem,
+        name,
+        token,
+        endpoints,
+        routes,
+    })
+    .await
+}
+
+/// Enroll with a pre-auth key.
+///
+/// The caller must not log `key`.
+pub async fn enroll_with_preauth(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    name: &str,
+    key: &str,
+    endpoints: &[String],
+    routes: &[String],
+) -> Result<EnrollResult, CoordError> {
+    enroll_op(EnrollOp {
+        op: "preauth-enroll",
+        coord,
+        coord_name,
+        bundle_pem,
+        name,
+        token: key,
+        endpoints,
+        routes,
+    })
+    .await
+}
+
+/// Enroll with a pre-auth key.
+///
+/// Call this function outside a Tokio runtime. The caller must not log `key`.
+pub fn enroll_with_preauth_blocking(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    name: &str,
+    key: &str,
+    endpoints: &[String],
+    routes: &[String],
+) -> Result<EnrollResult, CoordError> {
+    block_on(enroll_with_preauth(
+        coord, coord_name, bundle_pem, name, key, endpoints, routes,
+    ))
+}
+
+struct EnrollOp<'a> {
+    op: &'a str,
+    coord: SocketAddr,
+    coord_name: &'a str,
+    bundle_pem: &'a str,
+    name: &'a str,
+    token: &'a str,
+    endpoints: &'a [String],
+    routes: &'a [String],
+}
+
+async fn enroll_op(call: EnrollOp<'_>) -> Result<EnrollResult, CoordError> {
     let request = Request {
-        op: "enroll".to_string(),
-        name: name.to_string(),
-        token: Some(token.to_string()),
+        op: call.op.to_string(),
+        name: call.name.to_string(),
+        token: Some(call.token.to_string()),
         id_token: None,
         nonce: None,
-        endpoints: endpoints.to_vec(),
-        routes: routes.to_vec(),
+        endpoints: call.endpoints.to_vec(),
+        routes: call.routes.to_vec(),
         exit_node: false,
         grant: None,
         api_token: None,
@@ -37,7 +104,16 @@ pub async fn enroll_with_token(
         expect_sha256: None,
         unchanged_ok: false,
     };
-    round_trip(coord, coord_name, bundle_pem, None, request, None, true).await
+    round_trip(
+        call.coord,
+        call.coord_name,
+        call.bundle_pem,
+        None,
+        request,
+        None,
+        true,
+    )
+    .await
 }
 
 /// Enroll with a one-use token.

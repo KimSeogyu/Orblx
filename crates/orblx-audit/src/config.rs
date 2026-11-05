@@ -106,17 +106,27 @@ pub enum ConfigAction {
     UserApprove,
     /// An owner rejected one OIDC user (W25-15).
     UserReject,
+    /// An ephemeral pre-auth node was removed (W25-18 reserved this code).
+    NodeRemove,
     /// A client moved an HA subnet route to another router (W25-10).
     RouteFailover,
+    /// An owner or a scoped token created a pre-auth key.
+    PreauthCreate,
+    /// A pre-auth key enrolled one node.
+    PreauthUse,
+    /// A pre-auth key or a pre-auth grant was refused.
+    PreauthDeny,
+    /// An owner or a scoped token revoked a pre-auth key.
+    PreauthRevoke,
 }
 
 impl ConfigAction {
-    /// Codes that no action in this build uses. Code 37 is reserved for `node-remove` (W25-18).
+    /// Codes that no action in this build uses.
     /// The SIEM verifier has the placeholder `reserved-N` for each of these codes.
-    pub const RESERVED_CODES: [u8; 1] = [37];
+    pub const RESERVED_CODES: [u8; 0] = [];
 
     /// Every action in code order.
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 42] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -153,7 +163,12 @@ impl ConfigAction {
         Self::SinkError,
         Self::UserApprove,
         Self::UserReject,
+        Self::NodeRemove,
         Self::RouteFailover,
+        Self::PreauthCreate,
+        Self::PreauthUse,
+        Self::PreauthDeny,
+        Self::PreauthRevoke,
     ];
 
     /// Return the stable action token.
@@ -196,7 +211,12 @@ impl ConfigAction {
             Self::SinkError => "sink-error",
             Self::UserApprove => "user-approve",
             Self::UserReject => "user-reject",
+            Self::NodeRemove => "node-remove",
             Self::RouteFailover => "route-failover",
+            Self::PreauthCreate => "preauth-create",
+            Self::PreauthUse => "preauth-use",
+            Self::PreauthDeny => "preauth-deny",
+            Self::PreauthRevoke => "preauth-revoke",
         }
     }
 
@@ -246,7 +266,12 @@ impl ConfigAction {
             Self::SinkError => 34,
             Self::UserApprove => 35,
             Self::UserReject => 36,
+            Self::NodeRemove => 37,
             Self::RouteFailover => 38,
+            Self::PreauthCreate => 39,
+            Self::PreauthUse => 40,
+            Self::PreauthDeny => 41,
+            Self::PreauthRevoke => 42,
         }
     }
 

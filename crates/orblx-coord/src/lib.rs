@@ -17,6 +17,7 @@ mod apitoken;
 mod client;
 mod config;
 mod error;
+mod preauth;
 
 mod files;
 mod http_util;
@@ -52,10 +53,10 @@ pub use apitoken::{
 pub use client::{
     admin_blocking, admin_token_blocking, admin_token_expect_blocking, advertise_exit_blocking,
     advertise_routes_blocking, agent_grant_fetch_blocking, agent_grant_request_blocking,
-    enroll_with_oidc_blocking, enroll_with_token_blocking, fetch_deny_blocking,
-    fetch_deny_wait_blocking, fetch_netmap_blocking, fetch_policy_wait_blocking, netmap_json,
-    publish_candidates_blocking, renew_svid_blocking, AdminReply, GrantFetch, OidcEnroll,
-    PolicySync, PolicyWaiter, DENY_WAIT_HOLD,
+    enroll_with_oidc_blocking, enroll_with_preauth_blocking, enroll_with_token_blocking,
+    fetch_deny_blocking, fetch_deny_wait_blocking, fetch_netmap_blocking,
+    fetch_policy_wait_blocking, netmap_json, publish_candidates_blocking, renew_svid_blocking,
+    AdminReply, GrantFetch, OidcEnroll, PolicySync, PolicyWaiter, DENY_WAIT_HOLD,
 };
 pub use config::{CoordConfig, OidcSection};
 pub use error::{CoordError, USER_PENDING_TEXT, USER_REJECTED_TEXT};
@@ -64,6 +65,7 @@ pub use netmap::{
     decode_hex_32, encode_hex, verify_signed_endpoint, verify_signed_grants, verify_signed_netmap,
     NetmapKey, SignedEndpoint, SignedGrants, SignedNetmap,
 };
+pub use preauth::{MAX_PREAUTH_TTL_SECS, PREAUTH_PREFIX};
 pub use proto::GrantAsk;
 pub use server::serve_blocking;
 pub use state::{

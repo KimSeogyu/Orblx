@@ -499,6 +499,27 @@ impl Coordinator {
         inner.store.create_token(ttl, now)
     }
 
+    /// Enroll one node from a checked pre-auth stamp.
+    ///
+    /// The caller checked the key. This function does not read the key text.
+    pub(crate) fn enroll_preauth_stamp(
+        &self,
+        name: &str,
+        key_id: &str,
+        endpoints: &[String],
+        routes: &[String],
+        stamp: crate::store::PreauthStamp,
+        now: SystemTime,
+    ) -> Result<EnrollResult, CoordError> {
+        let _ = SpiffeId::node(name)?;
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        let plan = inner
+            .store
+            .begin_preauth(name, key_id, endpoints, routes, stamp)?;
+        finish_enroll(&mut inner, plan, now)
+    }
+
     pub fn enroll_token(
         &self,
         name: &str,
@@ -1145,10 +1166,31 @@ impl Coordinator {
     }
 
     /// Return the enrolled nodes.
+    /// Remove one ephemeral node from every netmap.
+    pub(crate) fn mark_removed(&self, name: &str) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        inner.store.set_removed(name)
+    }
+
     pub fn node_list(&self) -> Result<Vec<StoredNode>, CoordError> {
         let mut inner = self.lock()?;
         reload(&mut inner)?;
         Ok(inner.store.nodes())
+    }
+
+    /// Return true when the loaded policy defines `tag` and `id` owns it.
+    pub(crate) fn caller_owns_tag(&self, tag: &str, id: &SpiffeId) -> Result<bool, CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        Ok(inner.policy.known_tag(tag) && inner.policy.owns_tag(tag, id))
+    }
+
+    /// Return true when the loaded policy defines `tag`.
+    pub(crate) fn known_tag(&self, tag: &str) -> Result<bool, CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        Ok(inner.policy.known_tag(tag))
     }
 
     /// Return true when `id` is an owner in the loaded policy.
@@ -1726,6 +1768,10 @@ fn node_digest(inner: &Inner, name: &str) -> [u8; 32] {
         "exit_node": node.exit_node,
         "approved": node.approved,
         "expired": node.expired,
+        "removed": node.removed,
+        "ephemeral": node.ephemeral,
+        "preauth_id": node.preauth_id,
+        "tags": node.tags,
     });
     sha256(value.to_string().as_bytes())
 }
@@ -1746,10 +1792,11 @@ fn finish_enroll(
     let issued = inner
         .ca
         .issue(&id, now, inner.svid_ttl, &DenySet::empty())?;
+    let preauth = plan.preauth.is_some();
     let stored = inner
         .store
         .commit(plan, issued.spiffe_id.as_uri().to_string(), now)?;
-    let approved = initial_approved(&inner.policy, &stored.name);
+    let approved = preauth || initial_approved(&inner.policy, &stored.name);
     if !approved {
         inner.store.set_approved(&stored.name, false)?;
     }
@@ -1758,7 +1805,13 @@ fn finish_enroll(
         "svid {} ip {} {}",
         stored.svid,
         stored.overlay_ip,
-        if approved { "approved" } else { "pending" }
+        if preauth {
+            "preauth"
+        } else if approved {
+            "approved"
+        } else {
+            "pending"
+        }
     );
     record(
         inner,
@@ -1837,7 +1890,7 @@ fn issue_leaf(inner: &mut Inner, name: &str, now: SystemTime) -> Result<EnrollRe
 }
 
 fn node_visible(node: &StoredNode) -> bool {
-    node.approved && !node.expired
+    node.approved && !node.expired && !node.removed
 }
 
 fn sign_view(inner: &Inner, name: &str) -> Result<NetmapView, CoordError> {
@@ -2041,6 +2094,35 @@ fn filtered_grants(
     grants.grants.retain(|grant| !hidden.contains(&grant.src));
     grants.subnets.retain(|grant| !hidden.contains(&grant.src));
     grants.reach.retain(|dst| !hidden.contains(dst));
+    let peers: Vec<(SpiffeId, Vec<String>)> = nodes
+        .iter()
+        .filter(|node| node_visible(node) && crate::share::sees(&inner.policy, self_node, node))
+        .filter_map(|node| {
+            SpiffeId::parse(&node.svid)
+                .ok()
+                .map(|id| (id, node.tags.clone()))
+        })
+        .collect();
+    let (extra_grants, extra_reach) =
+        inner
+            .policy
+            .grants_for_tags(receiver, &self_node.tags, &peers);
+    for grant in extra_grants {
+        if hidden.contains(&grant.src) || other.contains(&grant.src) {
+            continue;
+        }
+        if !grants.grants.contains(&grant) {
+            grants.grants.push(grant);
+        }
+    }
+    for dst in extra_reach {
+        if hidden.contains(&dst) || other.contains(&dst) {
+            continue;
+        }
+        if !grants.reach.contains(&dst) {
+            grants.reach.push(dst);
+        }
+    }
     // A peer in another tenant gets only the grants of a share, also without an `acls` list (W25-1b).
     grants.guarded = other.difference(&hidden).cloned().collect();
     grants
