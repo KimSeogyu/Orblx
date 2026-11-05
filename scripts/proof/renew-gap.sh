@@ -62,7 +62,7 @@ finish() {
 trap 'finish' EXIT
 
 require_root "$@"
-proof_lock_take "renew-gap:${PROJECT}" "${PROJECT}-"
+proof_lock_take "renew-gap:${PROJECT}" "${PROJECT}"
 # W25-14b: start from a clean compose state (all profiles, all volumes).
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$ROOT/scripts/proof/compose-clean.sh"

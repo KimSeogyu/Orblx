@@ -31,7 +31,7 @@ WORK="$(mktemp -d)"
 . "$PROOF_LIB_DIR/proof-lock.sh"
 PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap proof_lock_end EXIT
-proof_lock_take "docker-image"
+proof_lock_take "docker-image" "$PREFIX"
 chmod 700 "$WORK"
 
 docker() {
@@ -125,6 +125,7 @@ node_run() {
   local name="$1"
   shift
   docker run -d --name "${PREFIX}-${name}" --hostname "$name" \
+    --label "com.docker.compose.project=${PREFIX}" \
     --network "$NET" --network-alias "$name" \
     --cap-add NET_ADMIN --device /dev/net/tun \
     -e "ORBLX_COORD=${coord_ip}:443" \
@@ -150,6 +151,7 @@ echo "=== [C] start the coordinator from the image (svid ttl ${TTL}) ==="
 teardown
 docker network create "$NET" >/dev/null
 docker run -d --name "${PREFIX}-coord" --hostname coord --network "$NET" --network-alias coord \
+  --label "com.docker.compose.project=${PREFIX}" \
   -e ORBLX_OIDC_MODE=mock -e "ORBLX_SVID_TTL=${TTL}" \
   -v "${PREFIX}-coord:${STATE}" \
   "$IMAGE" coord serve --state "$STATE" --listen 0.0.0.0:443 --name coord >/dev/null

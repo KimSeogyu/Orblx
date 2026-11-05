@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # W25-5 box proof lock.
-# Source this file. Then call: proof_lock_take LABEL [OWN_NAME_PREFIX ...]
+# Source this file. Then call: proof_lock_take LABEL [OWN_COMPOSE_PROJECT ...]
 # Every proof that runs the RTT or throughput gates takes one lock for the whole host,
 # so that these proofs run one at a time. The lock waits. It does not fail.
 # W25-14: the waiters take the lock in arrival order (a ticket queue next to the lock file).
@@ -23,6 +23,9 @@
 #                          that this pid is the pid in the holder file and that it runs.
 # The lock uses flock(1). Without flock (macOS), the proof runs without the lock and says so.
 # The script must call proof_lock_end in its EXIT trap.
+# proof_lock_end prints "proof_lock LABEL released at TIME pid=PID". When SIGKILL
+# skips the trap, the next proof_lock_take prints the same form with
+# reason=killed_holder_cleared_by_next for the dead holder pid (W25-46).
 # W25-19: a proof from an old checkout takes the lock file with a plain flock. While a FIFO
 # proof runs or waits first in the queue, a keeper process holds that flock, so the old
 # proof cannot pass the queue. The FIFO proofs take turns on a second lock, "${file}.fifo".
@@ -33,6 +36,7 @@ PROOF_LOCK_FD=9
 PROOF_LOCK_OWNER=0
 PROOF_LOCK_LABEL=""
 PROOF_LOCK_OWN=()
+PROOF_LOCK_OWN_FILE=""
 PROOF_LOCK_SAMPLER=""
 PROOF_LOCK_SAMPLES=""
 PROOF_LOCK_TICKET=""
@@ -59,25 +63,49 @@ proof_lock_ms() {
   date +%s%3N
 }
 
-# Print the running orblx container names that do not belong to this proof.
+# W25-46: a container belongs to this proof when its compose project label
+# (com.docker.compose.project) is exactly one of the OWN_COMPOSE_PROJECT words of
+# proof_lock_take. A name prefix is never used: a prefix can match a foreign container
+# (orblx-ssh is a prefix of orblx-ssh-renew). A proof that starts a container with
+# "docker run" gives it the label "com.docker.compose.project=<own project>".
+# The proof that holds the lock also owns the projects of its child proofs (a child under
+# ORBLX_PROOF_LOCK_HELD writes its projects to ORBLX_PROOF_OWN_FILE).
+# Print one "NAME<TAB>PROJECT" line for each running container.
 # Return 2 when docker ps fails (then the count is not known).
+PROOF_LOCK_PS_FORMAT='{{.Names}}	{{.Label "com.docker.compose.project"}}'
 proof_lock_docker_names() {
-  docker ps --format '{{.Names}}' 2>/dev/null && return 0
+  docker ps --format "$PROOF_LOCK_PS_FORMAT" 2>/dev/null && return 0
   [[ "$(id -u)" != "0" ]] || return 2
-  sudo -n docker ps --format '{{.Names}}' 2>/dev/null || return 2
+  sudo -n docker ps --format "$PROOF_LOCK_PS_FORMAT" 2>/dev/null || return 2
 }
 
+# Print the own projects: the words of proof_lock_take, and (for the holder) the child projects.
+proof_lock_own_projects() {
+  local own
+  for own in "${PROOF_LOCK_OWN[@]}"; do
+    [[ -n "$own" ]] && printf '%s\n' "$own"
+  done
+  if [[ "$PROOF_LOCK_OWNER" == "1" && -n "$PROOF_LOCK_OWN_FILE" && -f "$PROOF_LOCK_OWN_FILE" ]]; then
+    cat "$PROOF_LOCK_OWN_FILE" 2>/dev/null
+  fi
+  return 0
+}
+
+# Print the running orblx container names that do not belong to this proof.
 proof_lock_others() {
-  local names name own mine
+  local names name project own mine owns
   names="$(proof_lock_docker_names)" || return 2
-  while IFS= read -r name; do
+  owns="$(proof_lock_own_projects)"
+  while IFS=$'\t' read -r name project; do
     [[ "$name" == orblx-* ]] || continue
     mine=0
-    for own in "${PROOF_LOCK_OWN[@]}"; do
-      if [[ -n "$own" && "$name" == "$own"* ]]; then
-        mine=1
-      fi
-    done
+    if [[ -n "$project" ]]; then
+      while IFS= read -r own; do
+        if [[ -n "$own" && "$project" == "$own" ]]; then
+          mine=1
+        fi
+      done <<<"$owns"
+    fi
     if [[ "$mine" == "0" ]]; then
       printf '%s\n' "$name"
     fi
@@ -120,6 +148,22 @@ proof_lock_holder() {
   else
     printf 'unknown'
   fi
+}
+
+
+# W25-46: when a killed holder left the holder file, the next taker prints its release
+# line with the dead pid. SIGKILL skips the EXIT trap, so proof_lock_end never runs.
+proof_lock_note_killed_holder() {
+  local file="$1" prev_pid prev_label
+  [[ -s "${file}.holder" ]] || return 0
+  prev_pid="$(sed -n 's/^pid=//p' "${file}.holder" 2>/dev/null)"
+  prev_label="$(sed -n 's/^label=//p' "${file}.holder" 2>/dev/null)"
+  [[ "$prev_pid" =~ ^[0-9]+$ ]] || return 0
+  # A live process still owns the record until it releases; do not clear it.
+  if kill -0 "$prev_pid" 2>/dev/null; then
+    return 0
+  fi
+  echo "proof_lock ${prev_label:-unknown} released at $(proof_lock_now) pid=${prev_pid} reason=killed_holder_cleared_by_next"
 }
 
 # True when ORBLX_PROOF_LOCK_HELD names a running process that the holder file names.
@@ -400,12 +444,49 @@ proof_disk_check() {
   done
 }
 
+# W25-40 (PO rule 2026-10-31 23:14 KST): no foreign orblx container at lock acquire.
+# After the lock is taken, and before the proof's first step (build, compose up), the proof
+# stops when an orblx container that does not belong to this run exists (proof_lock_others: a
+# name that starts with "orblx-" and with no own compose project label). It prints
+#   proof_infra_abort LABEL reason=foreign_containers names=A,B,C. No proof step ran.
+# or, when docker ps fails,
+#   proof_infra_abort LABEL reason=containers_unknown names=none. No proof step ran.
+# releases the lock, and exits with status 5 (PROOF_FOREIGN_ABORT_EXIT). It never stops or
+# removes the other containers. The check runs only when this proof took the lock itself (not
+# under a parent proof that holds it, and not on a host with no flock).
+PROOF_FOREIGN_ABORT_EXIT=5
+
+proof_foreign_check() {
+  local label="$1" others names
+  if ! others="$(proof_lock_others)"; then
+    echo "proof_infra_abort ${label} reason=containers_unknown names=none. No proof step ran." >&2
+    proof_lock_end
+    exit "$PROOF_FOREIGN_ABORT_EXIT"
+  fi
+  others="$(printf '%s\n' "$others" | sed '/^$/d' | sort -u)"
+  [[ -n "$others" ]] || return 0
+  names="$(printf '%s\n' "$others" | paste -sd, -)"
+  echo "proof_infra_abort ${label} reason=foreign_containers names=${names}. No proof step ran." >&2
+  proof_lock_end
+  exit "$PROOF_FOREIGN_ABORT_EXIT"
+}
+
 proof_lock_take() {
   # The disk check runs before the lock, also when the script ran it before its build.
   proof_disk_check "$1"
   PROOF_LOCK_LABEL="$1"
   shift
   PROOF_LOCK_OWN=("$@")
+  # W25-46: the words are exact compose project names. A word that ends in "-" is an old
+  # name prefix: stop, so that no proof counts its own containers as other containers.
+  local own_word
+  for own_word in "${PROOF_LOCK_OWN[@]}"; do
+    if [[ -z "$own_word" || "$own_word" == *- || ! "$own_word" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+      echo "proof_lock ${PROOF_LOCK_LABEL} FAIL: \"${own_word}\" is not a compose project name. Give the exact compose project names, not a name prefix (W25-46)." >&2
+      PROOF_LOCK_LABEL=""
+      exit 1
+    fi
+  done
   local file waited_from note plain mode=lock
   file="$(proof_lock_file)"
   note="${ORBLX_PROOF_LOCK_NOTE_SECS:-30}"
@@ -433,6 +514,9 @@ proof_lock_take() {
   proof_context queued
   if [[ "$mode" == "parent" ]]; then
     echo "proof_lock ${PROOF_LOCK_LABEL} held by the parent proof, file ${file}"
+    if [[ -n "${ORBLX_PROOF_OWN_FILE:-}" && -f "$ORBLX_PROOF_OWN_FILE" && ${#PROOF_LOCK_OWN[@]} -gt 0 ]]; then
+      printf '%s\n' "${PROOF_LOCK_OWN[@]}" >>"$ORBLX_PROOF_OWN_FILE" 2>/dev/null || true
+    fi
   elif [[ "$mode" == "none" ]]; then
     echo "proof_lock ${PROOF_LOCK_LABEL} no flock on this host, the proof runs without the lock"
   else
@@ -442,6 +526,11 @@ proof_lock_take() {
     proof_lock_queue_wait "$file" "$note" "$waited_from"
     PROOF_LOCK_OWNER=1
     export ORBLX_PROOF_LOCK_HELD="$$"
+    PROOF_LOCK_OWN_FILE="$(mktemp)"
+    chmod 0666 "$PROOF_LOCK_OWN_FILE" 2>/dev/null || true
+    export ORBLX_PROOF_OWN_FILE="$PROOF_LOCK_OWN_FILE"
+    # W25-46: log a release for a killed previous holder before we replace the record.
+    proof_lock_note_killed_holder "$file"
     {
       echo "label=${PROOF_LOCK_LABEL}"
       echo "pid=$$"
@@ -454,6 +543,7 @@ proof_lock_take() {
     mv -f "${file}.holder.$$" "${file}.holder" 2>/dev/null || true
     echo "proof_lock ${PROOF_LOCK_LABEL} acquired at $(proof_lock_now) after $(( $(proof_lock_ms) - waited_from )) ms, file ${file}"
     proof_disk_report "$PROOF_LOCK_LABEL"
+    proof_foreign_check "$PROOF_LOCK_LABEL"
   fi
   proof_context start
   PROOF_LOCK_SAMPLES="$(mktemp)"
@@ -501,7 +591,9 @@ proof_lock_end() {
     flock -u "$PROOF_LOCK_FD" 2>/dev/null || true
     eval "exec ${PROOF_LOCK_FD}>&-"
     PROOF_LOCK_OWNER=0
-    echo "proof_lock ${PROOF_LOCK_LABEL} released at $(proof_lock_now)"
+    rm -f "$PROOF_LOCK_OWN_FILE"
+    PROOF_LOCK_OWN_FILE=""
+    echo "proof_lock ${PROOF_LOCK_LABEL} released at $(proof_lock_now) pid=$$"
   fi
   PROOF_LOCK_LABEL=""
   if [[ -n "$invalid" ]]; then
