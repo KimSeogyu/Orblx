@@ -62,7 +62,7 @@ cleanup() {
 . "$ROOT/scripts/proof/proof-lock.sh"
 PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap 'cleanup; proof_lock_end' EXIT
-proof_lock_take "policy-scale:${PROOF_PROJECT}" "${PROOF_PROJECT}-"
+proof_lock_take "policy-scale:${PROOF_PROJECT}" "${PROOF_PROJECT}"
 # W25-14b (#114): start from a clean state. Old containers, volumes, and networks of the project make the proof fail.
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"

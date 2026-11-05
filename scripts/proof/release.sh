@@ -40,7 +40,7 @@ cleanup() {
 . "$PROOF_LIB_DIR/proof-lock.sh"
 PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap 'cleanup; proof_lock_end' EXIT
-proof_lock_take "release"
+proof_lock_take "release" "orblx-release-proof"
 
 if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
   echo "The proof needs a Linux x86_64 host." >&2
@@ -119,23 +119,23 @@ RUN apt-get update \
 COPY cosign /usr/local/bin/cosign
 DOCKER
 as_root docker build -q -t "$IMAGE" "$WORK/img" >/dev/null
-as_root docker run --rm "$IMAGE" sh -c 'test ! -e /usr/local/bin/orblx && echo "client has no orblx"'
+as_root docker run --rm --label "com.docker.compose.project=orblx-release-proof" "$IMAGE" sh -c 'test ! -e /usr/local/bin/orblx && echo "client has no orblx"'
 
 echo "=== [C] start the HTTP container ==="
 as_root docker rm -f "$HTTP" >/dev/null 2>&1 || true
 as_root docker network rm "$NET" >/dev/null 2>&1 || true
 as_root docker network create "$NET" >/dev/null
-as_root docker run -d --name "$HTTP" --network "$NET" -v "$WORK/www:/srv:ro" "$IMAGE" \
+as_root docker run -d --name "$HTTP" --label "com.docker.compose.project=orblx-release-proof" --network "$NET" -v "$WORK/www:/srv:ro" "$IMAGE" \
   python3 -m http.server 8000 --directory /srv >/dev/null
 for _ in $(seq 1 30); do
-  if as_root docker run --rm --network "$NET" "$IMAGE" curl -fsS -o /dev/null "http://${HTTP}:8000/good/SHA256SUMS" 2>/dev/null; then
+  if as_root docker run --rm --label "com.docker.compose.project=orblx-release-proof" --network "$NET" "$IMAGE" curl -fsS -o /dev/null "http://${HTTP}:8000/good/SHA256SUMS" 2>/dev/null; then
     break
   fi
   sleep 1
 done
 
 client() {
-  as_root docker run --rm --network "$NET" -v "$WORK/keys/test.pub:/keys/cosign.pub:ro" "$IMAGE" sh -c "$1"
+  as_root docker run --rm --label "com.docker.compose.project=orblx-release-proof" --network "$NET" -v "$WORK/keys/test.pub:/keys/cosign.pub:ro" "$IMAGE" sh -c "$1"
 }
 
 echo "=== [C] install from good with curl | sh ==="
@@ -166,7 +166,7 @@ expect_refuse bad-signer "The signature check of SHA256SUMS failed."
 
 echo "=== [C] install without cosign must fail ==="
 set +e
-out="$(as_root docker run --rm --network "$NET" "$IMAGE" sh -c "rm /usr/local/bin/cosign; curl -fsSL http://${HTTP}:8000/good/install.sh | sh -s -- --base-url http://${HTTP}:8000/good; rc=\$?; test ! -e /usr/local/bin/orblx || exit 99; exit \$rc" 2>&1)"
+out="$(as_root docker run --rm --label "com.docker.compose.project=orblx-release-proof" --network "$NET" "$IMAGE" sh -c "rm /usr/local/bin/cosign; curl -fsSL http://${HTTP}:8000/good/install.sh | sh -s -- --base-url http://${HTTP}:8000/good; rc=\$?; test ! -e /usr/local/bin/orblx || exit 99; exit \$rc" 2>&1)"
 status=$?
 set -e
 printf '%s\n' "$out"
