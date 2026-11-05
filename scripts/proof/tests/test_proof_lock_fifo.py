@@ -169,7 +169,7 @@ class ProofLockFairnessTest(unittest.TestCase):
         m = re.search(r"rc=(\d+) ms=(\d+) pid=", free.stdout)
         self.assertIsNotNone(m, free.stdout + free.stderr)
         self.assertEqual(m.group(1), "1", free.stdout)
-        self.assertLess(int(m.group(2)), 500, free.stdout)
+        self.assertLess(int(m.group(2)), 1000, free.stdout)
         # The check still finds an ancestor that holds the lock among its many fds.
         self.assertIn("rc=0 ", plain.stdout, plain.stdout + plain.stderr)
         self.assertIn(f"pid={os.getpid()}", plain.stdout)

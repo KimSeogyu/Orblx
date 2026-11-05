@@ -16,6 +16,7 @@ mod quic;
 mod relay_path;
 mod router;
 mod run;
+mod soak;
 mod subnet;
 mod tun_bench;
 mod tun_dev;
