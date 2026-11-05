@@ -38,9 +38,24 @@ pub fn spawn_metrics_server(
     }
     let listener = TcpListener::bind(addr)
         .map_err(|err| format!("The metrics listener did not bind. {err}"))?;
+    spawn_metrics_listener(listener, render)
+}
+
+/// Serve `GET /metrics` on a listener the caller already owns.
+///
+/// The bound address must use the local host.
+/// The function returns the bound address.
+/// A later request calls `render`.
+pub fn spawn_metrics_listener(
+    listener: TcpListener,
+    render: impl Fn() -> String + Send + Sync + 'static,
+) -> Result<SocketAddr, String> {
     let bound = listener
         .local_addr()
         .map_err(|err| format!("The metrics listener did not bind. {err}"))?;
+    if !bound.ip().is_loopback() {
+        return Err("The metrics address must use the local host.".to_string());
+    }
     let render = Arc::new(render);
     thread::spawn(move || accept_loop(listener, render));
     Ok(bound)

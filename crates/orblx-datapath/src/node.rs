@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Command;
@@ -150,7 +150,15 @@ pub struct NodeRequest {
     /// The peer netmap.
     pub netmap: Netmap,
     /// The UDP socket for QUIC.
+    ///
+    /// The node binds this address when `listen_socket` is `None`.
     pub listen: SocketAddr,
+    /// A UDP socket that is already bound.
+    ///
+    /// `Some`: the node uses this socket. The node does not bind `listen`.
+    /// The node daemon sets `None` and binds `listen`.
+    /// A test sets `Some` so the port stays reserved until the node takes the socket.
+    pub listen_socket: Option<UdpSocket>,
     /// The state directory. The default is `/var/lib/orblx`.
     pub state_dir: PathBuf,
     /// Renews the node SVID. `None` keeps the file certificate.
@@ -199,7 +207,13 @@ pub struct NodeRequest {
     ///
     /// `None` does not open the metrics port.
     /// The default command uses `127.0.0.1:9464`.
+    /// The node ignores this address when `metrics_listener` is `Some`.
     pub metrics: Option<SocketAddr>,
+    /// A metrics listener that is already bound.
+    ///
+    /// `Some`: the node serves metrics on this listener. The node does not bind `metrics`.
+    /// The node daemon sets `None`.
+    pub metrics_listener: Option<TcpListener>,
     /// The receiver packet filter (W24).
     ///
     /// `None` keeps the old datapath. The node does not check the packet port.
@@ -724,7 +738,10 @@ async fn run_mesh_inner(
     let netmap_path = request.netmap_path.clone();
     let visibility = Arc::clone(&request.visibility);
     let bind_at = Instant::now();
-    let endpoint = Arc::new(HelloEndpoint::bind_node(request.config, request.listen)?);
+    let endpoint = Arc::new(match request.listen_socket.take() {
+        Some(socket) => HelloEndpoint::bind_node_socket(request.config, socket)?,
+        None => HelloEndpoint::bind_node(request.config, request.listen)?,
+    });
     let listened_at = Instant::now();
     let listened_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -833,10 +850,10 @@ async fn run_mesh_inner(
     if let Some(task) = crate::soak::spawn_runtime_watchdog() {
         tasks.push(task);
     }
-    if let Some(addr) = request.metrics {
+    if request.metrics_listener.is_some() || request.metrics.is_some() {
         let metrics_peers = Arc::clone(&peers);
         let metrics_counters = Arc::clone(&counters);
-        match orblx_audit::spawn_metrics_server(addr, move || {
+        let metrics_render = move || {
             let sessions = lock(&metrics_peers)
                 .iter()
                 .filter(|peer| peer.session)
@@ -861,9 +878,17 @@ async fn run_mesh_inner(
                     metrics_counters.dials.load(Ordering::Relaxed)
                 ),
             )
-        }) {
-            Ok(bound) => println!("metrics {bound}"),
-            Err(err) => eprintln!("{err}"),
+        };
+        if let Some(listener) = request.metrics_listener.take() {
+            match orblx_audit::spawn_metrics_listener(listener, metrics_render) {
+                Ok(bound) => println!("metrics {bound}"),
+                Err(err) => eprintln!("{err}"),
+            }
+        } else if let Some(addr) = request.metrics {
+            match orblx_audit::spawn_metrics_server(addr, metrics_render) {
+                Ok(bound) => println!("metrics {bound}"),
+                Err(err) => eprintln!("{err}"),
+            }
         }
     }
     apply_lock_allow(&mesh);

@@ -1,14 +1,15 @@
 use std::collections::HashSet;
 use std::fs;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_crypto::{mac_input, ticket_mac, TicketKey, TicketRing};
 use orblx_datapath::{
-    ipv4_packet, run_memory_node, AllowPeers, HelloEndpoint, ListenEvent, MemoryDevice, Netmap,
-    NodeRequest, RenewedLeaf, RenewedTicket, SvidRenewer, NODE_STATUS_FILE,
+    ipv4_packet, reserve_tcp_listeners, reserve_udp_sockets, run_memory_node, AllowPeers,
+    HelloEndpoint, ListenEvent, MemoryDevice, Netmap, NodeRequest, RenewedLeaf, RenewedTicket,
+    SvidRenewer, NODE_STATUS_FILE,
 };
 use orblx_identity::{
     decode_certificate_pem, leaf_validity, sign_ticket, SpiffeId, TicketClaims, TicketFlags,
@@ -48,9 +49,28 @@ fn hex(bytes: &[u8]) -> String {
     text
 }
 
-fn free_port() -> u16 {
-    let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    socket.local_addr().unwrap().port()
+struct ReservedUdp {
+    socket_a: UdpSocket,
+    socket_b: UdpSocket,
+    port_a: u16,
+    port_b: u16,
+}
+
+/// Bind two UDP sockets together and keep both sockets.
+///
+/// The ports differ. Give each socket to one node.
+fn reserve_udp_pair() -> ReservedUdp {
+    let mut sockets = reserve_udp_sockets(2);
+    let socket_b = sockets.pop().unwrap();
+    let socket_a = sockets.pop().unwrap();
+    let port_a = socket_a.local_addr().unwrap().port();
+    let port_b = socket_b.local_addr().unwrap().port();
+    ReservedUdp {
+        socket_a,
+        socket_b,
+        port_a,
+        port_b,
+    }
 }
 
 fn unix(now: SystemTime) -> u64 {
@@ -128,8 +148,9 @@ async fn session_stays_up_for_three_svid_lifetimes() {
         .unwrap();
     let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
     let issued_at = Instant::now();
-    let port_a = free_port();
-    let port_b = free_port();
+    let udp = reserve_udp_pair();
+    let port_a = udp.port_a;
+    let port_b = udp.port_b;
     let enrolled_a = client::enroll_with_token(
         addr,
         "coord",
@@ -184,7 +205,7 @@ async fn session_stays_up_for_three_svid_lifetimes() {
         node_request(
             config_a,
             map_a,
-            port_a,
+            Some(udp.socket_a),
             node_a.0.clone(),
             renewer(
                 addr,
@@ -203,7 +224,7 @@ async fn session_stays_up_for_three_svid_lifetimes() {
         node_request(
             config_b,
             map_b,
-            port_b,
+            Some(udp.socket_b),
             node_b.0.clone(),
             renewer(
                 addr,
@@ -403,8 +424,9 @@ async fn the_coordinator_ticket_keeps_the_path_up_across_svid_renewals() {
         .await
         .unwrap();
     let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
-    let port_a = free_port();
-    let port_b = free_port();
+    let udp = reserve_udp_pair();
+    let port_a = udp.port_a;
+    let port_b = udp.port_b;
     let enroll = |name: &'static str, secret: String, port: u16| {
         let bundle = bundle.clone();
         async move {
@@ -443,7 +465,7 @@ async fn the_coordinator_ticket_keeps_the_path_up_across_svid_renewals() {
         node_request(
             config_a,
             map_a,
-            port_a,
+            Some(udp.socket_a),
             node_a.0.clone(),
             renewer_with_coord_ticket(
                 addr,
@@ -462,7 +484,7 @@ async fn the_coordinator_ticket_keeps_the_path_up_across_svid_renewals() {
         node_request(
             config_b,
             map_b,
-            port_b,
+            Some(udp.socket_b),
             node_b.0.clone(),
             renewer_with_coord_ticket(
                 addr,
@@ -588,9 +610,11 @@ async fn data_stops_at_the_deadline_when_the_renewal_keeps_failing_and_the_link_
         .await
         .unwrap();
     let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
-    let port_a = free_port();
-    let port_b = free_port();
-    let metrics_a = SocketAddr::from((Ipv4Addr::LOCALHOST, free_tcp_port()));
+    let udp = reserve_udp_pair();
+    let port_a = udp.port_a;
+    let port_b = udp.port_b;
+    let metrics_listener = reserve_tcp_listeners(1).pop().unwrap();
+    let metrics_a = metrics_listener.local_addr().unwrap();
     let enroll = |name: &'static str, secret: String, port: u16| {
         let bundle = bundle.clone();
         async move {
@@ -634,8 +658,15 @@ async fn data_stops_at_the_deadline_when_the_renewal_keeps_failing_and_the_link_
     let (a_out_tx, mut a_out_rx) = mpsc::channel(64);
     let (b_in_tx, b_in_rx) = mpsc::channel(64);
     let (b_out_tx, mut b_out_rx) = mpsc::channel(64);
-    let mut request_a = node_request(config_a, map_a, port_a, node_a.0.clone(), failing, stop_a);
-    request_a.metrics = Some(metrics_a);
+    let mut request_a = node_request(
+        config_a,
+        map_a,
+        Some(udp.socket_a),
+        node_a.0.clone(),
+        failing,
+        stop_a,
+    );
+    request_a.metrics_listener = Some(metrics_listener);
     let task_a = tokio::spawn(run_memory_node(
         request_a,
         MemoryDevice {
@@ -647,7 +678,7 @@ async fn data_stops_at_the_deadline_when_the_renewal_keeps_failing_and_the_link_
         node_request(
             config_b,
             map_b,
-            port_b,
+            Some(udp.socket_b),
             node_b.0.clone(),
             renewer_with_coord_ticket(addr, bundle.clone(), node_b.0.clone(), Arc::clone(&calls_b)),
             stop_b,
@@ -777,11 +808,6 @@ async fn dial_attempts(metrics: SocketAddr) -> u64 {
     .unwrap_or(0)
 }
 
-fn free_tcp_port() -> u16 {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    listener.local_addr().unwrap().port()
-}
-
 /// The node config from the coordinator ticket, as `ticket_load::load_hello_config` builds it.
 fn coordinator_ticket_config(
     enrolled: &crate::EnrollResult,
@@ -863,8 +889,9 @@ async fn late_peer_case(
         .await
         .unwrap();
     let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
-    let port_a = free_port();
-    let port_b = free_port();
+    let udp = reserve_udp_pair();
+    let port_a = udp.port_a;
+    let port_b = udp.port_b;
     let token_a = coord.create_token(Duration::from_secs(600)).unwrap();
     let enrolled_a = client::enroll_with_token(
         addr,
@@ -904,7 +931,7 @@ async fn late_peer_case(
         node_request(
             config_a,
             map_a,
-            port_a,
+            Some(udp.socket_a),
             node_a.0.clone(),
             renewer(
                 addr,
@@ -974,7 +1001,7 @@ async fn late_peer_case(
     let mut request_b = node_request(
         config_b,
         map_b,
-        port_b,
+        Some(udp.socket_b),
         node_b.0.clone(),
         renewer(
             addr,
@@ -1259,8 +1286,8 @@ async fn startup_cost_once() -> StartupPhases {
     )
     .unwrap();
     let ring = TicketRing::single(ticket_key, &[7; 32]).unwrap();
-    // Node b binds port 0 itself and reports the real port in the listen event. A port from
-    // free_port() is free only until its socket drops, and a parallel test can take it then
+    // Node b binds port 0 itself and reports the real port in the listen event. A port is free
+    // after its socket drops, and a parallel test can take it then
     // (CI startup-cost run 41138247996: "node b ended before its listener started").
     // Node b has no peer here, so no node dials the endpoint that it enrolls with.
     let unused_endpoint = "127.0.0.1:9";
@@ -1290,7 +1317,7 @@ async fn startup_cost_once() -> StartupPhases {
     let mut request = node_request(
         config,
         map,
-        0,
+        None,
         node_dir.0.clone(),
         renewer(
             addr,
@@ -1373,7 +1400,9 @@ async fn a_netmap_file_written_before_the_watcher_starts_is_applied() {
         .await
         .unwrap();
     let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
-    let (port_a, port_b) = (free_port(), free_port());
+    let udp = reserve_udp_pair();
+    let port_a = udp.port_a;
+    let port_b = udp.port_b;
     let mut enrolled = Vec::new();
     for (name, port) in [("a", port_a), ("b", port_b)] {
         let token = coord.create_token(Duration::from_secs(600)).unwrap();
@@ -1441,7 +1470,7 @@ async fn a_netmap_file_written_before_the_watcher_starts_is_applied() {
     let mut request_a = node_request(
         config_a,
         map_a,
-        port_a,
+        Some(udp.socket_a),
         node_a.0.clone(),
         renew(&node_a.0),
         stop_a,
@@ -1458,7 +1487,7 @@ async fn a_netmap_file_written_before_the_watcher_starts_is_applied() {
         node_request(
             config_b,
             map_b,
-            port_b,
+            Some(udp.socket_b),
             node_b.0.clone(),
             renew(&node_b.0),
             stop_b,
@@ -1561,10 +1590,18 @@ async fn a_dial_to_a_peer_that_listens_late_ends_soon_after_it_listens() {
     )
     .unwrap();
     let ring = TicketRing::single(ticket_key, &[9; 32]).unwrap();
+    // One allocation binds the enroll sockets and the listener socket together.
+    // The listener socket stays bound until the late listener takes it.
+    let mut reserved = reserve_udp_sockets(3);
+    let listener_socket = reserved.pop().unwrap();
+    let target = listener_socket.local_addr().unwrap();
+    let enroll_ports: Vec<u16> = reserved
+        .iter()
+        .map(|socket| socket.local_addr().unwrap().port())
+        .collect();
     let mut configs = Vec::new();
-    for name in ["a", "b"] {
+    for (name, port) in [("a", enroll_ports[0]), ("b", enroll_ports[1])] {
         let token = coord.create_token(Duration::from_secs(600)).unwrap();
-        let port = free_port();
         let enrolled = client::enroll_with_token(
             addr,
             "coord",
@@ -1580,17 +1617,16 @@ async fn a_dial_to_a_peer_that_listens_late_ends_soon_after_it_listens() {
             &enrolled, &trust, &signer, &mac_key, &ring, now,
         ));
     }
+    drop(reserved);
     let config_b = configs.pop().unwrap();
     let config_a = configs.pop().unwrap();
     let dialer = Arc::new(
         HelloEndpoint::bind_node(config_a, SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap(),
     );
     let late = Duration::from_millis(1_200);
-    let port_b = free_port();
-    let target = SocketAddr::from((Ipv4Addr::LOCALHOST, port_b));
     let listener = tokio::spawn(async move {
         tokio::time::sleep(late).await;
-        let endpoint = HelloEndpoint::bind_node(config_b, target).unwrap();
+        let endpoint = HelloEndpoint::bind_node_socket(config_b, listener_socket).unwrap();
         let listening = Instant::now();
         let session = endpoint.accept_one().await.unwrap();
         (listening, session, endpoint)
@@ -1634,8 +1670,9 @@ async fn late_listener_case(tag: &str, late: Duration) -> Option<Duration> {
         .await
         .unwrap();
     let bundle = fs::read_to_string(scratch.0.join("trust-bundle.pem")).unwrap();
-    let port_a = free_port();
-    let port_b = free_port();
+    let udp = reserve_udp_pair();
+    let port_a = udp.port_a;
+    let port_b = udp.port_b;
     let mut enrolled = Vec::new();
     for (name, port) in [("a", port_a), ("b", port_b)] {
         let token = coord.create_token(Duration::from_secs(600)).unwrap();
@@ -1681,7 +1718,7 @@ async fn late_listener_case(tag: &str, late: Duration) -> Option<Duration> {
         node_request(
             config_a,
             map_a,
-            port_a,
+            Some(udp.socket_a),
             node_a.0.clone(),
             renewer(
                 addr,
@@ -1702,7 +1739,7 @@ async fn late_listener_case(tag: &str, late: Duration) -> Option<Duration> {
         node_request(
             config_b,
             map_b,
-            port_b,
+            Some(udp.socket_b),
             node_b.0.clone(),
             renewer(
                 addr,
@@ -1949,15 +1986,22 @@ fn renewer_with_coord_ticket(
 fn node_request(
     config: orblx_datapath::HelloConfig,
     netmap: Netmap,
-    port: u16,
+    socket: Option<UdpSocket>,
     state_dir: PathBuf,
     renew: SvidRenewer,
     stop: watch::Receiver<bool>,
 ) -> NodeRequest {
+    // `None` binds port 0. The node reports the bound port.
+    // `Some` keeps that socket until the node takes it.
+    let listen = match &socket {
+        Some(bound) => bound.local_addr().unwrap(),
+        None => SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+    };
     NodeRequest {
         config,
         netmap,
-        listen: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        listen,
+        listen_socket: socket,
         netmap_path: state_dir.join("netmap.json"),
         netmap_text: None,
         state_dir,
@@ -1974,6 +2018,7 @@ fn node_request(
         on_ready: None,
         on_listen: None,
         metrics: None,
+        metrics_listener: None,
         filter: None,
     }
 }

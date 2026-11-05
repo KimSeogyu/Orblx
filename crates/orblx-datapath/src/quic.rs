@@ -983,6 +983,53 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     Arc::new(transport)
 }
 
+impl HelloEndpoint {
+    /// Build a node socket on a UDP socket the caller already owns.
+    ///
+    /// Call this function inside a Tokio runtime.
+    /// The function sets the socket to nonblocking mode.
+    /// The node accepts peers and dials peers on this socket.
+    /// `bind_node` binds a new socket. This function keeps the caller's socket.
+    ///
+    /// This function stays below `transport_config`. The idle-timeout log names that line.
+    pub fn bind_node_socket(
+        config: HelloConfig,
+        socket: std::net::UdpSocket,
+    ) -> Result<Self, HelloError> {
+        let _ = socket.set_read_timeout(None);
+        socket.set_nonblocking(true).map_err(io_error)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| HelloError::Quic("The call is outside a Tokio runtime.".to_string()))?;
+        let (server_config, auth) = server_rustls(&config)?;
+        let (client_config, _) = client_rustls(&config)?;
+        let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(server_config)
+            .map_err(|err| HelloError::Tls(err.to_string()))?;
+        let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+        server.transport_config(transport_config());
+        let server = Arc::new(server);
+        let mut endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(quinn::ServerConfig::clone(&server)),
+            socket,
+            runtime,
+        )
+        .map_err(io_error)?;
+        let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client_config)
+            .map_err(|err| HelloError::Tls(err.to_string()))?;
+        let mut client = quinn::ClientConfig::new(Arc::new(quic_client));
+        client.transport_config(transport_config());
+        endpoint.set_default_client_config(client.clone());
+        let presented = Presented::from_config(&config);
+        Ok(Self::assemble(
+            endpoint,
+            auth,
+            Some(server),
+            Some(client),
+            presented,
+        ))
+    }
+}
+
 fn server_rustls(config: &HelloConfig) -> Result<(rustls::ServerConfig, Auth), HelloError> {
     let provider = crypto_provider();
     let verifier = Arc::new(PresentedLeafVerifier {
