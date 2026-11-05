@@ -1885,9 +1885,17 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
     } = io;
     // B2 (W25-45): close the session at its deadline. A renewal normally replaces the link
     // before this time. When the renewal keeps failing, the session ends here, and the
-    // peer refuses DATA after the deadline.
-    let at_deadline = tokio::time::sleep_until(deadline_instant(deadline, SystemTime::now()));
+    // peer refuses DATA after the deadline. The send paths check the time too: after a host
+    // stall, `select!` can pick a ready send branch before the timer branch.
+    let deadline_at = deadline_instant(deadline, SystemTime::now());
+    let at_deadline = tokio::time::sleep_until(deadline_at);
     tokio::pin!(at_deadline);
+    let close_at_deadline = || {
+        println!(
+            "The session with {peer} reached its deadline (ticket or certificate end). The node closes it."
+        );
+        tr!("{label} session_end reason=deadline");
+    };
     let mut first_rx = true;
     let mut first_tx = true;
     // The queue is open while this link is the live link for the peer.
@@ -1902,6 +1910,10 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
             tr!("{label} session_end reason=drained");
             return;
         }
+        if tokio::time::Instant::now() >= deadline_at {
+            close_at_deadline();
+            return;
+        }
         tokio::select! {
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
@@ -1910,10 +1922,7 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                 }
             }
             () = &mut at_deadline => {
-                println!(
-                    "The session with {peer} reached its deadline (ticket or certificate end). The node closes it."
-                );
-                tr!("{label} session_end reason=deadline");
+                close_at_deadline();
                 return;
             }
             changed = ask_rekey.changed(), if tx_open && ask_open => {
@@ -1948,6 +1957,10 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     tr!("{label} first_tx");
                     first_tx = false;
                 }
+                if tokio::time::Instant::now() >= deadline_at {
+                    close_at_deadline();
+                    return;
+                }
                 if sender.send_ipv4(&packet).await.is_err() {
                     tr!("{label} session_end reason=send_err");
                     return;
@@ -1978,6 +1991,10 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                                 }
                                 match inbound_action(&packet, overlay) {
                                     InboundAction::Reply(reply) if tx_open => {
+                                        if tokio::time::Instant::now() >= deadline_at {
+                                            close_at_deadline();
+                                            return;
+                                        }
                                         if sender.send_ipv4(&reply).await.is_err() {
                                             return;
                                         }
