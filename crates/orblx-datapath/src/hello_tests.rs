@@ -549,6 +549,13 @@ fn ticket_acl_drops_bad_tickets_and_allows_a_valid_ticket() {
         ticket_failure(gate.payload_from_data(&frame, now, &deny).unwrap_err()),
         CryptoError::Identity(IdentityError::Revoked)
     );
+
+    // W25-38: the set for a deny file that failed refuses the ticket and each frame.
+    let refuse = DenySet::refuse_all();
+    assert!(gate
+        .admit_ticket(&ring, &good.bytes, &good.mac, now, &refuse)
+        .is_err());
+    assert!(gate.payload_from_data(&frame, now, &refuse).is_err());
 }
 
 /// One bound gate for the W25-45 window tests: the peer leaf lives `cert_secs`.
@@ -1563,6 +1570,339 @@ fn a_failed_tun_open_leaves_the_state_directory_unchanged() {
     let after = snapshot(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(before, after, "a failed up changed the state directory");
+}
+
+/// W25-38: the deny file of a node with a valid list, as the node reload loop reads it.
+const W25_38_VALID: &str = r#"{"version":1,"generated_at":1,"revoked_uris":["spiffe://orblx.local/user/w25-38-revoked"],"revoked_ticket_nonces":[]}"#;
+
+/// Damage the deny file in one of the four ways of the W25-38 gate.
+fn w25_38_damage(path: &std::path::Path, kind: &str) {
+    match kind {
+        "corrupt" => std::fs::write(path, b"not json {").unwrap(),
+        "truncated" => {
+            std::fs::write(path, &W25_38_VALID.as_bytes()[..W25_38_VALID.len() / 2]).unwrap()
+        }
+        "missing" => std::fs::remove_file(path).unwrap(),
+        "unreadable" => {
+            std::fs::remove_file(path).unwrap();
+            std::fs::create_dir(path).unwrap();
+        }
+        other => panic!("unknown damage kind {other}"),
+    }
+}
+
+/// Do one reload as the node reload loop does it, and apply the result to the endpoint.
+fn w25_38_reload(
+    cache: &mut orblx_identity::DenyCache,
+    dir: &std::path::Path,
+    endpoint: &HelloEndpoint,
+) -> orblx_identity::DenyReload {
+    let reload = cache.reload(dir);
+    if !matches!(reload, orblx_identity::DenyReload::Same) {
+        endpoint.replace_deny(cache.set().clone());
+    }
+    reload
+}
+
+/// W25-38 gate (datapath): a corrupt, truncated, missing (after enroll) or unreadable
+/// deny file refuses each new QUIC session. A valid deny file does not change the
+/// mesh traffic.
+#[tokio::test]
+async fn w25_38_new_quic_sessions_refuse_when_the_deny_file_is_corrupt_truncated_missing_or_unreadable(
+) {
+    tokio::time::timeout(Duration::from_secs(60), w25_38_quic_cases())
+        .await
+        .expect("the W25-38 datapath test timed out");
+}
+
+async fn w25_38_quic_cases() {
+    let dir = std::env::temp_dir().join(format!(
+        "orblx-w25-38-quic-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(orblx_identity::ENROLL_MARKER_FILE), "server\n").unwrap();
+    let path = dir.join(orblx_identity::DENY_FILE);
+    std::fs::write(&path, W25_38_VALID).unwrap();
+
+    let now = SystemTime::now();
+    let (_ca, pair) = issue_pair(now);
+    let server = Arc::new(HelloEndpoint::bind_server(pair.server.clone(), loopback(0)).unwrap());
+    let addr = server.local_addr().unwrap();
+    let mut cache = orblx_identity::DenyCache::with_set(server.deny_set());
+    assert_eq!(
+        w25_38_reload(&mut cache, &dir, &server),
+        orblx_identity::DenyReload::Changed
+    );
+
+    let mut accepted_after_damage = 0;
+    for kind in ["corrupt", "truncated", "missing", "unreadable"] {
+        // A valid deny file: the session and its traffic are as before.
+        w25_38_session_ok(&server, addr, pair.client.clone(), &pair.client_id).await;
+
+        w25_38_damage(&path, kind);
+        let reload = w25_38_reload(&mut cache, &dir, &server);
+        assert!(
+            matches!(
+                reload,
+                orblx_identity::DenyReload::Stale { first: true, .. }
+            ),
+            "{kind}: the reload did not go stale: {reload:?}"
+        );
+        assert_eq!(server.deny_set().version(), Some(1), "{kind}");
+        assert!(server.denies(&pair.client_id), "{kind}");
+        let accept = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.accept_one().await })
+        };
+        let client = HelloEndpoint::bind_client(pair.client.clone(), loopback(0)).unwrap();
+        let connect = tokio::spawn(async move { client.connect_one(addr).await });
+        match accept.await.unwrap() {
+            Ok(_) => accepted_after_damage += 1,
+            Err(err) => {
+                let text = err.to_string();
+                assert!(!text.is_empty(), "{kind}");
+            }
+        }
+        connect.abort();
+
+        // The node gets a valid deny file again. New sessions work again.
+        if path.is_dir() {
+            std::fs::remove_dir(&path).unwrap();
+        }
+        std::fs::write(&path, W25_38_VALID).unwrap();
+        assert_eq!(
+            w25_38_reload(&mut cache, &dir, &server),
+            orblx_identity::DenyReload::Changed,
+            "{kind}"
+        );
+        assert!(!server.denies(&pair.client_id), "{kind}");
+    }
+    w25_38_session_ok(&server, addr, pair.client.clone(), &pair.client_id).await;
+    assert_eq!(
+        accepted_after_damage, 0,
+        "a damaged deny file accepted a session"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+async fn w25_38_session_ok(
+    server: &Arc<HelloEndpoint>,
+    addr: SocketAddr,
+    client: HelloConfig,
+    client_id: &SpiffeId,
+) {
+    let packet = sample_packet();
+    let expected = packet.clone();
+    let accept = {
+        let server = Arc::clone(server);
+        tokio::spawn(async move {
+            let mut session = server.accept_one().await.unwrap();
+            let frame = session.recv_data_frame().await.unwrap();
+            assert_eq!(frame.payload, expected);
+            session.peer_id().clone()
+        })
+    };
+    let client = HelloEndpoint::bind_client(client, loopback(0)).unwrap();
+    let mut session = client.connect_one(addr).await.unwrap();
+    session.send_ipv4(&packet).await.unwrap();
+    assert_eq!(&accept.await.unwrap(), client_id);
+}
+
+/// One memory node on its own thread (W25-38 tests).
+struct W2538Node {
+    stop: watch::Sender<bool>,
+    /// Packets from the host of the node into the mesh.
+    from_host: mpsc::Sender<Vec<u8>>,
+    /// Packets from the mesh to the host of the node.
+    to_host: mpsc::Receiver<Vec<u8>>,
+    thread: thread::JoinHandle<()>,
+}
+
+/// Start one memory node on its own thread.
+fn w25_38_memory_node(
+    config: HelloConfig,
+    netmap: Netmap,
+    listen: SocketAddr,
+    state_dir: PathBuf,
+) -> W2538Node {
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let (from_tx, from_rx) = mpsc::channel(64);
+    let (to_tx, to_rx) = mpsc::channel(64);
+    let node = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let _ = crate::run_memory_node(
+                NodeRequest {
+                    config,
+                    netmap,
+                    listen,
+                    state_dir,
+                    renew: None,
+                    stop: Some(stop_rx),
+                    accept_routes: false,
+                    forward_routes: Vec::new(),
+                    forward_exit: false,
+                    exit_node: None,
+                    allow_lan: false,
+                    underlay: Vec::new(),
+                    relay: None,
+                    netmap_path: PathBuf::from("netmap.json"),
+                    netmap_text: None,
+                    visibility: Arc::new(AllowPeers),
+                    on_ready: None,
+                    on_listen: None,
+                    metrics: None,
+                    filter: None,
+                },
+                MemoryDevice {
+                    from_tun: from_rx,
+                    to_tun: to_tx,
+                },
+            )
+            .await;
+        });
+    });
+    W2538Node {
+        stop: stop_tx,
+        from_host: from_tx,
+        to_host: to_rx,
+        thread: node,
+    }
+}
+
+/// Send ICMP echo requests from the host of node a to the overlay IP of node b until
+/// a reply comes back to the host of node a, or until `limit`. Return true for a reply.
+fn w25_38_echo_ok(
+    from_tx: &mpsc::Sender<Vec<u8>>,
+    to_rx: &mut mpsc::Receiver<Vec<u8>>,
+    seq: u16,
+    limit: Duration,
+) -> bool {
+    let local = Ipv4Addr::new(100, 64, 0, 1);
+    let peer = Ipv4Addr::new(100, 64, 0, 2);
+    let request = crate::ipv4::icmp_echo_request(local, peer, 0x3838, seq, b"w25-38").unwrap();
+    let end = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < end {
+        let _ = from_tx.try_send(request.clone());
+        for _ in 0..10 {
+            while let Ok(packet) = to_rx.try_recv() {
+                if crate::ipv4::is_icmp_echo_reply(&packet, peer, local, 0x3838, seq) {
+                    return true;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    false
+}
+
+/// W25-38 gate 0: `orblx ping b` on node a (a second process with the SVID of a) must
+/// not cut the path between the running nodes a and b.
+///
+/// Node a dials node b. The ping process also dials b with the SVID of a, and b
+/// accepts it as the new session of a. After the ping process stops, the running
+/// node a must again get replies from b.
+///
+/// The link of a is older than `ORPHAN_LIMIT` (5 s), so a asks for a new session at
+/// once. The path must come back in less than the limit.
+#[test]
+fn w25_38_a_ping_process_with_the_node_svid_does_not_cut_the_node_path() {
+    w25_38_same_svid_ping_case(Duration::from_secs(6), Duration::from_secs(3));
+}
+
+/// W25-38: the same case with a young link. The link of a only waits for
+/// `ORPHAN_LIMIT` (5 s), then the session ends and a dials again.
+#[test]
+fn w25_38_a_young_link_that_lost_its_peer_ends_after_the_orphan_limit() {
+    w25_38_same_svid_ping_case(Duration::ZERO, Duration::from_secs(15));
+}
+
+fn w25_38_same_svid_ping_case(settle: Duration, after_limit: Duration) {
+    let now = SystemTime::now();
+    let (_ca, pair) = issue_node_pair(now);
+    let a_listen = free_udp();
+    let b_listen = free_udp();
+    let base = std::env::temp_dir().join(format!(
+        "orblx-w25-38-same-svid-{}-{}",
+        std::process::id(),
+        b_listen.port()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    let a_dir = base.join("a");
+    let b_dir = base.join("b");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let a_netmap = Netmap::from_slice(
+        format!(
+            r#"{{
+            "version": 1,
+            "self": {{"name": "a", "overlay_ip": "100.64.0.1"}},
+            "peers": [{{
+                "name": "b",
+                "overlay_ip": "100.64.0.2",
+                "svid": "spiffe://orblx.local/node/b",
+                "endpoints": ["{b_listen}"],
+                "routes": []
+            }}]
+        }}"#
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let b_netmap = Netmap::from_slice(
+        format!(
+            r#"{{
+            "version": 1,
+            "self": {{"name": "b", "overlay_ip": "100.64.0.2"}},
+            "peers": [{{
+                "name": "a",
+                "overlay_ip": "100.64.0.1",
+                "svid": "spiffe://orblx.local/node/a",
+                "endpoints": ["{a_listen}"],
+                "routes": []
+            }}]
+        }}"#
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let b_node = w25_38_memory_node(pair.server.clone(), b_netmap, b_listen, b_dir);
+    let mut a_node = w25_38_memory_node(pair.client.clone(), a_netmap, a_listen, a_dir);
+    let before = w25_38_echo_ok(
+        &a_node.from_host,
+        &mut a_node.to_host,
+        1,
+        Duration::from_secs(10),
+    );
+    std::thread::sleep(settle);
+    // The ping process: one new QUIC session to b with the SVID of node a.
+    let ping = measure_hello_rtt(
+        pair.client.clone(),
+        b_listen,
+        Duration::from_secs(5),
+        Ipv4Addr::new(100, 64, 0, 1),
+        Ipv4Addr::new(100, 64, 0, 2),
+    );
+    let after = w25_38_echo_ok(&a_node.from_host, &mut a_node.to_host, 2, after_limit);
+    let _ = a_node.stop.send(true);
+    let _ = b_node.stop.send(true);
+    let _ = a_node.thread.join();
+    let _ = b_node.thread.join();
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(
+        before,
+        "node a got no echo reply from b before the ping process"
+    );
+    assert!(ping.is_ok(), "the ping process failed: {ping:?}");
+    assert!(
+        after,
+        "node a got no echo reply from b in {after_limit:?} after the ping process stopped"
+    );
 }
 
 /// The session rule is strict. `now == end` is past. `now == end - 1 s` is not past.

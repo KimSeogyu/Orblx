@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use orblx_coord::fetch_deny_blocking;
 use orblx_datapath::{measure_hello_rtt, Netmap};
-use orblx_identity::{DenySet, SpiffeId};
+use orblx_identity::{DenySet, DenyStore, SpiffeId};
 use orblx_relay::{encode_datagram, RelayKind, RelaySessionId};
 
 use super::ticket_load;
@@ -120,7 +120,9 @@ fn run_ping(options: Options) -> Result<(), String> {
         .first()
         .ok_or_else(|| "The peer has no endpoint.".to_string())?;
     let direct = resolve_endpoint(endpoint)?;
-    let config = load_config(&options.state)?;
+    let mut config = load_config(&options.state)?;
+    // W25-38: the hello endpoint uses the same deny set as the check above.
+    config.deny = deny;
     let src = parse_overlay(&netmap.self_node.overlay_ip)?;
     let dst = parse_overlay(&peer.overlay_ip)?;
     if let Ok(elapsed) = measure_hello_rtt(config, direct, options.timeout, src, dst) {
@@ -140,8 +142,12 @@ fn run_ping(options: Options) -> Result<(), String> {
     ))
 }
 
+/// Load the deny set for one ping (W25-38).
+///
+/// The function fails closed. A deny file that is not valid, did not open, or is
+/// missing after enroll stops the ping with an error. With `--coord`, the function
+/// writes the fetched list first. A write error also stops the ping.
 fn load_deny(options: &Options) -> Result<DenySet, String> {
-    let mut deny = DenySet::empty();
     if let Some(coord) = options.coord {
         let bundle_path = options
             .bundle
@@ -151,19 +157,20 @@ fn load_deny(options: &Options) -> Result<DenySet, String> {
             .map_err(|err| format!("The file {} did not open. {err}", bundle_path.display()))?;
         let text = fetch_deny_blocking(coord, &options.coord_name, &bundle, &options.state)
             .map_err(|err| err.to_string())?;
-        let _ = fs::write(options.state.join("deny.json"), text.as_bytes());
-        deny.apply_json(text.as_bytes())
-            .map_err(|_| "The deny document is not valid.".to_string())?;
-        return Ok(deny);
+        match orblx_identity::store_deny_file(&options.state, &text) {
+            Ok(DenyStore::Written | DenyStore::Same) => {}
+            Ok(DenyStore::KeptCurrent { current, offered }) => eprintln!(
+                "The coordinator sent deny list version {offered}. The node keeps version {current}."
+            ),
+            Err(err) => {
+                return Err(format!(
+                    "The node cannot send packets. The node did not write the deny list. {err}"
+                ))
+            }
+        }
     }
-    let path = options.state.join("deny.json");
-    if path.exists() {
-        let bytes = fs::read(&path)
-            .map_err(|err| format!("The file {} did not open. {err}", path.display()))?;
-        deny.apply_json(&bytes)
-            .map_err(|_| "The deny document is not valid.".to_string())?;
-    }
-    Ok(deny)
+    orblx_identity::load_deny_file(&options.state)
+        .map_err(|err| format!("The node cannot send packets. {err}"))
 }
 
 fn load_config(state: &Path) -> Result<orblx_datapath::HelloConfig, String> {
@@ -277,5 +284,49 @@ mod tests {
     fn ping_needs_a_node_name() {
         let err = parse(&["--state".to_string(), "/tmp/a".to_string()]).unwrap_err();
         assert!(err.contains("node name"));
+    }
+
+    /// W25-38: ping refuses when the deny file of an enrolled node is not valid, is
+    /// cut short, is missing, or does not open. It never uses an empty list.
+    #[test]
+    fn w25_38_ping_refuses_when_the_deny_file_is_corrupt_truncated_missing_or_unreadable() {
+        let dir = std::env::temp_dir().join(format!("orblx-ping-w25-38-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(orblx_identity::ENROLL_MARKER_FILE), "a\n").unwrap();
+        let path = dir.join("deny.json");
+        let valid =
+            r#"{"version":1,"generated_at":1,"revoked_uris":[],"revoked_ticket_nonces":[]}"#;
+        let Command::Ping(options) = parse(&[
+            "b".to_string(),
+            "--state".to_string(),
+            dir.display().to_string(),
+        ])
+        .unwrap() else {
+            panic!("the parser did not select ping");
+        };
+        std::fs::write(&path, valid).unwrap();
+        assert_eq!(super::load_deny(&options).unwrap().version(), Some(1));
+        for kind in ["corrupt", "truncated", "missing", "unreadable"] {
+            match kind {
+                "corrupt" => std::fs::write(&path, b"not json {").unwrap(),
+                "truncated" => std::fs::write(&path, &valid.as_bytes()[..valid.len() / 2]).unwrap(),
+                "missing" => std::fs::remove_file(&path).unwrap(),
+                _ => {
+                    std::fs::remove_file(&path).unwrap();
+                    std::fs::create_dir(&path).unwrap();
+                }
+            }
+            let err = super::load_deny(&options).unwrap_err();
+            assert!(
+                err.contains("The node cannot send packets. The deny file"),
+                "{kind}: {err}"
+            );
+            if path.is_dir() {
+                std::fs::remove_dir(&path).unwrap();
+            }
+            std::fs::write(&path, valid).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

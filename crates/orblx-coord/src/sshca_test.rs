@@ -2,8 +2,9 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 use orblx_audit::{verify_config_file, ConfigAction};
 use orblx_identity::{IssueGate, MiniCa, MockOidc, Policy, SpiffeId, MOCK_OIDC_ISSUER};
@@ -535,7 +536,6 @@ fn a_rotation_is_due_after_24_hours_only() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_mtls_path_binds_the_sshsig_to_the_same_connection() {
-    use std::net::{Ipv4Addr, SocketAddr};
     let lab = lab();
     let node_dir = Scratch::new();
     let _ = lab.coord.approve_user_by("oidc:alice", OWNER, lab.now);
@@ -602,4 +602,113 @@ async fn the_mtls_path_binds_the_sshsig_to_the_same_connection() {
     assert!(err.to_string().contains("reason nonce"), "{err}");
     assert_eq!(lab.scratch.ssh_records().len(), 4);
     handle.abort();
+}
+
+/// A stopped coordinator must not hold the SSH certificate request for the QUIC idle timeout.
+///
+/// The connect target is a UDP socket that never reads, so the handshake cannot finish.
+/// The read target accepts the QUIC connection, reads the request, and writes no reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_certificate_request_fails_inside_the_connect_and_read_limits() {
+    let connect_limit = crate::client::SSH_CERT_CONNECT_LIMIT;
+    let read_limit = crate::client::SSH_CERT_READ_LIMIT;
+    // `ssh_gate1` stops the client after 20 s. The request does two reads after the connect.
+    assert!(
+        connect_limit + read_limit + read_limit < Duration::from_secs(20),
+        "connect {connect_limit:?} read {read_limit:?}"
+    );
+
+    let lab = lab();
+    let node_dir = Scratch::new();
+    let _ = lab.coord.approve_user_by("oidc:alice", OWNER, lab.now);
+    let token = lab
+        .oidc
+        .issue_id_token("alice", lab.now, Duration::from_secs(600))
+        .unwrap();
+    lab.coord
+        .enroll_oidc(
+            "alice-laptop",
+            &token,
+            None,
+            &["127.0.0.1:443".to_string()],
+            &[],
+            lab.now,
+        )
+        .unwrap()
+        .write_state(&node_dir.0)
+        .unwrap();
+    let bundle = fs::read_to_string(lab.scratch.0.join("trust-bundle.pem")).unwrap();
+
+    // The socket stays open so the kernel does not answer with ICMP port unreachable.
+    let blackhole = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+    let (err, elapsed) =
+        ssh_cert_blocking_error(blackhole.local_addr().unwrap(), &bundle, &node_dir.0);
+    assert!(matches!(err, crate::CoordError::Tls(_)), "{err:?}");
+    assert_eq!(err.public_text(), "The coordinator request failed.");
+    assert!(
+        elapsed + Duration::from_millis(50) >= connect_limit,
+        "connect returned in {elapsed:?}, before the connect limit {connect_limit:?}"
+    );
+    assert!(
+        elapsed < connect_limit + Duration::from_secs(2),
+        "connect returned in {elapsed:?}, after the connect limit {connect_limit:?}"
+    );
+
+    let stall = spawn_coord_that_accepts_and_does_not_answer(lab.coord.tls_material().unwrap());
+    let (err, elapsed) = ssh_cert_blocking_error(stall, &bundle, &node_dir.0);
+    assert!(matches!(err, crate::CoordError::Tls(_)), "{err:?}");
+    assert_eq!(err.public_text(), "The coordinator request failed.");
+    assert!(
+        elapsed + Duration::from_millis(50) >= read_limit,
+        "read returned in {elapsed:?}, before the read limit {read_limit:?}"
+    );
+    assert!(
+        elapsed < read_limit + Duration::from_secs(2),
+        "read returned in {elapsed:?}, after the read limit {read_limit:?}"
+    );
+}
+
+/// Call `ssh_cert_request_blocking` on a plain thread, as the SSH client does.
+///
+/// The join has no timer. The connect limit and the read limit inside the request bound it.
+fn ssh_cert_blocking_error(
+    addr: SocketAddr,
+    bundle: &str,
+    node_dir: &Path,
+) -> (crate::CoordError, Duration) {
+    let dir = node_dir.to_path_buf();
+    let bundle = bundle.to_string();
+    let started = Instant::now();
+    let err = std::thread::spawn(move || {
+        let key = new_key();
+        crate::client::ssh_cert_request_blocking(addr, "coord", &bundle, &dir, &key)
+    })
+    .join()
+    .expect("the request thread panicked")
+    .expect_err("the certificate request must fail");
+    (err, started.elapsed())
+}
+
+/// Accept one QUIC connection and one request stream, then write no reply.
+fn spawn_coord_that_accepts_and_does_not_answer(material: crate::state::TlsMaterial) -> SocketAddr {
+    let (endpoint, _cert) =
+        crate::tlsutil::server_endpoint(&material, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .unwrap();
+    let addr = endpoint.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            tokio::spawn(async move {
+                let Ok(connection) = incoming.await else {
+                    return;
+                };
+                let Ok((send, mut recv)) = connection.accept_bi().await else {
+                    return;
+                };
+                let _ = recv.read_to_end(64 * 1024).await;
+                let _reply = send;
+                connection.closed().await;
+            });
+        }
+    });
+    addr
 }

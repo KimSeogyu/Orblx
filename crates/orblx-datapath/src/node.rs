@@ -64,6 +64,16 @@ const STALE_AFTER: Duration = Duration::from_secs(2);
 /// W25 HA subnet routers: a short interval lets a client see a failed router in
 /// [`crate::HA_DEAD_AFTER`] (four intervals). The frame is the same control frame.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(250);
+/// The time that a live link waits for a new session after the peer ended the receive
+/// stream of the link (W25-38).
+///
+/// The peer ends the stream when it accepts a newer session with the same SVID, for
+/// example from an `orblx ping` process on this node. This node did not make that
+/// session, so the link can send but it gets no reply. When the link is older than this
+/// time, it asks for a new session at once. When the link is still the live link after
+/// this time, the session ends and the dial task dials again. Thus two long-running
+/// processes with the same SVID replace each other at most one time in this period.
+const ORPHAN_LIMIT: Duration = Duration::from_secs(5);
 
 static LINK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -390,8 +400,15 @@ fn write_status(path: &Path, text: &str) {
 struct NodeCounters {
     tx: AtomicU64,
     rx: AtomicU64,
+    /// Sessions and frames that the identity, ticket, or deny check refused (W25-38).
+    refused: AtomicU64,
     /// Direct dial attempts to peer endpoints (W25-45: shows that a closed link dials again).
     dials: AtomicU64,
+}
+
+/// True when the identity, the ticket, or the deny check refused a session or a frame.
+fn is_refusal(err: &HelloError) -> bool {
+    matches!(err, HelloError::Identity(_) | HelloError::Ticket(_))
 }
 
 #[derive(Clone)]
@@ -768,6 +785,7 @@ async fn run_mesh_inner(
     let counters = Arc::new(NodeCounters {
         tx: AtomicU64::new(0),
         rx: AtomicU64::new(0),
+        refused: AtomicU64::new(0),
         dials: AtomicU64::new(0),
     });
 
@@ -843,7 +861,7 @@ async fn run_mesh_inner(
                 .count();
             let sessions = u64::try_from(sessions).unwrap_or(u64::MAX);
             format!(
-                "{}{}{}{}",
+                "{}{}{}{}{}",
                 orblx_audit::sample_line(
                     "orblx_node_packets_tx",
                     "counter",
@@ -855,6 +873,11 @@ async fn run_mesh_inner(
                     metrics_counters.rx.load(Ordering::Relaxed)
                 ),
                 orblx_audit::sample_line("orblx_node_sessions", "gauge", sessions),
+                orblx_audit::sample_line(
+                    "orblx_node_refused",
+                    "counter",
+                    metrics_counters.refused.load(Ordering::Relaxed)
+                ),
                 orblx_audit::sample_line(
                     "orblx_node_dial_attempts",
                     "counter",
@@ -879,7 +902,7 @@ async fn run_mesh_inner(
         // The node applies the list only when the file text changes. Thus the
         // tick does not touch the endpoint or the links when nothing changed.
         let mut ticks: u64 = 0;
-        let mut last_text: Option<Vec<u8>> = None;
+        let mut deny_cache = orblx_identity::DenyCache::with_set(deny_endpoint.deny_set());
         let mut last_netmap: Option<Vec<u8>> = None;
         let mut ssh_closed: HashSet<(u64, String)> = HashSet::new();
         loop {
@@ -892,16 +915,34 @@ async fn run_mesh_inner(
                 _ = tick.tick() => {
                     // The read runs on a blocking thread, so a slow disk does not stop
                     // the packet runtime (W25-11).
-                    let path = deny_dir.join("deny.json");
-                    let read = tokio::task::spawn_blocking(move || fs::read(path)).await;
-                    if let Ok(Ok(bytes)) = read {
-                        if last_text.as_deref() != Some(bytes.as_slice()) {
-                            if let Some(deny) = parse_deny(&bytes) {
-                                // Replace first, so a session that starts now uses the new list.
-                                // Then close the open sessions of the denied peers.
-                                deny_endpoint.replace_deny(deny.clone());
-                                close_denied_links(&lock_mesh, &deny);
-                                last_text = Some(bytes);
+                    let dir = Arc::clone(&deny_dir);
+                    let read = tokio::task::spawn_blocking(move || {
+                        orblx_identity::read_deny_file(&dir)
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(orblx_identity::DenyFileError::Unreadable(
+                            deny_dir.join(orblx_identity::DENY_FILE),
+                            std::io::ErrorKind::Other,
+                        ))
+                    });
+                    // W25-38: a deny file that is not valid, did not open, or is missing
+                    // after enroll makes the set stale. The stale set keeps the last good
+                    // entries and refuses new sessions, as the agent guard does. The node
+                    // never uses an empty list in place of such a file.
+                    match deny_cache.apply_read(&deny_dir, read) {
+                        orblx_identity::DenyReload::Same => {}
+                        orblx_identity::DenyReload::Changed => {
+                            // Replace first, so a session that starts now uses the new list.
+                            // Then close the open sessions of the denied peers.
+                            let deny = deny_cache.set().clone();
+                            deny_endpoint.replace_deny(deny.clone());
+                            close_denied_links(&lock_mesh, &deny);
+                        }
+                        orblx_identity::DenyReload::Stale { error, first } => {
+                            if first {
+                                eprintln!("{error} The node refuses new sessions.");
+                                deny_endpoint.replace_deny(deny_cache.set().clone());
                             }
                         }
                     }
@@ -1489,14 +1530,6 @@ fn close_ssh_revoked_links(mesh: &Mesh, netmap: &Netmap, seen: &mut HashSet<(u64
     }
 }
 
-fn parse_deny(bytes: &[u8]) -> Option<DenySet> {
-    let mut deny = DenySet::empty();
-    match deny.apply_json(bytes) {
-        Ok(_) => Some(deny),
-        Err(_) => None,
-    }
-}
-
 async fn accept_loop(mut mesh: Mesh) {
     loop {
         tokio::select! {
@@ -1535,7 +1568,12 @@ async fn accept_loop(mut mesh: Mesh) {
                     // The error is for one connection only. The next accept waits for a new
                     // connection, so the loop does not spin. A pause here would delay each
                     // connection behind it, for example after a peer stops its extra dial attempts.
-                    Err(err) => eprintln!("The node did not accept a peer. {err}"),
+                    Err(err) => {
+                        if is_refusal(&err) {
+                            mesh.counters.refused.fetch_add(1, Ordering::Relaxed);
+                        }
+                        eprintln!("The node did not accept a peer. {err}");
+                    }
                 }
             }
         }
@@ -2079,6 +2117,13 @@ fn next_event(mut receiver: crate::HelloReceiver) -> NextEvent {
     })
 }
 
+async fn poll_slot_sleep(slot: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>) {
+    match slot {
+        Some(sleep) => sleep.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn poll_slot<T>(
     slot: &mut Option<std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>>,
 ) -> T {
@@ -2132,6 +2177,9 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
     let mut ask_open = true;
     let mut rx_next: Option<NextEvent> = Some(next_event(receiver));
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    // W25-38: set when the peer ended the receive stream while this link is live.
+    let mut orphan_end: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    let started = tokio::time::Instant::now();
     // Declared last so a drop during `to_tun.send` still sees the open stall.
     let mut session_end = trace.then(|| crate::soak::SessionEnd {
         peer: peer.clone(),
@@ -2154,6 +2202,13 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     mark_session_end(&mut session_end, "cancel");
                     return;
                 }
+            }
+            () = poll_slot_sleep(&mut orphan_end), if tx_open && orphan_end.is_some() => {
+                // No newer session replaced this link in time. End it, so the dial
+                // task dials again.
+                tr!("{label} session_end reason=orphan");
+                mark_session_end(&mut session_end, "orphan");
+                return;
             }
             () = &mut at_deadline => {
                 close_at_deadline();
@@ -2283,8 +2338,26 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     Err(HelloError::StreamClosed) => {
                         // The peer replaced this session and sent all its frames on it.
                         tr!("{label} rx_end");
+                        if tx_open {
+                            // W25-38: this link is still the live link, so this node did
+                            // not make the newer session. Another process with the same
+                            // SVID made it. The link gets no more replies. When the link
+                            // is old, ask the dial task for a new session now (make
+                            // before break). A young link only waits for the limit, so
+                            // two processes with the same SVID do not dial in a loop.
+                            let old_link = started.elapsed() >= ORPHAN_LIMIT;
+                            tr!("{label} rx_end_while_live ask_now={old_link}");
+                            if old_link {
+                                let next = remote_rekey.borrow().saturating_add(1);
+                                let _ = remote_rekey.send(next);
+                            }
+                            orphan_end = Some(Box::pin(tokio::time::sleep(ORPHAN_LIMIT)));
+                        }
                     }
                     Err(err) => {
+                        if is_refusal(&err) {
+                            counters.refused.fetch_add(1, Ordering::Relaxed);
+                        }
                         tr!("{label} session_end reason=recv_err {err}");
                         if trace {
                             let reason = crate::soak::session_reason(&err);
