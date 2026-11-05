@@ -1898,15 +1898,22 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
     let mut ask_open = true;
     let mut rx_next: Option<NextEvent> = Some(next_event(receiver));
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    // Declared last so a drop during `to_tun.send` still sees the open stall.
+    let mut session_end = trace.then(|| crate::soak::SessionEnd {
+        peer: peer.clone(),
+        reason: String::from("dropped"),
+    });
     loop {
         if tx_done && rx_next.is_none() {
             tr!("{label} session_end reason=drained");
+            mark_session_end(&mut session_end, "drained");
             return;
         }
         tokio::select! {
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
                     tr!("{label} session_end reason=cancel");
+                    mark_session_end(&mut session_end, "cancel");
                     return;
                 }
             }
@@ -1919,11 +1926,13 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                 tr!("{label} send_rekey_req");
                 if sender.send_ctrl(FLAG_REKEY_REQ).await.is_err() {
                     tr!("{label} session_end reason=send_rekey_err");
+                    mark_session_end(&mut session_end, "send_rekey_err");
                     return;
                 }
             }
             _ = keepalive.tick(), if tx_open => {
                 if sender.send_ctrl(0).await.is_err() {
+                    mark_session_end(&mut session_end, "keepalive_err");
                     return;
                 }
             }
@@ -1944,6 +1953,7 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                 }
                 if sender.send_ipv4(&packet).await.is_err() {
                     tr!("{label} session_end reason=send_err");
+                    mark_session_end(&mut session_end, "send_err");
                     return;
                 }
                 counters.tx.fetch_add(1, Ordering::Relaxed);
@@ -1973,6 +1983,7 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                                 match inbound_action(&packet, overlay) {
                                     InboundAction::Reply(reply) if tx_open => {
                                         if sender.send_ipv4(&reply).await.is_err() {
+                                            mark_session_end(&mut session_end, "reply_err");
                                             return;
                                         }
                                         counters.tx.fetch_add(1, Ordering::Relaxed);
@@ -1996,15 +2007,24 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                                         )
                                         .await
                                         {
+                                            mark_session_end(&mut session_end, "to_tun_closed");
                                             return;
                                         }
                                     }
                                 }
                             }
-                            SessionEvent::Keepalive => on_rx(),
+                            SessionEvent::Keepalive => {
+                                on_rx();
+                                if trace {
+                                    crate::soak::note_inbound_during_stall(&peer);
+                                }
+                            }
                             SessionEvent::Rekey => {
                                 tr!("{label} got_rekey_req");
                                 on_rx();
+                                if trace {
+                                    crate::soak::note_inbound_during_stall(&peer);
+                                }
                                 let next = remote_rekey.borrow().saturating_add(1);
                                 let _ = remote_rekey.send(next);
                             }
@@ -2016,11 +2036,22 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                     }
                     Err(err) => {
                         tr!("{label} session_end reason=recv_err {err}");
+                        if trace {
+                            let reason = crate::soak::session_reason(&err);
+                            mark_session_end(&mut session_end, &reason);
+                        }
                         return;
                     }
                 }
             }
         }
+    }
+}
+
+fn mark_session_end(end: &mut Option<crate::soak::SessionEnd>, reason: &str) {
+    if let Some(end) = end.as_mut() {
+        end.reason.clear();
+        end.reason.push_str(reason);
     }
 }
 
