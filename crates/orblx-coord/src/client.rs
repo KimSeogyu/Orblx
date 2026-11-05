@@ -1,5 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
+use std::time::Duration;
 
 use orblx_identity::SpiffeId;
 
@@ -9,7 +10,7 @@ use crate::netmap::{
     SignedNetmap,
 };
 use crate::proto::{self, GrantAsk, Request, Response};
-use crate::state::{read_node_material, EnrollResult, NetmapView, NodeMaterial};
+use crate::state::{read_node_material, EnrollResult, FirstDeny, NetmapView, NodeMaterial};
 use crate::ticket::{decode_hex, decode_ticket_wire, IssuedTicket};
 use crate::tlsutil::{self, ClientTls};
 
@@ -106,7 +107,7 @@ async fn enroll_op(call: EnrollOp<'_>) -> Result<EnrollResult, CoordError> {
         ssh: None,
         unchanged_ok: false,
     };
-    round_trip(
+    let mut result = round_trip(
         call.coord,
         call.coord_name,
         call.bundle_pem,
@@ -115,7 +116,44 @@ async fn enroll_op(call: EnrollOp<'_>) -> Result<EnrollResult, CoordError> {
         None,
         true,
     )
-    .await
+    .await?;
+    result.first_deny =
+        first_deny_after_enroll(call.coord, call.coord_name, call.bundle_pem, &result).await;
+    Ok(result)
+}
+
+/// Fetch the deny list over a new mutual TLS connection with the new SVID (W25-38).
+///
+/// The function runs right after the enroll reply, with no wait for a poll tick. It does
+/// not fail the enroll: on an error the node stays refuse-all, and `orblx up` fetches the
+/// list again.
+async fn first_deny_after_enroll(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    result: &EnrollResult,
+) -> FirstDeny {
+    let cert_at = std::time::Instant::now();
+    let material = NodeMaterial {
+        name: result.name.clone(),
+        certificate_pem: result.certificate_pem.clone(),
+        private_key_pem: result.private_key_pem.clone(),
+        trust_bundle_pem: result.trust_bundle_pem.clone(),
+        netmap_public: result.netmap_public,
+    };
+    match fetch_deny_with(coord, coord_name, bundle_pem, material).await {
+        Ok(text) => match orblx_identity::DenySet::from_json(text.as_bytes()) {
+            Ok(_) => FirstDeny::Fetched { text, cert_at },
+            Err(_) => FirstDeny::Failed {
+                error: "The deny list from the coordinator is not valid.".to_string(),
+                cert_at,
+            },
+        },
+        Err(err) => FirstDeny::Failed {
+            error: err.to_string(),
+            cert_at,
+        },
+    }
 }
 
 /// Enroll with a one-use token.
@@ -172,7 +210,7 @@ pub async fn enroll_with_oidc(input: OidcEnroll<'_>) -> Result<EnrollResult, Coo
         ssh: None,
         unchanged_ok: false,
     };
-    round_trip(
+    let mut result = round_trip(
         input.coord,
         input.coord_name,
         input.bundle_pem,
@@ -181,7 +219,10 @@ pub async fn enroll_with_oidc(input: OidcEnroll<'_>) -> Result<EnrollResult, Coo
         None,
         true,
     )
-    .await
+    .await?;
+    result.first_deny =
+        first_deny_after_enroll(input.coord, input.coord_name, input.bundle_pem, &result).await;
+    Ok(result)
 }
 
 /// Enroll with an ID token.
@@ -582,6 +623,26 @@ pub fn fetch_deny_blocking(
     block_on(fetch_deny(coord, coord_name, bundle_pem, state_dir))
 }
 
+/// Fetch the first deny list of a node right after enroll (W25-38).
+///
+/// The enroll reply has no deny list. After enroll, `node-name` exists and `deny.json`
+/// is missing, so each reader of the node refuses each peer. This function opens a new
+/// mutual TLS connection with the new node SVID in `state_dir`, fetches the deny list
+/// of the node, and writes it with [`orblx_identity::store_deny_file`]. The writer checks
+/// the text and never moves the list back.
+///
+/// On an error the node stays refuse-all. `orblx up` fetches the list again without a
+/// manual step.
+pub fn fetch_first_deny_blocking(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+) -> Result<orblx_identity::DenyStore, CoordError> {
+    let text = fetch_deny_blocking(coord, coord_name, bundle_pem, state_dir)?;
+    orblx_identity::store_deny_file(state_dir, &text).map_err(CoordError::io)
+}
+
 /// Wait for a new deny list of this node (W25-2).
 ///
 /// The coordinator replies at once when the ETag of its deny list for this node is not
@@ -719,6 +780,15 @@ async fn fetch_deny(
     state_dir: &Path,
 ) -> Result<String, CoordError> {
     let material = read_node_material(state_dir)?;
+    fetch_deny_with(coord, coord_name, bundle_pem, material).await
+}
+
+async fn fetch_deny_with(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    material: NodeMaterial,
+) -> Result<String, CoordError> {
     let request = Request {
         op: "deny".to_string(),
         name: material.name.clone(),
@@ -735,8 +805,22 @@ async fn fetch_deny(
         ssh: None,
         unchanged_ok: false,
     };
-    authed_detail(coord, coord_name, bundle_pem, material, request).await
+    tokio::time::timeout(
+        DENY_FETCH_LIMIT,
+        authed_detail(coord, coord_name, bundle_pem, material, request),
+    )
+    .await
+    .map_err(|_| {
+        CoordError::Tls(format!(
+            "The deny fetch timed out. The coordinator did not answer in {} s.",
+            DENY_FETCH_LIMIT.as_secs()
+        ))
+    })?
 }
+
+/// The longest time for one deny fetch (W25-38). Without a limit, a fetch to a stopped
+/// coordinator waits for the QUIC idle timeout (60 s), and the node recovers late.
+pub const DENY_FETCH_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 async fn authed_detail(
     coord: SocketAddr,
@@ -821,6 +905,25 @@ fn response_ok(response: Response) -> Result<Response, CoordError> {
     Ok(response)
 }
 
+/// The longest time to open the QUIC connection for one SSH certificate request.
+///
+/// A stopped coordinator sends no reply. Without this limit the handshake waits for the
+/// QUIC idle timeout (60 s) in `tlsutil::transport_config`.
+pub(crate) const SSH_CERT_CONNECT_LIMIT: Duration = Duration::from_secs(5);
+
+/// The longest time to read one reply of an SSH certificate request.
+///
+/// The client reads the nonce, then the certificate. Each read has this limit.
+pub(crate) const SSH_CERT_READ_LIMIT: Duration = Duration::from_secs(5);
+
+/// A connect or a read that passed its limit.
+///
+/// `CoordError::Tls` prints `The coordinator request failed.` The SSH client prints that
+/// sentence. The thread join in the SSH client has no timer of its own.
+fn request_timed_out(step: &str) -> CoordError {
+    CoordError::Tls(format!("The {step} timed out."))
+}
+
 /// Ask for one SSH user certificate with the node SVID in `state_dir` (W25-31).
 ///
 /// The caller gives the SSH private key. The function signs the TLS exporter of the mTLS
@@ -878,15 +981,19 @@ where
     };
     let endpoint =
         tlsutil::client_endpoint(&client_tls, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
-    let connection = endpoint
+    let connecting = endpoint
         .connect(coord, tlsutil::SERVER_NAME)
-        .map_err(|err| CoordError::Tls(format!("connect: {err}")))?
-        .await
-        .map_err(|err| CoordError::Tls(format!("handshake: {err}")))?;
+        .map_err(|err| CoordError::Tls(format!("connect: {err}")))?;
+    let connection = match tokio::time::timeout(SSH_CERT_CONNECT_LIMIT, connecting).await {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(err)) => return Err(CoordError::Tls(format!("handshake: {err}"))),
+        Err(_expired) => return Err(request_timed_out("connect")),
+    };
+    let mut read_timed_out = false;
     let result = async {
         let mut nonce_request = blank_request("ssh-cert-nonce");
         nonce_request.name = String::new();
-        let reply = stream_trip(&connection, &nonce_request).await?;
+        let reply = read_reply(&connection, &nonce_request, &mut read_timed_out).await?;
         let nonce = decode_hex_32(reply.detail.as_deref().unwrap_or_default())
             .map_err(|_| CoordError::Protocol("The SSH nonce is not valid.".to_string()))?;
         let mut exporter = [0u8; crate::sshca::SSH_EXPORTER_LEN];
@@ -895,14 +1002,33 @@ where
             .map_err(|_| CoordError::Tls("The TLS exporter failed.".to_string()))?;
         let mut cert_request = blank_request("ssh-cert");
         cert_request.ssh = Some(make_ask(&exporter, &nonce)?);
-        let reply = stream_trip(&connection, &cert_request).await?;
+        let reply = read_reply(&connection, &cert_request, &mut read_timed_out).await?;
         reply
             .detail
             .ok_or_else(|| CoordError::Protocol("The SSH certificate is missing.".to_string()))
     }
     .await;
-    close_and_wait(&connection, &endpoint).await;
+    if read_timed_out {
+        connection.close(quinn::VarInt::from_u32(0), b"done");
+    } else {
+        close_and_wait(&connection, &endpoint).await;
+    }
     result
+}
+
+/// Read one SSH certificate reply. A read that passes [`SSH_CERT_READ_LIMIT`] fails the request.
+async fn read_reply(
+    connection: &quinn::Connection,
+    request: &Request,
+    read_timed_out: &mut bool,
+) -> Result<Response, CoordError> {
+    match tokio::time::timeout(SSH_CERT_READ_LIMIT, stream_trip(connection, request)).await {
+        Ok(result) => result,
+        Err(_expired) => {
+            *read_timed_out = true;
+            Err(request_timed_out("read"))
+        }
+    }
 }
 
 fn blank_request(op: &str) -> Request {
@@ -1394,6 +1520,7 @@ fn enroll_from_response(
         advertised_routes: response.advertised_routes.unwrap_or_default(),
         exit_approved: response.exit_approved.unwrap_or(false),
         ticket,
+        first_deny: FirstDeny::NotFetched,
     })
 }
 

@@ -10,7 +10,9 @@
 //!
 //! The only login method is a user certificate from the coordinator SSH user CA (W25-31).
 //! The server refuses each password login, also an SVID proof or a ticket as the password.
-//! A shell or a command needs a certificate admission and a netmap that is at most 60 s old.
+//! A new shell or a command needs a certificate admission and a netmap that is at most 60 s old.
+//! An open shell stays up while the stamp is at most `OPEN_SHELL_NETMAP_MAX_AGE_MS` (900 s) old.
+//! A stamp more than 60 s ahead of the node clock ends the shell. The deny check still stops it.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -27,7 +29,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_audit::{AuditLog, SessionEvent, SessionIds};
 use orblx_identity::{
-    ed25519_seed_from_private_pem, DenyApply, DenySet, Policy, SpiffeId, TrustBundle,
+    ed25519_seed_from_private_pem, DenyCache, DenyReload, DenySet, Policy, SpiffeId, TrustBundle,
 };
 use russh::keys::ssh_encoding::bytes::Bytes;
 use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Session};
@@ -35,7 +37,9 @@ use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use tokio::net::TcpListener;
 
 use crate::auth::{command_ok, overlay_listen_addr, RefusedLogin};
-use crate::cert::{check_cert, fresh_netmap, CertInput, CertRefuse};
+use crate::cert::{
+    check_cert, fresh_netmap, open_shell_netmap_age, verified_netmap, CertInput, CertRefuse,
+};
 use crate::hostkey::host_key_from_seed;
 use crate::pty::{kill_group, PtyShell, PtySpec};
 use crate::record::{Recorder, Utf8Carry};
@@ -47,6 +51,9 @@ struct Shared {
     overlay: Ipv4Addr,
     node_id: SpiffeId,
     state_dir: PathBuf,
+    /// W25-38: the last good deny set. A failed reload makes it stale. A stale set
+    /// refuses each login and stops each open session.
+    deny: Mutex<DenyCache>,
     audit: Mutex<AuditLog>,
     frames: AtomicU32,
     /// The open certificate sessions by serial (W25-31). A revoked serial stops each session.
@@ -405,7 +412,9 @@ impl SshHandler {
             Err(refused) => return refuse(self, node_id, refused),
         };
         let policy = load_policy(&self.shared.state_dir.join("policy.hujson"));
-        let deny = load_deny(&self.shared.state_dir.join("deny.json"));
+        // W25-38: a deny file that is not valid, did not open, or is missing after enroll
+        // refuses the login. It is never an empty list.
+        let deny = self.shared.reload_deny("The SSH server refuses the login.");
         if deny.reject_uri(&self.shared.node_id).is_err() {
             return refuse(self, node_id, CertRefuse::Revoked);
         }
@@ -690,7 +699,9 @@ impl SshHandler {
             }
             if Instant::now() >= next_check {
                 next_check += period;
-                if recheck(&self.shared, admitted).is_err() {
+                // The open shell allows a verified stamp up to the 900 s ceiling.
+                // A new shell still uses `recheck`. The deny list and the policy still do.
+                if recheck_open_shell(&self.shared, admitted, unix_now_ms()).is_err() {
                     live.fail(orblx_audit::DenyReason::Revoked);
                 }
             }
@@ -806,21 +817,20 @@ const DENY_WATCH: Duration = Duration::from_millis(100);
 /// denies the source or this node, the session stops. Thus a revoke-all stops an
 /// open session within one node deny fetch plus one watch period.
 struct DenyWatch {
-    path: PathBuf,
     next: Instant,
-    last: Option<Vec<u8>>,
 }
 
 impl DenyWatch {
-    fn new(shared: &Shared) -> Self {
+    fn new(_shared: &Shared) -> Self {
         Self {
-            path: shared.state_dir.join("deny.json"),
             next: Instant::now(),
-            last: None,
         }
     }
 
-    /// Return true when a new deny file text denies the session.
+    /// Return true when the deny set denies the session.
+    ///
+    /// W25-38: a deny file that is not valid, did not open, or is missing after enroll
+    /// makes the set stale, and a stale set stops the session (fail closed).
     fn denied(&mut self, shared: &Shared, admitted: &Admitted) -> bool {
         if let Some(cert) = &admitted.cert {
             if cert.stop.load(Ordering::Relaxed) {
@@ -832,22 +842,23 @@ impl DenyWatch {
             return false;
         }
         self.next = now + DENY_WATCH;
-        let Ok(bytes) = fs::read(&self.path) else {
-            return false;
-        };
-        if self.last.as_deref() == Some(bytes.as_slice()) {
-            return false;
+        let deny = shared.reload_deny("The SSH server stops the session.");
+        deny.reject_uri(&admitted.src).is_err() || deny.reject_uri(&shared.node_id).is_err()
+    }
+}
+
+impl Shared {
+    /// Read the deny file again and return the current set (W25-38).
+    ///
+    /// A failed reload keeps the last good set and marks it stale, as the agent guard
+    /// does. The stale set refuses each identifier. The function prints the reason
+    /// with `refusal` each time that the set is stale.
+    fn reload_deny(&self, refusal: &str) -> DenySet {
+        let mut cache = self.deny.lock().unwrap_or_else(|err| err.into_inner());
+        if let DenyReload::Stale { error, .. } = cache.reload(&self.state_dir) {
+            eprintln!("{refusal} {error}");
         }
-        let mut deny = DenySet::empty();
-        let parsed = deny.apply_json(&bytes).is_ok();
-        self.last = Some(bytes);
-        parsed
-            && (deny.reject_uri(&admitted.src).is_err()
-                || deny.reject_uri(&shared.node_id).is_err()
-                || admitted
-                    .cert
-                    .as_ref()
-                    .is_some_and(|cert| deny.reject_uri(&cert.client_node).is_err()))
+        cache.set().clone()
     }
 }
 
@@ -869,10 +880,43 @@ fn recheck(shared: &Shared, admitted: &Admitted) -> Result<(), RefusedLogin> {
     recheck_at(shared, admitted, unix_now_ms())
 }
 
-/// Check one admitted session again: the netmap age (each session), the deny file, the
-/// revoked serial, and the policy.
+/// Recheck an open shell.
+///
+/// A new shell still needs a netmap that is at most 60 s old (`recheck_at`).
+/// An open shell checks the signature with [`verified_netmap`], then the age
+/// with [`open_shell_netmap_age`] (`OPEN_SHELL_NETMAP_MAX_AGE_MS`, 900 s).
+/// A stamp more than 60 s ahead of `now_ms` ends the shell. A netmap that does
+/// not verify still ends the shell. The deny list, the revoked serial, and
+/// the policy still end the shell.
+fn recheck_open_shell(
+    shared: &Shared,
+    admitted: &Admitted,
+    now_ms: u64,
+) -> Result<(), RefusedLogin> {
+    let netmap = match verified_netmap(&shared.state_dir) {
+        Ok(netmap) => netmap,
+        Err(refused) => {
+            return Err(RefusedLogin {
+                peer: admitted.src.clone(),
+                reason: refused.audit_reason(),
+                ticket_hash: admitted.ticket_hash,
+            });
+        }
+    };
+    if let Err(refused) = open_shell_netmap_age(netmap.issued_at_ms, now_ms) {
+        return Err(RefusedLogin {
+            peer: admitted.src.clone(),
+            reason: refused.audit_reason(),
+            ticket_hash: admitted.ticket_hash,
+        });
+    }
+    recheck_rules(shared, admitted)
+}
+
+/// Check one admitted session again: the netmap age (a new shell or command),
+/// the deny file, the revoked serial, and the policy.
 fn recheck_at(shared: &Shared, admitted: &Admitted, now_ms: u64) -> Result<(), RefusedLogin> {
-    // R3: each session needs a netmap that is at most 60 s old, not only a new login.
+    // R3: a new shell or command needs a netmap that is at most 60 s old.
     if let Err(refused) = fresh_netmap(&shared.state_dir, now_ms) {
         return Err(RefusedLogin {
             peer: admitted.src.clone(),
@@ -880,8 +924,13 @@ fn recheck_at(shared: &Shared, admitted: &Admitted, now_ms: u64) -> Result<(), R
             ticket_hash: admitted.ticket_hash,
         });
     }
+    recheck_rules(shared, admitted)
+}
+
+/// The deny list and the policy for one admitted session.
+fn recheck_rules(shared: &Shared, admitted: &Admitted) -> Result<(), RefusedLogin> {
     let policy = load_policy(&shared.state_dir.join("policy.hujson"));
-    let deny = load_deny(&shared.state_dir.join("deny.json"));
+    let deny = shared.reload_deny("The SSH server refuses the session check.");
     if deny.reject_uri(&shared.node_id).is_err() {
         return Err(RefusedLogin {
             peer: shared.node_id.clone(),
@@ -1208,6 +1257,7 @@ impl Shared {
             overlay,
             node_id,
             state_dir: state_dir.to_path_buf(),
+            deny: Mutex::new(DenyCache::new()),
             audit: Mutex::new(AuditLog::new()),
             frames: AtomicU32::new(1),
             cert_sessions: Mutex::new(HashMap::new()),
@@ -1223,20 +1273,6 @@ fn load_policy(path: &Path) -> Policy {
                 eprintln!("The SSH policy did not load. {err}");
             }
             Policy::empty()
-        }
-    }
-}
-
-fn load_deny(path: &Path) -> DenySet {
-    let Ok(bytes) = fs::read(path) else {
-        return DenySet::empty();
-    };
-    let mut deny = DenySet::empty();
-    match deny.apply_json(&bytes) {
-        Ok(DenyApply::Applied | DenyApply::IgnoredOlder) => deny,
-        Err(_) => {
-            eprintln!("The deny file is not valid.");
-            DenySet::empty()
         }
     }
 }
@@ -1526,6 +1562,285 @@ mod tests {
         testkit::write_netmap(&dir, &ca_lines, &[], now);
         let ok = session_within(request).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&ok.stdout), "alice\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An open shell stays up when the signed netmap only ages.
+    ///
+    /// A new shell still refuses that stamp. The deny list still stops the
+    /// open shell. A netmap that does not verify still stops it.
+    #[test]
+    fn an_open_shell_stays_up_when_the_netmap_only_ages() {
+        use crate::cert::testkit;
+        let dir = recording_fixture("open-age");
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ca = testkit::key(22);
+        testkit::write_netmap_at(&dir, &[testkit::ca_line(&ca)], &[], (now - 120) * 1000);
+        let shared = Shared::load(&dir, Ipv4Addr::LOCALHOST).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let admitted = super::Admitted {
+            src: SpiffeId::user("alice").unwrap(),
+            user: "alice".to_string(),
+            check_period: 30,
+            ticket_hash: [0u8; 16],
+            frame: 1,
+            recording: false,
+            cert: Some(super::CertSession {
+                client_node: SpiffeId::node("laptop").unwrap(),
+                stop,
+                pty: true,
+            }),
+        };
+        let now_ms = now * 1000;
+        assert!(
+            super::session_gate(&shared, &admitted, now_ms).is_err(),
+            "a new shell still needs a fresh netmap"
+        );
+        assert!(
+            super::recheck_open_shell(&shared, &admitted, now_ms).is_ok(),
+            "an open shell stays up when the stamp is inside the 900 s ceiling"
+        );
+        testkit::write_netmap_at(&dir, &[testkit::ca_line(&ca)], &[], (now + 120) * 1000);
+        assert!(super::session_gate(&shared, &admitted, now_ms).is_err());
+        assert!(
+            super::recheck_open_shell(&shared, &admitted, now_ms).is_err(),
+            "a stamp more than 60 s ahead ends the open shell"
+        );
+        testkit::write_netmap_at(&dir, &[testkit::ca_line(&ca)], &[], now_ms);
+        std::fs::write(
+            dir.join("deny.json"),
+            r#"{"version":1,"generated_at":1,"revoked_uris":["spiffe://orblx.local/user/alice"],"revoked_ticket_nonces":[]}"#,
+        )
+        .unwrap();
+        assert!(
+            super::recheck_open_shell(&shared, &admitted, now_ms).is_err(),
+            "the deny list still stops the open shell"
+        );
+        std::fs::write(dir.join("deny.json"), W25_38_VALID).unwrap();
+        std::fs::write(dir.join("netmap.signed.json"), b"not a netmap").unwrap();
+        assert!(
+            super::recheck_open_shell(&shared, &admitted, now_ms).is_err(),
+            "a netmap that does not verify still stops the open shell"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An open shell ends when the signed netmap is older than the 900 s ceiling.
+    ///
+    /// A stamp at the ceiling stays up. A new shell still refuses a stamp that
+    /// is 120 s old.
+    #[test]
+    fn an_open_shell_refuses_a_netmap_older_than_the_ceiling() {
+        use crate::cert::{testkit, OPEN_SHELL_NETMAP_MAX_AGE_MS};
+        let dir = recording_fixture("open-ceiling");
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let now_ms = now * 1000;
+        let ca = testkit::key(23);
+        let shared = Shared::load(&dir, Ipv4Addr::LOCALHOST).unwrap();
+        let admitted = super::Admitted {
+            src: SpiffeId::user("alice").unwrap(),
+            user: "alice".to_string(),
+            check_period: 30,
+            ticket_hash: [0u8; 16],
+            frame: 1,
+            recording: false,
+            cert: Some(super::CertSession {
+                client_node: SpiffeId::node("laptop").unwrap(),
+                stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                pty: true,
+            }),
+        };
+        for age_s in [600_u64, 899] {
+            testkit::write_netmap_at(&dir, &[testkit::ca_line(&ca)], &[], now_ms - age_s * 1000);
+            assert!(
+                super::recheck_open_shell(&shared, &admitted, now_ms).is_ok(),
+                "an open shell stays up at {age_s} s"
+            );
+        }
+        testkit::write_netmap_at(&dir, &[testkit::ca_line(&ca)], &[], now_ms + 61_000);
+        assert!(
+            super::recheck_open_shell(&shared, &admitted, now_ms).is_err(),
+            "a stamp more than 60 s ahead ends the open shell"
+        );
+        testkit::write_netmap_at(
+            &dir,
+            &[testkit::ca_line(&ca)],
+            &[],
+            now_ms - OPEN_SHELL_NETMAP_MAX_AGE_MS,
+        );
+        assert!(
+            super::recheck_open_shell(&shared, &admitted, now_ms).is_ok(),
+            "a stamp at the ceiling stays up"
+        );
+        testkit::write_netmap_at(
+            &dir,
+            &[testkit::ca_line(&ca)],
+            &[],
+            now_ms - OPEN_SHELL_NETMAP_MAX_AGE_MS - 1_000,
+        );
+        assert!(
+            super::recheck_open_shell(&shared, &admitted, now_ms).is_err(),
+            "a stamp older than 900 s ends the open shell"
+        );
+        testkit::write_netmap_at(&dir, &[testkit::ca_line(&ca)], &[], (now - 120) * 1000);
+        assert!(
+            super::session_gate(&shared, &admitted, now_ms).is_err(),
+            "a new shell still refuses a stamp that is 120 s old"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W25-38: the four ways that a deny file can fail. Each one fails closed.
+    const W25_38_VALID: &str =
+        r#"{"version":1,"generated_at":1,"revoked_uris":[],"revoked_ticket_nonces":[]}"#;
+
+    fn w25_38_damage(path: &std::path::Path, kind: &str) {
+        match kind {
+            "corrupt" => std::fs::write(path, b"not json {").unwrap(),
+            "truncated" => {
+                std::fs::write(path, &W25_38_VALID.as_bytes()[..W25_38_VALID.len() / 2]).unwrap();
+            }
+            "missing" => std::fs::remove_file(path).unwrap(),
+            "unreadable" => {
+                // A directory at the deny file path does not open as a file.
+                std::fs::remove_file(path).unwrap();
+                std::fs::create_dir(path).unwrap();
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn w25_38_restore(path: &std::path::Path) {
+        if path.is_dir() {
+            std::fs::remove_dir(path).unwrap();
+        }
+        std::fs::write(path, W25_38_VALID).unwrap();
+    }
+
+    const W25_38_KINDS: [&str; 4] = ["corrupt", "truncated", "missing", "unreadable"];
+
+    /// An enrolled node with a valid deny file and a running SSH server.
+    async fn w25_38_server(
+        tag: &str,
+    ) -> (std::path::PathBuf, SocketAddr, crate::client::CertLogin) {
+        use crate::cert::testkit;
+        let dir = recording_fixture(tag);
+        std::fs::write(dir.join(orblx_identity::ENROLL_MARKER_FILE), "box\n").unwrap();
+        std::fs::write(dir.join("deny.json"), W25_38_VALID).unwrap();
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ca = testkit::key(38);
+        testkit::write_netmap(&dir, &[testkit::ca_line(&ca)], &[], now);
+        let key = testkit::key(39);
+        let spec = testkit::Spec::user("oidc:alice", "laptop", 3801, now);
+        let cert = testkit::sign(&ca, &key, &spec);
+        let login = crate::client::CertLogin { key, cert };
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shared = std::sync::Arc::new(Shared::load(&dir, Ipv4Addr::LOCALHOST).unwrap());
+        tokio::spawn(super::accept_loop(listener, shared));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        (dir, addr, login)
+    }
+
+    fn w25_38_request(
+        dir: &std::path::Path,
+        addr: SocketAddr,
+        command: &str,
+        cert_login: crate::client::CertLogin,
+    ) -> SessionRequest {
+        SessionRequest {
+            user: "alice".to_string(),
+            addr,
+            dst: SpiffeId::node("box").unwrap(),
+            identity_dir: dir.join("alice"),
+            peer_cert: dir.join("peer.pem"),
+            command: command.to_string(),
+            cert_login,
+        }
+    }
+
+    /// W25-38: an enrolled node refuses each new SSH login when its deny file is not
+    /// valid, is cut short, is missing, or does not open. It never uses an empty list.
+    #[tokio::test]
+    async fn w25_38_ssh_login_refuses_when_the_deny_file_is_corrupt_truncated_missing_or_unreadable(
+    ) {
+        let (dir, addr, login) = w25_38_server("w25-38-login").await;
+        let path = dir.join("deny.json");
+        let ok = session_within(w25_38_request(&dir, addr, "echo ok", login.clone()))
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "ok");
+        for kind in W25_38_KINDS {
+            w25_38_damage(&path, kind);
+            assert!(
+                session_within(w25_38_request(&dir, addr, "echo ok", login.clone()))
+                    .await
+                    .is_err(),
+                "{kind}: the login was accepted"
+            );
+            w25_38_restore(&path);
+            let again = session_within(w25_38_request(&dir, addr, "echo ok", login.clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&again.stdout).trim(),
+                "ok",
+                "{kind}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W25-38: the open-session recheck stops an open SSH session when the deny file
+    /// becomes not valid, cut short, missing, or does not open.
+    #[tokio::test]
+    async fn w25_38_ssh_open_session_stops_when_the_deny_file_is_corrupt_truncated_missing_or_unreadable(
+    ) {
+        let (dir, addr, login) = w25_38_server("w25-38-open").await;
+        let path = dir.join("deny.json");
+        for kind in W25_38_KINDS {
+            let damage_path = path.clone();
+            let writer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1500));
+                w25_38_damage(&damage_path, kind);
+                std::time::Instant::now()
+            });
+            let open = session_within(w25_38_request(
+                &dir,
+                addr,
+                "sleep 5; printf %s\\n late",
+                login.clone(),
+            ))
+            .await;
+            let ended = std::time::Instant::now();
+            let damaged_at = writer.join().unwrap();
+            assert!(
+                ended.duration_since(damaged_at) < Duration::from_millis(1000),
+                "{kind}: the open session ran {:?} after the damage",
+                ended.duration_since(damaged_at)
+            );
+            if let Ok(output) = &open {
+                assert!(
+                    !String::from_utf8_lossy(&output.stdout).contains("late"),
+                    "{kind}"
+                );
+                assert_ne!(output.exit_status, 0, "{kind}");
+            }
+            w25_38_restore(&path);
+        }
+        let ok = session_within(w25_38_request(&dir, addr, "echo ok", login))
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "ok");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

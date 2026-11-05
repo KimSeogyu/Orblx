@@ -98,7 +98,7 @@ replies at that time. After a failed policy-wait, a node that has a netmap tries
 2 s and asks for a reply at once. Thus one failed reply does not make a false stale refusal
 while the coordinator is up.
 
-SSH certificate logins need a coordinator reachable within the last 60 s. Mesh traffic does not.
+A new SSH certificate login needs a coordinator reachable within the last 60 s. An open shell stays up while the signed netmap is at most `OPEN_SHELL_NETMAP_MAX_AGE_MS` (900 s) old. The future-stamp skew limit stays 60 s for an open shell. A stamp more than 60 s ahead of the node clock ends the open shell. The deny list, a revoked serial, the policy, and a signature failure still end the open shell. Mesh traffic does not need the coordinator.
 Each deny writes 1 deny record in `ssh-audit.jsonl`.
 
 ## Sharing and agents
@@ -114,6 +114,7 @@ Each deny writes 1 deny record in `ssh-audit.jsonl`.
 - The node closes the matching SSH sessions and the mesh QUIC connections to the revoked node.
 - The node gets the change by push (policy-wait, deny-wait) and polls at least each 30 s.
 - The node refuses new certificate logins when its netmap is older than 60 s.
+- An open shell stays up while the signed netmap is at most `OPEN_SHELL_NETMAP_MAX_AGE_MS` (900 s) old. The future-stamp skew limit stays 60 s. A stamp more than 60 s ahead of the node clock ends the shell. The deny list, a revoked serial, the policy, and a signature failure still end the open shell.
 
 ## CLI
 
