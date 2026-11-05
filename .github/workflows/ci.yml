@@ -14,6 +14,11 @@ jobs:
       - name: Get the repository
         uses: actions/checkout@v7
 
+      - name: Check that the workspace version is not a release tag (W25-44)
+        run: |
+          git fetch --no-recurse-submodules --tags origin
+          bash scripts/check-version-not-tagged.sh
+
       - name: Install the stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
