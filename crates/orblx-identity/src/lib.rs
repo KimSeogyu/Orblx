@@ -32,12 +32,14 @@ mod cert;
 mod clock;
 mod codec;
 mod deny;
+mod deny_file;
 mod error;
 mod google;
 mod issuer;
 mod oidc;
 mod policy;
 mod share;
+mod signed_deny;
 mod sink;
 mod spiffe;
 mod ticket;
@@ -50,6 +52,11 @@ pub use cert::{
 };
 pub use clock::{MAX_AGENT_TTL, MAX_SKEW, MAX_USER_TTL};
 pub use deny::{DenyApply, DenySet};
+pub use deny_file::{
+    load_deny_file, read_deny_fetch_ok, read_deny_file, record_deny_fetch, store_deny_file,
+    store_deny_file_at, DenyCache, DenyFileError, DenyReload, DenyStore, DENY_FILE,
+    ENROLL_MARKER_FILE,
+};
 pub use error::IdentityError;
 pub use google::{
     google_client_id_ok, GoogleClient, GoogleIdClaims, GoogleJwks, GoogleTokenRequest, OidcMode,
@@ -89,6 +96,11 @@ pub fn leaf_ed25519_public_key(der: &[u8]) -> Result<[u8; 32], IdentityError> {
     cert::certificate_ed25519_public_key(der)
 }
 pub use share::{rules_without_shares, Share, ShareGuest};
+pub use signed_deny::{
+    deny_fetch_old_age, deny_fetch_old_line, deny_fetch_status_line, deny_sign_message, deny_wire,
+    seal_deny, verify_signed_deny, DenyObject, VerifiedDeny, DENY_FETCH_FILE, DENY_FETCH_OLD_MS,
+    DENY_SIGN_PREFIX,
+};
 pub use sink::{parse_https_url, AuditSink, SinkFormat, SinkTarget, MAX_AUDIT_SINKS};
 pub use spiffe::{SpiffeId, WorkloadKind, TRUST_DOMAIN};
 pub use ticket::{

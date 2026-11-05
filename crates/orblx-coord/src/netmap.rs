@@ -247,6 +247,20 @@ impl NetmapKey {
             .map_err(|err| CoordError::Protocol(err.to_string()))
     }
 
+    /// Sign one deny object. `deny_object_bytes` are the raw object bytes.
+    ///
+    /// The signed message is [`orblx_identity::deny_sign_message`] of those bytes.
+    pub fn sign_deny(&self, deny_object_bytes: &[u8]) -> Result<String, CoordError> {
+        let message = orblx_identity::deny_sign_message(deny_object_bytes);
+        if !message.starts_with(orblx_identity::DENY_SIGN_PREFIX) {
+            return Err(CoordError::Protocol(
+                "The deny list is not valid.".to_string(),
+            ));
+        }
+        orblx_identity::seal_deny(&self.signing, deny_object_bytes)
+            .map_err(|_| CoordError::Protocol("The deny list is not valid.".to_string()))
+    }
+
     pub fn sign_endpoint(&self, name: &str, endpoint: &str) -> Result<SignedEndpoint, CoordError> {
         let payload = endpoint_sign_payload(name, endpoint).map_err(|_| CoordError::Endpoint)?;
         let sig = STANDARD.encode(self.signing.sign(payload.as_bytes()).to_bytes());
@@ -634,6 +648,7 @@ mod tests {
     fn signed_structs_keep_a_strict_form() {
         let datapath = include_str!("../../orblx-datapath/src/netmap.rs");
         let identity = include_str!("../../orblx-identity/src/policy.rs");
+        let deny = include_str!("../../orblx-identity/src/signed_deny.rs");
         let coord = include_str!("netmap.rs");
         let datapath_types = [
             "Netmap",
@@ -645,13 +660,16 @@ mod tests {
             "SshRevoked",
         ];
         let identity_types = ["ReceiverGrants", "ReceiverGrant", "SubnetGrant"];
+        let deny_types = ["DenyObject"];
         let coord_types = ["SignedNetmapWire", "SignedGrantsWire"];
         let mut known: Vec<&str> = datapath_types.to_vec();
         known.extend(identity_types);
+        known.extend(deny_types);
         known.extend(coord_types);
         for (text, names) in [
             (datapath, &datapath_types[..]),
             (identity, &identity_types[..]),
+            (deny, &deny_types[..]),
             (coord, &coord_types[..]),
         ] {
             for name in names {
@@ -663,6 +681,25 @@ mod tests {
             if let Some(rest) = line.strip_prefix("pub struct ") {
                 let name = rest.split([' ', '{', '(']).next().unwrap();
                 assert!(datapath_types.contains(&name), "add {name} to the guard");
+            }
+        }
+        // A wire struct in the deny file has `deny_unknown_fields`. Other types
+        // in that file, such as the verified result, are not wire structs.
+        let deny_lines: Vec<&str> = deny.lines().collect();
+        for (index, line) in deny_lines.iter().enumerate() {
+            if let Some(rest) = line.strip_prefix("pub struct ") {
+                let name = rest.split([' ', '{', '(']).next().unwrap();
+                let wire = deny_lines[..index]
+                    .iter()
+                    .rev()
+                    .take_while(|line| {
+                        let line = line.trim();
+                        line.starts_with("#[") || line.starts_with("///") || line.is_empty()
+                    })
+                    .any(|line| line.trim() == "#[serde(deny_unknown_fields)]");
+                if wire {
+                    assert!(deny_types.contains(&name), "add {name} to the guard");
+                }
             }
         }
         // Each grant struct in the identity policy file is in the list.
@@ -806,6 +843,29 @@ mod tests {
             }
         }
         false
+    }
+
+    #[test]
+    fn netmap_key_labels_are_pairwise_distinct() {
+        let labels: [&[u8]; 3] = [
+            orblx_identity::DENY_SIGN_PREFIX,
+            orblx_edge::ENDPOINT_SIGN_PREFIX.as_bytes(),
+            orblx_agent::AGENT_GRANT_DOC_PREFIX,
+        ];
+        assert_eq!(orblx_identity::DENY_SIGN_PREFIX, b"orblx-deny-list-v1\n");
+        for (left_index, left) in labels.iter().enumerate() {
+            assert_ne!(
+                left.first(),
+                Some(&b'{'),
+                "{}",
+                String::from_utf8_lossy(left)
+            );
+            for right in labels.iter().skip(left_index + 1) {
+                assert_ne!(left, right);
+                assert!(!left.starts_with(right));
+                assert!(!right.starts_with(left));
+            }
+        }
     }
 
     #[test]

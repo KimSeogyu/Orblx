@@ -5,11 +5,12 @@ use crate::netmap::{SignedEndpoint, SignedGrantsWire, SignedNetmapWire};
 
 pub const MAX_MESSAGE: usize = 256 * 1024;
 
-/// The node protocol version that a client sends with each request (W25-34).
+/// The node protocol version that a client sends with each request (W25-34, W25-37).
 ///
 /// Version 1: the client checks the signed netmap `seq` and `issued_at_ms`.
+/// Version 2: the client also requires a signed deny list.
 /// A request with no version is from an older node.
-pub const NODE_PROTO: u32 = 1;
+pub const NODE_PROTO: u32 = 2;
 
 /// The start of the error text when the coordinator and the node have different versions.
 pub const VERSION_MISMATCH: &str = "version mismatch, upgrade";

@@ -135,11 +135,12 @@ async fn deny_wait(
     name: &str,
     known: Option<&str>,
     mut stamp: watch::Receiver<u64>,
+    proto: u32,
 ) -> Result<String, CoordError> {
     let deadline = tokio::time::Instant::now() + crate::DENY_WAIT_HOLD;
     loop {
         stamp.borrow_and_update();
-        let text = admin::deny_json_for(coord, name, SystemTime::now())?;
+        let text = admin::deny_wire(coord, name, SystemTime::now(), proto)?;
         if known != Some(admin::deny_etag(&text).as_str()) {
             return Ok(text);
         }
@@ -161,13 +162,14 @@ async fn policy_wait(
     known: Option<&str>,
     unchanged_ok: bool,
     mut stamp: watch::Receiver<u64>,
+    proto: u32,
 ) -> Result<Vec<u8>, CoordError> {
     let deadline = tokio::time::Instant::now() + crate::DENY_WAIT_HOLD;
     loop {
         stamp.borrow_and_update();
         // W25-16: the view comes from the cache when its inputs did not change.
         let cached = coord.netmap_cached(name)?;
-        let deny = admin::deny_json_for(coord, name, SystemTime::now())?;
+        let deny = admin::deny_wire(coord, name, SystemTime::now(), proto)?;
         let etag = policy_etag(&cached.digest, &deny);
         let changed = known != Some(etag.as_str());
         // W25-34: wake at the heartbeat time of the node too. At that time the cache gives a
@@ -365,9 +367,9 @@ async fn handle_stream(
     let reply = if let Err(err) = gated {
         Err(err)
     } else if request.op == "policy-wait" {
-        policy_wait_op(coord, connection, &request, stamp).await
+        policy_wait_op(coord, connection, &request, stamp, incoming.proto).await
     } else {
-        match dispatch(coord, connection, request, stamp).await {
+        match dispatch(coord, connection, request, stamp, incoming.proto).await {
             Ok(response) => proto::encode_json(&response),
             Err(err) => Err(err),
         }
@@ -394,6 +396,7 @@ async fn policy_wait_op(
     connection: &quinn::Connection,
     request: &Request,
     stamp: watch::Receiver<u64>,
+    proto: u32,
 ) -> Result<Vec<u8>, CoordError> {
     let peer = peer_node(coord, connection)?;
     if peer != request.name {
@@ -405,6 +408,7 @@ async fn policy_wait_op(
         request.deny_etag.as_deref(),
         request.unchanged_ok,
         stamp,
+        proto,
     )
     .await
 }
@@ -503,6 +507,7 @@ async fn dispatch(
     connection: &quinn::Connection,
     request: Request,
     stamp: watch::Receiver<u64>,
+    proto: u32,
 ) -> Result<Response, CoordError> {
     let now = SystemTime::now();
     match request.op.as_str() {
@@ -599,7 +604,7 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
-            let detail = admin::deny_json_for(coord, &request.name, now)?;
+            let detail = admin::deny_wire(coord, &request.name, now, proto)?;
             Ok(Response {
                 ok: true,
                 detail: Some(detail),
@@ -611,8 +616,14 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
-            let detail =
-                deny_wait(coord, &request.name, request.deny_etag.as_deref(), stamp).await?;
+            let detail = deny_wait(
+                coord,
+                &request.name,
+                request.deny_etag.as_deref(),
+                stamp,
+                proto,
+            )
+            .await?;
             Ok(Response {
                 ok: true,
                 detail: Some(detail),
@@ -1069,7 +1080,8 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let deny = crate::admin::deny_json_for(&coord, "reply-a", SystemTime::now()).unwrap();
+        let deny = crate::admin::deny_wire(&coord, "reply-a", SystemTime::now(), crate::NODE_PROTO)
+            .unwrap();
         let etag = super::policy_etag(&cached.digest, &deny);
         let ended = || {
             // A closed stamp channel ends the hold at once.
@@ -1084,6 +1096,7 @@ mod tests {
                     Some(&etag),
                     true,
                     ended(),
+                    crate::NODE_PROTO,
                 ))
                 .unwrap(),
         )
@@ -1098,6 +1111,7 @@ mod tests {
                 Some(&etag),
                 false,
                 ended(),
+                crate::NODE_PROTO,
             ))
             .unwrap();
         assert_eq!(held, super::policy_reply(&cached, &deny, &etag).unwrap());
@@ -1109,6 +1123,7 @@ mod tests {
                 Some("old"),
                 true,
                 ended(),
+                crate::NODE_PROTO,
             ))
             .unwrap();
         assert_eq!(changed, held);

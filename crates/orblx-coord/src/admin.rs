@@ -77,17 +77,78 @@ pub fn deny_json_for(
 /// A list with no file has the time of the call in `generated_at`, so the time is not in the ETag.
 pub fn deny_etag(text: &str) -> String {
     use sha2::{Digest, Sha256};
-    let canonical = serde_json::from_str::<DenyFile>(text)
-        .ok()
-        .and_then(|mut file| {
-            file.generated_at = 0;
-            file.to_json().ok()
-        })
-        .unwrap_or_else(|| text.to_string());
+    let canonical = etag_body(text).unwrap_or_else(|| text.to_string());
     Sha256::digest(canonical.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// The ETag body is the unsigned per-node list with `generated_at` 0.
+///
+/// A signed envelope uses the deny object inside it. `seq`, `node_uri`,
+/// `issued_at_ms`, and the signature are not in the ETag.
+fn etag_body(text: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    let object = value.get("deny").unwrap_or(&value);
+    let mut file = DenyFile {
+        version: object.get("version")?.as_u64()?,
+        generated_at: 0,
+        revoked_uris: string_list(object.get("revoked_uris")?)?,
+        revoked_ticket_nonces: string_list(object.get("revoked_ticket_nonces")?)?,
+    };
+    file.generated_at = 0;
+    file.to_json().ok()
+}
+
+fn string_list(value: &Value) -> Option<Vec<String>> {
+    let items = value.as_array()?;
+    items
+        .iter()
+        .map(|item| item.as_str().map(str::to_string))
+        .collect()
+}
+
+/// The deny list to send to one node (W25-37).
+///
+/// A node at [`crate::NODE_PROTO`] gets a signed list. An older node gets the
+/// unsigned list. The ETag of both forms is the same.
+pub(crate) fn deny_wire(
+    coord: &Coordinator,
+    name: &str,
+    now: SystemTime,
+    proto: u32,
+) -> Result<String, CoordError> {
+    let unsigned = deny_json_for(coord, name, now)?;
+    if proto < crate::NODE_PROTO {
+        return Ok(unsigned);
+    }
+    let file: DenyFile = serde_json::from_str(&unsigned).map_err(|_| CoordError::State)?;
+    let node_uri = SpiffeId::node(name)?.as_uri().to_string();
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let bytes = Sha256::digest(unsigned.as_bytes());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        out
+    };
+    let book_key = crate::seq::deny_book_key(name)?;
+    let now_ms = crate::seq::unix_ms(now);
+    let book = crate::seq::shared_book(&coord.state_dir()?)?;
+    let mut book = book.lock().map_err(|_| CoordError::State)?;
+    let (seq, issued_at_ms) = book.stamp_once(&book_key, digest, now_ms)?;
+    drop(book);
+    let object = orblx_identity::DenyObject {
+        version: file.version,
+        generated_at: file.generated_at,
+        revoked_uris: file.revoked_uris,
+        revoked_ticket_nonces: file.revoked_ticket_nonces,
+        node_uri,
+        seq,
+        issued_at_ms,
+    };
+    let raw = serde_json::to_vec(&object).map_err(|_| CoordError::State)?;
+    coord.sign_deny_bytes(&raw)
 }
 
 pub fn deny_set(coord: &Coordinator, now: SystemTime) -> Result<DenySet, CoordError> {
@@ -224,7 +285,7 @@ pub fn revoke_undo(
     file.version = file.version.saturating_add(1);
     file.generated_at = unix_now(now)?;
     let text = file.to_json()?;
-    write_text(&coord.state_dir()?.join(DENY_FILE), &text, 0o644)?;
+    crate::files::write_synced(&coord.state_dir()?.join(DENY_FILE), text.as_bytes(), 0o644)?;
     let after = deny_digest(coord)?;
     let detail = format!(
         "principal {uri} scope all svid restored deny_version {}",
@@ -590,7 +651,7 @@ pub(crate) fn push_deny(
     file.version = file.version.saturating_add(1);
     file.generated_at = unix_now(now)?;
     let text = file.to_json()?;
-    write_text(&coord.state_dir()?.join(DENY_FILE), &text, 0o644)?;
+    crate::files::write_synced(&coord.state_dir()?.join(DENY_FILE), text.as_bytes(), 0o644)?;
     Ok(file.version)
 }
 

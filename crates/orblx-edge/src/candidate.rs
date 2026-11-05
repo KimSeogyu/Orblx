@@ -65,6 +65,9 @@ pub fn encode_candidate(candidate: EndpointCandidate) -> String {
     )
 }
 
+/// The domain-separation prefix of an endpoint signature.
+pub const ENDPOINT_SIGN_PREFIX: &str = "orblx-endpoint-v1\n";
+
 /// The bytes the coordinator signs for one endpoint.
 ///
 /// The text is `orblx-endpoint-v1`, the node name, and `host:port`.
@@ -78,7 +81,7 @@ pub fn endpoint_sign_payload(node_name: &str, endpoint: &str) -> Result<String, 
     {
         return Err(EdgeError::BadCandidate);
     }
-    Ok(format!("orblx-endpoint-v1\n{node_name}\n{endpoint}\n"))
+    Ok(format!("{ENDPOINT_SIGN_PREFIX}{node_name}\n{endpoint}\n"))
 }
 
 /// Decode one unsigned candidate from text.

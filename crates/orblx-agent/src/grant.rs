@@ -19,7 +19,10 @@ pub const GRANT_VERSION: u8 = 1;
 /// The longest grant life in seconds.
 pub const MAX_GRANT_SECS: u64 = 300;
 
-const DOC_LABEL: &[u8] = b"orblx-agent-grant-doc-v1\n";
+/// The domain-separation prefix of an agent grant signature.
+pub const AGENT_GRANT_DOC_PREFIX: &[u8] = b"orblx-agent-grant-doc-v1\n";
+
+const DOC_LABEL: &[u8] = AGENT_GRANT_DOC_PREFIX;
 const MAX_SERVICE: usize = 32;
 const MAX_PATH: usize = 128;
 

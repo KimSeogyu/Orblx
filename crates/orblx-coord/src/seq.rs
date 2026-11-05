@@ -29,7 +29,6 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -177,9 +176,34 @@ impl SeqBook {
         content: [u8; 32],
         now_ms: u64,
     ) -> Result<(u64, u64), CoordError> {
-        if let Some(old) = self.memo.get(node) {
+        self.stamp_inner(node, content, now_ms, true)
+    }
+
+    /// Return the stamp for one deny list (W25-37).
+    ///
+    /// The same content digest gets the same stamp. There is no heartbeat. Any other
+    /// content gets a new stamp. The clock-forward rule of [`Self::stamp`] stays.
+    pub(crate) fn stamp_once(
+        &mut self,
+        key: &str,
+        content: [u8; 32],
+        now_ms: u64,
+    ) -> Result<(u64, u64), CoordError> {
+        self.stamp_inner(key, content, now_ms, false)
+    }
+
+    fn stamp_inner(
+        &mut self,
+        key: &str,
+        content: [u8; 32],
+        now_ms: u64,
+        heartbeat: bool,
+    ) -> Result<(u64, u64), CoordError> {
+        if let Some(old) = self.memo.get(key) {
             // A clock that goes back keeps the old stamp. This stops a reply loop.
-            if old.content == content && now_ms < old.issued_at_ms.saturating_add(HEARTBEAT_MS) {
+            let same = old.content == content;
+            let fresh = !heartbeat || now_ms < old.issued_at_ms.saturating_add(HEARTBEAT_MS);
+            if same && fresh {
                 return Ok((old.seq, old.issued_at_ms));
             }
         }
@@ -209,7 +233,7 @@ impl SeqBook {
             );
         }
         self.memo.insert(
-            node.to_string(),
+            key.to_string(),
             Stamp {
                 content,
                 seq,
@@ -278,31 +302,23 @@ fn read_coord_seq(path: &Path) -> Result<u64, CoordError> {
 }
 
 /// Write a file through a temp file, sync it, rename it, and sync the directory.
+///
+/// The seq file mode is `0600`.
 pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), CoordError> {
-    let mut name = path
-        .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_default();
-    name.push(".tmp");
-    let tmp = path.with_file_name(name);
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .map_err(CoordError::io)?;
-        file.write_all(bytes).map_err(CoordError::io)?;
-        file.sync_all().map_err(CoordError::io)?;
+    crate::files::write_synced(path, bytes, 0o600)
+}
+
+/// The seq book key of the deny list for one node (W25-37).
+///
+/// The key is `deny\n` plus the node name. A node name that contains `\n` is refused.
+/// No other code builds this key.
+pub fn deny_book_key(node: &str) -> Result<String, CoordError> {
+    if node.contains('\n') {
+        return Err(CoordError::Protocol(
+            "The node name is not valid.".to_string(),
+        ));
     }
-    fs::rename(&tmp, path).map_err(CoordError::io)?;
-    if let Some(parent) = path.parent() {
-        File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(CoordError::io)?;
-    }
-    Ok(())
+    Ok(format!("deny\n{node}"))
 }
 
 /// The result of one netmap intake on a node.
@@ -886,6 +902,33 @@ mod tests {
         wire["netmap"]["grants_sha256"] = serde_json::Value::String(old_grants.digest_hex());
         let wire: crate::netmap::SignedNetmapWire = serde_json::from_value(wire).unwrap();
         assert!(crate::netmap::verify_netmap_wire(&wire, &key.public()).is_err());
+    }
+
+    #[test]
+    fn deny_book_key_refuses_a_newline_and_does_not_match_a_netmap_key() {
+        assert!(super::deny_book_key("a\nb").is_err());
+        let key = super::deny_book_key("a").unwrap();
+        assert_eq!(key, "deny\na");
+        assert_ne!(key, "a");
+    }
+
+    #[test]
+    fn stamp_once_reuses_only_the_same_content_digest() {
+        let dir = temp_dir("deny-stamp");
+        let mut book = SeqBook::open(&dir).unwrap();
+        let deny = super::deny_book_key("a").unwrap();
+        let first = book.stamp_once(&deny, [1; 32], T0).unwrap();
+        assert_eq!(
+            book.stamp_once(&deny, [1; 32], T0 + super::HEARTBEAT_MS + 1)
+                .unwrap(),
+            first
+        );
+        let next = book.stamp_once(&deny, [2; 32], T0).unwrap();
+        assert!(next.0 > first.0);
+        // A deny key and a netmap key do not share a stamp.
+        let netmap = book.stamp("a", [1; 32], T0).unwrap();
+        assert_ne!(netmap.0, first.0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

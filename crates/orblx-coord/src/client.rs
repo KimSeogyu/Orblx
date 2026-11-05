@@ -9,7 +9,7 @@ use crate::netmap::{
     SignedNetmap,
 };
 use crate::proto::{self, GrantAsk, Request, Response};
-use crate::state::{read_node_material, EnrollResult, NetmapView, NodeMaterial};
+use crate::state::{read_node_material, EnrollResult, FirstDeny, NetmapView, NodeMaterial};
 use crate::ticket::{decode_hex, decode_ticket_wire, IssuedTicket};
 use crate::tlsutil::{self, ClientTls};
 
@@ -39,7 +39,51 @@ pub async fn enroll_with_token(
         ssh: None,
         unchanged_ok: false,
     };
-    round_trip(coord, coord_name, bundle_pem, None, request, None, true).await
+    let mut result = round_trip(coord, coord_name, bundle_pem, None, request, None, true).await?;
+    result.first_deny = first_deny_after_enroll(coord, coord_name, bundle_pem, &result).await;
+    Ok(result)
+}
+
+/// Check the first deny list with the new node SVID and the pinned netmap key.
+fn verify_first_deny(result: &EnrollResult, text: &str) -> Result<(), String> {
+    let der = orblx_identity::decode_certificate_pem(&result.certificate_pem)
+        .map_err(|_| "The node SVID is not valid.".to_string())?;
+    let uri = orblx_identity::extract_spiffe_id(&der)
+        .map_err(|_| "The node SVID is not valid.".to_string())?;
+    orblx_identity::verify_signed_deny(text.as_bytes(), &result.netmap_public, uri.as_uri())
+        .map(|_| ())
+        .map_err(|_| "The deny list from the coordinator is not valid.".to_string())
+}
+
+/// Fetch the deny list over a new mutual TLS connection with the new SVID (W25-38).
+///
+/// The function runs right after the enroll reply, with no wait for a poll tick. It does
+/// not fail the enroll: on an error the node stays refuse-all, and `orblx up` fetches the
+/// list again.
+async fn first_deny_after_enroll(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    result: &EnrollResult,
+) -> FirstDeny {
+    let cert_at = std::time::Instant::now();
+    let material = NodeMaterial {
+        name: result.name.clone(),
+        certificate_pem: result.certificate_pem.clone(),
+        private_key_pem: result.private_key_pem.clone(),
+        trust_bundle_pem: result.trust_bundle_pem.clone(),
+        netmap_public: result.netmap_public,
+    };
+    match fetch_deny_with(coord, coord_name, bundle_pem, material).await {
+        Ok(text) => match verify_first_deny(result, &text) {
+            Ok(()) => FirstDeny::Fetched { text, cert_at },
+            Err(error) => FirstDeny::Failed { error, cert_at },
+        },
+        Err(err) => FirstDeny::Failed {
+            error: err.to_string(),
+            cert_at,
+        },
+    }
 }
 
 /// Enroll with a one-use token.
@@ -96,7 +140,7 @@ pub async fn enroll_with_oidc(input: OidcEnroll<'_>) -> Result<EnrollResult, Coo
         ssh: None,
         unchanged_ok: false,
     };
-    round_trip(
+    let mut result = round_trip(
         input.coord,
         input.coord_name,
         input.bundle_pem,
@@ -105,7 +149,10 @@ pub async fn enroll_with_oidc(input: OidcEnroll<'_>) -> Result<EnrollResult, Coo
         None,
         true,
     )
-    .await
+    .await?;
+    result.first_deny =
+        first_deny_after_enroll(input.coord, input.coord_name, input.bundle_pem, &result).await;
+    Ok(result)
 }
 
 /// Enroll with an ID token.
@@ -506,6 +553,26 @@ pub fn fetch_deny_blocking(
     block_on(fetch_deny(coord, coord_name, bundle_pem, state_dir))
 }
 
+/// Fetch the first deny list of a node right after enroll (W25-38).
+///
+/// The enroll reply has no deny list. After enroll, `node-name` exists and `deny.json`
+/// is missing, so each reader of the node refuses each peer. This function opens a new
+/// mutual TLS connection with the new node SVID in `state_dir`, fetches the deny list
+/// of the node, and writes it with [`orblx_identity::store_deny_file`]. The writer checks
+/// the text and never moves the list back.
+///
+/// On an error the node stays refuse-all. `orblx up` fetches the list again without a
+/// manual step.
+pub fn fetch_first_deny_blocking(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    state_dir: &Path,
+) -> Result<orblx_identity::DenyStore, CoordError> {
+    let text = fetch_deny_blocking(coord, coord_name, bundle_pem, state_dir)?;
+    orblx_identity::store_deny_file(state_dir, &text).map_err(CoordError::io)
+}
+
 /// Wait for a new deny list of this node (W25-2).
 ///
 /// The coordinator replies at once when the ETag of its deny list for this node is not
@@ -643,6 +710,15 @@ async fn fetch_deny(
     state_dir: &Path,
 ) -> Result<String, CoordError> {
     let material = read_node_material(state_dir)?;
+    fetch_deny_with(coord, coord_name, bundle_pem, material).await
+}
+
+async fn fetch_deny_with(
+    coord: SocketAddr,
+    coord_name: &str,
+    bundle_pem: &str,
+    material: NodeMaterial,
+) -> Result<String, CoordError> {
     let request = Request {
         op: "deny".to_string(),
         name: material.name.clone(),
@@ -659,8 +735,22 @@ async fn fetch_deny(
         ssh: None,
         unchanged_ok: false,
     };
-    authed_detail(coord, coord_name, bundle_pem, material, request).await
+    tokio::time::timeout(
+        DENY_FETCH_LIMIT,
+        authed_detail(coord, coord_name, bundle_pem, material, request),
+    )
+    .await
+    .map_err(|_| {
+        CoordError::Tls(format!(
+            "The deny fetch timed out. The coordinator did not answer in {} s.",
+            DENY_FETCH_LIMIT.as_secs()
+        ))
+    })?
 }
+
+/// The longest time for one deny fetch (W25-38). Without a limit, a fetch to a stopped
+/// coordinator waits for the QUIC idle timeout (60 s), and the node recovers late.
+pub const DENY_FETCH_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 async fn authed_detail(
     coord: SocketAddr,
@@ -1318,6 +1408,7 @@ fn enroll_from_response(
         advertised_routes: response.advertised_routes.unwrap_or_default(),
         exit_approved: response.exit_approved.unwrap_or(false),
         ticket,
+        first_deny: FirstDeny::NotFetched,
     })
 }
 

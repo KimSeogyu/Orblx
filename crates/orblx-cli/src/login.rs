@@ -150,12 +150,22 @@ fn login(
     .map_err(|err| err.to_string())?;
     // W25-34: a new enrollment is the local reset of the last netmap seq.
     orblx_coord::reset_node_seq(state).map_err(|err| err.to_string())?;
+    let start = std::time::Instant::now();
     result.write_state(state).map_err(|err| err.to_string())?;
+    let first = crate::coord::first_deny(
+        coord,
+        coord_name,
+        &bundle_pem,
+        state,
+        &result.first_deny,
+        start,
+    );
     println!("enrolled");
     println!("name {}", result.name);
     println!("overlay_ip {}", result.overlay_ip);
     println!("svid {}", result.svid);
     println!("peers {}", result.signed_netmap.netmap.peers.len());
+    crate::coord::print_first_deny(&first);
     Ok(())
 }
 

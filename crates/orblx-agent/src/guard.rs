@@ -8,9 +8,10 @@
 //! The guard writes grant, use, deny, expire, and revoke records to a hash chain.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -41,8 +42,10 @@ pub struct GuardConfig {
     pub service: String,
     /// Local service address.
     pub target: SocketAddr,
-    /// SPIFFE ID of this node.
+    /// SPIFFE ID of this node. The audit actor uses this value.
     pub node: SpiffeId,
+    /// The node state directory. Each deny check reads the node leaf in this directory.
+    pub node_state: PathBuf,
     /// SVID trust bundle.
     pub bundle: TrustBundle,
     /// Coordinator ticket key.
@@ -93,6 +96,8 @@ struct Known {
 
 struct CoreState {
     deny: DenySet,
+    deny_seq: Option<u64>,
+    deny_raw: Option<Vec<u8>>,
     deny_ok_at: Option<SystemTime>,
     audit: ConfigLog,
     known: BTreeMap<String, Known>,
@@ -120,6 +125,7 @@ pub struct RequestCheck<'a> {
 /// The TCP guard and an HTTP gateway use the same core.
 pub struct GuardCore {
     node: SpiffeId,
+    node_state: PathBuf,
     addr: Ipv4Addr,
     bundle: TrustBundle,
     verifier: TicketVerifier,
@@ -158,6 +164,7 @@ impl GuardCore {
         };
         Ok(Self {
             node: config.node.clone(),
+            node_state: config.node_state.clone(),
             addr,
             bundle: config.bundle.clone(),
             verifier: config.verifier.clone(),
@@ -165,6 +172,8 @@ impl GuardCore {
             stale_after: config.stale_after,
             state: Mutex::new(CoreState {
                 deny: DenySet::empty(),
+                deny_seq: None,
+                deny_raw: None,
                 deny_ok_at: None,
                 audit,
                 known: BTreeMap::new(),
@@ -180,12 +189,38 @@ impl GuardCore {
     }
 
     /// Apply one deny document and record revoked grants.
+    ///
+    /// The function reads the node SVID URI from the node leaf on each call.
+    /// It checks the signature with the netmap public key. A bad list does not
+    /// move `deny_ok_at`.
     pub fn apply_deny(&self, text: &str, now: SystemTime) -> Result<(), AgentError> {
+        let uri = node_svid_uri(&self.node_state)?;
+        let verified =
+            orblx_identity::verify_signed_deny(text.as_bytes(), &self.netmap_public, uri.as_uri())
+                .map_err(|_| AgentError::Io("The deny document is not valid.".to_string()))?;
         let mut state = self.lock()?;
+        if let Some(seq) = state.deny_seq {
+            if verified.seq() < seq
+                || (verified.seq() == seq && state.deny_raw.as_deref() != Some(verified.raw()))
+            {
+                if verified.seq() == seq {
+                    eprintln!("ALERT deny refuse seq-replay seq {}", verified.seq());
+                }
+                return Err(AgentError::Io(
+                    "The deny document is not valid.".to_string(),
+                ));
+            }
+            if verified.seq() == seq {
+                state.deny_ok_at = Some(now);
+                return Ok(());
+            }
+        }
         let _ = state
             .deny
-            .apply_json(text.as_bytes())
+            .apply_verified(&verified)
             .map_err(|_| AgentError::Io("The deny document is not valid.".to_string()))?;
+        state.deny_seq = Some(verified.seq());
+        state.deny_raw = Some(verified.raw().to_vec());
         state.deny_ok_at = Some(now);
         let version = state.deny.version().unwrap_or(0);
         let mut revoked = Vec::new();
@@ -611,6 +646,21 @@ fn append(
         })
         .map(|_| ())
         .map_err(|err| AgentError::Audit(err.to_string()))
+}
+
+/// Read the node SVID URI from the node leaf. Each deny check calls this.
+fn node_svid_uri(dir: &Path) -> Result<SpiffeId, AgentError> {
+    let primary = dir.join("node.crt.pem");
+    let path = if primary.is_file() {
+        primary
+    } else {
+        dir.join("cert.pem")
+    };
+    let pem = fs::read_to_string(path).map_err(|err| AgentError::Io(err.to_string()))?;
+    let der = orblx_identity::decode_certificate_pem(&pem)
+        .map_err(|_| AgentError::Io("The node SVID is not valid.".to_string()))?;
+    orblx_identity::extract_spiffe_id(&der)
+        .map_err(|_| AgentError::Io("The node SVID is not valid.".to_string()))
 }
 
 /// Run the TCP guard until the process stops.
