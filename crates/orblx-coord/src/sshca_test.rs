@@ -691,7 +691,7 @@ fn ssh_cert_blocking_error(
 
 /// Accept one QUIC connection and one request stream, then write no reply.
 fn spawn_coord_that_accepts_and_does_not_answer(material: crate::state::TlsMaterial) -> SocketAddr {
-    let endpoint =
+    let (endpoint, _cert) =
         crate::tlsutil::server_endpoint(&material, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .unwrap();
     let addr = endpoint.local_addr().unwrap();
