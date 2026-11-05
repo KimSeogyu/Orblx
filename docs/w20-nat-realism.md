@@ -178,7 +178,7 @@ proof_ok
 - The prc filter comes from the conntrack 5-tuple. A router that answers new UDP with ICMP would change the mapping. The lab routers drop that UDP.
 - The symmetric routers use `--random-fully` over 1024-65535. A NAT with sequential ports makes the prediction better. A NAT with a small port pool or a per-host port limit can make the birthday attempt fail.
 - The birthday attempt is probabilistic. With 256 sockets and up to 2048 probes over 64512 ports, the expected number of hits is about 8, so the chance of no hit is about 0.03 percent. When it fails, the node uses the relay. The node makes one birthday attempt for each process start.
-- Two symmetric NATs always use the relay. The code does not try a punch in that case.
+- In this lab, two symmetric NATs use the relay. The code does not try a punch when both mappings are endpoint-dependent. A mapped router port can make one side endpoint-independent. Read [port-mapping.md](port-mapping.md).
 - The hello carries the SVID at the start of the session. After an SVID renewal, the NAT runtime now sends a new signed hello on the direct path and on the relay path. See [w20-nat-followup.md](w20-nat-followup.md).
 - The overlay RTT in the lab was about 50 ms on a direct path. The cause was the 50 ms read timeout in the TUN thread: a write waited for the read timeout. The fix and the measurement are in [w20-nat-followup.md](w20-nat-followup.md).
 - One host runs all containers. The bridge has no packet loss and no delay. The switch numbers do not include real WAN loss.

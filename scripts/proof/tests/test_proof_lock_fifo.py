@@ -29,9 +29,14 @@ LIB_W25_5 = os.path.join(HERE, "fixtures", "proof-lock-w25-5-d0ddf7f.sh")
 LIB_W25_14 = os.path.join(HERE, "fixtures", "proof-lock-w25-14-9d53d3c.sh")
 
 # A stand-in proof: take the lock, write start and end times, hold the lock for $3 s.
+# /proc/uptime is Linux. macOS uses time.monotonic_ns. Both ignore a realtime step.
+HOLD_MS = (
+    'hold_ms() { if [[ -r /proc/uptime ]]; then awk \'{printf "%d", $1 * 1000}\' /proc/uptime; '
+    'else python3 -c "import time; print(time.monotonic_ns() // 1000000)"; fi; }; '
+)
 PROOF = (
-    '. "$0"; trap proof_lock_end EXIT; proof_lock_take "$1"; '
-    'echo "start $1 $(date +%s%3N)" >>"$2"; sleep "$3"; echo "end $1 $(date +%s%3N)" >>"$2"'
+    '. "$0"; trap proof_lock_end EXIT; proof_lock_take "$1"; ' + HOLD_MS +
+    'echo "start $1 $(hold_ms)" >>"$2"; sleep "$3"; echo "end $1 $(hold_ms)" >>"$2"'
 )
 
 HAS_FLOCK = shutil.which("flock") is not None and os.path.isdir("/proc/self/fdinfo")
@@ -151,9 +156,13 @@ class ProofLockFairnessTest(unittest.TestCase):
     def test_the_plain_flock_check_is_fast_under_a_parent_with_many_fds(self):
         # A CI runner can be an ancestor with hundreds of fds. The check must not make one
         # grep per fd: that took 0.7 s with 600 fds and made the W25-5 waiter test fail on CI.
+        # date +%s%3N reads CLOCK_REALTIME. A step backward between the two calls makes a
+        # negative duration (CI printed rc=1 ms=-577) and the match on ms=(\d+) fails.
+        # rc=1 is the result when no ancestor holds a plain flock. hold_ms reads /proc/uptime.
         open(self.lock, "a").close()
-        check = ('. "$0"; s=$(date +%s%3N); p="$(proof_lock_plain_parent "$1")"; rc=$?; '
-                 'echo "rc=$rc ms=$(( $(date +%s%3N) - s )) pid=${p%% *}"')
+        check = ('. "$0"; ' + HOLD_MS +
+                 's=$(hold_ms); p="$(proof_lock_plain_parent "$1")"; rc=$?; '
+                 'echo "rc=$rc ms=$(( $(hold_ms) - s )) pid=${p%% *}"')
         fds = [os.open(os.devnull, os.O_RDONLY) for _ in range(2000)]
         held = os.open(self.lock, os.O_RDWR)
         try:

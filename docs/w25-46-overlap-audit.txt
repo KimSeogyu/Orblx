@@ -1,15 +1,24 @@
 w25-46 overlap audit
-dedupe_key=acquire_time+pid
-runs_before=6
-runs_after_dedupe=5
+dedupe_key=acquire_time+pid|label+acquire
+cutoff=2026-10-31T17:23:11.000+0900
+until=
+runs_before=7
+runs_after_dedupe=6
 duplicate_logs=1
+source_dir=/workspace/orblx-w18-proof
 soak_label=coord-cert-soak
 soak_pid=2065982
-soak_nominal_end=2026-11-05T09:30:00.000+0900
+soak_nominal_end=
 soak_real_end=2026-11-05T09:10:25.000+0900
 soak_real_end_source=proof_cancel
+soak_cancel_record=w25-42-step2-cancel-20261105-091025.log:1
 overlap_pairs=0
 rejudge_window=2026-11-05T09:10:00.000+0900/2026-11-05T09:15:00.000+0900
-rejudge policy-scale acquire=2026-11-05T09:10:35.126+0900 log=w25-34-proof-policy-scale-2876d63.log verdict=INVALID reason=soak_containers_still_running contended_samples=3 other=1
-rejudge deny-damage acquire=2026-11-05T09:13:31.657+0900 log=w25-38-deny-damage.log verdict=VALID_for_container_overlap reason=clear contended_samples=0 other=0
-rejudge policy-scale acquire=2026-11-05T09:14:40.000+0900 log=w25-34-proof-policy-scale-091440.log verdict=VALID_for_container_overlap reason=clear contended_samples=0 other=0
+rejudge policy-scale:orblx-w2534-scale-proof acquire=2026-11-05T09:10:35.126+0900 log=w25-34-proof-policy-scale-2876d63.log verdict=INVALID reason=soak_containers_still_running contended_samples=3 other=1
+rejudge w25-38-deny-damage acquire=2026-11-05T09:13:31.619+0900 log=w25-38-deny-damage-7d911a3.log verdict=VALID_for_container_overlap reason=clear contended_samples=0 other=0
+rejudge policy-scale:orblx-w2534-scale-proof acquire=2026-11-05T09:14:40.878+0900 log=w25-34-proof-policy-scale-main-995ea4d.log verdict=VALID_for_container_overlap reason=clear contended_samples=0 other=0
+timeline proof_cancel time=2026-11-05T09:10:25.000+0900 path=w25-42-step2-cancel-20261105-091025.log:1
+timeline flock_free_at_or_before time=2026-11-05T09:10:35.126+0900 path=w25-34-proof-policy-scale-2876d63.log:169
+timeline containers_still_up time=2026-11-05T09:10:35.166+0900 other_orblx_containers=1 groups=orblx-w2542:1 path=w25-34-proof-policy-scale-2876d63.log:170
+timeline lock_released time=2026-11-05T09:10:44.000+0900 path=w25-42-step2-cancel-20261105-091025.log:2 note=after_flock_free cancel_script_log_latency
+No real 2-holder flock window. Container overlap: yes (policy-scale 09:10:35 INVALID).

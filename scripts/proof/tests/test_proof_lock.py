@@ -8,6 +8,7 @@ and prints the holder, and that each shell prints the proof_context lines.
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -242,6 +243,91 @@ bash -c "$CHILD"
             r"(?m)^proof_lock next released at \S+ pid=\d+$",
             res.stdout,
         )
+
+    def test_sigkill_with_live_containers_aborts_before_the_proof_step(self):
+        # The killed-holder release line is test_a_killed_holder_gets_a_release_line_with_its_pid.
+        # The foreign abort before a proof step is test_proof_foreign_check.py. This test chains
+        # them: SIGKILL leaves the holder's compose rows up, and the next proof_lock_take must
+        # abort before its proof step.
+        docker = (
+            "#!/bin/sh\n"
+            'if [ "$1" = ps ]; then\n'
+            "  printf 'orblx-victim-1\\torblx-victim\\n'\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n"
+        )
+        env = with_fake_docker(self.env, docker=docker)
+        script = r"""
+set -euo pipefail
+. "$LOCK_SH"
+trap proof_lock_end EXIT
+proof_lock_take "$LABEL" "$OWN"
+echo "proof_step_ran $LABEL"
+sleep "$HOLD"
+"""
+        holder_env = dict(env, LABEL="victim", OWN="orblx-victim", HOLD="30")
+        holder = subprocess.Popen(
+            ["bash", "-c", script],
+            env=holder_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        victim_pid = None
+        try:
+            for _ in range(50):
+                time.sleep(0.1)
+                if holder.poll() is not None:
+                    break
+                holder_file = env["ORBLX_PROOF_LOCK"] + ".holder"
+                if os.path.isfile(holder_file):
+                    with open(holder_file) as handle:
+                        text = handle.read()
+                    if "label=victim" in text:
+                        found = re.search(r"(?m)^pid=(\d+)$", text)
+                        if found:
+                            victim_pid = int(found.group(1))
+                            break
+            else:
+                self.fail("holder did not write the holder file")
+            self.assertIsNotNone(victim_pid)
+            # SIGKILL the holder and the children that inherited the lock fd.
+            # A child sleep would keep the flock after the shell dies.
+            os.killpg(holder.pid, signal.SIGKILL)
+            holder.wait(timeout=10)
+            if holder.stdout is not None:
+                holder.stdout.close()
+        except Exception:
+            if holder.poll() is None:
+                os.killpg(holder.pid, signal.SIGKILL)
+            if holder.stdout is not None:
+                holder.stdout.close()
+            raise
+        next_env = dict(env, LABEL="next", OWN="orblx-next", HOLD="0.2")
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env=next_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
+        )
+        combined = result.stdout or ""
+        self.assertEqual(result.returncode, 5, combined)
+        self.assertIn(
+            "proof_infra_abort next reason=foreign_containers names=orblx-victim-1. No proof step ran.",
+            combined,
+        )
+        self.assertNotIn("proof_step_ran next", combined)
+        self.assertNotIn("phase start", combined)
+        self.assertRegex(
+            combined,
+            rf"(?m)^proof_lock victim released at \S+ pid={victim_pid} reason=killed_holder_cleared_by_next$",
+        )
+        free = subprocess.run(["flock", "-n", env["ORBLX_PROOF_LOCK"], "true"])
+        self.assertEqual(free.returncode, 0)
 
     def test_the_lock_is_free_after_the_holder_ends(self):
         first = self.start("one", 0.1)

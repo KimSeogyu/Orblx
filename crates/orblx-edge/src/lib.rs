@@ -29,6 +29,7 @@ mod nat_path;
 mod nat_run;
 mod nat_smash;
 mod path;
+mod portmap;
 mod punch;
 mod relay;
 mod same_nat;
@@ -60,6 +61,7 @@ pub use path::{
     AllocatePhase, DirectPhase, PathId, PathMachine, PathState, RelayPhase, DIRECT_ATTEMPT_BUDGET,
     DIRECT_QUIC_PORT, DIRECT_RETRY_INTERVAL, STICK_AND_UPGRADE,
 };
+pub use portmap::{PortMapChoice, PortMapProto, PORT_MAP_BUDGET, PORT_MAP_LIFETIME_SECS};
 pub use punch::PunchToken;
 pub use relay::{
     relay_policy_port, run_relay_smoke, RelayLabReport, RelayLink, RelayProof, RelayRequest,
