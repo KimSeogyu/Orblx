@@ -43,13 +43,18 @@ Roles: `owner`, `admin`, `network-admin`, `it-admin`, `auditor`, `member`.
 An auditor is read-only. The read set includes the audit log.
 A member can call no admin operation.
 A token stores `created_role` and, for an OIDC creator, `created_user`.
-`created_role` is the role at create time. A later call does not use it to keep rights.
+`created_role` is the role at create time. A later call does not use it to grant rights.
 At each call the scope must match and the creator's current role must allow the operation.
+The coordinator reads that role from the current policy and the current user store.
+A policy owner SVID is `owner` while it stays in `owners`.
+An enrolled node uses the approved role of its OIDC user.
+A removed user, a rejected user, a pending user, or a creator that is not found grants no rights.
 A demotion takes effect on the next call. The token file does not change.
-A removed user, a rejected user, or a pending user grants no rights.
-A policy owner SVID does not bind `created_user`. That token uses the owner role while the SVID stays an owner.
-A token with no user and no known node keeps the stored role. That is the path for a token file from before this change when the creator was not enrolled.
-Old token files have no `created_role`. The coordinator treats them as `owner`, because only an owner could create a token before this change.
+
+Migration: a token file from before this change has no `created_role` and no `created_user`.
+The file default for `created_role` is `owner`. That default does not grant rights.
+If the creator SVID is not a current policy owner and not an approved user of an enrolled node, the token has no rights.
+The call writes one `role-deny`. Replace or revoke those tokens after you move a SVID out of `owners`.
 The coordinator keeps only the token digest. Logs and audit records show the token id, not the token text.
 
 A role change needs the config audit chain. When the record write fails, the role does not change.
@@ -79,6 +84,9 @@ orblx admin token-create --scope SCOPE --ttl 10m --coord ADDR ...
 | `roles::tests::an_auditor_can_read_the_audit_log_and_cannot_write` | REAL | Audit read and node read pass. Approve and role-set each write one `role-deny`. |
 | `roles::tests::a_token_cannot_exceed_the_creator_role_and_a_demotion_has_one_deny` | REAL | `it-admin` cannot create a `policy:write` token. A `nodes:write` token works, then the user moves to `member`. The next call is `role-deny` once and not `token-deny`. The audit text has no token secret. |
 | `roles::tests::a_demoted_admin_token_follows_the_current_role` | REAL | An admin token has `nodes:read` and `nodes:write`. As `auditor`, `admin-nodes` still works and `admin-approve` is one `role-deny`. A member can call no admin operation, so after `member` the same read is one `role-deny`. Back as `admin`, `admin-approve` works and `admin-policy-set` stays a scope refusal. A rejected user and a removed user grant no rights. |
+| `server::tests::a_removed_policy_owner_token_gets_403_and_one_role_deny` | REAL | An owner SVID creates a `nodes:read` token. After the policy drops that SVID, the token gets status 403 and one `role-deny`. It does not write `token-deny`. |
+| `server::tests::a_legacy_token_without_a_live_creator_gets_403` | REAL | An old token file has no `created_role` and no live creator. The call gets status 403 and one `role-deny`. The stored default `owner` grants nothing. |
+| `roles::tests::a_former_owner_node_uses_the_approved_user_role` | REAL | A policy owner node leaves `owners`. Its user is rejected and the stored role is still `admin`. The token gets one `role-deny` and not the stored role. |
 | `admin::tests::role_set_parses_the_user_and_the_role` | REAL | The CLI accepts a known role and refuses an unknown role. |
 
 ## Proof

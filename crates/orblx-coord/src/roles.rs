@@ -149,10 +149,9 @@ pub fn scope_fits(role: Role, scope: &str, ops: &[(&str, &str)]) -> bool {
 /// The role of `actor` now.
 ///
 /// A policy owner SVID is `owner`.
-/// An enrolled node uses the role of its OIDC user, or `member` when the
-/// node has no OIDC user.
+/// An enrolled node uses the approved role of its OIDC user, or `member`
+/// when the node has no OIDC user or that user is not approved.
 /// `None` means the actor is not a known node and not a policy owner.
-/// A stored token role then stays in force.
 pub fn live_role(coord: &Coordinator, actor: &str) -> Result<Option<Role>, CoordError> {
     if let Ok(id) = SpiffeId::parse(actor) {
         if coord.caller_is_owner(&id)? {
@@ -161,14 +160,14 @@ pub fn live_role(coord: &Coordinator, actor: &str) -> Result<Option<Role>, Coord
         let nodes = coord.node_list()?;
         if let Some(node) = nodes.into_iter().find(|node| node.svid == actor) {
             if let Some(user) = oidc_user(&node.owner) {
-                return Ok(Some(user_role(coord, &user)?));
+                return Ok(Some(approved_user_role(coord, &user)?));
             }
             return Ok(Some(Role::Member));
         }
         return Ok(None);
     }
     if let Some(user) = oidc_user(actor) {
-        return Ok(Some(user_role(coord, &user)?));
+        return Ok(Some(approved_user_role(coord, &user)?));
     }
     Ok(None)
 }
@@ -183,7 +182,7 @@ pub fn require_live(coord: &Coordinator, actor: &str) -> Result<Role, CoordError
 /// The OIDC user that a new token must follow, or empty.
 ///
 /// A policy owner SVID does not bind the token to a user.
-/// The token then stays at the role stored at create time.
+/// Each later call reads that SVID from the current policy and the node store.
 pub fn token_user(coord: &Coordinator, actor: &str) -> Result<String, CoordError> {
     if let Ok(id) = SpiffeId::parse(actor) {
         if coord.caller_is_owner(&id)? {
@@ -205,18 +204,15 @@ pub fn token_user(coord: &Coordinator, actor: &str) -> Result<String, CoordError
 /// The role that blocks one token call, when the token would pass its scope.
 ///
 /// The effective rights are the token scopes crossed with the creator's role now.
-/// The stored create-time role does not keep rights after a demotion.
-/// A removed user, a rejected user, or a pending user grants nothing.
-/// A token with no user binding uses the live role of `created_by`.
-/// When that caller is not a known node, the stored role stays in force.
+/// The stored create-time role does not grant rights.
+/// A creator that is not in the current policy or the current user store grants nothing.
 pub fn blocking_role(
     coord: &Coordinator,
     created_by: &str,
     created_user: &str,
-    created_role: &str,
     op: &str,
 ) -> Result<Option<Role>, CoordError> {
-    let current = creator_role_now(coord, created_by, created_user, created_role)?;
+    let current = creator_role_now(coord, created_by, created_user)?;
     if current.allows(op) {
         Ok(None)
     } else {
@@ -225,24 +221,18 @@ pub fn blocking_role(
 }
 
 /// The role a token uses at call time.
+///
+/// Every creator kind is read from the current policy and the current store.
+/// A creator that is not found is `member`, which grants no admin call.
 fn creator_role_now(
     coord: &Coordinator,
     created_by: &str,
     created_user: &str,
-    created_role: &str,
 ) -> Result<Role, CoordError> {
     if !created_user.is_empty() {
         return approved_user_role(coord, created_user);
     }
-    if let Ok(id) = SpiffeId::parse(created_by) {
-        if coord.caller_is_owner(&id)? {
-            return Ok(Role::Owner);
-        }
-    }
-    match live_role(coord, created_by)? {
-        Some(live) => Ok(live),
-        None => Ok(Role::parse(created_role).unwrap_or(Role::Member)),
-    }
+    Ok(live_role(coord, created_by)?.unwrap_or(Role::Member))
 }
 
 /// The current role of an approved user. Any other state grants `member`.
@@ -346,14 +336,6 @@ fn oidc_user(owner: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-fn user_role(coord: &Coordinator, user: &str) -> Result<Role, CoordError> {
-    let (users, _) = coord.user_list()?;
-    let Some(stored) = users.into_iter().find(|stored| stored.user == user) else {
-        return Ok(Role::Member);
-    };
-    Ok(Role::parse(&stored.role).unwrap_or(Role::Member))
 }
 
 fn short_op(op: &str) -> String {
@@ -982,6 +964,70 @@ mod tests {
         let body = made.secret.trim_start_matches(apitoken::API_TOKEN_PREFIX);
         assert!(!audit.contains(body));
         assert!(!audit.contains(&id_token));
+    }
+
+    #[test]
+    fn a_former_owner_node_uses_the_approved_user_role() {
+        let scratch = Scratch::new();
+        let now = SystemTime::now();
+        let oidc = MockOidc::generate(MOCK_OIDC_ISSUER).unwrap();
+        let gate = IssueGate::new(MiniCa::generate(now).unwrap(), &oidc).unwrap();
+        let coord =
+            Coordinator::open(&scratch.0, "coord", OidcConfig::Mock(Box::new(gate))).unwrap();
+        coord.enable_config_audit().unwrap();
+        coord.approve_user_by("oidc:ada", ACTOR, now).unwrap();
+        apply(
+            &coord,
+            &SetAsk {
+                user: "ada".to_string(),
+                role: "admin".to_string(),
+            },
+            ACTOR,
+            now,
+        )
+        .unwrap();
+        let id_token = oidc
+            .issue_id_token("ada", now, Duration::from_secs(600))
+            .unwrap();
+        let enrolled = coord
+            .enroll_oidc(
+                "ada-pc",
+                &id_token,
+                None,
+                &["ada-pc:443".to_string()],
+                &[],
+                now,
+            )
+            .unwrap();
+        let path = scratch.0.join("policy.hujson");
+        let policy = |owner: &str| {
+            format!(
+                "{{\"owners\": [\"{owner}\"], \"acls\": [{{\"action\": \"accept\", \"src\": [\"{owner}\"], \"proto\": \"tcp\", \"dst\": [\"{owner}:1\"]}}]}}"
+            )
+        };
+        fs::write(&path, policy(&enrolled.svid)).unwrap();
+        coord.set_policy_file(&path).unwrap();
+        let made = apitoken::create(
+            &coord,
+            &CreateAsk {
+                scopes: vec!["nodes:read".to_string()],
+                ttl_secs: 60,
+            },
+            &enrolled.svid,
+            Role::Owner,
+            now,
+        )
+        .unwrap();
+        let call = |op: &str| apitoken::check(&coord, &made.secret, op, now, || Ok(None)).unwrap();
+        assert!(call("admin-nodes").role_block.is_none());
+        set_user_state(&scratch, "oidc:ada", Some("rejected"), true);
+        fs::write(&path, policy(ACTOR)).unwrap();
+        coord.set_policy_file(&path).unwrap();
+        let blocked = call("admin-nodes");
+        assert_eq!(blocked.role_block, Some(Role::Member));
+        assert_eq!(count(&coord, "role-deny", "nodes"), 1);
+        assert_eq!(count(&coord, "token-use", &made.id), 1);
+        assert_eq!(count(&coord, "token-deny", &made.id), 0);
     }
 
     /// Edit one user in `nodes.json`. `state` sets the approval state.

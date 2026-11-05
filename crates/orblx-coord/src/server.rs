@@ -1008,6 +1008,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
         coord.enable_config_audit().unwrap();
+        let policy_path = dir.join("policy.hujson");
+        std::fs::write(&policy_path, policy_text(&[OWNER], 22)).unwrap();
+        coord.set_policy_file(&policy_path).unwrap();
         let now = SystemTime::now();
         for scope in all_scopes() {
             let ask = CreateAsk {
@@ -1372,6 +1375,97 @@ mod tests {
         let reply = with_expect(&policy_text(&[OWNER], 23), &live);
         assert_eq!(reply.status, Some(409));
         assert_eq!(sha(&policy_path), applied);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn role_deny_count(coord: &Coordinator, target: &str) -> usize {
+        coord
+            .config_audit_text()
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                line.contains("\"role-deny\"") && line.contains(&format!("\"target\":\"{target}\""))
+            })
+            .count()
+    }
+
+    /// A policy owner SVID that leaves the owner list loses the token.
+    #[test]
+    fn a_removed_policy_owner_token_gets_403_and_one_role_deny() {
+        let dir = std::env::temp_dir().join(format!("orblx-server-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        let policy_path = dir.join("policy.hujson");
+        std::fs::write(&policy_path, policy_text(&[OWNER], 22)).unwrap();
+        coord.set_policy_file(&policy_path).unwrap();
+        let now = SystemTime::now();
+        let made = apitoken::create(
+            &coord,
+            &CreateAsk {
+                scopes: vec!["nodes:read".to_string()],
+                ttl_secs: 60,
+            },
+            OWNER,
+            crate::roles::Role::Owner,
+            now,
+        )
+        .unwrap();
+        let reply = dispatch_token(
+            &coord,
+            &call("admin-nodes", &made.secret),
+            &made.secret,
+            now,
+        );
+        assert_eq!(reply.status, Some(200));
+        std::fs::write(&policy_path, policy_text(&[NODE_A], 23)).unwrap();
+        coord.set_policy_file(&policy_path).unwrap();
+        let denies = role_deny_count(&coord, "nodes");
+        let token_denies = deny_count(&coord, &made.id, "scope");
+        let reply = dispatch_token(
+            &coord,
+            &call("admin-nodes", &made.secret),
+            &made.secret,
+            now,
+        );
+        assert_eq!(reply.status, Some(403));
+        assert!(reply.error.unwrap().contains("The caller is not an owner."));
+        assert_eq!(role_deny_count(&coord, "nodes"), denies + 1);
+        assert_eq!(deny_count(&coord, &made.id, "scope"), token_denies);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An old token file has no live creator. The default stored role grants nothing.
+    #[test]
+    fn a_legacy_token_without_a_live_creator_gets_403() {
+        let dir = std::env::temp_dir().join(format!("orblx-server-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
+        coord.enable_config_audit().unwrap();
+        let secret = format!("{}legacy-token-value", apitoken::API_TOKEN_PREFIX);
+        let hash = apitoken::token_hash_hex(&secret);
+        let id = hash.get(..16).unwrap().to_string();
+        let file = serde_json::json!({
+            "version": 1,
+            "tokens": [{
+                "id": id,
+                "hash_hex": hash,
+                "scopes": ["nodes:read"],
+                "created_by": "spiffe://orblx.local/node/old-owner",
+                "created_unix_ms": 1,
+                "expires_unix_ms": 9_000_000_000_000u64
+            }]
+        });
+        std::fs::write(dir.join(apitoken::API_TOKEN_FILE), file.to_string()).unwrap();
+        let now = SystemTime::now();
+        let reply = dispatch_token(&coord, &call("admin-nodes", &secret), &secret, now);
+        assert_eq!(reply.status, Some(403));
+        assert!(reply.error.unwrap().contains("The caller is not an owner."));
+        assert_eq!(role_deny_count(&coord, "nodes"), 1);
+        assert_eq!(deny_count(&coord, &id, "scope"), 0);
+        assert!(!coord.config_audit_text().unwrap().contains(&secret));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

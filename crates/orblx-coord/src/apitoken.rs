@@ -127,7 +127,8 @@ struct TokenRecord {
     /// The OIDC user the token follows. Empty for a policy owner SVID and for an old token.
     #[serde(default)]
     created_user: String,
-    /// The creator role at create time. An old token has no field and is `owner`.
+    /// The creator role at create time. An old token has no field and reads as `owner`.
+    /// A call does not use this field. Rights come from the current policy and store.
     #[serde(default = "default_owner_role")]
     created_role: String,
     created_unix_ms: u64,
@@ -565,7 +566,6 @@ pub fn decide(
     };
     let created_by = token.created_by.clone();
     let created_user = token.created_user.clone();
-    let created_role = token.created_role.clone();
     let id = token.id.clone();
     let result = if token.revoked_unix_ms.is_some() {
         Err(Refusal::Revoked)
@@ -577,7 +577,7 @@ pub fn decide(
         Err(Refusal::Scope)
     };
     let role_block = if result.is_ok() {
-        roles::blocking_role(coord, &created_by, &created_user, &created_role, op)?
+        roles::blocking_role(coord, &created_by, &created_user, op)?
     } else {
         None
     };
@@ -622,6 +622,12 @@ fn file_digest(dir: &Path) -> Result<[u8; 32], CoordError> {
 
 fn token_hash(secret: &str) -> String {
     encode_hex(Sha256::digest(secret.as_bytes()).as_slice())
+}
+
+/// SHA-256 hex of a token secret. Tests use it to build an old token file.
+#[cfg(test)]
+pub(crate) fn token_hash_hex(secret: &str) -> String {
+    token_hash(secret)
 }
 
 fn constant_eq(left: &str, right: &str) -> bool {
@@ -705,7 +711,16 @@ mod tests {
     fn audited(scratch: &Scratch) -> Coordinator {
         let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
         coord.enable_config_audit().unwrap();
+        let path = scratch.0.join("policy.hujson");
+        std::fs::write(&path, owner_policy(OWNER)).unwrap();
+        coord.set_policy_file(&path).unwrap();
         coord
+    }
+
+    fn owner_policy(owner: &str) -> String {
+        format!(
+            "{{\"owners\": [\"{owner}\"], \"acls\": [{{\"action\": \"accept\", \"src\": [\"{owner}\"], \"proto\": \"tcp\", \"dst\": [\"{owner}:1\"]}}]}}"
+        )
     }
 
     fn ask(scopes: &[&str], ttl_secs: u64) -> CreateAsk {
