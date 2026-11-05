@@ -75,11 +75,6 @@ struct Auth {
     trust: TrustBundle,
     deny: SharedDeny,
     allow: SharedAllow,
-    /// Capability ticket presented on each NEW handshake (W25-45).
-    ///
-    /// A renewal replaces this. A bound session keeps the ticket it presented
-    /// (snapshot at handshake). Do not mutate an open session's ticket in place.
-    presented: Mutex<Presented>,
     ticket_ring: TicketRing,
 }
 
@@ -90,13 +85,29 @@ struct Presented {
     mac: [u8; 32],
 }
 
-impl Auth {
-    fn presented_now(&self) -> Presented {
-        self.presented
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .clone()
+impl Presented {
+    fn from_config(config: &HelloConfig) -> Self {
+        Self {
+            bytes: config.ticket_bytes.clone(),
+            mac: config.ticket_mac,
+        }
     }
+}
+
+/// The identity for NEW handshakes (W25-45): the TLS configs and the capability ticket.
+///
+/// One lock holds all of them, so a handshake never pairs a new leaf with an old ticket
+/// or an old leaf with a new ticket. Open sessions keep the ticket they presented.
+struct Installed {
+    /// The server config for the next accepted connection. None for a client-only endpoint.
+    server: Option<Arc<quinn::ServerConfig>>,
+    /// The leaf used for the next outbound handshake.
+    ///
+    /// Quinn stores this value on the endpoint object.
+    /// A shared endpoint cannot replace it through `&self`.
+    client: Option<quinn::ClientConfig>,
+    /// The capability ticket presented in the next handshake.
+    presented: Presented,
 }
 
 type SharedDeny = Arc<Mutex<DenySet>>;
@@ -120,11 +131,8 @@ fn deny_now(deny: &SharedDeny) -> DenySet {
 pub struct HelloEndpoint {
     endpoint: quinn::Endpoint,
     auth: Arc<Auth>,
-    /// The leaf used for the next outbound handshake.
-    ///
-    /// Quinn stores this value on the endpoint object.
-    /// A shared endpoint cannot replace it through `&self`.
-    client_config: Mutex<Option<quinn::ClientConfig>>,
+    /// The TLS configs and the ticket for new handshakes, under one lock (W25-45).
+    installed: Mutex<Installed>,
 }
 
 impl HelloEndpoint {
@@ -137,8 +145,17 @@ impl HelloEndpoint {
             .map_err(|err| HelloError::Tls(err.to_string()))?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic));
         server.transport_config(transport_config());
-        let endpoint = quinn::Endpoint::server(server, listen).map_err(io_error)?;
-        Ok(Self::assemble(endpoint, auth, None))
+        let server = Arc::new(server);
+        let endpoint = quinn::Endpoint::server(quinn::ServerConfig::clone(&server), listen)
+            .map_err(io_error)?;
+        let presented = Presented::from_config(&config);
+        Ok(Self::assemble(
+            endpoint,
+            auth,
+            Some(server),
+            None,
+            presented,
+        ))
     }
 
     /// Bind a client socket.
@@ -152,7 +169,14 @@ impl HelloEndpoint {
         client.transport_config(transport_config());
         let mut endpoint = quinn::Endpoint::client(bind).map_err(io_error)?;
         endpoint.set_default_client_config(client.clone());
-        Ok(Self::assemble(endpoint, auth, Some(client)))
+        let presented = Presented::from_config(&config);
+        Ok(Self::assemble(
+            endpoint,
+            auth,
+            None,
+            Some(client),
+            presented,
+        ))
     }
 
     /// Bind one UDP socket that accepts peers and dials peers.
@@ -166,56 +190,64 @@ impl HelloEndpoint {
             .map_err(|err| HelloError::Tls(err.to_string()))?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
         server.transport_config(transport_config());
-        let mut endpoint = quinn::Endpoint::server(server, listen).map_err(io_error)?;
+        let server = Arc::new(server);
+        let mut endpoint = quinn::Endpoint::server(quinn::ServerConfig::clone(&server), listen)
+            .map_err(io_error)?;
         let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client_config)
             .map_err(|err| HelloError::Tls(err.to_string()))?;
         let mut client = quinn::ClientConfig::new(Arc::new(quic_client));
         client.transport_config(transport_config());
         endpoint.set_default_client_config(client.clone());
-        Ok(Self::assemble(endpoint, auth, Some(client)))
+        let presented = Presented::from_config(&config);
+        Ok(Self::assemble(
+            endpoint,
+            auth,
+            Some(server),
+            Some(client),
+            presented,
+        ))
     }
 
-    /// Install a new leaf for later handshakes.
+    /// Install a new leaf and its capability ticket for later handshakes.
     ///
-    /// Open sessions keep the previous leaf until the node reconnects.
+    /// The TLS configs and the ticket change together under one lock (W25-45).
+    /// Open sessions keep the previous leaf and ticket until the node reconnects.
     pub fn install_identity(&self, config: &HelloConfig) -> Result<(), HelloError> {
         let (server_config, _) = server_rustls(config)?;
         let (client_config, _) = client_rustls(config)?;
-        let presented = Presented {
-            bytes: config.ticket_bytes.clone(),
-            mac: config.ticket_mac,
-        };
         let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(server_config)
             .map_err(|err| HelloError::Tls(err.to_string()))?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
         server.transport_config(transport_config());
-        self.endpoint.set_server_config(Some(server));
+        let server = Arc::new(server);
         let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client_config)
             .map_err(|err| HelloError::Tls(err.to_string()))?;
         let mut client = quinn::ClientConfig::new(Arc::new(quic_client));
         client.transport_config(transport_config());
-        *self
-            .client_config
-            .lock()
-            .unwrap_or_else(|err| err.into_inner()) = Some(client);
-        // Replace the ticket for later handshakes only. Open sessions keep their snapshot.
-        *self
-            .auth
-            .presented
-            .lock()
-            .unwrap_or_else(|err| err.into_inner()) = presented;
+        let mut installed = self.installed.lock().unwrap_or_else(|err| err.into_inner());
+        self.endpoint
+            .set_server_config(Some(quinn::ServerConfig::clone(&server)));
+        installed.server = Some(server);
+        installed.client = Some(client);
+        installed.presented = Presented::from_config(config);
         Ok(())
     }
 
     fn assemble(
         endpoint: quinn::Endpoint,
         auth: Auth,
+        server: Option<Arc<quinn::ServerConfig>>,
         client: Option<quinn::ClientConfig>,
+        presented: Presented,
     ) -> Self {
         Self {
             endpoint,
             auth: Arc::new(auth),
-            client_config: Mutex::new(client),
+            installed: Mutex::new(Installed {
+                server,
+                client,
+                presented,
+            }),
         }
     }
 
@@ -266,10 +298,21 @@ impl HelloEndpoint {
             .accept()
             .await
             .ok_or(HelloError::EndpointClosed)?;
-        let connection = incoming
+        // W25-45: take the server config and the ticket from one snapshot, so the leaf of
+        // this handshake and the presented ticket come from the same renewal.
+        let (server, presented) = {
+            let installed = self.installed.lock().unwrap_or_else(|err| err.into_inner());
+            (installed.server.clone(), installed.presented.clone())
+        };
+        let connecting = match server {
+            Some(server) => incoming.accept_with(server),
+            None => incoming.accept(),
+        }
+        .map_err(|err| HelloError::Quic(err.to_string()))?;
+        let connection = connecting
             .await
             .map_err(|err| HelloError::Quic(err.to_string()))?;
-        bind_session(connection, &self.auth, StreamRole::Server).await
+        bind_session(connection, &self.auth, StreamRole::Server, presented).await
     }
 
     /// Build an endpoint on a socket the caller already owns.
@@ -286,21 +329,22 @@ impl HelloEndpoint {
         socket.set_nonblocking(true).map_err(io_error)?;
         let runtime = quinn::default_runtime()
             .ok_or_else(|| HelloError::Quic("The call is outside a Tokio runtime.".to_string()))?;
-        let (endpoint, auth, client) = match role {
+        let (endpoint, auth, server, client) = match role {
             HelloSocketRole::Server => {
                 let (rustls_config, auth) = server_rustls(&config)?;
                 let quic = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
                     .map_err(|err| HelloError::Tls(err.to_string()))?;
                 let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic));
                 server.transport_config(transport_config());
+                let server = Arc::new(server);
                 let endpoint = quinn::Endpoint::new(
                     quinn::EndpointConfig::default(),
-                    Some(server),
+                    Some(quinn::ServerConfig::clone(&server)),
                     socket,
                     runtime,
                 )
                 .map_err(io_error)?;
-                (endpoint, auth, None)
+                (endpoint, auth, Some(server), None)
             }
             HelloSocketRole::Client { .. } => {
                 let (rustls_config, auth) = client_rustls(&config)?;
@@ -312,19 +356,21 @@ impl HelloEndpoint {
                     quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
                         .map_err(io_error)?;
                 endpoint.set_default_client_config(client.clone());
-                (endpoint, auth, Some(client))
+                (endpoint, auth, None, Some(client))
             }
         };
-        Ok(Self::assemble(endpoint, auth, client))
+        let presented = Presented::from_config(&config);
+        Ok(Self::assemble(endpoint, auth, server, client, presented))
     }
 
     /// Connect to `peer` and open one bidirectional stream.
     pub async fn connect_one(&self, peer: SocketAddr) -> Result<HelloSession, HelloError> {
-        let config = self
-            .client_config
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .clone()
+        // W25-45: the client leaf and the ticket come from one snapshot.
+        let (config, presented) = {
+            let installed = self.installed.lock().unwrap_or_else(|err| err.into_inner());
+            (installed.client.clone(), installed.presented.clone())
+        };
+        let config = config
             .ok_or_else(|| HelloError::Quic("The endpoint has no client identity.".to_string()))?;
         let connecting = self
             .endpoint
@@ -333,7 +379,7 @@ impl HelloEndpoint {
         let connection = connecting
             .await
             .map_err(|err| HelloError::Quic(err.to_string()))?;
-        bind_session(connection, &self.auth, StreamRole::Client).await
+        bind_session(connection, &self.auth, StreamRole::Client, presented).await
     }
 
     /// Connect to `peer`. Start one more attempt each `probe_every` until one attempt ends.
@@ -495,10 +541,34 @@ impl HelloSession {
         self.receiver.recv_ipv4().await
     }
 
+    /// Send one TICKET frame on the open session (W25-45 test).
+    ///
+    /// The peer must end the session: a ticket is valid only in the hello.
+    #[cfg(test)]
+    pub(crate) async fn send_ticket_frame_for_test(&mut self) -> Result<(), HelloError> {
+        let sender = &mut self.sender;
+        let frame = Frame {
+            frame_type: FrameType::Ticket,
+            flags: 0,
+            session_id: sender.session_id,
+            seq: sender.next_seq,
+            ticket_hash: sender.ticket_hash,
+            payload: Vec::new(),
+        };
+        let bytes = encode_length_prefixed(&frame)?;
+        sender
+            .send
+            .write_all(&bytes)
+            .await
+            .map_err(|err| HelloError::Quic(err.to_string()))?;
+        sender.next_seq = sender.next_seq.checked_add(1).ok_or(HelloError::BadSeq)?;
+        Ok(())
+    }
+
     /// Read one IPv4 packet.
     ///
     /// CTRL frames stay on the session and are skipped.
-    async fn recv_overlay(&mut self) -> Result<Vec<u8>, HelloError> {
+    pub(crate) async fn recv_overlay(&mut self) -> Result<Vec<u8>, HelloError> {
         loop {
             match self.receiver.recv_event().await? {
                 SessionEvent::Packet(packet) => return Ok(packet),
@@ -692,6 +762,7 @@ async fn bind_session(
     connection: quinn::Connection,
     auth: &Auth,
     role: StreamRole,
+    presented: Presented,
 ) -> Result<HelloSession, HelloError> {
     let leaf = match peer_leaf(&connection) {
         Ok(leaf) => leaf,
@@ -713,7 +784,6 @@ async fn bind_session(
     }
     let peer_not_after = leaf_not_after(&leaf).map_err(HelloError::Identity)?;
     let (mut send, mut recv) = open_stream(&connection, role).await?;
-    let presented = auth.presented_now();
     if let Err(err) = exchange_ticket(&mut send, &mut recv, role, auth, &presented, &mut gate).await
     {
         reject_ticket(&connection);
@@ -951,10 +1021,6 @@ fn auth_from(config: &HelloConfig) -> Auth {
         trust: config.trust.clone(),
         deny: Arc::new(Mutex::new(config.deny.clone())),
         allow: Arc::new(Mutex::new(None)),
-        presented: Mutex::new(Presented {
-            bytes: config.ticket_bytes.clone(),
-            mac: config.ticket_mac,
-        }),
         ticket_ring: config.ticket_ring.clone(),
     }
 }
