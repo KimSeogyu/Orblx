@@ -36,7 +36,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 FILE="scripts/proof/compose.w25-38-deny-damage.yml"
-WORK="$(mktemp -d)"
+WORK="/workspace/orblx-w25-38-136/work-debug"; mkdir -p "$WORK"
 export POLICY_FILE="$WORK/policy.hujson"
 export COORD_ADDR="127.0.0.1:443"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
@@ -66,14 +66,14 @@ as_root() {
   if [[ "$(id -u)" -eq 0 ]]; then
     "$@"
   else
-    sudo -n "$@"
+    sudo -n env PATH="/workspace/orblx-w25-38-136/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" "$@"
   fi
 }
 
 dc() {
   # sudo drops the environment, so pass the Compose variables with env.
   as_root env POLICY_FILE="$POLICY_FILE" COORD_ADDR="$COORD_ADDR" \
-    docker compose --progress quiet --profile nodes -f "$FILE" "$@"
+    docker compose --profile nodes -f "$FILE" "$@"
 }
 
 cleanup() {
@@ -150,11 +150,15 @@ wait_log() {
 run_node() {
   local service="$1"
   shift
-  dc run --rm --no-deps --entrypoint orblx "$service" "$@"
+  if [[ "$service" == owner ]]; then
+    dc run --rm --no-deps --entrypoint orblx owner "$@"
+  else
+    dc run --rm --no-deps --entrypoint orblx "${service}-cli" "$@"
+  fi
 }
 
 owner() {
-  run_node owner admin "$@" --coord "${coord_ip}:443" --state "$STATE" --bundle "$STATE/bundle.pem"
+  dc run --rm --no-deps --entrypoint orblx owner admin "$@" --coord "${coord_ip}:443" --state "$STATE" --bundle "$STATE/bundle.pem"
 }
 
 # Print the refuse-all window of one enroll output file, or "pending".
@@ -171,6 +175,7 @@ enroll_node() {
   local name="$1"
   local out="$WORK/enroll-${name}.out"
   echo "=== [C] enroll ${name} ==="
+  set +e
   run_node "$name" \
     coord enroll \
     --name "$name" \
@@ -179,6 +184,12 @@ enroll_node() {
     --token-file "/coord-state/tokens/${name}" \
     --state "$STATE" \
     --endpoint "${name}:443" >"$out" 2>&1
+  local enroll_status=$?
+  set -e
+  if [[ "$enroll_status" -ne 0 ]]; then
+    grep -v 'PRIVATE KEY' "$out" >&2 || true
+    exit "$enroll_status"
+  fi
   grep -E '^(enrolled|name |overlay_ip |deny_list )' "$out"
   echo "enroll ${name} deny_window_ms $(window_of "$out")"
 }
@@ -310,12 +321,7 @@ for name in owner a b allowed; do
   echo "token ${name} written"
 done
 
-coord_ip="$(dc run --rm --no-deps --entrypoint getent owner ahostsv4 coord \
-  | read_all awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /{print $1; exit}')"
-if [[ -z "$coord_ip" ]]; then
-  echo "The coordinator address did not resolve." >&2
-  exit 1
-fi
+coord_ip=172.30.18.2
 echo "coord_ip ${coord_ip}"
 export COORD_ADDR="${coord_ip}:443"
 

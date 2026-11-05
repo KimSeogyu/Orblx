@@ -23,7 +23,8 @@ services:
       - orblx-w25-38-dd-store:/var/lib/orblx
       - ${POLICY_FILE:?set POLICY_FILE}:/var/lib/orblx/policy.hujson:ro
     networks:
-      - proof
+      proof:
+        ipv4_address: 172.30.18.2
 
   owner:
     image: orblx-w25-38-deny:w25
@@ -34,6 +35,12 @@ services:
     volumes:
       - orblx-w25-38-dd-store:/coord-state:ro
       - orblx-w25-38-dd-owner:/var/lib/orblx
+    extra_hosts:
+      - "coord:172.30.18.2"
+      - "owner:172.30.18.130"
+      - "a:172.30.18.131"
+      - "b:172.30.18.132"
+      - "allowed:172.30.18.133"
     networks:
       - proof
 
@@ -65,8 +72,15 @@ services:
     volumes:
       - orblx-w25-38-dd-store:/coord-state:ro
       - orblx-w25-38-dd-a:/var/lib/orblx
+    extra_hosts:
+      - "coord:172.30.18.2"
+      - "owner:172.30.18.130"
+      - "a:172.30.18.131"
+      - "b:172.30.18.132"
+      - "allowed:172.30.18.133"
     networks:
-      - proof
+      proof:
+        ipv4_address: 172.30.18.131
 
   b:
     image: orblx-w25-38-deny:w25
@@ -96,8 +110,15 @@ services:
     volumes:
       - orblx-w25-38-dd-store:/coord-state:ro
       - orblx-w25-38-dd-b:/var/lib/orblx
+    extra_hosts:
+      - "coord:172.30.18.2"
+      - "owner:172.30.18.130"
+      - "a:172.30.18.131"
+      - "b:172.30.18.132"
+      - "allowed:172.30.18.133"
     networks:
-      - proof
+      proof:
+        ipv4_address: 172.30.18.132
 
   allowed:
     image: orblx-w25-38-deny:w25
@@ -127,6 +148,124 @@ services:
     volumes:
       - orblx-w25-38-dd-store:/coord-state:ro
       - orblx-w25-38-dd-allowed:/var/lib/orblx
+    extra_hosts:
+      - "coord:172.30.18.2"
+      - "owner:172.30.18.130"
+      - "a:172.30.18.131"
+      - "b:172.30.18.132"
+      - "allowed:172.30.18.133"
+    networks:
+      proof:
+        ipv4_address: 172.30.18.133
+
+  a-cli:
+    image: orblx-w25-38-deny:w25
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-w25-38-dd-store:/coord-state:ro
+      - orblx-w25-38-dd-a:/var/lib/orblx
+    extra_hosts:
+      - "coord:172.30.18.2"
+      - "owner:172.30.18.130"
+      - "a:172.30.18.131"
+      - "b:172.30.18.132"
+      - "allowed:172.30.18.133"
+    networks:
+      - proof
+
+  b-cli:
+    image: orblx-w25-38-deny:w25
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-w25-38-dd-store:/coord-state:ro
+      - orblx-w25-38-dd-b:/var/lib/orblx
+    extra_hosts:
+      - "coord:172.30.18.2"
+      - "owner:172.30.18.130"
+      - "a:172.30.18.131"
+      - "b:172.30.18.132"
+      - "allowed:172.30.18.133"
+    networks:
+      - proof
+
+  allowed-cli:
+    image: orblx-w25-38-deny:w25
+    profiles: ["nodes"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    entrypoint: ["orblx"]
+    depends_on:
+      - coord
+    command:
+      - up
+      - --state-dir
+      - /var/lib/orblx
+      - --listen
+      - 0.0.0.0:443
+      - --coord
+      - ${COORD_ADDR:?set COORD_ADDR}
+      - --bundle
+      - /var/lib/orblx/bundle.pem
+      - --coord-name
+      - coord
+    volumes:
+      - orblx-w25-38-dd-store:/coord-state:ro
+      - orblx-w25-38-dd-allowed:/var/lib/orblx
+    extra_hosts:
+      - "coord:172.30.18.2"
+      - "owner:172.30.18.130"
+      - "a:172.30.18.131"
+      - "b:172.30.18.132"
+      - "allowed:172.30.18.133"
     networks:
       - proof
 
@@ -139,3 +278,7 @@ volumes:
 
 networks:
   proof:
+    ipam:
+      config:
+        - subnet: 172.30.18.0/24
+          ip_range: 172.30.18.0/25
