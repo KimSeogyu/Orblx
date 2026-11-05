@@ -18,16 +18,26 @@ from fake_docker import FAILS, SUDO, SUDO_FAILS, with_fake_docker
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOCK_SH = os.path.join(os.path.dirname(HERE), "proof-lock.sh")
 
+# Hold lines use a monotonic clock. `date +%s%3N` is CLOCK_REALTIME: a step
+# backward between hold_end and the next hold_start looks like overlap
+# (run 41940783765, 204 ms) while the fifo flock is still held by the first proof.
 HOLDER = r"""
 set -euo pipefail
 . "$LOCK_SH"
 trap proof_lock_end EXIT
 proof_lock_take "$LABEL" orblx-test
-echo "hold_start $LABEL $(date +%s%3N)"
+hold_ms() {
+  if [[ -r /proc/uptime ]]; then
+    awk '{printf "%d\n", $1 * 1000}' /proc/uptime
+  else
+    python3 -c 'import time; print(time.monotonic_ns() // 1000000)'
+  fi
+}
+echo "hold_start $LABEL $(hold_ms)"
 # A proof may wait for all of its own jobs. The sampler must not be one of them.
 sleep "$HOLD" &
 wait
-echo "hold_end $LABEL $(date +%s%3N)"
+echo "hold_end $LABEL $(hold_ms)"
 """
 
 CHILD = r"""
@@ -91,6 +101,38 @@ class ProofLockTest(unittest.TestCase):
                 self.assertRegex(out, rf"proof_context {label} phase {phase} time \S+ load \S+ other_orblx_containers (\d+|unknown)")
             self.assertRegex(out, rf"proof_contention {label} samples \d+ contended_samples \d+ unknown_samples \d+")
             self.assertIn(f"proof_lock {label} released", out)
+
+    def test_the_hold_clock_stays_monotonic_when_realtime_steps_backward(self):
+        # The old holder used `date +%s%3N` for both lines. This stands in for that
+        # clock and steps backward. hold_ms must not follow it.
+        found = re.search(r"(hold_ms\(\) \{.*?^\})", HOLDER, re.M | re.S)
+        self.assertIsNotNone(found, HOLDER)
+        bin_dir = os.path.join(self.dir, "bin")
+        os.makedirs(bin_dir)
+        seq = os.path.join(self.dir, "date-seq")
+        with open(os.path.join(bin_dir, "date"), "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                'n=2000000000000\n'
+                '[ -f "$FAKE_DATE_SEQ" ] && n=$(cat "$FAKE_DATE_SEQ")\n'
+                'echo "$n"\n'
+                'echo $((n - 500)) >"$FAKE_DATE_SEQ"\n'
+            )
+        os.chmod(os.path.join(bin_dir, "date"), 0o755)
+        env = dict(self.env, PATH=bin_dir + os.pathsep + self.env.get("PATH", ""), FAKE_DATE_SEQ=seq)
+
+        def read_hold():
+            out = subprocess.check_output(["bash", "-c", found.group(1) + "\nhold_ms\n"], env=env, text=True)
+            return int(out.strip())
+
+        first = read_hold()
+        second = read_hold()
+        self.assertGreaterEqual(second, first)
+        realtime = [
+            int(subprocess.check_output(["date", "+%s%3N"], env=env, text=True).strip())
+            for _ in range(2)
+        ]
+        self.assertLess(realtime[1], realtime[0])
 
     def test_a_child_of_the_holder_does_not_wait(self):
         parent = r"""
