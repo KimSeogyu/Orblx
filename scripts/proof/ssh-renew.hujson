@@ -1,5 +1,10 @@
 {
   // W25-40 SSH host key after node SVID renewal. Node a may open TCP to node b and back.
+  // alice is an owner user. The SSH rule source is the user SPIFFE ID.
+  "userApproval": {
+    // alice never waits.
+    "ownerUsers": ["oidc:alice"],
+  },
   "acls": [
     {
       "action": "accept",
@@ -11,7 +16,7 @@
   // Node a may open SSH on node b as alice.
   "ssh": [
     {
-      "src": ["spiffe://orblx.local/node/a"],
+      "src": ["spiffe://orblx.local/user/alice"],
       "dst": ["spiffe://orblx.local/node/b"],
       "users": ["alice"],
       "checkPeriod": "30s",

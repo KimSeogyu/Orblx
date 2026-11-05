@@ -5,13 +5,15 @@
 # W25-45: the coordinator refuses a node SVID life under 180 s.
 # The node renews at 2/3 of the life. That gap is one renewal interval.
 # Each renewal writes a new node key.
+# Node a enrolls with an OIDC ID token as alice. alice is an owner user and does not wait.
+# Node b enrolls with a token.
 # Gate b: node a logs in to node b before the first renewal of b, after it, and after the
 # second renewal. The login after the second renewal ends within one renewal interval.
 # The client pins the key of the current cert.pem of node b each time.
 # Gate c: one PTY shell opens before the first renewal of b and ends after it.
 # An exec command stops at 30 s, so gate c does not use --command.
 # The shell prints keepalive every 10 s so the client receives a packet.
-# The script does not print private keys, tickets, or SVID proofs.
+# The script does not print private keys, ID tokens, enroll tokens, tickets, or SVID proofs.
 set -euo pipefail
 # shellcheck source=scripts/proof/pipe-lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
@@ -25,6 +27,8 @@ work=$(mktemp -d)
 env_file="$work/ssh-renew.env"
 image_dir=""
 ttl="${SSH_RENEW_TTL:-180}"
+issuer="https://idp:8443"
+client_id="orblx-proof"
 # One renewal interval. The node renews at 2/3 of the SVID life.
 renew_interval=$((ttl * 2 / 3))
 # Gate c: the shell stays open for one renewal interval.
@@ -36,6 +40,17 @@ renewal_2_seen_at=""
 
 compose() {
   docker compose --env-file "$env_file" --progress quiet -f "$compose_file" "$@"
+}
+
+wait_log() {
+  local node=$1 pattern=$2 limit=$3
+  for _ in $(seq 1 "$limit"); do
+    if compose logs "$node" 2>/dev/null | read_all grep -q -- "$pattern"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 cleanup() {
@@ -78,16 +93,18 @@ rustc -V
 echo "cargo profile=release"
 
 echo "=== [C] build image ==="
-cargo build --release -p orblx-cli --bin orblx --locked
+cargo build --release -p orblx-cli --bin orblx -p orblx-test-idp --bin orblx-test-idp --locked
 # shellcheck source=stage-image.sh
 source "$root/scripts/proof/stage-image.sh"
 image_dir="$(stage_proof_image "$root" "$bin")"
+cp "$root/target/release/orblx-test-idp" "$image_dir/orblx-test-idp"
+printf '%s\n' 'COPY orblx-test-idp /usr/local/bin/orblx-test-idp' >>"$image_dir/Dockerfile"
 docker build --network host --no-cache -q -t orblx-ssh-renew:local "$image_dir" >/dev/null
 rm -rf "$image_dir"
 image_dir=""
 open_legacy_forward
 
-mkdir -p "$work/coord" "$work/a" "$work/b" "$work/tokens"
+mkdir -p "$work/coord" "$work/a" "$work/b" "$work/tokens" "$work/idp"
 cp "$root/scripts/proof/ssh-renew.hujson" "$work/coord/policy.hujson"
 cp "$root/scripts/proof/ssh-renew.hujson" "$work/b/policy.hujson"
 
@@ -116,8 +133,31 @@ SSH_RENEW_STATE_A=$work/a
 SSH_RENEW_STATE_B=$work/b
 SSH_RENEW_NETMAP_A=$work/netmap-a.json
 SSH_RENEW_NETMAP_B=$work/netmap-b.json
+SSH_RENEW_IDP_DIR=$work/idp
+SSH_RENEW_TOKENS=$work/tokens
+SSH_RENEW_CONFIG=$work/coord.toml
+SSH_RENEW_IDP_CA=$work/idp-ca.pem
 SSH_RENEW_TTL=$ttl
 ENV
+
+cat >"$work/coord.toml" <<CONF
+# [C] coordinator config for the SSH renewal proof.
+[oidc]
+issuer = "${issuer}"
+client_id = "${client_id}"
+allowed_domains = ["example.test"]
+allowed_emails = []
+ca_file = "/etc/orblx/idp-ca.pem"
+CONF
+
+echo "=== [C] init test issuer ==="
+# Compose creates a directory when a bind source is missing. The CA path must be a file.
+: >"$work/idp-ca.pem"
+compose run --rm --no-deps -T --entrypoint orblx-test-idp idp init --dir /idp --host idp >/dev/null
+cp "$work/idp/ca.pem" "$work/idp-ca.pem"
+grep -q 'BEGIN CERTIFICATE' "$work/idp-ca.pem"
+compose up -d idp
+wait_log idp "idp serve" 60 || { echo "The test issuer did not start." >&2; exit 1; }
 
 echo "=== [C] start coordinator (node SVID life ${ttl} s) ==="
 compose up -d coord
@@ -126,35 +166,36 @@ for _ in $(seq 1 90); do
   sleep 1
 done
 [[ -s "$work/coord/trust-bundle.pem" ]]
+wait_log coord "oidc issuer" 60 || { echo "The coordinator did not print the OIDC issuer." >&2; exit 1; }
 
-for name in a b; do
-  compose exec -T coord orblx coord token create --state /var/lib/orblx --ttl 3600 \
-    --out "/var/lib/orblx/tokens-${name}" >/dev/null
-  cp "$work/coord/tokens-${name}" "$work/tokens/${name}"
-  chmod 600 "$work/tokens/${name}"
-done
-enroll() {
+compose exec -T idp orblx-test-idp mint --dir /idp --kid rs1 --issuer "$issuer" --aud "$client_id" \
+  --out /tokens/alice --sub alice --email alice@example.test >/dev/null
+[[ -s "$work/tokens/alice" ]]
+chmod 600 "$work/tokens/alice"
+compose exec -T coord orblx coord token create --state /var/lib/orblx --ttl 3600 \
+  --out /var/lib/orblx/tokens-b >/dev/null
+cp "$work/coord/tokens-b" "$work/tokens/b"
+chmod 600 "$work/tokens/b"
+enroll_user() {
+  local name=$1 underlay=$2 user=$3
+  echo "=== [C] enroll ${name} ==="
+  "$bin" coord enroll --name "$name" --coord 172.28.19.10:443 --coord-name coord \
+    --bundle "$work/coord/trust-bundle.pem" --id-token-file "$work/tokens/${user}" \
+    --state "$work/${name}" --endpoint "${underlay}:443" >/dev/null
+  echo "enrolled ${name} as oidc:${user} (owner user, no wait)"
+}
+enroll_token() {
   local name=$1 underlay=$2
   echo "=== [C] enroll ${name} ==="
   "$bin" coord enroll --name "$name" --coord 172.28.19.10:443 --coord-name coord \
     --bundle "$work/coord/trust-bundle.pem" --token-file "$work/tokens/${name}" \
     --state "$work/${name}" --endpoint "${underlay}:443" >/dev/null
 }
-enroll a 172.28.19.11
-enroll b 172.28.19.12
+enroll_user a 172.28.19.11 alice
+enroll_token b 172.28.19.12
 
 echo "=== [C] start nodes ==="
 compose up -d node-a node-b
-wait_log() {
-  local node=$1 pattern=$2 limit=$3
-  for _ in $(seq 1 "$limit"); do
-    if compose logs "$node" 2>/dev/null | read_all grep -q -- "$pattern"; then
-      return 0
-    fi
-    sleep 1
-  done
-  return 1
-}
 wait_log node-b 'ssh_listen ' 60 || { echo "Node b did not listen for SSH." >&2; exit 1; }
 for _ in $(seq 1 60); do
   compose exec -T node-a orblx status 2>/dev/null | read_all grep -q "peer b overlay_ip .* path direct " && break
