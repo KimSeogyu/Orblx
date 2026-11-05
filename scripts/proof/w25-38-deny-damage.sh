@@ -376,7 +376,7 @@ open_ssh_hold() {
 wait_ssh_hold() {
   local i
   for i in $(seq 1 60); do
-    if tr -d '\r' <"$WORK/gate3-ssh-hold.out" | grep -qE 'tick [0-9]+ [0-9]+'; then
+    if tr -d '\r' <"$WORK/gate3-ssh-hold.out" | grep -E 'tick [0-9]+ [0-9]+' >/dev/null; then
       echo "ssh hold open pid ${ssh_hold_pid}"
       return 0
     fi
