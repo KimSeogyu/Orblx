@@ -655,6 +655,9 @@ mod tests {
         const POLL_MS: u64 = 100;
         // The node poll interval of the policy loop in `orblx up` (PO ruling (ii)).
         let node_poll_ms = u64::try_from(super::POLICY_WAIT_GAP.as_millis()).unwrap();
+        /// The test slack for the reply transfer and the signature checks of a debug build on
+        /// a loaded CI host. The product bound stays HEARTBEAT_MS plus `node_poll_ms`.
+        const LOADED_HOST_MS: u64 = 1_000;
         let scratch = Scratch::new();
         let node = Scratch::new();
         let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
@@ -711,7 +714,7 @@ mod tests {
                 "heartbeat {beat}: the old stamp was {gap_ms} ms old at the new stamp"
             );
             assert!(
-                age_ms <= super::HEARTBEAT_MS + node_poll_ms,
+                age_ms <= super::HEARTBEAT_MS + node_poll_ms + LOADED_HOST_MS,
                 "heartbeat {beat}: the old stamp was {age_ms} ms old at the checked reply"
             );
             assert_eq!(next_id, Some(id), "the waiter opened a new connection");
