@@ -109,9 +109,10 @@ Eng Lead rule, PO accepted (2026-10-31 KST):
   reply about each 15 s. The bytes of this are in the proof results.
 - `orblx admin netmap-seq-reset` clears the cached views, because the book forgets all stamps.
 - Tests: `an_idle_waiter_gets_a_fresh_signed_view_at_each_heartbeat` (3 idle heartbeats
-  through `PolicyWaiter`: each reply has a new seq and a new signature, and the old stamp is
-  at most 15 s plus one poll (100 ms) old when the reply comes), and
-  `a_cached_view_is_due_at_the_heartbeat`.
+  through `PolicyWaiter`: each reply has a new seq and a new signature. The old stamp is
+  at most 15 s plus one node poll (100 ms) plus 1000 ms of loaded-host slack. The slack
+  covers the timer wake and the sign work before the new stamp time is read, and the
+  reply transfer before the check), and `a_cached_view_is_due_at_the_heartbeat`.
 
 ## Upgrade and mixed versions
 
