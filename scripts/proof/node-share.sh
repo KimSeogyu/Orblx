@@ -46,7 +46,7 @@ POLICY_SRC="${ORBLX_SHARE_POLICY:-$ROOT/scripts/proof/node-share.hujson}"
 . "$PROOF_LIB_DIR/proof-lock.sh"
 PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap proof_lock_end EXIT
-proof_lock_take "node-share"
+proof_lock_take "node-share" "orblx-w25a-node-share"
 # W25-14b: start from a clean compose state (all profiles, all volumes).
 # shellcheck source=scripts/proof/compose-clean.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compose-clean.sh"
@@ -97,11 +97,12 @@ open_legacy_forward() {
 
 build_image() {
   local image_dir
-  cargo build -p orblx-cli --bin orblx -p orblx-test-idp --bin orblx-test-idp --locked
+  echo "rustc_version $(rustc -V)"
+  cargo build --release -p orblx-cli --bin orblx -p orblx-test-idp --bin orblx-test-idp --locked
   # shellcheck source=stage-image.sh
   source "$ROOT/scripts/proof/stage-image.sh"
-  image_dir="$(stage_proof_image "$ROOT" "$TARGET_DIR/debug/orblx")"
-  cp "$TARGET_DIR/debug/orblx-test-idp" "$image_dir/orblx-test-idp"
+  image_dir="$(stage_proof_image "$ROOT" "$TARGET_DIR/release/orblx")"
+  cp "$TARGET_DIR/release/orblx-test-idp" "$image_dir/orblx-test-idp"
   printf '%s\n' 'COPY orblx-test-idp /usr/local/bin/orblx-test-idp' >>"$image_dir/Dockerfile"
   as_root docker build -q -t orblx-w25a-share:w25 "$image_dir" >/dev/null
   rm -rf "$image_dir"

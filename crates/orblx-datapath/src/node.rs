@@ -159,6 +159,12 @@ pub struct NodeRequest {
     pub relay: Option<SocketAddr>,
     /// The netmap file. The node reads it again when the file changes.
     pub netmap_path: PathBuf,
+    /// The bytes of `netmap_path` that gave `netmap` (W25-43).
+    ///
+    /// The netmap watcher compares the file with these bytes, so a file that changed after
+    /// the caller read it and before the watcher started is applied. `None`: the watcher
+    /// takes the file text at its start.
+    pub netmap_text: Option<Vec<u8>>,
     /// [`crate::GrantPeers`] hides peers the signed grants do not let this node reach.
     /// [`crate::AllowPeers`] allows every peer when the node has no grant file.
     pub visibility: Arc<dyn PeerVisibility>,
@@ -754,6 +760,12 @@ async fn run_mesh_inner(
         rekey_rx,
         filter: request.filter.clone(),
     };
+    if let Some(task) = crate::soak::spawn_to_tun_probe(to_tun.clone()) {
+        tasks.push(task);
+    }
+    if let Some(task) = crate::soak::spawn_runtime_watchdog() {
+        tasks.push(task);
+    }
     if let Some(addr) = request.metrics {
         let metrics_peers = Arc::clone(&peers);
         let metrics_counters = Arc::clone(&counters);
@@ -838,12 +850,15 @@ async fn run_mesh_inner(
         }
     }
     let peer_tasks = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
+    // W25-43: the peer watcher and the DNS watcher both start from the start netmap text.
+    let start_text = request.netmap_text.take();
     let peer_watch = PeerWatch {
         mesh: mesh.clone(),
         router: router_tx,
         accept_routes,
         interface: interface.clone(),
         tasks: Arc::clone(&peer_tasks),
+        start_text: start_text.clone(),
     };
     tasks.push(tokio::spawn(async move {
         watch_netmap_peers(peer_watch).await;
@@ -887,6 +902,7 @@ async fn run_mesh_inner(
                 visibility,
                 shutdown: dns_shutdown,
                 exit_dns,
+                start_text,
             },
             &netmap,
         )
@@ -1159,6 +1175,8 @@ struct PeerWatch {
     accept_routes: bool,
     interface: Option<String>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// The file text that gave the start netmap, from [`NodeRequest::netmap_text`].
+    start_text: Option<Vec<u8>>,
 }
 
 /// Apply a new netmap file without a restart (W25-6).
@@ -1170,7 +1188,13 @@ struct PeerWatch {
 /// A peer that leaves the netmap loses its routes. The deny list and the node lock
 /// stop its sessions, as before.
 async fn watch_netmap_peers(watch: PeerWatch) {
-    let mut last = fs::read(&watch.mesh.netmap_path).ok();
+    // W25-43: `orblx up --coord` can write a new file after it read the start netmap and
+    // before this task starts. The start text is the text of the start netmap, so that
+    // change is applied at the first tick.
+    let mut last = watch
+        .start_text
+        .clone()
+        .or_else(|| fs::read(&watch.mesh.netmap_path).ok());
     let mut started: HashSet<String> = watch
         .mesh
         .netmap
@@ -1287,13 +1311,15 @@ fn fresh_netmap(mesh: &Mesh) -> Netmap {
 /// The node lock pass already removed each peer without a trusted owner signature
 /// from the netmap file. Without a node lock file, the endpoint allows every trusted leaf.
 fn apply_lock_allow(mesh: &Mesh) {
-    if !mesh.state_dir.join(crate::NODE_LOCK_FILE).exists() {
-        mesh.endpoint.replace_allow(None);
-        return;
-    }
-    let netmap = fresh_netmap(mesh);
-    let allow: HashSet<String> = netmap.peers.iter().map(|peer| peer.svid.clone()).collect();
-    mesh.endpoint.replace_allow(Some(allow));
+    crate::soak::span("apply_lock_allow", || {
+        if !mesh.state_dir.join(crate::NODE_LOCK_FILE).exists() {
+            mesh.endpoint.replace_allow(None);
+            return;
+        }
+        let netmap = fresh_netmap(mesh);
+        let allow: HashSet<String> = netmap.peers.iter().map(|peer| peer.svid.clone()).collect();
+        mesh.endpoint.replace_allow(Some(allow));
+    });
 }
 
 /// Close each open session whose peer SPIFFE ID is in the deny list (W25-1).
@@ -1303,6 +1329,12 @@ fn apply_lock_allow(mesh: &Mesh) {
 /// The dial task then tries again, and the session check refuses the denied peer.
 /// When the deny list drops the peer again, the next dial brings the session back.
 fn close_denied_links(mesh: &Mesh, deny: &DenySet) {
+    crate::soak::span("close_denied_links", || {
+        close_denied_links_body(mesh, deny);
+    });
+}
+
+fn close_denied_links_body(mesh: &Mesh, deny: &DenySet) {
     let netmap = fresh_netmap(mesh);
     let svids: HashMap<&str, &str> = mesh
         .netmap
@@ -1358,7 +1390,8 @@ async fn accept_loop(mut mesh: Mesh) {
                 match accepted {
                     Ok(session) => {
                         tr!("{} accepted {}", mesh.node.name, session.peer_id().as_uri());
-                        let netmap = fresh_netmap(&mesh);
+                        let netmap =
+                            crate::soak::span("fresh_netmap path=accept", || fresh_netmap(&mesh));
                         let peer_name = netmap.peers.iter().find(|peer| peer.svid == session.peer_id().as_uri()).map(|peer| peer.name.clone());
                         let Some(peer_name) = peer_name else {
                             eprintln!(
@@ -1853,6 +1886,9 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
         peer,
         label,
     } = io;
+    // One read of the soak flag for this link. The packet loop uses the local bool.
+    let trace = crate::soak::enabled();
+    let mut send_wait = crate::soak::SendWait::new();
     let mut first_rx = true;
     let mut first_tx = true;
     // The queue is open while this link is the live link for the peer.
@@ -1951,7 +1987,15 @@ async fn drive_session(io: SessionIo, on_rx: impl Fn() + Send) {
                                         }
                                     }
                                     InboundAction::Forward => {
-                                        if to_tun.send(packet).await.is_err() {
+                                        if !crate::soak::forward_to_tun(
+                                            &to_tun,
+                                            packet,
+                                            trace,
+                                            &peer,
+                                            &mut send_wait,
+                                        )
+                                        .await
+                                        {
                                             return;
                                         }
                                     }
@@ -2444,6 +2488,8 @@ struct DnsSpawn {
     visibility: Arc<dyn PeerVisibility>,
     shutdown: watch::Receiver<bool>,
     exit_dns: Option<ExitDns>,
+    /// The file text that gave the start netmap, from [`NodeRequest::netmap_text`] (W25-43).
+    start_text: Option<Vec<u8>>,
 }
 
 fn exit_dns_target(netmap: &Netmap, exit_node: Option<&str>) -> Option<ExitDns> {
@@ -2507,6 +2553,7 @@ async fn spawn_overlay_dns(
     let armed = guard.armed_flag();
     tasks.push(tokio::spawn(async move {
         watch_netmap_dns(DnsWatch {
+            start_text: dns.start_text,
             path: dns.netmap_path,
             node_name: dns.node_name,
             node_overlay: dns.node_overlay,
@@ -2524,6 +2571,8 @@ async fn spawn_overlay_dns(
 }
 
 struct DnsWatch {
+    /// The file text that gave the start DNS table (W25-43).
+    start_text: Option<Vec<u8>>,
     path: PathBuf,
     node_name: String,
     node_overlay: String,
@@ -2537,7 +2586,7 @@ struct DnsWatch {
 }
 
 async fn watch_netmap_dns(mut watch_state: DnsWatch) {
-    let mut last = fs::read(&watch_state.path).unwrap_or_default();
+    let mut last = dns_start_text(watch_state.start_text.take(), &watch_state.path);
     let mut last_error = String::new();
     let mut grant_revision = watch_state.visibility.revision();
     loop {
@@ -2582,19 +2631,48 @@ fn refresh_resolver_in_background(watch_state: &DnsWatch, table: DnsTable) {
     });
 }
 
+/// The text that the DNS watcher compares the netmap file with at its start (W25-43).
+///
+/// `orblx up --coord` can write a new file after it read the start netmap and before this
+/// task starts. The start text is the text of the start netmap, so the first tick applies
+/// that change. `None`: the file text at the start.
+fn dns_start_text(start_text: Option<Vec<u8>>, path: &Path) -> Vec<u8> {
+    start_text.unwrap_or_else(|| fs::read(path).unwrap_or_default())
+}
+
 fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut String) {
-    match fs::read(&watch_state.path) {
-        Ok(bytes) if bytes == *last => {}
+    let Some(map) = changed_dns_netmap(
+        &watch_state.path,
+        &watch_state.node_name,
+        &watch_state.node_overlay,
+        last,
+        last_error,
+    ) else {
+        return;
+    };
+    let table = DnsTable::from_netmap(&map);
+    // W25-6: the responder uses the new table first. A slow host resolver command
+    // (up to COMMAND_WAIT for each call) must not hold the new answers.
+    let _ = watch_state.tables.send(table.clone());
+    refresh_resolver_in_background(watch_state, table);
+    println!("The DNS answers follow the new netmap.");
+}
+
+/// Read the netmap file. Return the new netmap for the DNS table when the file changed.
+fn changed_dns_netmap(
+    path: &Path,
+    node_name: &str,
+    node_overlay: &str,
+    last: &mut Vec<u8>,
+    last_error: &mut String,
+) -> Option<Netmap> {
+    match fs::read(path) {
+        Ok(bytes) if bytes == *last => None,
         Ok(bytes) => match Netmap::from_slice(&bytes) {
-            Ok(map) if self_matches(&map, &watch_state.node_name, &watch_state.node_overlay) => {
+            Ok(map) if self_matches(&map, node_name, node_overlay) => {
                 last.clone_from(&bytes);
                 last_error.clear();
-                let table = DnsTable::from_netmap(&map);
-                // W25-6: the responder uses the new table first. A slow host resolver command
-                // (up to COMMAND_WAIT for each call) must not hold the new answers.
-                let _ = watch_state.tables.send(table.clone());
-                refresh_resolver_in_background(watch_state, table);
-                println!("The DNS answers follow the new netmap.");
+                Some(map)
             }
             Ok(_) => {
                 *last = bytes;
@@ -2603,6 +2681,7 @@ fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut 
                     eprintln!("The node keeps the current DNS answers. {text}");
                     *last_error = text;
                 }
+                None
             }
             Err(err) => {
                 *last = bytes;
@@ -2611,6 +2690,7 @@ fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut 
                     eprintln!("The node did not load the netmap for DNS. {text}");
                     *last_error = text;
                 }
+                None
             }
         },
         Err(err) => {
@@ -2619,6 +2699,7 @@ fn reload_dns_file(watch_state: &DnsWatch, last: &mut Vec<u8>, last_error: &mut 
                 eprintln!("The node did not read the netmap for DNS. {text}");
                 *last_error = text;
             }
+            None
         }
     }
 }
@@ -2663,7 +2744,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        format_node_status, load_state, read_status_text, store_record, NodeStatus, StatusPeer,
+        changed_dns_netmap, dns_start_text, format_node_status, load_state, read_status_text,
+        store_record, NodeStatus, StatusPeer,
     };
     use crate::netmap::Netmap;
 
@@ -2683,6 +2765,27 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// W25-43 (Datapath review): the policy sync can write a new netmap file after `orblx up`
+    /// read the start netmap and before the DNS watcher starts. The first DNS tick must give
+    /// the new table, with the new peer name.
+    #[test]
+    fn the_dns_watcher_applies_a_netmap_file_written_before_it_starts() {
+        let dir = test_dir("dns-start-race");
+        let path = dir.join("netmap.json");
+        let start =
+            br#"{"version": 1, "self": {"name": "a", "overlay_ip": "100.64.0.1"}, "peers": []}"#;
+        let new = br#"{"version": 1, "self": {"name": "a", "overlay_ip": "100.64.0.1"}, "peers": [{"name": "b", "overlay_ip": "100.64.0.2", "owner": "lab", "svid": "spiffe://orblx.local/node/b", "endpoints": ["172.28.18.12:443"], "routes": []}]}"#;
+        fs::write(&path, new).unwrap();
+        let mut last = dns_start_text(Some(start.to_vec()), &path);
+        let mut last_error = String::new();
+        let map = changed_dns_netmap(&path, "a", "100.64.0.1", &mut last, &mut last_error)
+            .expect("the first DNS tick did not apply the netmap file that changed before the DNS watcher started");
+        assert!(map.peers.iter().any(|peer| peer.name == "b"));
+        assert_eq!(last, new.to_vec());
+        assert!(changed_dns_netmap(&path, "a", "100.64.0.1", &mut last, &mut last_error).is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2882,5 +2985,82 @@ mod tests {
         let text = super::safe_text("-----BEGIN PRIVATE KEY-----\nabc");
         assert_eq!(text, "The coordinator request failed.");
         assert!(!text.contains("PRIVATE"));
+    }
+
+    /// W25-42: every forwarding link waits on one bounded TUN queue.
+    ///
+    /// While the writer holds every slot, both links stay pending.
+    /// One read from the writer frees one link. The other link stays pending.
+    #[test]
+    fn a_full_tun_queue_stalls_every_forwarding_link() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        use tokio::sync::mpsc;
+
+        fn idle_waker() -> Waker {
+            fn clone(ptr: *const ()) -> RawWaker {
+                RawWaker::new(ptr, &VTABLE)
+            }
+            fn wake(_: *const ()) {}
+            fn wake_by_ref(_: *const ()) {}
+            fn drop(_: *const ()) {}
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+            // SAFETY: the vtable does not read the pointer.
+            unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+        }
+
+        let marks = AtomicU64::new(0);
+        let queue = crate::tun_dev::TO_TUN_QUEUE;
+        let (tx, mut rx) = mpsc::channel(queue);
+        for n in 0..queue {
+            tx.try_send(vec![u8::try_from(n).unwrap()]).unwrap();
+        }
+        assert_eq!(tx.max_capacity(), queue);
+        assert_eq!(tx.capacity(), 0);
+
+        let tx_a = tx.clone();
+        let tx_b = tx.clone();
+        let mut link_a = Box::pin(async {
+            let mut wait = crate::soak::SendWait::new();
+            let ok = crate::soak::forward_to_tun(&tx_a, vec![0xa1], false, "a", &mut wait).await;
+            assert!(ok);
+            marks.fetch_add(1, Ordering::Relaxed);
+        });
+        let mut link_b = Box::pin(async {
+            let mut wait = crate::soak::SendWait::new();
+            let ok = crate::soak::forward_to_tun(&tx_b, vec![0xb2], false, "b", &mut wait).await;
+            assert!(ok);
+            marks.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let waker = idle_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(link_a.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(matches!(link_b.as_mut().poll(&mut cx), Poll::Pending));
+        let marks_while_full = marks.load(Ordering::Relaxed);
+        assert_eq!(marks_while_full, 0);
+
+        rx.try_recv().unwrap();
+        let ready_a = matches!(link_a.as_mut().poll(&mut cx), Poll::Ready(()));
+        let ready_b = matches!(link_b.as_mut().poll(&mut cx), Poll::Ready(()));
+        let ready_after_one = u32::from(ready_a) + u32::from(ready_b);
+        assert_eq!(ready_after_one, 1);
+        let marks_after_one = marks.load(Ordering::Relaxed);
+        assert_eq!(marks_after_one, 1);
+
+        rx.try_recv().unwrap();
+        if !ready_a {
+            assert!(matches!(link_a.as_mut().poll(&mut cx), Poll::Ready(())));
+        }
+        if !ready_b {
+            assert!(matches!(link_b.as_mut().poll(&mut cx), Poll::Ready(())));
+        }
+        let marks_after_two = marks.load(Ordering::Relaxed);
+        assert_eq!(marks_after_two, 2);
+        println!(
+            "w25-42 h1 queue={queue} links_pending_while_full=2 marks_while_full={marks_while_full} ready_after_one_read={ready_after_one} marks_after_one_read={marks_after_one} marks_after_two_reads={marks_after_two}"
+        );
     }
 }

@@ -18,23 +18,33 @@ from fake_docker import FAILS, SUDO, SUDO_FAILS, with_fake_docker
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOCK_SH = os.path.join(os.path.dirname(HERE), "proof-lock.sh")
 
+# Hold lines use a monotonic clock. `date +%s%3N` is CLOCK_REALTIME: a step
+# backward between hold_end and the next hold_start looks like overlap
+# (run 41940783765, 204 ms) while the fifo flock is still held by the first proof.
 HOLDER = r"""
 set -euo pipefail
 . "$LOCK_SH"
 trap proof_lock_end EXIT
-proof_lock_take "$LABEL" orblx-test-
-echo "hold_start $LABEL $(date +%s%3N)"
+proof_lock_take "$LABEL" orblx-test
+hold_ms() {
+  if [[ -r /proc/uptime ]]; then
+    awk '{printf "%d\n", $1 * 1000}' /proc/uptime
+  else
+    python3 -c 'import time; print(time.monotonic_ns() // 1000000)'
+  fi
+}
+echo "hold_start $LABEL $(hold_ms)"
 # A proof may wait for all of its own jobs. The sampler must not be one of them.
 sleep "$HOLD" &
 wait
-echo "hold_end $LABEL $(date +%s%3N)"
+echo "hold_end $LABEL $(hold_ms)"
 """
 
 CHILD = r"""
 set -euo pipefail
 . "$LOCK_SH"
 trap proof_lock_end EXIT
-proof_lock_take child orblx-test-
+proof_lock_take child orblx-test
 echo child_ran
 """
 
@@ -92,12 +102,44 @@ class ProofLockTest(unittest.TestCase):
             self.assertRegex(out, rf"proof_contention {label} samples \d+ contended_samples \d+ unknown_samples \d+")
             self.assertIn(f"proof_lock {label} released", out)
 
+    def test_the_hold_clock_stays_monotonic_when_realtime_steps_backward(self):
+        # The old holder used `date +%s%3N` for both lines. This stands in for that
+        # clock and steps backward. hold_ms must not follow it.
+        found = re.search(r"(hold_ms\(\) \{.*?^\})", HOLDER, re.M | re.S)
+        self.assertIsNotNone(found, HOLDER)
+        bin_dir = os.path.join(self.dir, "bin")
+        os.makedirs(bin_dir)
+        seq = os.path.join(self.dir, "date-seq")
+        with open(os.path.join(bin_dir, "date"), "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                'n=2000000000000\n'
+                '[ -f "$FAKE_DATE_SEQ" ] && n=$(cat "$FAKE_DATE_SEQ")\n'
+                'echo "$n"\n'
+                'echo $((n - 500)) >"$FAKE_DATE_SEQ"\n'
+            )
+        os.chmod(os.path.join(bin_dir, "date"), 0o755)
+        env = dict(self.env, PATH=bin_dir + os.pathsep + self.env.get("PATH", ""), FAKE_DATE_SEQ=seq)
+
+        def read_hold():
+            out = subprocess.check_output(["bash", "-c", found.group(1) + "\nhold_ms\n"], env=env, text=True)
+            return int(out.strip())
+
+        first = read_hold()
+        second = read_hold()
+        self.assertGreaterEqual(second, first)
+        realtime = [
+            int(subprocess.check_output(["date", "+%s%3N"], env=env, text=True).strip())
+            for _ in range(2)
+        ]
+        self.assertLess(realtime[1], realtime[0])
+
     def test_a_child_of_the_holder_does_not_wait(self):
         parent = r"""
 set -euo pipefail
 . "$LOCK_SH"
 trap proof_lock_end EXIT
-proof_lock_take parent orblx-test-
+proof_lock_take parent orblx-test
 bash -c "$CHILD"
 """
         env = dict(self.env, CHILD=CHILD)
@@ -120,41 +162,86 @@ bash -c "$CHILD"
                               text=True, timeout=60)
 
     def test_a_run_with_unknown_samples_fails_and_says_it_is_not_valid(self):
-        # W25-35: docker ps fails and sudo -n fails, so the sampler cannot count the containers.
+        # W25-35 + W25-46: when docker ps fails at acquire, proof_foreign_check aborts with
+        # containers_unknown (exit 5) before any proof step. The lock is released.
         env = with_fake_docker(self.env, docker=FAILS, sudo=SUDO_FAILS)
         res = self.run_holder(env, "blind", 1.5)
-        self.assertEqual(res.returncode, 3, res.stdout)
-        found = re.search(r"^proof_contention blind samples (\d+) contended_samples 0 unknown_samples (\d+) ", res.stdout, re.M)
-        self.assertIsNotNone(found, res.stdout)
-        samples, unknown = int(found.group(1)), int(found.group(2))
-        self.assertGreater(unknown, 0, res.stdout)
-        self.assertEqual(unknown, samples, res.stdout)
-        self.assertRegex(res.stdout, rf"(?m)^proof_contention_invalid blind unknown_samples {unknown} samples {samples}$")
+        self.assertEqual(res.returncode, 5, res.stdout)
+        self.assertIn("proof_infra_abort blind reason=containers_unknown names=none. No proof step ran.",
+                      res.stdout + (res.stderr or ""))
         self.assertIn("other_orblx_containers unknown", res.stdout)
-        # The lock is released before the script stops.
         self.assertIn("proof_lock blind released", res.stdout)
         free = subprocess.run(["flock", "-n", self.env["ORBLX_PROOF_LOCK"], "true"])
         self.assertEqual(free.returncode, 0)
 
     @unittest.skipIf(os.geteuid() == 0, "the sudo fallback is for a user that is not root")
     def test_the_sampler_uses_sudo_when_the_user_cannot_use_docker(self):
-        # W25-35: the root cause. The proof user is not in the docker group, but sudo -n docker works.
-        docker = '#!/bin/sh\n[ -n "$FAKE_VIA_SUDO" ] || exit 1\necho orblx-other-1\necho other-project\n'
+        # W25-35 + W25-46: sudo -n docker is used when docker ps fails. A foreign orblx
+        # container at acquire aborts with foreign_containers (exit 5). That proves the
+        # sudo path returned names (not containers_unknown).
+        docker = (
+            "#!/bin/sh\n"
+            '[ -n "$FAKE_VIA_SUDO" ] || exit 1\n'
+            'printf "orblx-other-1\tother-project\n"\n'
+            'printf "other-app\t\n"\n'
+        )
         env = with_fake_docker(self.env, docker=docker, sudo=SUDO)
         res = self.run_holder(env, "seen", 1.5)
-        self.assertEqual(res.returncode, 0, res.stdout)
-        found = re.search(r"^proof_contention seen samples (\d+) contended_samples (\d+) unknown_samples 0 "
-                          r"max_other_orblx_containers 1 ", res.stdout, re.M)
-        self.assertIsNotNone(found, res.stdout)
-        self.assertEqual(found.group(1), found.group(2), res.stdout)
-        self.assertNotIn("proof_contention_invalid", res.stdout)
-        self.assertRegex(res.stdout, r"proof_context seen phase start time \S+ load \S+ other_orblx_containers 1 groups orblx-other:1")
+        self.assertEqual(res.returncode, 5, res.stdout)
+        self.assertIn("proof_infra_abort seen reason=foreign_containers names=orblx-other-1",
+                      res.stdout + (res.stderr or ""))
+        self.assertIn("proof_lock seen released", res.stdout)
+        free = subprocess.run(["flock", "-n", self.env["ORBLX_PROOF_LOCK"], "true"])
+        self.assertEqual(free.returncode, 0)
+
 
     def test_a_run_with_known_samples_has_no_invalid_line(self):
         res = self.run_holder(self.env, "clear", 1.5)
         self.assertEqual(res.returncode, 0, res.stdout)
         self.assertRegex(res.stdout, r"(?m)^proof_contention clear samples [1-9]\d* contended_samples 0 unknown_samples 0 ")
         self.assertNotIn("proof_contention_invalid", res.stdout)
+
+
+    def test_a_killed_holder_gets_a_release_line_with_its_pid(self):
+        # W25-46: SIGKILL skips the EXIT trap. The next taker must print
+        # "proof_lock LABEL released at TIME pid=PID reason=killed_holder_cleared_by_next".
+        holder = self.start("victim", 30)
+        time.sleep(0.5)
+        out_so_far = ""
+        # Wait until the holder has the lock and wrote its holder file.
+        victim_pid = None
+        for _ in range(50):
+            time.sleep(0.1)
+            if holder.poll() is not None:
+                break
+            holder_file = self.env["ORBLX_PROOF_LOCK"] + ".holder"
+            if os.path.isfile(holder_file):
+                with open(holder_file) as hf:
+                    text = hf.read()
+                if "label=victim" in text and "pid=" in text:
+                    m = re.search(r"(?m)^pid=(\d+)$", text)
+                    if m:
+                        victim_pid = int(m.group(1))
+                        break
+        else:
+            holder.kill()
+            self.fail("holder did not write the holder file")
+        self.assertIsNotNone(victim_pid)
+        holder.kill()  # SIGKILL: no EXIT trap, no proof_lock_end
+        holder.wait(timeout=10)
+        # Next taker clears the dead holder record and must log the release.
+        res = self.run_holder(self.env, "next", 0.2)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertRegex(
+            res.stdout,
+            rf"(?m)^proof_lock victim released at \S+ pid={victim_pid} reason=killed_holder_cleared_by_next$",
+            res.stdout,
+        )
+        self.assertRegex(
+            res.stdout,
+            r"(?m)^proof_lock next released at \S+ pid=\d+$",
+            res.stdout,
+        )
 
     def test_the_lock_is_free_after_the_holder_ends(self):
         first = self.start("one", 0.1)
