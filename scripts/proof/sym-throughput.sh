@@ -15,6 +15,7 @@ export ORBLX_SERIAL_OUT="${ORBLX_SERIAL_OUT:-$ROOT/target/sym-throughput}"
 
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$ROOT/scripts/proof/proof-lock.sh"
+PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 trap proof_lock_end EXIT
 proof_lock_take "sym-throughput:${ORBLX_NATR_PROJECT:-orblx-natr-proof}" "${ORBLX_NATR_PREFIX:-orblx-natr-}" "${ORBLX_NATR_PROJECT:-orblx-natr-proof}-"
 
