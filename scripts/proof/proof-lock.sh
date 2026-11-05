@@ -59,12 +59,60 @@ proof_lock_file() {
   fi
 }
 
+# GNU date prints nine digits for %N. BSD date (macOS) prints the letter N.
+# The check runs once. Linux then uses the same date commands as before.
+PROOF_DATE_NS=""
+proof_date_has_ns() {
+  if [[ -z "$PROOF_DATE_NS" ]]; then
+    if [[ "$(date +%N 2>/dev/null || true)" =~ ^[0-9]{9}$ ]]; then
+      PROOF_DATE_NS=1
+    else
+      PROOF_DATE_NS=0
+    fi
+  fi
+  [[ "$PROOF_DATE_NS" == "1" ]]
+}
+
+# One clock helper for GNU date and BSD date.
+# ms: milliseconds since the epoch (GNU: date +%s%3N).
+# ns: seconds plus nine nanosecond digits (GNU: date +%s%N).
+# now: local time with milliseconds (GNU: date +%Y-%m-%dT%H:%M:%S.%3N%z).
+proof_date_ns() {
+  if proof_date_has_ns; then
+    case "$1" in
+      ms) date +%s%3N ;;
+      ns) date +%s%N ;;
+      now) date '+%Y-%m-%dT%H:%M:%S.%3N%z' ;;
+      *) return 1 ;;
+    esac
+    return
+  fi
+  case "$1" in
+    ms) python3 -c 'import time; print(int(time.time() * 1000))' ;;
+    ns) python3 -c 'import time
+t = time.time()
+sec = int(t)
+ns = int((t - sec) * 1000000000)
+if ns < 0:
+    ns = 0
+if ns > 999999999:
+    ns = 999999999
+print("%d%09d" % (sec, ns))' ;;
+    now) python3 -c 'import time
+t = time.time()
+ms = int(t * 1000) % 1000
+local = time.localtime(t)
+print(time.strftime("%Y-%m-%dT%H:%M:%S", local) + ".%03d" % ms + time.strftime("%z", local))' ;;
+    *) return 1 ;;
+  esac
+}
+
 proof_lock_now() {
-  date '+%Y-%m-%dT%H:%M:%S.%3N%z'
+  proof_date_ns now
 }
 
 proof_lock_ms() {
-  date +%s%3N
+  proof_date_ns ms
 }
 
 # W25-46: a container belongs to this proof when its compose project label
@@ -86,9 +134,13 @@ proof_lock_docker_names() {
 # Print the own projects: the words of proof_lock_take, and (for the holder) the child projects.
 proof_lock_own_projects() {
   local own
-  for own in "${PROOF_LOCK_OWN[@]}"; do
-    [[ -n "$own" ]] && printf '%s\n' "$own"
-  done
+  # Bash 3.2 (macOS /bin/bash) treats "${array[@]}" as unset when the array is
+  # empty and the script uses set -u. A proof script uses set -u.
+  if [[ ${#PROOF_LOCK_OWN[@]} -gt 0 ]]; then
+    for own in "${PROOF_LOCK_OWN[@]}"; do
+      [[ -n "$own" ]] && printf '%s\n' "$own"
+    done
+  fi
   if [[ "$PROOF_LOCK_OWNER" == "1" && -n "$PROOF_LOCK_OWN_FILE" && -f "$PROOF_LOCK_OWN_FILE" ]]; then
     cat "$PROOF_LOCK_OWN_FILE" 2>/dev/null
   fi
@@ -228,7 +280,7 @@ proof_lock_queue_join() {
     (umask 000 && mkdir -p "$dir") 2>/dev/null || true
     chmod 1777 "$dir" 2>/dev/null || true
   fi
-  PROOF_LOCK_TICKET="$(date +%s%N)-$$"
+  PROOF_LOCK_TICKET="$(proof_date_ns ns)-$$"
   printf 'label=%s\n%s\n' "$PROOF_LOCK_LABEL" "$PROOF_LOCK_PROTO" >"${dir}/${PROOF_LOCK_TICKET}" 2>/dev/null || PROOF_LOCK_TICKET=""
 }
 
@@ -486,13 +538,16 @@ proof_lock_take() {
   # W25-46: the words are exact compose project names. A word that ends in "-" is an old
   # name prefix: stop, so that no proof counts its own containers as other containers.
   local own_word
-  for own_word in "${PROOF_LOCK_OWN[@]}"; do
-    if [[ -z "$own_word" || "$own_word" == *- || ! "$own_word" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
-      echo "proof_lock ${PROOF_LOCK_LABEL} FAIL: \"${own_word}\" is not a compose project name. Give the exact compose project names, not a name prefix (W25-46)." >&2
-      PROOF_LOCK_LABEL=""
-      exit 1
-    fi
-  done
+  # Same bash 3.2 rule as proof_lock_own_projects: do not expand an empty array.
+  if [[ ${#PROOF_LOCK_OWN[@]} -gt 0 ]]; then
+    for own_word in "${PROOF_LOCK_OWN[@]}"; do
+      if [[ -z "$own_word" || "$own_word" == *- || ! "$own_word" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+        echo "proof_lock ${PROOF_LOCK_LABEL} FAIL: \"${own_word}\" is not a compose project name. Give the exact compose project names, not a name prefix (W25-46)." >&2
+        PROOF_LOCK_LABEL=""
+        exit 1
+      fi
+    done
+  fi
   local file waited_from note plain mode=lock
   file="$(proof_lock_file)"
   note="${ORBLX_PROOF_LOCK_NOTE_SECS:-30}"
