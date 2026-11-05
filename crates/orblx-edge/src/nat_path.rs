@@ -23,6 +23,8 @@ pub enum OverlayPath {
     Direct,
     /// The orblx Relay path.
     Relay,
+    /// A peer that forwards sealed frames.
+    PeerRelay,
 }
 
 impl OverlayPath {
@@ -32,6 +34,7 @@ impl OverlayPath {
         match self {
             Self::Direct => "direct",
             Self::Relay => "relay",
+            Self::PeerRelay => "peer-relay",
         }
     }
 }
@@ -97,6 +100,8 @@ pub enum SendPlan {
     Direct,
     /// Only the relay path.
     Relay,
+    /// Only the peer relay.
+    Peer,
     /// The direct path and the relay path.
     ///
     /// The receiver opens the first copy and drops the second copy.
@@ -115,6 +120,12 @@ impl SendPlan {
     pub const fn uses_relay(self) -> bool {
         matches!(self, Self::Relay | Self::Both)
     }
+
+    /// Return true when the plan uses the peer relay.
+    #[must_use]
+    pub const fn uses_peer(self) -> bool {
+        matches!(self, Self::Peer)
+    }
 }
 
 impl PathSelect {
@@ -126,6 +137,7 @@ impl PathSelect {
         match self.current {
             None => SendPlan::Hold,
             Some(OverlayPath::Relay) => SendPlan::Relay,
+            Some(OverlayPath::PeerRelay) => SendPlan::Peer,
             Some(OverlayPath::Direct) if now_ms < self.overlap_until_ms => SendPlan::Both,
             Some(OverlayPath::Direct) => SendPlan::Direct,
         }
@@ -176,6 +188,11 @@ pub fn select_path(
         }
         Some(OverlayPath::Relay) if relay_ok || !direct_ok => Some(OverlayPath::Relay),
         Some(OverlayPath::Relay) => Some(OverlayPath::Direct),
+        Some(OverlayPath::PeerRelay) if direct_ok && now_ms >= state.relay_hold_until_ms => {
+            state.overlap_until_ms = now_ms.saturating_add(OVERLAP_MS);
+            Some(OverlayPath::Direct)
+        }
+        Some(OverlayPath::PeerRelay) => Some(OverlayPath::PeerRelay),
         None if direct_ok => Some(OverlayPath::Direct),
         None if relay_ok && relay_allowed => Some(OverlayPath::Relay),
         current => current,

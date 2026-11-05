@@ -39,6 +39,8 @@ pub(crate) struct ServeOptions {
     audit_absent: Option<Vec<u8>>,
     audit_path: Option<PathBuf>,
     metrics: Option<SocketAddr>,
+    sealed_only: bool,
+    attach_delay: Duration,
 }
 
 #[derive(Debug)]
@@ -76,11 +78,18 @@ pub(crate) fn parse_serve(args: &[String]) -> Result<Command, String> {
     let mut audit_absent = None;
     let mut audit_path = None;
     let mut metrics = Some(orblx_audit::default_metrics_addr());
+    let mut sealed_only = false;
+    let mut attach_delay = Duration::ZERO;
     let mut saw_udp = false;
     let mut saw_tcp = false;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
+        if flag == "--sealed-only" {
+            sealed_only = true;
+            index += 1;
+            continue;
+        }
         index += 1;
         let value = take_value(args, &mut index)?;
         match flag {
@@ -101,6 +110,12 @@ pub(crate) fn parse_serve(args: &[String]) -> Result<Command, String> {
                     Some(parse_socket(&value, orblx_audit::DEFAULT_METRICS_PORT)?)
                 };
             }
+            "--attach-delay-ms" => {
+                let ms: u64 = value
+                    .parse()
+                    .map_err(|_| "The attach delay is not a number.".to_string())?;
+                attach_delay = Duration::from_millis(ms);
+            }
             other => {
                 return Err(format!("The flag {other} is not valid.\n{}", serve_help()));
             }
@@ -117,6 +132,8 @@ pub(crate) fn parse_serve(args: &[String]) -> Result<Command, String> {
         audit_absent,
         audit_path,
         metrics,
+        sealed_only,
+        attach_delay,
     }))
 }
 
@@ -287,6 +304,8 @@ fn run_serve(options: ServeOptions) -> Result<(), String> {
         audit_absent: options.audit_absent,
         audit_path: options.audit_path,
         udp_discard: false,
+        sealed_only: options.sealed_only,
+        attach_delay: options.attach_delay,
     })
     .map_err(|err| err.to_string())?;
     match server.udp_addr() {
@@ -299,12 +318,18 @@ fn run_serve(options: ServeOptions) -> Result<(), String> {
     }
     println!("policy port {}", relay_policy_port());
     println!("tcp framing quic-style");
+    if options.sealed_only {
+        println!("relay sealed-only yes");
+    } else {
+        println!("relay sealed-only no");
+    }
+    println!("relay attach delay {} ms", options.attach_delay.as_millis());
     if let Some(addr) = options.metrics {
         let read_stats = server.stats_reader();
         match orblx_audit::spawn_metrics_server(addr, move || {
             let stats = read_stats();
             format!(
-                "{}{}{}{}",
+                "{}{}{}{}{}{}",
                 orblx_audit::sample_line("orblx_relay_attaches", "counter", stats.attaches),
                 orblx_audit::sample_line("orblx_relay_forwards", "counter", stats.forwards),
                 orblx_audit::sample_line(
@@ -313,6 +338,16 @@ fn run_serve(options: ServeOptions) -> Result<(), String> {
                     stats.forward_bytes
                 ),
                 orblx_audit::sample_line("orblx_relay_drops", "counter", stats.drops),
+                orblx_audit::sample_line(
+                    "orblx_relay_plaintext_hits",
+                    "counter",
+                    stats.plaintext_hits
+                ),
+                orblx_audit::sample_line(
+                    "orblx_relay_plaintext_rejects",
+                    "counter",
+                    stats.plaintext_rejects
+                ),
             )
         }) {
             Ok(bound) => println!("metrics {bound}"),
@@ -507,7 +542,7 @@ fn wants_help(args: &[String]) -> bool {
 
 fn serve_help() -> String {
     "\
-orblx relay [--udp ADDR] [--tcp ADDR] [--audit-absent HEX] [--audit-file PATH]
+orblx relay [--udp ADDR] [--tcp ADDR] [--audit-absent HEX] [--audit-file PATH] [--sealed-only] [--attach-delay-ms N]
 The command runs the orblx Relay.
 The Relay routes by session id.
 The Relay forwards opaque payloads.
@@ -515,6 +550,12 @@ The Relay does not hold session keys.
 The default socket is UDP port 443 and TCP port 443.
 TCP uses a QUIC-style length prefix.
 The audit scan does not decrypt.
+--sealed-only forwards a sealed NAT frame only.
+An IPv4 packet is dropped.
+--attach-delay-ms N waits N ms before the attach reply.
+The default wait is 0 ms.
+A lab uses the wait to make the Relay far.
+The wait does not delay a forwarded payload.
 "
     .to_string()
 }
@@ -558,7 +599,20 @@ mod tests {
             Command::Serve(options) => {
                 assert_eq!(options.udp.unwrap().port(), 443);
                 assert_eq!(options.tcp.unwrap().port(), 443);
+                assert!(!options.sealed_only);
+                assert_eq!(options.attach_delay, std::time::Duration::ZERO);
             }
+            Command::Help(_) | Command::Peer(_) | Command::Smoke(_) | Command::Stick => {
+                panic!("the parser did not select relay");
+            }
+        }
+    }
+
+    #[test]
+    fn relay_sealed_only_has_no_value() {
+        let command = parse_serve(&["--sealed-only".to_string()]).unwrap();
+        match command {
+            Command::Serve(options) => assert!(options.sealed_only),
             Command::Help(_) | Command::Peer(_) | Command::Smoke(_) | Command::Stick => {
                 panic!("the parser did not select relay");
             }

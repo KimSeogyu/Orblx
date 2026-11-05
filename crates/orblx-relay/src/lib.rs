@@ -11,6 +11,7 @@
 mod batch;
 mod error;
 mod pipe;
+mod sealed;
 mod server;
 mod session;
 mod wire;
@@ -18,6 +19,7 @@ mod wire;
 pub use batch::{recv_batch, send_batch, BatchPeer, RecvBatch, UDP_BATCH};
 pub use error::RelayError;
 pub use pipe::{RelayPipe, RelaySender};
+pub use sealed::SealedPayload;
 pub use server::{RelayServer, RelayStats, ServerConfig, PEER_IDLE};
 pub use session::RelaySessionId;
 pub use wire::{

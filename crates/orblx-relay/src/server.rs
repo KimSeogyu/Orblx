@@ -13,7 +13,7 @@ use crate::error::io_error;
 use crate::session::encode_hex;
 use crate::{
     contains_needle, encode_datagram, encode_tcp_record, take_tcp_record, RelayError, RelayKind,
-    RelaySessionId, MAX_DATAGRAM_LEN, RELAY_HEADER_LEN,
+    RelaySessionId, SealedPayload, MAX_DATAGRAM_LEN, RELAY_HEADER_LEN,
 };
 
 const READ_SLICE: Duration = Duration::from_millis(50);
@@ -49,6 +49,17 @@ pub struct ServerConfig {
     /// This matches a firewall DROP on UDP.
     /// TCP still answers when `tcp_bind` is set.
     pub udp_discard: bool,
+    /// When true, the server forwards only a sealed NAT frame.
+    ///
+    /// An IPv4 packet and any other plaintext are dropped.
+    /// The server still has no session key.
+    pub sealed_only: bool,
+    /// Wait this long before the attach reply.
+    ///
+    /// Zero does not wait.
+    /// A lab uses the wait so a node records a far Relay.
+    /// The wait does not apply to forwarded payloads.
+    pub attach_delay: Duration,
 }
 
 /// Counters from the Relay process.
@@ -64,6 +75,10 @@ pub struct RelayStats {
     pub plaintext_hits: u64,
     /// DATA datagrams that were not delivered.
     pub drops: u64,
+    /// Payloads a sealed-only server refused.
+    ///
+    /// The payload was not a sealed NAT frame.
+    pub plaintext_rejects: u64,
 }
 
 /// A running Relay process.
@@ -87,6 +102,8 @@ struct Shared {
     audit: Mutex<Option<File>>,
     conns: Mutex<Vec<JoinHandle<()>>>,
     udp_discard: bool,
+    sealed_only: bool,
+    attach_delay: Duration,
 }
 
 struct Session {
@@ -127,6 +144,8 @@ impl RelayServer {
             audit: Mutex::new(audit),
             conns: Mutex::new(Vec::new()),
             udp_discard: config.udp_discard,
+            sealed_only: config.sealed_only,
+            attach_delay: config.attach_delay,
         });
 
         let (udp_addr, udp_thread) = match config.udp_bind {
@@ -391,10 +410,18 @@ fn handle_udp(
             }
             register_udp(shared, session_id, from)?;
             let ack = encode_datagram(RelayKind::Attach, session_id, &[])?;
+            pause(shared.attach_delay);
             socket.send_to(&ack, from).map_err(io_error)?;
             Ok(None)
         }
         RelayKind::Data => {
+            let payload = match admit_payload(shared, payload) {
+                Some(bytes) => bytes,
+                None => {
+                    bump_reject(shared);
+                    return Ok(None);
+                }
+            };
             let dest = udp_route(shared, session_id, from)?;
             let hit = shared
                 .audit_absent
@@ -508,6 +535,7 @@ fn tcp_conn(mut stream: TcpStream, shared: Arc<Shared>) {
                             let Ok(record) = encode_tcp_record(&ack) else {
                                 break 'conn;
                             };
+                            pause(shared.attach_delay);
                             if tx.send(record).is_err() {
                                 break 'conn;
                             }
@@ -678,6 +706,10 @@ fn remove_peer(shared: &Shared, session_id: RelaySessionId, id: u64) {
 }
 
 fn forward(shared: &Shared, session_id: RelaySessionId, from_id: u64, payload: &[u8]) {
+    let Some(payload) = admit_payload(shared, payload) else {
+        bump_reject(shared);
+        return;
+    };
     let dest = {
         let sessions = lock_mutex(&shared.sessions);
         let Some(session) = sessions.get(&session_id) else {
@@ -758,8 +790,34 @@ fn write_audit(shared: &Shared, session_id: RelaySessionId, len: usize, hit: boo
     let _ = file.flush();
 }
 
+/// Return the bytes a forward may copy.
+///
+/// A sealed-only server accepts only a [`SealedPayload`].
+/// The returned slice is that payload.
+/// An open server returns the original bytes.
+fn admit_payload<'a>(shared: &Shared, payload: &'a [u8]) -> Option<&'a [u8]> {
+    if !shared.sealed_only {
+        return Some(payload);
+    }
+    SealedPayload::parse(payload)
+        .ok()
+        .map(|sealed| sealed.as_bytes())
+}
+
 fn bump_drop(shared: &Shared) {
     lock_mutex(&shared.stats).drops += 1;
+}
+
+fn pause(delay: Duration) {
+    if !delay.is_zero() {
+        thread::sleep(delay);
+    }
+}
+
+fn bump_reject(shared: &Shared) {
+    let mut stats = lock_mutex(&shared.stats);
+    stats.drops += 1;
+    stats.plaintext_rejects += 1;
 }
 
 fn lock_mutex<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -792,6 +850,8 @@ mod tests {
             audit_absent: Some(b"orblx-w6-relay-probe".to_vec()),
             audit_path: None,
             udp_discard: false,
+            sealed_only: false,
+            attach_delay: Duration::ZERO,
         })
         .unwrap()
     }
@@ -891,6 +951,62 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, crate::RelayError::UdpBlocked);
         drop(blackhole);
+    }
+
+    #[test]
+    fn sealed_only_forwards_a_sealed_frame_and_drops_ipv4() {
+        let server = RelayServer::spawn(ServerConfig {
+            udp_bind: Some(localhost(0)),
+            tcp_bind: None,
+            audit_absent: Some(b"ORBLXPLAIN".to_vec()),
+            audit_path: None,
+            udp_discard: false,
+            sealed_only: true,
+            attach_delay: Duration::ZERO,
+        })
+        .unwrap();
+        let udp = server.udp_addr().unwrap();
+        let session = RelaySessionId::generate().unwrap();
+        let mut left = RelayPipe::connect_udp(udp, session, Duration::from_secs(2)).unwrap();
+        let mut right = RelayPipe::connect_udp(udp, session, Duration::from_secs(2)).unwrap();
+        let mut sealed = vec![0u8; 26 + 8 + 16];
+        sealed[..8].copy_from_slice(b"ORBLXNAT");
+        sealed[8] = 1;
+        sealed[9] = 3;
+        left.send_opaque(&sealed).unwrap();
+        assert_eq!(recv_some(&mut right), sealed.as_slice());
+        let mut plain = vec![0x45, 0, 0, 32];
+        plain.extend_from_slice(b"ORBLXPLAIN-packet");
+        left.send_opaque(&plain).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(right.recv_opaque().unwrap().is_none());
+        let stats = server.stats();
+        assert_eq!(stats.forwards, 1);
+        assert_eq!(stats.plaintext_rejects, 1);
+        assert_eq!(stats.plaintext_hits, 0);
+    }
+
+    #[test]
+    fn attach_delay_slows_the_reply() {
+        let delay = Duration::from_millis(80);
+        let server = RelayServer::spawn(ServerConfig {
+            udp_bind: Some(localhost(0)),
+            tcp_bind: None,
+            audit_absent: None,
+            audit_path: None,
+            udp_discard: false,
+            sealed_only: false,
+            attach_delay: delay,
+        })
+        .unwrap();
+        let started = std::time::Instant::now();
+        let _pipe = RelayPipe::connect_udp(
+            server.udp_addr().unwrap(),
+            RelaySessionId::from_bytes([2; 16]),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(started.elapsed() >= delay);
     }
 
     fn recv_some(pipe: &mut RelayPipe) -> Vec<u8> {
