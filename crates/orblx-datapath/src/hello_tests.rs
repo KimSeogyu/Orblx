@@ -1,9 +1,9 @@
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_crypto::{mac_input, ticket_hash, ticket_mac, CryptoError, TicketKey, TicketRing};
 use orblx_identity::{
@@ -1567,4 +1567,333 @@ fn a_failed_tun_open_leaves_the_state_directory_unchanged() {
     let after = snapshot(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(before, after, "a failed up changed the state directory");
+}
+
+/// The session rule is strict. `now == end` is past. `now == end - 1 s` is not past.
+#[test]
+fn a_session_deadline_at_now_is_past() {
+    assert!(crate::quic::session_deadline_is_past(100, 200, 100));
+    assert!(crate::quic::session_deadline_is_past(200, 100, 100));
+    assert!(crate::quic::session_deadline_is_past(90, 200, 100));
+    assert!(!crate::quic::session_deadline_is_past(101, 200, 100));
+    assert!(!crate::quic::session_deadline_is_past(200, 101, 100));
+}
+
+struct TicketMaterial<'a> {
+    ca: &'a MiniCa,
+    signer: &'a TicketSigner,
+    mac_key: &'a [u8; 32],
+    ring: &'a TicketRing,
+}
+
+fn config_at(
+    material: &TicketMaterial<'_>,
+    name: &str,
+    cert_at: SystemTime,
+    cert_ttl: Duration,
+    ticket_at: SystemTime,
+    ticket_life: u64,
+) -> HelloConfig {
+    let id = SpiffeId::node(name).unwrap();
+    let issued = material
+        .ca
+        .issue(&id, cert_at, cert_ttl, &DenySet::empty())
+        .unwrap();
+    let ticket = present(
+        material.signer,
+        material.mac_key,
+        ticket_at,
+        &id,
+        ticket_life,
+    );
+    config_for(
+        &issued.certificate_pem,
+        &issued.private_key_pem,
+        material.ca.trust_bundle().clone(),
+        &ticket,
+        material.ring,
+    )
+}
+
+/// W25-45 follow-up: an expired ticket and a live certificate are refused at bind.
+#[tokio::test]
+async fn an_expired_ticket_and_a_live_cert_are_refused_at_bind() {
+    let now = SystemTime::now();
+    let ca = MiniCa::generate(now).unwrap();
+    let signer = TicketSigner::generate();
+    let mac_key = [0x45; 32];
+    let ring = ring_for(&ca, &signer, mac_key, now);
+    let material = TicketMaterial {
+        ca: &ca,
+        signer: &signer,
+        mac_key: &mac_key,
+        ring: &ring,
+    };
+    let server = config_at(&material, "b", now, Duration::from_secs(300), now, 600);
+    // The ticket ended 20 s ago. The certificate is still live.
+    let client = config_at(
+        &material,
+        "a",
+        now,
+        Duration::from_secs(300),
+        now - Duration::from_secs(30),
+        10,
+    );
+    let server = HelloEndpoint::bind_server(server, loopback(0)).unwrap();
+    let addr = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move { server.accept_one().await });
+    let client = HelloEndpoint::bind_client(client, loopback(0)).unwrap();
+    let client_task = tokio::spawn(async move { client.connect_one(addr).await });
+    let server_result = tokio::time::timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("bind did not finish")
+        .unwrap();
+    client_task.abort();
+    let Err(server_err) = server_result else {
+        panic!("bind accepted an expired ticket");
+    };
+    assert_eq!(
+        ticket_failure(server_err),
+        CryptoError::Identity(IdentityError::Expired)
+    );
+}
+
+/// W25-45 follow-up: a live ticket and an expired peer certificate are refused at bind.
+///
+/// The certificate end is inside the 60 s grace, so the certificate verifier still
+/// accepts the leaf. The session deadline is the certificate end, and that time is past.
+#[tokio::test]
+async fn a_live_ticket_and_an_expired_peer_cert_are_refused_at_bind() {
+    let now = SystemTime::now();
+    let ca = MiniCa::generate(now).unwrap();
+    let signer = TicketSigner::generate();
+    let mac_key = [0x46; 32];
+    let ring = ring_for(&ca, &signer, mac_key, now);
+    let material = TicketMaterial {
+        ca: &ca,
+        signer: &signer,
+        mac_key: &mac_key,
+        ring: &ring,
+    };
+    let server = config_at(
+        &material,
+        "b",
+        now - Duration::from_secs(50),
+        Duration::from_secs(30),
+        now,
+        600,
+    );
+    let client = config_at(&material, "a", now, Duration::from_secs(300), now, 600);
+    let server = HelloEndpoint::bind_server(server, loopback(0)).unwrap();
+    let addr = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move { server.accept_one().await });
+    let client = HelloEndpoint::bind_client(client, loopback(0)).unwrap();
+    let client_result = tokio::time::timeout(Duration::from_secs(5), client.connect_one(addr))
+        .await
+        .expect("bind did not finish");
+    server_task.abort();
+    let Err(err) = client_result else {
+        panic!("bind accepted an expired peer certificate");
+    };
+    assert!(
+        matches!(err, HelloError::SessionDeadline),
+        "the bind did not refuse the past deadline: {err}"
+    );
+}
+
+fn pair_netmap(self_name: &str, self_ip: &str, peer: &str, peer_ip: &str, port: u16) -> Netmap {
+    let text = format!(
+        "{{\n  \"version\": 1,\n  \"self\": {{\"name\": \"{self_name}\", \"overlay_ip\": \"{self_ip}\"}},\n  \"peers\": [{{\n    \"name\": \"{peer}\",\n    \"overlay_ip\": \"{peer_ip}\",\n    \"svid\": \"spiffe://orblx.local/node/{peer}\",\n    \"endpoints\": [\"127.0.0.1:{port}\"],\n    \"routes\": []\n  }}]\n}}"
+    );
+    Netmap::from_slice(text.as_bytes()).unwrap()
+}
+
+fn memory_request(
+    config: HelloConfig,
+    netmap: Netmap,
+    listen: SocketAddr,
+    state_dir: PathBuf,
+    stop: watch::Receiver<bool>,
+    metrics: Option<SocketAddr>,
+    on_listen: Option<Box<dyn FnOnce(crate::ListenEvent) + Send>>,
+) -> NodeRequest {
+    NodeRequest {
+        config,
+        netmap,
+        listen,
+        state_dir,
+        renew: None,
+        stop: Some(stop),
+        accept_routes: false,
+        forward_routes: Vec::new(),
+        forward_exit: false,
+        exit_node: None,
+        allow_lan: false,
+        underlay: Vec::new(),
+        relay: None,
+        netmap_path: PathBuf::from("netmap.json"),
+        netmap_text: None,
+        visibility: Arc::new(AllowPeers),
+        on_ready: None,
+        on_listen,
+        metrics,
+        filter: None,
+    }
+}
+
+fn read_dial_attempts(addr: SocketAddr) -> Option<u64> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(200)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
+    stream
+        .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .ok()?;
+    let mut body = String::new();
+    stream.read_to_string(&mut body).ok()?;
+    if !body.contains("orblx_node_dial_attempts") {
+        return None;
+    }
+    Some(metric_value(&body, "orblx_node_dial_attempts"))
+}
+
+/// W25-45 follow-up: a dialer with a past ticket does not reconnect in a tight loop.
+///
+/// Node `a` dials node `b`. The ticket of `a` is already past. The certificate of `a` is live.
+/// In a fixed 2 s window the dialer makes at most two attempts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_past_deadline_does_not_redial_in_a_tight_loop() {
+    let now = SystemTime::now();
+    let ca = MiniCa::generate(now).unwrap();
+    let signer = TicketSigner::generate();
+    let mac_key = [0x47; 32];
+    let ring = ring_for(&ca, &signer, mac_key, now);
+    let material = TicketMaterial {
+        ca: &ca,
+        signer: &signer,
+        mac_key: &mac_key,
+        ring: &ring,
+    };
+    let dialer = config_at(
+        &material,
+        "a",
+        now,
+        Duration::from_secs(300),
+        now - Duration::from_secs(30),
+        10,
+    );
+    let listener = config_at(&material, "b", now, Duration::from_secs(300), now, 600);
+    let port_a = free_udp();
+    let port_b = free_udp();
+    let metrics = free_tcp();
+    let dir_a = std::env::temp_dir().join(format!(
+        "orblx-dial-hold-a-{}-{}",
+        std::process::id(),
+        port_a.port()
+    ));
+    let dir_b = std::env::temp_dir().join(format!(
+        "orblx-dial-hold-b-{}-{}",
+        std::process::id(),
+        port_b.port()
+    ));
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+    let (stop_tx, stop_a) = watch::channel(false);
+    let stop_b = stop_a.clone();
+    let dialer_up = Arc::new(Mutex::new(None::<Instant>));
+    let listener_up = Arc::new(Mutex::new(None::<Instant>));
+    let dialer_mark = Arc::clone(&dialer_up);
+    let listener_mark = Arc::clone(&listener_up);
+    let (a_in_tx, a_in_rx) = mpsc::channel(4);
+    let (a_out_tx, _a_out_rx) = mpsc::channel(4);
+    let (b_in_tx, b_in_rx) = mpsc::channel(4);
+    let (b_out_tx, _b_out_rx) = mpsc::channel(4);
+    let task_a = tokio::spawn(crate::run_memory_node(
+        memory_request(
+            dialer,
+            pair_netmap("a", "100.64.0.1", "b", "100.64.0.2", port_b.port()),
+            port_a,
+            dir_a.clone(),
+            stop_a,
+            Some(metrics),
+            Some(Box::new(move |_| {
+                *dialer_mark.lock().unwrap() = Some(Instant::now());
+            })),
+        ),
+        MemoryDevice {
+            from_tun: a_in_rx,
+            to_tun: a_out_tx,
+        },
+    ));
+    let task_b = tokio::spawn(crate::run_memory_node(
+        memory_request(
+            listener,
+            pair_netmap("b", "100.64.0.2", "a", "100.64.0.1", port_a.port()),
+            port_b,
+            dir_b.clone(),
+            stop_b,
+            None,
+            Some(Box::new(move |_| {
+                *listener_mark.lock().unwrap() = Some(Instant::now());
+            })),
+        ),
+        MemoryDevice {
+            from_tun: b_in_rx,
+            to_tun: b_out_tx,
+        },
+    ));
+    let started = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let ready =
+                dialer_up.lock().unwrap().is_some() && listener_up.lock().unwrap().is_some();
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(started.is_ok(), "the nodes did not start");
+    let window = Duration::from_secs(2);
+    let mut samples = Vec::new();
+    let watch_start = Instant::now();
+    while watch_start.elapsed() < window {
+        if let Some(dials) = read_dial_attempts(metrics) {
+            samples.push((watch_start.elapsed(), dials));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let dials = read_dial_attempts(metrics).unwrap_or(0);
+    let _ = stop_tx.send(true);
+    let _ = a_in_tx;
+    let _ = b_in_tx;
+    let _ = tokio::time::timeout(Duration::from_secs(3), task_a).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), task_b).await;
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+    let mut last_at: Option<Duration> = None;
+    let mut last_dials = 0u64;
+    for (at, count) in &samples {
+        if *count > last_dials {
+            if let Some(prev) = last_at {
+                let gap = at.saturating_sub(prev);
+                assert!(
+                    gap >= Duration::from_millis(700),
+                    "dial attempts moved from {last_dials} to {count} after {} ms",
+                    gap.as_millis()
+                );
+            }
+            assert!(
+                count - last_dials <= 1,
+                "dial attempts jumped from {last_dials} to {count}"
+            );
+            last_dials = *count;
+            last_at = Some(*at);
+        }
+    }
+    assert!(
+        dials <= 2,
+        "the dialer made {dials} attempts in {} ms while the ticket was past",
+        window.as_millis()
+    );
 }

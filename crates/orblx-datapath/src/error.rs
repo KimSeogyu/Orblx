@@ -52,6 +52,10 @@ pub enum HelloError {
     Node(String),
     /// Node lock is on and the peer is not in the signed peer list (W23-1).
     NodeLock(String),
+    /// min(peer ticket end, peer certificate end) is already at or before now.
+    ///
+    /// The node does not start the session.
+    SessionDeadline,
 }
 
 impl fmt::Display for HelloError {
@@ -97,6 +101,9 @@ impl fmt::Display for HelloError {
                 formatter,
                 "Node lock refused the peer {peer}. No trusted owner key signed it."
             ),
+            Self::SessionDeadline => formatter.write_str(
+                "The session deadline is already past. The node does not start the session.",
+            ),
         }
     }
 }
@@ -125,7 +132,8 @@ impl std::error::Error for HelloError {
             | Self::Connector(_)
             | Self::EndpointClosed
             | Self::Node(_)
-            | Self::NodeLock(_) => None,
+            | Self::NodeLock(_)
+            | Self::SessionDeadline => None,
         }
     }
 }

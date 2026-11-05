@@ -85,7 +85,9 @@ async fn renew_replaces_the_leaf_and_keeps_the_address() {
     let scratch = Scratch::new("api");
     let node = Scratch::new("api-node");
     let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
-    coord.set_node_svid_ttl(Duration::from_secs(60)).unwrap();
+    coord
+        .set_node_svid_ttl_for_test(Duration::from_secs(60))
+        .unwrap();
     let token = coord.create_token(Duration::from_secs(600)).unwrap();
     let (addr, handle) = server::spawn(&coord, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .await
@@ -142,7 +144,7 @@ async fn session_stays_up_for_three_svid_lifetimes() {
     let node_b = Scratch::new("life-b");
     let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
     coord
-        .set_node_svid_ttl(Duration::from_secs(LIFE_SECS))
+        .set_node_svid_ttl_for_test(Duration::from_secs(LIFE_SECS))
         .unwrap();
     let token_a = coord.create_token(Duration::from_secs(600)).unwrap();
     let token_b = coord.create_token(Duration::from_secs(600)).unwrap();
@@ -419,7 +421,7 @@ async fn the_coordinator_ticket_keeps_the_path_up_across_svid_renewals() {
     let node_b = Scratch::new("w2545-b");
     let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
     coord
-        .set_node_svid_ttl(Duration::from_secs(LIFE_SECS))
+        .set_node_svid_ttl_for_test(Duration::from_secs(LIFE_SECS))
         .unwrap();
     let token_a = coord.create_token(Duration::from_secs(600)).unwrap();
     let token_b = coord.create_token(Duration::from_secs(600)).unwrap();
@@ -594,7 +596,8 @@ async fn the_coordinator_ticket_keeps_the_path_up_across_svid_renewals() {
 /// DATA passes until the deadline of `a` (its ticket end, which is also its leaf `not_after`).
 /// At the deadline both nodes close the session (B2). After it, no DATA passes in either
 /// direction: `b` closes its session at the deadline of `a`, and the peers refuse the expired
-/// ticket and leaf of `a`. The link of `a` dials again (fail closed, then redial).
+/// ticket and leaf of `a`. The link of `a` does not dial in a loop. The local ticket is past,
+/// so the dial path waits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn data_stops_at_the_deadline_when_the_renewal_keeps_failing_and_the_link_dials_again() {
     const LIFE_SECS: u64 = 9;
@@ -605,7 +608,7 @@ async fn data_stops_at_the_deadline_when_the_renewal_keeps_failing_and_the_link_
     let node_b = Scratch::new("w2545-fail-b");
     let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
     coord
-        .set_node_svid_ttl(Duration::from_secs(LIFE_SECS))
+        .set_node_svid_ttl_for_test(Duration::from_secs(LIFE_SECS))
         .unwrap();
     let token_a = coord.create_token(Duration::from_secs(600)).unwrap();
     let token_b = coord.create_token(Duration::from_secs(600)).unwrap();
@@ -781,9 +784,32 @@ async fn data_stops_at_the_deadline_when_the_renewal_keeps_failing_and_the_link_
         "DATA passed after the deadline of a (a-to-b, b-to-a)"
     );
     assert!(
-        dials_end >= dials_at_deadline + 3,
-        "the link of a did not dial again after the deadline: dial attempts {dials_at_deadline} at the deadline, {dials_end} at the end"
+        dials_end <= dials_at_deadline.saturating_add(1),
+        "the link of a dialed in a loop after the deadline: dial attempts {dials_at_deadline} at the deadline, {dials_end} at the end"
     );
+}
+
+/// Production `set_node_svid_ttl` refuses a life under 180 s.
+/// The test-only path can set 1 s.
+#[test]
+fn node_svid_ttl_under_180_seconds_is_refused() {
+    let scratch = Scratch::new("ttl-floor");
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    assert!(coord.set_node_svid_ttl(Duration::from_secs(1)).is_err());
+    assert!(coord.set_node_svid_ttl(Duration::from_secs(179)).is_err());
+    assert!(coord
+        .set_node_svid_ttl(Duration::from_millis(180_500))
+        .is_err());
+    assert!(coord.set_node_svid_ttl(Duration::from_secs(180)).is_ok());
+    assert!(coord.set_node_svid_ttl(Duration::from_secs(900)).is_ok());
+    assert!(coord.set_node_svid_ttl(Duration::from_secs(901)).is_err());
+    assert!(coord
+        .set_node_svid_ttl_for_test(Duration::from_secs(1))
+        .is_ok());
+    assert!(coord
+        .set_node_svid_ttl_for_test(Duration::from_secs(9))
+        .is_ok());
+    assert!(coord.set_node_svid_ttl_for_test(Duration::ZERO).is_err());
 }
 
 /// The dial attempt counter of one node, from its metrics port.
