@@ -123,3 +123,31 @@ w22:  sym_gate failed: 5 runs of at least 29 s (5 alone), median 1010.96 Mbit/s 
 - `serial-rtt.sh` printed the summary line after each run (`| tail -1`). It now prints the row of
   the current run (`serial-rtt-table.py --last-row`).
 - [W25-5 proof lock](w25-proof-lock.md) has the table of the serial runs on main after the merge.
+
+## W25-16: measured packet rate and in-window host probes (report only)
+
+No gate, limit, run count, sleep or exclusion changes. Nothing below is read by `--gate`,
+`--sym-gate` or `--kill-check`.
+
+- **Packet rate.** `nat-realism.sh` `bulk()` reads the rx and tx packet counters
+  (`/sys/class/net/DEV/statistics`) of the interface that carries the bulk, in the client and in
+  the server container, before and after each transfer. The client interface is the route to the
+  target IP. The server interface holds the target IP. On an overlay path both are the orblx TUN.
+  After each `throughput` line the script prints:
+
+  ```
+  bulk_pps LABEL client_dev DEV tx_packets N rx_packets N server_dev DEV rx_packets N tx_packets N bulk_s S window_s W pps P client_tx_pps C
+  ```
+
+  `pps` is the packets the server interface received (on an overlay path: the frames the node
+  decrypted and wrote to its TUN) divided by `bulk_s`, the seconds of the server result.
+  `window_s` is the wall time between the two counter reads. A missing counter prints
+  `bulk_pps LABEL none ...`. The serial table has a new last column, `Sym relay pps`.
+- **Host probe.** `serial-rtt.sh` runs `host-probe.py` during each nat-realism run. It writes
+  `runN.hostprobe.tsv` with a row every 0.5 s (`ORBLX_HOST_PROBE_INTERVAL`, at most 1 s): KST time,
+  epoch, CPU user, sys, iowait, steal and idle percent, PSI cpu, io and memory `some` and `full`
+  stall ms in the interval, PSI io full avg10, load1, the busiest disk's busy percent, disk requests
+  in flight and disk weighted I/O ms. After each run, `serial-rtt-table.py --probe-context` prints
+  `host_probe_context` for the max gate ping (time in KST, path, `above_limit`) and the probe rows
+  within 3 s (`ORBLX_PROBE_CONTEXT_S`) as `host_probe_row` lines. The output does not classify the
+  ping; a reader applies the W25-26 host-stall rule.
