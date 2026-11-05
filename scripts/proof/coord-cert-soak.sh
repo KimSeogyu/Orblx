@@ -56,6 +56,7 @@ fi
 
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$PROOF_LIB_DIR/proof-lock.sh"
+PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before the lock).
 trap 'cleanup; proof_lock_end' EXIT
 # The soak holds the lock. ticket-renewal.sh sees ORBLX_PROOF_LOCK_HELD and runs under it.
 proof_lock_take "coord-cert-soak" "$TR_PROJECT"

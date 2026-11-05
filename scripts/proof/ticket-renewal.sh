@@ -124,6 +124,7 @@ cleanup() {
 }
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$PROOF_LIB_DIR/proof-lock.sh"
+PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before the lock).
 trap 'cleanup; proof_lock_end' EXIT
 proof_lock_take "ticket-renewal" "$TR_PROJECT"
 
@@ -161,8 +162,10 @@ open_legacy_forward() {
 build_image() {
   local image_dir bin="$TR_BIN"
   if [[ -z "$bin" ]]; then
-    cargo build -p orblx-cli --bin orblx --locked
-    bin="$ROOT/target/debug/orblx"
+    export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}"
+    echo "rustc_version $(rustc -V)"
+    cargo build --release -p orblx-cli --bin orblx --locked
+    bin="$ROOT/target/release/orblx"
   fi
   [[ -x "$bin" ]] || fail "The orblx binary ${bin} is missing."
   echo "orblx_bin_sha256 $(sha256sum "$bin" | awk '{print $1}')"
@@ -374,7 +377,8 @@ if [[ "$TR_DIAG" == "1" ]]; then
     npid="$(docker inspect -f '{{.State.Pid}}' "$(dc ps -q "$src")")"
     for dst in "${NODES[@]}"; do
       [[ "$src" == "$dst" ]] && continue
-      echo "prober_path ${src} netns_pid ${npid} $(nsenter --net="/proc/${npid}/ns/net" ip -o route get "${OVERLAY[$dst]}" | head -1)"
+      route="$(nsenter --net="/proc/${npid}/ns/net" ip -o route get "${OVERLAY[$dst]}")"
+      echo "prober_path ${src} netns_pid ${npid} ${route%%$'\n'*}"
     done
     echo "prober_iface ${src} $(nsenter --net="/proc/${npid}/ns/net" ip -o -4 addr show dev orblx0 | awk '{print $2, $4}')"
   done | tee "$OUTD/prober-path.txt"
