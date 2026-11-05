@@ -7,8 +7,9 @@
 //!
 //! The admin API accepts a token call only when the token is known, not expired,
 //! not revoked, and holds the scope of the operation. The token also cannot do
-//! more than the role of its creator. Token management (`admin-token-*`) and
-//! `admin-role-set` have no scope. A token cannot call them.
+//! more than the role of its creator. Token management (`admin-token-*`),
+//! `admin-role-set`, and `admin-netmap-seq-reset` have no scope. A token cannot
+//! call them.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -77,6 +78,7 @@ pub const OWNER_ONLY_OPS: &[&str] = &[
     "admin-token-list",
     "admin-token-revoke",
     "admin-role-set",
+    "admin-netmap-seq-reset",
 ];
 
 /// Every admin operation name.

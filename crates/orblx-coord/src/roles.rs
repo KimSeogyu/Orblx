@@ -140,6 +140,8 @@ const OPS: &[(&str, u8)] = &[
     ("admin-token-list", OWNER | ADMIN),
     ("admin-token-revoke", OWNER | ADMIN | NETWORK | IT),
     ("admin-role-set", OWNER),
+    // The reset lowers the netmap anti-rollback floor. Only the owner role may run it.
+    ("admin-netmap-seq-reset", OWNER),
 ];
 
 /// Return true when every operation in `scope` is allowed for `role`.
@@ -461,10 +463,23 @@ mod tests {
             .map(|(op, _)| *op)
             .collect();
         assert_eq!(auditor, BTreeSet::from(reads));
+        let owner_only = ["admin-role-set", "admin-netmap-seq-reset"];
         for (op, _) in OPS {
             assert!(Role::Owner.allows(op));
             assert!(!Role::Member.allows(op));
-            assert_ne!(Role::Admin.allows(op), *op == "admin-role-set");
+            assert_ne!(Role::Admin.allows(op), owner_only.contains(op));
+        }
+        for op in owner_only {
+            assert!(Role::Owner.allows(op));
+            for role in [
+                Role::Admin,
+                Role::NetworkAdmin,
+                Role::ItAdmin,
+                Role::Auditor,
+                Role::Member,
+            ] {
+                assert!(!role.allows(op), "{} {op}", role.as_str());
+            }
         }
         assert!(Role::NetworkAdmin.allows("admin-policy-set"));
         assert!(!Role::NetworkAdmin.allows("admin-user-approve"));

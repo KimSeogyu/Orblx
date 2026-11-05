@@ -122,6 +122,13 @@ pub enum ConfigAction {
     PreauthDeny,
     /// An owner or a scoped token revoked a pre-auth key.
     PreauthRevoke,
+    /// The coordinator decided one SSH user certificate request (W25-31).
+    ///
+    /// The coordinator writes one record for each allow and for each deny.
+    SshCert,
+    /// An owner set the stored netmap `seq` to the coordinator clock time after a
+    /// clock-forward error (W25-34).
+    NetmapSeqReset,
 }
 
 impl ConfigAction {
@@ -130,7 +137,7 @@ impl ConfigAction {
     pub const RESERVED_CODES: [u8; 0] = [];
 
     /// Every action in code order.
-    pub const ALL: [Self; 44] = [
+    pub const ALL: [Self; 46] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -175,6 +182,8 @@ impl ConfigAction {
         Self::PreauthUse,
         Self::PreauthDeny,
         Self::PreauthRevoke,
+        Self::SshCert,
+        Self::NetmapSeqReset,
     ];
 
     /// Return the stable action token.
@@ -225,6 +234,8 @@ impl ConfigAction {
             Self::PreauthUse => "preauth-use",
             Self::PreauthDeny => "preauth-deny",
             Self::PreauthRevoke => "preauth-revoke",
+            Self::SshCert => "ssh-cert",
+            Self::NetmapSeqReset => "netmap-seq-reset",
         }
     }
 
@@ -282,6 +293,8 @@ impl ConfigAction {
             Self::PreauthUse => 42,
             Self::PreauthDeny => 43,
             Self::PreauthRevoke => 44,
+            Self::SshCert => 45,
+            Self::NetmapSeqReset => 46,
         }
     }
 
