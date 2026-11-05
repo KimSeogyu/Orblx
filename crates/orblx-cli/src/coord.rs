@@ -9,9 +9,9 @@ use orblx_identity::{OidcMode, GOOGLE_CLIENT_ID_ENV, MAX_USER_TTL};
 
 use super::{parse_socket, take_value};
 use orblx_coord::{
-    advertise_routes_blocking, enroll_with_oidc_blocking, enroll_with_token_blocking,
-    fetch_netmap_blocking, oidc_config, serve_blocking, CoordConfig, Coordinator, OidcConfig,
-    OidcEnroll,
+    advertise_routes_blocking, enroll_with_oidc_blocking, enroll_with_preauth_blocking,
+    enroll_with_token_blocking, fetch_netmap_blocking, oidc_config, serve_blocking, CoordConfig,
+    Coordinator, OidcConfig, OidcEnroll, PREAUTH_PREFIX,
 };
 
 const DEFAULT_PORT: u16 = 443;
@@ -178,15 +178,27 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
                     if token.is_empty() {
                         return Err("The enroll token file is empty.".to_string());
                     }
-                    enroll_with_token_blocking(
-                        coord,
-                        &coord_name,
-                        &bundle_pem,
-                        &name,
-                        token,
-                        &endpoints,
-                        &routes,
-                    )
+                    if token.starts_with(PREAUTH_PREFIX) {
+                        enroll_with_preauth_blocking(
+                            coord,
+                            &coord_name,
+                            &bundle_pem,
+                            &name,
+                            token,
+                            &endpoints,
+                            &routes,
+                        )
+                    } else {
+                        enroll_with_token_blocking(
+                            coord,
+                            &coord_name,
+                            &bundle_pem,
+                            &name,
+                            token,
+                            &endpoints,
+                            &routes,
+                        )
+                    }
                 }
                 EnrollSecret::IdToken {
                     file,
@@ -694,8 +706,9 @@ The default coordinator name is coord.
 The node SVID is spiffe://orblx.local/node/{name}.
 The coordinator SVID is spiffe://orblx.local/coord/{name}.
 An enroll token is one use.
+A pre-auth key in --token-file enrolls an agent node. The key text starts with orblx-pak1.
 The command writes the token only to --out.
-The command does not print the token.
+The command does not print the token or the pre-auth key.
 ORBLX_SVID_TTL sets the node leaf life in seconds, from 180 to 900.
 The default life is 900 seconds.
 The enroll command stores the coordinator address in the state directory.

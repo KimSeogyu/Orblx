@@ -33,6 +33,8 @@ Roles: `owner`, `admin`, `network-admin`, `it-admin`, `auditor`, `member`.
 | Read policy | yes | yes | yes | no | yes | no |
 | Read audit | yes | yes | no | no | yes | no |
 | Approve, revoke, expire a node | yes | yes | yes | yes | no | no |
+| List pre-auth keys | yes | yes | yes | yes | yes | no |
+| Create or revoke a pre-auth key | yes | yes | yes | yes | no | no |
 | Approve or reject a user | yes | yes | no | yes | no | no |
 | Grant approve or revoke, node lock write, policy write | yes | yes | yes | no | no | no |
 | Create a token | yes | yes | yes | yes | no | no |

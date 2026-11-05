@@ -64,6 +64,9 @@ pub const SCOPES: &[(&str, &str)] = &[
     ("admin-lock-update", "lock:write"),
     ("admin-policy", "policy:read"),
     ("admin-policy-set", "policy:write"),
+    ("admin-preauth-list", "nodes:read"),
+    ("admin-preauth-create", "nodes:write"),
+    ("admin-preauth-revoke", "nodes:write"),
 ];
 
 /// Admin operations that have no token scope.
@@ -159,14 +162,26 @@ pub enum Refusal {
     /// The call would add, remove, or change a SIEM sink (403, W25-13).
     /// Only an owner SVID (mTLS) can change the sinks.
     Sinks,
+    /// A pre-auth key tag is outside the caller rights (403).
+    /// The pre-auth path writes `preauth-deny`. This variant writes no token record.
+    Tag,
+    /// A pre-auth key grant is outside the caller rights (403).
+    /// The pre-auth path writes `preauth-deny`. This variant writes no token record.
+    Grant,
+    /// A pre-auth key life is outside 1 second to 1 hour (400).
+    /// The pre-auth path writes `preauth-deny`. This variant writes no token record.
+    Life,
 }
 
 impl Refusal {
     /// The HTTP-style status code.
     pub fn status(self) -> u16 {
         match self {
-            Self::Scope | Self::Owners | Self::Webhooks | Self::Sinks => 403,
-            _ => 401,
+            Self::Scope | Self::Owners | Self::Webhooks | Self::Sinks | Self::Tag | Self::Grant => {
+                403
+            }
+            Self::Life => 400,
+            Self::Unknown | Self::Expired | Self::Revoked => 401,
         }
     }
 
@@ -180,6 +195,9 @@ impl Refusal {
             Self::Owners => "owners",
             Self::Webhooks => "webhooks",
             Self::Sinks => "sinks",
+            Self::Tag => "tag",
+            Self::Grant => "grant",
+            Self::Life => "life",
         }
     }
 
@@ -199,6 +217,9 @@ impl Refusal {
             Self::Sinks => {
                 "An API token cannot change the SIEM sinks. Only an owner SVID can do this."
             }
+            Self::Tag => "The pre-auth key tag is outside the caller rights.",
+            Self::Grant => "The pre-auth key grant is outside the caller rights.",
+            Self::Life => "The pre-auth key life is not valid.",
         }
     }
 }
@@ -494,6 +515,13 @@ pub fn check(
     }
     let dir = coord.state_dir()?;
     let digest = file_digest(&dir)?;
+    // A pre-auth bound refusal already wrote one preauth-deny record.
+    if matches!(
+        &checked.result,
+        Err(Refusal::Tag | Refusal::Grant | Refusal::Life)
+    ) {
+        return Ok(checked);
+    }
     let (action, detail) = match checked.result {
         Ok(()) => (
             ConfigAction::TokenUse,
@@ -591,6 +619,31 @@ pub fn decide(
         result,
         role_block,
     })
+}
+
+/// Return the scopes of a token text. The function writes no audit record.
+pub(crate) fn scopes_of(coord: &Coordinator, secret: &str) -> Result<Vec<String>, CoordError> {
+    let dir = coord.state_dir()?;
+    let _guard = FILE_LOCK.lock().map_err(|_| CoordError::State)?;
+    let file = read_file(&dir)?;
+    let hash = token_hash(secret);
+    file.tokens
+        .iter()
+        .find(|token| constant_eq(&token.hash_hex, &hash))
+        .map(|token| token.scopes.clone())
+        .ok_or_else(|| CoordError::Protocol("The API token is not valid.".to_string()))
+}
+
+/// Return the scopes of a token id. The function writes no audit record.
+pub(crate) fn scopes_by_id(coord: &Coordinator, id: &str) -> Result<Vec<String>, CoordError> {
+    let dir = coord.state_dir()?;
+    let _guard = FILE_LOCK.lock().map_err(|_| CoordError::State)?;
+    let file = read_file(&dir)?;
+    file.tokens
+        .iter()
+        .find(|token| token.id == id)
+        .map(|token| token.scopes.clone())
+        .ok_or_else(|| CoordError::Protocol("The API token id is not known.".to_string()))
 }
 
 fn read_file(dir: &Path) -> Result<TokenFile, CoordError> {
