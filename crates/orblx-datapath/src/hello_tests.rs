@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -1163,8 +1163,10 @@ async fn agent_quic_acl() {
 fn a_ping_increments_the_overlay_counters() {
     let now = SystemTime::now();
     let (_ca, pair) = issue_node_pair(now);
-    let listen = free_udp();
-    let metrics = free_tcp();
+    let udp = reserve_udp_socket();
+    let listen = udp.local_addr().unwrap();
+    let tcp = reserve_tcp_listener();
+    let metrics = tcp.local_addr().unwrap();
     let dir = std::env::temp_dir().join(format!(
         "orblx-ping-counters-{}-{}",
         std::process::id(),
@@ -1203,6 +1205,7 @@ fn a_ping_increments_the_overlay_counters() {
                     config: server,
                     netmap,
                     listen,
+                    listen_socket: Some(udp),
                     state_dir,
                     renew: None,
                     stop: Some(stop_rx),
@@ -1219,6 +1222,7 @@ fn a_ping_increments_the_overlay_counters() {
                     on_ready: None,
                     on_listen: None,
                     metrics: Some(metrics),
+                    metrics_listener: Some(tcp),
                     filter: None,
                 },
                 MemoryDevice {
@@ -1294,7 +1298,8 @@ fn a_ping_increments_the_overlay_counters() {
 fn a_ticket_frame_in_an_open_session_ends_the_session() {
     let now = SystemTime::now();
     let (_ca, pair) = issue_node_pair(now);
-    let listen = free_udp();
+    let udp = reserve_udp_socket();
+    let listen = udp.local_addr().unwrap();
     let dir = std::env::temp_dir().join(format!(
         "orblx-ticket-frame-{}-{}",
         std::process::id(),
@@ -1333,6 +1338,7 @@ fn a_ticket_frame_in_an_open_session_ends_the_session() {
                     config: server,
                     netmap,
                     listen,
+                    listen_socket: Some(udp),
                     state_dir,
                     renew: None,
                     stop: Some(stop_rx),
@@ -1349,6 +1355,7 @@ fn a_ticket_frame_in_an_open_session_ends_the_session() {
                     on_ready: None,
                     on_listen: None,
                     metrics: None,
+                    metrics_listener: None,
                     filter: None,
                 },
                 MemoryDevice {
@@ -1444,18 +1451,12 @@ fn issue_node_pair(now: SystemTime) -> (MiniCa, IssuedPair) {
     (ca, pair)
 }
 
-fn free_udp() -> SocketAddr {
-    let socket = std::net::UdpSocket::bind(loopback(0)).unwrap();
-    let addr = socket.local_addr().unwrap();
-    drop(socket);
-    addr
+fn reserve_udp_socket() -> std::net::UdpSocket {
+    crate::reserve_udp_sockets(1).pop().unwrap()
 }
 
-fn free_tcp() -> SocketAddr {
-    let listener = std::net::TcpListener::bind(loopback(0)).unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
+fn reserve_tcp_listener() -> std::net::TcpListener {
+    crate::reserve_tcp_listeners(1).pop().unwrap()
 }
 
 fn metrics_body(addr: SocketAddr) -> String {
@@ -1510,7 +1511,8 @@ fn a_failed_tun_open_leaves_the_state_directory_unchanged() {
     }
     let now = SystemTime::now();
     let (_ca, pair) = issue_node_pair(now);
-    let listen = free_udp();
+    let udp = reserve_udp_socket();
+    let listen = udp.local_addr().unwrap();
     let dir = std::env::temp_dir().join(format!(
         "orblx-failed-tun-{}-{}",
         std::process::id(),
@@ -1548,6 +1550,7 @@ fn a_failed_tun_open_leaves_the_state_directory_unchanged() {
         config: pair.server,
         netmap: Netmap::from_slice(netmap_text).unwrap(),
         listen,
+        listen_socket: Some(udp),
         state_dir: dir.clone(),
         renew: None,
         stop: Some(stop_rx),
@@ -1564,6 +1567,7 @@ fn a_failed_tun_open_leaves_the_state_directory_unchanged() {
         on_ready: None,
         on_listen: None,
         metrics: None,
+        metrics_listener: None,
         filter: None,
     });
     assert!(result.is_err(), "the TUN device opened without root");
@@ -1724,9 +1728,12 @@ struct W2538Node {
 fn w25_38_memory_node(
     config: HelloConfig,
     netmap: Netmap,
-    listen: SocketAddr,
+    listen_socket: UdpSocket,
     state_dir: PathBuf,
 ) -> W2538Node {
+    let listen = listen_socket
+        .local_addr()
+        .expect("The reserved UDP socket has no local port.");
     let (stop_tx, stop_rx) = watch::channel(false);
     let (from_tx, from_rx) = mpsc::channel(64);
     let (to_tx, to_rx) = mpsc::channel(64);
@@ -1741,6 +1748,7 @@ fn w25_38_memory_node(
                     config,
                     netmap,
                     listen,
+                    listen_socket: Some(listen_socket),
                     state_dir,
                     renew: None,
                     stop: Some(stop_rx),
@@ -1757,6 +1765,7 @@ fn w25_38_memory_node(
                     on_ready: None,
                     on_listen: None,
                     metrics: None,
+                    metrics_listener: None,
                     filter: None,
                 },
                 MemoryDevice {
@@ -1825,8 +1834,11 @@ fn w25_38_a_young_link_that_lost_its_peer_ends_after_the_orphan_limit() {
 fn w25_38_same_svid_ping_case(settle: Duration, after_limit: Duration) {
     let now = SystemTime::now();
     let (_ca, pair) = issue_node_pair(now);
-    let a_listen = free_udp();
-    let b_listen = free_udp();
+    let mut udp = crate::reserve_udp_sockets(2);
+    let socket_b = udp.pop().unwrap();
+    let socket_a = udp.pop().unwrap();
+    let a_listen = socket_a.local_addr().unwrap();
+    let b_listen = socket_b.local_addr().unwrap();
     let base = std::env::temp_dir().join(format!(
         "orblx-w25-38-same-svid-{}-{}",
         std::process::id(),
@@ -1871,8 +1883,8 @@ fn w25_38_same_svid_ping_case(settle: Duration, after_limit: Duration) {
         .as_bytes(),
     )
     .unwrap();
-    let b_node = w25_38_memory_node(pair.server.clone(), b_netmap, b_listen, b_dir);
-    let mut a_node = w25_38_memory_node(pair.client.clone(), a_netmap, a_listen, a_dir);
+    let b_node = w25_38_memory_node(pair.server.clone(), b_netmap, socket_b, b_dir);
+    let mut a_node = w25_38_memory_node(pair.client.clone(), a_netmap, socket_a, a_dir);
     let before = w25_38_echo_ok(
         &a_node.from_host,
         &mut a_node.to_host,
@@ -2047,16 +2059,25 @@ fn pair_netmap(self_name: &str, self_ip: &str, peer: &str, peer_ip: &str, port: 
 fn memory_request(
     config: HelloConfig,
     netmap: Netmap,
-    listen: SocketAddr,
+    listen_socket: UdpSocket,
     state_dir: PathBuf,
     stop: watch::Receiver<bool>,
-    metrics: Option<SocketAddr>,
+    metrics_listener: Option<TcpListener>,
     on_listen: Option<Box<dyn FnOnce(crate::ListenEvent) + Send>>,
 ) -> NodeRequest {
+    let listen = listen_socket
+        .local_addr()
+        .expect("The reserved UDP socket has no local port.");
+    let metrics = metrics_listener.as_ref().map(|listener| {
+        listener
+            .local_addr()
+            .expect("The reserved TCP listener has no local port.")
+    });
     NodeRequest {
         config,
         netmap,
         listen,
+        listen_socket: Some(listen_socket),
         state_dir,
         renew: None,
         stop: Some(stop),
@@ -2073,6 +2094,7 @@ fn memory_request(
         on_ready: None,
         on_listen,
         metrics,
+        metrics_listener,
         filter: None,
     }
 }
@@ -2117,9 +2139,13 @@ async fn a_past_deadline_does_not_redial_in_a_tight_loop() {
         10,
     );
     let listener = config_at(&material, "b", now, Duration::from_secs(300), now, 600);
-    let port_a = free_udp();
-    let port_b = free_udp();
-    let metrics = free_tcp();
+    let mut udp = crate::reserve_udp_sockets(2);
+    let socket_b = udp.pop().unwrap();
+    let socket_a = udp.pop().unwrap();
+    let metrics_listener = reserve_tcp_listener();
+    let port_a = socket_a.local_addr().unwrap();
+    let port_b = socket_b.local_addr().unwrap();
+    let metrics = metrics_listener.local_addr().unwrap();
     let dir_a = std::env::temp_dir().join(format!(
         "orblx-dial-hold-a-{}-{}",
         std::process::id(),
@@ -2148,10 +2174,10 @@ async fn a_past_deadline_does_not_redial_in_a_tight_loop() {
         memory_request(
             dialer,
             pair_netmap("a", "100.64.0.1", "b", "100.64.0.2", port_b.port()),
-            port_a,
+            socket_a,
             dir_a.clone(),
             stop_a,
-            Some(metrics),
+            Some(metrics_listener),
             Some(Box::new(move |_| {
                 *dialer_mark.lock().unwrap() = Some(Instant::now());
             })),
@@ -2165,7 +2191,7 @@ async fn a_past_deadline_does_not_redial_in_a_tight_loop() {
         memory_request(
             listener,
             pair_netmap("b", "100.64.0.2", "a", "100.64.0.1", port_a.port()),
-            port_b,
+            socket_b,
             dir_b.clone(),
             stop_b,
             None,
