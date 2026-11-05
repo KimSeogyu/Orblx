@@ -38,6 +38,10 @@ use crate::nat_path::{
     OverlayPath, PathSelect, SendPlan, KIND_DATA, KIND_PROBE, PROBE_GAP_MS, PROBE_HEARS, RESEND_MS,
     STALE_MS,
 };
+use crate::portmap::{
+    candidate_texts, load_port_map_nonce, probe_port_map, ActiveMap, PortMapChoice, ProbeReport,
+    ProbeRequest, PORT_MAP_BUDGET,
+};
 use crate::punch::{
     admit_punch, decode_punch, encode_punch, exchange_same_ip, PunchDecision, PunchKind, PunchToken,
 };
@@ -157,6 +161,10 @@ pub struct NatConfig {
     pub relay_tcp: SocketAddr,
     /// Replace the default route with this gateway before the TUN device opens.
     pub gateway: Option<Ipv4Addr>,
+    /// Ask the gateway for a mapped UDP port. `Off` skips the probe.
+    pub port_map: PortMapChoice,
+    /// The lifetime to request, in seconds. Zero selects 7200 seconds.
+    pub port_map_lifetime: u32,
     /// The coordinator netmap public key.
     pub netmap_public: [u8; 32],
     /// The SVID material for the signed hello.
@@ -187,19 +195,26 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         .unwrap_or(0);
     println!("clock_origin unix_ms {origin_ms}");
     install_signals();
+    // The status file is from the previous process until this process writes it.
+    // Write `down` before the probe so a reader does not treat the old path as live.
+    write_status_file(&config.state_dir, &starting_status(&config));
     if let Some(gateway) = config.gateway {
         set_default_route(gateway)?;
     }
+    // The probe runs beside STUN and the relay. A silent gateway must not delay the first relay packet.
+    let probe_handle = spawn_port_map_probe(&config, started)?;
     let (socket, reflexive, alt) = gather_reflexive(config.stun, config.stun_alt)?;
     println!("The reflexive endpoint is {reflexive}.");
     if let Some(alt) = alt {
         println!("The second reflexive endpoint is {alt}.");
     }
-    let nat_kind = local_kind(reflexive, alt);
-    println!("The local NAT mapping is {}.", nat_kind.as_str());
-    let mut reflexive_text = vec![reflexive.to_string()];
+    let stun_kind = local_kind(reflexive, alt);
+    println!("The STUN mapping is {}.", stun_kind.as_str());
+    // The probe may later replace this with an endpoint-independent map.
+    println!("The local NAT mapping is {}.", stun_kind.as_str());
+    let mut stun_texts = vec![reflexive.to_string()];
     if let Some(alt) = alt {
-        reflexive_text.push(alt.to_string());
+        stun_texts.push(alt.to_string());
     }
     let leaf_der = config.hello.cert_der.clone();
     let session = session_id(&config.name, &config.peer_name)?;
@@ -239,10 +254,15 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         relay_udp: config.relay_udp,
         relay_tcp: config.relay_tcp,
         netmap_public: config.netmap_public,
-        nat_kind,
+        nat_kind: Mutex::new(stun_kind),
         stun: config.stun,
-        reflexive: Mutex::new(reflexive_text),
+        reflexive: Mutex::new(stun_texts.clone()),
         local_alloc: Mutex::new(PortAlloc::Unknown),
+        stun_texts,
+        mapped: Mutex::new(None),
+        port_map: Mutex::new(None),
+        probe_done: AtomicBool::new(probe_handle.is_none()),
+        publish_gen: AtomicU64::new(0),
         session,
         token: session_punch_token(&session),
         relay_id: RelaySessionId::from_bytes(session),
@@ -273,6 +293,18 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         .name("orblx-nat-publish".to_string())
         .spawn(move || publish_loop(publish_hub, &mut publish))
         .map_err(|err| EdgeError::Io(err.to_string()))?;
+    if let Some(handle) = probe_handle {
+        let apply_hub = Arc::clone(&hub);
+        thread::Builder::new()
+            .name("orblx-nat-portmap".to_string())
+            .spawn(move || apply_port_map(apply_hub, handle))
+            .map_err(|err| EdgeError::Io(err.to_string()))?;
+        let renew_hub = Arc::clone(&hub);
+        thread::Builder::new()
+            .name("orblx-nat-portmap-renew".to_string())
+            .spawn(move || renew_port_map(renew_hub))
+            .map_err(|err| EdgeError::Io(err.to_string()))?;
+    }
     let relay_hub = Arc::clone(&hub);
     thread::Builder::new()
         .name("orblx-nat-relay".to_string())
@@ -300,7 +332,7 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
             .spawn(move || renew_loop(renew_hub, leaf_der, renew))
             .map_err(|err| EdgeError::Io(err.to_string()))?;
     }
-    if nat_kind == MappingKind::Hard {
+    if stun_kind == MappingKind::Hard {
         // The relay threads are already up. These samples must not hold the first packet.
         let sample_hub = Arc::clone(&hub);
         let stun = config.stun;
@@ -319,7 +351,76 @@ pub fn run_nat_node(config: NatConfig) -> Result<(), EdgeError> {
         thread::sleep(Duration::from_millis(200));
     }
     println!("The NAT node is stopping.");
+    // Drop deletes the map. The router removes the port.
+    drop(lock(&hub.port_map).take());
     Ok(())
+}
+
+fn since_ms(started: Instant) -> u128 {
+    started.elapsed().as_millis()
+}
+
+/// Start the gateway probe on a side thread.
+///
+/// `None` means the probe is off. The relay path does not wait for this thread.
+fn spawn_port_map_probe(
+    config: &NatConfig,
+    started: Instant,
+) -> Result<Option<thread::JoinHandle<ProbeReport>>, EdgeError> {
+    if matches!(config.port_map, PortMapChoice::Off) {
+        println!("The port map is off.");
+        println!("The port map probe took 0 ms.");
+        println!("The port map probe did not start.");
+        return Ok(None);
+    }
+    let nonce = load_port_map_nonce(&config.state_dir)?;
+    let request = ProbeRequest {
+        choice: config.port_map,
+        gateway: config.gateway,
+        internal_port: DIRECT_QUIC_PORT,
+        lifetime_secs: config.port_map_lifetime,
+        budget: PORT_MAP_BUDGET,
+        nonce: Some(nonce),
+    };
+    thread::Builder::new()
+        .name("orblx-nat-portmap-probe".to_string())
+        .spawn(move || {
+            println!("The port map probe started at {} ms.", since_ms(started));
+            println!(
+                "The port map probe budget is {} ms.",
+                PORT_MAP_BUDGET.as_millis()
+            );
+            let report = probe_port_map(request);
+            println!("The port map probe took {} ms.", report.elapsed.as_millis());
+            if report.mapping.is_none() {
+                println!("The port map probe ended. No router answered.");
+            }
+            report
+        })
+        .map_err(|err| EdgeError::Io(err.to_string()))
+        .map(Some)
+}
+
+fn apply_port_map(hub: Arc<Hub>, handle: thread::JoinHandle<ProbeReport>) {
+    let Ok(report) = handle.join() else {
+        hub.probe_done.store(true, Ordering::Relaxed);
+        return;
+    };
+    let Some(mapping) = report.mapping else {
+        hub.probe_done.store(true, Ordering::Relaxed);
+        return;
+    };
+    let external = mapping.external();
+    let protocol = mapping.protocol().as_str();
+    let lifetime = mapping.lifetime_secs();
+    *lock(&hub.mapped) = Some(external);
+    *lock(&hub.nat_kind) = MappingKind::Easy;
+    *lock(&hub.port_map) = Some(mapping);
+    hub.publish_gen.fetch_add(1, Ordering::Relaxed);
+    hub.probe_done.store(true, Ordering::Relaxed);
+    println!("The port map was granted at {} ms.", hub.now_ms());
+    println!("The port map is {protocol} {external} lifetime {lifetime}.");
+    println!("The local NAT mapping is endpoint-independent.");
 }
 
 struct PidGuard {
@@ -440,13 +541,24 @@ struct Hub {
     relay_udp: SocketAddr,
     relay_tcp: SocketAddr,
     netmap_public: [u8; 32],
-    nat_kind: MappingKind,
+    /// The punch kind. A granted map replaces the STUN kind.
+    nat_kind: Mutex<MappingKind>,
     /// The STUN server used for allocation samples.
     stun: SocketAddr,
-    /// Reflexive endpoints published to the coordinator, in sample order.
+    /// Reflexive endpoints, in sample order. A mapped port replaces this list.
     reflexive: Mutex<Vec<String>>,
     /// The local port allocation class.
     local_alloc: Mutex<PortAlloc>,
+    /// The STUN endpoints. A mapped port replaces them in the published list.
+    stun_texts: Vec<String>,
+    /// The mapped external socket, when the router granted one.
+    mapped: Mutex<Option<SocketAddr>>,
+    /// The live map. Drop removes it from the router.
+    port_map: Mutex<Option<ActiveMap>>,
+    /// True when the probe thread has finished. `Off` starts true.
+    probe_done: AtomicBool,
+    /// Bumps when the published endpoints should be sent at once.
+    publish_gen: AtomicU64,
     session: [u8; 16],
     token: PunchToken,
     relay_id: RelaySessionId,
@@ -536,15 +648,26 @@ impl Hub {
         *lock(&self.local_alloc)
     }
 
+    fn kind(&self) -> MappingKind {
+        *lock(&self.nat_kind)
+    }
+
     fn peer_alloc(&self) -> PortAlloc {
         classify_ports(&self.peer_ports())
     }
 
     fn mark_rx(&self, slot: Slot) {
         let now = self.now_ms().max(1);
-        match slot {
-            Slot::Direct => self.direct_rx.store(now, Ordering::Relaxed),
-            Slot::Relay => self.relay_rx.store(now, Ordering::Relaxed),
+        let first = match slot {
+            Slot::Direct => self.direct_rx.swap(now, Ordering::Relaxed) == 0,
+            Slot::Relay => self.relay_rx.swap(now, Ordering::Relaxed) == 0,
+        };
+        if first {
+            let name = match slot {
+                Slot::Direct => "direct",
+                Slot::Relay => "relay",
+            };
+            println!("The first {name} packet arrived at {now} ms.");
         }
     }
 
@@ -959,12 +1082,34 @@ impl Hub {
                 svid_expiry: peer_expiry,
             }],
         };
-        let text = format_node_status(&status);
-        let path = self.state_dir.join(NODE_STATUS_FILE);
-        let tmp = self.state_dir.join("status.txt.tmp");
-        if fs::write(&tmp, text.as_bytes()).is_ok() {
-            let _ = fs::rename(&tmp, &path);
-        }
+        write_status_file(&self.state_dir, &status);
+    }
+}
+
+fn starting_status(config: &NatConfig) -> NodeStatus {
+    NodeStatus {
+        state: "starting".to_string(),
+        name: config.name.clone(),
+        overlay_ip: config.overlay.to_string(),
+        svid: config.svid.clone(),
+        svid_expiry: config.svid_expiry,
+        exit_node: None,
+        peers: vec![StatusPeer {
+            name: config.peer_name.clone(),
+            overlay_ip: config.peer_overlay.to_string(),
+            path: "down".to_string(),
+            svid: config.peer_svid.clone(),
+            svid_expiry: None,
+        }],
+    }
+}
+
+fn write_status_file(dir: &Path, status: &NodeStatus) {
+    let text = format_node_status(status);
+    let path = dir.join(NODE_STATUS_FILE);
+    let tmp = dir.join("status.txt.tmp");
+    if fs::write(&tmp, text.as_bytes()).is_ok() {
+        let _ = fs::rename(&tmp, &path);
     }
 }
 
@@ -1005,10 +1150,24 @@ fn publish_loop(
     hub: Arc<Hub>,
     publish: &mut dyn FnMut(Vec<String>) -> Result<Vec<SignedCandidate>, String>,
 ) {
+    let mut last = Vec::new();
     while !stopped() {
-        let reflexive = lock(&hub.reflexive).clone();
-        match publish(reflexive) {
-            Ok(list) => store_peer(&hub, &list),
+        let gen = hub.publish_gen.load(Ordering::Relaxed);
+        let mapped = *lock(&hub.mapped);
+        // A granted map replaces the STUN list. Otherwise publish the sample list.
+        let texts = if mapped.is_some() {
+            candidate_texts(&hub.stun_texts, mapped)
+        } else {
+            lock(&hub.reflexive).clone()
+        };
+        match publish(texts.clone()) {
+            Ok(list) => {
+                store_peer(&hub, &list);
+                if texts != last {
+                    println!("The endpoints were published at {} ms.", hub.now_ms());
+                    last = texts;
+                }
+            }
             Err(err) => {
                 eprintln!("The candidate update failed. The node will retry. {err}");
             }
@@ -1016,6 +1175,9 @@ fn publish_loop(
         for _ in 0..10 {
             if stopped() {
                 return;
+            }
+            if hub.publish_gen.load(Ordering::Relaxed) != gen {
+                break;
             }
             thread::sleep(Duration::from_millis(100));
         }
@@ -1167,24 +1329,13 @@ fn direct_loop(hub: Arc<Hub>, socket: UdpSocket) {
     let mut spray: Option<Spray> = None;
     let mut fleet: Option<Fleet> = None;
     let mut predict: Option<PredictCycle> = None;
-    if direct_peer.is_none() {
-        let now = Instant::now();
-        match plan {
-            Strategy::Spray => {
-                if let Some(peer) = hub.peer_addr() {
-                    spray = Some(Spray::new(peer.ip(), &hub.peer_ports(), now));
-                }
-            }
-            Strategy::Sockets => match Fleet::open(BIRTHDAY_SOCKETS, now) {
-                Ok(opened) => fleet = Some(opened),
-                Err(err) => eprintln!("The birthday sockets did not open. {err}"),
-            },
-            Strategy::Predict => predict = Some(PredictCycle::start(&hub, now)),
-            Strategy::Plain | Strategy::RelayOnly => {}
-        }
+    arm_punch(&hub, plan, &mut spray, &mut fleet);
+    if plan == Strategy::Predict {
+        predict = Some(PredictCycle::start(&hub, Instant::now()));
     }
     let check = encode_punch(PunchKind::Check, hub.token);
     let ack = encode_punch(PunchKind::Ack, hub.token);
+    let mut punch_gap = punch_gap_for(plan);
     let mut last_hello = Instant::now() - HELLO_GAP;
     let mut last_probe = Instant::now() - PROBE_GAP;
     let mut last_punch = Instant::now() - PUNCH_GAP;
@@ -1204,17 +1355,16 @@ fn direct_loop(hub: Arc<Hub>, socket: UdpSocket) {
         let now = Instant::now();
         if direct_peer.is_none() && current_strategy(&hub) != plan {
             plan = log_plan(&hub);
+            punch_gap = punch_gap_for(plan);
+            spray = None;
+            fleet = None;
+            arm_punch(&hub, plan, &mut spray, &mut fleet);
             predict = if plan == Strategy::Predict {
                 Some(PredictCycle::start(&hub, now))
             } else {
                 None
             };
         }
-        let punch_gap = if plan == Strategy::RelayOnly {
-            RELAY_ONLY_PUNCH_GAP
-        } else {
-            PUNCH_GAP
-        };
         let fresh = hub.fresh(Slot::Direct, hub.now_ms());
         if (direct_peer.is_none() || !fresh) && last_punch.elapsed() >= punch_gap {
             let signed = hub.peer_addr();
@@ -1377,6 +1527,7 @@ fn sample_allocation(hub: &Hub, stun: SocketAddr) {
     let alloc = classify_ports(&ports);
     *lock(&hub.local_alloc) = alloc;
     println!("The local port allocation is {alloc}.");
+    hub.publish_gen.fetch_add(1, Ordering::Relaxed);
 }
 
 fn alloc_samples(server: SocketAddr, count: usize) -> Vec<SocketAddr> {
@@ -1397,7 +1548,7 @@ fn alloc_samples(server: SocketAddr, count: usize) -> Vec<SocketAddr> {
 
 fn current_strategy(hub: &Hub) -> Strategy {
     strategy_for(
-        hub.nat_kind,
+        hub.kind(),
         hub.peer_kind(),
         hub.local_alloc(),
         hub.peer_alloc(),
@@ -1406,16 +1557,18 @@ fn current_strategy(hub: &Hub) -> Strategy {
 
 fn log_plan(hub: &Hub) -> Strategy {
     let peer_nat = hub.peer_kind();
+    let local_nat = hub.kind();
     let local_alloc = hub.local_alloc();
     let peer_alloc = hub.peer_alloc();
-    let chosen = strategy_for(hub.nat_kind, peer_nat, local_alloc, peer_alloc);
+    let chosen = strategy_for(local_nat, peer_nat, local_alloc, peer_alloc);
     println!(
         "The punch plan is {}. The local mapping is {}. The peer mapping is {}.",
         chosen.as_str(),
-        hub.nat_kind.as_str(),
+        local_nat.as_str(),
         peer_nat.as_str()
     );
-    if hub.nat_kind == MappingKind::Hard || peer_nat == MappingKind::Hard {
+    println!("The punch plan time is {} ms.", hub.now_ms());
+    if local_nat == MappingKind::Hard || peer_nat == MappingKind::Hard {
         println!("The local port allocation is {local_alloc}.");
         println!("The peer port allocation is {peer_alloc}.");
     }
@@ -1522,6 +1675,34 @@ fn refresh_alloc_samples(hub: &Hub) {
         }
         list.push(addr.to_string());
     }
+    hub.publish_gen.fetch_add(1, Ordering::Relaxed);
+}
+
+fn punch_gap_for(plan: Strategy) -> Duration {
+    if plan == Strategy::RelayOnly {
+        RELAY_ONLY_PUNCH_GAP
+    } else {
+        PUNCH_GAP
+    }
+}
+
+fn arm_punch(hub: &Hub, plan: Strategy, spray: &mut Option<Spray>, fleet: &mut Option<Fleet>) {
+    if spray.is_some() || fleet.is_some() {
+        return;
+    }
+    let now = Instant::now();
+    match plan {
+        Strategy::Spray => {
+            if let Some(peer) = hub.peer_addr() {
+                *spray = Some(Spray::new(peer.ip(), &hub.peer_ports(), now));
+            }
+        }
+        Strategy::Sockets => match Fleet::open(BIRTHDAY_SOCKETS, now) {
+            Ok(opened) => *fleet = Some(opened),
+            Err(err) => eprintln!("The birthday sockets did not open. {err}"),
+        },
+        Strategy::Plain | Strategy::RelayOnly | Strategy::Predict => {}
+    }
 }
 
 fn coordinated_punch(hub: &Hub, socket: &UdpSocket) -> (Option<SocketAddr>, Strategy) {
@@ -1535,7 +1716,7 @@ fn coordinated_punch(hub: &Hub, socket: &UdpSocket) -> (Option<SocketAddr>, Stra
         };
         // One signed endpoint is not enough to class a hard peer.
         // Wait briefly so the allocation samples can arrive before the plan is fixed.
-        if hub.nat_kind == MappingKind::Hard && hub.peer_kind() == MappingKind::Unknown {
+        if hub.kind() == MappingKind::Hard && hub.peer_kind() == MappingKind::Unknown {
             let waited = hard_wait.get_or_insert_with(Instant::now);
             if waited.elapsed() < Duration::from_secs(2) {
                 thread::sleep(Duration::from_millis(50));
@@ -1657,6 +1838,60 @@ fn relay_loop(hub: Arc<Hub>) {
         }
     }
     hub.set_relay_out(None);
+}
+
+fn renew_port_map(hub: Arc<Hub>) {
+    loop {
+        let wait = {
+            let guard = lock(&hub.port_map);
+            match guard.as_ref() {
+                Some(mapping) => Some(Duration::from_secs(u64::from(
+                    mapping.lifetime_secs().max(2) / 2,
+                ))),
+                None if hub.probe_done.load(Ordering::Relaxed) => return,
+                None => None,
+            }
+        };
+        let Some(wait) = wait else {
+            if !sleep_for(Duration::from_millis(50)) {
+                return;
+            }
+            continue;
+        };
+        if !sleep_for(wait) {
+            return;
+        }
+        let renewed = {
+            let mut guard = lock(&hub.port_map);
+            let Some(mapping) = guard.as_mut() else {
+                return;
+            };
+            let before = mapping.external();
+            match mapping.renew() {
+                Ok(()) => {
+                    let external = mapping.external();
+                    let lifetime = mapping.lifetime_secs();
+                    Some((before, external, lifetime))
+                }
+                Err(err) => {
+                    eprintln!("The port map renew failed. The node will try again. {err}");
+                    None
+                }
+            }
+        };
+        let Some((before, external, lifetime)) = renewed else {
+            if !sleep_for(Duration::from_secs(1)) {
+                return;
+            }
+            continue;
+        };
+        println!(
+            "The port map was renewed. The endpoint is {external}. The lifetime is {lifetime} s."
+        );
+        if external != before {
+            *lock(&hub.mapped) = Some(external);
+        }
+    }
 }
 
 fn renew_loop(hub: Arc<Hub>, first_der: Vec<u8>, mut renew: RenewFn) {
@@ -1845,7 +2080,7 @@ fn router_loop(hub: Arc<Hub>) {
         let direct_ok = hub.both_ways(Slot::Direct, now);
         let relay_ok = hub.both_ways(Slot::Relay, now);
         // A hard pair starts on the relay at once. The predict spray must not hold the first packet.
-        let hard_pair = hub.nat_kind == MappingKind::Hard && hub.peer_kind() == MappingKind::Hard;
+        let hard_pair = hub.kind() == MappingKind::Hard && hub.peer_kind() == MappingKind::Hard;
         let budget_done = hard_pair
             || lock(&hub.candidate_at)
                 .map(|start| start.elapsed() >= DIRECT_ATTEMPT_BUDGET)

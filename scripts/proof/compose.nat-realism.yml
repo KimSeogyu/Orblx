@@ -71,7 +71,7 @@ services:
   router-c:
     image: ${ORBLX_NATR_IMAGE:-orblx-natr:w20}
     entrypoint: ["/bin/sh", "/nat-router.sh"]
-    command: ["${ORBLX_NATR_PUB:-172.29.20}.13", "${ORBLX_NATR_LAN:-10.19}.23.2", "${ORBLX_NATR_LAN:-10.19}.23.10", "${ORBLX_NATR_MODE_C:-symmetric}"]
+    command: ["${ORBLX_NATR_PUB:-172.29.20}.13", "${ORBLX_NATR_LAN:-10.19}.23.2", "${ORBLX_NATR_LAN:-10.19}.23.10", "${ORBLX_NATR_MODE_C:-${ORBLX_ROUTER_C:-symmetric}}"]
     privileged: true
     cap_add:
       - NET_ADMIN
@@ -87,7 +87,7 @@ services:
   router-d:
     image: ${ORBLX_NATR_IMAGE:-orblx-natr:w20}
     entrypoint: ["/bin/sh", "/nat-router.sh"]
-    command: ["${ORBLX_NATR_PUB:-172.29.20}.14", "${ORBLX_NATR_LAN:-10.19}.24.2", "${ORBLX_NATR_LAN:-10.19}.24.10", "${ORBLX_NATR_MODE_D:-symmetric}"]
+    command: ["${ORBLX_NATR_PUB:-172.29.20}.14", "${ORBLX_NATR_LAN:-10.19}.24.2", "${ORBLX_NATR_LAN:-10.19}.24.10", "${ORBLX_NATR_MODE_D:-${ORBLX_ROUTER_D:-symmetric}}"]
     privileged: true
     cap_add:
       - NET_ADMIN
