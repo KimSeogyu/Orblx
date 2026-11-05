@@ -91,16 +91,95 @@ The script takes the box proof lock, builds the release binary, and runs each ca
 
 ## Results
 
-The proof log is inserted below after the run.
+The run is `scripts/proof/sym-sym-direct.sh` on this host. The build is release. N is 5 for each pair. One extra run blocks the punch, waits for the second attempt, then opens the punch. The node container does not restart.
+
+```text
+rustc rustc 1.99.1 (58cf8f9c3 2026-10-13)
+build profile release
+```
+
+`relay_ms` and `direct_ms` are `path_up` from process start. `first_packet_ms` is the first ICMP reply, measured from the host clock before the two node containers start. That clock includes container start, so it is larger than `relay_ms`. `probes` is the sum of the `predict_probes` lines from both nodes. `switch_lost` is the loss in 50 pings at 0.1 s after the first reply. `switch_gap_ms` is the longest gap between those replies.
+
+```text
+case random-random-1 expect relay relay_ms 111 direct_ms none first_packet_ms 1713 probes 0 switch_lost 0/50 switch_gap_ms 108
+case sequential-random-1 expect direct relay_ms 111 direct_ms 1501 first_packet_ms 1954 probes 262 switch_lost 0/50 switch_gap_ms 108
+case sequential-sequential-1 expect direct relay_ms 232 direct_ms 1514 first_packet_ms 1917 probes 231 switch_lost 0/50 switch_gap_ms 109
+case portblock-random-1 expect direct relay_ms 111 direct_ms 1308 first_packet_ms 1838 probes 224 switch_lost 0/50 switch_gap_ms 109
+case random-random-2 expect relay relay_ms 111 direct_ms none first_packet_ms 1695 probes 0 switch_lost 0/50 switch_gap_ms 108
+case sequential-random-2 expect direct relay_ms 111 direct_ms 1560 first_packet_ms 1956 probes 261 switch_lost 0/50 switch_gap_ms 109
+case sequential-sequential-2 expect direct relay_ms 273 direct_ms 1571 first_packet_ms 1990 probes 203 switch_lost 0/50 switch_gap_ms 108
+case portblock-random-2 expect direct relay_ms 111 direct_ms 1570 first_packet_ms 1927 probes 268 switch_lost 0/50 switch_gap_ms 108
+case random-random-3 expect relay relay_ms 111 direct_ms none first_packet_ms 1713 probes 0 switch_lost 0/50 switch_gap_ms 108
+case sequential-random-3 expect direct relay_ms 111 direct_ms 1624 first_packet_ms 2021 probes 260 switch_lost 0/50 switch_gap_ms 108
+case sequential-sequential-3 expect direct relay_ms 111 direct_ms 1563 first_packet_ms 1980 probes 243 switch_lost 0/50 switch_gap_ms 109
+case portblock-random-3 expect direct relay_ms 111 direct_ms 1568 first_packet_ms 1972 probes 267 switch_lost 0/50 switch_gap_ms 108
+case random-random-4 expect relay relay_ms 111 direct_ms none first_packet_ms 1750 probes 0 switch_lost 0/50 switch_gap_ms 109
+case sequential-random-4 expect direct relay_ms 111 direct_ms 1616 first_packet_ms 1942 probes 260 switch_lost 0/50 switch_gap_ms 109
+case sequential-sequential-4 expect direct relay_ms 233 direct_ms 1419 first_packet_ms 1936 probes 185 switch_lost 0/50 switch_gap_ms 109
+case portblock-random-4 expect direct relay_ms 111 direct_ms 1666 first_packet_ms 1847 probes 268 switch_lost 0/50 switch_gap_ms 108
+case random-random-5 expect relay relay_ms 111 direct_ms none first_packet_ms 1746 probes 0 switch_lost 0/50 switch_gap_ms 108
+case sequential-random-5 expect direct relay_ms 111 direct_ms 1498 first_packet_ms 1909 probes 260 switch_lost 0/50 switch_gap_ms 108
+case sequential-sequential-5 expect direct relay_ms 181 direct_ms 1563 first_packet_ms 1918 probes 251 switch_lost 0/50 switch_gap_ms 108
+case portblock-random-5 expect direct relay_ms 111 direct_ms 1647 first_packet_ms 1947 probes 270 switch_lost 0/50 switch_gap_ms 109
+```
+
+Plan lines from the fifth run of each pair:
+
+```text
+case random-random-5
+The punch plan is relay-only. The local mapping is endpoint-dependent. The peer mapping is endpoint-dependent.
+The local port allocation is random.
+The peer port allocation is random.
+
+case sequential-random-5
+The punch plan is predict-spray. The local mapping is endpoint-dependent. The peer mapping is endpoint-dependent.
+The local port allocation is sequential step 1 origin 1030.
+The peer port allocation is random.
+
+case sequential-sequential-5
+The punch plan is predict-spray. The local mapping is endpoint-dependent. The peer mapping is endpoint-dependent.
+The local port allocation is sequential step 1 origin 1030.
+The peer port allocation is sequential step 1 origin 1030.
+
+case portblock-random-5
+The punch plan is predict-spray. The local mapping is endpoint-dependent. The peer mapping is endpoint-dependent.
+The local port allocation is port-block 20003-20058.
+The peer port allocation is random.
+```
+
+| Pair | Path | Success | Relay path | First packet | Direct path | Probes | Switch loss |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| random to random | relay | 5/5 | 111 ms | 1695–1750 ms | none | 0 | 0/50 |
+| sequential to random | direct | 5/5 | 111 ms | 1909–2021 ms | 1498–1624 ms | 260–262 | 0/50 |
+| sequential to sequential | direct | 5/5 | 111–273 ms | 1917–1990 ms | 1419–1571 ms | 185–251 | 0/50 |
+| port-block to random | direct | 5/5 | 111 ms | 1838–1972 ms | 1308–1666 ms | 224–270 | 0/50 |
+
+Every direct run has `relay_ms` below `direct_ms`. The first packets use the relay. The later path is direct. The ping gap stays at the 0.1 s interval (108 ms or 109 ms). The switch drops no ping in these 50-ping samples.
+
+The blocked-punch run:
+
+```text
+retry relay up while the punch is blocked
+punch_open output udp 172.29.28.13 172.29.28.14
+retry paths direct direct
+retry restarted false
+sym_sym_direct_ok
+```
+
+The script reaches `punch_open` only after a log line `The predict attempt 2 starts.` (or a later attempt) while the UDP block is still in place. `retry restarted false` means the node container start time did not change.
+
+```text
+proof_contention sym-sym-direct:orblx-sym-proof samples 327 contended_samples 0 unknown_samples 0 max_other_orblx_containers 0 max_load1 0.87
+```
 
 ## Comparison
 
-| Pair | Orblx | Tailscale |
+| Pair | Orblx, this run | Tailscale |
 | --- | --- | --- |
-| random to random | See the result table. Plan `relay-only`. No predict spray. | DERP. No direct path. Blog calculation: 0.01% after 20 seconds of a birthday search. The client does not run that search. |
-| sequential to random | See the result table. Plan `predict-spray`. | DERP when both mappings vary by destination. No predicted-port spray. |
-| sequential to sequential | See the result table. Plan `predict-spray`. | DERP. The blog says a full search is not usable for interactive traffic. |
-| port-block to random | See the result table. Plan `predict-spray` of the block window. | DERP. No port-block spray. |
+| random to random | 5/5 relay. 0 predict probes. Plan `relay-only`. | DERP. The blog calculates 0.01% for a birthday search after 20 seconds. The client pings advertised endpoints only. |
+| sequential to random | 5/5 direct. Direct path 1498–1624 ms from process start. 260–262 probes. Switch loss 0/50. | DERP when both mappings vary by destination. The client pings the endpoints named in the call-me message. |
+| sequential to sequential | 5/5 direct. Direct path 1419–1571 ms from process start. 185–251 probes. Switch loss 0/50. | DERP. The blog says 170,000 probes per side for a 99.9% birthday collision, which is 28 minutes at 100 packets per second. |
+| port-block to random | 5/5 direct. Direct path 1308–1666 ms from process start. 224–270 probes. Switch loss 0/50. | DERP. The client pings the endpoints named in the call-me message. |
 
 Sources: <https://tailscale.com/blog/how-nat-traversal-works>, <https://github.com/tailscale/tailscale/blob/main/net/netcheck/netcheck.go>, <https://github.com/tailscale/tailscale/blob/main/wgengine/magicsock/magicsock.go>, <https://github.com/tailscale/tailscale/blob/main/wgengine/magicsock/endpoint.go>.
 
