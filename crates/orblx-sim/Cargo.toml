@@ -15,7 +15,7 @@ path = "src/main.rs"
 # Do not add a Unix socket for the feed.
 
 [dependencies]
-axum = "0.7.9"
+axum = "0.8.9"
 orblx-audit = { path = "../orblx-audit" }
 orblx-datapath = { path = "../orblx-datapath" }
 orblx-edge = { path = "../orblx-edge" }
