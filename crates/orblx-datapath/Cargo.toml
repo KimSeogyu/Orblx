@@ -21,7 +21,7 @@ orblx-relay = { path = "../orblx-relay" }
 sha2 = "0.10.8"
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rand = "0.8"
-rcgen = { version = "=0.14.7", default-features = false, features = ["crypto", "pem", "ring"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "logging"] }
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
