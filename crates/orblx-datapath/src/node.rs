@@ -2488,24 +2488,67 @@ fn status_text(node: &NodeView, peers: &Mutex<Vec<PeerView>>, state: &str) -> St
     format_node_status(&status)
 }
 
-async fn renew_loop(mut mesh: Mesh, renewer: SvidRenewer) {
-    loop {
-        if stopped(&mesh) {
-            return;
-        }
-        let not_before = mesh.node.not_before.load(Ordering::Relaxed);
-        let not_after = mesh.node.not_after.load(Ordering::Relaxed);
-        let due = renew_unix(not_before, not_after);
-        let wait = due.saturating_sub(unix_now());
-        tokio::select! {
-            changed = mesh.shutdown.changed() => {
-                if changed.is_err() || *mesh.shutdown.borrow() {
-                    return;
-                }
+/// The wall clock the renewal loop reads.
+///
+/// Production uses the host clock. A test supplies one unix second.
+enum RenewClock {
+    Host,
+    #[cfg(test)]
+    Fake(Arc<FakeNow>),
+}
+
+/// One unix second for a renewal test. The host clock does not change.
+#[cfg(test)]
+struct FakeNow {
+    unix: AtomicU64,
+    reads: AtomicU64,
+}
+
+#[cfg(test)]
+impl FakeNow {
+    fn new(unix: u64) -> Arc<Self> {
+        Arc::new(Self {
+            unix: AtomicU64::new(unix),
+            reads: AtomicU64::new(0),
+        })
+    }
+
+    fn set(&self, unix: u64) {
+        self.unix.store(unix, Ordering::Relaxed);
+    }
+
+    fn reads(&self) -> u64 {
+        self.reads.load(Ordering::Relaxed)
+    }
+}
+
+impl RenewClock {
+    fn unix(&self) -> u64 {
+        match self {
+            Self::Host => host_unix(),
+            #[cfg(test)]
+            Self::Fake(now) => {
+                now.reads.fetch_add(1, Ordering::Relaxed);
+                now.unix.load(Ordering::Relaxed)
             }
-            _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
         }
-        if stopped(&mesh) {
+    }
+}
+
+/// Read the wall clock at least once per second of scheduled runtime time.
+///
+/// The sleep is runtime time. It does not run while the runtime is not executing.
+/// A wall step is visible at the next one-second wake. The loop then renews when
+/// the leaf is due. A failure wait is separate and keeps its full retry delay.
+const RENEW_REALTIME_POLL: Duration = Duration::from_secs(1);
+
+async fn renew_loop(mesh: Mesh, renewer: SvidRenewer) {
+    renew_loop_with_clock(mesh, renewer, RenewClock::Host).await;
+}
+
+async fn renew_loop_with_clock(mut mesh: Mesh, renewer: SvidRenewer, clock: RenewClock) {
+    loop {
+        if !wait_until_renew_due(&mut mesh, &clock).await {
             return;
         }
         let mut attempt = 0u32;
@@ -2548,7 +2591,7 @@ async fn renew_loop(mut mesh: Mesh, renewer: SvidRenewer) {
                     // peers check it with their own clocks. But a leaf that is due again at
                     // once by this node's clock counts as a failed renewal. The node waits
                     // the retry delay, so the loop never renews with no delay.
-                    let now = unix_now();
+                    let now = clock.unix();
                     let (not_before, not_after) = (
                         mesh.node.not_before.load(Ordering::Relaxed),
                         mesh.node.not_after.load(Ordering::Relaxed),
@@ -2682,11 +2725,40 @@ fn renew_unix(not_before: u64, not_after: u64) -> u64 {
 /// The minimum renewal lead (W25-45) for a life of 10 min or more.
 const RENEW_LEAD_MIN_SECS: u64 = 5 * 60;
 
-fn unix_now() -> u64 {
+fn host_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+/// Return true when the leaf is due. Return false when the node stops.
+///
+/// A shutdown signal that leaves the node running ends the wait, as before.
+async fn wait_until_renew_due(mesh: &mut Mesh, clock: &RenewClock) -> bool {
+    loop {
+        if stopped(mesh) {
+            return false;
+        }
+        let not_before = mesh.node.not_before.load(Ordering::Relaxed);
+        let not_after = mesh.node.not_after.load(Ordering::Relaxed);
+        let due = renew_unix(not_before, not_after);
+        let now = clock.unix();
+        if now >= due {
+            return true;
+        }
+        let slice_secs = (due - now).min(RENEW_REALTIME_POLL.as_secs());
+        let slice = Duration::from_secs(slice_secs);
+        tokio::select! {
+            changed = mesh.shutdown.changed() => {
+                if changed.is_err() || *mesh.shutdown.borrow() {
+                    return false;
+                }
+                return true;
+            }
+            _ = tokio::time::sleep(slice) => {}
+        }
+    }
 }
 
 fn safe_text(text: &str) -> String {
@@ -3184,8 +3256,18 @@ impl Drop for PidGuard {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::net::SocketAddr;
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use orblx_crypto::{TicketKey, TicketRing};
+    use orblx_identity::{
+        decode_certificate_pem, DenySet, IssuedSvid, MiniCa, SpiffeId, TicketSigner, TrustBundle,
+        MAX_SKEW,
+    };
+    use tokio::sync::{mpsc, watch};
 
     use super::{
         changed_dns_netmap, dns_start_text, format_node_status, load_state, read_status_text,
@@ -3573,5 +3655,483 @@ mod tests {
         println!(
             "w25-42 h1 queue={queue} links_pending_while_full=2 marks_while_full={marks_while_full} ready_after_one_read={ready_after_one} marks_after_one_read={marks_after_one} marks_after_two_reads={marks_after_two}"
         );
+    }
+
+    const RENEW_BASE: u64 = 1_700_000_000;
+
+    #[derive(Clone, Copy)]
+    enum RenewPlan {
+        Authorized { ttl: u64 },
+        DueAtOnceThenStable,
+        Fail,
+    }
+
+    struct RenewObs {
+        attempts: Arc<AtomicU64>,
+        done: Arc<AtomicU64>,
+        error: Arc<Mutex<String>>,
+    }
+
+    struct Renewal {
+        mesh: super::Mesh,
+        now: Arc<super::FakeNow>,
+        attempts: Arc<AtomicU64>,
+        done: Arc<AtomicU64>,
+        error: Arc<Mutex<String>>,
+        task: tokio::task::JoinHandle<()>,
+        stop: watch::Sender<bool>,
+        dir: PathBuf,
+    }
+
+    impl Drop for Renewal {
+        fn drop(&mut self) {
+            let _ = self.stop.send(true);
+            self.task.abort();
+            self.mesh.status.close(None);
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn at(unix: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(unix)
+    }
+
+    fn issue(ca: &MiniCa, id: &SpiffeId, unix: u64, ttl: u64) -> IssuedSvid {
+        ca.issue(id, at(unix), Duration::from_secs(ttl), &DenySet::empty())
+            .unwrap()
+    }
+
+    fn config_for(issued: &IssuedSvid, trust: TrustBundle, ring: TicketRing) -> crate::HelloConfig {
+        crate::HelloConfig::from_issued(
+            &issued.certificate_pem,
+            &issued.private_key_pem,
+            trust,
+            Vec::new(),
+            [0; 32],
+            ring,
+        )
+    }
+
+    async fn open_renewal(name: &str, life: u64, start: u64, plan: RenewPlan) -> Renewal {
+        let base = RENEW_BASE;
+        let ca = MiniCa::generate(at(base)).unwrap();
+        let id = SpiffeId::node("a").unwrap();
+        let issued = issue(&ca, &id, base, life);
+        let signer = TicketSigner::generate();
+        let ticket_key = TicketKey::new(
+            signer.verifier(),
+            [7; 32],
+            at(base.saturating_sub(60)),
+            at(base + 86_400),
+        )
+        .unwrap();
+        let ring = TicketRing::single(ticket_key, ca.public_key()).unwrap();
+        let trust = ca.trust_bundle().clone();
+        let endpoint = crate::quic::HelloEndpoint::bind_node(
+            config_for(&issued, trust.clone(), ring.clone()),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .unwrap();
+        let dir = test_dir(name);
+        let (stop, shutdown) = watch::channel(false);
+        let (rekey_tx, rekey_rx) = watch::channel(0);
+        let (to_tun, _from_peers) = mpsc::channel(8);
+        let now = super::FakeNow::new(start);
+        let obs = Arc::new(RenewObs {
+            attempts: Arc::new(AtomicU64::new(0)),
+            done: Arc::new(AtomicU64::new(0)),
+            error: Arc::new(Mutex::new(String::new())),
+        });
+        let mesh = super::Mesh {
+            endpoint: Arc::new(endpoint),
+            identity: Arc::new(Mutex::new(config_for(&issued, trust.clone(), ring))),
+            netmap: Arc::new(sample_map("10.0.0.1")),
+            netmap_path: dir.join("netmap.json"),
+            node: Arc::new(super::NodeView {
+                name: "a".to_string(),
+                overlay_ip: "10.0.0.1".to_string(),
+                svid: id.as_uri().to_string(),
+                exit_node: None,
+                not_before: AtomicU64::new(issued.not_before),
+                not_after: AtomicU64::new(issued.not_after),
+            }),
+            links: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            retired: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            peers: Arc::new(Mutex::new(Vec::new())),
+            counters: Arc::new(super::NodeCounters {
+                tx: AtomicU64::new(0),
+                rx: AtomicU64::new(0),
+                refused: AtomicU64::new(0),
+                dials: AtomicU64::new(0),
+            }),
+            to_tun,
+            overlay: std::net::Ipv4Addr::new(10, 0, 0, 1),
+            state_dir: Arc::new(dir.clone()),
+            status: super::StatusFile::start(dir.join("status.txt")),
+            relay: None,
+            shutdown,
+            rekey_tx,
+            rekey_rx,
+            filter: None,
+        };
+        let clock = super::RenewClock::Fake(Arc::clone(&now));
+        let renewer = renewer(
+            plan,
+            Arc::new(ca),
+            id,
+            trust,
+            Arc::clone(&mesh.identity),
+            Arc::clone(&now),
+            Arc::clone(&obs),
+        );
+        let task = tokio::spawn(super::renew_loop_with_clock(mesh.clone(), renewer, clock));
+        Renewal {
+            mesh,
+            now,
+            attempts: Arc::clone(&obs.attempts),
+            done: Arc::clone(&obs.done),
+            error: Arc::clone(&obs.error),
+            task,
+            stop,
+            dir,
+        }
+    }
+
+    fn renewer(
+        plan: RenewPlan,
+        ca: Arc<MiniCa>,
+        id: SpiffeId,
+        trust: TrustBundle,
+        identity: Arc<Mutex<crate::HelloConfig>>,
+        now: Arc<super::FakeNow>,
+        obs: Arc<RenewObs>,
+    ) -> super::SvidRenewer {
+        super::SvidRenewer::new(move || {
+            obs.attempts.fetch_add(1, Ordering::Relaxed);
+            let call = obs.attempts.load(Ordering::Relaxed);
+            let result = renew_once(plan, &ca, &id, &trust, &identity, &now, call);
+            if let Err(ref err) = result {
+                *obs.error.lock().expect("renewal error") = err.clone();
+            }
+            obs.done.fetch_add(1, Ordering::Relaxed);
+            result
+        })
+    }
+
+    fn renew_once(
+        plan: RenewPlan,
+        ca: &MiniCa,
+        id: &SpiffeId,
+        trust: &TrustBundle,
+        identity: &Mutex<crate::HelloConfig>,
+        now: &super::FakeNow,
+        call: u64,
+    ) -> Result<super::RenewedLeaf, String> {
+        if matches!(plan, RenewPlan::Fail) {
+            return Err("The coordinator refused the renewal.".to_string());
+        }
+        let pem = identity.lock().expect("identity").certificate_pem.clone();
+        let der = decode_certificate_pem(&pem).map_err(|_| "The leaf is not valid.".to_string())?;
+        let unix = now.unix.load(Ordering::Relaxed);
+        trust
+            .authenticate_leaf(&der, at(unix), &DenySet::empty())
+            .map_err(|_| "The leaf is outside the authorization window.".to_string())?;
+        let ttl = match plan {
+            RenewPlan::Authorized { ttl } => ttl,
+            RenewPlan::DueAtOnceThenStable => {
+                if call == 1 {
+                    2
+                } else {
+                    9
+                }
+            }
+            RenewPlan::Fail => unreachable!(),
+        };
+        let issued = issue(ca, id, unix, ttl);
+        Ok(super::RenewedLeaf {
+            certificate_pem: issued.certificate_pem,
+            private_key_pem: issued.private_key_pem,
+            ticket: None,
+        })
+    }
+
+    fn expiry(renewal: &Renewal) -> u64 {
+        renewal.mesh.node.not_after.load(Ordering::Relaxed)
+    }
+
+    fn note(renewal: &Renewal) -> String {
+        renewal.error.lock().expect("renewal error").clone()
+    }
+
+    async fn idle(now: &super::FakeNow) {
+        let start = now.reads();
+        for _ in 0..40 {
+            tokio::task::yield_now().await;
+            let reads = now.reads();
+            if reads > start + 3 {
+                panic!("the renewal wait did not sleep, reads={reads}");
+            }
+        }
+    }
+
+    async fn arm(now: &super::FakeNow) {
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            if now.reads() > 0 {
+                idle(now).await;
+                return;
+            }
+        }
+        panic!("the renewal loop did not arm a wait");
+    }
+
+    async fn until_done(renewal: &Renewal, want: u64) {
+        let started = std::time::Instant::now();
+        loop {
+            if renewal.done.load(Ordering::Relaxed) >= want {
+                for _ in 0..50 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    renewal.attempts.load(Ordering::Relaxed),
+                    renewal.done.load(Ordering::Relaxed)
+                );
+                return;
+            }
+            if started.elapsed() > Duration::from_secs(2) {
+                break;
+            }
+            tokio::task::yield_now().await;
+            std::thread::yield_now();
+        }
+        panic!(
+            "renewal calls stayed at {}, attempts={}, error={}",
+            renewal.done.load(Ordering::Relaxed),
+            renewal.attempts.load(Ordering::Relaxed),
+            note(renewal)
+        );
+    }
+
+    async fn stopped(renewal: &Renewal) {
+        for _ in 0..50 {
+            if renewal.task.is_finished() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the renewal loop did not stop");
+    }
+
+    /// Let paused runtime time pass. Armed renewal waits run in that time.
+    async fn step(secs: u64) {
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn renewal_follows_realtime_when_both_clocks_move_together() {
+        let life = 9;
+        let renewal = open_renewal(
+            "renew-together",
+            life,
+            RENEW_BASE,
+            RenewPlan::Authorized { ttl: 9 },
+        )
+        .await;
+        let due = super::renew_unix(RENEW_BASE, RENEW_BASE + life);
+        assert!(due > RENEW_BASE + 1);
+        arm(&renewal.now).await;
+        for unix in (RENEW_BASE + 1)..due {
+            renewal.now.set(unix);
+            step(1).await;
+            idle(&renewal.now).await;
+            assert_eq!(renewal.done.load(Ordering::Relaxed), 0, "{unix}");
+            assert_eq!(expiry(&renewal), RENEW_BASE + life);
+        }
+        renewal.now.set(due);
+        step(1).await;
+        until_done(&renewal, 1).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 1);
+        assert_eq!(expiry(&renewal), due + 9, "{}", note(&renewal));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn realtime_before_the_due_time_does_not_renew() {
+        let life = 9;
+        let renewal = open_renewal(
+            "renew-before-due",
+            life,
+            RENEW_BASE,
+            RenewPlan::Authorized { ttl: 9 },
+        )
+        .await;
+        let due = super::renew_unix(RENEW_BASE, RENEW_BASE + life);
+        arm(&renewal.now).await;
+        renewal.now.set(due - 1);
+        step(30).await;
+        idle(&renewal.now).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 0);
+        assert_eq!(expiry(&renewal), RENEW_BASE + life);
+        renewal.now.set(due);
+        step(1).await;
+        until_done(&renewal, 1).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 1);
+        assert_eq!(expiry(&renewal), due + 9, "{}", note(&renewal));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn realtime_past_due_renews_while_the_original_wait_is_pending() {
+        let life = 9;
+        let renewal = open_renewal(
+            "renew-past-due",
+            life,
+            RENEW_BASE,
+            RenewPlan::Authorized { ttl: 9 },
+        )
+        .await;
+        let due = super::renew_unix(RENEW_BASE, RENEW_BASE + life);
+        let not_after = RENEW_BASE + life;
+        assert!(due + 1 < not_after);
+        arm(&renewal.now).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 0);
+        renewal.now.set(due + 1);
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 0);
+        step(1).await;
+        until_done(&renewal, 1).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 1);
+        assert_eq!(expiry(&renewal), due + 1 + 9, "{}", note(&renewal));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn renewal_at_certificate_grace_end_installs_once() {
+        let life = 900;
+        let not_after = RENEW_BASE + life;
+        let at_grace = not_after + MAX_SKEW.as_secs();
+        let renewal = open_renewal(
+            "renew-grace-end",
+            life,
+            at_grace,
+            RenewPlan::Authorized { ttl: 9 },
+        )
+        .await;
+        until_done(&renewal, 1).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 1);
+        assert_eq!(expiry(&renewal), at_grace + 9, "{}", note(&renewal));
+        idle(&renewal.now).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn renewal_past_certificate_grace_does_not_install() {
+        let life = 900;
+        let not_after = RENEW_BASE + life;
+        let past = not_after + MAX_SKEW.as_secs() + 1;
+        let renewal = open_renewal(
+            "renew-past-grace",
+            life,
+            past,
+            RenewPlan::Authorized { ttl: 9 },
+        )
+        .await;
+        until_done(&renewal, 1).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 1);
+        assert_eq!(expiry(&renewal), not_after, "{}", note(&renewal));
+        assert_eq!(
+            note(&renewal),
+            "The leaf is outside the authorization window."
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn backward_realtime_does_not_spin_or_renew_again() {
+        let life = 9;
+        let due = super::renew_unix(RENEW_BASE, RENEW_BASE + life);
+        let renewal = open_renewal(
+            "renew-backward",
+            life,
+            due,
+            RenewPlan::Authorized { ttl: 9 },
+        )
+        .await;
+        until_done(&renewal, 1).await;
+        assert_eq!(expiry(&renewal), due + 9, "{}", note(&renewal));
+        arm(&renewal.now).await;
+        renewal.now.set(RENEW_BASE);
+        step(30).await;
+        idle(&renewal.now).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 1);
+        let next = super::renew_unix(due, due + 9);
+        renewal.now.set(next);
+        step(1).await;
+        until_done(&renewal, 2).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 2);
+        assert_eq!(expiry(&renewal), next + 9, "{}", note(&renewal));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn shutdown_during_the_renewal_wait_does_not_renew() {
+        let renewal = open_renewal(
+            "renew-stop-wait",
+            9,
+            RENEW_BASE,
+            RenewPlan::Authorized { ttl: 9 },
+        )
+        .await;
+        arm(&renewal.now).await;
+        renewal.stop.send(true).unwrap();
+        stopped(&renewal).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn shutdown_during_a_failure_retry_returns() {
+        let life = 9;
+        let due = super::renew_unix(RENEW_BASE, RENEW_BASE + life);
+        let renewal = open_renewal("renew-stop-retry", life, due, RenewPlan::Fail).await;
+        until_done(&renewal, 1).await;
+        renewal.stop.send(true).unwrap();
+        stopped(&renewal).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 1);
+        assert_eq!(expiry(&renewal), RENEW_BASE + life);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_failed_renewal_keeps_the_backoff_delay() {
+        let life = 9;
+        let due = super::renew_unix(RENEW_BASE, RENEW_BASE + life);
+        let renewal = open_renewal("renew-backoff", life, due, RenewPlan::Fail).await;
+        until_done(&renewal, 1).await;
+        assert_eq!(expiry(&renewal), RENEW_BASE + life);
+        step(1).await;
+        until_done(&renewal, 2).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 2);
+        step(1).await;
+        idle(&renewal.now).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 2);
+        step(1).await;
+        until_done(&renewal, 3).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 3);
+        assert_eq!(expiry(&renewal), RENEW_BASE + life);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_leaf_due_at_once_waits_the_retry_delay_in_the_loop() {
+        let life = 9;
+        let due = super::renew_unix(RENEW_BASE, RENEW_BASE + life);
+        let renewal = open_renewal(
+            "renew-clock-ahead",
+            life,
+            due,
+            RenewPlan::DueAtOnceThenStable,
+        )
+        .await;
+        until_done(&renewal, 1).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 1);
+        assert_eq!(expiry(&renewal), due + 2, "{}", note(&renewal));
+        idle(&renewal.now).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 1);
+        step(1).await;
+        until_done(&renewal, 2).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 2);
+        assert_eq!(expiry(&renewal), due + 9, "{}", note(&renewal));
     }
 }

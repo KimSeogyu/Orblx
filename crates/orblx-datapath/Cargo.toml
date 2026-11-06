@@ -33,3 +33,6 @@ tun = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
