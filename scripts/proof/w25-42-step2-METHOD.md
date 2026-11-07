@@ -39,8 +39,11 @@ The failure console still prints the last 80 lines. That tail is not the export.
 A missing status file is not a complete export. A failed export is not `ok`.
 The coordinator follow log is `coord.log` when the follow started.
 `coord-log-status.txt` says `not_reached` when the follow never started.
-On failure, the EXIT trap copies the ping files and `big-gaps.txt` into `TR_OUT_DIR` before it removes the work directory.
-A phase that did not run is `not_reached`. The trap does not create an empty file for that phase.
+The EXIT trap writes `harness-artifacts.txt` before it removes the work directory.
+It copies the ping files and `big-gaps.txt` when that phase ran.
+A phase that did not run is `not_reached`. A missing file is not `kept`.
+`qualification-events.txt` is written after the export and the artifact status.
+`coord-cert-soak.sh` prints `qualification` after `coord-log-status.txt` exists.
 
 ### Clocks
 
@@ -132,8 +135,15 @@ Each bound edge must be within 100 ms.
 Each sample's realtime-minus-monotonic offset and boottime-minus-monotonic offset is compared with the first eligible sample.
 The uncertainty is that sample's capture bracket plus the baseline sample's capture bracket.
 The largest step between neighbours is not this test.
+A negative realtime, monotonic, or boottime step between adjacent samples does not qualify.
 An ambiguous capture does not qualify. A value on the 50 ms line does not qualify.
-An install before expiry is `observation_only`. It is not a refusal gate.
+`qualification_clock` is the clock result only.
+`qualification yes` also needs every renewal that is due inside the measured interval, a bound install for that renewal, and ok export, artifact, and coordinator-log status.
+A renewal that is due after the measured end is not required. An early product FAIL does not require it.
+A missing or ambiguous input does not qualify.
+An install binds to the old credential expiry at the same renewal index for that node.
+A later expiry is not that credential. The latest expiry before the renewal is not that credential.
+An install before its own old expiry is `observation_only`. It is not a refusal gate.
 
 ### Gates and outcomes
 

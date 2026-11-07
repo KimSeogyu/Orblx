@@ -73,10 +73,29 @@ persist_coord_log() {
   fi
 }
 
+# Print the acceptance qualification after the coord log status exists.
+# Clock-only output is not this line. This function does not change a gate.
+final_qualification() {
+  local dest="${TR_OUT_DIR:-}"
+  if [[ -z "$dest" ]]; then
+    echo "qualification unknown reason output_missing"
+    return 0
+  fi
+  if ! python3 "$ROOT/scripts/proof/host-sampler.py" acceptance \
+    --coverage "$dest/host-coverage.txt" \
+    --events "$dest/qualification-events.txt" \
+    --export-status "$dest/log-export-status.txt" \
+    --artifact-status "$dest/harness-artifacts.txt" \
+    --coord-status "$dest/coord-log-status.txt"; then
+    echo "qualification unknown reason command_failed"
+  fi
+}
+
 cleanup() {
   [[ -n "$FOLLOW_PID" ]] && kill "$FOLLOW_PID" >/dev/null 2>&1 || true
   [[ -n "$TR_PID" ]] && kill "$TR_PID" >/dev/null 2>&1 || true
   persist_coord_log
+  final_qualification
   rm -rf "$WORK"
 }
 if [[ ! -f "$TR_SCRIPT" ]]; then

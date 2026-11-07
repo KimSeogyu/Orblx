@@ -627,9 +627,14 @@ def qualify_observation(samples, start_ns, end_ns, early_fail=False, require_s=7
                     reasons.append(f"duration_{name}")
             span_max = 0
             for prev, cur in zip(inside, inside[1:]):
+                deltas = {name: clock_delta(prev[name], cur[name]) for name in CLOCK_NAMES}
+                for name in CLOCK_NAMES:
+                    delta = deltas[name]
+                    # A backward step does not qualify, even when it is below the drift limit.
+                    if delta != "unsupported" and delta < 0:
+                        reasons.append("negative_delta")
                 if capture_status(prev) != "ok" or capture_status(cur) != "ok":
                     continue
-                deltas = {name: clock_delta(prev[name], cur[name]) for name in CLOCK_NAMES}
                 for name in CLOCK_NAMES:
                     delta = deltas[name]
                     if delta != "unsupported" and delta > span_max:
@@ -678,10 +683,86 @@ def qualify_observation(samples, start_ns, end_ns, early_fail=False, require_s=7
         if reason not in ordered:
             ordered.append(reason)
     if ordered:
-        lines.append("qualification no reason " + ",".join(ordered))
+        lines.append("qualification_clock no reason " + ",".join(ordered))
     else:
-        lines.append("qualification yes reason eligible_interval")
+        lines.append("qualification_clock yes reason eligible_interval")
     return lines
+
+
+def _read_status_file(path):
+    """Return file text. A missing path is missing input, not an empty success."""
+    if not path or not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+_EXPORT_SERVICES = ("stack.log", "coord", "owner", "a", "b", "c")
+
+
+def acceptance_qualification(clock_text, event_text, export_text, artifact_text, coord_text):
+    """Combine clock, event, install, and copy evidence. This does not set a product verdict.
+
+    A missing or ambiguous input is unknown, never yes. Clock-only output stays on qualification_clock.
+    """
+    unknown = []
+    failed = []
+    if clock_text is None:
+        unknown.append("clock_missing")
+    else:
+        clock_lines = [line for line in clock_text.splitlines() if line.startswith("qualification_clock ")]
+        if len(clock_lines) != 1:
+            unknown.append("clock_missing")
+        elif not clock_lines[0].startswith("qualification_clock yes"):
+            failed.append("clock")
+    if event_text is None:
+        unknown.append("events_missing")
+    else:
+        for line in event_text.splitlines():
+            if line == "required_events unknown":
+                unknown.append("events_unknown")
+            elif line.startswith("required_renewal ") and not line.endswith(" present"):
+                failed.append("renewal")
+            elif line.startswith("required_install ") and not line.endswith(" before_expiry yes"):
+                failed.append("install")
+    if export_text is None:
+        unknown.append("export_status_missing")
+    else:
+        found = {}
+        for line in export_text.splitlines():
+            parts = line.split()
+            if len(parts) != 3 or parts[0] != "log_export":
+                failed.append("export")
+                continue
+            found[parts[1]] = parts[2]
+        for service in _EXPORT_SERVICES:
+            if found.get(service) != "ok":
+                failed.append("export")
+    if artifact_text is None:
+        unknown.append("artifact_status_missing")
+    else:
+        artifact_lines = [line for line in artifact_text.splitlines() if line.startswith("artifact ")]
+        if "artifact ping_files kept" not in artifact_lines or "artifact big_gaps kept" not in artifact_lines:
+            failed.append("artifact")
+        if any(not line.endswith(" kept") for line in artifact_lines):
+            failed.append("artifact")
+    if coord_text is None:
+        unknown.append("coord_log_status_missing")
+    elif [line for line in coord_text.splitlines() if line.strip()] != ["coord_log ok"]:
+        failed.append("coord_log")
+    if unknown:
+        ordered = []
+        for reason in unknown + failed:
+            if reason not in ordered:
+                ordered.append(reason)
+        return "qualification unknown reason " + ",".join(ordered)
+    if failed:
+        ordered = []
+        for reason in failed:
+            if reason not in ordered:
+                ordered.append(reason)
+        return "qualification no reason " + ",".join(ordered)
+    return "qualification yes reason complete"
 
 
 def parse_mark(text):
@@ -745,11 +826,33 @@ def _wall_fields(cur, prev):
     return kst, epoch_ms, dt_ms
 
 
+def acceptance_main(argv):
+    ap = argparse.ArgumentParser(prog="host-sampler.py acceptance")
+    ap.add_argument("--coverage")
+    ap.add_argument("--events")
+    ap.add_argument("--export-status")
+    ap.add_argument("--artifact-status")
+    ap.add_argument("--coord-status")
+    args = ap.parse_args(argv)
+    print(
+        acceptance_qualification(
+            _read_status_file(args.coverage),
+            _read_status_file(args.events),
+            _read_status_file(args.export_status),
+            _read_status_file(args.artifact_status),
+            _read_status_file(args.coord_status),
+        )
+    )
+    return 0
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "analyze":
         return analyze(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "coverage":
         return coverage_main(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == "acceptance":
+        return acceptance_main(sys.argv[2:])
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--interval", type=float, default=0.1)

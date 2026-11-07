@@ -183,41 +183,150 @@ observation_mark_lines() {
   fi
 }
 
-# A renewal before an expiry is an observation note. It is not a refusal.
+# Pair renewal i with expiry i for that node.
+# Expiry 0 is the credential the first renewal replaces. A later expiry is not a candidate.
+# This note is not a refusal.
 install_before_expiry_lines() {
-  local name r e k expiry before
+  local name r e prev ambiguous i
+  local -a renewals=() expiries=()
   declare -p RENEWS >/dev/null 2>&1 || return 0
   for name in "${NODES[@]}"; do
+    renewals=()
+    expiries=()
+    ambiguous=0
+    if declare -p EXPIRIES >/dev/null 2>&1 && [[ -n "${EXPIRIES[$name]:-}" ]]; then
+      for e in ${EXPIRIES[$name]}; do
+        expiries+=("$e")
+      done
+    elif [[ -n "${E0[$name]:-}" ]]; then
+      expiries+=("${E0[$name]}")
+    fi
+    if [[ -n "${E0[$name]:-}" && ${#expiries[@]} -gt 0 ]]; then
+      if ! awk -v a="${expiries[0]}" -v b="${E0[$name]}" 'BEGIN {exit !((a + 0) == (b + 0))}'; then
+        echo "install_binding ${name} ambiguous"
+        continue
+      fi
+    fi
+    prev=""
+    for e in "${expiries[@]}"; do
+      if [[ -n "$prev" ]] && ! awk -v p="$prev" -v e="$e" 'BEGIN {exit !((e + 0) > (p + 0))}'; then
+        ambiguous=1
+      fi
+      prev="$e"
+    done
     for r in ${RENEWS[$name]:-}; do
-      before=0
-      if declare -p EXPIRIES >/dev/null 2>&1; then
-        for e in ${EXPIRIES[$name]:-}; do
-          if awk -v r="$r" -v e="$e" 'BEGIN {exit !((r + 0) < (e + 0))}'; then
-            before=1
-          fi
-        done
+      renewals+=("$r")
+    done
+    if ((${#renewals[@]} > 0)); then
+      mapfile -t renewals < <(printf '%s\n' "${renewals[@]}" | sort -n)
+    fi
+    prev=""
+    for r in "${renewals[@]}"; do
+      if [[ -n "$prev" ]] && awk -v p="$prev" -v r="$r" 'BEGIN {exit !((r + 0) == (p + 0))}'; then
+        ambiguous=1
       fi
-      if [[ "$before" == "0" && -n "${E0[$name]:-}" && -n "${PERIOD:-}" && -n "${TR_ENDS:-}" ]]; then
-        for ((k = 1; k <= TR_ENDS; k++)); do
-          expiry=$(( E0[$name] + (k - 1) * PERIOD ))
-          if awk -v r="$r" -v e="$expiry" 'BEGIN {exit !((r + 0) < (e + 0))}'; then
-            before=1
-          fi
-        done
+      prev="$r"
+    done
+    if [[ "$ambiguous" == "1" ]]; then
+      echo "install_binding ${name} ambiguous"
+      continue
+    fi
+    i=0
+    for r in "${renewals[@]}"; do
+      if (( i >= ${#expiries[@]} )); then
+        echo "install_binding ${name} renewal ${r} missing_old_expiry"
+      else
+        e="${expiries[$i]}"
+        if awk -v r="$r" -v e="$e" 'BEGIN {exit !((r + 0) < (e + 0))}'; then
+          echo "install_binding ${name} renewal ${r} old_expiry ${e} before_expiry yes"
+          echo "${name}=${r}"
+        else
+          echo "install_binding ${name} renewal ${r} old_expiry ${e} before_expiry no"
+        fi
       fi
-      if [[ "$before" == "1" ]]; then
-        echo "${name}=${r}"
+      i=$((i + 1))
+    done
+  done
+}
+
+# Required events are due times inside the measured interval. A later event is not required.
+qualification_event_lines() {
+  local name i renew r lead due bindings state
+  local -a renewals=()
+  if [[ -z "${ACTUAL_BOUND_START:-}" || -z "${ACTUAL_BOUND_END:-}" ]]; then
+    echo "required_events unknown"
+    return 0
+  fi
+  if [[ -z "${PERIOD:-}" || -z "${TR_SVID_TTL:-}" || -z "${TR_ENDS:-}" ]] || ! declare -p E0 >/dev/null 2>&1; then
+    echo "required_events unknown"
+    return 0
+  fi
+  bindings="$(install_before_expiry_lines)"
+  lead=$((TR_SVID_TTL - PERIOD))
+  # Match one binding line. This loop reads every line. It does not stop the writer early.
+  binding_state() {
+    local node="$1" stamp="$2" line found="missing"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ -n "$line" ]] || continue
+      if [[ "$line" == "install_binding ${node} ambiguous" ]]; then
+        echo ambiguous
+        return 0
+      fi
+      [[ -n "$stamp" ]] || continue
+      if [[ "$line" == "install_binding ${node} renewal ${stamp} missing_old_expiry" ]]; then
+        found="missing_old_expiry"
+      elif [[ "$line" == "install_binding ${node} renewal ${stamp} old_expiry "*" before_expiry yes" ]]; then
+        found="before_expiry yes"
+      elif [[ "$line" == "install_binding ${node} renewal ${stamp} old_expiry "*" before_expiry no" ]]; then
+        found="before_expiry no"
+      fi
+    done <<< "$bindings"
+    echo "$found"
+  }
+  for name in "${NODES[@]}"; do
+    [[ -n "${E0[$name]:-}" ]] || continue
+    state="$(binding_state "$name" "")"
+    if [[ "$state" == "ambiguous" ]]; then
+      echo "required_install ${name} ambiguous"
+      continue
+    fi
+    renewals=()
+    if declare -p RENEWS >/dev/null 2>&1 && [[ -n "${RENEWS[$name]:-}" ]]; then
+      mapfile -t renewals < <(printf '%s\n' ${RENEWS[$name]} | awk 'NF {print $1}' | sort -n)
+    fi
+    for ((i = 0; i < TR_ENDS; i++)); do
+      renew=$(( E0[$name] + i * PERIOD - lead ))
+      due="$(awk -v s="$ACTUAL_BOUND_START" -v e="$ACTUAL_BOUND_END" -v r="$renew" 'BEGIN {print ((r + 0) >= (s + 0) && (r + 0) <= (e + 0)) ? "yes" : "no"}')"
+      [[ "$due" == "yes" ]] || continue
+      if [[ "$i" -ge "${#renewals[@]}" ]]; then
+        echo "required_renewal ${name} ${renew} missing"
+        echo "required_install ${name} ${renew} missing"
+        continue
+      fi
+      echo "required_renewal ${name} ${renew} present"
+      r="${renewals[$i]}"
+      state="$(binding_state "$name" "$r")"
+      if [[ "$state" == "before_expiry yes" ]]; then
+        echo "required_install ${name} ${renew} before_expiry yes"
+      else
+        echo "required_install ${name} ${renew} ${state}"
       fi
     done
   done
 }
 
-# Copy the ping files and the big-gap file after a failed run.
-# A phase that did not run is not_reached. This function does not create an empty success file.
+write_qualification_events() {
+  local dest="$1"
+  [[ -n "$dest" ]] || return 0
+  mkdir -p "$dest"
+  qualification_event_lines > "$dest/qualification-events.txt"
+}
+
+# Record the ping files and the big-gap file.
+# A phase that did not run is not_reached. A missing file is not kept.
 persist_run_artifacts() {
   local status="$1" dest="$2" work="$3"
   local linefile found f
-  [[ "$status" == "0" ]] && return 0
   if [[ -z "$dest" ]]; then
     echo "artifact_persist dest_missing"
     return 0
@@ -337,7 +446,7 @@ report_observation() {
   samples="${OUTD:-}/host-samples.txt"
   if [[ -z "${OUTD:-}" || ! -f "$samples" ]]; then
     echo "qualification_separate_from_product_verdict yes"
-    echo "qualification no reason eligible_interval_not_reached"
+    echo "qualification_clock no reason eligible_interval_not_reached"
     COVERAGE_DONE=1
     return 0
   fi
@@ -397,7 +506,7 @@ report_observation() {
     cov_args+=(--qualify-early-fail)
   fi
   while IFS= read -r mark; do
-    [[ -n "$mark" ]] || continue
+    [[ "$mark" == *=* ]] || continue
     cov_args+=(--install-before-expiry "$mark")
   done < <(install_before_expiry_lines)
   cov_args+=("${coverage_marks[@]}")
@@ -424,6 +533,7 @@ cleanup() {
     mkdir -p "$TR_OUT_DIR"
     export_service_logs "$TR_OUT_DIR"
     persist_run_artifacts "$status" "$TR_OUT_DIR" "$WORK"
+    write_qualification_events "$TR_OUT_DIR"
   else
     echo "log_export dest_missing"
     if [[ "$status" -ne 0 ]]; then
