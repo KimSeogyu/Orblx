@@ -219,6 +219,28 @@ def psi(path):
     return out
 
 
+def read_cgroup_list(base, path):
+    """Read name=dir lines. An empty dir stays empty. A missing file keeps the base list."""
+    items = list(base)
+    if not path:
+        return items
+    try:
+        with open(path) as handle:
+            text = handle.read()
+    except OSError:
+        return items
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, directory = line.split("=", 1)
+        if not name:
+            continue
+        items = [item for item in items if item[0] != name]
+        items.append((name, directory))
+    return items
+
+
 def snapshot(cgroups, clock_gettime_ns=None, clock_ids=None):
     if clock_gettime_ns is None:
         clock_gettime_ns = time.clock_gettime_ns
@@ -231,6 +253,9 @@ def snapshot(cgroups, clock_gettime_ns=None, clock_ids=None):
     mem = psi("/proc/pressure/memory") or {"some": 0, "full": 0}
     cg = {}
     for name, path in cgroups:
+        if not path:
+            cg[name] = None
+            continue
         p = psi(os.path.join(path, "cpu.pressure"))
         cg[name] = None if p is None else p["some"]
     wall = None if clocks["realtime"] == "unsupported" else clocks["realtime"] / 1e9
@@ -533,6 +558,125 @@ def coverage_samples(path):
     return [clocks_from_row(row) for row in rows]
 
 
+# This limit is 2x the 100 ms sample cadence. It is not the 200 ms reply-gap gate.
+SAMPLER_SPAN_LIMIT_NS = 200_000_000
+QUALIFY_EDGE_NS = 100_000_000
+QUALIFY_DRIFT_NS = 50_000_000
+
+
+def _capture_bracket_ns(sample):
+    """Return the capture bracket in ns. A negative or missing bracket cannot qualify."""
+    mono = sample.get("capture_monotonic", "unsupported")
+    boot = sample.get("capture_boottime", "unsupported")
+    if mono == "unsupported" or boot == "unsupported" or mono < 0 or boot < 0:
+        return "unsupported"
+    return max(mono, boot)
+
+
+def qualify_observation(samples, start_ns, end_ns, early_fail=False, require_s=7200, installs=None):
+    """Report whether the eligible interval is observed. This does not set a product verdict."""
+    lines = [
+        "qualification_separate_from_product_verdict yes",
+        "qualification_sampler_span_limit_ms 200",
+        "qualification_sampler_span_note not_the_reply_gap_gate",
+        "qualification_edge_limit_ms 100",
+        "qualification_drift_limit_ms 50",
+        "qualification_drift_note includes_capture_bracket_uncertainty",
+        "qualification_duration_note setup_cleanup_and_run_end_padding_do_not_count",
+    ]
+    if early_fail:
+        lines.append("qualification_window actual_start_to_failure")
+        lines.append("qualification_duration_required_s 0")
+    else:
+        lines.append("qualification_window eligible_measurement")
+        lines.append(f"qualification_duration_required_s {int(require_s)}")
+    for item in installs or []:
+        lines.append(f"qualification_install_before_expiry {item} observation_only")
+    if installs:
+        lines.append("qualification_install_before_expiry_note not_a_refusal_gate")
+    reasons = []
+    if start_ns is None or end_ns is None:
+        reasons.append("eligible_interval_not_reached")
+    elif end_ns < start_ns:
+        reasons.append("window_backward")
+    else:
+        inside = [
+            sample
+            for sample in samples
+            if sample.get("realtime") != "unsupported" and start_ns <= sample["realtime"] <= end_ns
+        ]
+        if len(inside) < 2:
+            reasons.append("no_eligible_samples")
+        else:
+            first, last = inside[0], inside[-1]
+            start_edge = first["realtime"] - start_ns
+            end_edge = end_ns - last["realtime"]
+            lines.append(f"qualification_start_edge_ns {start_edge}")
+            lines.append(f"qualification_end_edge_ns {end_edge}")
+            if start_edge > QUALIFY_EDGE_NS:
+                reasons.append("start_edge")
+            if end_edge > QUALIFY_EDGE_NS:
+                reasons.append("end_edge")
+            for name in CLOCK_NAMES:
+                elapsed = clock_delta(first[name], last[name])
+                lines.append(f"qualification_elapsed_{name}_ns {elapsed}")
+                if elapsed == "unsupported" or elapsed < 0:
+                    reasons.append(f"duration_{name}")
+                elif not early_fail and elapsed < int(require_s) * 1_000_000_000:
+                    reasons.append(f"duration_{name}")
+            span_max = 0
+            worst_rt = None
+            worst_boot = None
+            for prev, cur in zip(inside, inside[1:]):
+                if capture_status(prev) != "ok" or capture_status(cur) != "ok":
+                    reasons.append("capture")
+                    continue
+                deltas = {name: clock_delta(prev[name], cur[name]) for name in CLOCK_NAMES}
+                for name in CLOCK_NAMES:
+                    delta = deltas[name]
+                    if delta != "unsupported" and delta > span_max:
+                        span_max = delta
+                bracket_prev = _capture_bracket_ns(prev)
+                bracket_cur = _capture_bracket_ns(cur)
+                if (
+                    bracket_prev == "unsupported"
+                    or bracket_cur == "unsupported"
+                    or any(deltas[name] == "unsupported" for name in CLOCK_NAMES)
+                ):
+                    reasons.append("capture")
+                    continue
+                uncertainty = bracket_prev + bracket_cur
+                drift_rt = deltas["realtime"] - deltas["monotonic"]
+                drift_boot = deltas["boottime"] - deltas["monotonic"]
+                margin_rt = abs(drift_rt) + uncertainty
+                margin_boot = abs(drift_boot) + uncertainty
+                if worst_rt is None or margin_rt > worst_rt[0]:
+                    worst_rt = (margin_rt, drift_rt, uncertainty)
+                if worst_boot is None or margin_boot > worst_boot[0]:
+                    worst_boot = (margin_boot, drift_boot, uncertainty)
+                # A value on the 50 ms line does not qualify. The bracket is inside the sum.
+                if margin_rt >= QUALIFY_DRIFT_NS or margin_boot >= QUALIFY_DRIFT_NS:
+                    reasons.append("drift")
+            lines.append(f"qualification_sampler_span_max_ms {span_max / 1_000_000:.3f}")
+            if span_max > SAMPLER_SPAN_LIMIT_NS:
+                reasons.append("sampler_span")
+            if worst_rt is not None:
+                lines.append(f"qualification_drift_rt_mono_ns {worst_rt[1]}")
+                lines.append(f"qualification_drift_rt_mono_uncertainty_ns {worst_rt[2]}")
+            if worst_boot is not None:
+                lines.append(f"qualification_drift_boot_mono_ns {worst_boot[1]}")
+                lines.append(f"qualification_drift_boot_mono_uncertainty_ns {worst_boot[2]}")
+    ordered = []
+    for reason in reasons:
+        if reason not in ordered:
+            ordered.append(reason)
+    if ordered:
+        lines.append("qualification no reason " + ",".join(ordered))
+    else:
+        lines.append("qualification yes reason eligible_interval")
+    return lines
+
+
 def parse_mark(text):
     name, sep, rest = text.partition("=")
     if sep != "=" or not name or not rest:
@@ -551,6 +695,12 @@ def coverage_main(argv):
     ap.add_argument("--mark", action="append", default=[])
     ap.add_argument("--bound")
     ap.add_argument("--unknown-samples", type=int)
+    ap.add_argument("--qualify", action="store_true")
+    ap.add_argument("--qualify-start")
+    ap.add_argument("--qualify-end")
+    ap.add_argument("--qualify-early-fail", action="store_true")
+    ap.add_argument("--qualify-require-s", type=int, default=7200)
+    ap.add_argument("--install-before-expiry", action="append", default=[])
     args = ap.parse_args(argv)
     windows = [parse_mark(item) for item in args.mark]
     bound = None
@@ -562,6 +712,19 @@ def coverage_main(argv):
     )
     if args.unknown_samples is not None:
         lines.append(f"observation_unknown_samples_ignored {args.unknown_samples}")
+    if args.qualify or args.qualify_start or args.qualify_end or args.qualify_early_fail or args.install_before_expiry:
+        start_ns = None if not args.qualify_start else int(float(args.qualify_start) * 1e9)
+        end_ns = None if not args.qualify_end else int(float(args.qualify_end) * 1e9)
+        lines.extend(
+            qualify_observation(
+                coverage_samples(args.samples),
+                start_ns,
+                end_ns,
+                early_fail=args.qualify_early_fail,
+                require_s=args.qualify_require_s,
+                installs=args.install_before_expiry,
+            )
+        )
     print("\n".join(lines))
     return 0
 
@@ -584,13 +747,15 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--interval", type=float, default=0.1)
     ap.add_argument("--secs", type=float, default=0)
+    ap.add_argument("--cgroup-file")
     ap.add_argument("cgroups", nargs="*")
     args = ap.parse_args()
     cgroups = [tuple(c.split("=", 1)) for c in args.cgroups]
     stop = []
     signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
     start = time.monotonic()
-    prev = snapshot(cgroups)
+    active = read_cgroup_list(cgroups, args.cgroup_file)
+    prev = snapshot(active)
     nxt = time.monotonic()
     with open(args.out, "w", buffering=1) as out:
         out.write(COLUMN_HEADER)
@@ -600,13 +765,19 @@ def main():
             delay = nxt - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
-            cur = snapshot(cgroups)
+            active = read_cgroup_list(cgroups, args.cgroup_file)
+            cur = snapshot(active)
             ms = lambda a, b: (a - b) / 1000.0
             ticks = lambda a, b: (a - b) * 1000.0 / HZ
-            cg = " ".join(
-                f"{n}:{'-' if cur[8][n] is None or prev[8][n] is None else f'{ms(cur[8][n], prev[8][n]):.1f}'}"
-                for n, _ in cgroups
-            )
+            cg_parts = []
+            for name, _directory in active:
+                before = prev[8].get(name)
+                after = cur[8].get(name)
+                if before is None or after is None:
+                    cg_parts.append(f"{name}:-")
+                else:
+                    cg_parts.append(f"{name}:{ms(after, before):.1f}")
+            cg = " ".join(cg_parts)
             kst, epoch_ms, dt_ms = _wall_fields(cur, prev)
             clocks = format_clock_fields(prev[9], cur[9])
             out.write(

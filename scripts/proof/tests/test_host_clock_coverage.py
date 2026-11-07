@@ -204,10 +204,19 @@ class HostClockCoverageTest(unittest.TestCase):
             "observation_note contention_unknown_samples_do_not_mean_a_renewal_interval_was_fully_observed",
             src,
         )
+        self.assertNotIn("stop_sampler\nreport_observation\ncheck_refusals", src)
         self.assertLess(
-            src.index("stop_sampler\nreport_observation"),
+            src.index("stop_sampler\n  report_observation"),
             src.index('echo "=== gate 1: ticket ends crossed ==="'),
         )
+        head, tail = src.split('echo "=== [C] start coordinator ==="', 1)
+        self.assertIn("--cgroup-file", head)
+        self.assertIn("--interval 0.1", head)
+        self.assertNotIn("--interval 0.1", tail)
+        between = src.split('echo "=== [C] wait for the ping runs to end ==="', 1)[1]
+        between = between.split('echo "=== gate 1: ticket ends crossed ==="', 1)[0]
+        self.assertNotIn("stop_sampler", between)
+        self.assertNotIn("report_observation", between)
         self.assertEqual(src.count("(( crossed >= TR_ENDS ))"), 1)
         self.assertEqual(src.count("e + SKEW < RUN_END"), 1)
         self.assertIn('TR_GAP_MS="${TR_GAP_MS:-200}"', src)

@@ -86,6 +86,10 @@ OUTD=""
 COVERAGE_DONE=0
 COORD="${TR_NET}.10:443"
 NODES=(owner a b c)
+declare -A PHASE_NODE=()
+PHASE_COORD=0
+PHASE_PING=0
+PHASE_GAPS=0
 declare -A NODE_IP=([owner]="${TR_NET}.20" [a]="${TR_NET}.11" [b]="${TR_NET}.12" [c]="${TR_NET}.13")
 WORK="$(mktemp -d /tmp/orblx-tr.XXXXXX)"
 export TR_POLICY="$WORK/policy.hujson"
@@ -104,15 +108,238 @@ stop_sampler() {
   fi
 }
 
+# The eligible end. An early failure uses FAIL_AT.
+# A finished run drops the RUN_END padding (SKEW + 5). Empty means the interval was not reached.
+eligible_end_unix() {
+  if [[ -z "${ELIGIBLE_START:-}" ]]; then
+    return 0
+  fi
+  if [[ -n "${FAIL_AT:-}" ]]; then
+    printf '%s\n' "$FAIL_AT"
+    return 0
+  fi
+  if [[ -n "${RUN_END:-}" && -n "${SKEW:-}" ]]; then
+    awk -v e="$RUN_END" -v s="$SKEW" 'BEGIN {printf "%.9f\n", (e - s - 5)}'
+  fi
+}
+
+# One mark line per call. A missing event keeps its nominal schedule.
+# This does not change a gate.
+observation_mark_lines() {
+  local name k expiry renew renew0 first found e r
+  if declare -p E0 >/dev/null 2>&1 && [[ -n "${PERIOD:-}" && -n "${TR_SVID_TTL:-}" && -n "${TR_ENDS:-}" ]]; then
+    for name in "${NODES[@]}"; do
+      [[ -n "${E0[$name]:-}" ]] || continue
+      renew0=$(( E0[$name] - (TR_SVID_TTL - PERIOD) ))
+      echo "first-renewal-${name}-sched=${renew0}:$((renew0 + 1))"
+      first=""
+      if declare -p RENEWS >/dev/null 2>&1; then
+        first="${RENEWS[$name]:-}"
+        first="${first%% *}"
+      fi
+      if [[ -n "$first" ]]; then
+        echo "first-renewal-${name}=${first}:$(awk -v t="$first" 'BEGIN {printf "%.9f", t + 1}')"
+      else
+        echo "missing-event-first-renewal-${name}=${renew0}:$((renew0 + 1))"
+      fi
+      for ((k = 1; k <= TR_ENDS; k++)); do
+        expiry=$(( E0[$name] + (k - 1) * PERIOD ))
+        echo "ticket-end-${name}-sched-${k}=${expiry}:$((expiry + 1))"
+        found=0
+        if declare -p EXPIRIES >/dev/null 2>&1; then
+          for e in ${EXPIRIES[$name]:-}; do
+            [[ "$e" == "$expiry" ]] && found=1
+          done
+        fi
+        if [[ "$found" == "0" ]]; then
+          echo "missing-event-ticket-end-${name}-sched-${k}=${expiry}:$((expiry + 1))"
+        else
+          echo "ticket-end-${name}-actual-${k}=${expiry}:$((expiry + 1))"
+        fi
+      done
+      for ((k = 2; k <= TR_ENDS; k++)); do
+        expiry=$(( E0[$name] + (k - 1) * PERIOD ))
+        renew=$(( expiry - (TR_SVID_TTL - PERIOD) ))
+        found=0
+        if declare -p RENEWS >/dev/null 2>&1; then
+          for r in ${RENEWS[$name]:-}; do
+            if awk -v r="$r" -v a="$renew" -v b="$expiry" 'BEGIN {exit !((r + 0) >= (a + 0) && (r + 0) <= (b + 0))}'; then
+              found=1
+            fi
+          done
+        fi
+        if [[ "$found" == "0" ]]; then
+          echo "missing-event-${name}-sched-${k}=${renew}:${expiry}"
+        fi
+      done
+    done
+  fi
+  if [[ -n "${PLANNED_BOUND_START:-}" && -n "${PLANNED_BOUND_END:-}" ]]; then
+    echo "planned-bound=${PLANNED_BOUND_START}:${PLANNED_BOUND_END}"
+  fi
+  if [[ -n "${ACTUAL_BOUND_START:-}" && -n "${ACTUAL_BOUND_END:-}" ]]; then
+    echo "actual-bound=${ACTUAL_BOUND_START}:${ACTUAL_BOUND_END}"
+  fi
+}
+
+# A renewal before an expiry is an observation note. It is not a refusal.
+install_before_expiry_lines() {
+  local name r e k expiry before
+  declare -p RENEWS >/dev/null 2>&1 || return 0
+  for name in "${NODES[@]}"; do
+    for r in ${RENEWS[$name]:-}; do
+      before=0
+      if declare -p EXPIRIES >/dev/null 2>&1; then
+        for e in ${EXPIRIES[$name]:-}; do
+          if awk -v r="$r" -v e="$e" 'BEGIN {exit !((r + 0) < (e + 0))}'; then
+            before=1
+          fi
+        done
+      fi
+      if [[ "$before" == "0" && -n "${E0[$name]:-}" && -n "${PERIOD:-}" && -n "${TR_ENDS:-}" ]]; then
+        for ((k = 1; k <= TR_ENDS; k++)); do
+          expiry=$(( E0[$name] + (k - 1) * PERIOD ))
+          if awk -v r="$r" -v e="$expiry" 'BEGIN {exit !((r + 0) < (e + 0))}'; then
+            before=1
+          fi
+        done
+      fi
+      if [[ "$before" == "1" ]]; then
+        echo "${name}=${r}"
+      fi
+    done
+  done
+}
+
+# Copy the ping files and the big-gap file after a failed run.
+# A phase that did not run is not_reached. This function does not create an empty success file.
+persist_run_artifacts() {
+  local status="$1" dest="$2" work="$3"
+  local linefile found f
+  [[ "$status" == "0" ]] && return 0
+  if [[ -z "$dest" ]]; then
+    echo "artifact_persist dest_missing"
+    return 0
+  fi
+  mkdir -p "$dest"
+  linefile="$dest/harness-artifacts.txt"
+  : > "$linefile"
+  if [[ "${PHASE_PING:-0}" != "1" ]]; then
+    echo "artifact ping_files not_reached" | tee -a "$linefile"
+  else
+    found=0
+    for f in "$work"/ping-*.txt; do
+      [[ -e "$f" ]] || continue
+      if cp "$f" "$dest/"; then
+        found=1
+      else
+        echo "artifact ping_files failed" | tee -a "$linefile"
+        found=2
+        break
+      fi
+    done
+    if [[ "$found" == "0" ]]; then
+      echo "artifact ping_files missing" | tee -a "$linefile"
+    elif [[ "$found" == "1" ]]; then
+      echo "artifact ping_files kept" | tee -a "$linefile"
+    fi
+  fi
+  if [[ "${PHASE_GAPS:-0}" != "1" ]]; then
+    echo "artifact big_gaps not_reached" | tee -a "$linefile"
+  elif [[ -f "$work/big-gaps.txt" ]]; then
+    if cp "$work/big-gaps.txt" "$dest/big-gaps.txt"; then
+      echo "artifact big_gaps kept" | tee -a "$linefile"
+    else
+      echo "artifact big_gaps failed" | tee -a "$linefile"
+    fi
+  else
+    echo "artifact big_gaps missing" | tee -a "$linefile"
+  fi
+}
+
+# One status line. not_reached and failed are never complete.
+log_export_status() {
+  local svc="$1" reached="$2" rc="$3"
+  if [[ "$reached" != "1" ]]; then
+    echo "log_export ${svc} not_reached"
+  elif [[ "$rc" == "0" ]]; then
+    echo "log_export ${svc} ok"
+  else
+    echo "log_export ${svc} failed"
+  fi
+}
+
+# Export the full compose log and one log per service. Record the status of each export.
+export_service_logs() {
+  local dest="$1" svc rc reached
+  mkdir -p "$dest"
+  : > "$dest/log-export-status.txt"
+  if [[ "${PHASE_COORD:-0}" == "1" ]]; then
+    if dc logs -t > "$dest/stack.log" 2>"$dest/stack.log.err"; then
+      rc=0
+    else
+      rc=1
+      echo "stack_log_copy_failed"
+    fi
+    log_export_status stack.log 1 "$rc" | tee -a "$dest/log-export-status.txt"
+  else
+    log_export_status stack.log 0 0 | tee -a "$dest/log-export-status.txt"
+  fi
+  for svc in coord owner a b c; do
+    reached=0
+    rc=0
+    if [[ "$svc" == "coord" ]]; then
+      [[ "${PHASE_COORD:-0}" == "1" ]] && reached=1
+    else
+      [[ "${PHASE_NODE[$svc]:-0}" == "1" ]] && reached=1
+    fi
+    if [[ "$reached" == "1" ]]; then
+      if dc logs -t "$svc" > "$dest/${svc}.log" 2>"$dest/${svc}.log.err"; then
+        rc=0
+      else
+        rc=1
+      fi
+    fi
+    log_export_status "$svc" "$reached" "$rc" | tee -a "$dest/log-export-status.txt"
+  done
+}
+
+# Write name=dir lines for the running sampler. A missing directory stays empty.
+write_sampler_cgroups() {
+  local name cid d found linefile
+  linefile="${OUTD}/sampler-cgroups.txt"
+  [[ -n "${OUTD:-}" ]] || return 0
+  : > "$linefile"
+  for name in "${NODES[@]}"; do
+    cid="$(dc ps -q "$name" 2>/dev/null || true)"
+    found=""
+    if [[ -n "$cid" ]]; then
+      for d in "/sys/fs/cgroup/docker/${cid}" "/sys/fs/cgroup/system.slice/docker-${cid}.scope"; do
+        if [[ -d "$d" ]]; then
+          found="$d"
+          break
+        fi
+      done
+    fi
+    echo "${name}=${found}" >> "$linefile"
+  done
+}
+
 # Print observation coverage. This does not change a gate and it does not change the exit status.
 # contention unknown_samples is not an input.
+# The qualification lines are separate from the product verdict.
 report_observation() {
   local samples name e cov k expiry renew bound_start bound_end
   local -a coverage_marks=()
   local -a cov_args=()
   [[ "${COVERAGE_DONE:-0}" == "1" ]] && return 0
   samples="${OUTD:-}/host-samples.txt"
-  [[ -n "${OUTD:-}" && -f "$samples" ]] || return 0
+  if [[ -z "${OUTD:-}" || ! -f "$samples" ]]; then
+    echo "qualification_separate_from_product_verdict yes"
+    echo "qualification no reason eligible_interval_not_reached"
+    COVERAGE_DONE=1
+    return 0
+  fi
   COVERAGE_DONE=1
   bound_start=""
   bound_end=""
@@ -141,10 +368,37 @@ report_observation() {
       done
     done
   fi
+  PLANNED_BOUND_START="$bound_start"
+  PLANNED_BOUND_END="$bound_end"
+  ACTUAL_BOUND_START=""
+  ACTUAL_BOUND_END=""
+  QUALIFY_EARLY=0
+  if [[ -n "${ELIGIBLE_START:-}" ]]; then
+    ACTUAL_BOUND_START="$ELIGIBLE_START"
+    ACTUAL_BOUND_END="$(eligible_end_unix)"
+    if [[ -n "${FAIL_AT:-}" ]]; then
+      QUALIFY_EARLY=1
+    fi
+  fi
+  while IFS= read -r mark; do
+    [[ -n "$mark" ]] || continue
+    coverage_marks+=(--mark "$mark")
+  done < <(observation_mark_lines)
   cov_args=(coverage --samples "$samples" --cadence-ms 100)
   if [[ -n "$bound_start" && -n "$bound_end" ]]; then
     cov_args+=(--bound "${bound_start}:${bound_end}")
   fi
+  cov_args+=(--qualify)
+  if [[ -n "$ACTUAL_BOUND_START" && -n "$ACTUAL_BOUND_END" ]]; then
+    cov_args+=(--qualify-start "$ACTUAL_BOUND_START" --qualify-end "$ACTUAL_BOUND_END")
+  fi
+  if [[ "$QUALIFY_EARLY" == "1" ]]; then
+    cov_args+=(--qualify-early-fail)
+  fi
+  while IFS= read -r mark; do
+    [[ -n "$mark" ]] || continue
+    cov_args+=(--install-before-expiry "$mark")
+  done < <(install_before_expiry_lines)
   cov_args+=("${coverage_marks[@]}")
   cov="$(python3 "$ROOT/scripts/proof/host-sampler.py" "${cov_args[@]}")" \
     || cov="observation_coverage command_failed"
@@ -157,6 +411,9 @@ report_observation() {
 cleanup() {
   local status=$?
   local pid
+  if [[ "$status" -ne 0 && -z "${FAIL_AT:-}" ]]; then
+    FAIL_AT="$(date +%s.%N)"
+  fi
   for pid in "${PING_PIDS[@]}"; do
     kill "$pid" >/dev/null 2>&1 || true
   done
@@ -164,7 +421,13 @@ cleanup() {
   report_observation
   if [[ -n "${TR_OUT_DIR:-}" ]]; then
     mkdir -p "$TR_OUT_DIR"
-    dc logs -t > "$TR_OUT_DIR/stack.log" 2>&1 || echo "stack_log_copy_failed"
+    export_service_logs "$TR_OUT_DIR"
+    persist_run_artifacts "$status" "$TR_OUT_DIR" "$WORK"
+  else
+    echo "log_export dest_missing"
+    if [[ "$status" -ne 0 ]]; then
+      echo "artifact_persist dest_missing"
+    fi
   fi
   for pid in "${DIAG_PIDS[@]}"; do
     kill "$pid" >/dev/null 2>&1 || true
@@ -202,6 +465,7 @@ proof_compose_clean "${TR_PROJECT}" || exit 1
 
 fail() {
   echo "FAIL: $*" >&2
+  FAIL_AT="$(date +%s.%N)"
   exit 1
 }
 
@@ -322,8 +586,19 @@ open_legacy_forward
 echo "=== [C] build image ${TR_IMAGE} ==="
 build_image
 
+OUTD="${TR_OUT_DIR:-$WORK/out}"
+mkdir -p "$OUTD"
+: > "$OUTD/sampler-cgroups.txt"
+echo "=== [C] host sampler every 100 ms to ${OUTD}/host-samples.txt ==="
+python3 "$ROOT/scripts/proof/host-sampler.py" --out "$OUTD/host-samples.txt" --interval 0.1 \
+  --cgroup-file "$OUTD/sampler-cgroups.txt" &
+SAMPLER_PID="$!"
+echo "host_sampler pid ${SAMPLER_PID} cgroups_pending_until_nodes"
+echo "observation_note early_clock_sampler_does_not_change_proof_lock_unknown_samples"
+
 echo "=== [C] start coordinator ==="
 dc up -d coord
+PHASE_COORD=1
 for ((i = 0; i < 60; i++)); do
   dc exec -T coord test -s /var/lib/orblx/trust-bundle.pem && break
   sleep 0.5
@@ -353,6 +628,7 @@ listed_peers() {
 }
 for name in "${NODES[@]}"; do
   dc up -d "$name"
+  PHASE_NODE[$name]=1
   wait_log "$name" "The TUN device" 30 || fail "The node ${name} did not start."
   for ((i = 0; i < 120; i++)); do
     [[ "$(listed_peers "$name")" -eq 3 ]] && break
@@ -422,22 +698,9 @@ RUN_END="$(ticket_run_end "$max_e0" "$TR_ENDS" "$PERIOD" "$TR_SVID_TTL" "$SKEW")
 PING_SECS=$(( RUN_END - $(date +%s) + 3 ))
 echo "renew_period_s ${PERIOD} run_end_unix ${RUN_END} ping_s ${PING_SECS}"
 
-OUTD="${TR_OUT_DIR:-$WORK/out}"
-mkdir -p "$OUTD"
-echo "=== [C] host sampler every 100 ms to ${OUTD}/host-samples.txt ==="
-cg_args=()
-for name in "${NODES[@]}"; do
-  cid="$(dc ps -q "$name")"
-  for d in "/sys/fs/cgroup/docker/${cid}" "/sys/fs/cgroup/system.slice/docker-${cid}.scope"; do
-    if [[ -n "$cid" && -d "$d" ]]; then
-      cg_args+=("${name}=${d}")
-      break
-    fi
-  done
-done
-python3 "$ROOT/scripts/proof/host-sampler.py" --out "$OUTD/host-samples.txt" --interval 0.1 "${cg_args[@]}" &
-SAMPLER_PID="$!"
-echo "host_sampler pid ${SAMPLER_PID} cgroups ${#cg_args[@]}"
+echo "=== [C] host sampler cgroups after the nodes exist ==="
+write_sampler_cgroups
+echo "host_sampler cgroup_lines $(wc -l < "$OUTD/sampler-cgroups.txt" | tr -d ' ')"
 if [[ "$TR_DIAG" == "1" ]]; then
   echo "=== [C] W25-42 diag: host probers (nsenter net ns), docker events ==="
   docker events --format '{{.TimeNano}} {{.Type}} {{.Action}} {{.Actor.Attributes.name}}' > "$OUTD/docker-events.txt" 2>&1 &
@@ -470,6 +733,7 @@ PING_OPT=()
 [[ "$TR_DIAG" == "1" ]] && PING_OPT=(-O)
 
 echo "=== [C] ping each pair every ${TR_PING_I} s for ${PING_SECS} s ==="
+PHASE_PING=1
 for src in "${NODES[@]}"; do
   for dst in "${NODES[@]}"; do
     [[ "$src" == "$dst" ]] && continue
@@ -495,6 +759,8 @@ if [[ "$TR_DIAG_SCHED" == "1" ]]; then
 fi
 
 echo "=== [C] sample the status of each node every 2 s ==="
+ELIGIBLE_START="$(now_s)"
+echo "eligible_start_unix ${ELIGIBLE_START}"
 lost=0
 samples=0
 declare -A EXPIRIES
@@ -526,8 +792,7 @@ for pid in "${PING_PIDS[@]}"; do
   wait "$pid" || true
 done
 PING_PIDS=()
-stop_sampler
-report_observation
+# The host sampler stays up through the gates. cleanup stops it and then reports coverage.
 check_refusals
 echo "refusals 0"
 echo "status_samples ${samples} lost_peer_samples ${lost}"
@@ -608,6 +873,7 @@ echo "ticket_end_lines ${end_lines} ticket_end_gaps_above_limit ${end_fail}"
 # node is in [gap start - 2 s, gap end + 2 s]. "ticket_end": an end or an end + MAX_SKEW of
 # the src or dst node is in that range. "elsewhere": none of them.
 echo "=== gate 4c: place of each reply gap above ${TR_GAP_MS} ms ==="
+PHASE_GAPS=1
 big=0
 for src in "${NODES[@]}"; do
   for dst in "${NODES[@]}"; do
@@ -729,6 +995,7 @@ if (( ${#LATE_FAIL[@]} > 0 )); then
   if (( host_gaps > 0 )); then
     echo "proof_invalid host_stall_gaps ${host_gaps}: a host stall touches a reply gap. The run is INVALID, not a PASS."
     echo "FAIL: ${LATE_FAIL[0]}" >&2
+    FAIL_AT="$(date +%s.%N)"
     exit 3
   fi
   fail "${LATE_FAIL[0]}"

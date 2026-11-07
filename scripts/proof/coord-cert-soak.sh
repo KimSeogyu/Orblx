@@ -45,9 +45,38 @@ fail() {
   exit 1
 }
 
+# Keep the coordinator log. A follow that never started is not_reached.
+# This function does not write an empty log as a complete export.
+persist_coord_log() {
+  local dest="${TR_OUT_DIR:-}"
+  if [[ -z "$dest" ]]; then
+    echo "coord_log dest_missing"
+    return 0
+  fi
+  mkdir -p "$dest"
+  if [[ "${COORD_FOLLOW_STARTED:-0}" != "1" ]]; then
+    echo "coord_log not_reached"
+    printf '%s\n' "coord_log not_reached" > "$dest/coord-log-status.txt"
+    return 0
+  fi
+  if [[ ! -f "$COORD_LOG" ]]; then
+    echo "coord_log failed"
+    printf '%s\n' "coord_log failed" > "$dest/coord-log-status.txt"
+    return 0
+  fi
+  if cp "$COORD_LOG" "$dest/coord.log"; then
+    echo "coord_log ok"
+    printf '%s\n' "coord_log ok" > "$dest/coord-log-status.txt"
+  else
+    echo "coord_log failed"
+    printf '%s\n' "coord_log failed" > "$dest/coord-log-status.txt"
+  fi
+}
+
 cleanup() {
   [[ -n "$FOLLOW_PID" ]] && kill "$FOLLOW_PID" >/dev/null 2>&1 || true
   [[ -n "$TR_PID" ]] && kill "$TR_PID" >/dev/null 2>&1 || true
+  persist_coord_log
   rm -rf "$WORK"
 }
 if [[ ! -f "$TR_SCRIPT" ]]; then
@@ -191,6 +220,7 @@ while kill -0 "$TR_PID" >/dev/null 2>&1; do
       NAME_CHECKED[coord]=1
       docker logs -f -t "$id" > "$COORD_LOG" 2>&1 &
       FOLLOW_PID="$!"
+      COORD_FOLLOW_STARTED=1
       followed="$id"
       echo "coord_log_follow container ${id:0:12}"
     fi
