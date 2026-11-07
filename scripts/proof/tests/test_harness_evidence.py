@@ -4,6 +4,7 @@ Failure artifacts stay. A missing export is not complete.
 Observation qualification stays separate from the product verdict.
 """
 
+import builtins
 import importlib.util
 import os
 import re
@@ -251,6 +252,8 @@ observation_mark_lines
         self.assertIn("missing-event-first-renewal-a=9700:9701", lines)
         self.assertIn("ticket-end-a-sched-1=10000:10001", lines)
         self.assertIn("missing-event-ticket-end-a-sched-1=10000:10001", lines)
+        self.assertFalse(any("ticket-end-a-deadline-" in line for line in lines))
+        self.assertFalse(any("-actual" in line for line in lines))
         self.assertIn("ticket-end-a-sched-2=10600:10601", lines)
         self.assertIn("missing-event-ticket-end-a-sched-2=10600:10601", lines)
         self.assertIn("missing-event-a-sched-2=10300:10600", lines)
@@ -278,7 +281,9 @@ observation_mark_lines
         self.assertIn("first-renewal-a-sched=9700:9701", lines)
         self.assertTrue(any(line.startswith("first-renewal-a=10300.5:") for line in lines))
         self.assertNotIn("missing-event-first-renewal-a=9700:9701", lines)
-        self.assertIn("ticket-end-a-actual-1=10000:10001", lines)
+        self.assertIn("ticket-end-a-deadline-1=10000:10001", lines)
+        self.assertNotIn("ticket-end-a-actual-1=10000:10001", lines)
+        self.assertFalse(any(line.startswith("ticket-end-") and "-actual-" in line for line in lines))
         self.assertNotIn("missing-event-ticket-end-a-sched-1=10000:10001", lines)
         self.assertNotIn("missing-event-a-sched-2=10300:10600", lines)
         self.assertIn("missing-event-a-sched-3=10900:11200", lines)
@@ -298,6 +303,13 @@ eligible_end_unix
         result = run_bash(script)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["9935.000000000", "1500.25"])
+
+    def test_the_ticket_end_label_is_the_scheduled_deadline(self):
+        with open(RENEW, encoding="utf-8") as handle:
+            src = handle.read()
+        self.assertIn('ticket-end-${name}-deadline-${k}', src)
+        self.assertNotIn('ticket-end-${name}-actual-${k}', src)
+        self.assertIn("scheduled svid_expiry", src)
 
 
 class QualificationTest(unittest.TestCase):
@@ -360,6 +372,44 @@ class QualificationTest(unittest.TestCase):
         under_text = qualify_text(under, under[0]["realtime"], under[-1]["realtime"], early_fail=True)
         self.assertIn("qualification yes reason eligible_interval", under_text)
 
+    def test_interval_baseline_drift_rejects_a_slow_walk_and_the_50_ms_line(self):
+        def walked(clock):
+            rows = cadence(0, 0.3, cap=0, skew=0)
+            for index, row in enumerate(rows):
+                row[clock] += index * 20_000_000
+            for prev, cur in zip(rows, rows[1:]):
+                neighbour = abs((cur[clock] - prev[clock]) - (cur["monotonic"] - prev["monotonic"]))
+                self.assertLess(neighbour, 50_000_000)
+            end_drift = abs((rows[-1][clock] - rows[0][clock]) - (rows[-1]["monotonic"] - rows[0]["monotonic"]))
+            self.assertGreater(end_drift, 50_000_000)
+            text = qualify_text(rows, rows[0]["realtime"], rows[-1]["realtime"], early_fail=True)
+            self.assertIn("drift", verdict_line(text))
+            self.assertIn("qualification_drift_baseline first_eligible_sample", text)
+            self.assertNotIn("qualification yes reason eligible_interval", text)
+
+        walked("realtime")
+        walked("boottime")
+
+        stable = cadence(0, 0.4, cap=0, skew=0)
+        stable_text = qualify_text(stable, stable[0]["realtime"], stable[-1]["realtime"], early_fail=True)
+        self.assertIn("qualification yes reason eligible_interval", stable_text)
+
+        equal = cadence(0, 0.3, cap=0, skew=0)
+        equal[-1]["realtime"] += 50_000_000
+        equal_text = qualify_text(equal, equal[0]["realtime"], equal[-1]["realtime"], early_fail=True)
+        self.assertIn("drift", verdict_line(equal_text))
+
+        ambiguous = cadence(0, 0.2, cap=0, skew=0)
+        ambiguous[1]["capture_monotonic"] = 60_000_000
+        ambiguous[1]["capture_boottime"] = 60_000_000
+        ambiguous_text = qualify_text(ambiguous, ambiguous[0]["realtime"], ambiguous[-1]["realtime"], early_fail=True)
+        self.assertIn("capture", verdict_line(ambiguous_text))
+        self.assertNotIn("qualification yes reason eligible_interval", ambiguous_text)
+
+        on_bracket = cadence(0, 0.2, cap=25_000_000, skew=0)
+        bracket_text = qualify_text(on_bracket, on_bracket[0]["realtime"], on_bracket[-1]["realtime"], early_fail=True)
+        self.assertIn("drift", verdict_line(bracket_text))
+
     def test_ambiguous_capture_and_fractional_bounds(self):
         rows = cadence(0, 0.2, cap=0, skew=0)
         rows[1]["capture_monotonic"] = 60_000_000
@@ -400,36 +450,53 @@ class QualificationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "cgroups.txt")
             with open(path, "w", encoding="utf-8") as handle:
-                handle.write("a=\nb=/no/such/cgroup\n")
+                handle.write("empty=\nmissing=/no/such/cgroup\n")
             self.assertEqual(
                 host_sampler.read_cgroup_list([], path),
-                [("a", ""), ("b", "/no/such/cgroup")],
+                [("empty", ""), ("missing", "/no/such/cgroup")],
             )
-        saved_stat = host_sampler.stat_ticks
-        saved_psi = host_sampler.psi
-        calls = []
+            proc = os.path.join(directory, "proc")
+            os.makedirs(os.path.join(proc, "pressure"))
+            with open(os.path.join(proc, "stat"), "w", encoding="utf-8") as handle:
+                handle.write("cpu 0 0 0 0 111 0 0 222 0\n")
+            for name, total in (("cpu", 333), ("io", 0), ("memory", 0)):
+                with open(os.path.join(proc, "pressure", name), "w", encoding="utf-8") as handle:
+                    handle.write(f"some avg10=0.00 avg60=0.00 avg300=0.00 total={total}\n")
+                    handle.write("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+            present = os.path.join(directory, "present-cgroup")
+            os.makedirs(present)
+            with open(os.path.join(present, "cpu.pressure"), "w", encoding="utf-8") as handle:
+                handle.write("some avg10=0.00 avg60=0.00 avg300=0.00 total=444\n")
+                handle.write("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+            opened = []
+            real_open = builtins.open
 
-        def psi(path):
-            calls.append(path)
-            if path.startswith("/proc/"):
-                return {"some": 7, "full": 0}
-            return None
+            def tracking_open(file, *args, **kwargs):
+                opened.append(os.fspath(file))
+                return real_open(file, *args, **kwargs)
 
-        host_sampler.stat_ticks = lambda: (0, 0)
-        host_sampler.psi = psi
-        try:
-            shot = host_sampler.snapshot(
-                [("a", "/no/such/cgroup"), ("b", "")],
-                clock_gettime_ns=lambda _clock: 1,
-                clock_ids={"realtime": 0, "monotonic": 1, "boottime": 2},
-            )
-        finally:
-            host_sampler.stat_ticks = saved_stat
-            host_sampler.psi = saved_psi
-        self.assertIsNone(shot[8]["a"])
-        self.assertIsNone(shot[8]["b"])
-        self.assertIn("/no/such/cgroup/cpu.pressure", calls)
-        self.assertNotIn("cpu.pressure", calls)
+            builtins.open = tracking_open
+            try:
+                shot = host_sampler.snapshot(
+                    [("present", present), ("empty", ""), ("missing", os.path.join(directory, "missing-cgroup"))],
+                    clock_gettime_ns=lambda _clock: 1,
+                    clock_ids={"realtime": 0, "monotonic": 1, "boottime": 2},
+                    proc_root=proc,
+                )
+            finally:
+                builtins.open = real_open
+        self.assertEqual(shot[1], 222)
+        self.assertEqual(shot[2], 111)
+        self.assertEqual(shot[3], 333)
+        self.assertEqual(shot[8]["present"], 444)
+        self.assertIsNone(shot[8]["empty"])
+        self.assertIsNone(shot[8]["missing"])
+        self.assertIn(os.path.join(proc, "stat"), opened)
+        self.assertIn(os.path.join(present, "cpu.pressure"), opened)
+        self.assertNotIn("/proc/stat", opened)
+        self.assertNotIn("/proc/pressure/cpu", opened)
+        self.assertNotIn("cpu.pressure", opened)
+        self.assertFalse(any(item.startswith("/sys/fs/cgroup") for item in opened))
 
 
 if __name__ == "__main__":

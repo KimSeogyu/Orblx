@@ -154,7 +154,8 @@ observation_mark_lines() {
         if [[ "$found" == "0" ]]; then
           echo "missing-event-ticket-end-${name}-sched-${k}=${expiry}:$((expiry + 1))"
         else
-          echo "ticket-end-${name}-actual-${k}=${expiry}:$((expiry + 1))"
+          # The value is the scheduled svid_expiry. It is not an observed crossing time.
+          echo "ticket-end-${name}-deadline-${k}=${expiry}:$((expiry + 1))"
         fi
       done
       for ((k = 2; k <= TR_ENDS; k++)); do

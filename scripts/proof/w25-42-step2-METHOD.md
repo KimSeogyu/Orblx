@@ -92,6 +92,8 @@ That early sampler does not change `unknown_samples`.
 The proof passes each scheduled renewal interval from the first ticket end and the renewal period.
 It also passes each recorded ticket end.
 A missing event keeps that nominal schedule and adds a `missing-event` mark.
+A ticket-end `deadline` mark repeats that scheduled `svid_expiry`.
+It is not an observed crossing time. A missing ticket end has no deadline mark.
 The marks also include the first renewal, each ticket end, the planned bound, and the actual bound.
 The planned bound is the earliest renewal time through the latest scheduled expiry.
 The actual bound is the eligible start through the eligible end.
@@ -127,8 +129,9 @@ An early product FAIL is assessed on the actual start-to-failure interval. That 
 `qualification_sampler_span_limit_ms` is 200. That is 2 times the 100 ms cadence.
 That limit is not the 200 ms reply-gap gate.
 Each bound edge must be within 100 ms.
-Paired realtime-minus-monotonic drift and boottime-minus-monotonic drift must stay within 50 ms.
-The capture-bracket uncertainty is inside that comparison.
+Each sample's realtime-minus-monotonic offset and boottime-minus-monotonic offset is compared with the first eligible sample.
+The uncertainty is that sample's capture bracket plus the baseline sample's capture bracket.
+The largest step between neighbours is not this test.
 An ambiguous capture does not qualify. A value on the 50 ms line does not qualify.
 An install before expiry is `observation_only`. It is not a refusal gate.
 

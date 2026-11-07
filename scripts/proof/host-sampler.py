@@ -198,8 +198,8 @@ def _num_or_none(token):
         return None
 
 
-def stat_ticks():
-    with open("/proc/stat") as f:
+def stat_ticks(proc_root="/proc"):
+    with open(os.path.join(proc_root, "stat")) as f:
         parts = f.readline().split()
     # cpu user nice system idle iowait irq softirq steal ...
     return int(parts[5]), int(parts[8])
@@ -241,16 +241,16 @@ def read_cgroup_list(base, path):
     return items
 
 
-def snapshot(cgroups, clock_gettime_ns=None, clock_ids=None):
+def snapshot(cgroups, clock_gettime_ns=None, clock_ids=None, proc_root="/proc"):
     if clock_gettime_ns is None:
         clock_gettime_ns = time.clock_gettime_ns
     if clock_ids is None:
         clock_ids = linux_clock_ids()
     clocks = read_clock_sample(clock_gettime_ns, clock_ids)
-    iowait, steal = stat_ticks()
-    cpu = psi("/proc/pressure/cpu") or {"some": 0, "full": 0}
-    io = psi("/proc/pressure/io") or {"some": 0, "full": 0}
-    mem = psi("/proc/pressure/memory") or {"some": 0, "full": 0}
+    iowait, steal = stat_ticks(proc_root)
+    cpu = psi(os.path.join(proc_root, "pressure", "cpu")) or {"some": 0, "full": 0}
+    io = psi(os.path.join(proc_root, "pressure", "io")) or {"some": 0, "full": 0}
+    mem = psi(os.path.join(proc_root, "pressure", "memory")) or {"some": 0, "full": 0}
     cg = {}
     for name, path in cgroups:
         if not path:
@@ -581,7 +581,8 @@ def qualify_observation(samples, start_ns, end_ns, early_fail=False, require_s=7
         "qualification_sampler_span_note not_the_reply_gap_gate",
         "qualification_edge_limit_ms 100",
         "qualification_drift_limit_ms 50",
-        "qualification_drift_note includes_capture_bracket_uncertainty",
+        "qualification_drift_baseline first_eligible_sample",
+        "qualification_drift_note both_capture_brackets_are_in_the_uncertainty",
         "qualification_duration_note setup_cleanup_and_run_end_padding_do_not_count",
     ]
     if early_fail:
@@ -625,38 +626,44 @@ def qualify_observation(samples, start_ns, end_ns, early_fail=False, require_s=7
                 elif not early_fail and elapsed < int(require_s) * 1_000_000_000:
                     reasons.append(f"duration_{name}")
             span_max = 0
-            worst_rt = None
-            worst_boot = None
             for prev, cur in zip(inside, inside[1:]):
                 if capture_status(prev) != "ok" or capture_status(cur) != "ok":
-                    reasons.append("capture")
                     continue
                 deltas = {name: clock_delta(prev[name], cur[name]) for name in CLOCK_NAMES}
                 for name in CLOCK_NAMES:
                     delta = deltas[name]
                     if delta != "unsupported" and delta > span_max:
                         span_max = delta
-                bracket_prev = _capture_bracket_ns(prev)
-                bracket_cur = _capture_bracket_ns(cur)
-                if (
-                    bracket_prev == "unsupported"
-                    or bracket_cur == "unsupported"
-                    or any(deltas[name] == "unsupported" for name in CLOCK_NAMES)
-                ):
-                    reasons.append("capture")
-                    continue
-                uncertainty = bracket_prev + bracket_cur
-                drift_rt = deltas["realtime"] - deltas["monotonic"]
-                drift_boot = deltas["boottime"] - deltas["monotonic"]
-                margin_rt = abs(drift_rt) + uncertainty
-                margin_boot = abs(drift_boot) + uncertainty
-                if worst_rt is None or margin_rt > worst_rt[0]:
-                    worst_rt = (margin_rt, drift_rt, uncertainty)
-                if worst_boot is None or margin_boot > worst_boot[0]:
-                    worst_boot = (margin_boot, drift_boot, uncertainty)
-                # A value on the 50 ms line does not qualify. The bracket is inside the sum.
-                if margin_rt >= QUALIFY_DRIFT_NS or margin_boot >= QUALIFY_DRIFT_NS:
-                    reasons.append("drift")
+            # Drift uses the first eligible sample as the baseline.
+            # A small step between neighbours can still leave the interval outside 50 ms.
+            baseline = inside[0]
+            worst_rt = None
+            worst_boot = None
+            base_bracket = _capture_bracket_ns(baseline)
+            if capture_status(baseline) != "ok" or base_bracket == "unsupported":
+                reasons.append("capture")
+            else:
+                for cur in inside[1:]:
+                    cur_bracket = _capture_bracket_ns(cur)
+                    if capture_status(cur) != "ok" or cur_bracket == "unsupported":
+                        reasons.append("capture")
+                        continue
+                    deltas = {name: clock_delta(baseline[name], cur[name]) for name in CLOCK_NAMES}
+                    if any(deltas[name] == "unsupported" for name in CLOCK_NAMES):
+                        reasons.append("capture")
+                        continue
+                    uncertainty = base_bracket + cur_bracket
+                    drift_rt = deltas["realtime"] - deltas["monotonic"]
+                    drift_boot = deltas["boottime"] - deltas["monotonic"]
+                    margin_rt = abs(drift_rt) + uncertainty
+                    margin_boot = abs(drift_boot) + uncertainty
+                    if worst_rt is None or margin_rt > worst_rt[0]:
+                        worst_rt = (margin_rt, drift_rt, uncertainty)
+                    if worst_boot is None or margin_boot > worst_boot[0]:
+                        worst_boot = (margin_boot, drift_boot, uncertainty)
+                    # A value on the 50 ms line does not qualify. Both brackets are in the sum.
+                    if margin_rt >= QUALIFY_DRIFT_NS or margin_boot >= QUALIFY_DRIFT_NS:
+                        reasons.append("drift")
             lines.append(f"qualification_sampler_span_max_ms {span_max / 1_000_000:.3f}")
             if span_max > SAMPLER_SPAN_LIMIT_NS:
                 reasons.append("sampler_span")
