@@ -14,7 +14,7 @@ path = "src/main.rs"
 base64 = "0.22"
 jsonwebtoken = { version = "=10.3.0", features = ["rust_crypto"] }
 rand = "0.8.5"
-rcgen = { version = "=0.14.7", default-features = false, features = ["crypto", "pem", "ring"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 rsa = { version = "=0.9.10", features = ["pem", "sha2"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "logging"] }
 rustls-pemfile = "2"
