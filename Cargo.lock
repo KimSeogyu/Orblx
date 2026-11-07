@@ -1630,7 +1630,7 @@ dependencies = [
  "orblx-relay",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -1674,7 +1674,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "ssh-key",
  "tokio",
  "tokio-rustls",
@@ -1688,7 +1688,7 @@ dependencies = [
  "hkdf 0.12.4",
  "hmac 0.12.1",
  "orblx-identity",
- "sha2 0.10.9",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -1707,7 +1707,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "time",
  "tokio",
  "tokio-rustls",
@@ -1729,7 +1729,7 @@ dependencies = [
  "orblx-identity",
  "orblx-relay",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "x25519-dalek",
 ]
 
@@ -1741,7 +1741,7 @@ dependencies = [
  "orblx-audit",
  "orblx-identity",
  "rand 0.8.8",
- "sha2 0.10.9",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -1757,7 +1757,7 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "time",
  "x509-parser",
 ]
@@ -1828,7 +1828,7 @@ dependencies = [
  "orblx-identity",
  "russh",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "tokio",
 ]
 
