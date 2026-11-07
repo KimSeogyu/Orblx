@@ -531,12 +531,12 @@ def renewal_log_line(unix, expiry=None, sentence=None):
     return f"{stamp} The node renewed the SVID. The new expiry is {expiry}."
 
 
-def chain_prelude(log_lines, expiries, start, end, collected=True):
+def chain_prelude(log_lines, expiries, start, end, collected=True, e0=10000):
     body = "\n".join(log_lines)
     seen = "1" if collected else "0"
     return f"""
 NODES=(a)
-declare -A E0=([a]=10000)
+declare -A E0=([a]={e0})
 declare -A EXPIRIES=([a]="{expiries}")
 declare -A RENEWAL_LOG_SEEN=([a]={seen})
 declare -A RENEWAL_LOG=()
@@ -856,6 +856,121 @@ persist_coord_log
         self.assertIn("required_events unknown", events)
         self.assertNotIn("required_renewal", events)
         self.assertNotIn("qualification yes", self.accept(dest))
+
+    def test_a_due_before_the_start_still_checks_a_later_late_install(self):
+        require_associative_arrays(self)
+        dest = self.prepare(chain_prelude(
+            [
+                renewal_log_line(10800, 11500),
+                renewal_log_line(11550, 12100),
+            ],
+            "10900 11500 12100",
+            10720,
+            11600,
+            e0=10900,
+        ))
+        self.assertNotIn("qualification yes", self.accept(dest))
+        events = self.events_text(dest)
+        self.assertIn("required_renewal a 10600 present", events)
+        self.assertIn("required_install a 11200 before_expiry no", events)
+
+    def test_an_on_time_chain_that_crosses_the_start_can_qualify(self):
+        require_associative_arrays(self)
+        dest = self.prepare(chain_prelude(
+            [
+                renewal_log_line(10800, 11500),
+                renewal_log_line(11400, 12100),
+            ],
+            "10900 11500 12100",
+            10720,
+            11600,
+            e0=10900,
+        ))
+        self.assertEqual(self.accept(dest), "qualification yes reason complete")
+        events = self.events_text(dest)
+        self.assertIn("required_install a 10600 before_expiry yes", events)
+        self.assertIn("required_install a 11200 before_expiry yes", events)
+        self.assertNotIn("required_renewal a 11800", events)
+
+    def test_a_missing_bridge_record_cannot_qualify(self):
+        require_associative_arrays(self)
+        dest = self.prepare(chain_prelude([], "10000", 11000, 12000))
+        self.assertNotIn("qualification yes", self.accept(dest))
+        events = self.events_text(dest)
+        self.assertIn("required_renewal a 9700 missing", events)
+
+    def test_an_uncollected_bridge_record_is_unknown(self):
+        require_associative_arrays(self)
+        dest = self.prepare(chain_prelude([], "10000", 11000, 12000, collected=False))
+        events = self.events_text(dest)
+        self.assertIn("required_events unknown", events)
+        self.assertNotIn("required_renewal", events)
+        self.assertNotIn("qualification yes", self.accept(dest))
+
+    def test_a_due_after_the_end_requires_no_event(self):
+        require_associative_arrays(self)
+        dest = self.prepare(chain_prelude(
+            [renewal_log_line(10800, 11500)],
+            "10900 11500",
+            10720,
+            11100,
+            e0=10900,
+        ))
+        self.assertEqual(self.accept(dest), "qualification yes reason complete")
+        events = self.events_text(dest)
+        self.assertIn("required_install a 10600 before_expiry yes", events)
+        self.assertNotIn("required_renewal a 11200", events)
+
+    def test_a_retry_before_the_start_does_not_hide_a_later_obligation(self):
+        require_associative_arrays(self)
+        dest = self.prepare(chain_prelude(
+            [
+                renewal_log_line(9700, 10040),
+                renewal_log_line(9710, 10600),
+            ],
+            "10000 10600",
+            10400,
+            11000,
+        ))
+        self.assertNotIn("qualification yes", self.accept(dest))
+        events = self.events_text(dest)
+        self.assertNotIn("required_renewal a 9700", events)
+        self.assertNotIn("required_renewal a 9740", events)
+        self.assertIn("required_renewal a 10300 missing", events)
+        self.assertNotIn("required_install a 10300 before_expiry yes", events)
+
+    def test_due_at_the_start_is_required(self):
+        require_associative_arrays(self)
+        dest = self.prepare(chain_prelude(
+            [renewal_log_line(9750, 10600)],
+            "10000 10600",
+            9700,
+            10000,
+        ))
+        self.assertEqual(self.accept(dest), "qualification yes reason complete")
+        self.assertIn("required_renewal a 9700 present", self.events_text(dest))
+
+    def test_due_at_the_end_is_required(self):
+        require_associative_arrays(self)
+        dest = self.prepare(chain_prelude(
+            [renewal_log_line(9750, 10600)],
+            "10000 10600",
+            9000,
+            9700,
+        ))
+        self.assertEqual(self.accept(dest), "qualification yes reason complete")
+        self.assertIn("required_renewal a 9700 present", self.events_text(dest))
+
+    def test_expiry_at_the_start_is_required(self):
+        require_associative_arrays(self)
+        dest = self.prepare(chain_prelude(
+            [renewal_log_line(10010, 10600)],
+            "10000 10600",
+            10000,
+            10200,
+        ))
+        self.assertNotIn("qualification yes", self.accept(dest))
+        self.assertIn("required_install a 9700 before_expiry no", self.events_text(dest))
 
 
 if __name__ == "__main__":

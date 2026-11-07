@@ -323,10 +323,12 @@ install_before_expiry_lines() {
   done < <(renewal_chain_lines)
 }
 
-# A due time is the actual old expiry minus the lead. A later credential is not required.
-# A log that was not collected is unknown. It is not a missing renewal.
+# A due time is the actual old expiry minus the lead.
+# Walk through a due time before the start. Stop only when the due time is after the end.
+# Require a credential when the span from its due time to its expiry overlaps the measured interval.
+# A missing link in that walk is not an empty success. A log that was not collected is unknown.
 qualification_event_lines() {
-  local name line tag node unix old new lead due current found inside
+  local name line tag node unix old new lead due current found past overlaps
   local -a lines=()
   if [[ -z "${ACTUAL_BOUND_START:-}" || -z "${ACTUAL_BOUND_END:-}" ]]; then
     echo "required_events unknown"
@@ -350,8 +352,9 @@ qualification_event_lines() {
     current="${E0[$name]}"
     while true; do
       due="$(awk -v c="$current" -v l="$lead" 'BEGIN {d = c - l; if (d == int(d)) printf "%.0f", d; else printf "%.9f", d}')"
-      inside="$(awk -v s="$ACTUAL_BOUND_START" -v e="$ACTUAL_BOUND_END" -v d="$due" 'BEGIN {print ((d + 0) >= (s + 0) && (d + 0) <= (e + 0)) ? "yes" : "no"}')"
-      [[ "$inside" == "yes" ]] || break
+      past="$(awk -v d="$due" -v e="$ACTUAL_BOUND_END" 'BEGIN {print ((d + 0) > (e + 0)) ? "yes" : "no"}')"
+      [[ "$past" == "yes" ]] && break
+      overlaps="$(awk -v c="$current" -v s="$ACTUAL_BOUND_START" 'BEGIN {print ((c + 0) >= (s + 0)) ? "yes" : "no"}')"
       found=0
       unix=""
       old=""
@@ -375,11 +378,13 @@ qualification_event_lines() {
         echo "required_install ${name} ${due} missing"
         break
       fi
-      echo "required_renewal ${name} ${due} present"
-      if awk -v r="$unix" -v e="$old" 'BEGIN {exit !((r + 0) < (e + 0))}'; then
-        echo "required_install ${name} ${due} before_expiry yes"
-      else
-        echo "required_install ${name} ${due} before_expiry no"
+      if [[ "$overlaps" == "yes" ]]; then
+        echo "required_renewal ${name} ${due} present"
+        if awk -v r="$unix" -v e="$old" 'BEGIN {exit !((r + 0) < (e + 0))}'; then
+          echo "required_install ${name} ${due} before_expiry yes"
+        else
+          echo "required_install ${name} ${due} before_expiry no"
+        fi
       fi
       current="$new"
     done
