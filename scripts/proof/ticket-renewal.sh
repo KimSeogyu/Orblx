@@ -124,6 +124,7 @@ eligible_end_unix() {
 }
 
 # One mark line per call. A missing event keeps its nominal schedule.
+# A nominal mark is not evidence that the event happened.
 # This does not change a gate.
 observation_mark_lines() {
   local name k expiry renew renew0 first found e r
@@ -183,134 +184,204 @@ observation_mark_lines() {
   fi
 }
 
-# Pair renewal i with expiry i for that node.
-# Expiry 0 is the credential the first renewal replaces. A later expiry is not a candidate.
-# This note is not a refusal.
-install_before_expiry_lines() {
-  local name r e prev ambiguous i
-  local -a renewals=() expiries=()
-  declare -p RENEWS >/dev/null 2>&1 || return 0
+# Read one node log in docker `-t --no-log-prefix` order.
+# A complete record is the install time and "The new expiry is <digits>."
+# The old expiry is the previous logged new expiry. The first old expiry is E0.
+# A status snapshot is a cross-check. It does not fill a gap.
+renewal_chain_lines() {
+  local name line ts rest expiry unix old prev_unix bad p j found idx seen prior log_text
+  local -a records=() news=() polls=() chain_exp=()
+  declare -p E0 >/dev/null 2>&1 || return 0
   for name in "${NODES[@]}"; do
-    renewals=()
-    expiries=()
-    ambiguous=0
-    if declare -p EXPIRIES >/dev/null 2>&1 && [[ -n "${EXPIRIES[$name]:-}" ]]; then
-      for e in ${EXPIRIES[$name]}; do
-        expiries+=("$e")
-      done
-    elif [[ -n "${E0[$name]:-}" ]]; then
-      expiries+=("${E0[$name]}")
+    [[ -n "${E0[$name]:-}" ]] || continue
+    seen=0
+    if declare -p RENEWAL_LOG_SEEN >/dev/null 2>&1; then
+      seen="${RENEWAL_LOG_SEEN[$name]:-0}"
     fi
-    if [[ -n "${E0[$name]:-}" && ${#expiries[@]} -gt 0 ]]; then
-      if ! awk -v a="${expiries[0]}" -v b="${E0[$name]}" 'BEGIN {exit !((a + 0) == (b + 0))}'; then
-        echo "install_binding ${name} ambiguous"
-        continue
-      fi
-    fi
-    prev=""
-    for e in "${expiries[@]}"; do
-      if [[ -n "$prev" ]] && ! awk -v p="$prev" -v e="$e" 'BEGIN {exit !((e + 0) > (p + 0))}'; then
-        ambiguous=1
-      fi
-      prev="$e"
-    done
-    for r in ${RENEWS[$name]:-}; do
-      renewals+=("$r")
-    done
-    if ((${#renewals[@]} > 0)); then
-      mapfile -t renewals < <(printf '%s\n' "${renewals[@]}" | sort -n)
-    fi
-    prev=""
-    for r in "${renewals[@]}"; do
-      if [[ -n "$prev" ]] && awk -v p="$prev" -v r="$r" 'BEGIN {exit !((r + 0) == (p + 0))}'; then
-        ambiguous=1
-      fi
-      prev="$r"
-    done
-    if [[ "$ambiguous" == "1" ]]; then
-      echo "install_binding ${name} ambiguous"
+    if [[ "$seen" != "1" ]]; then
+      echo "renewal_chain ${name} uncollected"
       continue
     fi
-    i=0
-    for r in "${renewals[@]}"; do
-      if (( i >= ${#expiries[@]} )); then
-        echo "install_binding ${name} renewal ${r} missing_old_expiry"
-      else
-        e="${expiries[$i]}"
-        if awk -v r="$r" -v e="$e" 'BEGIN {exit !((r + 0) < (e + 0))}'; then
-          echo "install_binding ${name} renewal ${r} old_expiry ${e} before_expiry yes"
-          echo "${name}=${r}"
-        else
-          echo "install_binding ${name} renewal ${r} old_expiry ${e} before_expiry no"
-        fi
+    log_text=""
+    if declare -p RENEWAL_LOG >/dev/null 2>&1; then
+      log_text="${RENEWAL_LOG[$name]:-}"
+    fi
+    records=()
+    news=()
+    old="${E0[$name]}"
+    prev_unix=""
+    bad=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ "$line" == *"The node renewed the SVID"* ]] || continue
+      ts="${line%% *}"
+      rest="${line#"$ts" }"
+      if [[ "$rest" != *"The new expiry is "* ]]; then
+        bad="missing_new_expiry"
+        break
       fi
-      i=$((i + 1))
+      expiry="${rest##*"The new expiry is "}"
+      expiry="${expiry%.}"
+      if [[ ! "$expiry" =~ ^[0-9]+$ ]]; then
+        bad="malformed"
+        break
+      fi
+      if [[ "$ts" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        unix="$ts"
+      else
+        unix="$(date -u -d "$ts" +%s.%N 2>/dev/null || true)"
+      fi
+      if [[ -z "$unix" ]]; then
+        bad="malformed"
+        break
+      fi
+      unix="$(awk -v t="$unix" 'BEGIN {if ((t + 0) == int(t + 0)) printf "%.0f", t + 0; else printf "%.9f", t + 0}')"
+      if [[ -n "$prev_unix" ]] && awk -v p="$prev_unix" -v t="$unix" 'BEGIN {exit !((t + 0) == (p + 0))}'; then
+        bad="non_unique"
+        break
+      fi
+      if [[ -n "$prev_unix" ]] && awk -v p="$prev_unix" -v t="$unix" 'BEGIN {exit !((t + 0) < (p + 0))}'; then
+        bad="inconsistent"
+        break
+      fi
+      for prior in "${news[@]}"; do
+        if [[ "$prior" == "$expiry" ]]; then
+          bad="non_unique"
+        fi
+      done
+      [[ -z "$bad" ]] || break
+      if ! awk -v n="$expiry" -v o="$old" 'BEGIN {exit !((n + 0) > (o + 0))}'; then
+        bad="inconsistent"
+        break
+      fi
+      records+=("${unix} ${old} ${expiry}")
+      news+=("$expiry")
+      prev_unix="$unix"
+      old="$expiry"
+    done <<< "$log_text"
+    if [[ -n "$bad" ]]; then
+      echo "renewal_chain ${name} ${bad}"
+      continue
+    fi
+    polls=()
+    if declare -p EXPIRIES >/dev/null 2>&1 && [[ -n "${EXPIRIES[$name]:-}" ]]; then
+      for expiry in ${EXPIRIES[$name]}; do
+        polls+=("$expiry")
+      done
+    fi
+    chain_exp=("${E0[$name]}")
+    for expiry in "${news[@]}"; do
+      chain_exp+=("$expiry")
+    done
+    idx=0
+    for p in "${polls[@]}"; do
+      found=0
+      for ((j = idx; j < ${#chain_exp[@]}; j++)); do
+        if awk -v a="$p" -v b="${chain_exp[$j]}" 'BEGIN {exit !((a + 0) == (b + 0))}'; then
+          found=1
+          idx=$((j + 1))
+          break
+        fi
+      done
+      if [[ "$found" == "0" ]]; then
+        bad="inconsistent"
+        break
+      fi
+    done
+    if [[ -n "$bad" ]]; then
+      echo "renewal_chain ${name} ${bad}"
+      continue
+    fi
+    for line in "${records[@]}"; do
+      unix="${line%% *}"
+      rest="${line#* }"
+      old="${rest%% *}"
+      expiry="${rest##* }"
+      echo "renewal_record ${name} ${unix} ${old} ${expiry}"
     done
   done
 }
 
-# Required events are due times inside the measured interval. A later event is not required.
+# Bind each install to the old credential in the log chain.
+# This note is not a refusal.
+install_before_expiry_lines() {
+  local line name unix old new
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] || continue
+    if [[ "$line" == renewal_chain\ * ]]; then
+      name="${line#renewal_chain }"
+      name="${name%% *}"
+      echo "install_binding ${name} ${line##* }"
+      continue
+    fi
+    read -r _ name unix old new <<< "$line"
+    if awk -v r="$unix" -v e="$old" 'BEGIN {exit !((r + 0) < (e + 0))}'; then
+      echo "install_binding ${name} renewal ${unix} old_expiry ${old} before_expiry yes"
+      echo "${name}=${unix}"
+    else
+      echo "install_binding ${name} renewal ${unix} old_expiry ${old} before_expiry no"
+    fi
+  done < <(renewal_chain_lines)
+}
+
+# A due time is the actual old expiry minus the lead. A later credential is not required.
+# A log that was not collected is unknown. It is not a missing renewal.
 qualification_event_lines() {
-  local name i renew r lead due bindings state
-  local -a renewals=()
+  local name line tag node unix old new lead due current found inside
+  local -a lines=()
   if [[ -z "${ACTUAL_BOUND_START:-}" || -z "${ACTUAL_BOUND_END:-}" ]]; then
     echo "required_events unknown"
     return 0
   fi
-  if [[ -z "${PERIOD:-}" || -z "${TR_SVID_TTL:-}" || -z "${TR_ENDS:-}" ]] || ! declare -p E0 >/dev/null 2>&1; then
+  if [[ -z "${PERIOD:-}" || -z "${TR_SVID_TTL:-}" ]] || ! declare -p E0 >/dev/null 2>&1; then
     echo "required_events unknown"
     return 0
   fi
-  bindings="$(install_before_expiry_lines)"
   lead=$((TR_SVID_TTL - PERIOD))
-  # Match one binding line. This loop reads every line. It does not stop the writer early.
-  binding_state() {
-    local node="$1" stamp="$2" line found="missing"
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      [[ -n "$line" ]] || continue
-      if [[ "$line" == "install_binding ${node} ambiguous" ]]; then
-        echo ambiguous
-        return 0
-      fi
-      [[ -n "$stamp" ]] || continue
-      if [[ "$line" == "install_binding ${node} renewal ${stamp} missing_old_expiry" ]]; then
-        found="missing_old_expiry"
-      elif [[ "$line" == "install_binding ${node} renewal ${stamp} old_expiry "*" before_expiry yes" ]]; then
-        found="before_expiry yes"
-      elif [[ "$line" == "install_binding ${node} renewal ${stamp} old_expiry "*" before_expiry no" ]]; then
-        found="before_expiry no"
-      fi
-    done <<< "$bindings"
-    echo "$found"
-  }
+  mapfile -t lines < <(renewal_chain_lines)
+  for line in "${lines[@]}"; do
+    [[ "$line" == renewal_chain\ *\ uncollected ]] && continue
+    if [[ "$line" == renewal_chain\ * ]]; then
+      echo "required_events unknown"
+      return 0
+    fi
+  done
   for name in "${NODES[@]}"; do
     [[ -n "${E0[$name]:-}" ]] || continue
-    state="$(binding_state "$name" "")"
-    if [[ "$state" == "ambiguous" ]]; then
-      echo "required_install ${name} ambiguous"
-      continue
-    fi
-    renewals=()
-    if declare -p RENEWS >/dev/null 2>&1 && [[ -n "${RENEWS[$name]:-}" ]]; then
-      mapfile -t renewals < <(printf '%s\n' ${RENEWS[$name]} | awk 'NF {print $1}' | sort -n)
-    fi
-    for ((i = 0; i < TR_ENDS; i++)); do
-      renew=$(( E0[$name] + i * PERIOD - lead ))
-      due="$(awk -v s="$ACTUAL_BOUND_START" -v e="$ACTUAL_BOUND_END" -v r="$renew" 'BEGIN {print ((r + 0) >= (s + 0) && (r + 0) <= (e + 0)) ? "yes" : "no"}')"
-      [[ "$due" == "yes" ]] || continue
-      if [[ "$i" -ge "${#renewals[@]}" ]]; then
-        echo "required_renewal ${name} ${renew} missing"
-        echo "required_install ${name} ${renew} missing"
-        continue
+    current="${E0[$name]}"
+    while true; do
+      due="$(awk -v c="$current" -v l="$lead" 'BEGIN {d = c - l; if (d == int(d)) printf "%.0f", d; else printf "%.9f", d}')"
+      inside="$(awk -v s="$ACTUAL_BOUND_START" -v e="$ACTUAL_BOUND_END" -v d="$due" 'BEGIN {print ((d + 0) >= (s + 0) && (d + 0) <= (e + 0)) ? "yes" : "no"}')"
+      [[ "$inside" == "yes" ]] || break
+      found=0
+      unix=""
+      old=""
+      new=""
+      for line in "${lines[@]}"; do
+        [[ "$line" == renewal_record\ ${name}\ * ]] || continue
+        read -r tag node unix old new <<< "$line"
+        if awk -v a="$old" -v b="$current" 'BEGIN {exit !((a + 0) == (b + 0))}'; then
+          found=1
+          break
+        fi
+      done
+      if [[ "$found" == "0" ]]; then
+        for line in "${lines[@]}"; do
+          if [[ "$line" == "renewal_chain ${name} uncollected" ]]; then
+            echo "required_events unknown"
+            return 0
+          fi
+        done
+        echo "required_renewal ${name} ${due} missing"
+        echo "required_install ${name} ${due} missing"
+        break
       fi
-      echo "required_renewal ${name} ${renew} present"
-      r="${renewals[$i]}"
-      state="$(binding_state "$name" "$r")"
-      if [[ "$state" == "before_expiry yes" ]]; then
-        echo "required_install ${name} ${renew} before_expiry yes"
+      echo "required_renewal ${name} ${due} present"
+      if awk -v r="$unix" -v e="$old" 'BEGIN {exit !((r + 0) < (e + 0))}'; then
+        echo "required_install ${name} ${due} before_expiry yes"
       else
-        echo "required_install ${name} ${renew} ${state}"
+        echo "required_install ${name} ${due} before_expiry no"
       fi
+      current="$new"
     done
   done
 }
@@ -950,13 +1021,23 @@ echo "max_gap_ms_all_pairs ${worst} limit_ms ${TR_GAP_MS}"
 # that touch the window, on a pair that has the node at one end.
 echo "=== gate 4b: reply gap at each ticket end, per node ==="
 declare -A RENEWS
+declare -A RENEWAL_LOG
+declare -A RENEWAL_LOG_SEEN
 end_lines=0
 end_fail=0
 for name in "${NODES[@]}"; do
   renews=""
-  for ts in $(dc logs -t --no-log-prefix "$name" 2>&1 | read_all awk '/The node renewed the SVID/ {print $1}'); do
+  if log_text="$(dc logs -t --no-log-prefix "$name" 2>&1)"; then
+    RENEWAL_LOG[$name]="$log_text"
+    RENEWAL_LOG_SEEN[$name]=1
+  else
+    log_text=""
+    RENEWAL_LOG_SEEN[$name]=0
+  fi
+  while IFS= read -r ts; do
+    [[ -n "$ts" ]] || continue
     renews="${renews:+${renews} }$(date -u -d "$ts" +%s.%N)"
-  done
+  done < <(printf '%s\n' "$log_text" | read_all awk '/The node renewed the SVID/ {print $1}')
   RENEWS[$name]="$renews"
   echo "node ${name} renewals_unix ${renews:-none}"
   files=()

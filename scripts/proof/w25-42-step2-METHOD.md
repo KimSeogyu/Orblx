@@ -141,8 +141,14 @@ An ambiguous capture does not qualify. A value on the 50 ms line does not qualif
 `qualification yes` also needs every renewal that is due inside the measured interval, a bound install for that renewal, and ok export, artifact, and coordinator-log status.
 A renewal that is due after the measured end is not required. An early product FAIL does not require it.
 A missing or ambiguous input does not qualify.
-An install binds to the old credential expiry at the same renewal index for that node.
-A later expiry is not that credential. The latest expiry before the renewal is not that credential.
+An install binds to the previous new expiry in that node's renewal log.
+The first old expiry is E0. The log sentence is `The node renewed the SVID. The new expiry is <expiry>.`
+A status snapshot is a cross-check only. It does not fill a missing log record.
+A missing, malformed, non-unique, or inconsistent chain does not qualify.
+A due time is that credential's expiry minus the lead (`TTL - PERIOD`). It is not a nominal `E0 + k * PERIOD` instant.
+A nominal schedule mark is not evidence of an event.
+An early retry does not satisfy a later credential.
+On an early failure, a renewal log that was not collected is unknown. It is not a missing renewal.
 An install before its own old expiry is `observation_only`. It is not a refusal gate.
 
 ### Gates and outcomes
