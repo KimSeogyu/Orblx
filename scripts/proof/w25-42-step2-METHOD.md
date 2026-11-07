@@ -25,6 +25,7 @@ The renewal at 06:12:58 and the leaf expiry at 06:17:58 sit inside the unsampled
 - `TR_DIAG=0`. This starts the host sampler. It does not start host probers, scheduler sampling, docker events, or `ping -O`.
 - `ORBLX_SOAK_TRACE=0`. Product stall traces stay off.
 - Set a new persistent `TR_OUT_DIR`.
+- `SOAK_BIN` selects the product binary. `coord-cert-soak.sh` exports it as `TR_BIN`. A set `TR_BIN` skips the cargo build.
 - `RUSTUP_TOOLCHAIN=stable`.
 - Run under `scripts/proof/proof-lock.sh`.
 - The free-space floor stays 15 GiB. `proof_infra_abort` applies only when free space is below that floor before the lock.
@@ -32,8 +33,17 @@ The renewal at 06:12:58 and the leaf expiry at 06:17:58 sit inside the unsampled
 
 `TR_DIAG=0` still runs the product gates inside `ticket-renewal.sh`.
 The harness writes `host-samples.txt`, `host-coverage.txt`, and `stack.log` under `TR_OUT_DIR`.
-`stack.log` is the docker log. It is the raw renewal and refusal record.
-Ping files stay in the work directory. The script removes that directory at exit.
+`stack.log` is the full `docker compose logs -t` export. It is not a tail.
+The failure console still prints the last 80 lines. That tail is not the export.
+`log-export-status.txt` records one line per service: `ok`, `failed`, or `not_reached`.
+A missing status file is not a complete export. A failed export is not `ok`.
+The coordinator follow log is `coord.log` when the follow started.
+`coord-log-status.txt` says `not_reached` when the follow never started.
+The EXIT trap writes `harness-artifacts.txt` before it removes the work directory.
+It copies the ping files and `big-gaps.txt` when that phase ran.
+A phase that did not run is `not_reached`. A missing file is not `kept`.
+`qualification-events.txt` is written after the export and the artifact status.
+`coord-cert-soak.sh` prints `qualification` after `coord-log-status.txt` exists.
 
 ### Clocks
 
@@ -76,9 +86,22 @@ An unsupported clock, a clock rollback, or a wall step during capture makes `ful
 `unknown_samples=0` does not change that result.
 No samples do not produce `fully_observed yes`.
 
+The host sampler starts before the coordinator container.
+It keeps sampling through the final checks.
+Before the containers exist, a node cgroup line is `name=` with an empty directory.
+The sampler prints `-` for that pressure value. It does not print `0`.
+That early sampler does not change `unknown_samples`.
+
 The proof passes each scheduled renewal interval from the first ticket end and the renewal period.
 It also passes each recorded ticket end.
-The scheduled bound is the earliest renewal time through the latest scheduled expiry.
+A missing event keeps that nominal schedule and adds a `missing-event` mark.
+A ticket-end `deadline` mark repeats that scheduled `svid_expiry`.
+It is not an observed crossing time. A missing ticket end has no deadline mark.
+The marks also include the first renewal, each ticket end, the planned bound, and the actual bound.
+The planned bound is the earliest renewal time through the latest scheduled expiry.
+The actual bound is the eligible start through the eligible end.
+Setup time and the `RUN_END` padding (`MAX_SKEW` + 5 s) are outside that bound.
+An early product FAIL uses the actual start-to-failure interval.
 
 `host-coverage.txt` and the proof log report:
 
@@ -96,6 +119,37 @@ The scheduled bound is the earliest renewal time through the latest scheduled ex
 - `observation_note contention_unknown_samples_do_not_mean_a_renewal_interval_was_fully_observed`
 - `observation_pressure_note cgroup_cpu_some_ms_is_psi_stall_not_cpu_time_consumed`
 - `observation_pattern_limit no_clock_pattern_identifies_every_hypervisor_pause`
+
+### Observation qualification
+
+Qualification is a separate report. It does not add a product FAIL gate.
+It does not relabel a result as INVALID. It does not relabel a result as `proof_infra_abort`.
+It does not exclude a gap.
+
+The eligible interval must cover at least 7200 s on realtime, monotonic, and boottime.
+Setup, cleanup, and the planned `RUN_END` padding do not count.
+An early product FAIL is assessed on the actual start-to-failure interval. That interval does not need 7200 s.
+`qualification_sampler_span_limit_ms` is 200. That is 2 times the 100 ms cadence.
+That limit is not the 200 ms reply-gap gate.
+Each bound edge must be within 100 ms.
+Each sample's realtime-minus-monotonic offset and boottime-minus-monotonic offset is compared with the first eligible sample.
+The uncertainty is that sample's capture bracket plus the baseline sample's capture bracket.
+The largest step between neighbours is not this test.
+A negative realtime, monotonic, or boottime step between adjacent samples does not qualify.
+An ambiguous capture does not qualify. A value on the 50 ms line does not qualify.
+`qualification_clock` is the clock result only.
+`qualification yes` also needs every renewal that is due inside the measured interval, a bound install for that renewal, and ok export, artifact, and coordinator-log status.
+A renewal that is due after the measured end is not required. An early product FAIL does not require it.
+A missing or ambiguous input does not qualify.
+An install binds to the previous new expiry in that node's renewal log.
+The first old expiry is E0. The log sentence is `The node renewed the SVID. The new expiry is <expiry>.`
+A status snapshot is a cross-check only. It does not fill a missing log record.
+A missing, malformed, non-unique, or inconsistent chain does not qualify.
+A due time is that credential's expiry minus the lead (`TTL - PERIOD`). It is not a nominal `E0 + k * PERIOD` instant.
+A nominal schedule mark is not evidence of an event.
+An early retry does not satisfy a later credential.
+On an early failure, a renewal log that was not collected is unknown. It is not a missing renewal.
+An install before its own old expiry is `observation_only`. It is not a refusal gate.
 
 ### Gates and outcomes
 
