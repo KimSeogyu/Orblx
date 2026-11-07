@@ -405,9 +405,31 @@ class QualificationTest(unittest.TestCase):
                 host_sampler.read_cgroup_list([], path),
                 [("a", ""), ("b", "/no/such/cgroup")],
             )
-        shot = host_sampler.snapshot([("a", "/no/such/cgroup"), ("b", "")])
+        saved_stat = host_sampler.stat_ticks
+        saved_psi = host_sampler.psi
+        calls = []
+
+        def psi(path):
+            calls.append(path)
+            if path.startswith("/proc/"):
+                return {"some": 7, "full": 0}
+            return None
+
+        host_sampler.stat_ticks = lambda: (0, 0)
+        host_sampler.psi = psi
+        try:
+            shot = host_sampler.snapshot(
+                [("a", "/no/such/cgroup"), ("b", "")],
+                clock_gettime_ns=lambda _clock: 1,
+                clock_ids={"realtime": 0, "monotonic": 1, "boottime": 2},
+            )
+        finally:
+            host_sampler.stat_ticks = saved_stat
+            host_sampler.psi = saved_psi
         self.assertIsNone(shot[8]["a"])
         self.assertIsNone(shot[8]["b"])
+        self.assertIn("/no/such/cgroup/cpu.pressure", calls)
+        self.assertNotIn("cpu.pressure", calls)
 
 
 if __name__ == "__main__":
