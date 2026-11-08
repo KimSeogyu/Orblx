@@ -7,10 +7,12 @@ and prints the holder, and that each shell prints the proof_context lines.
 
 import os
 import re
+import select
 import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 
@@ -49,6 +51,60 @@ proof_lock_take child orblx-test
 echo child_ran
 """
 
+# The shell stops inside the critical section until the parent writes the go fifo.
+# ENTER_FIFO is opened by the parent first, so the enter write does not block.
+ORDERED = r"""
+set -euo pipefail
+. "$LOCK_SH"
+trap proof_lock_end EXIT
+proof_lock_take "$LABEL" orblx-test
+hold_ms() {
+  if [[ -r /proc/uptime ]]; then
+    awk '{printf "%d\n", $1 * 1000}' /proc/uptime
+  else
+    python3 -c 'import time; print(time.monotonic_ns() // 1000000)'
+  fi
+}
+echo "hold_start $LABEL $(hold_ms)"
+printf '%s enter\n' "$LABEL" >> "$ORDER_FILE"
+printf 'in\n' > "$ENTER_FIFO"
+IFS= read -r _ < "$GO_FIFO"
+echo "hold_end $LABEL $(hold_ms)"
+printf '%s leave\n' "$LABEL" >> "$ORDER_FILE"
+"""
+
+_WAIT_LINE = re.compile(
+    r"^proof_lock two waiting for lock, \d+ s, position (\d+), at \S+, file (\S+), holder: label=one\b",
+    re.M,
+)
+
+
+class _Output:
+    """Stdout collected while the shell is still running."""
+
+    def __init__(self):
+        self.ready = threading.Condition()
+        self._buf = bytearray()
+        self.thread = None
+
+    def drain(self, pipe):
+        def run():
+            while True:
+                data = pipe.read(4096)
+                with self.ready:
+                    if data:
+                        self._buf.extend(data)
+                    self.ready.notify_all()
+                if not data:
+                    return
+
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()
+
+    def text(self):
+        with self.ready:
+            return bytes(self._buf).decode("utf-8", "replace")
+
 
 @unittest.skipUnless(shutil.which("flock"), "flock(1) is not installed")
 class ProofLockTest(unittest.TestCase):
@@ -82,26 +138,216 @@ class ProofLockTest(unittest.TestCase):
         return start, end
 
     def test_two_proofs_run_one_after_the_other(self):
-        first = self.start("one", 2.5)
-        # communicate() has a timeout, so a wait for the sampler fails the test.
-        time.sleep(0.3)
-        second = self.start("two", 0.2)
-        out_one, _ = first.communicate(timeout=60)
-        out_two, _ = second.communicate(timeout=60)
-        self.assertEqual(first.returncode, 0, out_one)
-        self.assertEqual(second.returncode, 0, out_two)
-        one = self.times(out_one, "one")
-        two = self.times(out_two, "two")
-        self.assertGreaterEqual(two[0], one[1], f"overlap: one {one} two {two}")
-        self.assertIn("proof_lock two waiting", out_two)
-        self.assertIn("label=one", out_two)
-        # W25-14: the waiter prints the wait time, the queue position, and the holder.
-        self.assertGreaterEqual(len(re.findall(r"waiting for lock, \d+ s, position \d+, .*holder: label=one", out_two)), 2, out_two)
+        # The two shells block inside the critical section on private fifos.
+        # The parent releases each one. It does not reap the first shell before
+        # the second shell enters. A note-line count is not the exclusion check:
+        # the waiter line is accepted only while the first shell still holds the
+        # write flock on the production fifo inode.
+        order_path = os.path.join(self.dir, "order")
+        open(order_path, "w").close()
+        one_enter = os.path.join(self.dir, "one.enter")
+        one_go = os.path.join(self.dir, "one.go")
+        two_enter = os.path.join(self.dir, "two.enter")
+        two_go = os.path.join(self.dir, "two.go")
+        for path in (one_enter, one_go, two_enter, two_go):
+            os.mkfifo(path)
+        one_enter_fd = os.open(one_enter, os.O_RDWR)
+        two_enter_fd = os.open(two_enter, os.O_RDWR)
+        procs = []
+        try:
+            one = self._start_ordered("one", order_path, one_enter, one_go)
+            procs.append(one)
+            one_out = _Output()
+            one_out.drain(one.stdout)
+            self._read_handshake(one_enter_fd, one, one_out, "one did not enter the critical section")
+            fifo = self.env["ORBLX_PROOF_LOCK"] + ".fifo"
+            one_lock = self._write_flock_line(one.pid, fifo)
+            self.assertIsNotNone(
+                one_lock,
+                "one does not hold the production fifo flock\n" + self._fd_report(one.pid, fifo) + one_out.text(),
+            )
+            two = self._start_ordered("two", order_path, two_enter, two_go)
+            procs.append(two)
+            two_out = _Output()
+            two_out.drain(two.stdout)
+            waited = self._wait_for_output(
+                two,
+                two_out,
+                lambda text: _WAIT_LINE.search(text),
+                "two did not print a waiter line while one held the lock\n" + one_out.text(),
+            )
+            # Re-check before the release. This read does not take the flock.
+            one_lock = self._write_flock_line(one.pid, fifo)
+            two_lock = self._write_flock_line(two.pid, fifo)
+            self.assertIsNotNone(
+                one_lock,
+                "one lost the fifo flock before release\n" + self._fd_report(one.pid, fifo),
+            )
+            self.assertIsNone(
+                two_lock,
+                "two holds the fifo flock before one is released\n" + self._fd_report(two.pid, fifo) + two_out.text(),
+            )
+            self._release(one_go)
+            self._read_handshake(two_enter_fd, two, two_out, "two did not enter after one left the critical section")
+            # two is inside the critical section. one may still be exiting.
+            # Do not wait for one here: reaping is not the order under test.
+            order = self._order_lines(order_path)
+            self.assertIn("one leave", order, order)
+            self.assertIn("two enter", order, order)
+            self.assertLess(order.index("one leave"), order.index("two enter"), order)
+            self._release(two_go)
+            out_one = self._finish(one, one_out)
+            out_two = self._finish(two, two_out)
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.send_signal(signal.SIGKILL)
+            for proc in procs:
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            for fd in (one_enter_fd, two_enter_fd):
+                os.close(fd)
+        self.assertEqual(one.returncode, 0, out_one)
+        self.assertEqual(two.returncode, 0, out_two)
+        one_times = self.times(out_one, "one")
+        two_times = self.times(out_two, "two")
+        self.assertGreaterEqual(two_times[0], one_times[1], f"overlap: one {one_times} two {two_times}")
+        order = self._order_lines(order_path)
+        self.assertEqual(
+            order,
+            ["one enter", "one leave", "two enter", "two leave"],
+            order,
+        )
+        self.assertEqual(waited.group(1), "1", waited.group(0))
+        self.assertEqual(waited.group(2), self.env["ORBLX_PROOF_LOCK"], waited.group(0))
+        self.assertIn("holder: label=one", waited.group(0))
         for out, label in ((out_one, "one"), (out_two, "two")):
             for phase in ("queued", "start", "end"):
                 self.assertRegex(out, rf"proof_context {label} phase {phase} time \S+ load \S+ other_orblx_containers (\d+|unknown)")
             self.assertRegex(out, rf"proof_contention {label} samples \d+ contended_samples \d+ unknown_samples \d+")
             self.assertIn(f"proof_lock {label} released", out)
+
+    def _start_ordered(self, label, order_path, enter_fifo, go_fifo):
+        env = dict(
+            self.env,
+            LABEL=label,
+            ORDER_FILE=order_path,
+            ENTER_FIFO=enter_fifo,
+            GO_FIFO=go_fifo,
+        )
+        return subprocess.Popen(
+            ["bash", "-c", ORDERED],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+        )
+
+    def _write_flock_line(self, pid, path):
+        """Return the write-flock fdinfo line for this inode, or None.
+
+        The fd is matched by device and inode, the same identity as ``stat``
+        of the production fifo. This does not call flock, so it cannot take
+        the lock.
+        """
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        dev = f"{os.major(st.st_dev):x}:{os.minor(st.st_dev):x}:{st.st_ino}"
+        fd_dir = f"/proc/{pid}/fd"
+        if not os.path.isdir(fd_dir):
+            return None
+        for name in os.listdir(fd_dir):
+            try:
+                got = os.stat(os.path.join(fd_dir, name))
+                with open(f"/proc/{pid}/fdinfo/{name}") as fh:
+                    info = fh.read()
+            except OSError:
+                continue
+            if (got.st_dev, got.st_ino) != (st.st_dev, st.st_ino):
+                continue
+            for row in info.splitlines():
+                if row.startswith("lock:") and "FLOCK" in row and "WRITE" in row and dev in row.split():
+                    return row
+        return None
+
+    def _fd_report(self, pid, path):
+        lines = [f"pid {pid} path {path}"]
+        try:
+            st = os.stat(path)
+            lines.append(f"stat dev {os.major(st.st_dev):x}:{os.minor(st.st_dev):x} ino {st.st_ino}")
+        except OSError as err:
+            return f"{path} stat failed: {err}\n"
+        fd_dir = f"/proc/{pid}/fd"
+        if not os.path.isdir(fd_dir):
+            return "\n".join(lines) + "\nno fd table\n"
+        for name in sorted(os.listdir(fd_dir)):
+            try:
+                got = os.stat(os.path.join(fd_dir, name))
+            except OSError:
+                continue
+            if (got.st_dev, got.st_ino) != (st.st_dev, st.st_ino):
+                continue
+            try:
+                with open(f"/proc/{pid}/fdinfo/{name}") as fh:
+                    info = fh.read().strip()
+            except OSError as err:
+                info = str(err)
+            lines.append(f"fd {name}\n{info}")
+        return "\n".join(lines) + "\n"
+
+    def _read_handshake(self, fd, proc, output, detail):
+        deadline = time.monotonic() + 30
+        data = b""
+        while b"in\n" not in data:
+            remain = deadline - time.monotonic()
+            if remain <= 0 or proc.poll() is not None:
+                self.fail(f"{detail}\nexit {proc.poll()}\n{output.text()}")
+            ready, _, _ = select.select([fd], [], [], min(remain, 1))
+            if not ready:
+                continue
+            piece = os.read(fd, 64)
+            if not piece:
+                self.fail(f"{detail}\nfifo closed\n{output.text()}")
+            data += piece
+
+    def _wait_for_output(self, proc, output, pred, detail):
+        deadline = time.monotonic() + 30
+        while True:
+            found = pred(output.text())
+            if found:
+                return found
+            if time.monotonic() >= deadline or proc.poll() is not None:
+                self.fail(f"{detail}\nexit {proc.poll()}\n{output.text()}")
+            with output.ready:
+                output.ready.wait(0.2)
+
+    def _release(self, go_fifo):
+        fd = os.open(go_fifo, os.O_WRONLY)
+        try:
+            os.write(fd, b"go\n")
+        finally:
+            os.close(fd)
+
+    def _finish(self, proc, output):
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.send_signal(signal.SIGKILL)
+            proc.wait(timeout=5)
+            self.fail(f"the shell did not exit\n{output.text()}")
+        output.thread.join(timeout=5)
+        if proc.stdout is not None:
+            proc.stdout.close()
+        return output.text()
+
+    @staticmethod
+    def _order_lines(path):
+        with open(path) as fh:
+            return [line.strip() for line in fh if line.strip()]
 
     def test_the_hold_clock_stays_monotonic_when_realtime_steps_backward(self):
         # The old holder used `date +%s%3N` for both lines. This stands in for that
