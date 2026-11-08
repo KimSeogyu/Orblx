@@ -5,6 +5,7 @@ The test checks that the hold intervals do not overlap, that the second shell wa
 and prints the holder, and that each shell prints the proof_context lines.
 """
 
+import errno
 import os
 import re
 import select
@@ -77,6 +78,116 @@ _WAIT_LINE = re.compile(
     r"^proof_lock two waiting for lock, \d+ s, position (\d+), at \S+, file (\S+), holder: label=one\b",
     re.M,
 )
+# major and minor are hex. The kernel prints at least two digits (00:2f:2).
+_FLOCK_DEV = re.compile(
+    r"FLOCK\s+ADVISORY\s+WRITE\s+\d+\s+([0-9A-Fa-f]+):([0-9A-Fa-f]+):(\d+)\b"
+)
+
+
+def parse_flock_dev(row):
+    """Return (major, minor, inode) from one fdinfo lock row, or None."""
+    match = _FLOCK_DEV.search(row)
+    if match is None:
+        return None
+    return (int(match.group(1), 16), int(match.group(2), 16), int(match.group(3), 10))
+
+
+def proc_fdinfo_available(root="/proc"):
+    return os.path.isdir(os.path.join(root, "self", "fdinfo"))
+
+
+def release_go(go_fifo, proc, timeout):
+    """Open the go fifo for write and send one line.
+
+    A blocking open waits forever when the child has already exited.
+    Non-blocking open returns ENXIO when no reader exists. A dead child
+    fails before that open.
+    """
+    if proc.poll() is not None:
+        raise AssertionError(f"child {proc.pid} exited {proc.returncode} before the go fifo was opened")
+    deadline = time.monotonic() + timeout
+    while True:
+        if proc.poll() is not None:
+            raise AssertionError(f"child {proc.pid} exited {proc.returncode} before the go fifo was opened")
+        try:
+            fd = os.open(go_fifo, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as err:
+            if err.errno != errno.ENXIO:
+                raise
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"no reader for {go_fifo} within {timeout}s; child {proc.poll()}")
+            time.sleep(0.02)
+            continue
+        try:
+            os.write(fd, b"go\n")
+        finally:
+            os.close(fd)
+        return
+
+
+def stop_owned(procs, fds, keeper_file=None):
+    """Stop the shells this test started, their process group, and that test's keeper.
+
+    The keeper calls setsid, so it is not in the shell group. Its pid is read
+    from the keeper file under this test's lock path. The cmdline must contain
+    that path. No other process is signaled.
+    """
+    for proc in procs:
+        if proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+    if keeper_file and os.path.isfile(keeper_file):
+        _stop_recorded_keeper(keeper_file)
+    for proc in procs:
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    for proc in procs:
+        if proc.stdout is not None and not proc.stdout.closed:
+            proc.stdout.close()
+        if proc.stderr is not None and proc.stderr is not proc.stdout and not proc.stderr.closed:
+            proc.stderr.close()
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _stop_recorded_keeper(path):
+    with open(path) as fh:
+        text = fh.read()
+    match = re.search(r"(?m)^pid=(\d+)$", text)
+    if match is None:
+        return
+    pid = int(match.group(1))
+    lock_path = path[: -len(".keeper")] if path.endswith(".keeper") else ""
+    if not lock_path:
+        return
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            cmd = fh.read()
+    except OSError:
+        return
+    if lock_path.encode() not in cmd:
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        return
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        time.sleep(0.02)
 
 
 class _Output:
@@ -104,6 +215,138 @@ class _Output:
     def text(self):
         with self.ready:
             return bytes(self._buf).decode("utf-8", "replace")
+
+
+class ProofLockHandoffTest(unittest.TestCase):
+    """Checks that do not need the proof lock binary."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.procs = []
+        self.fds = []
+
+    def tearDown(self):
+        stop_owned(self.procs, self.fds)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_zero_padded_device_matches_by_number(self):
+        # minor 0x0a is below 0x10. The row pads both components to two digits.
+        # The old unpadded token 0:a:99 is not in the row.
+        row = "lock:\t1: FLOCK  ADVISORY  WRITE 0 00:0a:99 0 EOF"
+        self.assertNotIn("0:a:99", row)
+        self.assertEqual(parse_flock_dev(row), (0, 10, 99))
+        self.assertIsNone(parse_flock_dev("lock:\t1: POSIX  ADVISORY  WRITE 0 00:0a:99 0 EOF"))
+
+    @unittest.skipUnless(
+        proc_fdinfo_available() and os.path.isdir("/dev/shm"),
+        "a live padded fdinfo row is Linux /dev/shm evidence",
+    )
+    def test_a_live_fdinfo_row_with_a_small_major_is_padded(self):
+        path = os.path.join("/dev/shm", f"orblx-proof-lock-pad-{os.getpid()}")
+        open(path, "a").close()
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        proc = subprocess.Popen(["flock", path, "sleep", "30"], start_new_session=True)
+        self.procs.append(proc)
+        deadline = time.monotonic() + 5
+        row = None
+        fd_name = None
+        while time.monotonic() < deadline and row is None:
+            fd_name, row = _flock_row(proc.pid, path)
+            if row is None:
+                time.sleep(0.02)
+        st = os.stat(path)
+        self.assertIsNotNone(row, f"no flock row for {path}")
+        print(f"live-fdinfo fd={fd_name} {row}")
+        found = _FLOCK_DEV.search(row)
+        self.assertIsNotNone(found, row)
+        token = f"{found.group(1)}:{found.group(2)}:{found.group(3)}"
+        unpadded = f"{os.major(st.st_dev):x}:{os.minor(st.st_dev):x}:{st.st_ino}"
+        self.assertLess(os.major(st.st_dev), 0x10)
+        # The field is 00:2f:N. The unpadded form 0:2f:N is a different token.
+        self.assertNotEqual(token, unpadded, row)
+        self.assertEqual(parse_flock_dev(row), (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino))
+
+    def test_proc_fdinfo_absence_is_not_exclusion(self):
+        root = os.path.join(self.dir, "noproc")
+        os.makedirs(root)
+        self.assertFalse(proc_fdinfo_available(root))
+        if os.path.isdir("/proc/self/fdinfo"):
+            self.assertTrue(proc_fdinfo_available())
+
+    def test_release_returns_when_the_child_is_already_dead(self):
+        go = os.path.join(self.dir, "dead.go")
+        os.mkfifo(go)
+        proc = subprocess.Popen(["bash", "-c", "exit 7"], stdout=subprocess.PIPE, start_new_session=True)
+        self.procs.append(proc)
+        proc.wait(timeout=5)
+        started = time.monotonic()
+        with self.assertRaises(AssertionError) as caught:
+            release_go(go, proc, 5)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1, elapsed)
+        self.assertIn(f"child {proc.pid} exited 7", str(caught.exception))
+
+    def test_cleanup_stops_the_descendant_and_closes_the_fd(self):
+        desc = os.path.join(self.dir, "desc")
+        proc = subprocess.Popen(
+            ["bash", "-c", 'sleep 60 & echo "$!" > "$DESC"; wait'],
+            env=dict(os.environ, DESC=desc),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        self.procs.append(proc)
+        deadline = time.monotonic() + 5
+        gpid = None
+        while time.monotonic() < deadline and gpid is None:
+            if os.path.isfile(desc) and os.path.getsize(desc) > 0:
+                with open(desc) as fh:
+                    gpid = int(fh.read().strip())
+                break
+            time.sleep(0.02)
+        self.assertIsNotNone(gpid, "the descendant pid was not written")
+        held = os.open(os.path.join(self.dir, "held"), os.O_RDWR | os.O_CREAT, 0o600)
+        self.fds.append(held)
+        started = time.monotonic()
+        stop_owned(self.procs, self.fds)
+        self.procs = []
+        self.fds = []
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIsNotNone(proc.poll())
+        gone = time.monotonic() + 2
+        while time.monotonic() < gone:
+            try:
+                os.kill(gpid, 0)
+            except OSError:
+                break
+        else:
+            self.fail(f"descendant {gpid} is still running")
+        with self.assertRaises(OSError):
+            os.fstat(held)
+
+
+def _flock_row(pid, path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None, None
+    want = (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+    fd_dir = f"/proc/{pid}/fd"
+    if not os.path.isdir(fd_dir):
+        return None, None
+    for name in os.listdir(fd_dir):
+        try:
+            got = os.stat(os.path.join(fd_dir, name))
+            with open(f"/proc/{pid}/fdinfo/{name}") as fh:
+                info = fh.read()
+        except OSError:
+            continue
+        if (got.st_dev, got.st_ino) != (st.st_dev, st.st_ino):
+            continue
+        for row in info.splitlines():
+            if row.startswith("lock:") and parse_flock_dev(row) == want:
+                return name, row
+    return None, None
 
 
 @unittest.skipUnless(shutil.which("flock"), "flock(1) is not installed")
@@ -161,11 +404,16 @@ class ProofLockTest(unittest.TestCase):
             one_out.drain(one.stdout)
             self._read_handshake(one_enter_fd, one, one_out, "one did not enter the critical section")
             fifo = self.env["ORBLX_PROOF_LOCK"] + ".fifo"
-            one_lock = self._write_flock_line(one.pid, fifo)
-            self.assertIsNotNone(
-                one_lock,
-                "one does not hold the production fifo flock\n" + self._fd_report(one.pid, fifo) + one_out.text(),
-            )
+            # /proc fdinfo is Linux evidence. The order and context checks below
+            # still run when it is absent. Absence is not treated as exclusion.
+            if proc_fdinfo_available():
+                one_fd, one_lock = self._write_flock(one.pid, fifo)
+                self.assertEqual(
+                    one_fd,
+                    "9",
+                    "the shell fd for the fifo is not PROOF_LOCK_FD\n" + self._fd_report(one.pid, fifo) + one_out.text(),
+                )
+                print(f"fifo-fdinfo fd={one_fd} {one_lock}")
             two = self._start_ordered("two", order_path, two_enter, two_go)
             procs.append(two)
             two_out = _Output()
@@ -177,17 +425,23 @@ class ProofLockTest(unittest.TestCase):
                 "two did not print a waiter line while one held the lock\n" + one_out.text(),
             )
             # Re-check before the release. This read does not take the flock.
-            one_lock = self._write_flock_line(one.pid, fifo)
-            two_lock = self._write_flock_line(two.pid, fifo)
-            self.assertIsNotNone(
-                one_lock,
-                "one lost the fifo flock before release\n" + self._fd_report(one.pid, fifo),
-            )
-            self.assertIsNone(
-                two_lock,
-                "two holds the fifo flock before one is released\n" + self._fd_report(two.pid, fifo) + two_out.text(),
-            )
-            self._release(one_go)
+            if proc_fdinfo_available():
+                one_fd, one_lock = self._write_flock(one.pid, fifo)
+                two_fd, two_lock = self._write_flock(two.pid, fifo)
+                self.assertEqual(
+                    one_fd,
+                    "9",
+                    "one lost fd 9 before release\n" + self._fd_report(one.pid, fifo),
+                )
+                self.assertIsNotNone(one_lock, self._fd_report(one.pid, fifo))
+                self.assertIsNone(
+                    two_lock,
+                    "two holds the fifo flock before one is released\n"
+                    + self._fd_report(two.pid, fifo)
+                    + two_out.text(),
+                )
+                self.assertIsNone(two_fd, two_lock)
+            release_go(one_go, one, 5)
             self._read_handshake(two_enter_fd, two, two_out, "two did not enter after one left the critical section")
             # two is inside the critical section. one may still be exiting.
             # Do not wait for one here: reaping is not the order under test.
@@ -195,20 +449,11 @@ class ProofLockTest(unittest.TestCase):
             self.assertIn("one leave", order, order)
             self.assertIn("two enter", order, order)
             self.assertLess(order.index("one leave"), order.index("two enter"), order)
-            self._release(two_go)
+            release_go(two_go, two, 5)
             out_one = self._finish(one, one_out)
             out_two = self._finish(two, two_out)
         finally:
-            for proc in procs:
-                if proc.poll() is None:
-                    proc.send_signal(signal.SIGKILL)
-            for proc in procs:
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-            for fd in (one_enter_fd, two_enter_fd):
-                os.close(fd)
+            stop_owned(procs, [one_enter_fd, two_enter_fd], self.env["ORBLX_PROOF_LOCK"] + ".keeper")
         self.assertEqual(one.returncode, 0, out_one)
         self.assertEqual(two.returncode, 0, out_two)
         one_times = self.times(out_one, "one")
@@ -243,36 +488,17 @@ class ProofLockTest(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=0,
+            start_new_session=True,
         )
 
-    def _write_flock_line(self, pid, path):
-        """Return the write-flock fdinfo line for this inode, or None.
+    def _write_flock(self, pid, path):
+        """Return (fd number, lock row) for a write flock on path's inode.
 
-        The fd is matched by device and inode, the same identity as ``stat``
-        of the production fifo. This does not call flock, so it cannot take
-        the lock.
+        The fd is identified by ``stat`` device and inode, then the lock row's
+        major, minor, and inode are parsed as numbers. A zero-padded token
+        still matches. This does not call flock.
         """
-        try:
-            st = os.stat(path)
-        except OSError:
-            return None
-        dev = f"{os.major(st.st_dev):x}:{os.minor(st.st_dev):x}:{st.st_ino}"
-        fd_dir = f"/proc/{pid}/fd"
-        if not os.path.isdir(fd_dir):
-            return None
-        for name in os.listdir(fd_dir):
-            try:
-                got = os.stat(os.path.join(fd_dir, name))
-                with open(f"/proc/{pid}/fdinfo/{name}") as fh:
-                    info = fh.read()
-            except OSError:
-                continue
-            if (got.st_dev, got.st_ino) != (st.st_dev, st.st_ino):
-                continue
-            for row in info.splitlines():
-                if row.startswith("lock:") and "FLOCK" in row and "WRITE" in row and dev in row.split():
-                    return row
-        return None
+        return _flock_row(pid, path)
 
     def _fd_report(self, pid, path):
         lines = [f"pid {pid} path {path}"]
@@ -336,7 +562,10 @@ class ProofLockTest(unittest.TestCase):
         try:
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            proc.send_signal(signal.SIGKILL)
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                proc.kill()
             proc.wait(timeout=5)
             self.fail(f"the shell did not exit\n{output.text()}")
         output.thread.join(timeout=5)
