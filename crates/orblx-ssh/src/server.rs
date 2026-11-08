@@ -41,7 +41,7 @@ use crate::cert::{
     check_cert, fresh_netmap, open_shell_netmap_age, verified_netmap, CertInput, CertRefuse,
 };
 use crate::hostkey::host_key_from_seed;
-use crate::pty::{kill_group, PtyShell, PtySpec};
+use crate::pty::{kill_group, observe_echo, ObservedEcho, PtyShell, PtySpec};
 use crate::record::{Recorder, Utf8Carry};
 
 /// The open certificate sessions: serial to (key ID, stop flag) (W25-31).
@@ -124,31 +124,43 @@ impl LiveShell {
     /// Record the input and then give it to the shell.
     ///
     /// When the terminal echo is off, the recording gets one `m` marker and
-    /// not the input bytes. When the recording fails, the shell stops and the
-    /// input does not go to the shell.
+    /// not the input bytes. When the terminal state cannot be read, or the
+    /// recording write fails, the shell stops and the input does not go to
+    /// the shell. A session that is not recording still gives the input to
+    /// the shell.
     fn input(&self, data: &[u8]) {
         let mut writer = self.writer.lock().unwrap_or_else(|err| err.into_inner());
-        let hidden = crate::pty::echo_off(&self.slave);
         {
             let mut record = self.record.lock().unwrap_or_else(|err| err.into_inner());
             if let Some(state) = record.as_mut() {
-                let at = self.started.elapsed();
-                let written = if hidden {
-                    state.input = Utf8Carry::default();
-                    let first = !state.hidden;
-                    state.hidden = true;
-                    if first {
-                        state.recorder.event_text(at, "m", "input hidden")
-                    } else {
-                        Ok(())
+                let observed = match observe_echo(&self.slave) {
+                    Ok(observed) => observed,
+                    Err(_) => {
+                        drop(record);
+                        self.fail(orblx_audit::DenyReason::Recording);
+                        return;
                     }
-                } else {
-                    state.hidden = false;
-                    let text = state.input.take(data);
-                    if text.is_empty() {
-                        Ok(())
-                    } else {
-                        state.recorder.event_text(at, "i", &text)
+                };
+                let at = self.started.elapsed();
+                let written = match observed {
+                    ObservedEcho::Off => {
+                        state.input = Utf8Carry::default();
+                        let first = !state.hidden;
+                        state.hidden = true;
+                        if first {
+                            state.recorder.event_text(at, "m", "input hidden")
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    ObservedEcho::On => {
+                        state.hidden = false;
+                        let text = state.input.take(data);
+                        if text.is_empty() {
+                            Ok(())
+                        } else {
+                            state.recorder.event_text(at, "i", &text)
+                        }
                     }
                 };
                 if written.is_err() {
@@ -1294,6 +1306,7 @@ fn unix_now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::Mutex;
     use std::time::{Duration, Instant, SystemTime};
 
@@ -2115,6 +2128,139 @@ mod tests {
         }
         assert!(stopped, "the shell did not stop");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A pipe is not a terminal. `tcgetattr` on it fails.
+    fn non_terminal() -> std::fs::File {
+        let (read, write) = observation_pipe();
+        drop(write);
+        read
+    }
+
+    fn observation_pipe() -> (std::fs::File, std::fs::File) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let read = unsafe { std::fs::File::from(OwnedFd::from_raw_fd(fds[0])) };
+        let write = unsafe { std::fs::File::from(OwnedFd::from_raw_fd(fds[1])) };
+        (read, write)
+    }
+
+    fn read_ready(file: &std::fs::File) -> Vec<u8> {
+        let fd = file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0, "fcntl get");
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0,
+            "fcntl set"
+        );
+        let mut buf = [0u8; 256];
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            assert_eq!(err.raw_os_error(), Some(libc::EAGAIN), "{err}");
+            return Vec::new();
+        }
+        buf[..usize::try_from(n).unwrap()].to_vec()
+    }
+
+    /// The slave is not a terminal, so the echo flag cannot be read.
+    /// A recorded session must not store the bytes and must not write them onward.
+    /// The session ends with the existing recording failure.
+    #[test]
+    fn a_recorded_shell_drops_input_when_the_terminal_state_cannot_be_read() {
+        let secret = b"SYNTH-SECRET-observe";
+        let spec = crate::pty::PtySpec::from_request("xterm", 80, 24);
+        let mut shell = crate::pty::spawn_shell(&spec, "rec").unwrap();
+        let dir = std::env::temp_dir().join(format!("orblx-ssh-obs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let recorder = Recorder::create(&dir, 1, "rec").unwrap();
+        let (read_end, write_end) = observation_pipe();
+        let live = LiveShell {
+            writer: Mutex::new(write_end),
+            slave: non_terminal(),
+            pid: shell.child.id(),
+            started: Instant::now(),
+            record: Mutex::new(Some(ShellRecord {
+                recorder,
+                input: Utf8Carry::default(),
+                output: Utf8Carry::default(),
+                hidden: false,
+            })),
+            failed: Mutex::new(None),
+        };
+        live.input(secret);
+        let forwarded = read_ready(&read_end);
+        let state = live.record.lock().unwrap().take().unwrap();
+        let (rel, _) = state.recorder.finish().unwrap();
+        let text = std::fs::read_to_string(dir.join(rel)).unwrap();
+        let failed = *live.failed.lock().unwrap();
+        assert!(
+            forwarded.is_empty() && !text.contains("SYNTH-SECRET-observe"),
+            "forwarded {forwarded:?} captured {text} failed {failed:?}"
+        );
+        assert_eq!(
+            *live.failed.lock().unwrap(),
+            Some(orblx_audit::DenyReason::Recording)
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stopped = false;
+        while Instant::now() < deadline {
+            if shell.child.try_wait().unwrap().is_some() {
+                stopped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(stopped, "the shell did not stop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Recording is off. A failed terminal-state read must still forward the bytes
+    /// and must not fail the shell. Exec does not use this path.
+    #[test]
+    fn an_unrecorded_shell_forwards_input_when_the_terminal_state_cannot_be_read() {
+        let secret = b"SYNTH-SECRET-observe";
+        let spec = crate::pty::PtySpec::from_request("xterm", 80, 24);
+        let mut shell = crate::pty::spawn_shell(&spec, "alice").unwrap();
+        let (read_end, write_end) = observation_pipe();
+        let live = LiveShell {
+            writer: Mutex::new(write_end),
+            slave: non_terminal(),
+            pid: shell.child.id(),
+            started: Instant::now(),
+            record: Mutex::new(None),
+            failed: Mutex::new(None),
+        };
+        live.input(secret);
+        assert_eq!(read_ready(&read_end), secret);
+        assert!(live.failed.lock().unwrap().is_none());
+        assert!(shell.child.try_wait().unwrap().is_none());
+        crate::pty::kill_group(shell.child.id(), libc::SIGKILL);
+        let _ = shell.child.wait();
+    }
+
+    /// Exec runs `sh -c`. It does not read the PTY echo flag.
+    #[test]
+    fn an_exec_command_returns_stdout_without_a_terminal_observation() {
+        let dir = recording_fixture("exec-obs");
+        std::fs::write(dir.join("deny.json"), W25_38_VALID).unwrap();
+        let shared = super::Shared::load(&dir, Ipv4Addr::new(10, 0, 0, 1)).unwrap();
+        let admitted = super::Admitted {
+            src: SpiffeId::node("laptop").unwrap(),
+            user: "alice".to_string(),
+            check_period: 60,
+            ticket_hash: [0u8; 16],
+            frame: 1,
+            recording: false,
+            cert: None,
+        };
+        let (code, out) =
+            super::run_command("printf SYNTH-EXEC-ISOLATED", &admitted, &shared, None).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(out, b"SYNTH-EXEC-ISOLATED");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

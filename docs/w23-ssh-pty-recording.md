@@ -60,6 +60,7 @@ This keeps passwords out of the recording.
 
 - The recording file does not open (for example, a read-only directory): the server prints "The SSH session recording did not open. The session is refused.", refuses the shell, and audits a deny with the reason `recording`. The shell does not start.
 - A recording write fails while the shell runs: the server does not write that input to the PTY, kills the process group, and audits a deny with the reason `recording`. It writes no `record` line for that file.
+- The terminal state cannot be read while a recording is on: the server does not write that input to the recording or to the PTY, kills the process group, and audits a deny with the reason `recording`. A session that is not recording still writes the input to the PTY.
 - The recording finish fails: the server audits a deny with the reason `recording`.
 - A policy revoke while the shell runs: the server kills the process group, writes the `record` line, and audits a deny with the reason `revoked`.
 
@@ -73,6 +74,7 @@ This keeps passwords out of the recording.
 - `pty::tests::a_shell_on_the_pty_runs_input_and_echo_off_is_seen`
 - `server::tests::a_pty_shell_records_input_and_output_in_time_order`: input and output in time order, the hidden input marker, 1-byte change fails verify, a rule without recording writes no file, a recording directory that cannot open refuses the shell with a `recording` deny.
 - `server::tests::a_shell_stops_when_a_recording_write_fails` (a recording file that is open only for read): the shell stops and the failure is `recording`.
+- `server::tests::a_recorded_shell_drops_input_when_the_terminal_state_cannot_be_read`: a failed terminal-state read stores no input, forwards no input, and the failure is `recording`.
 - `ssh::tests::the_shell_flag_takes_no_value_and_refuses_a_command` (orblx-cli).
 
 `scripts/proof/ssh.sh` ([C], log `/workspace/orblx-w18-proof/w23-2-dev2-ssh.log`) reruns all W22-3 exec steps and then:
