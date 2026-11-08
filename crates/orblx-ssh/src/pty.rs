@@ -11,6 +11,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 
 /// The terminal of one PTY request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,19 +60,62 @@ pub(crate) struct PtyShell {
     pub(crate) child: Child,
 }
 
+/// Arguments for one interactive `/bin/sh`.
+///
+/// Bash line editing turns kernel echo off and draws the echo itself.
+/// The recorder would then hide ordinary input.
+/// `--noediting` leaves kernel echo on until a program turns it off.
+pub(crate) fn interactive_shell_args(bash: bool) -> &'static [&'static str] {
+    if bash {
+        &["--noediting", "-i"]
+    } else {
+        &["-i"]
+    }
+}
+
+/// `/bin/sh` is Bash when it sets `BASH_VERSION`.
+///
+/// macOS runs Bash for `/bin/sh`. Linux often runs another shell.
+/// The probe result is kept for the process.
+fn shell_is_bash() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let Ok(output) = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf %s \"${BASH_VERSION-}\"")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+        else {
+            return false;
+        };
+        output.status.success() && output.stdout.iter().any(|byte| !byte.is_ascii_whitespace())
+    })
+}
+
 /// Open a PTY pair and start `/bin/sh -i` on it.
 ///
 /// The environment has only `PATH`, `TERM`, `HOME`, and `ORBLX_SSH_USER`.
+/// When `/bin/sh` is Bash, the arguments are `--noediting -i`.
 pub(crate) fn spawn_shell(spec: &PtySpec, user: &str) -> io::Result<PtyShell> {
+    spawn_program(
+        "/bin/sh",
+        interactive_shell_args(shell_is_bash()),
+        spec,
+        user,
+    )
+}
+
+fn spawn_program(program: &str, args: &[&str], spec: &PtySpec, user: &str) -> io::Result<PtyShell> {
     let (master, slave) = open_pair(spec.cols, spec.rows)?;
     // Keep one slave descriptor. A later open of the slave path can fail,
     // and the master side does not show the echo flag.
     let echo_slave = slave.try_clone()?;
     let stdin = slave.try_clone()?;
     let stdout = slave.try_clone()?;
-    let mut command = Command::new("/bin/sh");
+    let mut command = Command::new(program);
     command
-        .arg("-i")
+        .args(args)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", &spec.term)
@@ -200,7 +244,9 @@ mod tests {
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
 
-    use super::{clamp_size, echo_off, readable, spawn_shell, PtySpec};
+    use super::{
+        clamp_size, echo_off, interactive_shell_args, readable, spawn_program, spawn_shell, PtySpec,
+    };
 
     #[test]
     fn a_bad_terminal_type_and_size_become_safe_values() {
@@ -242,5 +288,122 @@ mod tests {
         let _ = shell.child.wait();
         assert!(String::from_utf8_lossy(&seen).contains("user-rec"));
         assert!(saw_off, "the echo-off state was not seen");
+    }
+
+    fn bash_program() -> &'static str {
+        if std::path::Path::new("/bin/bash").is_file() {
+            "/bin/bash"
+        } else if std::path::Path::new("/usr/bin/bash").is_file() {
+            "/usr/bin/bash"
+        } else {
+            panic!("bash is not installed");
+        }
+    }
+
+    /// Read until the shell writes, then sample kernel echo.
+    fn prompt_has_echo_off(program: &str, args: &[&str]) -> bool {
+        let spec = PtySpec::from_request("xterm", 80, 24);
+        let mut shell = spawn_program(program, args, &spec, "rec").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut buf = [0u8; 256];
+        let mut saw = false;
+        while Instant::now() < deadline {
+            if readable(&shell.master, 50) {
+                match shell.master.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        saw = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let settle = Instant::now() + Duration::from_secs(1);
+        let mut off = false;
+        while Instant::now() < settle {
+            if readable(&shell.master, 20) {
+                let _ = shell.master.read(&mut buf);
+            }
+            off = echo_off(&shell.slave);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        super::kill_group(shell.child.id(), libc::SIGKILL);
+        let _ = shell.child.wait();
+        assert!(saw, "the shell did not write a prompt");
+        off
+    }
+
+    #[test]
+    fn bash_line_editing_turns_kernel_echo_off() {
+        // This is the macOS failure mode. Linux `/bin/sh` is not Bash.
+        // The check uses Bash itself. It is not a macOS run.
+        assert!(prompt_has_echo_off(bash_program(), &["-i"]));
+    }
+
+    #[test]
+    fn the_server_bash_args_keep_kernel_echo_until_stty() {
+        let spec = PtySpec::from_request("xterm", 80, 24);
+        let args = interactive_shell_args(true);
+        assert_eq!(args, ["--noediting", "-i"]);
+        let mut shell = spawn_program(bash_program(), args, &spec, "rec").unwrap();
+        let mut writer = shell.master.try_clone().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut buf = [0u8; 256];
+        let mut saw = false;
+        while Instant::now() < deadline {
+            if readable(&shell.master, 50) {
+                match shell.master.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        saw = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(saw, "the shell did not write a prompt");
+        let settle = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < settle {
+            if readable(&shell.master, 20) {
+                let _ = shell.master.read(&mut buf);
+            }
+            assert!(
+                !echo_off(&shell.slave),
+                "kernel echo is off at the bash prompt"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // `$((...))` makes the output differ from the echo of the input line.
+        writer
+            .write_all(b"stty -echo; echo hide-$((40+2)); sleep 1; stty echo; echo back-$((3+4))\n")
+            .unwrap();
+        let mut seen = Vec::new();
+        let mut saw_off = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if readable(&shell.master, 50) {
+                match shell.master.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(len) => seen.extend_from_slice(&buf[..len]),
+                }
+            }
+            let text = String::from_utf8_lossy(&seen);
+            if text.contains("hide-42") && echo_off(&shell.slave) {
+                saw_off = true;
+            }
+            if text.contains("back-7") {
+                break;
+            }
+        }
+        let echo_after = echo_off(&shell.slave);
+        let text = String::from_utf8_lossy(&seen);
+        super::kill_group(shell.child.id(), libc::SIGKILL);
+        let _ = shell.child.wait();
+        assert!(
+            text.contains("back-7"),
+            "the shell did not restore echo. output={text:?}"
+        );
+        assert!(saw_off, "stty -echo did not clear kernel echo");
+        assert!(!echo_after, "stty echo did not restore kernel echo");
     }
 }

@@ -29,6 +29,7 @@ sudo orblx ssh rec@b --state <dir> --peer-cert <cert.pem> --shell
 - A `shell` request without a `pty-req` is refused and audited as a `destination` deny.
 - The server runs the policy recheck before the shell starts, and then each `checkPeriod` while the shell runs.
 - The shell is `/bin/sh -i` on a new PTY, in a new session, with a clean environment: `PATH=/usr/bin:/bin`, `TERM`, `HOME=/`, `ORBLX_SSH_USER`.
+- When `/bin/sh` is Bash, the arguments are `--noediting -i`. Bash line editing turns kernel echo off and draws the echo itself. The recorder would then hide ordinary input. `--noediting` leaves kernel echo on until a program turns it off.
 - `window-change` resizes the PTY.
 - When the shell exits, the server sends the exit status, EOF and close. It sends SIGKILL to the process group 500 ms after the shell exits, so background processes do not stay.
 
