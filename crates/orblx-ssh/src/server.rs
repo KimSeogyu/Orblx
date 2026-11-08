@@ -2029,6 +2029,11 @@ mod tests {
             None => panic!("the recording has no pty-42 output. output={output_text:?}"),
         };
         assert!(first_input < answer);
+        // Visible lines stay in the joined input. The hidden line does not.
+        assert!(input_text.contains("echo pty-$((6*7))\n"), "{input_text:?}");
+        assert!(input_text.contains("stty -echo;"), "{input_text:?}");
+        assert!(input_text.contains("exit\n"), "{input_text:?}");
+        assert!(!input_text.contains("hidden-w23"), "{input_text:?}");
         assert!(events
             .iter()
             .any(|row| row[1] == "m" && row[2] == "input hidden"));
