@@ -1,10 +1,28 @@
 #!/usr/bin/env bash
-# W25-47 release proof for DoD a, b, and f.
-# Eng Lead runs this on a host. Do not call scripts/proof/proof-lock.sh.
-# The run needs CAP_SYS_TIME or root. It steps CLOCK_REALTIME with date -u -s.
-# A real pause may use virsh suspend and virsh resume. Do not use docker pause.
-# Repeat a and b 10 times on the merge commit. This script runs f, then one a/b pass
-# when ORBLX_W25_47_NODE=1.
+# W25-47 release proof for DoD f, then one DoD a pass.
+# Eng Lead runs this on the final pull request head.
+# Do not call scripts/proof/proof-lock.sh. This script reads no manifest.
+#
+# Privileges: CAP_SYS_TIME or root. Stop NTP before the run.
+# This script does not stop NTP. The trap sets the clock back.
+#
+# Build, then point ORBLX_BIN at that binary. The default is target/debug/orblx.
+#   cargo build --release --bin orblx
+#
+# DoD f. The script creates the coordinator directory with mktemp.
+#   ORBLX_BIN=target/release/orblx scripts/proof/w25-47-reauth.sh
+# PASS line: DoD f passed.
+#
+# DoD a in the same process, after f. The node directory must already exist.
+#   ORBLX_W25_47_NODE=1 ORBLX_W25_47_STATE=/var/lib/orblx ORBLX_BIN=target/release/orblx scripts/proof/w25-47-reauth.sh
+# PASS lines: DoD f passed.
+#             DoD a passed.
+# DoD b is not a script result. After PASS DoD a, status prints the owner command.
+# Eng Lead runs that command and checks that peers pass traffic within 60 s.
+# Repeat the node command 10 times on the same head.
+#
+# One iteration ends after ORBLX_W25_47_TIMEOUT seconds (default 180) with exit 124.
+# A failed check exits 1. A privilege or lock refusal exits 2. A pass exits 0.
 set -euo pipefail
 
 if [[ "${ORBLX_PROOF_LOCK:-}" == "1" ]]; then
@@ -25,10 +43,38 @@ if [[ ! -x "$bin" ]]; then
 fi
 
 saved=$(date -u +%Y-%m-%dT%H:%M:%S)
-restore_clock() {
+coord_pid=
+watchdog_pid=
+cleaned=0
+cleanup() {
+  if [[ "$cleaned" == 1 ]]; then
+    return
+  fi
+  cleaned=1
+  if [[ -n "$watchdog_pid" ]]; then
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$coord_pid" ]]; then
+    kill "$coord_pid" 2>/dev/null || true
+    wait "$coord_pid" 2>/dev/null || true
+  fi
   date -u -s "$saved" >/dev/null || true
 }
-trap restore_clock EXIT
+trap cleanup EXIT INT TERM HUP
+on_alarm() {
+  echo "The iteration timed out after ${limit} s." >&2
+  exit 124
+}
+trap on_alarm USR1
+
+# One iteration. The alarm fires after this many seconds.
+limit="${ORBLX_W25_47_TIMEOUT:-180}"
+(
+  sleep "$limit"
+  kill -USR1 $$ 2>/dev/null || true
+) &
+watchdog_pid=$!
 
 work=$(mktemp -d)
 coord_dir="$work/coord"
@@ -50,15 +96,12 @@ date -u -s "+20 min" >/dev/null
 sleep 3
 if ! grep -q "coord svid renewed" "$log"; then
   echo "DoD f failed. The coordinator log has no coord svid renewed line."
-  kill "$coord_pid" || true
   exit 1
 fi
 echo "DoD f passed."
-restore_clock
+date -u -s "$saved" >/dev/null
 
 if [[ "${ORBLX_W25_47_NODE:-}" != "1" ]]; then
-  kill "$coord_pid" || true
-  wait "$coord_pid" || true
   echo "DoD a and b stay for Eng Lead. Set ORBLX_W25_47_NODE=1 after a node is up."
   echo "Step the node clock 20 min. orblx status must show state needs-reauth."
   echo "The status line must be: reauth orblx login --name NAME"
@@ -70,7 +113,6 @@ fi
 echo "DoD a and b need the node state directory in ORBLX_W25_47_STATE."
 if [[ -z "${ORBLX_W25_47_STATE:-}" ]]; then
   echo "Set ORBLX_W25_47_STATE to the node state directory."
-  kill "$coord_pid" || true
   exit 1
 fi
 date -u -s "+20 min" >/dev/null
@@ -79,15 +121,13 @@ status=$("$bin" status --state "$ORBLX_W25_47_STATE" || true)
 printf '%s\n' "$status"
 if ! printf '%s\n' "$status" | grep -q "state needs-reauth"; then
   echo "DoD a failed."
-  kill "$coord_pid" || true
   exit 1
 fi
 if ! printf '%s\n' "$status" | grep -q "reauth orblx login --name"; then
   echo "DoD a failed. The login command is missing."
-  kill "$coord_pid" || true
   exit 1
 fi
-echo "DoD a passed. Eng Lead runs the owner command for DoD b and checks peer traffic within 60 s."
-kill "$coord_pid" || true
-wait "$coord_pid" || true
+echo "DoD a passed."
+echo "DoD b is the owner command in the status text. This script does not run it."
+echo "Eng Lead checks that peers pass traffic within 60 s."
 exit 0
