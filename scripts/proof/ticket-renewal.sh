@@ -855,9 +855,9 @@ build_image
 OUTD="${TR_OUT_DIR:-$WORK/out}"
 mkdir -p "$OUTD"
 : > "$OUTD/sampler-cgroups.txt"
-echo "=== [C] host sampler every 100 ms to ${OUTD}/host-samples.txt ==="
-# --interval 0.1 matches HOST_SAMPLER_INTERVAL_S. The guard checks that constant and the median gap.
-python3 "$ROOT/scripts/proof/host-sampler.py" --out "$OUTD/host-samples.txt" --interval 0.1 \
+echo "=== [C] host sampler to ${OUTD}/host-samples.txt ==="
+# The interval is HOST_SAMPLER_INTERVAL_S, the sampler default. This command does not set an interval.
+python3 "$ROOT/scripts/proof/host-sampler.py" --out "$OUTD/host-samples.txt" \
   --cgroup-file "$OUTD/sampler-cgroups.txt" &
 SAMPLER_PID="$!"
 SAMPLER_STARTED=1

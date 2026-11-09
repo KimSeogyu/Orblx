@@ -16,7 +16,8 @@ CLOCK_BOOTTIME includes Linux suspend.
 A missing clock is the token unsupported. The sampler does not copy another clock.
 The sampler stops on SIGTERM or after --secs seconds.
 
-Usage: host-sampler.py --out FILE [--interval 0.1] [--secs N] [name=cgroup_dir ...]
+Usage: host-sampler.py --out FILE [--interval SECONDS] [--secs N] [name=cgroup_dir ...]
+       The default --interval is HOST_SAMPLER_INTERVAL_S.
        host-sampler.py analyze --samples FILE --gaps FILE [--traces FILE] [thresholds]
        host-sampler.py coverage --samples FILE --cadence-ms N [--mark name=epoch_s]
 
@@ -852,8 +853,8 @@ def acceptance_main(argv):
 HOST_DRIFT_MAX_S = 5
 HOST_GAP_MAX_S = 5
 HOST_BOOT_MONO_JUMP_MAX_S = 5
-# Cadence of this harness. The start command passes the same value as --interval.
-# The guard checks this constant. It does not read an interval from the environment.
+# Cadence of this harness. argparse --interval defaults to this value.
+# The harness does not pass --interval. The guard does not read an interval from the environment.
 # A constant above 1 s is reason=sampler_interval_cfg.
 HOST_SAMPLER_INTERVAL_S = 0.1
 HOST_SAMPLER_INTERVAL_MAX_S = 1
@@ -871,8 +872,8 @@ _REASON_ORDER = (
     "sampler_median",
     "uncovered_fork",
 )
-# Raw dmesg only. "[seconds.fraction] message". ISO lines have no brackets and are ignored.
-_RAW_DMESG_RE = re.compile(r"^\[(\d+)(?:\.(\d+))?\]\s*(.*)$")
+# Raw dmesg. "[seconds.fraction] message". Short uptime pads the seconds with spaces.
+_RAW_DMESG_RE = re.compile(r"^\[\s*(\d+)(?:\.(\d+))?\]\s*(.*)$")
 
 
 def _fmt_seconds(value):
@@ -1004,30 +1005,34 @@ def _forks_in_window(dmesg_text, clocks):
     both have no sample. A sample at the fork time covers both sides.
     A sample at exactly 5.0 s covers that side. A sample farther than 5.0 s does not.
     A fork outside the sampler monotonic window is not counted.
+    A fork line whose stamp does not parse is data_missing.
+    Returns (forks, unparsed).
     """
     mono = [item[1] for item in clocks]
     start = mono[0]
     end = mono[-1]
     found = []
+    unparsed = False
     for line in dmesg_text.splitlines():
         if _HOST_FORK_TEXT not in line:
             continue
         stamp_ns = _raw_stamp_ns(line)
-        if stamp_ns is None or stamp_ns < start or stamp_ns > end:
-            continue
-        before = any(stamp_ns - HOST_FORK_COVER_NS <= sample <= stamp_ns for sample in mono)
-        after = any(stamp_ns <= sample <= stamp_ns + HOST_FORK_COVER_NS for sample in mono)
-        gap_s, drift_s = _bracket(clocks, stamp_ns)
-        found.append(
-            {
-                "mono_ns": stamp_ns,
-                "uncovered": not before and not after,
-                "gap_s": gap_s,
-                "drift_s": drift_s,
-            }
-        )
+        if stamp_ns is None:
+            unparsed = True
+        elif start <= stamp_ns <= end:
+            before = any(stamp_ns - HOST_FORK_COVER_NS <= sample <= stamp_ns for sample in mono)
+            after = any(stamp_ns <= sample <= stamp_ns + HOST_FORK_COVER_NS for sample in mono)
+            gap_s, drift_s = _bracket(clocks, stamp_ns)
+            found.append(
+                {
+                    "mono_ns": stamp_ns,
+                    "uncovered": not before and not after,
+                    "gap_s": gap_s,
+                    "drift_s": drift_s,
+                }
+            )
     found.sort(key=lambda item: item["mono_ns"])
-    return found
+    return found, unparsed
 
 
 def _fork_fail_delta_s(forks, fail_mono_ns):
@@ -1094,7 +1099,9 @@ def host_qualification_report(
         if "data_missing" not in reasons:
             reasons.append("data_missing")
     elif measured is not None:
-        forks = _forks_in_window(text, measured["clocks"])
+        forks, fork_unparsed = _forks_in_window(text, measured["clocks"])
+        if fork_unparsed and "data_missing" not in reasons:
+            reasons.append("data_missing")
         if any(item["uncovered"] for item in forks):
             reasons.append("uncovered_fork")
     ordered = [name for name in _REASON_ORDER if name in reasons]
@@ -1204,7 +1211,7 @@ def main():
         return host_qualification_main(sys.argv[2:])
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--interval", type=float, default=0.1)
+    ap.add_argument("--interval", type=float, default=HOST_SAMPLER_INTERVAL_S)
     ap.add_argument("--secs", type=float, default=0)
     ap.add_argument("--cgroup-file")
     ap.add_argument("cgroups", nargs="*")

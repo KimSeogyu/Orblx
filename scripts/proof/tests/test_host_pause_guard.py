@@ -242,14 +242,44 @@ class HostPauseGuardTest(unittest.TestCase):
         self.assertIn("vm_fork=0", line)
         self.assertNotIn("uncovered_fork", reason_of(line))
 
-    def test_iso_fork_lines_are_not_parsed(self):
-        with open(os.path.join(FIXTURES, "fork-lines-iso.txt"), encoding="utf-8") as handle:
-            text = handle.read()
+    def test_padded_fork_stamp_inside_the_window_is_counted(self):
+        text = "[   12.345678] random: crng reseeded due to virtual machine fork\n"
+        stamp = host_sampler._raw_stamp_ns(text.strip())
+        self.assertEqual(stamp, 12_345_678_000)
+        step = 100_000_000
+        covered = absolute_samples(
+            (
+                (BASE_RT, stamp - step, stamp - step),
+                (BASE_RT + 2 * step, stamp + step, stamp + step),
+                (BASE_RT + 3 * step, stamp + 2 * step, stamp + 2 * step),
+            )
+        )
+        line = report(covered, text)
+        self.assertTrue(line.startswith("host_qualification ok "), line)
+        self.assertIn("fork_count=1", line)
+        self.assertIn("vm_fork=0", line)
+        self.assertIn("fork_1_mono_s=12.345678", line)
+        wide = absolute_samples(
+            (
+                (BASE_RT, stamp - 6_000_000_000, stamp - 6_000_000_000),
+                (BASE_RT + 500_000_000, stamp - 5_500_000_000, stamp - 5_500_000_000),
+                (BASE_RT + 12_000_000_000, stamp + 6_000_000_000, stamp + 6_000_000_000),
+            )
+        )
+        uncovered = report(wide, text)
+        self.assertIn("fork_count=1", uncovered)
+        self.assertIn("uncovered_fork", reason_of(uncovered))
+
+    def test_unparseable_fork_line_is_data_missing(self):
+        text = "2026-11-09T08:03:39,800899+09:00 random: crng reseeded due to virtual machine fork\n"
         line = report(samples(((0, 0, 0), (0.1, 0.1, 0.1), (0.2, 0.2, 0.2))), text)
-        self.assertTrue(line.startswith("host_qualification ok "))
-        self.assertIn("fork_count=0", line)
-        self.assertNotIn("data_missing", reason_of(line))
-        self.assertNotIn("uncovered_fork", reason_of(line))
+        self.assertTrue(line.startswith("host_qualification invalid "), line)
+        self.assertIn("data_missing", reason_of(line))
+        with open(os.path.join(FIXTURES, "fork-lines-iso.txt"), encoding="utf-8") as handle:
+            fixture = handle.read()
+        fixture_line = report(samples(((0, 0, 0), (0.1, 0.1, 0.1), (0.2, 0.2, 0.2))), fixture)
+        self.assertTrue(fixture_line.startswith("host_qualification invalid "), fixture_line)
+        self.assertEqual(reason_of(fixture_line), "data_missing")
 
     def test_real_box_raw_with_covering_samples_is_ok(self):
         with open(os.path.join(FIXTURES, "box-dmesg-raw.txt"), encoding="utf-8") as handle:
@@ -620,7 +650,10 @@ class HostPauseGuardTest(unittest.TestCase):
         self.assertNotIn("os.environ", sampler)
         self.assertIn("HOST_SAMPLER_INTERVAL_S = 0.1", sampler)
         self.assertIn("HOST_SAMPLER_INTERVAL_MAX_S = 1", sampler)
-        self.assertIn("--interval 0.1", renewal)
+        sampler_start = renewal.index('python3 "$ROOT/scripts/proof/host-sampler.py"')
+        sampler_cmd = renewal[sampler_start:renewal.index("SAMPLER_PID", sampler_start)]
+        self.assertNotIn("--interval", sampler_cmd)
+        self.assertIn("default=HOST_SAMPLER_INTERVAL_S", sampler)
         self.assertNotIn("sampler_interval_s=", renewal)
         self.assertNotIn("sampler_interval_s=", soak)
 
