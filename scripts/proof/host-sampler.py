@@ -1104,8 +1104,10 @@ def host_qualification_report(
     else:
         vm_fork = 1 if any(item["uncovered"] for item in forks) else 0
         fork_count = len(forks)
-    seen = "yes" if product_fail_seen or product_fail_utc else "no"
-    fail_utc = product_fail_utc if product_fail_utc else "-"
+    # seen follows --product-fail-seen only. A UTC string, "-", and an empty value do not set it.
+    seen = "yes" if product_fail_seen else "no"
+    utc_text = "" if product_fail_utc is None else str(product_fail_utc).strip()
+    fail_utc = "-" if utc_text in ("", "-") else utc_text
     event_utc = _utc_from_ns(min(item for item in (gap_event_ns, jump_event_ns) if item is not None)) if any(
         item is not None for item in (gap_event_ns, jump_event_ns)
     ) else "-"

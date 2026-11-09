@@ -655,12 +655,18 @@ SAMPLER_STARTED=0
 
 # Exit 7 is setup_fail. It is not HOST_INVALID. It does not consume a GO.
 # The sampler had not started. Status 1 from that path is not exit 6.
+# PRODUCT_FAIL_UTC is set only in fail(), which prints the FAIL: line. That is the seen signal.
+# An empty value and "-" are not a product FAIL.
 host_pause_print() {
   local status="$1" samples dmesg_file line seen="no" utc="-"
+  if [[ -n "${PRODUCT_FAIL_UTC:-}" && "${PRODUCT_FAIL_UTC}" != "-" ]]; then
+    seen="yes"
+    utc="$PRODUCT_FAIL_UTC"
+  fi
   if [[ "${SAMPLER_STARTED:-0}" != "1" ]]; then
     if [[ "$status" -eq 1 ]]; then
-      if [[ -n "${PRODUCT_FAIL_UTC:-}" ]]; then
-        echo "setup_fail product_fail_seen yes product_fail_utc=${PRODUCT_FAIL_UTC}"
+      if [[ "$seen" == "yes" ]]; then
+        echo "setup_fail product_fail_seen yes product_fail_utc=${utc}"
       else
         echo "setup_fail product_fail_seen no product_fail_utc=-"
       fi
@@ -668,19 +674,14 @@ host_pause_print() {
     fi
     return 0
   fi
-  if [[ -n "${PRODUCT_FAIL_UTC:-}" ]]; then
-    seen="yes"
-    utc="$PRODUCT_FAIL_UTC"
-  fi
   samples="${OUTD:-}/host-samples.txt"
   dmesg_file="$(mktemp)"
   local -a args=(
     host-qualification
     --product-status "$status"
-    --product-fail-utc "$utc"
   )
   if [[ "$seen" == "yes" ]]; then
-    args+=(--product-fail-seen)
+    args+=(--product-fail-seen --product-fail-utc "$utc")
   fi
   if [[ -n "${PRODUCT_FAIL_MONO_NS:-}" ]]; then
     args+=(--product-fail-mono-ns "$PRODUCT_FAIL_MONO_NS")
@@ -725,6 +726,7 @@ proof_compose_clean "${TR_PROJECT}" || exit 1
 
 fail() {
   echo "FAIL: $*" >&2
+  # This is the only writer of PRODUCT_FAIL_UTC. host_pause_print treats that value as the FAIL line.
   if [[ -z "${PRODUCT_FAIL_UTC:-}" ]]; then
     PRODUCT_FAIL_UTC="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
     PRODUCT_FAIL_MONO_NS="$(python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC))')"

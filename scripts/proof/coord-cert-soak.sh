@@ -295,6 +295,7 @@ if ! grep -q '^host_qualification ' "$WORK/tr.log"; then
   if [[ "$tr_status" -eq 7 ]]; then
     echo "setup_fail passthrough"
   else
+    # seen follows a FAIL: line in the child log. This synthetic line has no UTC, so the field stays -.
     seen="no"
     if grep -q '^FAIL:' "$WORK/tr.log"; then
       seen="yes"

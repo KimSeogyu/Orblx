@@ -457,6 +457,137 @@ class HostPauseGuardTest(unittest.TestCase):
         self.assertIn("reason=data_missing", empty_result.stdout)
         self.assertIn("product_fail_seen no", empty_result.stdout)
 
+    def _qualification_cli(self, extra):
+        with tempfile.TemporaryDirectory() as tmp:
+            samples_path = os.path.join(tmp, "samples.txt")
+            dmesg = os.path.join(tmp, "dmesg.txt")
+            fork_ns = BASE_MONO + _ns(0.1)
+            with open(samples_path, "w", encoding="utf-8") as handle:
+                handle.write(_line(BASE_RT, BASE_MONO, BASE_BOOT) + "\n")
+                handle.write(_line(BASE_RT + _ns(0.1), BASE_MONO + _ns(0.1), BASE_BOOT + _ns(0.1)) + "\n")
+                handle.write(_line(BASE_RT + _ns(0.2), BASE_MONO + _ns(0.2), BASE_BOOT + _ns(0.2)) + "\n")
+            with open(dmesg, "w", encoding="utf-8") as handle:
+                handle.write(raw_fork_at(fork_ns))
+            result = subprocess.run(
+                [
+                    "python3",
+                    os.path.join(PROOF, "host-sampler.py"),
+                    "host-qualification",
+                    *extra,
+                    "--samples",
+                    samples_path,
+                    "--dmesg",
+                    dmesg,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        return result.stdout.strip(), fork_ns
+
+    def test_cli_status_0_with_a_dash_utc_is_not_a_product_fail(self):
+        # The old harness always passed --product-fail-utc -. That dash must not set seen.
+        line, _fork_ns = self._qualification_cli(["--product-status", "0", "--product-fail-utc", "-"])
+        self.assertIn("product_fail_seen no", line)
+        self.assertIn("product_fail_utc=-", line)
+        self.assertIn("fork_fail_delta_s=-", line)
+        harness, _fork_ns = self._qualification_cli(["--product-status", "0"])
+        self.assertIn("product_fail_seen no", harness)
+        self.assertIn("product_fail_utc=-", harness)
+        self.assertIn("fork_fail_delta_s=-", harness)
+
+    def test_cli_status_1_without_a_fail_line_is_not_a_product_fail(self):
+        line, _fork_ns = self._qualification_cli(["--product-status", "1", "--product-fail-utc", "-"])
+        self.assertIn("product_fail_seen no", line)
+        self.assertIn("fork_fail_delta_s=-", line)
+        harness, _fork_ns = self._qualification_cli(["--product-status", "1"])
+        self.assertIn("product_fail_seen no", harness)
+
+    def test_cli_real_fail_line_prints_the_delta(self):
+        fail_utc = "2026-11-09T05:00:30.000Z"
+        preview, fork_ns = self._qualification_cli(["--product-status", "0"])
+        del preview
+        line, fork_ns = self._qualification_cli(
+            [
+                "--product-status",
+                "1",
+                "--product-fail-seen",
+                "--product-fail-utc",
+                fail_utc,
+                "--product-fail-mono-ns",
+                str(fork_ns + _ns(30)),
+            ]
+        )
+        self.assertIn("product_fail_seen yes", line)
+        self.assertIn(f"product_fail_utc={fail_utc}", line)
+        self.assertIn("fork_fail_delta_s=+30.000", line)
+
+    def test_dash_utc_does_not_set_seen_or_the_delta(self):
+        fork_ns = BASE_MONO + _ns(0.1)
+        line = report(
+            samples(((0, 0, 0), (0.1, 0.1, 0.1), (0.2, 0.2, 0.2))),
+            raw_fork_at(fork_ns),
+            status=0,
+            fail_utc="-",
+            seen=False,
+            fail_mono=fork_ns + _ns(30),
+        )
+        self.assertIn("product_fail_seen no", line)
+        self.assertIn("product_fail_utc=-", line)
+        self.assertIn("fork_fail_delta_s=-", line)
+
+    def test_host_pause_print_status_0_says_seen_no(self):
+        renewal_path = os.path.join(PROOF, "ticket-renewal.sh")
+        with open(renewal_path, encoding="utf-8") as handle:
+            text = handle.read()
+        start = text.index("host_pause_print() {")
+        depth = 0
+        end = start
+        for index, char in enumerate(text[start:], start):
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index + 1
+                    break
+        body = text[start:end]
+        repo = os.path.dirname(os.path.dirname(PROOF))
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "bin")
+            outd = os.path.join(tmp, "out")
+            os.makedirs(bindir)
+            os.makedirs(outd)
+            with open(os.path.join(bindir, "dmesg"), "w", encoding="utf-8") as handle:
+                handle.write("#!/bin/sh\nprintf '%s\\n' '[1.000000] Linux version test'\n")
+            os.chmod(os.path.join(bindir, "dmesg"), 0o755)
+            with open(os.path.join(outd, "host-samples.txt"), "w", encoding="utf-8") as handle:
+                handle.write(_line(BASE_RT, BASE_MONO, BASE_BOOT) + "\n")
+                handle.write(_line(BASE_RT + _ns(0.1), BASE_MONO + _ns(0.1), BASE_BOOT + _ns(0.1)) + "\n")
+                handle.write(_line(BASE_RT + _ns(0.2), BASE_MONO + _ns(0.2), BASE_BOOT + _ns(0.2)) + "\n")
+            script = (
+                "set -euo pipefail\n"
+                + body
+                + "\n"
+                + f'ROOT="{repo}"\n'
+                + f'OUTD="{outd}"\n'
+                + f'PATH="{bindir}:$PATH"\n'
+                + "SAMPLER_STARTED=1\n"
+                + "PRODUCT_FAIL_UTC=\n"
+                + "PRODUCT_FAIL_MONO_NS=\n"
+                + "HOST_PAUSE_EXIT=\n"
+                + "host_pause_print 0\n"
+            )
+            result = subprocess.run(["bash", "-c", script], check=False, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.startswith("host_qualification ok "), result.stdout)
+        self.assertIn("product_fail_seen no", result.stdout)
+        self.assertIn("product_fail_utc=-", result.stdout)
+        self.assertIn("fork_fail_delta_s=-", result.stdout)
+        self.assertNotIn("product_fail_seen yes", result.stdout)
+
     def test_scripts_use_exit_6_and_keep_product_fail_text(self):
         with open(os.path.join(PROOF, "ticket-renewal.sh"), encoding="utf-8") as handle:
             renewal = handle.read()
@@ -475,6 +606,7 @@ class HostPauseGuardTest(unittest.TestCase):
         self.assertIn('echo "FAIL: $*" >&2', renewal)
         self.assertIn("PRODUCT_FAIL_UTC=", renewal)
         self.assertIn("PRODUCT_FAIL_MONO_NS=", renewal)
+        self.assertIn('args+=(--product-fail-seen --product-fail-utc "$utc")', renewal)
         self.assertNotIn('if [[ "$status" -eq 1 || -n "${PRODUCT_FAIL_UTC:-}" ]]; then', renewal)
         self.assertIn("soak_final_status", soak)
         self.assertIn('exit "$final"', soak)
