@@ -13,10 +13,11 @@
 #   sudo -n scripts/proof/w25-47-reauth.sh
 # The state directories are under mktemp. The script does not use /var/lib/orblx.
 #
-# NTP: this host has no systemd, so timedatectl cannot stop a sync daemon and
-# the script cannot start one again. When chronyd, ntpd, or systemd-timesyncd
-# is running, the script refuses with exit 2. When none of them is running,
-# it prints "ntp none" and steps the clock. The trap sets the clock back.
+# NTP: when chronyd, ntpd, or systemd-timesyncd is running, the script refuses
+# with exit 2. It does not stop a daemon, because a host without systemd cannot
+# start that daemon again. When none of them is running, the script steps the
+# clock 2 min and checks that the step is still there. If the clock is put back,
+# the script refuses with exit 2. The trap sets the clock back after a real run.
 #
 # PASS lines, in order:
 #   DoD f passed.
@@ -51,6 +52,16 @@ for ntp_name in chronyd ntpd systemd-timesyncd; do
   fi
 done
 echo "ntp none"
+# A hypervisor can put the clock back within a second. The proof needs the step to stay.
+clock_before=$(date +%s)
+date -u -s "+2 min" >/dev/null
+sleep 0.4
+clock_after=$(date +%s)
+if [[ $((clock_after - clock_before)) -lt 60 ]]; then
+  echo "The clock did not stay stepped. Something other than chronyd, ntpd, or systemd-timesyncd put it back within 1 s. This proof cannot run on this host."
+  exit 2
+fi
+date -u -s "-2 min" >/dev/null
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
 bin="${ORBLX_BIN:-$root/target/release/orblx}"
