@@ -224,6 +224,10 @@ pub struct OidcIdClaims {
     pub email_verified: bool,
     /// The token expiry as Unix seconds.
     pub expires_at: u64,
+    /// The verified `iss` claim. This is the token issuer, not a configured alias.
+    pub issuer: String,
+    /// The verified `nonce` claim. `None` means the token has no nonce.
+    pub nonce: Option<String>,
 }
 
 /// Signing keys from one JWKS document.
@@ -378,6 +382,8 @@ impl OidcJwks {
             email,
             email_verified: claims.email_verified == Some(true),
             expires_at: claims.exp,
+            issuer: claims.iss,
+            nonce: claims.nonce,
         })
     }
 }

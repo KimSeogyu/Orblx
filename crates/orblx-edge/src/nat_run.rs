@@ -1166,6 +1166,7 @@ impl Hub {
             svid: self.svid.clone(),
             svid_expiry: self.svid_expiry.load(Ordering::Relaxed),
             exit_node: None,
+            reauth: None,
             peers: vec![StatusPeer {
                 name: self.peer_name.clone(),
                 overlay_ip: self.peer_overlay.to_string(),
@@ -1187,6 +1188,7 @@ fn starting_status(config: &NatConfig) -> NodeStatus {
         svid: config.svid.clone(),
         svid_expiry: config.svid_expiry,
         exit_node: None,
+        reauth: None,
         peers: vec![StatusPeer {
             name: config.peer_name.clone(),
             overlay_ip: config.peer_overlay.to_string(),

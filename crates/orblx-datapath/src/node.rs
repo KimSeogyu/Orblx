@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use orblx_identity::{decode_certificate_pem, extract_spiffe_id, leaf_validity, DenySet, SpiffeId};
+use orblx_identity::{
+    decode_certificate_pem, extract_spiffe_id, leaf_validity, DenySet, SpiffeId, MAX_SKEW,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -260,6 +262,8 @@ pub struct NodeStatus {
     pub svid_expiry: u64,
     /// The selected exit node. `None` means this node does not use one.
     pub exit_node: Option<String>,
+    /// The owner command when the leaf is past its grace. `None` means the leaf is current.
+    pub reauth: Option<String>,
     /// One entry for each peer.
     pub peers: Vec<StatusPeer>,
 }
@@ -277,6 +281,8 @@ struct NodeView {
     exit_node: Option<String>,
     not_before: AtomicU64,
     not_after: AtomicU64,
+    reauth_logged: AtomicBool,
+    reauth_command: Mutex<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -295,6 +301,8 @@ struct LiveLink {
     cancel: watch::Sender<bool>,
     generation: u64,
     ask_rekey: watch::Sender<u64>,
+    peer_key_id: String,
+    ticket_nonces: Vec<String>,
 }
 
 /// A link that a newer session for the same peer replaced (W25-11).
@@ -304,6 +312,8 @@ struct LiveLink {
 struct RetiredLink {
     peer: String,
     cancel: watch::Sender<bool>,
+    peer_key_id: String,
+    ticket_nonces: Vec<String>,
 }
 
 /// The status file writer (W25-11).
@@ -461,6 +471,9 @@ pub fn format_node_status(status: &NodeStatus) -> String {
     );
     if let Some(name) = &status.exit_node {
         text.push_str(&format!("exit_node {name}\n"));
+    }
+    if let Some(command) = &status.reauth {
+        text.push_str(&format!("reauth {command}\n"));
     }
     for peer in peers {
         let expiry = match peer.svid_expiry {
@@ -1117,6 +1130,8 @@ fn local_view(request: &NodeRequest) -> Result<NodeView, HelloError> {
         exit_node: None,
         not_before: AtomicU64::new(not_before),
         not_after: AtomicU64::new(not_after),
+        reauth_logged: AtomicBool::new(false),
+        reauth_command: Mutex::new(None),
     })
 }
 
@@ -1495,29 +1510,38 @@ fn close_denied_links_body(mesh: &Mesh, deny: &DenySet) {
         .collect();
     let links = lock(&mesh.links);
     for (name, link) in links.iter() {
-        let Some(svid) = svids.get(name.as_str()) else {
-            continue;
-        };
-        let Ok(id) = SpiffeId::parse(svid) else {
-            continue;
-        };
-        if deny.reject_uri(&id).is_err() && !*link.cancel.borrow() {
+        let uri_denied = svids
+            .get(name.as_str())
+            .and_then(|svid| SpiffeId::parse(svid).ok())
+            .is_some_and(|id| deny.reject_uri(&id).is_err());
+        let crypto_denied = session_crypto_denied(deny, &link.peer_key_id, &link.ticket_nonces);
+        if (uri_denied || crypto_denied) && !*link.cancel.borrow() {
             println!("The peer {name} is in the deny list. The node closes the session.");
             let _ = link.cancel.send(true);
         }
     }
     drop(links);
     for retired in lock(&mesh.retired).values() {
-        let Some(svid) = svids.get(retired.peer.as_str()) else {
-            continue;
-        };
-        let Ok(id) = SpiffeId::parse(svid) else {
-            continue;
-        };
-        if deny.reject_uri(&id).is_err() {
+        let crypto_denied =
+            session_crypto_denied(deny, &retired.peer_key_id, &retired.ticket_nonces);
+        let uri_denied = svids
+            .get(retired.peer.as_str())
+            .and_then(|svid| SpiffeId::parse(svid).ok())
+            .is_some_and(|id| deny.reject_uri(&id).is_err());
+        if uri_denied || crypto_denied {
             let _ = retired.cancel.send(true);
         }
     }
+}
+
+fn session_crypto_denied(deny: &DenySet, key_id: &str, nonces: &[String]) -> bool {
+    let now_unix = host_unix();
+    if !key_id.is_empty() && deny.reject_leaf_key_hex(key_id, now_unix).is_err() {
+        return true;
+    }
+    nonces
+        .iter()
+        .any(|nonce| deny.reject_nonce_hex(nonce).is_err())
 }
 
 /// Close the open mesh sessions of each node with a new revoked SSH certificate (W25-31).
@@ -1714,6 +1738,13 @@ async fn dial_ready(
         }
         // The local ticket or the local certificate is already past.
         // Wait for a renewal, or use the slow dial pause. Do not redial at once.
+        if past_reauth_grace(host_unix(), mesh.node.not_after.load(Ordering::Relaxed)) {
+            note_needs_reauth(mesh);
+            if !sleep_retry(mesh, RENEW_REALTIME_POLL).await {
+                return None;
+            }
+            continue;
+        }
         if local_credential_past(mesh) {
             tr!(
                 "{} dial_hold reason=local_credential_past peer={}",
@@ -2039,6 +2070,8 @@ async fn run_link(
                 cancel: cancel_tx,
                 generation,
                 ask_rekey: ask_tx,
+                peer_key_id: session.peer_key_id().to_string(),
+                ticket_nonces: session.ticket_nonces().to_vec(),
             },
         ) {
             // Make before break (W25-11): the new session carries new packets now.
@@ -2054,6 +2087,8 @@ async fn run_link(
                 RetiredLink {
                     peer: name.clone(),
                     cancel: old.cancel,
+                    peer_key_id: old.peer_key_id,
+                    ticket_nonces: old.ticket_nonces,
                 },
             );
         }
@@ -2467,6 +2502,12 @@ fn status_text(node: &NodeView, peers: &Mutex<Vec<PeerView>>, state: &str) -> St
         }
         peers.clone()
     };
+    let reauth = lock(&node.reauth_command).clone();
+    let state = if reauth.is_some() {
+        "needs-reauth"
+    } else {
+        state
+    };
     let status = NodeStatus {
         state: state.to_string(),
         name: node.name.clone(),
@@ -2474,6 +2515,7 @@ fn status_text(node: &NodeView, peers: &Mutex<Vec<PeerView>>, state: &str) -> St
         svid: node.svid.clone(),
         svid_expiry: node.not_after.load(Ordering::Relaxed),
         exit_node: node.exit_node.clone(),
+        reauth,
         peers: peers
             .iter()
             .map(|peer| StatusPeer {
@@ -2548,6 +2590,20 @@ async fn renew_loop(mesh: Mesh, renewer: SvidRenewer) {
 
 async fn renew_loop_with_clock(mut mesh: Mesh, renewer: SvidRenewer, clock: RenewClock) {
     loop {
+        if stopped(&mesh) {
+            return;
+        }
+        if past_reauth_grace(clock.unix(), mesh.node.not_after.load(Ordering::Relaxed)) {
+            note_needs_reauth(&mesh);
+            if try_disk_leaf(&mesh) {
+                publish(&mesh.status, &mesh.node, &mesh.peers, "up");
+                continue;
+            }
+            if !sleep_retry(&mut mesh, RENEW_REALTIME_POLL).await {
+                return;
+            }
+            continue;
+        }
         if !wait_until_renew_due(&mut mesh, &clock).await {
             return;
         }
@@ -2555,6 +2611,9 @@ async fn renew_loop_with_clock(mut mesh: Mesh, renewer: SvidRenewer, clock: Rene
         loop {
             if stopped(&mesh) {
                 return;
+            }
+            if past_reauth_grace(clock.unix(), mesh.node.not_after.load(Ordering::Relaxed)) {
+                break;
             }
             tr!("{} renew_start", mesh.node.name);
             let renewer = renewer.clone();
@@ -2665,7 +2724,57 @@ fn apply_leaf(mesh: &Mesh, leaf: &RenewedLeaf) -> Result<u64, HelloError> {
     }
     mesh.node.not_before.store(not_before, Ordering::Relaxed);
     mesh.node.not_after.store(not_after, Ordering::Relaxed);
+    mesh.node.reauth_logged.store(false, Ordering::Relaxed);
+    *lock(&mesh.node.reauth_command) = None;
     Ok(not_after)
+}
+
+fn past_reauth_grace(now_unix: u64, not_after: u64) -> bool {
+    now_unix > not_after.saturating_add(MAX_SKEW.as_secs())
+}
+
+fn note_needs_reauth(mesh: &Mesh) {
+    let command = format!("orblx login --name {}", mesh.node.name);
+    if !mesh.node.reauth_logged.swap(true, Ordering::Relaxed) {
+        eprintln!("The node must sign in again. {command}");
+    }
+    *lock(&mesh.node.reauth_command) = Some(command);
+    publish(&mesh.status, &mesh.node, &mesh.peers, "needs-reauth");
+}
+
+fn try_disk_leaf(mesh: &Mesh) -> bool {
+    let cert_path = ["node.crt.pem", "cert.pem"]
+        .into_iter()
+        .map(|name| mesh.state_dir.join(name))
+        .find(|path| path.exists());
+    let Some(cert_path) = cert_path else {
+        return false;
+    };
+    let Ok(certificate_pem) = fs::read_to_string(&cert_path) else {
+        return false;
+    };
+    let Ok(private_key_pem) = fs::read_to_string(mesh.state_dir.join("key.pem")) else {
+        return false;
+    };
+    let current = lock(&mesh.identity);
+    if certificate_pem == current.certificate_pem && private_key_pem == current.private_key_pem {
+        return false;
+    }
+    drop(current);
+    let ticket = read_disk_ticket(mesh);
+    let leaf = RenewedLeaf {
+        certificate_pem,
+        private_key_pem,
+        ticket,
+    };
+    apply_leaf(mesh, &leaf).is_ok()
+}
+
+fn read_disk_ticket(mesh: &Mesh) -> Option<RenewedTicket> {
+    let bytes = fs::read(mesh.state_dir.join("ticket.bin")).ok()?;
+    let mac_bytes = fs::read(mesh.state_dir.join("ticket.bin.mac")).ok()?;
+    let mac = <[u8; 32]>::try_from(mac_bytes.as_slice()).ok()?;
+    Some(RenewedTicket { bytes, mac })
 }
 
 fn signal_rekey(mesh: &Mesh) {
@@ -3258,7 +3367,7 @@ mod tests {
     use std::fs;
     use std::net::SocketAddr;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -3427,6 +3536,86 @@ mod tests {
         eprintln!("crash rounds 20, kills after the first rename {kills_with_record}");
     }
 
+    #[tokio::test]
+    async fn a_wall_step_past_grace_stops_renew_and_names_the_login_command() {
+        let life = 900u64;
+        let renewal = open_renewal(
+            "reauth-wall",
+            life,
+            RENEW_BASE,
+            RenewPlan::Authorized { ttl: life },
+        )
+        .await;
+        renewal.now.set(RENEW_BASE + life + 61);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut text;
+        loop {
+            text = fs::read_to_string(renewal.dir.join("status.txt")).unwrap_or_default();
+            if text.contains("state needs-reauth") && text.contains("reauth orblx login --name a") {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("status was {text}");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(renewal.attempts.load(Ordering::Relaxed), 0);
+        let ca = MiniCa::generate(at(RENEW_BASE)).unwrap();
+        let issued = issue(
+            &ca,
+            &SpiffeId::node("a").unwrap(),
+            RENEW_BASE + life + 61,
+            life,
+        );
+        fs::write(renewal.dir.join("cert.pem"), &issued.certificate_pem).unwrap();
+        fs::write(renewal.dir.join("key.pem"), &issued.private_key_pem).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let end = renewal.mesh.node.not_after.load(Ordering::Relaxed);
+            if end == issued.not_after {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("leaf end stayed {end}");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(renewal.attempts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn an_open_peer_session_closes_when_the_leaf_key_is_denied() {
+        let renewal = open_renewal("reauth-close", 900, RENEW_BASE, RenewPlan::Fail).await;
+        let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (ask, _ask_rx) = tokio::sync::watch::channel(0u64);
+        let key = "ab".repeat(32);
+        let nonce = "cd".repeat(16);
+        {
+            let mut links = super::lock(&renewal.mesh.links);
+            links.insert(
+                "peer".to_string(),
+                super::LiveLink {
+                    tx,
+                    cancel,
+                    generation: 1,
+                    ask_rekey: ask,
+                    peer_key_id: key.clone(),
+                    ticket_nonces: vec![nonce.clone()],
+                },
+            );
+        }
+        let mut deny = DenySet::empty();
+        let doc = format!(
+            r#"{{"version":1,"generated_at":1,"revoked_uris":[],"revoked_ticket_nonces":["{nonce}"],"revoked_leaf_keys":[{{"key_id":"{key}","not_after":4000000000}}]}}"#
+        );
+        deny.apply_json(doc.as_bytes()).unwrap();
+        let started = std::time::Instant::now();
+        super::close_denied_links(&renewal.mesh, &deny);
+        assert!(*cancel_rx.borrow());
+        assert!(started.elapsed() < Duration::from_millis(1000));
+    }
+
     #[test]
     fn status_text_lists_each_peer_path_and_expiry() {
         let text = format_node_status(&NodeStatus {
@@ -3436,6 +3625,7 @@ mod tests {
             svid: "spiffe://orblx.local/node/a".to_string(),
             svid_expiry: 100,
             exit_node: None,
+            reauth: None,
             peers: vec![
                 StatusPeer {
                     name: "c".to_string(),
@@ -3561,6 +3751,7 @@ mod tests {
             svid: "spiffe://orblx.local/node/a".to_string(),
             svid_expiry: 100,
             exit_node: None,
+            reauth: None,
             peers: vec![StatusPeer {
                 name: "b".to_string(),
                 overlay_ip: "100.64.0.2".to_string(),
@@ -3754,6 +3945,8 @@ mod tests {
                 exit_node: None,
                 not_before: AtomicU64::new(issued.not_before),
                 not_after: AtomicU64::new(issued.not_after),
+                reauth_logged: AtomicBool::new(false),
+                reauth_command: Mutex::new(None),
             }),
             links: Arc::new(Mutex::new(std::collections::HashMap::new())),
             retired: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -4032,13 +4225,21 @@ mod tests {
             RenewPlan::Authorized { ttl: 9 },
         )
         .await;
-        until_done(&renewal, 1).await;
-        assert_eq!(renewal.done.load(Ordering::Relaxed), 1);
-        assert_eq!(expiry(&renewal), not_after, "{}", note(&renewal));
-        assert_eq!(
-            note(&renewal),
-            "The leaf is outside the authorization window."
-        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let text = fs::read_to_string(renewal.dir.join("status.txt")).unwrap_or_default();
+            if text.contains("state needs-reauth") && text.contains("reauth orblx login --name a") {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("status was {text}");
+            }
+            tokio::task::yield_now().await;
+        }
+        step(2).await;
+        assert_eq!(renewal.done.load(Ordering::Relaxed), 0);
+        assert_eq!(renewal.attempts.load(Ordering::Relaxed), 0);
+        assert_eq!(expiry(&renewal), not_after);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

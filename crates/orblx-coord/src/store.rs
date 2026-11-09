@@ -131,6 +131,27 @@ struct NodeRecord {
     /// The only grant this pre-auth node may receive.
     #[serde(default)]
     grant_bound: Option<NodeGrantBound>,
+    /// Live leaf keys. `None` means the field is absent (a pre-rc.3 record).
+    /// `Some` empty means a prune removed every entry. That is not absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    live_leaf_keys: Option<Vec<LiveLeafKey>>,
+    /// Live ticket nonces. `None` means the field is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    live_ticket_nonces: Option<Vec<LiveTicketNonce>>,
+}
+
+/// One live leaf key id and the certificate end time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveLeafKey {
+    pub key_id: String,
+    pub not_after: u64,
+}
+
+/// One live ticket nonce and the ticket end time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveTicketNonce {
+    pub nonce: String,
+    pub expires: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +225,8 @@ pub struct StoredNode {
     pub preauth_actor: String,
     pub auth_expires_unix_ms: u64,
     pub grant_bound: Option<NodeGrantBound>,
+    pub live_leaf_keys: Option<Vec<LiveLeafKey>>,
+    pub live_ticket_nonces: Option<Vec<LiveTicketNonce>>,
 }
 
 impl NodeStore {
@@ -586,6 +609,8 @@ impl NodeStore {
                 .map(|item| item.auth_expires_unix_ms)
                 .unwrap_or(0),
             grant_bound: stamp.and_then(|item| item.grant_bound),
+            live_leaf_keys: None,
+            live_ticket_nonces: None,
         };
         let stored = stored_node(&node);
         self.disk.nodes.push(node);
@@ -726,6 +751,86 @@ impl NodeStore {
         })
     }
 
+    /// Replace the live leaf list and the live ticket list, then store the record.
+    pub(crate) fn set_live_lists(
+        &mut self,
+        name: &str,
+        keys: Option<Vec<LiveLeafKey>>,
+        nonces: Option<Vec<LiveTicketNonce>>,
+    ) -> Result<(), CoordError> {
+        let node = self
+            .disk
+            .nodes
+            .iter_mut()
+            .find(|node| node.name == name)
+            .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        node.live_leaf_keys = keys;
+        node.live_ticket_nonces = nonces;
+        self.persist()
+    }
+
+    /// Store the one key and the one nonce from a new enrollment.
+    pub(crate) fn remember_issued(
+        &mut self,
+        name: &str,
+        key: LiveLeafKey,
+        nonce: LiveTicketNonce,
+    ) -> Result<(), CoordError> {
+        self.set_live_lists(name, Some(vec![key]), Some(vec![nonce]))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_enrolled_unix(&mut self, name: &str, unix: u64) -> Result<(), CoordError> {
+        let node = self
+            .disk
+            .nodes
+            .iter_mut()
+            .find(|node| node.name == name)
+            .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        node.enrolled_unix = unix;
+        self.persist()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_removed_flag(&mut self, name: &str, removed: bool) -> Result<(), CoordError> {
+        let node = self
+            .disk
+            .nodes
+            .iter_mut()
+            .find(|node| node.name == name)
+            .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        node.removed = removed;
+        self.persist()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_tags(&mut self, name: &str, tags: Vec<String>) -> Result<(), CoordError> {
+        let node = self
+            .disk
+            .nodes
+            .iter_mut()
+            .find(|node| node.name == name)
+            .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        node.tags = tags;
+        self.persist()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_grant_bound(
+        &mut self,
+        name: &str,
+        grant: Option<NodeGrantBound>,
+    ) -> Result<(), CoordError> {
+        let node = self
+            .disk
+            .nodes
+            .iter_mut()
+            .find(|node| node.name == name)
+            .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        node.grant_bound = grant;
+        self.persist()
+    }
+
     fn persist(&self) -> Result<(), CoordError> {
         let text = serde_json::to_string_pretty(&self.disk).map_err(|_| CoordError::State)?;
         if text.contains("PRIVATE KEY") || text.contains(TOKEN_PREFIX) {
@@ -765,6 +870,8 @@ fn stored_node(node: &NodeRecord) -> StoredNode {
         preauth_actor: node.preauth_actor.clone(),
         auth_expires_unix_ms: node.auth_expires_unix_ms,
         grant_bound: node.grant_bound.clone(),
+        live_leaf_keys: node.live_leaf_keys.clone(),
+        live_ticket_nonces: node.live_ticket_nonces.clone(),
     }
 }
 

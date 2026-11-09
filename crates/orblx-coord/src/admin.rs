@@ -17,17 +17,25 @@ use orblx_identity::{DenySet, SpiffeId, WorkloadKind};
 use serde_json::{json, Value};
 
 use crate::error::CoordError;
-use crate::files::{read_text, write_text};
+use crate::files::{read_text, write_durable, write_text};
 use crate::state::Coordinator;
 
 const DENY_FILE: &str = "deny.json";
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct DenyFile {
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub(crate) struct DenyFile {
     version: u64,
     generated_at: u64,
     revoked_uris: Vec<String>,
     revoked_ticket_nonces: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    revoked_leaf_keys: Vec<RevokedLeafKey>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub(crate) struct RevokedLeafKey {
+    pub key_id: String,
+    pub not_after: u64,
 }
 
 impl DenyFile {
@@ -37,7 +45,52 @@ impl DenyFile {
             generated_at: unix_now(now).unwrap_or(0),
             revoked_uris: Vec::new(),
             revoked_ticket_nonces: Vec::new(),
+            revoked_leaf_keys: Vec::new(),
         }
+    }
+
+    pub(crate) fn add_leaf(&mut self, key_id: &str, not_after: u64, now_unix: u64) {
+        if now_unix > not_after.saturating_add(60) {
+            return;
+        }
+        if self
+            .revoked_leaf_keys
+            .iter()
+            .any(|item| item.key_id == key_id)
+        {
+            return;
+        }
+        self.revoked_leaf_keys.push(RevokedLeafKey {
+            key_id: key_id.to_string(),
+            not_after,
+        });
+    }
+
+    pub(crate) fn add_nonce(&mut self, nonce: &str, expires: u64, now_unix: u64) {
+        if now_unix > expires {
+            return;
+        }
+        if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return;
+        }
+        if self.revoked_ticket_nonces.iter().any(|item| item == nonce) {
+            return;
+        }
+        self.revoked_ticket_nonces.push(nonce.to_string());
+    }
+
+    pub(crate) fn prune_leaves(&mut self, now_unix: u64) {
+        self.revoked_leaf_keys
+            .retain(|item| now_unix <= item.not_after.saturating_add(60));
+    }
+
+    pub(crate) fn bump(&mut self, now_unix: u64) {
+        self.version = self.version.saturating_add(1);
+        self.generated_at = now_unix;
+        self.revoked_uris.sort();
+        self.revoked_ticket_nonces.sort();
+        self.revoked_leaf_keys
+            .sort_by(|left, right| left.key_id.cmp(&right.key_id));
     }
 
     fn to_json(&self) -> Result<String, CoordError> {
@@ -601,13 +654,36 @@ pub(crate) fn push_deny(
             file.revoked_ticket_nonces.push(nonce.clone());
         }
     }
-    file.revoked_uris.sort();
-    file.revoked_ticket_nonces.sort();
-    file.version = file.version.saturating_add(1);
-    file.generated_at = unix_now(now)?;
-    let text = file.to_json()?;
-    write_text(&coord.state_dir()?.join(DENY_FILE), &text, 0o644)?;
+    let now_unix = unix_now(now)?;
+    file.prune_leaves(now_unix);
+    file.bump(now_unix);
+    let dir = coord.state_dir()?;
+    let text = store_deny_file(&dir, &file)?;
+    let set = DenySet::from_json(text.as_bytes()).map_err(|_| CoordError::State)?;
+    coord.publish_deny(set)?;
     Ok(file.version)
+}
+
+/// Read `deny.json`. A missing file is an empty document.
+pub(crate) fn load_deny_file(
+    dir: &std::path::Path,
+    now: SystemTime,
+) -> Result<DenyFile, CoordError> {
+    let path = dir.join(DENY_FILE);
+    if !path.exists() {
+        return Ok(DenyFile::empty(now));
+    }
+    serde_json::from_str(&read_text(&path)?).map_err(|_| CoordError::State)
+}
+
+/// Store `deny.json` with the atomic writer. The caller updates the deny cache.
+pub(crate) fn store_deny_file(
+    dir: &std::path::Path,
+    file: &DenyFile,
+) -> Result<String, CoordError> {
+    let text = file.to_json()?;
+    write_durable(&dir.join(DENY_FILE), text.as_bytes(), 0o644)?;
+    Ok(text)
 }
 
 /// Return the revoked SPIFFE URIs in the deny file of one state directory (W25-31).

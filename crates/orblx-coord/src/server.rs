@@ -46,7 +46,8 @@ pub async fn spawn(
     coord.enable_config_audit()?;
     crate::webhook::start(coord);
     let material = coord.tls_material()?;
-    let (endpoint, live) = tlsutil::server_endpoint(&material, listen)?;
+    let deny = coord.deny_handle()?;
+    let (endpoint, live) = tlsutil::server_endpoint_with_deny(&material, listen, deny)?;
     let addr = endpoint.local_addr().map_err(CoordError::io)?;
     println!("coord svid expiry {}", live.not_after());
     let cert_coord = coord.clone();
@@ -586,13 +587,22 @@ async fn dispatch(
                     &request.routes,
                     now,
                 )?,
-                (Some(token), None, false) => coord.enroll_token(
-                    &request.name,
-                    token,
-                    &request.endpoints,
-                    &request.routes,
-                    now,
-                )?,
+                (Some(token), None, false) => {
+                    match coord.enroll_token(
+                        &request.name,
+                        token,
+                        &request.endpoints,
+                        &request.routes,
+                        now,
+                    ) {
+                        Ok(result) => result,
+                        Err(CoordError::Exists) => {
+                            coord.reauth_deny_exists_token(&request.name)?;
+                            return Err(CoordError::Exists);
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
                 (None, Some(id_token), false) => {
                     if coord.google_client_id_for_fetch()?.is_some() {
                         warm_jwks(coord).await;
@@ -601,14 +611,23 @@ async fn dispatch(
                     if let Some(plan) = coord.issuer_fetch_plan(kid.as_deref(), now)? {
                         refresh_issuer_jwks(coord, plan).await;
                     }
-                    coord.enroll_oidc(
+                    match coord.enroll_oidc(
                         &request.name,
                         id_token,
                         request.nonce.as_deref(),
                         &request.endpoints,
                         &request.routes,
                         now,
-                    )?
+                    ) {
+                        Ok(result) => result,
+                        Err(CoordError::Exists) => coord.reauth_oidc(
+                            &request.name,
+                            id_token,
+                            request.nonce.as_deref(),
+                            now,
+                        )?,
+                        Err(err) => return Err(err),
+                    }
                 }
                 _ => {
                     return Err(CoordError::Protocol(
@@ -625,7 +644,10 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
-            let result = coord.renew_node(&request.name, now)?;
+            let der = peer_leaf_der(connection)?;
+            let key_id = orblx_identity::leaf_key_id(&der).map_err(|_| CoordError::Peer)?;
+            let not_after = orblx_identity::leaf_not_after(&der).map_err(|_| CoordError::Peer)?;
+            let result = coord.renew_node(&request.name, &key_id, not_after, now)?;
             println!("renewed {}", result.name);
             Ok(leaf_response(result))
         }
@@ -1075,6 +1097,19 @@ fn peer_node(coord: &Coordinator, connection: &quinn::Connection) -> Result<Stri
     Ok(name)
 }
 
+fn peer_leaf_der(connection: &quinn::Connection) -> Result<Vec<u8>, CoordError> {
+    let Some(identity) = connection.peer_identity() else {
+        return Err(CoordError::Peer);
+    };
+    let chain = identity
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .map_err(|_| CoordError::Peer)?;
+    let Some(leaf) = chain.first() else {
+        return Err(CoordError::Peer);
+    };
+    Ok(leaf.as_ref().to_vec())
+}
+
 fn peer_id(
     coord: &Coordinator,
     connection: &quinn::Connection,
@@ -1090,7 +1125,11 @@ fn peer_id(
     };
     let material = coord.tls_material()?;
     let trust = TrustBundle::from_pem(&material.trust_pem)?;
-    let deny = admin::deny_set(coord, SystemTime::now())?;
+    let handle = coord.deny_handle()?;
+    let deny = handle
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
     let id = trust.authenticate_leaf(leaf.as_ref(), SystemTime::now(), &deny)?;
     if id.kind() != WorkloadKind::Node && id.kind() != WorkloadKind::User {
         return Err(CoordError::Peer);

@@ -40,6 +40,19 @@ pub fn write_text(path: &Path, text: &str, mode: u32) -> Result<(), CoordError> 
     write_bytes(path, text.as_bytes(), mode)
 }
 
+/// Write one file with the #136 steps: temp file, fsync, rename, directory fsync.
+pub fn write_durable(path: &Path, bytes: &[u8], mode: u32) -> Result<(), CoordError> {
+    write_bytes(path, bytes, mode)?;
+    if let Some(parent) = path.parent() {
+        if parent.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let dir = fs::File::open(parent).map_err(CoordError::io)?;
+        dir.sync_all().map_err(CoordError::io)?;
+    }
+    Ok(())
+}
+
 pub fn read_text(path: &Path) -> Result<String, CoordError> {
     fs::read_to_string(path).map_err(CoordError::io)
 }

@@ -192,6 +192,12 @@ impl PeerGate {
         Ok(hash)
     }
 
+    /// Return the admitted ticket bytes.
+    #[must_use]
+    pub fn admitted_bytes(&self) -> Option<&[u8]> {
+        self.admitted.as_ref().map(|ticket| ticket.bytes.as_slice())
+    }
+
     /// Return the peer or reject the DATA path.
     pub fn require_bound(&self) -> Result<&SpiffeId, HelloError> {
         self.peer.as_ref().ok_or(HelloError::PeerNotBound)

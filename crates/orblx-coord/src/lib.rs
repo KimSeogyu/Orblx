@@ -18,6 +18,9 @@ mod client;
 mod config;
 mod error;
 mod preauth;
+mod reauth;
+#[cfg(test)]
+mod reauth_test;
 
 mod files;
 mod http_util;

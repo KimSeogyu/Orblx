@@ -46,8 +46,8 @@ mod user_approval;
 
 pub use ca::{IssuedSvid, MiniCa};
 pub use cert::{
-    decode_certificate_pem, decode_certificate_pem_file, extract_spiffe_id, leaf_not_after,
-    leaf_validity, TrustBundle,
+    decode_certificate_pem, decode_certificate_pem_file, extract_spiffe_id, leaf_key_id,
+    leaf_not_after, leaf_validity, TrustBundle,
 };
 pub use clock::{MAX_AGENT_TTL, MAX_SKEW, MAX_USER_TTL};
 pub use deny::{DenyApply, DenySet};
@@ -63,7 +63,7 @@ pub use google::{
     OIDC_MODE_ENV,
 };
 pub use issuer::{token_kid, OidcIdClaims, OidcIssuer, OidcJwks, OidcReject, DISCOVERY_PATH};
-pub use oidc::{AgentSvid, IssueGate, MockOidc, MOCK_OIDC_ISSUER, OIDC_AUDIENCE};
+pub use oidc::{AgentSvid, IssueGate, MockOidc, VerifiedLogin, MOCK_OIDC_ISSUER, OIDC_AUDIENCE};
 pub use policy::{
     Policy, PolicyAssertion, PolicyError, ReceiverGrant, ReceiverGrants, SplitDnsZone,
     SshAssertion, SubnetGrant,
@@ -97,9 +97,9 @@ pub use share::{rules_without_shares, Share, ShareGuest};
 pub use sink::{parse_https_url, AuditSink, SinkFormat, SinkTarget, MAX_AUDIT_SINKS};
 pub use spiffe::{SpiffeId, WorkloadKind, TRUST_DOMAIN};
 pub use ticket::{
-    allow_agent_jit, sign_agent_jit_ticket, sign_ticket, ticket_hash, verify_ticket,
-    Ipv4Destination, SignedTicket, TicketClaims, TicketFlags, TicketSigner, TicketVerifier,
-    VerifiedTicket, FLAG_AGENT_JIT, FLAG_ONE_SHOT,
+    allow_agent_jit, sign_agent_jit_ticket, sign_ticket, ticket_hash, ticket_nonce_and_expiry,
+    verify_ticket, Ipv4Destination, SignedTicket, TicketClaims, TicketFlags, TicketSigner,
+    TicketVerifier, VerifiedTicket, FLAG_AGENT_JIT, FLAG_ONE_SHOT,
 };
 pub use user_approval::UserApproval;
 

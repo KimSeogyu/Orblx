@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_audit::{
@@ -181,6 +181,8 @@ struct Inner {
     /// Ed25519 signatures are deterministic. The same key and the same endpoint give the same
     /// signature, so the coordinator signs each endpoint one time.
     endpoint_sigs: RefCell<HashMap<(String, String), SignedEndpoint>>,
+    /// The in-memory deny set. Handshake and `peer_id` read this cache.
+    deny: Arc<RwLock<DenySet>>,
 }
 
 /// The time after which the coordinator reads a state file again, also when its metadata
@@ -453,6 +455,8 @@ impl Coordinator {
                 attempted_at: None,
             })),
         };
+        crate::reauth::ensure_rc3_start(dir, now)?;
+        let deny = Arc::new(RwLock::new(crate::reauth::load_deny_or_refuse(dir)));
         let coord = Self {
             inner: Arc::new(Mutex::new(Inner {
                 state_dir: dir.to_path_buf(),
@@ -482,6 +486,7 @@ impl Coordinator {
                 lock_loaded: None,
                 views: ViewCache::default(),
                 endpoint_sigs: RefCell::new(HashMap::new()),
+                deny: Arc::clone(&deny),
             })),
         };
         {
@@ -536,20 +541,141 @@ impl Coordinator {
     ///
     /// The overlay address does not change.
     /// The caller must not log `private_key_pem`.
-    pub fn renew_node(&self, name: &str, now: SystemTime) -> Result<EnrollResult, CoordError> {
+    /// The presenting key id must be live, except when `live_leaf_keys` is absent.
+    pub fn renew_node(
+        &self,
+        name: &str,
+        presenting_key_id: &str,
+        presenting_not_after: u64,
+        now: SystemTime,
+    ) -> Result<EnrollResult, CoordError> {
+        let _ = SpiffeId::node(name)?;
+        crate::reauth::renew_hook();
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        renew_locked(
+            &mut inner,
+            name,
+            presenting_key_id,
+            presenting_not_after,
+            now,
+        )
+    }
+
+    /// True when `name` already has a node record.
+    pub(crate) fn node_enrolled(&self, name: &str) -> Result<bool, CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        Ok(inner.store.nodes().iter().any(|node| node.name == name))
+    }
+
+    pub(crate) fn deny_handle(&self) -> Result<Arc<RwLock<DenySet>>, CoordError> {
+        Ok(Arc::clone(&self.lock()?.deny))
+    }
+
+    pub(crate) fn publish_deny(&self, set: DenySet) -> Result<(), CoordError> {
+        let inner = self.lock()?;
+        *inner
+            .deny
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = set;
+        Ok(())
+    }
+
+    /// Re-auth one enrolled node with an OIDC ID token.
+    pub(crate) fn reauth_oidc(
+        &self,
+        name: &str,
+        id_token: &str,
+        nonce: Option<&str>,
+        now: SystemTime,
+    ) -> Result<EnrollResult, CoordError> {
         let _ = SpiffeId::node(name)?;
         let mut inner = self.lock()?;
         reload(&mut inner)?;
-        let node = inner
+        let login = owner_from_oidc(&inner.oidc, id_token, nonce, now)?;
+        reauth_locked(
+            &mut inner,
+            name,
+            ReauthSource::Oidc {
+                issuer: login.issuer,
+                subject: login.subject,
+                nonce: login.nonce,
+                expires: login.expires_at,
+            },
+            now,
+        )
+    }
+
+    /// Re-auth one enrolled node with a pre-auth key.
+    ///
+    /// The caller holds the pre-auth file lock. This function does not take it again.
+    pub(crate) fn reauth_preauth(
+        &self,
+        name: &str,
+        facts: crate::reauth::PreauthFacts,
+        now: SystemTime,
+    ) -> Result<EnrollResult, CoordError> {
+        let _ = SpiffeId::node(name)?;
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        reauth_locked(&mut inner, name, ReauthSource::Preauth(facts), now)
+    }
+
+    /// Write one `reauth-deny` for a same-name enroll token. The public error stays `Exists`.
+    pub(crate) fn reauth_deny_exists_token(&self, name: &str) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        reload(&mut inner)?;
+        refuse(&mut inner, name, "token", "exists-token")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_set_live_keys(
+        &self,
+        name: &str,
+        keys: Option<Vec<crate::store::LiveLeafKey>>,
+    ) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        let nonces = inner
             .store
             .nodes()
             .into_iter()
             .find(|node| node.name == name)
+            .map(|node| node.live_ticket_nonces)
             .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
-        if node.expired {
-            return Err(CoordError::Protocol("The node key is expired.".to_string()));
-        }
-        issue_leaf(&mut inner, name, now)
+        inner.store.set_live_lists(name, keys, nonces)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_set_enrolled_unix(
+        &self,
+        name: &str,
+        unix: u64,
+    ) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        inner.store.set_enrolled_unix(name, unix)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_set_removed(&self, name: &str, removed: bool) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        inner.store.set_removed_flag(name, removed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_set_tags(&self, name: &str, tags: Vec<String>) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        inner.store.set_tags(name, tags)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_set_grant(
+        &self,
+        name: &str,
+        grant: Option<crate::store::NodeGrantBound>,
+    ) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        inner.store.set_grant_bound(name, grant)
     }
 
     pub fn create_token(&self, ttl: std::time::Duration) -> Result<CreatedToken, CoordError> {
@@ -2296,6 +2422,8 @@ fn finish_enroll(
     )?;
     let view = sign_view(inner, &stored.name)?;
     let ticket = issue_ticket(inner, &stored.name, now)?;
+    let (key, nonce) = crate::reauth::issued_ids(&issued.certificate_pem, &ticket.bytes)?;
+    inner.store.remember_issued(&stored.name, key, nonce)?;
     Ok(EnrollResult {
         name: stored.name,
         overlay_ip: stored.overlay_ip,
@@ -2323,6 +2451,286 @@ fn initial_approved(policy: &Policy, name: &str) -> bool {
         Ok(id) => policy.is_owner(&id),
         Err(_) => false,
     }
+}
+
+enum ReauthSource {
+    Oidc {
+        issuer: String,
+        subject: String,
+        nonce: String,
+        expires: u64,
+    },
+    Preauth(crate::reauth::PreauthFacts),
+}
+
+fn renew_locked(
+    inner: &mut Inner,
+    name: &str,
+    presenting_key_id: &str,
+    presenting_not_after: u64,
+    now: SystemTime,
+) -> Result<EnrollResult, CoordError> {
+    let node = node_of(inner, name)?;
+    if node.expired {
+        return Err(CoordError::Protocol("The node key is expired.".to_string()));
+    }
+    let now_unix = crate::reauth::wall_secs(now)?;
+    let deny = inner
+        .deny
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    if deny
+        .reject_leaf_key_hex(presenting_key_id, now_unix)
+        .is_err()
+    {
+        return Err(CoordError::Protocol("The leaf key is revoked.".to_string()));
+    }
+    let absent = node.live_leaf_keys.is_none();
+    if let Some(keys) = &node.live_leaf_keys {
+        let live = crate::reauth::prune_keys(keys, now_unix);
+        if !live.iter().any(|item| item.key_id == presenting_key_id) {
+            return Err(CoordError::Protocol(
+                "The leaf key is not current.".to_string(),
+            ));
+        }
+    }
+    let result = issue_leaf(inner, name, now)?;
+    store_renewed(
+        inner,
+        name,
+        absent,
+        presenting_key_id,
+        presenting_not_after,
+        &result,
+        now_unix,
+    )?;
+    Ok(result)
+}
+
+fn store_renewed(
+    inner: &mut Inner,
+    name: &str,
+    absent: bool,
+    presenting_key_id: &str,
+    presenting_not_after: u64,
+    result: &EnrollResult,
+    now_unix: u64,
+) -> Result<(), CoordError> {
+    let ticket = result
+        .ticket
+        .as_ref()
+        .ok_or_else(|| CoordError::Protocol("The ticket is missing.".to_string()))?;
+    let (new_key, new_nonce) = crate::reauth::issued_ids(&result.certificate_pem, &ticket.bytes)?;
+    let node = node_of(inner, name)?;
+    let mut keys = if absent {
+        let mut filled = Vec::new();
+        if !presenting_key_id.is_empty() {
+            filled.push(crate::store::LiveLeafKey {
+                key_id: presenting_key_id.to_string(),
+                not_after: presenting_not_after,
+            });
+        }
+        filled
+    } else {
+        crate::reauth::prune_keys(node.live_leaf_keys.as_deref().unwrap_or(&[]), now_unix)
+    };
+    if !keys.iter().any(|item| item.key_id == new_key.key_id) {
+        keys.push(new_key);
+    }
+    let mut nonces = if absent {
+        Vec::new()
+    } else {
+        crate::reauth::prune_nonces(node.live_ticket_nonces.as_deref().unwrap_or(&[]), now_unix)
+    };
+    if !nonces.iter().any(|item| item.nonce == new_nonce.nonce) {
+        nonces.push(new_nonce);
+    }
+    inner.store.set_live_lists(name, Some(keys), Some(nonces))
+}
+
+fn reauth_locked(
+    inner: &mut Inner,
+    name: &str,
+    source: ReauthSource,
+    now: SystemTime,
+) -> Result<EnrollResult, CoordError> {
+    let node = node_of(inner, name)?;
+    let now_unix = crate::reauth::wall_secs(now)?;
+    let deny = inner
+        .deny
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    let uri = node.svid.clone();
+    if node.removed || deny.reject_uri(&SpiffeId::parse(&uri)?).is_err() {
+        refuse(inner, name, actor_of(&source), "revoked")?;
+        return Err(CoordError::Protocol("The re-auth was refused.".to_string()));
+    }
+    if let Err(reason) = source_ok(inner, &node, &source) {
+        refuse(inner, name, actor_of(&source), reason)?;
+        return Err(CoordError::Protocol("The re-auth was refused.".to_string()));
+    }
+    let start = crate::reauth::read_rc3_start(&inner.state_dir)?;
+    if crate::reauth::legacy_wait_blocks(
+        node.live_leaf_keys.is_none(),
+        node.enrolled_unix,
+        start,
+        now_unix,
+    ) {
+        refuse(inner, name, actor_of(&source), "legacy-wait")?;
+        return Err(CoordError::Protocol("The re-auth was refused.".to_string()));
+    }
+    let (authorizer, preauth_id) = match &source {
+        ReauthSource::Oidc {
+            issuer,
+            subject,
+            nonce,
+            expires,
+        } => {
+            let fresh = crate::reauth::take_used_token(
+                &inner.state_dir,
+                issuer,
+                subject,
+                nonce,
+                *expires,
+                now_unix,
+            )?;
+            if !fresh {
+                refuse(inner, name, actor_of(&source), "replay")?;
+                return Err(CoordError::Protocol("The re-auth was refused.".to_string()));
+            }
+            ("oidc", None)
+        }
+        ReauthSource::Preauth(facts) => ("preauth", Some(facts.id.clone())),
+    };
+    let old_keys =
+        crate::reauth::prune_keys(node.live_leaf_keys.as_deref().unwrap_or(&[]), now_unix);
+    let old_nonces =
+        crate::reauth::prune_nonces(node.live_ticket_nonces.as_deref().unwrap_or(&[]), now_unix);
+    let old_ids: Vec<String> = old_keys.iter().map(|item| item.key_id.clone()).collect();
+    write_reauth_deny(inner, &old_keys, &old_nonces, now, now_unix)?;
+    if let Some(id) = &preauth_id {
+        crate::preauth::add_use_held(&inner.state_dir, id)?;
+    }
+    crate::reauth::crash_at(1)?;
+    let result = issue_leaf(inner, name, now)?;
+    let ticket = result
+        .ticket
+        .as_ref()
+        .ok_or_else(|| CoordError::Protocol("The ticket is missing.".to_string()))?;
+    let (new_key, new_nonce) = crate::reauth::issued_ids(&result.certificate_pem, &ticket.bytes)?;
+    let new_id = new_key.key_id.clone();
+    inner
+        .store
+        .set_live_lists(name, Some(vec![new_key]), Some(vec![new_nonce]))?;
+    crate::reauth::crash_at(2)?;
+    let old_text = if old_ids.is_empty() {
+        "none".to_string()
+    } else {
+        old_ids.join(",")
+    };
+    let mut detail = format!("node {uri} old {old_text} new {new_id} authorizer {authorizer}");
+    if let Some(id) = preauth_id {
+        detail.push_str(&format!(" preauth {id}"));
+    }
+    record(
+        inner,
+        actor_of(&source),
+        ConfigAction::Reauth,
+        name,
+        EMPTY_DIGEST,
+        node_digest(inner, name),
+        &detail,
+    )?;
+    Ok(result)
+}
+
+fn write_reauth_deny(
+    inner: &mut Inner,
+    keys: &[crate::store::LiveLeafKey],
+    nonces: &[crate::store::LiveTicketNonce],
+    now: SystemTime,
+    now_unix: u64,
+) -> Result<(), CoordError> {
+    let mut file = crate::admin::load_deny_file(&inner.state_dir, now)?;
+    file.prune_leaves(now_unix);
+    for key in keys {
+        file.add_leaf(&key.key_id, key.not_after, now_unix);
+    }
+    for nonce in nonces {
+        file.add_nonce(&nonce.nonce, nonce.expires, now_unix);
+    }
+    file.bump(now_unix);
+    let text = crate::admin::store_deny_file(&inner.state_dir, &file)?;
+    let set = DenySet::from_json(text.as_bytes()).map_err(|_| CoordError::State)?;
+    *inner
+        .deny
+        .write()
+        .unwrap_or_else(|poison| poison.into_inner()) = set;
+    Ok(())
+}
+
+fn source_ok(inner: &Inner, node: &StoredNode, source: &ReauthSource) -> Result<(), &'static str> {
+    match source {
+        ReauthSource::Oidc { subject, .. } => {
+            if node.owner == format!("oidc:{subject}") {
+                Ok(())
+            } else {
+                Err("owner")
+            }
+        }
+        ReauthSource::Preauth(facts) => {
+            if !facts.nodes.iter().any(|item| item == &node.name) {
+                return Err("scope");
+            }
+            if !node
+                .tags
+                .iter()
+                .all(|tag| facts.tags.iter().any(|item| item == tag))
+            {
+                return Err("scope");
+            }
+            if facts.grant != node.grant_bound {
+                return Err("scope");
+            }
+            if facts.created_by == node.owner || facts.created_by == node.preauth_actor {
+                return Ok(());
+            }
+            match SpiffeId::parse(&facts.created_by) {
+                Ok(id) if inner.policy.is_owner(&id) => Ok(()),
+                _ => Err("owner"),
+            }
+        }
+    }
+}
+
+fn actor_of(source: &ReauthSource) -> &str {
+    match source {
+        ReauthSource::Oidc { .. } => "oidc",
+        ReauthSource::Preauth(facts) => facts.id.as_str(),
+    }
+}
+
+fn refuse(inner: &mut Inner, name: &str, actor: &str, reason: &str) -> Result<(), CoordError> {
+    record(
+        inner,
+        actor,
+        ConfigAction::ReauthDeny,
+        name,
+        EMPTY_DIGEST,
+        EMPTY_DIGEST,
+        &format!("reason {reason}"),
+    )
+}
+
+fn node_of(inner: &Inner, name: &str) -> Result<StoredNode, CoordError> {
+    inner
+        .store
+        .nodes()
+        .into_iter()
+        .find(|node| node.name == name)
+        .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))
 }
 
 fn issue_ticket(inner: &Inner, name: &str, now: SystemTime) -> Result<IssuedTicket, CoordError> {
@@ -2724,17 +3132,12 @@ struct OidcLogin {
     subject: String,
     email: Option<String>,
     email_verified: bool,
+    issuer: String,
+    expires_at: u64,
+    nonce: String,
 }
 
 impl OidcLogin {
-    fn subject_only(subject: String) -> Self {
-        Self {
-            subject,
-            email: None,
-            email_verified: false,
-        }
-    }
-
     fn user(&self) -> String {
         format!("oidc:{}", self.subject)
     }
@@ -2877,14 +3280,28 @@ fn owner_from_oidc(
     match oidc {
         OidcState::TokenOnly => Err(CoordError::Oidc),
         OidcState::Mock(gate) => gate
-            .owner_subject(id_token, nonce, now)
-            .map(OidcLogin::subject_only)
+            .verified_login(id_token, nonce, now)
+            .map(|login| OidcLogin {
+                subject: login.subject,
+                email: None,
+                email_verified: false,
+                issuer: login.issuer,
+                expires_at: login.expires_at,
+                nonce: String::new(),
+            })
             .map_err(|_| CoordError::Oidc),
         OidcState::Google { client_id, jwks } => {
             let jwks = jwks.as_ref().ok_or(CoordError::Oidc)?;
             let nonce = nonce.ok_or(CoordError::Oidc)?;
             jwks.verify(id_token, client_id, nonce, now)
-                .map(|claims| OidcLogin::subject_only(claims.subject))
+                .map(|claims| OidcLogin {
+                    subject: claims.subject,
+                    email: None,
+                    email_verified: false,
+                    issuer: claims.issuer,
+                    expires_at: claims.expires_at,
+                    nonce: nonce.to_string(),
+                })
                 .map_err(|_| CoordError::Oidc)
         }
         OidcState::Issuer(cache) => {
@@ -2899,6 +3316,9 @@ fn owner_from_oidc(
                         subject: claims.subject,
                         email: claims.email,
                         email_verified: claims.email_verified,
+                        issuer: claims.issuer,
+                        expires_at: claims.expires_at,
+                        nonce: claims.nonce.unwrap_or_default(),
                     })
                 }
                 Err(reason) => {
