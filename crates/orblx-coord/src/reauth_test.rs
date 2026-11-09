@@ -753,7 +753,7 @@ fn a_rejected_user_cannot_reauth() {
 fn release_notes_keep_the_rc1_sentence_and_the_rc3_step() {
     const RC3: &str = include_str!("../../../docs/rc3-release-notes.md");
     const NOTES: &str = include_str!("../../../docs/release-notes/0.1.0-rc.3.md");
-    const SENTENCE: &str = "rc.1/rc.2: A node that sleeps or pauses longer than its SVID life plus 1 min (about 16 min by default) cannot reconnect, and a restart does not help. Enroll it again under a new node name with a new enroll token or pre-auth key (orblx admin preauth-create, then orblx coord enroll). The old node name cannot be enrolled again in this release. Policy rules and grants for the old name do not apply to the new name: update them, and revoke the old node.";
+    const SENTENCE: &str = "rc.1/rc.2: A node that sleeps or pauses longer than its SVID life plus 1 min (about 16 min by default) cannot reconnect, and a restart does not help. Enroll it again under a new node name with a new enroll token (orblx coord token create, then orblx coord enroll). The old node name cannot be enrolled again in this release. Policy rules and grants for the old name do not apply to the new name: update them, and revoke the old node (orblx admin revoke OLD_NAME --coord ADDR).";
     for text in [RC3, NOTES] {
         assert!(text.contains(SENTENCE));
         assert!(!text.contains("Re-enroll the node."));
