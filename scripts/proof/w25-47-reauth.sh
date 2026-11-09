@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # W25-47 release proof for DoD f, then one DoD a pass.
 # Eng Lead runs this on the final pull request head.
-# Do not call scripts/proof/proof-lock.sh. This script reads no manifest.
+# The script sources proof-lock.sh and takes the lock. It reads no manifest.
+# Do not start proof-lock.sh as its own command.
 #
 # Privileges: CAP_SYS_TIME or root. Stop NTP before the run.
 # This script does not stop NTP. The trap sets the clock back.
@@ -22,15 +23,16 @@
 # Repeat the node command 10 times on the same head.
 #
 # One iteration ends after ORBLX_W25_47_TIMEOUT seconds (default 180) with exit 124.
-# A failed check exits 1. A privilege or lock refusal exits 2. A pass exits 0.
+# A failed check exits 1. A missing privilege exits 2. The proof lock uses status 3, 4, or 5.
+# A pass exits 0.
 set -euo pipefail
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
 
-if [[ "${ORBLX_PROOF_LOCK:-}" == "1" ]]; then
-  echo "Do not run this proof from proof-lock.sh."
-  exit 2
-fi
-
-if ! capsh --print 2>/dev/null | grep -q cap_sys_time && [[ "$(id -u)" != "0" ]]; then
+if ! capsh --print 2>/dev/null | read_all grep -q cap_sys_time && [[ "$(id -u)" != "0" ]]; then
   echo "The W25-47 release proof needs CAP_SYS_TIME or root. Eng Lead runs it."
   exit 2
 fi
@@ -41,6 +43,8 @@ if [[ ! -x "$bin" ]]; then
   echo "Build orblx first. The proof looks for $bin."
   exit 1
 fi
+
+proof_lock_take "w25-47-reauth"
 
 saved=$(date -u +%Y-%m-%dT%H:%M:%S)
 coord_pid=
@@ -60,6 +64,7 @@ cleanup() {
     wait "$coord_pid" 2>/dev/null || true
   fi
   date -u -s "$saved" >/dev/null || true
+  proof_lock_end
 }
 trap cleanup EXIT INT TERM HUP
 on_alarm() {
@@ -94,7 +99,7 @@ fi
 echo "DoD f: step the coordinator clock past its leaf end plus 60 s."
 date -u -s "+20 min" >/dev/null
 sleep 3
-if ! grep -q "coord svid renewed" "$log"; then
+if ! read_all grep -q "coord svid renewed" <"$log"; then
   echo "DoD f failed. The coordinator log has no coord svid renewed line."
   exit 1
 fi
@@ -119,11 +124,11 @@ date -u -s "+20 min" >/dev/null
 sleep 3
 status=$("$bin" status --state "$ORBLX_W25_47_STATE" || true)
 printf '%s\n' "$status"
-if ! printf '%s\n' "$status" | grep -q "state needs-reauth"; then
+if ! printf '%s\n' "$status" | read_all grep -q "state needs-reauth"; then
   echo "DoD a failed."
   exit 1
 fi
-if ! printf '%s\n' "$status" | grep -q "reauth orblx login --name"; then
+if ! printf '%s\n' "$status" | read_all grep -q "reauth orblx login --name"; then
   echo "DoD a failed. The login command is missing."
   exit 1
 fi
