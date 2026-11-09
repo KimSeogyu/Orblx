@@ -119,14 +119,17 @@ cleanup() {
     return
   fi
   cleaned=1
+  # Put the clock back before any wait. A later signal must not leave it stepped.
+  if [[ -n "$saved" ]]; then
+    date -u -s "$saved" >/dev/null || true
+    saved=
+  fi
   if [[ -n "$watchdog_pid" ]]; then
     kill "$watchdog_pid" 2>/dev/null || true
-    wait "$watchdog_pid" 2>/dev/null || true
   fi
   for pid in "$node_a_pid" "$node_b_pid" "$coord_pid" "$idp_pid"; do
     if [[ -n "$pid" ]]; then
       kill "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
     fi
   done
   for ns in "$ns_a" "$ns_b"; do
@@ -144,9 +147,6 @@ cleanup() {
   fi
   if [[ -n "$rp_was" ]]; then
     printf '%s\n' "$rp_was" >/proc/sys/net/ipv4/conf/all/rp_filter || true
-  fi
-  if [[ -n "$saved" ]]; then
-    date -u -s "$saved" >/dev/null || true
   fi
   proof_lock_end
 }
@@ -224,7 +224,7 @@ ip netns exec "$ns_b" ping -c 1 -W 2 10.200.0.1 >/dev/null
 issuer=https://127.0.0.1:8443
 client=orblx-w25-47
 "$idp" init --dir "$idp_dir" --host 127.0.0.1 >/dev/null
-"$idp" serve --dir "$idp_dir" --issuer "$issuer" --listen 127.0.0.1:8443 >"$work/idp.log" 2>&1 &
+stdbuf -oL -eL "$idp" serve --dir "$idp_dir" --issuer "$issuer" --listen 127.0.0.1:8443 >"$work/idp.log" 2>&1 &
 idp_pid=$!
 wait_grep "$work/idp.log" "idp serve" 20 || fail "The test issuer did not stay up."
 
@@ -245,7 +245,7 @@ allowed_emails = []
 ca_file = "${idp_dir}/ca.pem"
 CONF
 
-"$bin" coord serve --state "$coord_dir" --name coord --listen 0.0.0.0:7443 \
+stdbuf -oL -eL "$bin" coord serve --state "$coord_dir" --name coord --listen 0.0.0.0:7443 \
   --policy "$coord_dir/policy.hujson" --config "$work/coord.toml" >"$work/coord.log" 2>&1 &
 coord_pid=$!
 wait_grep "$work/coord.log" "oidc issuer" 20 || fail "The coordinator did not stay up."
@@ -267,7 +267,7 @@ name_a=$(printf '%s\n' "$enroll_a" | awk '/^name /{print $2}')
 old_key=$(key_id "$state_a/cert.pem")
 [[ "$old_key" =~ ^[0-9a-f]{64}$ ]] || fail "The first leaf key id is not 64 hex digits."
 
-ip netns exec "$ns_a" "$bin" up --state-dir "$state_a" --listen 10.200.0.2:443 \
+ip netns exec "$ns_a" stdbuf -oL -eL "$bin" up --state-dir "$state_a" --listen 10.200.0.2:443 \
   --coord 10.200.0.1:7443 --coord-name coord --bundle "$coord_dir/trust-bundle.pem" \
   --metrics off >"$work/node-a.log" 2>&1 &
 node_a_pid=$!
@@ -340,7 +340,7 @@ enroll_b=$("$bin" coord enroll --name b --coord 10.200.0.1:7443 \
   --state "$state_b" --coord-name coord --endpoint 10.200.1.2:443)
 overlay_b=$(printf '%s\n' "$enroll_b" | awk '/^overlay_ip /{print $2}')
 [[ -n "$overlay_b" ]] || fail "Node b did not enroll."
-ip netns exec "$ns_b" "$bin" up --state-dir "$state_b" --listen 10.200.1.2:443 \
+ip netns exec "$ns_b" stdbuf -oL -eL "$bin" up --state-dir "$state_b" --listen 10.200.1.2:443 \
   --coord 10.200.0.1:7443 --coord-name coord --bundle "$coord_dir/trust-bundle.pem" \
   --metrics off >"$work/node-b.log" 2>&1 &
 node_b_pid=$!
