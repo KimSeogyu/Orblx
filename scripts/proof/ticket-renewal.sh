@@ -695,7 +695,7 @@ host_pause_print() {
     args+=(--dmesg-unreadable)
   fi
   if ! line="$(python3 "$ROOT/scripts/proof/host-sampler.py" "${args[@]}")"; then
-    line="host_qualification invalid drift_s=na max=5 max_gap_s=na max=5 vm_fork=na boot_mono_jump_s=na max=5 sampler_interval_s=na max=1 fork_count=na reason=data_missing product_fail_seen ${seen} product_fail_utc=${utc} host_event_utc=- fork_fail_delta_s=-"
+    line="host_qualification invalid drift_s=na max=5 max_gap_s=na max=5 vm_fork=na boot_mono_jump_s=na max=5 sampler_interval_cfg_s=0.100 max=1 sampler_median_s=na max=1 fork_count=na reason=data_missing,sampler_median product_fail_seen ${seen} product_fail_utc=${utc} host_event_utc=- fork_fail_delta_s=-"
   fi
   rm -f "$dmesg_file"
   printf '%s\n' "$line"
@@ -854,7 +854,7 @@ OUTD="${TR_OUT_DIR:-$WORK/out}"
 mkdir -p "$OUTD"
 : > "$OUTD/sampler-cgroups.txt"
 echo "=== [C] host sampler every 100 ms to ${OUTD}/host-samples.txt ==="
-# Configured interval is 0.1 s. The guard asserts the observed CLOCK_MONOTONIC spacing, max 1 s.
+# --interval 0.1 matches HOST_SAMPLER_INTERVAL_S. The guard checks that constant and the median gap.
 python3 "$ROOT/scripts/proof/host-sampler.py" --out "$OUTD/host-samples.txt" --interval 0.1 \
   --cgroup-file "$OUTD/sampler-cgroups.txt" &
 SAMPLER_PID="$!"

@@ -299,7 +299,7 @@ if ! grep -q '^host_qualification ' "$WORK/tr.log"; then
     if grep -q '^FAIL:' "$WORK/tr.log"; then
       seen="yes"
     fi
-    echo "host_qualification invalid drift_s=na max=5 max_gap_s=na max=5 vm_fork=na boot_mono_jump_s=na max=5 sampler_interval_s=na max=1 fork_count=na reason=data_missing product_fail_seen ${seen} product_fail_utc=- host_event_utc=- fork_fail_delta_s=-"
+    echo "host_qualification invalid drift_s=na max=5 max_gap_s=na max=5 vm_fork=na boot_mono_jump_s=na max=5 sampler_interval_cfg_s=0.100 max=1 sampler_median_s=na max=1 fork_count=na reason=data_missing,sampler_median product_fail_seen ${seen} product_fail_utc=- host_event_utc=- fork_fail_delta_s=-"
     if [[ "$tr_status" -eq 0 || "$tr_status" -eq 1 ]]; then
       tr_status=6
     fi

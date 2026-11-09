@@ -1,7 +1,8 @@
 """W25-47 host-pause guard.
 
 Drift, gap, and boot-minus-mono jump use a fixed 5 s limit. A value of 5 s stays inside that rule.
-The observed CLOCK_MONOTONIC spacing uses a fixed 1 s limit. A spacing of 1 s stays inside that rule.
+The configured sampler interval is a fixed 0.1 s constant. It must be at most 1 s.
+The median CLOCK_MONOTONIC delta must be at most 1 s. A single gap uses the 5 s rule.
 A fork is invalid only when the 5 s before it and the 5 s after it both have no sample.
 A sample at exactly 5.0 s counts. A sample farther than 5.0 s does not.
 Exit 5 stays the foreign-container abort. This guard uses exit 6. Setup before the sampler uses exit 7.
@@ -96,12 +97,13 @@ def first_raw_fork_ns(text):
 
 class HostPauseGuardTest(unittest.TestCase):
     def test_ok_with_a_small_observed_interval(self):
-        line = report(rows(0.1, 0.1, 0.1), QUIET_DMESG)
+        line = report(samples(((0, 0, 0), (0.1, 0.1, 0.1), (0.2, 0.2, 0.2))), QUIET_DMESG)
         self.assertTrue(line.startswith("host_qualification ok "))
         self.assertIn("drift_s=0.000 max=5", line)
         self.assertIn("max_gap_s=0.100 max=5", line)
         self.assertIn("boot_mono_jump_s=0.000 max=5", line)
-        self.assertIn("sampler_interval_s=0.100 max=1", line)
+        self.assertIn("sampler_interval_cfg_s=0.100 max=1", line)
+        self.assertIn("sampler_median_s=0.100 max=1", line)
         self.assertIn("vm_fork=0", line)
         self.assertIn("fork_count=0", line)
         self.assertIn("reason=-", line)
@@ -112,22 +114,44 @@ class HostPauseGuardTest(unittest.TestCase):
         self.assertEqual(host_sampler.host_pause_exit_code(0, line), 0)
 
     def test_exact_5_s_rules_do_not_add_their_reason(self):
-        # Spacing is 1.0 s, so the interval rule also stays inside its limit.
-        line = report(rows(6.0, 1.0, 6.0), QUIET_DMESG)
+        # Two 1.0 s steps. Drift and the boot jump are exactly 5 s. The median is 1.0 s.
+        line = report(samples(((0, 0, 0), (1, 1, 1), (7, 2, 7))), QUIET_DMESG)
         self.assertTrue(line.startswith("host_qualification ok "))
         self.assertIn("drift_s=5.000 max=5", line)
         self.assertIn("boot_mono_jump_s=5.000 max=5", line)
-        self.assertIn("sampler_interval_s=1.000 max=1", line)
+        self.assertIn("sampler_median_s=1.000 max=1", line)
         self.assertEqual(reason_of(line), "-")
 
-    def test_gap_of_exactly_5_s_is_the_interval_rule(self):
-        line = report(rows(5.0, 5.0, 5.0), QUIET_DMESG)
+    def test_gap_of_exactly_5_s_stays_ok(self):
+        line = report(samples(((0, 0, 0), (0.1, 0.1, 0.1), (5.1, 5.1, 5.1), (5.2, 5.2, 5.2))), QUIET_DMESG)
+        self.assertTrue(line.startswith("host_qualification ok "))
         self.assertIn("max_gap_s=5.000 max=5", line)
-        self.assertEqual(reason_of(line), "sampler_interval")
-        self.assertNotIn("gap", reason_of(line))
+        self.assertIn("sampler_median_s=0.100 max=1", line)
+        self.assertEqual(reason_of(line), "-")
+
+    def test_one_4_9_s_gap_among_0_1_s_samples_stays_ok(self):
+        line = report(
+            samples(((0, 0, 0), (0.1, 0.1, 0.1), (5.0, 5.0, 5.0), (5.1, 5.1, 5.1))),
+            QUIET_DMESG,
+        )
+        self.assertTrue(line.startswith("host_qualification ok "), line)
+        self.assertIn("max_gap_s=4.900 max=5", line)
+        self.assertIn("sampler_median_s=0.100 max=1", line)
+        self.assertEqual(reason_of(line), "-")
+
+    def test_one_5_1_s_gap_among_0_1_s_samples_is_a_gap_only(self):
+        line = report(
+            samples(((0, 0, 0), (0.1, 0.1, 0.1), (5.2, 5.2, 5.2), (5.3, 5.3, 5.3))),
+            QUIET_DMESG,
+        )
+        self.assertTrue(line.startswith("host_qualification invalid "))
+        self.assertIn("max_gap_s=5.100 max=5", line)
+        self.assertIn("sampler_median_s=0.100 max=1", line)
+        self.assertEqual(reason_of(line), "gap")
+        self.assertNotIn("sampler_median", reason_of(line))
 
     def test_drift_above_5_s(self):
-        line = report(rows(5.101, 0.1, 0.1), QUIET_DMESG)
+        line = report(samples(((0, 0, 0), (0.1, 0.1, 0.1), (5.201, 0.2, 0.2))), QUIET_DMESG)
         self.assertTrue(line.startswith("host_qualification invalid "))
         self.assertIn("drift_s=5.001 max=5", line)
         self.assertEqual(reason_of(line), "drift")
@@ -135,23 +159,43 @@ class HostPauseGuardTest(unittest.TestCase):
         self.assertEqual(host_sampler.host_pause_exit_code(0, line), 6)
 
     def test_monotonic_gap_above_5_s(self):
-        line = report(rows(5.001, 5.001, 5.001), QUIET_DMESG)
-        self.assertIn("max_gap_s=5.001 max=5", line)
-        self.assertEqual(reason_of(line), "gap,sampler_interval")
+        line = report(samples(((0, 0, 0), (0.1, 0.1, 0.1), (5.201, 5.201, 5.201), (5.301, 5.301, 5.301))), QUIET_DMESG)
+        self.assertIn("max_gap_s=5.101 max=5", line)
+        self.assertEqual(reason_of(line), "gap")
         self.assertIn("drift_s=0.000 max=5", line)
         self.assertIn("boot_mono_jump_s=0.000 max=5", line)
-        self.assertIn(f"host_event_utc={host_sampler._utc_from_ns(BASE_RT)}", line)
+        self.assertIn("sampler_median_s=0.100 max=1", line)
+        self.assertIn(f"host_event_utc={host_sampler._utc_from_ns(BASE_RT + _ns(0.1))}", line)
         self.assertEqual(host_sampler.host_pause_exit_code(0, line), 6)
 
-    def test_observed_interval_above_1_s(self):
-        line = report(rows(1.001, 1.001, 1.001), QUIET_DMESG)
-        self.assertIn("sampler_interval_s=1.001 max=1", line)
-        self.assertEqual(reason_of(line), "sampler_interval")
+    def test_median_delta_above_1_s(self):
+        line = report(samples(((0, 0, 0), (1.2, 1.2, 1.2), (2.4, 2.4, 2.4))), QUIET_DMESG)
+        self.assertIn("sampler_median_s=1.200 max=1", line)
+        self.assertEqual(reason_of(line), "sampler_median")
+        self.assertNotIn("gap", reason_of(line))
+        self.assertEqual(host_sampler.HOST_SAMPLER_INTERVAL_S, 0.1)
         self.assertEqual(host_sampler.HOST_SAMPLER_INTERVAL_MAX_S, 1)
+
+    def test_configured_interval_above_1_s(self):
+        original = host_sampler.HOST_SAMPLER_INTERVAL_S
+        host_sampler.HOST_SAMPLER_INTERVAL_S = 1.5
+        try:
+            line = report(samples(((0, 0, 0), (0.1, 0.1, 0.1), (0.2, 0.2, 0.2))), QUIET_DMESG)
+        finally:
+            host_sampler.HOST_SAMPLER_INTERVAL_S = original
+        self.assertIn("sampler_interval_cfg_s=1.500 max=1", line)
+        self.assertEqual(reason_of(line), "sampler_interval_cfg")
+
+    def test_too_few_deltas_are_sampler_median(self):
+        one_delta = report(rows(0.1, 0.1, 0.1), QUIET_DMESG)
+        self.assertEqual(reason_of(one_delta), "sampler_median")
+        self.assertIn("sampler_median_s=na max=1", one_delta)
+        missing = report([], QUIET_DMESG)
+        self.assertEqual(reason_of(missing), "data_missing,sampler_median")
 
     def test_covered_fork_stays_ok(self):
         fork_ns = BASE_MONO + _ns(0.1)
-        line = report(samples(((0, 0, 0), (0.2, 0.2, 0.2))), raw_fork_at(fork_ns))
+        line = report(samples(((0, 0, 0), (0.2, 0.2, 0.2), (0.3, 0.3, 0.3))), raw_fork_at(fork_ns))
         self.assertTrue(line.startswith("host_qualification ok "))
         self.assertIn("vm_fork=0", line)
         self.assertIn("fork_count=1", line)
@@ -179,20 +223,20 @@ class HostPauseGuardTest(unittest.TestCase):
         line = report(samples(((0, 0, 0), (10.1, 10.1, 10.1))), raw_fork_at(fork_ns))
         self.assertNotIn("uncovered_fork", reason_of(line))
         self.assertIn("vm_fork=0", line)
-        self.assertEqual(reason_of(line), "gap,sampler_interval")
+        self.assertEqual(reason_of(line), "gap,sampler_median")
         outside = report(samples(((0, 0, 0), (10.002, 10.002, 10.002))), raw_fork_at(BASE_MONO + _ns(5.001)))
         self.assertIn("uncovered_fork", reason_of(outside))
 
     def test_raw_fork_outside_the_window_stays_clear(self):
         fork_ns = BASE_MONO - _ns(1000)
-        line = report(rows(0.1, 0.1, 0.1), raw_fork_at(fork_ns))
+        line = report(samples(((0, 0, 0), (0.1, 0.1, 0.1), (0.2, 0.2, 0.2))), raw_fork_at(fork_ns))
         self.assertTrue(line.startswith("host_qualification ok "))
         self.assertIn("vm_fork=0", line)
         self.assertIn("fork_count=0", line)
 
     def test_old_fork_plus_a_wall_step_is_not_in_the_window(self):
         fork_ns = BASE_MONO - _ns(1000)
-        line = report(samples(((0, 0, 0), (20.1, 0.1, 0.1))), raw_fork_at(fork_ns))
+        line = report(samples(((0, 0, 0), (20.1, 0.1, 0.1), (20.2, 0.2, 0.2))), raw_fork_at(fork_ns))
         self.assertEqual(reason_of(line), "drift")
         self.assertIn("fork_count=0", line)
         self.assertIn("vm_fork=0", line)
@@ -201,7 +245,7 @@ class HostPauseGuardTest(unittest.TestCase):
     def test_iso_fork_lines_are_not_parsed(self):
         with open(os.path.join(FIXTURES, "fork-lines-iso.txt"), encoding="utf-8") as handle:
             text = handle.read()
-        line = report(rows(0.1, 0.1, 0.1), text)
+        line = report(samples(((0, 0, 0), (0.1, 0.1, 0.1), (0.2, 0.2, 0.2))), text)
         self.assertTrue(line.startswith("host_qualification ok "))
         self.assertIn("fork_count=0", line)
         self.assertNotIn("data_missing", reason_of(line))
@@ -216,6 +260,7 @@ class HostPauseGuardTest(unittest.TestCase):
             (
                 (BASE_RT, stamp - step, stamp - step),
                 (BASE_RT + 2 * step, stamp + step, stamp + step),
+                (BASE_RT + 3 * step, stamp + 2 * step, stamp + 2 * step),
             )
         )
         line = report(covered, text)
@@ -227,21 +272,59 @@ class HostPauseGuardTest(unittest.TestCase):
         self.assertIn("fork_1_drift_s=0.000", line)
         self.assertNotIn("uncovered_fork", reason_of(line))
 
+    def test_real_box_v2_gaps_keep_the_median_and_the_covered_fork(self):
+        # 0.1 s rows, one 8.648 s gap, one 11.710 s gap, and a 5.001 s wall step.
+        # The real fork sits in the first small steps, so both sides have a sample.
+        with open(os.path.join(FIXTURES, "box-dmesg-raw.txt"), encoding="utf-8") as handle:
+            text = handle.read()
+        stamp = first_raw_fork_ns(text)
+        small = 100_000_000
+        gaps = [small] * 8 + [8_648_000_000] + [small] * 8 + [11_710_000_000] + [small] * 8
+        mono = stamp - 1_000_000_000
+        realtime = BASE_RT
+        points = [(realtime, mono, mono)]
+        for index, gap in enumerate(gaps):
+            mono += gap
+            realtime += gap
+            if index == len(gaps) - 1:
+                realtime += 5_001_000_000
+            points.append((realtime, mono, mono))
+        line = report(absolute_samples(points), text)
+        self.assertTrue(line.startswith("host_qualification invalid "), line)
+        self.assertEqual(reason_of(line), "drift,gap")
+        self.assertIn("drift_s=5.001 max=5", line)
+        self.assertIn("max_gap_s=11.710 max=5", line)
+        self.assertIn("sampler_interval_cfg_s=0.100 max=1", line)
+        self.assertIn("sampler_median_s=0.100 max=1", line)
+        self.assertIn("vm_fork=0", line)
+        self.assertIn("fork_count=1", line)
+        self.assertNotIn("sampler_median", reason_of(line))
+        self.assertNotIn("uncovered_fork", reason_of(line))
+
     def test_real_raw_forks_outside_the_sampler_window_stay_clear(self):
         with open(os.path.join(FIXTURES, "fork-lines-raw.txt"), encoding="utf-8") as handle:
             text = handle.read()
-        line = report(absolute_samples(((BASE_RT, 1_000_000_000, 1_000_000_000), (BASE_RT + 100_000_000, 1_100_000_000, 1_100_000_000))), text)
+        line = report(
+            absolute_samples(
+                (
+                    (BASE_RT, 1_000_000_000, 1_000_000_000),
+                    (BASE_RT + 100_000_000, 1_100_000_000, 1_100_000_000),
+                    (BASE_RT + 200_000_000, 1_200_000_000, 1_200_000_000),
+                )
+            ),
+            text,
+        )
         self.assertTrue(line.startswith("host_qualification ok "), line)
         self.assertIn("fork_count=0", line)
         self.assertIn("vm_fork=0", line)
 
     def test_boot_mono_jump_above_5_s(self):
-        line = report(rows(0.1, 0.1, 5.101), QUIET_DMESG)
+        line = report(samples(((0, 0, 0), (0.1, 0.1, 0.1), (0.2, 0.2, 5.201))), QUIET_DMESG)
         self.assertIn("boot_mono_jump_s=5.001 max=5", line)
         self.assertEqual(reason_of(line), "boot_mono_jump")
         self.assertIn("drift_s=0.000 max=5", line)
         self.assertIn("max_gap_s=0.100 max=5", line)
-        self.assertIn(f"host_event_utc={host_sampler._utc_from_ns(BASE_RT)}", line)
+        self.assertIn(f"host_event_utc={host_sampler._utc_from_ns(BASE_RT + _ns(0.1))}", line)
 
     def test_missing_samples_are_invalid(self):
         line = report([], QUIET_DMESG, readable=True)
@@ -250,26 +333,27 @@ class HostPauseGuardTest(unittest.TestCase):
         self.assertIn("max_gap_s=na max=5", line)
         self.assertIn("vm_fork=na", line)
         self.assertIn("fork_count=na", line)
-        self.assertIn("sampler_interval_s=na max=1", line)
+        self.assertIn("sampler_interval_cfg_s=0.100 max=1", line)
+        self.assertIn("sampler_median_s=na max=1", line)
         self.assertIn("boot_mono_jump_s=na max=5", line)
-        self.assertEqual(reason_of(line), "data_missing")
+        self.assertEqual(reason_of(line), "data_missing,sampler_median")
 
     def test_empty_dmesg_is_invalid(self):
-        line = report(rows(0.1, 0.1, 0.1), "")
+        line = report(samples(((0, 0, 0), (0.1, 0.1, 0.1), (0.2, 0.2, 0.2))), "")
         self.assertTrue(line.startswith("host_qualification invalid "))
         self.assertEqual(reason_of(line), "data_missing")
         self.assertIn("vm_fork=na", line)
         self.assertIn("drift_s=0.000 max=5", line)
 
     def test_unreadable_dmesg_is_invalid(self):
-        line = report(rows(0.1, 0.1, 0.1), "", readable=False)
+        line = report(samples(((0, 0, 0), (0.1, 0.1, 0.1), (0.2, 0.2, 0.2))), "", readable=False)
         self.assertTrue(line.startswith("host_qualification invalid "))
         self.assertEqual(reason_of(line), "data_missing")
         self.assertIn("vm_fork=na", line)
         self.assertIn("drift_s=0.000 max=5", line)
 
     def test_status_1_without_a_fail_line_is_not_a_product_fail(self):
-        line = report(rows(0.1, 0.1, 0.1), QUIET_DMESG, status=1)
+        line = report(samples(((0, 0, 0), (0.1, 0.1, 0.1), (0.2, 0.2, 0.2))), QUIET_DMESG, status=1)
         self.assertIn("product_fail_seen no", line)
         self.assertIn("product_fail_utc=-", line)
         self.assertEqual(host_sampler.host_pause_exit_code(1, line), 1)
@@ -289,7 +373,7 @@ class HostPauseGuardTest(unittest.TestCase):
         fork_ns = BASE_MONO + _ns(0.1)
         fail_utc = "2026-11-09T05:00:30.000Z"
         line = report(
-            samples(((0, 0, 0), (0.2, 0.2, 0.2))),
+            samples(((0, 0, 0), (0.1, 0.1, 0.1), (0.2, 0.2, 0.2))),
             raw_fork_at(fork_ns),
             status=1,
             fail_utc=fail_utc,
@@ -301,7 +385,7 @@ class HostPauseGuardTest(unittest.TestCase):
         self.assertIn("product_fail_seen yes", line)
         self.assertEqual(host_sampler.host_pause_exit_code(1, line), 1)
         earlier = report(
-            samples(((0, 0, 0), (0.2, 0.2, 0.2))),
+            samples(((0, 0, 0), (0.1, 0.1, 0.1), (0.2, 0.2, 0.2))),
             raw_fork_at(fork_ns),
             status=1,
             fail_utc=fail_utc,
@@ -313,7 +397,7 @@ class HostPauseGuardTest(unittest.TestCase):
 
     def test_exit_code_keeps_other_statuses(self):
         invalid = report(rows(5.001, 5.001, 5.001), QUIET_DMESG)
-        ok = report(rows(0.1, 0.1, 0.1), QUIET_DMESG)
+        ok = report(samples(((0, 0, 0), (0.1, 0.1, 0.1), (0.2, 0.2, 0.2))), QUIET_DMESG)
         self.assertEqual(host_sampler.host_pause_exit_code(1, ok), 1)
         self.assertEqual(host_sampler.host_pause_exit_code(3, invalid), 3)
         self.assertEqual(host_sampler.host_pause_exit_code(4, invalid), 4)
@@ -329,6 +413,7 @@ class HostPauseGuardTest(unittest.TestCase):
             with open(samples_path, "w", encoding="utf-8") as handle:
                 handle.write(_line(BASE_RT, BASE_MONO, BASE_BOOT) + "\n")
                 handle.write(_line(BASE_RT + _ns(0.1), BASE_MONO + _ns(0.1), BASE_BOOT + _ns(0.1)) + "\n")
+                handle.write(_line(BASE_RT + _ns(0.2), BASE_MONO + _ns(0.2), BASE_BOOT + _ns(0.2)) + "\n")
             with open(dmesg, "w", encoding="utf-8") as handle:
                 handle.write(QUIET_DMESG)
             with open(empty, "w", encoding="utf-8") as handle:
@@ -401,7 +486,11 @@ class HostPauseGuardTest(unittest.TestCase):
         with open(os.path.join(PROOF, "host-sampler.py"), encoding="utf-8") as handle:
             sampler = handle.read()
         self.assertNotIn("os.environ", sampler)
+        self.assertIn("HOST_SAMPLER_INTERVAL_S = 0.1", sampler)
         self.assertIn("HOST_SAMPLER_INTERVAL_MAX_S = 1", sampler)
+        self.assertIn("--interval 0.1", renewal)
+        self.assertNotIn("sampler_interval_s=", renewal)
+        self.assertNotIn("sampler_interval_s=", soak)
 
     def test_soak_final_status_passes_child_codes(self):
         with open(os.path.join(PROOF, "coord-cert-soak.sh"), encoding="utf-8") as handle:

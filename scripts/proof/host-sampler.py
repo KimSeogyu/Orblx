@@ -852,8 +852,10 @@ def acceptance_main(argv):
 HOST_DRIFT_MAX_S = 5
 HOST_GAP_MAX_S = 5
 HOST_BOOT_MONO_JUMP_MAX_S = 5
-# Observed CLOCK_MONOTONIC spacing. The harness configures --interval 0.1.
-# A larger observed spacing is reason=sampler_interval. The configured flag is not the measurement.
+# Cadence of this harness. The start command passes the same value as --interval.
+# The guard checks this constant. It does not read an interval from the environment.
+# A constant above 1 s is reason=sampler_interval_cfg.
+HOST_SAMPLER_INTERVAL_S = 0.1
 HOST_SAMPLER_INTERVAL_MAX_S = 1
 # A sample at a distance of exactly 5.0 s is inside the fork neighbourhood. A larger distance is outside.
 HOST_FORK_COVER_NS = 5_000_000_000
@@ -865,7 +867,8 @@ _REASON_ORDER = (
     "drift",
     "gap",
     "boot_mono_jump",
-    "sampler_interval",
+    "sampler_interval_cfg",
+    "sampler_median",
     "uncovered_fork",
 )
 # Raw dmesg only. "[seconds.fraction] message". ISO lines have no brackets and are ignored.
@@ -876,6 +879,17 @@ def _fmt_seconds(value):
     if value is None:
         return "na"
     return f"{value:.3f}"
+
+
+def _median(values):
+    """Median of at least two deltas. Fewer than two deltas has no median."""
+    if len(values) < 2:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
 def _clock_ns(row, name):
@@ -936,11 +950,13 @@ def _host_events(rows):
     max_jump_s = 0.0
     gap_event_ns = None
     jump_event_ns = None
+    deltas = []
     for prev, cur in zip(clocks, clocks[1:]):
         mono_s = (cur[1] - prev[1]) / 1e9
         jump_s = abs((cur[2] - cur[1]) - (prev[2] - prev[1])) / 1e9
         if mono_s < 0:
             return None
+        deltas.append(mono_s)
         if mono_s > max_gap_s:
             max_gap_s = mono_s
         if gap_event_ns is None and mono_s > HOST_GAP_MAX_S:
@@ -953,6 +969,7 @@ def _host_events(rows):
         "drift_s": drift_s,
         "max_gap_s": max_gap_s,
         "max_jump_s": max_jump_s,
+        "median_s": _median(deltas),
         "clocks": clocks,
         "gap_event_ns": gap_event_ns,
         "jump_event_ns": jump_event_ns,
@@ -1047,17 +1064,21 @@ def host_qualification_report(
     reasons = []
     measured = _host_events(rows) if rows else None
     forks = None
+    if HOST_SAMPLER_INTERVAL_S > HOST_SAMPLER_INTERVAL_MAX_S:
+        reasons.append("sampler_interval_cfg")
     if measured is None:
         reasons.append("data_missing")
         drift_s = None
         max_gap_s = None
         max_jump_s = None
+        median_s = None
         gap_event_ns = None
         jump_event_ns = None
     else:
         drift_s = measured["drift_s"]
         max_gap_s = measured["max_gap_s"]
         max_jump_s = measured["max_jump_s"]
+        median_s = measured["median_s"]
         gap_event_ns = measured["gap_event_ns"]
         jump_event_ns = measured["jump_event_ns"]
         if drift_s > HOST_DRIFT_MAX_S:
@@ -1066,8 +1087,8 @@ def host_qualification_report(
             reasons.append("gap")
         if max_jump_s > HOST_BOOT_MONO_JUMP_MAX_S:
             reasons.append("boot_mono_jump")
-        if max_gap_s > HOST_SAMPLER_INTERVAL_MAX_S:
-            reasons.append("sampler_interval")
+    if median_s is None or median_s > HOST_SAMPLER_INTERVAL_MAX_S:
+        reasons.append("sampler_median")
     text = dmesg_text or ""
     if not dmesg_readable or text.strip() == "":
         if "data_missing" not in reasons:
@@ -1099,7 +1120,8 @@ def host_qualification_report(
         f"max_gap_s={_fmt_seconds(max_gap_s)} max={HOST_GAP_MAX_S}",
         f"vm_fork={vm_text}",
         f"boot_mono_jump_s={_fmt_seconds(max_jump_s)} max={HOST_BOOT_MONO_JUMP_MAX_S}",
-        f"sampler_interval_s={_fmt_seconds(max_gap_s)} max={HOST_SAMPLER_INTERVAL_MAX_S}",
+        f"sampler_interval_cfg_s={_fmt_seconds(HOST_SAMPLER_INTERVAL_S)} max={HOST_SAMPLER_INTERVAL_MAX_S}",
+        f"sampler_median_s={_fmt_seconds(median_s)} max={HOST_SAMPLER_INTERVAL_MAX_S}",
         f"fork_count={count_text}",
     ]
     for index, fork in enumerate(forks or [], start=1):
