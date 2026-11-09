@@ -264,8 +264,31 @@ if [[ -n "$FOLLOW_PID" ]]; then
   wait "$FOLLOW_PID" 2>/dev/null || true
   FOLLOW_PID=""
 fi
-sed 's/^/tr | /' "$WORK/tr.log"
+awk '
+  /^host_qualification / { print; next }
+  { print "tr | " $0 }
+' "$WORK/tr.log"
+if ! grep -q '^host_qualification ' "$WORK/tr.log"; then
+  seen="no"
+  if grep -q '^FAIL:' "$WORK/tr.log"; then
+    seen="yes"
+  fi
+  echo "host_qualification invalid drift_s=na max=5 max_gap_s=na max=5 vm_fork=na boot_mono_jump_s=na max=5 reason=data_missing product_fail_seen ${seen} product_fail_utc=- host_event_utc=-"
+  if [[ "$tr_status" -eq 0 || "$tr_status" -eq 1 ]]; then
+    tr_status=6
+  fi
+fi
 echo "tr_exit ${tr_status}"
+# Exit 6 is host_invalid. Exit 5 stays the foreign-container abort.
+# A product FAIL line from the child stays in the log above. Do not replace it with exit 1.
+if [[ "$tr_status" -eq 6 ]]; then
+  exit 6
+fi
+if grep -q '^host_qualification invalid ' "$WORK/tr.log"; then
+  if [[ "$tr_status" -eq 0 || "$tr_status" -eq 1 ]]; then
+    exit 6
+  fi
+fi
 
 # coord_cert_gate2_check LOG ENDS NEED
 # N/A when LOG has no coordinator leaf line. Otherwise ENDS must reach NEED.

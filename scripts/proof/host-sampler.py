@@ -34,6 +34,7 @@ contention unknown_samples is not an input to coverage.
 """
 import argparse
 import os
+import re
 import signal
 import sys
 import time
@@ -846,6 +847,247 @@ def acceptance_main(argv):
     return 0
 
 
+# W25-47 host-pause guard. These limits are fixed. The program does not read them from the environment.
+# A value above the limit makes the run HOST_INVALID. A value equal to the limit stays inside the rule.
+HOST_DRIFT_MAX_S = 5
+HOST_GAP_MAX_S = 5
+HOST_BOOT_MONO_JUMP_MAX_S = 5
+# Exit 5 is PROOF_FOREIGN_ABORT_EXIT in proof-lock.sh. This guard uses 6.
+HOST_INVALID_EXIT = 6
+_HOST_FORK_TEXT = "virtual machine fork"
+_ISO_DMESG_RE = re.compile(
+    r"^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})([.,]\d+)?(Z|[+-]\d{2}:?\d{2})\]\s*(.*)$"
+)
+_CTIME_DMESG_RE = re.compile(
+    r"^\[([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\]\s*(.*)$"
+)
+
+
+def _fmt_seconds(value):
+    if value is None:
+        return "na"
+    return f"{value:.3f}"
+
+
+def _clock_ns(row, name):
+    token = row.get("clk", {}).get(name)
+    if token is None or token in ("unsupported", "na", "-"):
+        return None
+    try:
+        return int(token)
+    except ValueError:
+        return None
+
+
+def _utc_from_ns(ns):
+    moment = datetime.fromtimestamp(ns / 1e9, timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+
+
+def _parse_dmesg_stamp(line, local_tz):
+    """Return (utc datetime, message) or None when the line has no stamp."""
+    iso = _ISO_DMESG_RE.match(line)
+    if iso:
+        fraction = (iso.group(2) or "").replace(",", ".")
+        offset = iso.group(3)
+        if offset == "Z":
+            offset = "+00:00"
+        elif len(offset) == 5:
+            offset = offset[:3] + ":" + offset[3:]
+        moment = datetime.fromisoformat(f"{iso.group(1)}{fraction}{offset}")
+        return moment.astimezone(timezone.utc), iso.group(4)
+    ctime = _CTIME_DMESG_RE.match(line)
+    if ctime is None:
+        return None
+    text = re.sub(r"\s+", " ", ctime.group(1).strip())
+    local = datetime.strptime(text, "%a %b %d %H:%M:%S %Y").replace(tzinfo=local_tz)
+    return local.astimezone(timezone.utc), ctime.group(2)
+
+
+def _host_events(rows):
+    """Measure drift, the monotonic gap, and the boottime-minus-monotonic jump.
+
+    The gap uses CLOCK_MONOTONIC between consecutive samples.
+    dt_ms is CLOCK_REALTIME. A wall step is the drift rule, not a sampler gap.
+    CLOCK_MONOTONIC advances when the sampler does not run. It does not follow a wall step.
+    The jump is the change in (CLOCK_BOOTTIME - CLOCK_MONOTONIC) between consecutive samples.
+    """
+    if len(rows) < 2:
+        return None
+    clocks = []
+    for row in rows:
+        realtime = _clock_ns(row, "clk_realtime_ns")
+        monotonic = _clock_ns(row, "clk_monotonic_ns")
+        boottime = _clock_ns(row, "clk_boottime_ns")
+        if realtime is None or monotonic is None or boottime is None:
+            return None
+        clocks.append((realtime, monotonic, boottime))
+    drift_s = abs((clocks[-1][0] - clocks[0][0]) - (clocks[-1][1] - clocks[0][1])) / 1e9
+    max_gap_s = 0.0
+    max_jump_s = 0.0
+    gap_event_ns = None
+    jump_event_ns = None
+    for prev, cur in zip(clocks, clocks[1:]):
+        mono_s = (cur[1] - prev[1]) / 1e9
+        jump_s = abs((cur[2] - cur[1]) - (prev[2] - prev[1])) / 1e9
+        if mono_s < 0:
+            return None
+        if mono_s > max_gap_s:
+            max_gap_s = mono_s
+        if gap_event_ns is None and mono_s > HOST_GAP_MAX_S:
+            gap_event_ns = prev[0]
+        if jump_s > max_jump_s:
+            max_jump_s = jump_s
+        if jump_event_ns is None and jump_s > HOST_BOOT_MONO_JUMP_MAX_S:
+            jump_event_ns = prev[0]
+    return {
+        "drift_s": drift_s,
+        "max_gap_s": max_gap_s,
+        "max_jump_s": max_jump_s,
+        "window": (clocks[0][0], clocks[-1][0]),
+        "gap_event_ns": gap_event_ns,
+        "jump_event_ns": jump_event_ns,
+    }
+
+
+def _fork_times(dmesg_text, window, local_tz):
+    if window is None:
+        return None
+    start_ns, end_ns = window
+    found = []
+    for line in dmesg_text.splitlines():
+        if _HOST_FORK_TEXT not in line:
+            continue
+        parsed = _parse_dmesg_stamp(line, local_tz)
+        if parsed is None:
+            return None
+        moment, _message = parsed
+        stamp_ns = int(moment.timestamp() * 1e9)
+        if start_ns <= stamp_ns <= end_ns:
+            found.append(stamp_ns)
+    return found
+
+
+def host_qualification_report(
+    rows,
+    dmesg_text,
+    dmesg_readable,
+    product_status,
+    product_fail_utc,
+    local_tz=None,
+):
+    """Return the one host_qualification line for this run."""
+    if local_tz is None:
+        local_tz = datetime.now().astimezone().tzinfo
+    reasons = []
+    measured = _host_events(rows) if rows is not None else None
+    if measured is None:
+        reasons.append("data_missing")
+        drift_s = None
+        max_gap_s = None
+        max_jump_s = None
+        window = None
+        gap_event_ns = None
+        jump_event_ns = None
+    else:
+        drift_s = measured["drift_s"]
+        max_gap_s = measured["max_gap_s"]
+        max_jump_s = measured["max_jump_s"]
+        window = measured["window"]
+        gap_event_ns = measured["gap_event_ns"]
+        jump_event_ns = measured["jump_event_ns"]
+        if drift_s > HOST_DRIFT_MAX_S:
+            reasons.append("drift")
+        if max_gap_s > HOST_GAP_MAX_S:
+            reasons.append("gap")
+        if max_jump_s > HOST_BOOT_MONO_JUMP_MAX_S:
+            reasons.append("boot_mono_jump")
+    if not dmesg_readable:
+        if "data_missing" not in reasons:
+            reasons.append("data_missing")
+        vm_fork = None
+        fork_event_ns = None
+    else:
+        forks = _fork_times(dmesg_text or "", window, local_tz)
+        if forks is None and window is not None and dmesg_text and _HOST_FORK_TEXT in dmesg_text:
+            if "data_missing" not in reasons:
+                reasons.append("data_missing")
+            vm_fork = None
+            fork_event_ns = None
+        elif forks is None:
+            vm_fork = None if window is None else 0
+            fork_event_ns = None
+            if window is None and "data_missing" not in reasons:
+                reasons.append("data_missing")
+        else:
+            vm_fork = 1 if forks else 0
+            fork_event_ns = min(forks) if forks else None
+            if vm_fork == 1:
+                reasons.append("vm_fork")
+    event_times = [item for item in (gap_event_ns, jump_event_ns, fork_event_ns) if item is not None]
+    if product_status == 1:
+        seen = "yes"
+    else:
+        seen = "no"
+    fail_utc = product_fail_utc if product_fail_utc else "-"
+    event_utc = _utc_from_ns(min(event_times)) if event_times else "-"
+    verdict = "invalid" if reasons else "ok"
+    reason = ",".join(reasons) if reasons else "-"
+    vm_text = "na" if vm_fork is None else str(vm_fork)
+    return (
+        f"host_qualification {verdict} "
+        f"drift_s={_fmt_seconds(drift_s)} max={HOST_DRIFT_MAX_S} "
+        f"max_gap_s={_fmt_seconds(max_gap_s)} max={HOST_GAP_MAX_S} "
+        f"vm_fork={vm_text} "
+        f"boot_mono_jump_s={_fmt_seconds(max_jump_s)} max={HOST_BOOT_MONO_JUMP_MAX_S} "
+        f"reason={reason} "
+        f"product_fail_seen {seen} "
+        f"product_fail_utc={fail_utc} "
+        f"host_event_utc={event_utc}"
+    )
+
+
+def host_pause_exit_code(product_status, line):
+    """Keep exit 3, 4, and 5. Replace pass 0 and product FAIL 1 when the guard is invalid."""
+    if line.startswith("host_qualification invalid ") and product_status in (0, 1):
+        return HOST_INVALID_EXIT
+    return product_status
+
+
+def host_qualification_main(argv):
+    ap = argparse.ArgumentParser(prog="host-sampler.py host-qualification")
+    ap.add_argument("--samples")
+    ap.add_argument("--dmesg")
+    ap.add_argument("--dmesg-unreadable", action="store_true")
+    ap.add_argument("--product-status", type=int, default=0)
+    ap.add_argument("--product-fail-utc", default="")
+    args = ap.parse_args(argv)
+    rows = None
+    if args.samples and os.path.isfile(args.samples):
+        rows = read_samples(args.samples)
+    dmesg_text = ""
+    readable = not args.dmesg_unreadable
+    if readable:
+        if not args.dmesg or not os.path.isfile(args.dmesg):
+            readable = False
+        else:
+            try:
+                with open(args.dmesg, encoding="utf-8", errors="replace") as handle:
+                    dmesg_text = handle.read()
+            except OSError:
+                readable = False
+    print(
+        host_qualification_report(
+            rows,
+            dmesg_text,
+            readable,
+            args.product_status,
+            args.product_fail_utc,
+        )
+    )
+    return 0
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "analyze":
         return analyze(sys.argv[2:])
@@ -853,6 +1095,8 @@ def main():
         return coverage_main(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "acceptance":
         return acceptance_main(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == "host-qualification":
+        return host_qualification_main(sys.argv[2:])
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--interval", type=float, default=0.1)
