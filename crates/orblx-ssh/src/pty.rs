@@ -139,19 +139,37 @@ fn close_on_exec(fd: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
-/// Return true when the terminal echo is off.
+/// The echo flag from one successful read of the terminal state.
+///
+/// A failed read is `Err` from `observe_echo`. It is not `On` and it is not `Off`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObservedEcho {
+    /// The kernel echo is on.
+    On,
+    /// The kernel echo is off.
+    Off,
+}
+
+/// Read the echo flag.
 ///
 /// A shell turns the echo off for a password prompt.
 /// `slave` is the slave side from `openpty`. On macOS the master side does
 /// not carry the slave `ECHO` flag, so a master-only check hides every input.
 /// A later open of the slave path can also fail, so this reads the descriptor
-/// that `spawn_shell` kept. When the call fails, the function returns false.
-pub(crate) fn echo_off(slave: &File) -> bool {
+/// that `spawn_shell` kept. `Err` means the terminal state was not read.
+pub(crate) fn observe_echo(slave: &File) -> io::Result<ObservedEcho> {
     // SAFETY: termios is plain data. tcgetattr fills it.
     let mut modes: libc::termios = unsafe { std::mem::zeroed() };
     // SAFETY: the descriptor is open and the pointer is valid.
     let status = unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut modes) };
-    status == 0 && modes.c_lflag & libc::ECHO == 0
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if modes.c_lflag & libc::ECHO == 0 {
+        Ok(ObservedEcho::Off)
+    } else {
+        Ok(ObservedEcho::On)
+    }
 }
 
 /// Set the terminal size.
@@ -200,7 +218,10 @@ mod tests {
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
 
-    use super::{clamp_size, echo_off, readable, spawn_shell, PtySpec};
+    use std::fs::File;
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    use super::{clamp_size, observe_echo, readable, spawn_shell, ObservedEcho, PtySpec};
 
     #[test]
     fn a_bad_terminal_type_and_size_become_safe_values() {
@@ -231,7 +252,9 @@ mod tests {
                     Ok(len) => seen.extend_from_slice(&buf[..len]),
                 }
             }
-            if String::from_utf8_lossy(&seen).contains("user-rec") && echo_off(&shell.slave) {
+            if String::from_utf8_lossy(&seen).contains("user-rec")
+                && observe_echo(&shell.slave).ok() == Some(ObservedEcho::Off)
+            {
                 saw_off = true;
             }
             if shell.child.try_wait().unwrap().is_some() && !readable(&shell.master, 50) {
@@ -242,5 +265,18 @@ mod tests {
         let _ = shell.child.wait();
         assert!(String::from_utf8_lossy(&seen).contains("user-rec"));
         assert!(saw_off, "the echo-off state was not seen");
+    }
+
+    #[test]
+    fn a_pipe_is_not_an_echo_observation() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let read = unsafe { File::from(OwnedFd::from_raw_fd(fds[0])) };
+        let write = unsafe { File::from(OwnedFd::from_raw_fd(fds[1])) };
+        drop(write);
+        let err = observe_echo(&read).expect_err("a pipe has no terminal state");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTTY));
+        assert_ne!(observe_echo(&read).ok(), Some(ObservedEcho::On));
+        assert_ne!(observe_echo(&read).ok(), Some(ObservedEcho::Off));
     }
 }
