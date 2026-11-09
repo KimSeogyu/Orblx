@@ -57,6 +57,7 @@ struct UsedFile {
 thread_local! {
     static CRASH: Cell<u8> = const { Cell::new(0) };
     static RENEW_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
+    static DENY_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -64,6 +65,12 @@ static RENEW_WAIT: Mutex<Option<std::sync::mpsc::Receiver<()>>> = Mutex::new(Non
 
 #[cfg(test)]
 static RENEW_READY: Mutex<Option<std::sync::mpsc::Sender<()>>> = Mutex::new(None);
+
+#[cfg(test)]
+static DENY_WAIT: Mutex<Option<std::sync::mpsc::Receiver<()>>> = Mutex::new(None);
+
+#[cfg(test)]
+static DENY_READY: Mutex<Option<std::sync::mpsc::Sender<()>>> = Mutex::new(None);
 
 /// Mark this thread. Only a marked thread takes the renew hook.
 #[cfg(test)]
@@ -88,6 +95,50 @@ pub(crate) fn arm_renew_wait() -> (std::sync::mpsc::Receiver<()>, std::sync::mps
 #[cfg(test)]
 pub(crate) fn arm_crash(point: u8) {
     CRASH.with(|cell| cell.set(point));
+}
+
+/// Mark this thread. Only a marked thread takes the deny hook.
+#[cfg(test)]
+pub(crate) fn mark_deny_wait() {
+    DENY_THIS_THREAD.with(|flag| flag.set(true));
+}
+
+/// Arm the deny hook. The marked call sends on the ready channel, then waits.
+#[cfg(test)]
+pub(crate) fn arm_deny_wait() -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    *DENY_READY
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(ready_tx);
+    *DENY_WAIT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(go_rx);
+    (ready_rx, go_tx)
+}
+
+pub(crate) fn deny_hook() {
+    #[cfg(test)]
+    {
+        let marked = DENY_THIS_THREAD.with(|flag| flag.replace(false));
+        if !marked {
+            return;
+        }
+        let ready = DENY_READY
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        let wait = DENY_WAIT
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        if let Some(ready) = ready {
+            let _ = ready.send(());
+        }
+        if let Some(wait) = wait {
+            let _ = wait.recv();
+        }
+    }
 }
 
 pub(crate) fn renew_hook() {

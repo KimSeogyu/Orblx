@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,6 +36,11 @@ const POLICY_FILE: &str = "policy.hujson";
 const LOADED_POLICY_FILE: &str = "policy.loaded.hujson";
 /// The control-plane audit chain in the state directory.
 pub const CONFIG_AUDIT_FILE: &str = "config-audit.jsonl";
+
+/// Same-name enroll token refusals share one audit record inside this window.
+const EXISTS_DENY_WINDOW_MS: u64 = 1_000;
+
+static EXISTS_DENY_MS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 
 /// How the coordinator checks a laptop enrollment.
 pub enum OidcConfig {
@@ -455,7 +460,6 @@ impl Coordinator {
                 attempted_at: None,
             })),
         };
-        crate::reauth::ensure_rc3_start(dir, now)?;
         let deny = Arc::new(RwLock::new(crate::reauth::load_deny_or_refuse(dir)));
         let coord = Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -573,13 +577,28 @@ impl Coordinator {
         Ok(Arc::clone(&self.lock()?.deny))
     }
 
-    pub(crate) fn publish_deny(&self, set: DenySet) -> Result<(), CoordError> {
-        let inner = self.lock()?;
-        *inner
-            .deny
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner()) = set;
+    /// Write the rc.3 marker. Only the coordinator serve path calls this.
+    pub fn note_serving(&self, now: SystemTime) -> Result<(), CoordError> {
+        let dir = {
+            let inner = self.lock()?;
+            inner.state_dir.clone()
+        };
+        crate::reauth::ensure_rc3_start(&dir, now)?;
         Ok(())
+    }
+
+    /// Read, change, and publish `deny.json` under the coordinator lock.
+    ///
+    /// The write uses the atomic writer. The cache update uses the same lock.
+    /// Callers must not hold the coordinator lock. A caller that already holds
+    /// it uses [`mutate_deny_locked`].
+    pub(crate) fn mutate_deny(
+        &self,
+        now: SystemTime,
+        change: impl FnOnce(&mut crate::admin::DenyFile, u64) -> Result<(), CoordError>,
+    ) -> Result<u64, CoordError> {
+        let mut inner = self.lock()?;
+        mutate_deny_locked(&mut inner, now, change)
     }
 
     /// Re-auth one enrolled node with an OIDC ID token.
@@ -623,10 +642,42 @@ impl Coordinator {
     }
 
     /// Write one `reauth-deny` for a same-name enroll token. The public error stays `Exists`.
+    ///
+    /// The name check runs before the token check, so one name can produce many calls.
+    /// The directory keeps at most one record per second, as an unknown pre-auth key does.
     pub(crate) fn reauth_deny_exists_token(&self, name: &str) -> Result<(), CoordError> {
+        let dir = {
+            let inner = self.lock()?;
+            inner.state_dir.to_string_lossy().to_string()
+        };
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        {
+            let mut guard = EXISTS_DENY_MS.lock().map_err(|_| CoordError::State)?;
+            let last = guard.entry(dir).or_insert(0);
+            if *last != 0 && now_ms.saturating_sub(*last) < EXISTS_DENY_WINDOW_MS {
+                return Ok(());
+            }
+            *last = now_ms;
+        }
         let mut inner = self.lock()?;
         reload(&mut inner)?;
         refuse(&mut inner, name, "token", "exists-token")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_reject_user(
+        &self,
+        user: &str,
+        now: SystemTime,
+    ) -> Result<(), CoordError> {
+        let mut inner = self.lock()?;
+        inner
+            .store
+            .set_user_state(user, UserState::Rejected, None, now)?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2571,6 +2622,26 @@ fn reauth_locked(
         refuse(inner, name, actor_of(&source), reason)?;
         return Err(CoordError::Protocol("The re-auth was refused.".to_string()));
     }
+    if let ReauthSource::Oidc {
+        subject,
+        issuer,
+        nonce,
+        expires,
+    } = &source
+    {
+        let login = OidcLogin {
+            subject: subject.clone(),
+            email: None,
+            email_verified: false,
+            issuer: issuer.clone(),
+            expires_at: *expires,
+            nonce: nonce.clone(),
+        };
+        if let Err(err) = admit_user(inner, &login, now) {
+            refuse(inner, name, actor_of(&source), "owner")?;
+            return Err(err);
+        }
+    }
     let start = crate::reauth::read_rc3_start(&inner.state_dir)?;
     if crate::reauth::legacy_wait_blocks(
         node.live_leaf_keys.is_none(),
@@ -2621,10 +2692,22 @@ fn reauth_locked(
         .ok_or_else(|| CoordError::Protocol("The ticket is missing.".to_string()))?;
     let (new_key, new_nonce) = crate::reauth::issued_ids(&result.certificate_pem, &ticket.bytes)?;
     let new_id = new_key.key_id.clone();
-    inner
-        .store
-        .set_live_lists(name, Some(vec![new_key]), Some(vec![new_nonce]))?;
-    crate::reauth::crash_at(2)?;
+    if let Err(err) = crate::reauth::crash_at(3) {
+        deny_issued_best_effort(inner, &new_key, &new_nonce, now);
+        return Err(err);
+    }
+    if let Err(err) = inner.store.set_live_lists(
+        name,
+        Some(vec![new_key.clone()]),
+        Some(vec![new_nonce.clone()]),
+    ) {
+        deny_issued_best_effort(inner, &new_key, &new_nonce, now);
+        return Err(err);
+    }
+    if let Err(err) = crate::reauth::crash_at(2) {
+        deny_issued_best_effort(inner, &new_key, &new_nonce, now);
+        return Err(err);
+    }
     let old_text = if old_ids.is_empty() {
         "none".to_string()
     } else {
@@ -2634,7 +2717,7 @@ fn reauth_locked(
     if let Some(id) = preauth_id {
         detail.push_str(&format!(" preauth {id}"));
     }
-    record(
+    if let Err(err) = record(
         inner,
         actor_of(&source),
         ConfigAction::Reauth,
@@ -2642,8 +2725,28 @@ fn reauth_locked(
         EMPTY_DIGEST,
         node_digest(inner, name),
         &detail,
-    )?;
+    ) {
+        deny_issued_best_effort(inner, &new_key, &new_nonce, now);
+        return Err(err);
+    }
     Ok(result)
+}
+
+fn deny_issued_best_effort(
+    inner: &mut Inner,
+    key: &crate::store::LiveLeafKey,
+    nonce: &crate::store::LiveTicketNonce,
+    now: SystemTime,
+) {
+    if mutate_deny_locked(inner, now, |file, now_unix| {
+        file.add_leaf(&key.key_id, key.not_after, now_unix);
+        file.add_nonce(nonce.nonce.as_str(), nonce.expires, now_unix);
+        Ok(())
+    })
+    .is_err()
+    {
+        eprintln!("The re-auth could not deny the new leaf.");
+    }
 }
 
 fn write_reauth_deny(
@@ -2653,14 +2756,29 @@ fn write_reauth_deny(
     now: SystemTime,
     now_unix: u64,
 ) -> Result<(), CoordError> {
+    let _ = now_unix;
+    mutate_deny_locked(inner, now, |file, now_unix| {
+        for key in keys {
+            file.add_leaf(&key.key_id, key.not_after, now_unix);
+        }
+        for nonce in nonces {
+            file.add_nonce(&nonce.nonce, nonce.expires, now_unix);
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn mutate_deny_locked(
+    inner: &mut Inner,
+    now: SystemTime,
+    change: impl FnOnce(&mut crate::admin::DenyFile, u64) -> Result<(), CoordError>,
+) -> Result<u64, CoordError> {
+    crate::reauth::deny_hook();
+    let now_unix = crate::reauth::wall_secs(now)?;
     let mut file = crate::admin::load_deny_file(&inner.state_dir, now)?;
+    change(&mut file, now_unix)?;
     file.prune_leaves(now_unix);
-    for key in keys {
-        file.add_leaf(&key.key_id, key.not_after, now_unix);
-    }
-    for nonce in nonces {
-        file.add_nonce(&nonce.nonce, nonce.expires, now_unix);
-    }
     file.bump(now_unix);
     let text = crate::admin::store_deny_file(&inner.state_dir, &file)?;
     let set = DenySet::from_json(text.as_bytes()).map_err(|_| CoordError::State)?;
@@ -2668,7 +2786,7 @@ fn write_reauth_deny(
         .deny
         .write()
         .unwrap_or_else(|poison| poison.into_inner()) = set;
-    Ok(())
+    Ok(file.version())
 }
 
 fn source_ok(inner: &Inner, node: &StoredNode, source: &ReauthSource) -> Result<(), &'static str> {

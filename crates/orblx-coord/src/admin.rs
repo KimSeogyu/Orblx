@@ -84,6 +84,40 @@ impl DenyFile {
             .retain(|item| now_unix <= item.not_after.saturating_add(60));
     }
 
+    pub(crate) fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub(crate) fn contains_uri(&self, uri: &str) -> bool {
+        self.revoked_uris.iter().any(|item| item == uri)
+    }
+
+    pub(crate) fn add_uri(&mut self, uri: &str) -> Result<(), CoordError> {
+        let _ = SpiffeId::parse(uri)?;
+        if !self.contains_uri(uri) {
+            self.revoked_uris.push(uri.to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_uri(&mut self, uri: &str) {
+        self.revoked_uris.retain(|item| item != uri);
+    }
+
+    /// Add one ticket nonce. A bad nonce is an error. An expired nonce stays out.
+    pub(crate) fn add_nonce_exact(
+        &mut self,
+        nonce: &str,
+        expires: u64,
+        now_unix: u64,
+    ) -> Result<(), CoordError> {
+        if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(CoordError::State);
+        }
+        self.add_nonce(nonce, expires, now_unix);
+        Ok(())
+    }
+
     pub(crate) fn bump(&mut self, now_unix: u64) {
         self.version = self.version.saturating_add(1);
         self.generated_at = now_unix;
@@ -267,29 +301,24 @@ pub fn revoke_undo(
 ) -> Result<Value, CoordError> {
     let id = principal_id(coord, principal)?;
     let uri = id.as_uri().to_string();
-    let mut file = read_deny(coord, now)?;
-    if !file.revoked_uris.contains(&uri) {
-        return Err(CoordError::Protocol(
-            "The principal is not in the deny list.".to_string(),
-        ));
-    }
     let before = deny_digest(coord)?;
-    file.revoked_uris.retain(|item| *item != uri);
-    file.version = file.version.saturating_add(1);
-    file.generated_at = unix_now(now)?;
-    let text = file.to_json()?;
-    write_text(&coord.state_dir()?.join(DENY_FILE), &text, 0o644)?;
+    let version = coord.mutate_deny(now, |file, _now_unix| {
+        if !file.contains_uri(&uri) {
+            return Err(CoordError::Protocol(
+                "The principal is not in the deny list.".to_string(),
+            ));
+        }
+        file.remove_uri(&uri);
+        Ok(())
+    })?;
     let after = deny_digest(coord)?;
-    let detail = format!(
-        "principal {uri} scope all svid restored deny_version {}",
-        file.version
-    );
+    let detail = format!("principal {uri} scope all svid restored deny_version {version}");
     coord.record_change(actor, ConfigAction::Unrevoke, &uri, before, after, &detail)?;
     Ok(json!({
         "op": "revoke-undo",
         "principal": uri,
         "svid_restored": true,
-        "deny_version": file.version
+        "deny_version": version
     }))
 }
 
@@ -639,29 +668,15 @@ pub(crate) fn push_deny(
     nonces: &[String],
     now: SystemTime,
 ) -> Result<u64, CoordError> {
-    let mut file = read_deny(coord, now)?;
-    for uri in uris {
-        let _ = SpiffeId::parse(uri)?;
-        if !file.revoked_uris.iter().any(|item| item == uri) {
-            file.revoked_uris.push(uri.clone());
+    coord.mutate_deny(now, |file, now_unix| {
+        for uri in uris {
+            file.add_uri(uri)?;
         }
-    }
-    for nonce in nonces {
-        if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(CoordError::State);
+        for nonce in nonces {
+            file.add_nonce_exact(nonce, u64::MAX, now_unix)?;
         }
-        if !file.revoked_ticket_nonces.iter().any(|item| item == nonce) {
-            file.revoked_ticket_nonces.push(nonce.clone());
-        }
-    }
-    let now_unix = unix_now(now)?;
-    file.prune_leaves(now_unix);
-    file.bump(now_unix);
-    let dir = coord.state_dir()?;
-    let text = store_deny_file(&dir, &file)?;
-    let set = DenySet::from_json(text.as_bytes()).map_err(|_| CoordError::State)?;
-    coord.publish_deny(set)?;
-    Ok(file.version)
+        Ok(())
+    })
 }
 
 /// Read `deny.json`. A missing file is an empty document.

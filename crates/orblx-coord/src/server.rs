@@ -29,6 +29,7 @@ pub fn serve_blocking(coord: &Coordinator, listen: SocketAddr) -> Result<(), Coo
 
 /// Accept QUIC connections on `listen`.
 pub async fn serve(coord: &Coordinator, listen: SocketAddr) -> Result<(), CoordError> {
+    coord.note_serving(SystemTime::now())?;
     warm_jwks(coord).await;
     let (addr, handle) = spawn(coord, listen).await?;
     println!("coord listen {addr}");
@@ -557,6 +558,24 @@ async fn ssh_cert(
     }
 }
 
+pub(crate) fn enroll_token_dispatch(
+    coord: &Coordinator,
+    name: &str,
+    token: &str,
+    endpoints: &[String],
+    routes: &[String],
+    now: SystemTime,
+) -> Result<crate::state::EnrollResult, CoordError> {
+    match coord.enroll_token(name, token, endpoints, routes, now) {
+        Ok(result) => Ok(result),
+        Err(CoordError::Exists) => {
+            coord.reauth_deny_exists_token(name)?;
+            Err(CoordError::Exists)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 async fn dispatch(
     coord: &Coordinator,
     connection: &quinn::Connection,
@@ -587,22 +606,14 @@ async fn dispatch(
                     &request.routes,
                     now,
                 )?,
-                (Some(token), None, false) => {
-                    match coord.enroll_token(
-                        &request.name,
-                        token,
-                        &request.endpoints,
-                        &request.routes,
-                        now,
-                    ) {
-                        Ok(result) => result,
-                        Err(CoordError::Exists) => {
-                            coord.reauth_deny_exists_token(&request.name)?;
-                            return Err(CoordError::Exists);
-                        }
-                        Err(err) => return Err(err),
-                    }
-                }
+                (Some(token), None, false) => enroll_token_dispatch(
+                    coord,
+                    &request.name,
+                    token,
+                    &request.endpoints,
+                    &request.routes,
+                    now,
+                )?,
                 (None, Some(id_token), false) => {
                     if coord.google_client_id_for_fetch()?.is_some() {
                         warm_jwks(coord).await;

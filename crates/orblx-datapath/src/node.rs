@@ -929,79 +929,7 @@ async fn run_mesh_inner(
     }
     apply_lock_allow(&mesh);
     let lock_mesh = mesh.clone();
-    let deny_endpoint = Arc::clone(&endpoint);
-    let deny_dir = Arc::clone(&state_dir);
-    let mut deny_shutdown = mesh.shutdown.clone();
-    tasks.push(tokio::spawn(async move {
-        // The deny list reloads each 100 ms, so an unshare or a revoke stops a peer
-        // at most 100 ms after the node writes the new list (W25-1).
-        // The node lock check stays at each 10 s (each 100 ticks).
-        let mut tick = tokio::time::interval(Duration::from_millis(100));
-        // The node applies the list only when the file text changes. Thus the
-        // tick does not touch the endpoint or the links when nothing changed.
-        let mut ticks: u64 = 0;
-        let mut deny_cache = orblx_identity::DenyCache::with_set(deny_endpoint.deny_set());
-        let mut last_netmap: Option<Vec<u8>> = None;
-        let mut ssh_closed: HashSet<(u64, String)> = HashSet::new();
-        loop {
-            tokio::select! {
-                changed = deny_shutdown.changed() => {
-                    if changed.is_err() || *deny_shutdown.borrow() {
-                        return;
-                    }
-                }
-                _ = tick.tick() => {
-                    // The read runs on a blocking thread, so a slow disk does not stop
-                    // the packet runtime (W25-11).
-                    let dir = Arc::clone(&deny_dir);
-                    let read = tokio::task::spawn_blocking(move || {
-                        orblx_identity::read_deny_file(&dir)
-                    })
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(orblx_identity::DenyFileError::Unreadable(
-                            deny_dir.join(orblx_identity::DENY_FILE),
-                            std::io::ErrorKind::Other,
-                        ))
-                    });
-                    // W25-38: a deny file that is not valid, did not open, or is missing
-                    // after enroll makes the set stale. The stale set keeps the last good
-                    // entries and refuses new sessions, as the agent guard does. The node
-                    // never uses an empty list in place of such a file.
-                    match deny_cache.apply_read(&deny_dir, read) {
-                        orblx_identity::DenyReload::Same => {}
-                        orblx_identity::DenyReload::Changed => {
-                            // Replace first, so a session that starts now uses the new list.
-                            // Then close the open sessions of the denied peers.
-                            let deny = deny_cache.set().clone();
-                            deny_endpoint.replace_deny(deny.clone());
-                            close_denied_links(&lock_mesh, &deny);
-                        }
-                        orblx_identity::DenyReload::Stale { error, first } => {
-                            if first {
-                                eprintln!("{error} The node refuses new sessions.");
-                                deny_endpoint.replace_deny(deny_cache.set().clone());
-                            }
-                        }
-                    }
-                    // W25-31: a revoked SSH user certificate closes the mesh sessions of the
-                    // node that asked for it. The node reads the netmap only when its text changes.
-                    if let Ok(bytes) = fs::read(&lock_mesh.netmap_path) {
-                        if last_netmap.as_deref() != Some(bytes.as_slice()) {
-                            if let Ok(netmap) = Netmap::from_slice(&bytes) {
-                                close_ssh_revoked_links(&lock_mesh, &netmap, &mut ssh_closed);
-                            }
-                            last_netmap = Some(bytes);
-                        }
-                    }
-                    if ticks.is_multiple_of(100) {
-                        apply_lock_allow(&lock_mesh);
-                    }
-                    ticks = ticks.wrapping_add(1);
-                }
-            }
-        }
-    }));
+    tasks.push(tokio::spawn(deny_reload_loop(lock_mesh)));
     let accept_mesh = mesh.clone();
     tasks.push(tokio::spawn(async move {
         accept_loop(accept_mesh).await;
@@ -1579,8 +1507,89 @@ fn close_ssh_revoked_links(mesh: &Mesh, netmap: &Netmap, seen: &mut HashSet<(u64
     }
 }
 
+async fn deny_reload_loop(mesh: Mesh) {
+    // The deny list reloads each 100 ms, so an unshare or a revoke stops a peer
+    // at most 100 ms after the node writes the new list (W25-1).
+    // The node lock check stays at each 10 s (each 100 ticks).
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    // The node applies the list only when the file text changes. Thus the
+    // tick does not touch the endpoint or the links when nothing changed.
+    let mut ticks: u64 = 0;
+    let mut deny_shutdown = mesh.shutdown.clone();
+    let deny_endpoint = Arc::clone(&mesh.endpoint);
+    let deny_dir = Arc::clone(&mesh.state_dir);
+    let mut deny_cache = orblx_identity::DenyCache::with_set(deny_endpoint.deny_set());
+    let mut last_netmap: Option<Vec<u8>> = None;
+    let mut ssh_closed: HashSet<(u64, String)> = HashSet::new();
+    loop {
+        tokio::select! {
+            changed = deny_shutdown.changed() => {
+                if changed.is_err() || *deny_shutdown.borrow() {
+                    return;
+                }
+            }
+            _ = tick.tick() => {
+                // The read runs on a blocking thread, so a slow disk does not stop
+                // the packet runtime (W25-11).
+                let dir = Arc::clone(&deny_dir);
+                let read = tokio::task::spawn_blocking(move || {
+                    orblx_identity::read_deny_file(&dir)
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    Err(orblx_identity::DenyFileError::Unreadable(
+                        deny_dir.join(orblx_identity::DENY_FILE),
+                        std::io::ErrorKind::Other,
+                    ))
+                });
+                // W25-38: a deny file that is not valid, did not open, or is missing
+                // after enroll makes the set stale. The stale set keeps the last good
+                // entries and refuses new sessions, as the agent guard does. The node
+                // never uses an empty list in place of such a file.
+                match deny_cache.apply_read(&deny_dir, read) {
+                    orblx_identity::DenyReload::Same => {}
+                    orblx_identity::DenyReload::Changed => {
+                        // Replace first, so a session that starts now uses the new list.
+                        // Then close the open sessions of the denied peers.
+                        let deny = deny_cache.set().clone();
+                        deny_endpoint.replace_deny(deny.clone());
+                        close_denied_links(&mesh, &deny);
+                    }
+                    orblx_identity::DenyReload::Stale { error, first } => {
+                        if first {
+                            eprintln!("{error} The node refuses new sessions.");
+                            deny_endpoint.replace_deny(deny_cache.set().clone());
+                        }
+                    }
+                }
+                // W25-31: a revoked SSH user certificate closes the mesh sessions of the
+                // node that asked for it. The node reads the netmap only when its text changes.
+                if let Ok(bytes) = fs::read(&mesh.netmap_path) {
+                    if last_netmap.as_deref() != Some(bytes.as_slice()) {
+                        if let Ok(netmap) = Netmap::from_slice(&bytes) {
+                            close_ssh_revoked_links(&mesh, &netmap, &mut ssh_closed);
+                        }
+                        last_netmap = Some(bytes);
+                    }
+                }
+                if ticks.is_multiple_of(100) {
+                    apply_lock_allow(&mesh);
+                }
+                ticks = ticks.wrapping_add(1);
+            }
+        }
+    }
+}
+
 async fn accept_loop(mut mesh: Mesh) {
     loop {
+        if past_reauth_grace(host_unix(), mesh.node.not_after.load(Ordering::Relaxed)) {
+            note_needs_reauth(&mesh);
+            if !sleep_retry(&mut mesh, RENEW_REALTIME_POLL).await {
+                return;
+            }
+            continue;
+        }
         tokio::select! {
             changed = mesh.shutdown.changed() => {
                 if changed.is_err() || *mesh.shutdown.borrow() {
@@ -1692,6 +1701,10 @@ async fn reconnect(
     mesh.rekey_rx.borrow_and_update();
     remote_rx.borrow_and_update();
     let t0 = Instant::now();
+    if past_reauth_grace(host_unix(), mesh.node.not_after.load(Ordering::Relaxed)) {
+        note_needs_reauth(mesh);
+        return;
+    }
     if local_credential_past(mesh) {
         tr!(
             "{} dial_hold reason=local_credential_past peer={}",
@@ -1976,6 +1989,13 @@ async fn accept_relay(mut mesh: Mesh, peer: NetmapPeer) {
         if stopped(&mesh) {
             return;
         }
+        if past_reauth_grace(host_unix(), mesh.node.not_after.load(Ordering::Relaxed)) {
+            note_needs_reauth(&mesh);
+            if !sleep_retry(&mut mesh, RENEW_REALTIME_POLL).await {
+                return;
+            }
+            continue;
+        }
         let config = lock(&mesh.identity).clone();
         let session_id = crate::relay_path::relay_session_id(&mesh.node.name, &peer.name);
         let opened = tokio::task::spawn_blocking(move || {
@@ -1991,6 +2011,13 @@ async fn accept_relay(mut mesh: Mesh, peer: NetmapPeer) {
             }
             Err(_) => return,
         };
+        if past_reauth_grace(host_unix(), mesh.node.not_after.load(Ordering::Relaxed)) {
+            note_needs_reauth(&mesh);
+            if !sleep_retry(&mut mesh, RENEW_REALTIME_POLL).await {
+                return;
+            }
+            continue;
+        }
         let accepted = face.endpoint.accept_one();
         tokio::select! {
             changed = mesh.shutdown.changed() => {
@@ -3605,15 +3632,26 @@ mod tests {
                 },
             );
         }
-        let mut deny = DenySet::empty();
         let doc = format!(
             r#"{{"version":1,"generated_at":1,"revoked_uris":[],"revoked_ticket_nonces":["{nonce}"],"revoked_leaf_keys":[{{"key_id":"{key}","not_after":4000000000}}]}}"#
         );
-        deny.apply_json(doc.as_bytes()).unwrap();
+        let task = tokio::spawn(super::deny_reload_loop(renewal.mesh.clone()));
+        let path = renewal.dir.join("deny.json");
+        let tmp = renewal.dir.join("deny.json.tmp");
+        fs::write(&tmp, doc).unwrap();
         let started = std::time::Instant::now();
-        super::close_denied_links(&renewal.mesh, &deny);
-        assert!(*cancel_rx.borrow());
-        assert!(started.elapsed() < Duration::from_millis(1000));
+        fs::rename(&tmp, &path).unwrap();
+        loop {
+            if *cancel_rx.borrow() {
+                break;
+            }
+            if started.elapsed() > Duration::from_millis(1000) {
+                panic!("the session stayed open after the deny rename");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(started.elapsed() <= Duration::from_millis(1000));
+        task.abort();
     }
 
     #[test]

@@ -45,10 +45,23 @@ fn count_action(lines: &[Value], action: &str) -> usize {
     lines.iter().filter(|line| line["action"] == action).count()
 }
 
-fn has_reason(lines: &[Value], reason: &str) -> bool {
-    lines.iter().any(|line| {
-        line["action"] == "reauth-deny" && line["detail"].as_str().unwrap_or("").contains(reason)
-    })
+fn count_reason(lines: &[Value], reason: &str) -> usize {
+    lines
+        .iter()
+        .filter(|line| {
+            line["action"] == "reauth-deny"
+                && line["detail"].as_str().unwrap_or("").contains(reason)
+        })
+        .count()
+}
+
+fn same_record(before: &crate::store::StoredNode, after: &crate::store::StoredNode) {
+    assert_eq!(after.name, before.name);
+    assert_eq!(after.overlay_ip, before.overlay_ip);
+    assert_eq!(after.owner, before.owner);
+    assert_eq!(after.routes, before.routes);
+    assert_eq!(after.tags, before.tags);
+    assert_eq!(after.grant_bound, before.grant_bound);
 }
 
 struct Lab {
@@ -69,6 +82,7 @@ impl Lab {
         let policy = dir.join("policy.hujson");
         fs::write(&policy, r#"{"owners":["spiffe://orblx.local/node/owner"]}"#).unwrap();
         coord.set_policy_file(&policy).unwrap();
+        coord.note_serving(now).unwrap();
         coord
             .approve_user_by("oidc:ada", "spiffe://orblx.local/node/owner", now)
             .unwrap();
@@ -240,8 +254,10 @@ fn the_same_id_token_is_replay_and_a_foreign_subject_is_owner() {
         .reauth_oidc("laptop", &token, None, lab.now)
         .is_err());
     let lines = audits(&lab.coord);
-    assert!(has_reason(&lines, "reason replay"));
+    let kept = lab.node("laptop");
+    assert_eq!(count_reason(&lines, "reason replay"), 1);
     assert_eq!(count_action(&lines, "reauth"), 1);
+    same_record(&kept, &lab.node("laptop"));
     lab.coord
         .approve_user_by("oidc:bob", "spiffe://orblx.local/node/owner", lab.now)
         .unwrap();
@@ -250,7 +266,9 @@ fn the_same_id_token_is_replay_and_a_foreign_subject_is_owner() {
         .coord
         .reauth_oidc("laptop", &other, None, lab.now)
         .is_err());
-    assert!(has_reason(&audits(&lab.coord), "reason owner"));
+    let lines = audits(&lab.coord);
+    assert_eq!(count_reason(&lines, "reason owner"), 1);
+    same_record(&kept, &lab.node("laptop"));
 }
 
 #[test]
@@ -258,12 +276,14 @@ fn an_absent_list_waits_and_a_revoked_or_removed_node_stays_refused() {
     let lab = Lab::open("wait");
     lab.enroll_oidc("laptop", "ada");
     lab.coord.testing_set_live_keys("laptop", None).unwrap();
+    let before = lab.node("laptop");
     let token = lab.token("ada");
     assert!(lab
         .coord
         .reauth_oidc("laptop", &token, None, lab.now)
         .is_err());
-    assert!(has_reason(&audits(&lab.coord), "reason legacy-wait"));
+    assert_eq!(count_reason(&audits(&lab.coord), "reason legacy-wait"), 1);
+    same_record(&before, &lab.node("laptop"));
     let early = unix(lab.now).saturating_sub(legacy_wait_secs());
     reauth::testing_write_rc3_start(&lab.dir, &format!("{early}\n"));
     lab.coord
@@ -288,16 +308,18 @@ fn an_absent_list_waits_and_a_revoked_or_removed_node_stays_refused() {
     }
     let deny = fs::read_to_string(lab.dir.join("deny.json")).unwrap();
     assert!(deny.contains("spiffe://orblx.local/node/laptop"));
-    assert!(has_reason(&audits(&lab.coord), "reason revoked"));
+    assert_eq!(count_reason(&audits(&lab.coord), "reason revoked"), 10);
 
     let lab = Lab::open("removed");
     lab.enroll_oidc("laptop", "ada");
     lab.coord.testing_set_removed("laptop", true).unwrap();
+    let kept = lab.node("laptop");
     assert!(lab
         .coord
         .reauth_oidc("laptop", &lab.token("ada"), None, lab.now)
         .is_err());
-    assert!(has_reason(&audits(&lab.coord), "reason revoked"));
+    assert_eq!(count_reason(&audits(&lab.coord), "reason revoked"), 1);
+    same_record(&kept, &lab.node("laptop"));
 }
 
 #[test]
@@ -317,19 +339,42 @@ fn an_enroll_token_for_the_same_name_writes_exists_token() {
         )
         .unwrap();
     let again = coord.create_token_at(Duration::from_secs(60), now).unwrap();
-    let err = coord
-        .enroll_token(
-            "laptop",
-            &again.secret,
-            &["laptop:443".to_string()],
-            &[],
-            now,
-        )
-        .unwrap_err();
+    let kept = coord
+        .node_list()
+        .unwrap()
+        .into_iter()
+        .find(|node| node.name == "laptop")
+        .unwrap();
+    let err = crate::server::enroll_token_dispatch(
+        &coord,
+        "laptop",
+        &again.secret,
+        &["laptop:443".to_string()],
+        &[],
+        now,
+    )
+    .unwrap_err();
     assert!(matches!(err, crate::error::CoordError::Exists));
-    coord.reauth_deny_exists_token("laptop").unwrap();
-    assert!(has_reason(&audits(&coord), "reason exists-token"));
-    assert_eq!(count_action(&audits(&coord), "reauth"), 0);
+    let err = crate::server::enroll_token_dispatch(
+        &coord,
+        "laptop",
+        &again.secret,
+        &["laptop:443".to_string()],
+        &[],
+        now,
+    )
+    .unwrap_err();
+    assert!(matches!(err, crate::error::CoordError::Exists));
+    let lines = audits(&coord);
+    assert_eq!(count_reason(&lines, "reason exists-token"), 1);
+    assert_eq!(count_action(&lines, "reauth"), 0);
+    let after = coord
+        .node_list()
+        .unwrap()
+        .into_iter()
+        .find(|node| node.name == "laptop")
+        .unwrap();
+    same_record(&kept, &after);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -377,6 +422,7 @@ fn preauth_reauth_uses_the_key_once_and_scope_failures_do_not() {
     };
     let created = preauth::create(&lab.coord, &empty, owner, lab.now).unwrap();
     let secret = created["key"].as_str().unwrap();
+    let before_scope = lab.node("laptop");
     assert!(preauth::enroll(
         &lab.coord,
         "laptop",
@@ -386,7 +432,8 @@ fn preauth_reauth_uses_the_key_once_and_scope_failures_do_not() {
         lab.now,
     )
     .is_err());
-    assert!(has_reason(&audits(&lab.coord), "reason scope"));
+    assert_eq!(count_reason(&audits(&lab.coord), "reason scope"), 1);
+    same_record(&before_scope, &lab.node("laptop"));
 
     lab.coord.testing_set_enrolled_unix("laptop", 1).unwrap();
     assert!(lab
@@ -438,7 +485,8 @@ fn preauth_reauth_uses_the_key_once_and_scope_failures_do_not() {
         lab.now,
     )
     .is_err());
-    assert!(has_reason(&audits(&lab.coord), "reason scope"));
+    assert_eq!(count_reason(&audits(&lab.coord), "reason scope"), 3);
+    assert_eq!(count_reason(&audits(&lab.coord), "reason legacy-wait"), 1);
 }
 
 #[test]
@@ -573,6 +621,135 @@ fn certificate_grace_and_ticket_end_stay_unchanged() {
 }
 
 #[test]
+fn open_does_not_write_the_marker() {
+    let dir = scratch("open-marker");
+    let now = SystemTime::now();
+    let coord = Coordinator::open(&dir, "coord", OidcConfig::TokenOnly).unwrap();
+    assert!(!dir.join("rc3-start").exists());
+    coord.note_serving(now).unwrap();
+    assert!(dir.join("rc3-start").exists());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_admin_revoke_keeps_the_reauth_deny() {
+    let lab = Lab::open("interleave");
+    let enrolled = lab.enroll_oidc("laptop", "ada");
+    let (old_key, _) = key_of(&enrolled);
+    let (ready, go) = reauth::arm_deny_wait();
+    let coord = lab.coord.clone();
+    let token = lab.token("ada");
+    let now = lab.now;
+    let worker = std::thread::spawn(move || {
+        reauth::mark_deny_wait();
+        coord.reauth_oidc("laptop", &token, None, now)
+    });
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    let coord = lab.coord.clone();
+    let revoke_now = lab.now;
+    let revoker = std::thread::spawn(move || {
+        crate::admin::revoke(
+            &coord,
+            "laptop",
+            "spiffe://orblx.local/node/owner",
+            revoke_now,
+        )
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    go.send(()).unwrap();
+    worker.join().unwrap().unwrap();
+    let reply = revoker.join().unwrap().unwrap();
+    assert_eq!(reply["deny_version"], 2);
+    let text = fs::read_to_string(lab.dir.join("deny.json")).unwrap();
+    assert!(text.contains(&old_key));
+    assert!(text.contains("spiffe://orblx.local/node/laptop"));
+    let set = lab
+        .coord
+        .deny_handle()
+        .unwrap()
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    assert!(set.reject_uri(&SpiffeId::node("laptop").unwrap()).is_err());
+    assert!(set.reject_leaf_key_hex(&old_key, unix(lab.now)).is_err());
+}
+
+#[test]
+fn revoke_undo_updates_the_cache_without_a_restart() {
+    let lab = Lab::open("undo");
+    lab.enroll_oidc("laptop", "ada");
+    crate::admin::revoke(
+        &lab.coord,
+        "laptop",
+        "spiffe://orblx.local/node/owner",
+        lab.now,
+    )
+    .unwrap();
+    let set = lab
+        .coord
+        .deny_handle()
+        .unwrap()
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    assert!(set.reject_uri(&SpiffeId::node("laptop").unwrap()).is_err());
+    crate::admin::revoke_undo(
+        &lab.coord,
+        "laptop",
+        "spiffe://orblx.local/node/owner",
+        lab.now,
+    )
+    .unwrap();
+    let set = lab
+        .coord
+        .deny_handle()
+        .unwrap()
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    assert!(set.reject_uri(&SpiffeId::node("laptop").unwrap()).is_ok());
+    let text = fs::read_to_string(lab.dir.join("deny.json")).unwrap();
+    assert!(!text.contains("spiffe://orblx.local/node/laptop"));
+}
+
+#[test]
+fn a_failure_after_issue_denies_the_new_leaf() {
+    let lab = Lab::open("issue-fail");
+    let enrolled = lab.enroll_oidc("laptop", "ada");
+    let (old_key, _) = key_of(&enrolled);
+    reauth::arm_crash(3);
+    assert!(lab
+        .coord
+        .reauth_oidc("laptop", &lab.token("ada"), None, lab.now)
+        .is_err());
+    let text = fs::read_to_string(lab.dir.join("deny.json")).unwrap();
+    assert!(text.contains(&old_key));
+    let file: Value = serde_json::from_str(&text).unwrap();
+    let keys = file["revoked_leaf_keys"].as_array().unwrap();
+    assert!(keys.len() >= 2, "{text}");
+    assert_eq!(count_action(&audits(&lab.coord), "reauth"), 0);
+    let stored = lab.node("laptop").live_leaf_keys.unwrap();
+    assert!(stored.iter().any(|item| item.key_id == old_key));
+}
+
+#[test]
+fn a_rejected_user_cannot_reauth() {
+    let lab = Lab::open("rejected");
+    let enrolled = lab.enroll_oidc("laptop", "ada");
+    let (old_key, _) = key_of(&enrolled);
+    let before = lab.node("laptop");
+    lab.coord.testing_reject_user("oidc:ada", lab.now).unwrap();
+    assert!(lab
+        .coord
+        .reauth_oidc("laptop", &lab.token("ada"), None, lab.now)
+        .is_err());
+    assert_eq!(count_reason(&audits(&lab.coord), "reason owner"), 1);
+    same_record(&before, &lab.node("laptop"));
+    let stored = lab.node("laptop").live_leaf_keys.unwrap();
+    assert!(stored.iter().any(|item| item.key_id == old_key));
+}
+
+#[test]
 fn release_notes_keep_the_rc1_sentence_and_the_rc3_step() {
     const RC3: &str = include_str!("../../../docs/rc3-release-notes.md");
     const NOTES: &str = include_str!("../../../docs/release-notes/0.1.0-rc.3.md");
@@ -582,5 +759,9 @@ fn release_notes_keep_the_rc1_sentence_and_the_rc3_step() {
         assert!(!text.contains("Re-enroll the node."));
         assert!(text.contains("Automatic recovery after a long sleep is not supported"));
         assert!(text.contains("orblx login"));
+        assert!(text.contains("Upgrade all nodes before you use re-auth."));
+        assert!(text.contains(
+            "If the old coordinator wall clock was ahead and was set back before rc.3 start, a legacy leaf can outlive the wait."
+        ));
     }
 }

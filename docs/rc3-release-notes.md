@@ -37,6 +37,8 @@ The client asks the coordinator for a short user certificate (`ssh-cert-request`
 - The node keeps its name and its overlay address.
 - The coordinator issues a new leaf and a new ticket, and denies the previous leaf key id and ticket nonce.
 - An expired leaf is not accepted.
+- Upgrade all nodes before you use re-auth. An rc.2 node refuses a deny file that contains revoked_leaf_keys, so it refuses all peers.
+- If the old coordinator wall clock was ahead and was set back before rc.3 start, a legacy leaf can outlive the wait.
 
 ## Known issues in v0.1.0-rc.2
 
