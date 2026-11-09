@@ -1,0 +1,12 @@
+[37138.556375] br-1a96ad6bee68: port 5(vethba3d43c) entered blocking state
+[37138.556793] br-1a96ad6bee68: port 5(vethba3d43c) entered forwarding state
+[38043.880221] random: crng reseeded due to virtual machine fork
+[38048.878520] fill_balloon: 1 callbacks suppressed
+[38048.878560] virtio_balloon virtio0: Out of puff! Can't get 1 pages
+--
+[38670.582615] R13: 0000000000000009 R14: 000000000000005a R15: 0000000000000072
+[38670.582891] FS:  00007fce0f71a8c0 GS:  0000000000000000
+[39814.110118] random: crng reseeded due to virtual machine fork
+[39823.782888] virtio_balloon virtio0: Out of puff! Can't get 1 pages
+[39824.071096] virtio_balloon virtio0: Out of puff! Can't get 1 pages
+--

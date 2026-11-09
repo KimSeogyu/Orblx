@@ -45,6 +45,29 @@ fail() {
   exit 1
 }
 
+# A gate failure after the child prints FAIL and continues. The final exit is soak_final_status.
+GATE_FAIL=0
+gate_fail() {
+  echo "FAIL: $*" >&2
+  GATE_FAIL=1
+  return 0
+}
+
+# Status 3, 4, 5, 6, and 7 pass through. Status 1 stays 1.
+# Status 0 with a gate failure is 1. Status 0 with no gate failure is 0.
+soak_final_status() {
+  local tr="$1" gate="${2:-0}"
+  if [[ "$tr" -ne 0 && "$tr" -ne 1 ]]; then
+    printf '%s\n' "$tr"
+    return 0
+  fi
+  if [[ "$tr" -eq 1 || "$gate" -eq 1 ]]; then
+    printf '%s\n' 1
+    return 0
+  fi
+  printf '%s\n' 0
+}
+
 # Keep the coordinator log. A follow that never started is not_reached.
 # This function does not write an empty log as a complete export.
 persist_coord_log() {
@@ -269,26 +292,28 @@ awk '
   { print "tr | " $0 }
 ' "$WORK/tr.log"
 if ! grep -q '^host_qualification ' "$WORK/tr.log"; then
-  seen="no"
-  if grep -q '^FAIL:' "$WORK/tr.log"; then
-    seen="yes"
+  if [[ "$tr_status" -eq 7 ]]; then
+    echo "setup_fail passthrough"
+  else
+    seen="no"
+    if grep -q '^FAIL:' "$WORK/tr.log"; then
+      seen="yes"
+    fi
+    echo "host_qualification invalid drift_s=na max=5 max_gap_s=na max=5 vm_fork=na boot_mono_jump_s=na max=5 sampler_interval_s=na max=1 fork_count=na reason=data_missing product_fail_seen ${seen} product_fail_utc=- host_event_utc=- fork_fail_delta_s=-"
+    if [[ "$tr_status" -eq 0 || "$tr_status" -eq 1 ]]; then
+      tr_status=6
+    fi
   fi
-  echo "host_qualification invalid drift_s=na max=5 max_gap_s=na max=5 vm_fork=na boot_mono_jump_s=na max=5 reason=data_missing product_fail_seen ${seen} product_fail_utc=- host_event_utc=-"
+fi
+if grep -q '^host_qualification invalid ' "$WORK/tr.log"; then
   if [[ "$tr_status" -eq 0 || "$tr_status" -eq 1 ]]; then
     tr_status=6
   fi
 fi
 echo "tr_exit ${tr_status}"
-# Exit 6 is host_invalid. Exit 5 stays the foreign-container abort.
-# A product FAIL line from the child stays in the log above. Do not replace it with exit 1.
-if [[ "$tr_status" -eq 6 ]]; then
-  exit 6
-fi
-if grep -q '^host_qualification invalid ' "$WORK/tr.log"; then
-  if [[ "$tr_status" -eq 0 || "$tr_status" -eq 1 ]]; then
-    exit 6
-  fi
-fi
+# Exit 6 is host_invalid. The final command can be exit 6. Do not exit before the gates.
+# Exit 5 stays the foreign-container abort. Exit 7 is setup_fail.
+# A product FAIL line from the child stays in the log above.
 
 # coord_cert_gate2_check LOG ENDS NEED
 # N/A when LOG has no coordinator leaf line. Otherwise ENDS must reach NEED.
@@ -300,33 +325,57 @@ coord_cert_gate2_check() {
     echo "gate2 N/A reason=main_lacks_coord_svid_expiry_lines"
     return 0
   fi
-  (( ends >= need )) || fail "The run crossed ${ends} coordinator leaf ends, not ${need}."
+  (( ends >= need )) || gate_fail "The run crossed ${ends} coordinator leaf ends, not ${need}."
 }
 
 echo "=== gates ==="
 RUN_END="$(awk '/^renew_period_s .* run_end_unix [0-9]+ / && !f {for (i = 1; i < NF; i++) if ($i == "run_end_unix") print $(i + 1); f = 1}' "$WORK/tr.log")"
-[[ -n "$RUN_END" ]] || fail "ticket-renewal.sh printed no run_end_unix."
-[[ -s "$COORD_LOG" ]] || fail "No coordinator log. The proof did not start the coordinator."
-coord_start_utc="$(awk '/ coord listen / && !f {print $1; f = 1}' "$COORD_LOG")"
-[[ -n "$coord_start_utc" ]] || fail "The coordinator log has no 'coord listen' line."
-coord_start="$(date -d "$coord_start_utc" +%s)"
-soak_run_s=$(( RUN_END - coord_start ))
-ends="$(awk -v e="$RUN_END" -v s="$SKEW" '
-  / coord svid expiry [0-9]+$/ || / coord svid renewed, new expiry [0-9]+$/ {
-    v = $NF; if (!(v in seen)) { seen[v] = 1; if (v + s < e + 0) n++ }
-  }
-  END {print n + 0}' "$COORD_LOG")"
-renewals="$(awk '/ coord svid renewed, new expiry / {n++} END {print n + 0}' "$COORD_LOG")"
-# The product line is "coord handshake failed: <error> remote <address>".
-# The phrase stays. The error and the address follow it. Count that line.
-handshake_fail="$(awk '/ coord handshake failed/ {n++} END {print n + 0}' "$COORD_LOG")"
-renew_fail="$(awk '/ coord svid renewal failed/ {n++} END {print n + 0}' "$COORD_LOG")"
-echo "coord_start_utc ${coord_start_utc} run_end_unix ${RUN_END} soak_run_s ${soak_run_s}"
-echo "coord_svid_ends_crossed ${ends} coord_svid_renewals ${renewals} coord_handshake_failed ${handshake_fail} coord_svid_renewal_failed ${renew_fail}"
-(( tr_status == 0 )) || fail "ticket-renewal.sh failed (exit ${tr_status})."
-read_all grep -qx "proof_ok" < "$WORK/tr.log" || fail "ticket-renewal.sh has no proof_ok line."
-(( handshake_fail == 0 )) || fail "${handshake_fail} coord handshake failed lines."
-(( renew_fail == 0 )) || fail "${renew_fail} coord svid renewal failed lines."
-coord_cert_gate2_check "$COORD_LOG" "$ends" "$SOAK_COORD_ENDS"
-(( soak_run_s >= SOAK_S )) || fail "The run is ${soak_run_s} s from the coordinator start, not ${SOAK_S} s."
-echo "proof_ok coord-cert-soak"
+coord_start_utc=""
+if [[ -z "$RUN_END" ]]; then
+  gate_fail "ticket-renewal.sh printed no run_end_unix."
+fi
+if [[ ! -s "$COORD_LOG" ]]; then
+  gate_fail "No coordinator log. The proof did not start the coordinator."
+else
+  coord_start_utc="$(awk '/ coord listen / && !f {print $1; f = 1}' "$COORD_LOG")"
+  if [[ -z "$coord_start_utc" ]]; then
+    gate_fail "The coordinator log has no 'coord listen' line."
+  fi
+fi
+if [[ -n "$RUN_END" && -n "$coord_start_utc" ]]; then
+  coord_start="$(date -d "$coord_start_utc" +%s)" || coord_start=""
+  if [[ -z "$coord_start" ]]; then
+    gate_fail "The coordinator start time is not a date."
+  else
+    soak_run_s=$(( RUN_END - coord_start ))
+    ends="$(awk -v e="$RUN_END" -v s="$SKEW" '
+      / coord svid expiry [0-9]+$/ || / coord svid renewed, new expiry [0-9]+$/ {
+        v = $NF; if (!(v in seen)) { seen[v] = 1; if (v + s < e + 0) n++ }
+      }
+      END {print n + 0}' "$COORD_LOG")"
+    renewals="$(awk '/ coord svid renewed, new expiry / {n++} END {print n + 0}' "$COORD_LOG")"
+    # The product line is "coord handshake failed: <error> remote <address>".
+    # The phrase stays. The error and the address follow it. Count that line.
+    handshake_fail="$(awk '/ coord handshake failed/ {n++} END {print n + 0}' "$COORD_LOG")"
+    renew_fail="$(awk '/ coord svid renewal failed/ {n++} END {print n + 0}' "$COORD_LOG")"
+    echo "coord_start_utc ${coord_start_utc} run_end_unix ${RUN_END} soak_run_s ${soak_run_s}"
+    echo "coord_svid_ends_crossed ${ends} coord_svid_renewals ${renewals} coord_handshake_failed ${handshake_fail} coord_svid_renewal_failed ${renew_fail}"
+    (( handshake_fail == 0 )) || gate_fail "${handshake_fail} coord handshake failed lines."
+    (( renew_fail == 0 )) || gate_fail "${renew_fail} coord svid renewal failed lines."
+    coord_cert_gate2_check "$COORD_LOG" "$ends" "$SOAK_COORD_ENDS"
+    (( soak_run_s >= SOAK_S )) || gate_fail "The run is ${soak_run_s} s from the coordinator start, not ${SOAK_S} s."
+  fi
+else
+  echo "gate2 skipped reason=missing_run_end_or_coord_start"
+fi
+if [[ "$tr_status" -eq 1 ]]; then
+  gate_fail "ticket-renewal.sh failed (exit 1)."
+fi
+if [[ "$tr_status" -eq 0 || "$tr_status" -eq 1 ]]; then
+  read_all grep -qx "proof_ok" < "$WORK/tr.log" || gate_fail "ticket-renewal.sh has no proof_ok line."
+fi
+final="$(soak_final_status "$tr_status" "$GATE_FAIL")"
+if [[ "$final" -eq 0 ]]; then
+  echo "proof_ok coord-cert-soak"
+fi
+exit "$final"
