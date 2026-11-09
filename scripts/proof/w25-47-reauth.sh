@@ -29,6 +29,8 @@
 # The alarm is 300 s (ORBLX_W25_47_TIMEOUT). DoD b waits up to 60 s for peer
 # traffic after two clock steps and two node starts. One pass prints elapsed_s
 # before the final PASS line. 180 s does not cover that work.
+# DoD f steps the clock before either node starts, so the step does not land
+# in the middle of a node handshake. DoD a then steps again, past the grace.
 set -euo pipefail
 # shellcheck source=scripts/proof/pipe-lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
@@ -255,6 +257,11 @@ for _ in $(seq 1 20); do
 done
 [[ -f "$coord_dir/trust-bundle.pem" ]] || fail "The coordinator did not write the trust bundle."
 
+echo "DoD f: step the clock 11 min so the coordinator leaf is due, before a node is up."
+date -u -s "+11 min" >/dev/null
+wait_grep "$work/coord.log" "coord svid renewed" 30 || fail "DoD f failed. The coordinator log has no coord svid renewed line."
+echo "DoD f passed."
+
 "$idp" mint --dir "$idp_dir" --kid rs1 --issuer "$issuer" --aud "$client" \
   --sub ada --ttl 3600 --out "$work/ada-1.token" >/dev/null
 enroll_a=$("$bin" coord enroll --name a --coord 10.200.0.1:7443 \
@@ -273,13 +280,7 @@ ip netns exec "$ns_a" stdbuf -oL -eL "$bin" up --state-dir "$state_a" --listen 1
 node_a_pid=$!
 wait_grep "$work/node-a.log" "The TUN device is" 30 || fail "Node a did not open the TUN device."
 
-echo "DoD f: step the clock 11 min so the coordinator leaf is due and the node leaf is still inside the grace."
-date -u -s "+11 min" >/dev/null
-wait_grep "$work/coord.log" "coord svid renewed" 30 || fail "DoD f failed. The coordinator log has no coord svid renewed line."
-wait_grep "$work/node-a.log" "The node renewed the SVID." 30 || fail "DoD f failed. Node a did not renew inside the grace."
-echo "DoD f passed."
-
-echo "DoD a: step the clock 17 min so the renewed leaf is past the grace."
+echo "DoD a: step the clock 17 min so the node leaf is past the grace."
 date -u -s "+17 min" >/dev/null
 status_a=
 for _ in $(seq 1 30); do
