@@ -2738,6 +2738,7 @@ fn deny_issued_best_effort(
     nonce: &crate::store::LiveTicketNonce,
     now: SystemTime,
 ) {
+    crate::reauth::note_issued_for_test(&key.key_id, &nonce.nonce);
     if mutate_deny_locked(inner, now, |file, now_unix| {
         file.add_leaf(&key.key_id, key.not_after, now_unix);
         file.add_nonce(nonce.nonce.as_str(), nonce.expires, now_unix);

@@ -58,6 +58,7 @@ thread_local! {
     static CRASH: Cell<u8> = const { Cell::new(0) };
     static RENEW_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
     static DENY_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
+    static ISSUED: Cell<Option<(String, String)>> = const { Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -95,6 +96,22 @@ pub(crate) fn arm_renew_wait() -> (std::sync::mpsc::Receiver<()>, std::sync::mps
 #[cfg(test)]
 pub(crate) fn arm_crash(point: u8) {
     CRASH.with(|cell| cell.set(point));
+}
+
+/// Remember the leaf a failed re-auth denied, so a test can name that leaf.
+pub(crate) fn note_issued_for_test(key_id: &str, nonce: &str) {
+    #[cfg(test)]
+    ISSUED.with(|cell| cell.set(Some((key_id.to_string(), nonce.to_string()))));
+    #[cfg(not(test))]
+    {
+        let _ = (key_id, nonce);
+    }
+}
+
+/// Take the leaf remembered by [`note_issued_for_test`].
+#[cfg(test)]
+pub(crate) fn testing_last_issued() -> Option<(String, String)> {
+    ISSUED.with(|cell| cell.take())
 }
 
 /// Mark this thread. Only a marked thread takes the deny hook.

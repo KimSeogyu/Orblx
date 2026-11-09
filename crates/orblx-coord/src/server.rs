@@ -622,23 +622,32 @@ async fn dispatch(
                     if let Some(plan) = coord.issuer_fetch_plan(kid.as_deref(), now)? {
                         refresh_issuer_jwks(coord, plan).await;
                     }
-                    match coord.enroll_oidc(
-                        &request.name,
-                        id_token,
-                        request.nonce.as_deref(),
-                        &request.endpoints,
-                        &request.routes,
-                        now,
-                    ) {
-                        Ok(result) => result,
-                        Err(CoordError::Exists) => coord.reauth_oidc(
-                            &request.name,
-                            id_token,
-                            request.nonce.as_deref(),
+                    // Re-auth writes the deny file under the coordinator lock.
+                    // The write runs on a blocking thread. The reply waits for it.
+                    let step = coord.clone();
+                    let name = request.name.clone();
+                    let token = id_token.clone();
+                    let nonce = request.nonce.clone();
+                    let endpoints = request.endpoints.clone();
+                    let routes = request.routes.clone();
+                    tokio::task::spawn_blocking(move || {
+                        match step.enroll_oidc(
+                            &name,
+                            &token,
+                            nonce.as_deref(),
+                            &endpoints,
+                            &routes,
                             now,
-                        )?,
-                        Err(err) => return Err(err),
-                    }
+                        ) {
+                            Ok(result) => Ok(result),
+                            Err(CoordError::Exists) => {
+                                step.reauth_oidc(&name, &token, nonce.as_deref(), now)
+                            }
+                            Err(err) => Err(err),
+                        }
+                    })
+                    .await
+                    .map_err(|_| CoordError::State)??
                 }
                 _ => {
                     return Err(CoordError::Protocol(
@@ -658,7 +667,16 @@ async fn dispatch(
             let der = peer_leaf_der(connection)?;
             let key_id = orblx_identity::leaf_key_id(&der).map_err(|_| CoordError::Peer)?;
             let not_after = orblx_identity::leaf_not_after(&der).map_err(|_| CoordError::Peer)?;
-            let result = coord.renew_node(&request.name, &key_id, not_after, now)?;
+            // Renew writes nodes.json under the coordinator lock. The write runs on a
+            // blocking thread so a stall in that fsync does not stop packet tasks.
+            // Deny writes stay in mutate_deny_locked. Renew does not write the deny file.
+            let step = coord.clone();
+            let name = request.name.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                step.renew_node(&name, &key_id, not_after, now)
+            })
+            .await
+            .map_err(|_| CoordError::State)??;
             println!("renewed {}", result.name);
             Ok(leaf_response(result))
         }

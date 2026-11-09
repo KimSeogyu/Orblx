@@ -722,11 +722,16 @@ fn a_failure_after_issue_denies_the_new_leaf() {
         .coord
         .reauth_oidc("laptop", &lab.token("ada"), None, lab.now)
         .is_err());
+    let (new_key, new_nonce) = reauth::testing_last_issued().unwrap();
+    assert_ne!(new_key, old_key);
+    assert_eq!(new_nonce.len(), 32);
     let text = fs::read_to_string(lab.dir.join("deny.json")).unwrap();
     assert!(text.contains(&old_key));
     let file: Value = serde_json::from_str(&text).unwrap();
     let keys = file["revoked_leaf_keys"].as_array().unwrap();
-    assert!(keys.len() >= 2, "{text}");
+    assert!(keys.iter().any(|item| item["key_id"] == new_key), "{text}");
+    let nonces = file["revoked_ticket_nonces"].as_array().unwrap();
+    assert!(nonces.iter().any(|item| item == &new_nonce), "{text}");
     assert_eq!(count_action(&audits(&lab.coord), "reauth"), 0);
     let stored = lab.node("laptop").live_leaf_keys.unwrap();
     assert!(stored.iter().any(|item| item.key_id == old_key));

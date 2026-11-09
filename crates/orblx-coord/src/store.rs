@@ -764,6 +764,12 @@ impl NodeStore {
             .iter_mut()
             .find(|node| node.name == name)
             .ok_or_else(|| CoordError::Protocol("The node is not enrolled.".to_string()))?;
+        if node.live_leaf_keys == keys && node.live_ticket_nonces == nonces {
+            // No new key and no new nonce. The stored lists stay as they are.
+            // A new key still takes the persist below, and that write finishes
+            // before this function returns, so the reply cannot go out first.
+            return Ok(());
+        }
         node.live_leaf_keys = keys;
         node.live_ticket_nonces = nonces;
         self.persist()
