@@ -4,40 +4,159 @@
 # Any later push voids the run.
 #
 # This proof steps CLOCK_REALTIME. It is not in sweep-manifest.txt.
-# The release sweep must not step the clock. The script prints head= and
-# bin_sha256= for the checkout it ran, and it stops when the tree is dirty
-# or the binary is older than HEAD.
+# The release sweep must not step the clock.
 #
 # Build, then run as root:
 #   cargo build --release --locked -p orblx-cli --bin orblx -p orblx-test-idp --bin orblx-test-idp
 #   sudo -n scripts/proof/w25-47-reauth.sh
 # The state directories are under mktemp. The script does not use /var/lib/orblx.
 #
-# NTP: when chronyd, ntpd, or systemd-timesyncd is running, the script refuses
-# with exit 2. It does not stop a daemon, because a host without systemd cannot
-# start that daemon again. When none of them is running, the script steps the
-# clock 2 min and checks that the step is still there. If the clock is put back,
-# the script refuses with exit 2. The trap sets the clock back after a real run.
+# W25_47_LOCK=outer skips the in-script lock. The box launcher holds the lock.
+# That mode requires W25_47_RUN_ID. The default mode takes the in-script lock.
+# W25_47_ALARM_S is the iteration alarm (default 300). W25_47_SETUP_WAIT_S is the
+# pre-marker orblx wait (default 20). The DoD recovery limit is 60 s. It is not
+# an environment setting.
+# W25_47_DRY=1 prints the start lines and does not step the clock. It does not
+# print the PASS line.
+#
+# The stay-probe runs before any orblx process. It refuses with exit 2 when the
+# step does not stay, or when the restored clock is more than 1 s from the start.
+#
+# The marker line is W25-47 first_clock_step. After that line the only exit is 1.
+# The first enroll and the first TUN run before the marker. The script stops that
+# node, prints the marker, and then steps the clock for DoD f.
+#
+# Exit codes:
+#   0    DoD a, b, and f passed.
+#   1    A check failed after the marker. This is the only exit after the marker.
+#   2    Host clock precondition. Privilege, time sync, or the stay-probe.
+#   3    Lock sampler invalid. Only before the marker.
+#   4    Lock disk check. Only before the marker.
+#   5    Lock foreign container. Only before the marker.
+#   6    An orblx command failed before the marker.
+#   7    A tool or file check failed. That step runs no orblx code.
+#   124  The alarm fired before the marker.
 #
 # PASS lines, in order:
 #   DoD f passed.
 #   DoD a passed.
 #   DoD b passed.
-#   W25-47 PASS a b f
-# A pass exits 0. A failed check exits 1. A missing privilege, or an active
-# time sync, exits 2. The proof lock uses status 3, 4, or 5. The alarm exits 124.
-#
-# The alarm is 300 s (ORBLX_W25_47_TIMEOUT). DoD b waits up to 60 s for peer
-# traffic after two clock steps and two node starts. One pass prints elapsed_s
-# before the final PASS line. 180 s does not cover that work.
-# DoD f steps the clock before either node starts, so the step does not land
-# in the middle of a node handshake. DoD a then steps again, past the grace.
+#   W25-47 PASS a b f run_id=<id>
 set -euo pipefail
 # shellcheck source=scripts/proof/pipe-lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$PROOF_LIB_DIR/proof-lock.sh"
 PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before builds).
+
+RECOVERY_NS=60000000000
+NS_PER_S=1000000000
+
+run_id="${W25_47_RUN_ID:-}"
+lock_mode="${W25_47_LOCK:-script}"
+alarm_s="${W25_47_ALARM_S:-300}"
+setup_wait_s="${W25_47_SETUP_WAIT_S:-20}"
+dry="${W25_47_DRY:-}"
+
+if [[ "$lock_mode" != "script" && "$lock_mode" != "outer" ]]; then
+  echo "W25-47 SETUP_FAIL lock run_id=${run_id}"
+  exit 7
+fi
+if [[ "$lock_mode" == "outer" && -z "$run_id" ]]; then
+  echo "W25-47 SETUP_FAIL run_id run_id="
+  exit 7
+fi
+if [[ ! "$alarm_s" =~ ^[0-9]+$ || "$alarm_s" -lt 2 ]]; then
+  echo "W25-47 SETUP_FAIL alarm run_id=${run_id}"
+  exit 7
+fi
+if [[ ! "$setup_wait_s" =~ ^[0-9]+$ || "$setup_wait_s" -lt 1 ]]; then
+  echo "W25-47 SETUP_FAIL setup_wait run_id=${run_id}"
+  exit 7
+fi
+
+transcript=$(mktemp)
+say() {
+  printf '%s\n' "$1"
+  printf '%s\n' "$1" >>"$transcript"
+}
+
+setup_fail() {
+  say "W25-47 SETUP_FAIL $1 run_id=${run_id}"
+  exit 7
+}
+
+host_invalid() {
+  say "W25-47 HOST_INVALID_PRESTEP step=$1 run_id=${run_id}"
+  exit 6
+}
+
+mono_ns() {
+  python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC))'
+}
+
+realtime_ns() {
+  python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_REALTIME))'
+}
+
+dod_fail() {
+  local dod="$1" start_ns="$2" now elapsed
+  now=$(mono_ns)
+  elapsed=$(( (now - start_ns) / NS_PER_S ))
+  say "W25-47 FAIL ${dod} recovery_mono_s=${elapsed} run_id=${run_id}"
+  exit 1
+}
+
+say "run_id=${run_id}"
+
+command -v python3 >/dev/null 2>&1 || setup_fail python3
+command -v rustc >/dev/null 2>&1 || setup_fail rustc
+command -v sha256sum >/dev/null 2>&1 || setup_fail sha256sum
+command -v uname >/dev/null 2>&1 || setup_fail uname
+command -v openssl >/dev/null 2>&1 || setup_fail openssl
+command -v stdbuf >/dev/null 2>&1 || setup_fail stdbuf
+command -v ip >/dev/null 2>&1 || setup_fail ip
+[[ -r /sys/devices/system/clocksource/clocksource0/current_clocksource ]] || setup_fail clocksource
+
+root=$(cd "$(dirname "$0")/../.." && pwd)
+bin="${ORBLX_BIN:-$root/target/release/orblx}"
+idp="${ORBLX_IDP_BIN:-$(dirname "$bin")/orblx-test-idp}"
+case "$bin" in
+  */debug/*) setup_fail "debug ${bin}" ;;
+esac
+case "$idp" in
+  */debug/*) setup_fail "debug ${idp}" ;;
+esac
+[[ -x "$bin" && -x "$idp" ]] || setup_fail binary
+head_sha=$(git -C "$root" rev-parse HEAD) || setup_fail git
+head_ct=$(git -C "$root" log -1 --format=%ct) || setup_fail git
+bin_sha=$(sha256sum "$bin" | awk '{print $1}')
+idp_sha=$(sha256sum "$idp" | awk '{print $1}')
+clocksource=$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource)
+
+say "rustc $(rustc -V)"
+say "cargo_profile=release"
+say "head=${head_sha}"
+say "bin_sha256=${bin_sha}"
+say "idp_sha256=${idp_sha}"
+say "uname_r=$(uname -r)"
+say "clocksource=${clocksource}"
+say "W25_47_ALARM_S=${alarm_s}"
+say "W25_47_SETUP_WAIT_S=${setup_wait_s}"
+say "lock=${lock_mode}"
+
+if [[ "$dry" == "1" ]]; then
+  say "new_key_id=0000000000000000000000000000000000000000000000000000000000000000"
+  secret_scan "$transcript" || setup_fail secret_scan
+  say "W25-47 DRY run_id=${run_id}"
+  rm -f "$transcript"
+  exit 0
+fi
+
+rm_transcript() {
+  rm -f "$transcript"
+}
+trap rm_transcript EXIT
 
 if ! capsh --print 2>/dev/null | read_all grep -q cap_sys_time && [[ "$(id -u)" != "0" ]]; then
   echo "The W25-47 release proof needs CAP_SYS_TIME or root. Eng Lead runs it."
@@ -51,53 +170,50 @@ for ntp_name in chronyd ntpd systemd-timesyncd; do
     exit 2
   fi
 done
-echo "ntp none"
-# A hypervisor can put the clock back within a second. The proof needs the step to stay.
-clock_before=$(date +%s)
-date -u -s "+2 min" >/dev/null
+say "ntp none"
+
+# The stay-probe is a host precondition. It runs before any orblx process.
+clock_before=$(realtime_ns)
+date -u -s "+2 min" >/dev/null || {
+  echo "The stay-probe could not step the clock."
+  exit 2
+}
 sleep 0.4
-clock_after=$(date +%s)
-if [[ $((clock_after - clock_before)) -lt 60 ]]; then
+clock_mid=$(realtime_ns)
+if [[ $(( clock_mid - clock_before )) -lt 60000000000 ]]; then
   echo "The clock did not stay stepped. Something other than chronyd, ntpd, or systemd-timesyncd put it back within 1 s. This proof cannot run on this host."
   exit 2
 fi
-date -u -s "-2 min" >/dev/null
+date -u -s "-2 min" >/dev/null || {
+  echo "The stay-probe could not restore the clock."
+  exit 2
+}
+clock_after=$(realtime_ns)
+clock_delta=$(( clock_after - clock_before ))
+if [[ "$clock_delta" -lt 0 ]]; then
+  clock_delta=$(( -clock_delta ))
+fi
+if [[ "$clock_delta" -gt 1000000000 ]]; then
+  date -u -s "@$(( clock_before / NS_PER_S ))" >/dev/null || true
+  echo "The restored clock is ${clock_delta} ns from the time before the stay-probe. This proof cannot run on this host."
+  exit 2
+fi
+say "W25-47 stay_probe ok"
 
-root=$(cd "$(dirname "$0")/../.." && pwd)
-bin="${ORBLX_BIN:-$root/target/release/orblx}"
-idp="${ORBLX_IDP_BIN:-$(dirname "$bin")/orblx-test-idp}"
-case "$bin" in
-  */debug/*)
-    echo "The proof refuses a debug binary ($bin)."
-    exit 1
-    ;;
-esac
-case "$idp" in
-  */debug/*)
-    echo "The proof refuses a debug binary ($idp)."
-    exit 1
-    ;;
-esac
-if [[ ! -x "$bin" || ! -x "$idp" ]]; then
-  echo "Build the release binaries first. The proof looks for $bin and $idp."
-  exit 1
-fi
 if [[ -n "$(git -C "$root" status --porcelain)" ]]; then
-  echo "The tree is dirty. Eng Lead runs this proof on the exact head."
-  exit 1
+  setup_fail dirty
 fi
-head_sha=$(git -C "$root" rev-parse HEAD)
-head_ct=$(git -C "$root" log -1 --format=%ct)
 bin_mt=$(stat -c %Y "$bin")
 idp_mt=$(stat -c %Y "$idp")
 if [[ "$bin_mt" -lt "$head_ct" || "$idp_mt" -lt "$head_ct" ]]; then
-  echo "The binary is older than HEAD. Build the release binaries again."
-  exit 1
+  setup_fail mtime
 fi
-bin_sha=$(sha256sum "$bin" | awk '{print $1}')
-echo "head=${head_sha}"
-echo "bin_sha256=${bin_sha}"
 
+# Outer mode has no in-script lock. The call below stays at the top level.
+if [[ "$lock_mode" == "outer" ]]; then
+  proof_lock_take() { :; }
+  proof_lock_end() { :; }
+fi
 proof_lock_take "w25-47-reauth"
 
 saved=$(date -u +%Y-%m-%dT%H:%M:%S)
@@ -112,33 +228,22 @@ ns_b=w2547b
 forward_was=
 rp_was=
 cleaned=0
-
-fail() {
-  echo "$1" >&2
-  if [[ -n "$work" && -d "$work" ]]; then
-    echo "proof work $work" >&2
-    for log in coord.log idp.log node-a.log node-b.log; do
-      if [[ -f "$work/$log" ]]; then
-        echo "--- $log ---" >&2
-        tail -n 40 "$work/$log" >&2 || true
-      fi
-    done
-  fi
-  exit 1
-}
+past_marker=0
+alarm_start_ns=0
 
 cleanup() {
   if [[ "$cleaned" == 1 ]]; then
     return
   fi
   cleaned=1
-  # Put the clock back before any wait. A later signal must not leave it stepped.
+  if [[ -n "$watchdog_pid" ]]; then
+    kill "$watchdog_pid" 2>/dev/null || true
+    watchdog_pid=
+  fi
+  # Put the clock back before any other wait.
   if [[ -n "$saved" ]]; then
     date -u -s "$saved" >/dev/null || true
     saved=
-  fi
-  if [[ -n "$watchdog_pid" ]]; then
-    kill "$watchdog_pid" 2>/dev/null || true
   fi
   for pid in "$node_a_pid" "$node_b_pid" "$coord_pid" "$idp_pid"; do
     if [[ -n "$pid" ]]; then
@@ -161,32 +266,92 @@ cleanup() {
   if [[ -n "$rp_was" ]]; then
     printf '%s\n' "$rp_was" >/proc/sys/net/ipv4/conf/all/rp_filter || true
   fi
-  proof_lock_end
+  # After the marker, a lock status must not replace the decided exit.
+  if [[ "$past_marker" == 1 && "$lock_mode" != "outer" ]]; then
+    ( proof_lock_end ) || true
+  else
+    proof_lock_end
+  fi
+  rm -f "$transcript"
 }
 trap cleanup EXIT INT TERM HUP
+
 on_alarm() {
-  echo "The iteration timed out after ${limit} s." >&2
+  if [[ "$past_marker" == 1 ]]; then
+    local now elapsed
+    now=$(mono_ns)
+    elapsed=$(( (now - alarm_start_ns) / NS_PER_S ))
+    say "W25-47 FAIL iteration recovery_mono_s=${elapsed} run_id=${run_id}"
+    exit 1
+  fi
+  echo "The iteration timed out after ${alarm_s} s." >&2
   exit 124
 }
 trap on_alarm USR1
 
-# One iteration. The alarm fires after this many seconds.
-limit="${ORBLX_W25_47_TIMEOUT:-300}"
+alarm_start_ns=$(mono_ns)
 (
-  sleep "$limit"
+  sleep "$alarm_s"
   kill -USR1 $$ 2>/dev/null || true
 ) &
 watchdog_pid=$!
 
-wait_grep() {
-  local file="$1" pattern="$2" seconds="$3" i
-  for i in $(seq 1 "$seconds"); do
+check_deadline() {
+  local now elapsed limit_ns
+  [[ "$past_marker" == 1 ]] || return 0
+  now=$(mono_ns)
+  elapsed=$(( now - alarm_start_ns ))
+  limit_ns=$(( (alarm_s - 1) * NS_PER_S ))
+  if [[ "$elapsed" -ge "$limit_ns" ]]; then
+    say "W25-47 FAIL iteration recovery_mono_s=$(( elapsed / NS_PER_S )) run_id=${run_id}"
+    exit 1
+  fi
+}
+
+wait_prestep() {
+  local step="$1" file="$2" pattern="$3" start now limit_ns
+  start=$(mono_ns)
+  limit_ns=$(( setup_wait_s * NS_PER_S ))
+  while true; do
+    now=$(mono_ns)
+    if [[ $(( now - start )) -ge "$limit_ns" ]]; then
+      host_invalid "$step"
+    fi
     if [[ -f "$file" ]] && read_all grep -q -- "$pattern" <"$file"; then
       return 0
     fi
     sleep 1
   done
-  return 1
+}
+
+wait_file_prestep() {
+  local step="$1" file="$2" start now limit_ns
+  start=$(mono_ns)
+  limit_ns=$(( setup_wait_s * NS_PER_S ))
+  while true; do
+    now=$(mono_ns)
+    [[ -f "$file" ]] && return 0
+    if [[ $(( now - start )) -ge "$limit_ns" ]]; then
+      host_invalid "$step"
+    fi
+    sleep 1
+  done
+}
+
+wait_dod() {
+  local dod="$1" file="$2" pattern="$3" start now
+  start=$(mono_ns)
+  while true; do
+    check_deadline
+    now=$(mono_ns)
+    if [[ $(( now - start )) -ge "$RECOVERY_NS" ]]; then
+      dod_fail "$dod" "$start"
+    fi
+    if [[ -f "$file" ]] && read_all grep -q -- "$pattern" <"$file"; then
+      return 0
+    fi
+    sleep 1
+  done
 }
 
 key_id() {
@@ -197,7 +362,7 @@ key_id() {
     | tr -d ' \n'
 }
 
-work=$(mktemp -d)
+work=$(mktemp -d) || setup_fail work
 coord_dir="$work/coord"
 state_a="$work/node-a"
 state_b="$work/node-b"
@@ -209,37 +374,37 @@ ip netns del "$ns_a" 2>/dev/null || true
 ip netns del "$ns_b" 2>/dev/null || true
 ip link del veth-a 2>/dev/null || true
 ip link del veth-b 2>/dev/null || true
-ip netns add "$ns_a"
-ip netns add "$ns_b"
-ip link add veth-a type veth peer name peer-a
-ip link add veth-b type veth peer name peer-b
-ip link set peer-a netns "$ns_a"
-ip link set peer-b netns "$ns_b"
-ip addr add 10.200.0.1/24 dev veth-a
-ip addr add 10.200.1.1/24 dev veth-b
-ip link set veth-a up
-ip link set veth-b up
-ip netns exec "$ns_a" ip link set lo up
-ip netns exec "$ns_b" ip link set lo up
-ip netns exec "$ns_a" ip addr add 10.200.0.2/24 dev peer-a
-ip netns exec "$ns_b" ip addr add 10.200.1.2/24 dev peer-b
-ip netns exec "$ns_a" ip link set peer-a up
-ip netns exec "$ns_b" ip link set peer-b up
-ip netns exec "$ns_a" ip route add default via 10.200.0.1
-ip netns exec "$ns_b" ip route add default via 10.200.1.1
+ip netns add "$ns_a" || setup_fail netns
+ip netns add "$ns_b" || setup_fail netns
+ip link add veth-a type veth peer name peer-a || setup_fail netns
+ip link add veth-b type veth peer name peer-b || setup_fail netns
+ip link set peer-a netns "$ns_a" || setup_fail netns
+ip link set peer-b netns "$ns_b" || setup_fail netns
+ip addr add 10.200.0.1/24 dev veth-a || setup_fail netns
+ip addr add 10.200.1.1/24 dev veth-b || setup_fail netns
+ip link set veth-a up || setup_fail netns
+ip link set veth-b up || setup_fail netns
+ip netns exec "$ns_a" ip link set lo up || setup_fail netns
+ip netns exec "$ns_b" ip link set lo up || setup_fail netns
+ip netns exec "$ns_a" ip addr add 10.200.0.2/24 dev peer-a || setup_fail netns
+ip netns exec "$ns_b" ip addr add 10.200.1.2/24 dev peer-b || setup_fail netns
+ip netns exec "$ns_a" ip link set peer-a up || setup_fail netns
+ip netns exec "$ns_b" ip link set peer-b up || setup_fail netns
+ip netns exec "$ns_a" ip route add default via 10.200.0.1 || setup_fail netns
+ip netns exec "$ns_b" ip route add default via 10.200.1.1 || setup_fail netns
 forward_was=$(cat /proc/sys/net/ipv4/ip_forward)
 rp_was=$(cat /proc/sys/net/ipv4/conf/all/rp_filter)
 printf '1\n' >/proc/sys/net/ipv4/ip_forward
 printf '0\n' >/proc/sys/net/ipv4/conf/all/rp_filter
-ip netns exec "$ns_a" ping -c 1 -W 2 10.200.0.1 >/dev/null
-ip netns exec "$ns_b" ping -c 1 -W 2 10.200.0.1 >/dev/null
+ip netns exec "$ns_a" ping -c 1 -W 2 10.200.0.1 >/dev/null || setup_fail netns
+ip netns exec "$ns_b" ping -c 1 -W 2 10.200.0.1 >/dev/null || setup_fail netns
 
 issuer=https://127.0.0.1:8443
 client=orblx-w25-47
-"$idp" init --dir "$idp_dir" --host 127.0.0.1 >/dev/null
+"$idp" init --dir "$idp_dir" --host 127.0.0.1 >/dev/null || host_invalid idp
 stdbuf -oL -eL "$idp" serve --dir "$idp_dir" --issuer "$issuer" --listen 127.0.0.1:8443 >"$work/idp.log" 2>&1 &
 idp_pid=$!
-wait_grep "$work/idp.log" "idp serve" 20 || fail "The test issuer did not stay up."
+wait_prestep idp "$work/idp.log" "idp serve"
 
 cat >"$coord_dir/policy.hujson" <<'POLICY'
 {
@@ -261,104 +426,152 @@ CONF
 stdbuf -oL -eL "$bin" coord serve --state "$coord_dir" --name coord --listen 0.0.0.0:7443 \
   --policy "$coord_dir/policy.hujson" --config "$work/coord.toml" >"$work/coord.log" 2>&1 &
 coord_pid=$!
-wait_grep "$work/coord.log" "oidc issuer" 20 || fail "The coordinator did not stay up."
-for _ in $(seq 1 20); do
-  [[ -f "$coord_dir/trust-bundle.pem" ]] && break
-  sleep 1
-done
-[[ -f "$coord_dir/trust-bundle.pem" ]] || fail "The coordinator did not write the trust bundle."
-
-echo "DoD f: step the clock 11 min so the coordinator leaf is due, before a node is up."
-date -u -s "+11 min" >/dev/null
-wait_grep "$work/coord.log" "coord svid renewed" 30 || fail "DoD f failed. The coordinator log has no coord svid renewed line."
-echo "DoD f passed."
+wait_prestep coord "$work/coord.log" "oidc issuer"
+wait_file_prestep coord "$coord_dir/trust-bundle.pem"
 
 "$idp" mint --dir "$idp_dir" --kid rs1 --issuer "$issuer" --aud "$client" \
-  --sub ada --ttl 3600 --out "$work/ada-1.token" >/dev/null
+  --sub ada --ttl 3600 --out "$work/ada-1.token" >/dev/null || host_invalid token
 enroll_a=$("$bin" coord enroll --name a --coord 10.200.0.1:7443 \
   --bundle "$coord_dir/trust-bundle.pem" --id-token-file "$work/ada-1.token" \
-  --state "$state_a" --coord-name coord --endpoint 10.200.0.2:443)
-printf '%s\n' "$enroll_a"
+  --state "$state_a" --coord-name coord --endpoint 10.200.0.2:443) || host_invalid enroll
 overlay_a=$(printf '%s\n' "$enroll_a" | awk '/^overlay_ip /{print $2}')
 name_a=$(printf '%s\n' "$enroll_a" | awk '/^name /{print $2}')
-[[ "$name_a" == "a" && -n "$overlay_a" ]] || fail "The first enroll did not keep the name."
-old_key=$(key_id "$state_a/cert.pem")
-[[ "$old_key" =~ ^[0-9a-f]{64}$ ]] || fail "The first leaf key id is not 64 hex digits."
+[[ "$name_a" == "a" && -n "$overlay_a" ]] || host_invalid enroll
+old_key=$(key_id "$state_a/cert.pem") || host_invalid enroll
+[[ "$old_key" =~ ^[0-9a-f]{64}$ ]] || host_invalid enroll
+say "old_key_id=${old_key}"
 
 ip netns exec "$ns_a" stdbuf -oL -eL "$bin" up --state-dir "$state_a" --listen 10.200.0.2:443 \
   --coord 10.200.0.1:7443 --coord-name coord --bundle "$coord_dir/trust-bundle.pem" \
   --metrics off >"$work/node-a.log" 2>&1 &
 node_a_pid=$!
-wait_grep "$work/node-a.log" "The TUN device is" 30 || fail "Node a did not open the TUN device."
+wait_prestep tun "$work/node-a.log" "The TUN device is"
+kill "$node_a_pid" 2>/dev/null || true
+wait "$node_a_pid" 2>/dev/null || true
+node_a_pid=
 
-echo "DoD a: step the clock 17 min so the node leaf is past the grace."
-date -u -s "+17 min" >/dev/null
+step_mono=$(mono_ns)
+say "W25-47 first_clock_step mono_ns=${step_mono} realtime_ns=$(realtime_ns)"
+past_marker=1
+
+say "DoD f: step the clock 11 min so the coordinator leaf is due."
+date -u -s "+11 min" >/dev/null || dod_fail f "$step_mono"
+wait_dod f "$work/coord.log" "coord svid renewed"
+say "DoD f passed."
+
+ip netns exec "$ns_a" stdbuf -oL -eL "$bin" up --state-dir "$state_a" --listen 10.200.0.2:443 \
+  --coord 10.200.0.1:7443 --coord-name coord --bundle "$coord_dir/trust-bundle.pem" \
+  --metrics off >"$work/node-a-again.log" 2>&1 &
+node_a_pid=$!
+wait_dod a "$work/node-a-again.log" "The TUN device is" || dod_fail a "$step_mono"
+
+say "DoD a: step the clock 17 min so the node leaf is past the grace."
+date -u -s "+17 min" >/dev/null || dod_fail a "$step_mono"
+a_start=$(mono_ns)
 status_a=
-for _ in $(seq 1 30); do
+while true; do
+  check_deadline
+  now=$(mono_ns)
+  if [[ $(( now - a_start )) -ge "$RECOVERY_NS" ]]; then
+    dod_fail a "$a_start"
+  fi
   status_a=$("$bin" status --state-dir "$state_a" || true)
   if printf '%s\n' "$status_a" | read_all grep -q "state needs-reauth" \
     && printf '%s\n' "$status_a" | read_all grep -q "reauth orblx login --name a"; then
     break
   fi
-  sleep 1
   status_a=
+  sleep 1
 done
-[[ -n "$status_a" ]] || fail "DoD a failed."
-printf '%s\n' "$status_a"
-echo "DoD a passed."
+say "$status_a"
+say "DoD a passed."
 
-echo "DoD b: owner re-auth for the same name."
-reauth_start=$(date +%s)
-"$idp" mint --dir "$idp_dir" --kid rs1 --issuer "$issuer" --aud "$client" \
-  --sub ada --ttl 3600 --nonce aabbccdd --out "$work/ada-2.token" >/dev/null
-enroll_again=$("$bin" coord enroll --name a --coord 10.200.0.1:7443 \
-  --bundle "$coord_dir/trust-bundle.pem" --id-token-file "$work/ada-2.token" \
-  --nonce aabbccdd --state "$state_a" --coord-name coord --endpoint 10.200.0.2:443)
-printf '%s\n' "$enroll_again"
-name_again=$(printf '%s\n' "$enroll_again" | awk '/^name /{print $2}')
-overlay_again=$(printf '%s\n' "$enroll_again" | awk '/^overlay_ip /{print $2}')
-[[ "$name_again" == "a" ]] || fail "DoD b failed. The name changed."
-[[ "$overlay_again" == "$overlay_a" ]] || fail "DoD b failed. The overlay address changed."
-new_key=$(key_id "$state_a/cert.pem")
-[[ "$new_key" != "$old_key" ]] || fail "DoD b failed. The key id did not change."
-python3 - "$coord_dir/deny.json" "$old_key" "$new_key" <<'PY'
+say "DoD b: owner re-auth for the same name."
+reauth_mono=$(mono_ns)
+old_nonces=$(python3 - "$coord_dir/nodes.json" <<'PY'
 import json
 import sys
-path, old_key, new_key = sys.argv[1:]
-file = json.load(open(path))
-ids = [item["key_id"] for item in file.get("revoked_leaf_keys", [])]
+file = json.load(open(sys.argv[1]))
+nonces = []
+for node in file["nodes"]:
+    if node.get("name") != "a":
+        continue
+    for item in node.get("live_ticket_nonces") or []:
+        nonces.append(item["nonce"])
+if not nonces:
+    raise SystemExit("no live nonce")
+print(",".join(nonces))
+PY
+) || dod_fail b "$reauth_mono"
+
+"$idp" mint --dir "$idp_dir" --kid rs1 --issuer "$issuer" --aud "$client" \
+  --sub ada --ttl 3600 --nonce aabbccdd --out "$work/ada-2.token" >/dev/null || dod_fail b "$reauth_mono"
+enroll_again=$("$bin" coord enroll --name a --coord 10.200.0.1:7443 \
+  --bundle "$coord_dir/trust-bundle.pem" --id-token-file "$work/ada-2.token" \
+  --nonce aabbccdd --state "$state_a" --coord-name coord --endpoint 10.200.0.2:443) || dod_fail b "$reauth_mono"
+name_again=$(printf '%s\n' "$enroll_again" | awk '/^name /{print $2}')
+overlay_again=$(printf '%s\n' "$enroll_again" | awk '/^overlay_ip /{print $2}')
+[[ "$name_again" == "a" ]] || dod_fail b "$reauth_mono"
+[[ "$overlay_again" == "$overlay_a" ]] || dod_fail b "$reauth_mono"
+new_key=$(key_id "$state_a/cert.pem") || dod_fail b "$reauth_mono"
+[[ "$new_key" != "$old_key" ]] || dod_fail b "$reauth_mono"
+say "new_key_id=${new_key}"
+python3 - "$coord_dir/deny.json" "$coord_dir/config-audit.jsonl" "$old_key" "$new_key" "$old_nonces" <<'PY' || dod_fail b "$reauth_mono"
+import json
+import re
+import sys
+deny_path, audit_path, old_key, new_key, nonce_text = sys.argv[1:]
+deny = json.load(open(deny_path))
+ids = [item["key_id"] for item in deny.get("revoked_leaf_keys", [])]
 if old_key not in ids:
     raise SystemExit("old key is not denied")
 if new_key in ids:
     raise SystemExit("new key is denied")
-PY
-reauth_n=$(python3 - "$coord_dir/config-audit.jsonl" <<'PY'
-import json
-import sys
-count = 0
-for line in open(sys.argv[1]):
+revoked = set(deny.get("revoked_ticket_nonces", []))
+old_nonces = [item for item in nonce_text.split(",") if item]
+if not old_nonces:
+    raise SystemExit("no old nonce")
+for nonce in old_nonces:
+    if nonce not in revoked:
+        raise SystemExit("old nonce is not denied")
+records = []
+for line in open(audit_path):
     line = line.strip()
-    if line and json.loads(line).get("action") == "reauth":
-        count += 1
-print(count)
+    if not line:
+        continue
+    item = json.loads(line)
+    if item.get("action") == "reauth":
+        records.append(item)
+if len(records) != 1:
+    raise SystemExit("reauth count %s" % len(records))
+detail = records[0].get("detail", "")
+match = re.search(r"\bold ([0-9a-f]{64}(?:,[0-9a-f]{64})*) new ([0-9a-f]{64})\b", detail)
+if match is None:
+    raise SystemExit("detail has no key fields")
+old_field = match.group(1).split(",")
+if old_key not in old_field or match.group(2) != new_key:
+    raise SystemExit("detail keys do not match")
 PY
-)
-[[ "$reauth_n" == "1" ]] || fail "DoD b failed. The reauth audit count is ${reauth_n}."
 
 "$idp" mint --dir "$idp_dir" --kid rs1 --issuer "$issuer" --aud "$client" \
-  --sub ada --ttl 3600 --out "$work/ada-b.token" >/dev/null
+  --sub ada --ttl 3600 --out "$work/ada-b.token" >/dev/null || dod_fail b "$reauth_mono"
 enroll_b=$("$bin" coord enroll --name b --coord 10.200.0.1:7443 \
   --bundle "$coord_dir/trust-bundle.pem" --id-token-file "$work/ada-b.token" \
-  --state "$state_b" --coord-name coord --endpoint 10.200.1.2:443)
+  --state "$state_b" --coord-name coord --endpoint 10.200.1.2:443) || dod_fail b "$reauth_mono"
 overlay_b=$(printf '%s\n' "$enroll_b" | awk '/^overlay_ip /{print $2}')
-[[ -n "$overlay_b" ]] || fail "Node b did not enroll."
+[[ -n "$overlay_b" ]] || dod_fail b "$reauth_mono"
 ip netns exec "$ns_b" stdbuf -oL -eL "$bin" up --state-dir "$state_b" --listen 10.200.1.2:443 \
   --coord 10.200.0.1:7443 --coord-name coord --bundle "$coord_dir/trust-bundle.pem" \
   --metrics off >"$work/node-b.log" 2>&1 &
 node_b_pid=$!
 
 traffic=0
-while [[ $(( $(date +%s) - reauth_start )) -lt 60 ]]; do
+while true; do
+  check_deadline
+  now=$(mono_ns)
+  if [[ $(( now - reauth_mono )) -ge "$RECOVERY_NS" ]]; then
+    dod_fail b "$reauth_mono"
+  fi
   status_b=$("$bin" status --state-dir "$state_a" || true)
   if printf '%s\n' "$status_b" | read_all grep -q "peer b .* path direct " \
     && ip netns exec "$ns_a" ping -c 1 -W 1 "$overlay_b" >/dev/null 2>&1; then
@@ -367,8 +580,9 @@ while [[ $(( $(date +%s) - reauth_start )) -lt 60 ]]; do
   fi
   sleep 1
 done
-[[ "$traffic" == "1" ]] || fail "DoD b failed. Peer traffic did not pass within 60 s."
-echo "DoD b passed."
-echo "elapsed_s ${SECONDS}"
-echo "W25-47 PASS a b f"
+[[ "$traffic" == "1" ]] || dod_fail b "$reauth_mono"
+say "DoD b passed."
+say "elapsed_s $(( ($(mono_ns) - alarm_start_ns) / NS_PER_S ))"
+secret_scan "$transcript" || dod_fail secret "$reauth_mono"
+say "W25-47 PASS a b f run_id=${run_id}"
 exit 0
