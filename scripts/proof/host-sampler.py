@@ -16,7 +16,8 @@ CLOCK_BOOTTIME includes Linux suspend.
 A missing clock is the token unsupported. The sampler does not copy another clock.
 The sampler stops on SIGTERM or after --secs seconds.
 
-Usage: host-sampler.py --out FILE [--interval 0.1] [--secs N] [name=cgroup_dir ...]
+Usage: host-sampler.py --out FILE [--interval SECONDS] [--secs N] [name=cgroup_dir ...]
+       The default --interval is HOST_SAMPLER_INTERVAL_S.
        host-sampler.py analyze --samples FILE --gaps FILE [--traces FILE] [thresholds]
        host-sampler.py coverage --samples FILE --cadence-ms N [--mark name=epoch_s]
 
@@ -34,6 +35,7 @@ contention unknown_samples is not an input to coverage.
 """
 import argparse
 import os
+import re
 import signal
 import sys
 import time
@@ -846,6 +848,358 @@ def acceptance_main(argv):
     return 0
 
 
+# W25-47 host-pause guard. These limits are fixed. The program does not read them from the environment.
+# A value above the limit makes the run HOST_INVALID. A value equal to the limit stays inside the rule.
+HOST_DRIFT_MAX_S = 5
+HOST_GAP_MAX_S = 5
+HOST_BOOT_MONO_JUMP_MAX_S = 5
+# Cadence of this harness. argparse --interval defaults to this value.
+# The harness does not pass --interval. The guard does not read an interval from the environment.
+# A constant above 1 s is reason=sampler_interval_cfg.
+HOST_SAMPLER_INTERVAL_S = 0.1
+HOST_SAMPLER_INTERVAL_MAX_S = 1
+# A sample at a distance of exactly 5.0 s is inside the fork neighbourhood. A larger distance is outside.
+HOST_FORK_COVER_NS = 5_000_000_000
+# Exit 5 is PROOF_FOREIGN_ABORT_EXIT in proof-lock.sh. This guard uses 6.
+HOST_INVALID_EXIT = 6
+_HOST_FORK_TEXT = "virtual machine fork"
+_REASON_ORDER = (
+    "data_missing",
+    "drift",
+    "gap",
+    "boot_mono_jump",
+    "sampler_interval_cfg",
+    "sampler_median",
+    "uncovered_fork",
+)
+# Raw dmesg. "[seconds.fraction] message". Short uptime pads the seconds with spaces.
+_RAW_DMESG_RE = re.compile(r"^\[\s*(\d+)(?:\.(\d+))?\]\s*(.*)$")
+
+
+def _fmt_seconds(value):
+    if value is None:
+        return "na"
+    return f"{value:.3f}"
+
+
+def _median(values):
+    """Median of at least two deltas. Fewer than two deltas has no median."""
+    if len(values) < 2:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _clock_ns(row, name):
+    token = row.get("clk", {}).get(name)
+    if token is None or token in ("unsupported", "na", "-"):
+        return None
+    try:
+        return int(token)
+    except ValueError:
+        return None
+
+
+def _utc_from_ns(ns):
+    moment = datetime.fromtimestamp(ns / 1e9, timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+
+
+def _raw_stamp_ns(line):
+    """Return printk nanoseconds from a raw dmesg line, or None.
+
+    printk stores local_clock(), which is sched_clock()
+    (kernel/printk/printk.c, include/linux/sched/clock.h).
+    util-linux dmesg maps that raw value with CLOCK_MONOTONIC when it prints iso or ctime.
+    Both clocks omit suspend when sched_clock stops in suspend.
+    They are not one counter. Short-run skew is microseconds to low milliseconds.
+    NTP can move CLOCK_MONOTONIC by about 1 s per day at 12 ppm.
+    On a nonstop TSC, sched_clock can include suspend while CLOCK_MONOTONIC does not.
+    This guard compares the raw seconds with clk_monotonic_ns. It does not use wall time.
+    """
+    match = _RAW_DMESG_RE.match(line)
+    if match is None:
+        return None
+    fraction = (match.group(2) or "")[:9]
+    fraction = fraction.ljust(9, "0")
+    return int(match.group(1)) * 1_000_000_000 + int(fraction)
+
+
+def _host_events(rows):
+    """Measure drift, the monotonic gap, and the boottime-minus-monotonic jump.
+
+    The gap uses CLOCK_MONOTONIC between consecutive samples.
+    dt_ms is CLOCK_REALTIME. A wall step is the drift rule, not a sampler gap.
+    CLOCK_MONOTONIC advances when the sampler does not run. It does not follow a wall step.
+    The jump is the change in (CLOCK_BOOTTIME - CLOCK_MONOTONIC) between consecutive samples.
+    """
+    if len(rows) < 2:
+        return None
+    clocks = []
+    for row in rows:
+        realtime = _clock_ns(row, "clk_realtime_ns")
+        monotonic = _clock_ns(row, "clk_monotonic_ns")
+        boottime = _clock_ns(row, "clk_boottime_ns")
+        if realtime is None or monotonic is None or boottime is None:
+            return None
+        clocks.append((realtime, monotonic, boottime))
+    drift_s = abs((clocks[-1][0] - clocks[0][0]) - (clocks[-1][1] - clocks[0][1])) / 1e9
+    max_gap_s = 0.0
+    max_jump_s = 0.0
+    gap_event_ns = None
+    jump_event_ns = None
+    deltas = []
+    for prev, cur in zip(clocks, clocks[1:]):
+        mono_s = (cur[1] - prev[1]) / 1e9
+        jump_s = abs((cur[2] - cur[1]) - (prev[2] - prev[1])) / 1e9
+        if mono_s < 0:
+            return None
+        deltas.append(mono_s)
+        if mono_s > max_gap_s:
+            max_gap_s = mono_s
+        if gap_event_ns is None and mono_s > HOST_GAP_MAX_S:
+            gap_event_ns = prev[0]
+        if jump_s > max_jump_s:
+            max_jump_s = jump_s
+        if jump_event_ns is None and jump_s > HOST_BOOT_MONO_JUMP_MAX_S:
+            jump_event_ns = prev[0]
+    return {
+        "drift_s": drift_s,
+        "max_gap_s": max_gap_s,
+        "max_jump_s": max_jump_s,
+        "median_s": _median(deltas),
+        "clocks": clocks,
+        "gap_event_ns": gap_event_ns,
+        "jump_event_ns": jump_event_ns,
+    }
+
+
+def _bracket(clocks, fork_ns):
+    """Gap and drift of the two samples that bracket the fork.
+
+    The left sample is the latest CLOCK_MONOTONIC at or before the fork.
+    The right sample is the earliest CLOCK_MONOTONIC at or after the fork.
+    A sample on the fork has gap 0 and drift 0.
+    """
+    left = None
+    right = None
+    for item in clocks:
+        if item[1] <= fork_ns:
+            left = item
+        if item[1] >= fork_ns and right is None:
+            right = item
+    if left is None or right is None or left[1] == right[1]:
+        return 0.0, 0.0
+    gap_s = (right[1] - left[1]) / 1e9
+    drift_s = abs((right[0] - left[0]) - (right[1] - left[1])) / 1e9
+    return gap_s, drift_s
+
+
+def _forks_in_window(dmesg_text, clocks):
+    """Forks whose raw time is inside the first-to-last monotonic sample.
+
+    A fork is uncovered only when the 5 s before the fork and the 5 s after it
+    both have no sample. A sample at the fork time covers both sides.
+    A sample at exactly 5.0 s covers that side. A sample farther than 5.0 s does not.
+    A fork outside the sampler monotonic window is not counted.
+    A fork line whose stamp does not parse is data_missing.
+    Returns (forks, unparsed).
+    """
+    mono = [item[1] for item in clocks]
+    start = mono[0]
+    end = mono[-1]
+    found = []
+    unparsed = False
+    for line in dmesg_text.splitlines():
+        if _HOST_FORK_TEXT not in line:
+            continue
+        stamp_ns = _raw_stamp_ns(line)
+        if stamp_ns is None:
+            unparsed = True
+        elif start <= stamp_ns <= end:
+            before = any(stamp_ns - HOST_FORK_COVER_NS <= sample <= stamp_ns for sample in mono)
+            after = any(stamp_ns <= sample <= stamp_ns + HOST_FORK_COVER_NS for sample in mono)
+            gap_s, drift_s = _bracket(clocks, stamp_ns)
+            found.append(
+                {
+                    "mono_ns": stamp_ns,
+                    "uncovered": not before and not after,
+                    "gap_s": gap_s,
+                    "drift_s": drift_s,
+                }
+            )
+    found.sort(key=lambda item: item["mono_ns"])
+    return found, unparsed
+
+
+def _fork_fail_delta_s(forks, fail_mono_ns):
+    """Signed seconds from the nearest in-window fork at or before the FAIL, else the earliest fork."""
+    if fail_mono_ns is None or not forks:
+        return None
+    earlier = [item["mono_ns"] for item in forks if item["mono_ns"] <= fail_mono_ns]
+    chosen = max(earlier) if earlier else forks[0]["mono_ns"]
+    return (fail_mono_ns - chosen) / 1e9
+
+
+def _fmt_signed(value):
+    if value is None:
+        return "-"
+    return f"{value:+.3f}"
+
+
+def host_qualification_report(
+    rows,
+    dmesg_text,
+    dmesg_readable,
+    product_status,
+    product_fail_utc,
+    product_fail_seen=False,
+    product_fail_mono_ns=None,
+):
+    """Return the one host_qualification line for this run.
+
+    The window is the sampler lifetime: the first sample through the last sample.
+    product_status is not a product FAIL. product_fail_seen is a real FAIL line.
+    vm_fork=1 means an uncovered fork. A covered fork stays vm_fork=0.
+    """
+    del product_status
+    reasons = []
+    measured = _host_events(rows) if rows else None
+    forks = None
+    if HOST_SAMPLER_INTERVAL_S > HOST_SAMPLER_INTERVAL_MAX_S:
+        reasons.append("sampler_interval_cfg")
+    if measured is None:
+        reasons.append("data_missing")
+        drift_s = None
+        max_gap_s = None
+        max_jump_s = None
+        median_s = None
+        gap_event_ns = None
+        jump_event_ns = None
+    else:
+        drift_s = measured["drift_s"]
+        max_gap_s = measured["max_gap_s"]
+        max_jump_s = measured["max_jump_s"]
+        median_s = measured["median_s"]
+        gap_event_ns = measured["gap_event_ns"]
+        jump_event_ns = measured["jump_event_ns"]
+        if drift_s > HOST_DRIFT_MAX_S:
+            reasons.append("drift")
+        if max_gap_s > HOST_GAP_MAX_S:
+            reasons.append("gap")
+        if max_jump_s > HOST_BOOT_MONO_JUMP_MAX_S:
+            reasons.append("boot_mono_jump")
+    if median_s is None or median_s > HOST_SAMPLER_INTERVAL_MAX_S:
+        reasons.append("sampler_median")
+    text = dmesg_text or ""
+    if not dmesg_readable or text.strip() == "":
+        if "data_missing" not in reasons:
+            reasons.append("data_missing")
+    elif measured is not None:
+        forks, fork_unparsed = _forks_in_window(text, measured["clocks"])
+        if fork_unparsed and "data_missing" not in reasons:
+            reasons.append("data_missing")
+        if any(item["uncovered"] for item in forks):
+            reasons.append("uncovered_fork")
+    ordered = [name for name in _REASON_ORDER if name in reasons]
+    if forks is None:
+        vm_fork = None
+        fork_count = None
+    else:
+        vm_fork = 1 if any(item["uncovered"] for item in forks) else 0
+        fork_count = len(forks)
+    # seen follows --product-fail-seen only. A UTC string, "-", and an empty value do not set it.
+    seen = "yes" if product_fail_seen else "no"
+    utc_text = "" if product_fail_utc is None else str(product_fail_utc).strip()
+    fail_utc = "-" if utc_text in ("", "-") else utc_text
+    event_utc = _utc_from_ns(min(item for item in (gap_event_ns, jump_event_ns) if item is not None)) if any(
+        item is not None for item in (gap_event_ns, jump_event_ns)
+    ) else "-"
+    delta = _fork_fail_delta_s(forks, product_fail_mono_ns) if seen == "yes" else None
+    verdict = "invalid" if ordered else "ok"
+    reason = ",".join(ordered) if ordered else "-"
+    vm_text = "na" if vm_fork is None else str(vm_fork)
+    count_text = "na" if fork_count is None else str(fork_count)
+    parts = [
+        f"host_qualification {verdict}",
+        f"drift_s={_fmt_seconds(drift_s)} max={HOST_DRIFT_MAX_S}",
+        f"max_gap_s={_fmt_seconds(max_gap_s)} max={HOST_GAP_MAX_S}",
+        f"vm_fork={vm_text}",
+        f"boot_mono_jump_s={_fmt_seconds(max_jump_s)} max={HOST_BOOT_MONO_JUMP_MAX_S}",
+        f"sampler_interval_cfg_s={_fmt_seconds(HOST_SAMPLER_INTERVAL_S)} max={HOST_SAMPLER_INTERVAL_MAX_S}",
+        f"sampler_median_s={_fmt_seconds(median_s)} max={HOST_SAMPLER_INTERVAL_MAX_S}",
+        f"fork_count={count_text}",
+    ]
+    for index, fork in enumerate(forks or [], start=1):
+        parts.append(f"fork_{index}_mono_s={fork['mono_ns'] / 1e9:.6f}")
+        parts.append(f"fork_{index}_gap_s={fork['gap_s']:.3f}")
+        parts.append(f"fork_{index}_drift_s={fork['drift_s']:.3f}")
+    parts.extend(
+        (
+            f"reason={reason}",
+            f"product_fail_seen {seen}",
+            f"product_fail_utc={fail_utc}",
+            f"host_event_utc={event_utc}",
+            f"fork_fail_delta_s={_fmt_signed(delta)}",
+        )
+    )
+    return " ".join(parts)
+
+
+def host_pause_exit_code(product_status, line):
+    """Keep exit 3, 4, and 5. Replace pass 0 and product FAIL 1 when the guard is invalid."""
+    if line.startswith("host_qualification invalid ") and product_status in (0, 1):
+        return HOST_INVALID_EXIT
+    return product_status
+
+
+def host_qualification_main(argv):
+    ap = argparse.ArgumentParser(prog="host-sampler.py host-qualification")
+    ap.add_argument("--samples")
+    ap.add_argument("--dmesg")
+    ap.add_argument("--dmesg-unreadable", action="store_true")
+    ap.add_argument("--product-status", type=int, default=0)
+    ap.add_argument("--product-fail-utc", default="")
+    ap.add_argument("--product-fail-seen", action="store_true")
+    ap.add_argument("--product-fail-mono-ns", default="")
+    args = ap.parse_args(argv)
+    rows = None
+    if args.samples and os.path.isfile(args.samples):
+        rows = read_samples(args.samples)
+    dmesg_text = ""
+    readable = not args.dmesg_unreadable
+    if readable:
+        if not args.dmesg or not os.path.isfile(args.dmesg):
+            readable = False
+        else:
+            try:
+                with open(args.dmesg, encoding="utf-8", errors="replace") as handle:
+                    dmesg_text = handle.read()
+            except OSError:
+                readable = False
+    fail_mono = None
+    if args.product_fail_mono_ns:
+        try:
+            fail_mono = int(args.product_fail_mono_ns)
+        except ValueError:
+            fail_mono = None
+    print(
+        host_qualification_report(
+            rows,
+            dmesg_text,
+            readable,
+            args.product_status,
+            args.product_fail_utc,
+            product_fail_seen=args.product_fail_seen,
+            product_fail_mono_ns=fail_mono,
+        )
+    )
+    return 0
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "analyze":
         return analyze(sys.argv[2:])
@@ -853,9 +1207,11 @@ def main():
         return coverage_main(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "acceptance":
         return acceptance_main(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == "host-qualification":
+        return host_qualification_main(sys.argv[2:])
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--interval", type=float, default=0.1)
+    ap.add_argument("--interval", type=float, default=HOST_SAMPLER_INTERVAL_S)
     ap.add_argument("--secs", type=float, default=0)
     ap.add_argument("--cgroup-file")
     ap.add_argument("cgroups", nargs="*")
