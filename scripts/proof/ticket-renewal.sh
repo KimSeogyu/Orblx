@@ -597,6 +597,8 @@ report_observation() {
 cleanup() {
   local status=$?
   local pid
+  # set -e must not skip host_pause_print. The trap continues after this function returns 0.
+  set +e
   if [[ "$status" -ne 0 && -z "${FAIL_AT:-}" ]]; then
     FAIL_AT="$(date +%s.%N)"
   fi
@@ -637,12 +639,84 @@ cleanup() {
     dc logs -t --tail 80 2>&1 | sed 's/[A-Za-z0-9_-]\{40,\}/<redacted>/g' || true
   fi
   dc down -v --remove-orphans >/dev/null 2>&1 || true
+  host_pause_print "$status"
   rm -rf "$WORK"
+  set -e
+  return 0
+}
+
+# W25-47. Exit 5 is the foreign-container abort. This guard uses 6.
+# The limits stay in host-sampler.py. This script does not read a limit from the environment.
+HOST_PAUSE_EXIT=""
+PRODUCT_FAIL_UTC=""
+PRODUCT_FAIL_MONO_NS=""
+SETUP_EXIT=""
+SAMPLER_STARTED=0
+
+# Exit 7 is setup_fail. It is not HOST_INVALID. It does not consume a GO.
+# The sampler had not started. Status 1 from that path is not exit 6.
+# PRODUCT_FAIL_UTC is set only in fail(), which prints the FAIL: line. That is the seen signal.
+# An empty value and "-" are not a product FAIL.
+host_pause_print() {
+  local status="$1" samples dmesg_file line seen="no" utc="-"
+  if [[ -n "${PRODUCT_FAIL_UTC:-}" && "${PRODUCT_FAIL_UTC}" != "-" ]]; then
+    seen="yes"
+    utc="$PRODUCT_FAIL_UTC"
+  fi
+  if [[ "${SAMPLER_STARTED:-0}" != "1" ]]; then
+    if [[ "$status" -eq 1 ]]; then
+      if [[ "$seen" == "yes" ]]; then
+        echo "setup_fail product_fail_seen yes product_fail_utc=${utc}"
+      else
+        echo "setup_fail product_fail_seen no product_fail_utc=-"
+      fi
+      SETUP_EXIT=7
+    fi
+    return 0
+  fi
+  samples="${OUTD:-}/host-samples.txt"
+  dmesg_file="$(mktemp)"
+  local -a args=(
+    host-qualification
+    --product-status "$status"
+  )
+  if [[ "$seen" == "yes" ]]; then
+    args+=(--product-fail-seen --product-fail-utc "$utc")
+  fi
+  if [[ -n "${PRODUCT_FAIL_MONO_NS:-}" ]]; then
+    args+=(--product-fail-mono-ns "$PRODUCT_FAIL_MONO_NS")
+  fi
+  if [[ -n "${OUTD:-}" && -f "$samples" ]]; then
+    args+=(--samples "$samples")
+  fi
+  # Raw printk seconds. Do not use iso or -T. Those convert through the wall clock.
+  if dmesg --time-format=raw >"$dmesg_file" 2>/dev/null || dmesg >"$dmesg_file" 2>/dev/null; then
+    args+=(--dmesg "$dmesg_file")
+  else
+    args+=(--dmesg-unreadable)
+  fi
+  if ! line="$(python3 "$ROOT/scripts/proof/host-sampler.py" "${args[@]}")"; then
+    line="host_qualification invalid drift_s=na max=5 max_gap_s=na max=5 vm_fork=na boot_mono_jump_s=na max=5 sampler_interval_cfg_s=0.100 max=1 sampler_median_s=na max=1 fork_count=na reason=data_missing,sampler_median product_fail_seen ${seen} product_fail_utc=${utc} host_event_utc=- fork_fail_delta_s=-"
+  fi
+  rm -f "$dmesg_file"
+  printf '%s\n' "$line"
+  if [[ "$line" == host_qualification\ invalid\ * && ( "$status" -eq 0 || "$status" -eq 1 ) ]]; then
+    HOST_PAUSE_EXIT=6
+  fi
+}
+
+host_pause_apply_exit() {
+  if [[ "${SETUP_EXIT:-}" == "7" ]]; then
+    exit 7
+  fi
+  if [[ "${HOST_PAUSE_EXIT:-}" == "6" ]]; then
+    exit 6
+  fi
 }
 # shellcheck source=scripts/proof/proof-lock.sh
 . "$PROOF_LIB_DIR/proof-lock.sh"
 PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before the lock).
-trap 'cleanup; proof_lock_end' EXIT
+trap 'cleanup; proof_lock_end; host_pause_apply_exit' EXIT
 proof_lock_take "ticket-renewal" "$TR_PROJECT"
 
 # W25-14b: start from a clean compose state (all profiles, all volumes).
@@ -652,6 +726,11 @@ proof_compose_clean "${TR_PROJECT}" || exit 1
 
 fail() {
   echo "FAIL: $*" >&2
+  # This is the only writer of PRODUCT_FAIL_UTC. host_pause_print treats that value as the FAIL line.
+  if [[ -z "${PRODUCT_FAIL_UTC:-}" ]]; then
+    PRODUCT_FAIL_UTC="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+    PRODUCT_FAIL_MONO_NS="$(python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC))')"
+  fi
   FAIL_AT="$(date +%s.%N)"
   exit 1
 }
@@ -776,10 +855,12 @@ build_image
 OUTD="${TR_OUT_DIR:-$WORK/out}"
 mkdir -p "$OUTD"
 : > "$OUTD/sampler-cgroups.txt"
-echo "=== [C] host sampler every 100 ms to ${OUTD}/host-samples.txt ==="
-python3 "$ROOT/scripts/proof/host-sampler.py" --out "$OUTD/host-samples.txt" --interval 0.1 \
+echo "=== [C] host sampler to ${OUTD}/host-samples.txt ==="
+# The interval is HOST_SAMPLER_INTERVAL_S, the sampler default. This command does not set an interval.
+python3 "$ROOT/scripts/proof/host-sampler.py" --out "$OUTD/host-samples.txt" \
   --cgroup-file "$OUTD/sampler-cgroups.txt" &
 SAMPLER_PID="$!"
+SAMPLER_STARTED=1
 echo "host_sampler pid ${SAMPLER_PID} cgroups_pending_until_nodes"
 echo "observation_note early_clock_sampler_does_not_change_proof_lock_unknown_samples"
 

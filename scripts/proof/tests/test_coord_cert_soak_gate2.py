@@ -36,7 +36,7 @@ def run_gate(log_text, ends, need):
             handle.write(log_text)
         script = (
             "set -euo pipefail\n"
-            "fail() { echo \"FAIL: $*\" >&2; exit 1; }\n"
+            "gate_fail() { echo \"FAIL: $*\" >&2; exit 1; }\n"
             + function_text("coord_cert_gate2_check")
             + "\ncoord_cert_gate2_check \"$1\" \"$2\" \"$3\"\n"
         )

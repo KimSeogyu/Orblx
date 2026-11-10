@@ -211,7 +211,7 @@ class HostClockCoverageTest(unittest.TestCase):
         )
         head, tail = src.split('echo "=== [C] start coordinator ==="', 1)
         self.assertIn("--cgroup-file", head)
-        self.assertIn("--interval 0.1", head)
+        self.assertNotIn("--interval", head)
         self.assertNotIn("--interval 0.1", tail)
         between = src.split('echo "=== [C] wait for the ping runs to end ==="', 1)[1]
         between = between.split('echo "=== gate 1: ticket ends crossed ==="', 1)[0]
