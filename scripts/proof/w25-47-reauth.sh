@@ -55,7 +55,9 @@ PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 Gi
 
 RECOVERY_NS=60000000000
 NS_PER_S=1000000000
+NS_PER_MS=1000000
 NODE_URI="spiffe://orblx.local/node/a"
+SESSION_UP_LINE="The peer SPIFFE ID is "
 
 export W25_47_PROOF=1
 run_id="${W25_47_RUN_ID:-}"
@@ -387,8 +389,15 @@ wait_file_prestep() {
   done
 }
 
+mark_elapsed() {
+  local dod="$1" start="$2" what="$3" now ms
+  now=$(mono_ns)
+  ms=$(( (now - start) / NS_PER_MS ))
+  say "W25-47 elapsed ${dod} ${what} mono_ms=${ms}"
+}
+
 wait_from() {
-  local dod="$1" start="$2" file="$3" pattern="$4" now
+  local dod="$1" start="$2" file="$3" pattern="$4" what="$5" now
   while true; do
     check_deadline
     now=$(mono_ns)
@@ -396,10 +405,21 @@ wait_from() {
       dod_fail "$dod" "$start"
     fi
     if [[ -f "$file" ]] && read_all grep -q -- "$pattern" <"$file"; then
+      mark_elapsed "$dod" "$start" "$what"
       return 0
     fi
     sleep 1
   done
+}
+
+client_stopped() {
+  local state
+  [[ -n "${hello_pid:-}" ]] || return 0
+  if [[ ! -d "/proc/${hello_pid}" ]]; then
+    return 0
+  fi
+  state=$(awk '/^State:/ { print $2 }' "/proc/${hello_pid}/status" 2>/dev/null || true)
+  [[ "$state" == "Z" ]]
 }
 
 key_id() {
@@ -516,6 +536,21 @@ say "DoD b live: re-auth while the old leaf is inside not_after."
 say "DoD b order: a_crash_after_deny_and_a_crash_after_nodes_match_the_audit_rule"
 live_mono=$(mono_ns)
 cp -a "$state_a" "$work/state-a-old" || dod_fail b "$live_mono"
+old_keys=$(timeout 60 python3 - "$coord_dir/nodes.json" <<'PY'
+import json
+import sys
+file = json.load(open(sys.argv[1]))
+keys = []
+for node in file["nodes"]:
+    if node.get("name") != "a":
+        continue
+    for item in node.get("live_leaf_keys") or []:
+        keys.append(item["key_id"])
+if not keys:
+    raise SystemExit("no live leaf key")
+print(",".join(keys))
+PY
+) || dod_fail b "$live_mono"
 old_nonces=$(timeout 60 python3 - "$coord_dir/nodes.json" <<'PY'
 import json
 import sys
@@ -545,15 +580,19 @@ overlay_again=$(printf '%s\n' "$enroll_again" | awk '/^overlay_ip /{print $2}')
 new_key=$(key_id_bounded "$state_a/cert.pem") || dod_fail b "$live_mono"
 [[ "$new_key" != "$old_key" ]] || dod_fail b "$live_mono"
 say "new_key_id=${new_key}"
-timeout 60 python3 - "$coord_dir/deny.json" "$coord_dir/config-audit.jsonl" "$old_key" "$new_key" "$old_nonces" "$NODE_URI" <<'PY' || dod_fail b "$live_mono"
+checked=$(timeout 60 python3 - "$coord_dir/deny.json" "$coord_dir/config-audit.jsonl" "$old_key" "$new_key" "$old_keys" "$old_nonces" "$NODE_URI" <<'PY'
 import json
 import re
 import sys
-deny_path, audit_path, old_key, new_key, nonce_text, node_uri = sys.argv[1:]
+deny_path, audit_path, old_key, new_key, key_text, nonce_text, node_uri = sys.argv[1:]
 deny = json.load(open(deny_path))
 ids = [item["key_id"] for item in deny.get("revoked_leaf_keys", [])]
-if old_key not in ids:
-    raise SystemExit("old key is not denied")
+old_keys = [item for item in key_text.split(",") if item]
+if not old_keys:
+    raise SystemExit("no live leaf key")
+for key in old_keys:
+    if key not in ids:
+        raise SystemExit("old key is not denied")
 if new_key in ids:
     raise SystemExit("new key is denied")
 revoked = set(deny.get("revoked_ticket_nonces", []))
@@ -582,7 +621,14 @@ if match is None:
 old_field = match.group(1).split(",")
 if old_key not in old_field or match.group(2) != new_key:
     raise SystemExit("detail keys do not match")
+print(
+    "live_leaf_keys_checked=%d live_ticket_nonces_checked=%d"
+    % (len(old_keys), len(old_nonces))
+)
 PY
+) || dod_fail b "$live_mono"
+[[ "$checked" == live_leaf_keys_checked=* ]] || dod_fail b "$live_mono"
+say "$checked"
 
 timeout 60 "$idp" mint --dir "$idp_dir" --kid rs1 --issuer "$issuer" --aud "$client" \
   --sub ada --ttl 3600 --out "$work/ada-b.token" >/dev/null || dod_fail b "$live_mono"
@@ -595,29 +641,60 @@ ip netns exec "$ns_b" stdbuf -oL -eL "$bin" up --state-dir "$state_b" --listen 1
   --coord 10.200.0.1:7443 --coord-name coord --bundle "$coord_dir/trust-bundle.pem" \
   --metrics off >"$work/node-b.log" 2>&1 &
 node_b_pid=$!
-wait_from b "$live_mono" "$work/node-b.log" "The TUN device is"
+wait_from b "$live_mono" "$work/node-b.log" "The TUN device is" "live-tun"
 
 present() {
-  local start="$1" log="$2" pattern="$3" cert="$4" key="$5" ticket="$6"
-  timeout 60 "$bin" hello-quic client \
+  local start="$1" log="$2" pattern="$3" cert="$4" key="$5" ticket="$6" what="$7"
+  local now hello_code
+  : >"$work/hello.out"
+  : >"$work/hello.err"
+  "$bin" hello-quic client \
     --cert "$cert" --key "$key" --bundle "$coord_dir/trust-bundle.pem" \
     --ticket "$ticket" --connect 10.200.1.2:443 \
-    >"$work/hello.out" 2>>"$work/orblx.err" &
+    >"$work/hello.out" 2>"$work/hello.err" &
   hello_pid=$!
-  wait_from b "$start" "$log" "$pattern"
-  kill "$hello_pid" 2>/dev/null || true
-  wait "$hello_pid" 2>/dev/null || true
+  wait_from b "$start" "$log" "$pattern" "${what}-refusal"
+  while true; do
+    check_deadline
+    now=$(mono_ns)
+    if [[ $(( now - start )) -ge "$RECOVERY_NS" ]]; then
+      kill "$hello_pid" 2>/dev/null || true
+      wait "$hello_pid" 2>/dev/null || true
+      hello_pid=
+      if [[ -s "$work/hello.err" ]]; then
+        cat "$work/hello.err" >>"$work/orblx.err"
+      fi
+      dod_fail b "$start"
+    fi
+    if client_stopped; then
+      break
+    fi
+    sleep 1
+  done
+  hello_code=0
+  wait "$hello_pid" || hello_code=$?
   hello_pid=
+  if [[ -s "$work/hello.err" ]]; then
+    cat "$work/hello.err" >>"$work/orblx.err"
+  fi
+  if [[ "$hello_code" -eq 0 || "$hello_code" -eq 127 ]]; then
+    dod_fail b "$start"
+  fi
+  if read_all grep -q -F -- "$SESSION_UP_LINE" <"$work/hello.out" \
+    || read_all grep -q -F -- "$SESSION_UP_LINE" <"$work/hello.err"; then
+    dod_fail b "$start"
+  fi
+  mark_elapsed b "$start" "$what"
 }
 
 present "$live_mono" "$work/node-b.log" "The leaf check failed. The deny list contains this identifier." \
-  "$work/state-a-old/cert.pem" "$work/state-a-old/key.pem" "$work/state-a-old/ticket.bin"
+  "$work/state-a-old/cert.pem" "$work/state-a-old/key.pem" "$work/state-a-old/ticket.bin" "old-leaf"
 rm -rf "$work/state-a-ticket"
 cp -a "$state_a" "$work/state-a-ticket" || dod_fail b "$live_mono"
 cp "$work/state-a-old/ticket.bin" "$work/state-a-ticket/ticket.bin" || dod_fail b "$live_mono"
 cp "$work/state-a-old/ticket.bin.mac" "$work/state-a-ticket/ticket.bin.mac" || dod_fail b "$live_mono"
 present "$live_mono" "$work/node-b.log" "The capability ticket check rejected the peer. The deny list contains this identifier." \
-  "$work/state-a-ticket/cert.pem" "$work/state-a-ticket/key.pem" "$work/state-a-ticket/ticket.bin"
+  "$work/state-a-ticket/cert.pem" "$work/state-a-ticket/key.pem" "$work/state-a-ticket/ticket.bin" "old-ticket"
 kill "$node_b_pid" 2>/dev/null || true
 wait "$node_b_pid" 2>/dev/null || true
 node_b_pid=
@@ -625,14 +702,14 @@ say "DoD b live passed."
 
 say "DoD f: step the clock 11 min so the coordinator leaf is due."
 date -u -s "+11 min" >/dev/null || dod_fail f "$step_mono"
-wait_from f "$step_mono" "$work/coord.log" "coord svid renewed"
+wait_from f "$step_mono" "$work/coord.log" "coord svid renewed" "coord-renew"
 say "DoD f passed."
 
 ip netns exec "$ns_a" stdbuf -oL -eL "$bin" up --state-dir "$state_a" --listen 10.200.0.2:443 \
   --coord 10.200.0.1:7443 --coord-name coord --bundle "$coord_dir/trust-bundle.pem" \
   --metrics off >"$work/node-a-again.log" 2>&1 &
 node_a_pid=$!
-wait_from a "$step_mono" "$work/node-a-again.log" "The TUN device is"
+wait_from a "$step_mono" "$work/node-a-again.log" "The TUN device is" "node-tun"
 
 say "DoD a: step the clock 17 min so the node leaf is past the grace."
 date -u -s "+17 min" >/dev/null || dod_fail a "$step_mono"
@@ -717,15 +794,15 @@ ip netns exec "$ns_b" stdbuf -oL -eL "$bin" up --state-dir "$state_c" --listen 1
   --coord 10.200.0.1:7443 --coord-name coord --bundle "$coord_dir/trust-bundle.pem" \
   --metrics off >"$work/node-c.log" 2>&1 &
 node_b_pid=$!
-wait_from b "$expired_mono" "$work/node-c.log" "The TUN device is"
+wait_from b "$expired_mono" "$work/node-c.log" "The TUN device is" "expired-tun"
 present "$expired_mono" "$work/node-c.log" "The leaf check failed. The end time has passed." \
-  "$work/state-a-expired/cert.pem" "$work/state-a-expired/key.pem" "$work/state-a-expired/ticket.bin"
+  "$work/state-a-expired/cert.pem" "$work/state-a-expired/key.pem" "$work/state-a-expired/ticket.bin" "expired-leaf"
 rm -rf "$work/state-a-expired-ticket"
 cp -a "$state_a" "$work/state-a-expired-ticket" || dod_fail b "$expired_mono"
 cp "$work/state-a-expired/ticket.bin" "$work/state-a-expired-ticket/ticket.bin" || dod_fail b "$expired_mono"
 cp "$work/state-a-expired/ticket.bin.mac" "$work/state-a-expired-ticket/ticket.bin.mac" || dod_fail b "$expired_mono"
 present "$expired_mono" "$work/node-c.log" "The capability ticket check rejected the peer. The end time has passed." \
-  "$work/state-a-expired-ticket/cert.pem" "$work/state-a-expired-ticket/key.pem" "$work/state-a-expired-ticket/ticket.bin"
+  "$work/state-a-expired-ticket/cert.pem" "$work/state-a-expired-ticket/key.pem" "$work/state-a-expired-ticket/ticket.bin" "expired-ticket"
 
 say "DoD b passed."
 say "elapsed_s $(( ($(mono_ns) - alarm_start_ns) / NS_PER_S ))"
