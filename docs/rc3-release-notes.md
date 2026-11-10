@@ -40,6 +40,10 @@ The client asks the coordinator for a short user certificate (`ssh-cert-request`
 - Upgrade all nodes before you use re-auth. An rc.2 node refuses a deny file that contains revoked_leaf_keys, so it refuses all peers.
 - If the old coordinator wall clock was ahead and was set back before rc.3 start, a legacy leaf can outlive the wait.
 
+## W25-47 DoD b
+
+b2 and b4 each have two branches. The live branch runs before any clock step. The deny set has the old leaf key id and each old ticket nonce, and the one `reauth` audit line has that old key id and the new key id. A handshake with the old leaf and a use of the old ticket are refused while both are still inside `not_after`. The expired branch runs after the clock step. The old leaf and the old ticket are refused because the end time has passed. The one `reauth` audit line for that re-auth says `old none` and the new key id. The deny set has no expired leaf key. The ordering proof is the unit test `a_crash_after_deny_and_a_crash_after_nodes_match_the_audit_rule`: crash point 1 writes the old key into `deny.json` and does not issue the new leaf.
+
 ## Known issues in v0.1.0-rc.2
 
 - With --coord, the coordinator cert is not renewed; nodes lose all peers about 26 min after coordinator start. (from code and a main run, not reproduced on the rc.2 tag)

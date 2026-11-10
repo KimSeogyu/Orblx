@@ -465,8 +465,14 @@ proof_free_gib_at() {
   echo $((kib / 1048576))
 }
 
+proof_run_id_suffix() {
+  if [[ "${W25_47_PROOF:-}" == "1" ]]; then
+    printf ' run_id=%s' "${W25_47_RUN_ID:-}"
+  fi
+}
+
 proof_infra_abort() {
-  echo "proof_infra_abort $1 $2. No proof step ran." >&2
+  echo "proof_infra_abort $1 $2. No proof step ran.$(proof_run_id_suffix)" >&2
   exit "$PROOF_INFRA_ABORT_EXIT"
 }
 
@@ -515,14 +521,14 @@ PROOF_FOREIGN_ABORT_EXIT=5
 proof_foreign_check() {
   local label="$1" others names
   if ! others="$(proof_lock_others)"; then
-    echo "proof_infra_abort ${label} reason=containers_unknown names=none. No proof step ran." >&2
+    echo "proof_infra_abort ${label} reason=containers_unknown names=none. No proof step ran.$(proof_run_id_suffix)" >&2
     proof_lock_end
     exit "$PROOF_FOREIGN_ABORT_EXIT"
   fi
   others="$(printf '%s\n' "$others" | sed '/^$/d' | sort -u)"
   [[ -n "$others" ]] || return 0
   names="$(printf '%s\n' "$others" | paste -sd, -)"
-  echo "proof_infra_abort ${label} reason=foreign_containers names=${names}. No proof step ran." >&2
+  echo "proof_infra_abort ${label} reason=foreign_containers names=${names}. No proof step ran.$(proof_run_id_suffix)" >&2
   proof_lock_end
   exit "$PROOF_FOREIGN_ABORT_EXIT"
 }
@@ -658,7 +664,7 @@ proof_lock_end() {
   fi
   PROOF_LOCK_LABEL=""
   if [[ -n "$invalid" ]]; then
-    echo "proof_lock FAIL: the sampler could not count the other orblx containers, so the run is not valid (W25-35)." >&2
+    echo "proof_lock FAIL: the sampler could not count the other orblx containers, so the run is not valid (W25-35).$(proof_run_id_suffix)" >&2
     exit 3
   fi
 }

@@ -20,11 +20,14 @@
 # print the PASS line.
 #
 # The stay-probe runs before any orblx process. It refuses with exit 2 when the
-# step does not stay, or when the restored clock is more than 1 s from the start.
+# step does not stay, or when the restored clock is more than 1 s from the
+# monotonic elapsed time.
 #
-# The marker line is W25-47 first_clock_step. After that line the only exit is 1.
-# The first enroll and the first TUN run before the marker. The script stops that
-# node, prints the marker, and then steps the clock for DoD f.
+# The marker line is W25-47 first_clock_step. It is printed just before DoD b
+# branch 2 (the live leaf). After that line the only exit is 1.
+# Setup enroll and the first TUN run before the marker. Branch 2 re-auths that
+# leaf while it is still inside not_after. The clock steps for DoD f and DoD a
+# come after branch 2. DoD b branch 1 then re-auths the expired leaf.
 #
 # Exit codes:
 #   0    DoD a, b, and f passed.
@@ -35,9 +38,10 @@
 #   5    Lock foreign container. Only before the marker.
 #   6    An orblx command failed before the marker.
 #   7    A tool or file check failed. That step runs no orblx code.
-#   124  The alarm fired before the marker.
+#   124  The alarm or a signal fired before the marker.
 #
 # PASS lines, in order:
+#   DoD b live passed.
 #   DoD f passed.
 #   DoD a passed.
 #   DoD b passed.
@@ -51,8 +55,11 @@ PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 Gi
 
 RECOVERY_NS=60000000000
 NS_PER_S=1000000000
+NODE_URI="spiffe://orblx.local/node/a"
 
+export W25_47_PROOF=1
 run_id="${W25_47_RUN_ID:-}"
+export W25_47_RUN_ID="$run_id"
 lock_mode="${W25_47_LOCK:-script}"
 alarm_s="${W25_47_ALARM_S:-300}"
 setup_wait_s="${W25_47_SETUP_WAIT_S:-20}"
@@ -91,12 +98,35 @@ host_invalid() {
   exit 6
 }
 
+clock_fail() {
+  echo "$1 run_id=${run_id}" >&2
+  exit 2
+}
+
 mono_ns() {
   python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC))'
 }
 
 realtime_ns() {
   python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_REALTIME))'
+}
+
+set_clock_ns() {
+  local target="$1" sec frac
+  sec=$(( target / NS_PER_S ))
+  frac=$(printf '%09d' $(( target % NS_PER_S )))
+  date -u -s "@${sec}.${frac}" >/dev/null
+}
+
+restore_marked_clock() {
+  local now elapsed target
+  [[ -n "${mono_origin:-}" && -n "${real_origin:-}" ]] || return 0
+  now=$(mono_ns) || return 0
+  elapsed=$(( now - mono_origin ))
+  target=$(( real_origin + elapsed ))
+  set_clock_ns "$target" || true
+  mono_origin=
+  real_origin=
 }
 
 dod_fail() {
@@ -116,6 +146,8 @@ command -v uname >/dev/null 2>&1 || setup_fail uname
 command -v openssl >/dev/null 2>&1 || setup_fail openssl
 command -v stdbuf >/dev/null 2>&1 || setup_fail stdbuf
 command -v ip >/dev/null 2>&1 || setup_fail ip
+command -v timeout >/dev/null 2>&1 || setup_fail timeout
+command -v pgrep >/dev/null 2>&1 || setup_fail pgrep
 [[ -r /sys/devices/system/clocksource/clocksource0/current_clocksource ]] || setup_fail clocksource
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
@@ -130,9 +162,9 @@ esac
 [[ -x "$bin" && -x "$idp" ]] || setup_fail binary
 head_sha=$(git -C "$root" rev-parse HEAD) || setup_fail git
 head_ct=$(git -C "$root" log -1 --format=%ct) || setup_fail git
-bin_sha=$(sha256sum "$bin" | awk '{print $1}')
-idp_sha=$(sha256sum "$idp" | awk '{print $1}')
-clocksource=$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource)
+bin_sha=$(sha256sum "$bin" | awk '{print $1}') || setup_fail sha256sum
+idp_sha=$(sha256sum "$idp" | awk '{print $1}') || setup_fail sha256sum
+clocksource=$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource) || setup_fail clocksource
 
 say "rustc $(rustc -V)"
 say "cargo_profile=release"
@@ -156,55 +188,60 @@ fi
 rm_transcript() {
   rm -f "$transcript"
 }
-trap rm_transcript EXIT
 
 if ! capsh --print 2>/dev/null | read_all grep -q cap_sys_time && [[ "$(id -u)" != "0" ]]; then
-  echo "The W25-47 release proof needs CAP_SYS_TIME or root. Eng Lead runs it."
-  exit 2
+  clock_fail "The W25-47 release proof needs CAP_SYS_TIME or root. Eng Lead runs it."
 fi
+
+ntp_active() {
+  local name="$1" pat
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$name" 2>/dev/null; then
+    return 0
+  fi
+  pat="[${name:0:1}]${name:1}"
+  pgrep -f "$pat" >/dev/null 2>&1
+}
 
 ntp_name=
 for ntp_name in chronyd ntpd systemd-timesyncd; do
-  if pgrep -x "$ntp_name" >/dev/null 2>&1; then
-    echo "Time sync is active (${ntp_name}). This proof does not stop it, because it cannot start it again. Stop ${ntp_name}, then run the proof."
-    exit 2
+  if ntp_active "$ntp_name"; then
+    clock_fail "Time sync is active (${ntp_name}). This proof does not stop it, because it cannot start it again. Stop ${ntp_name}, then run the proof."
   fi
 done
 say "ntp none"
 
 # The stay-probe is a host precondition. It runs before any orblx process.
-clock_before=$(realtime_ns)
-date -u -s "+2 min" >/dev/null || {
-  echo "The stay-probe could not step the clock."
-  exit 2
-}
+probe_mono=$(mono_ns) || setup_fail python3
+probe_real=$(realtime_ns) || setup_fail python3
+date -u -s "+2 min" >/dev/null || clock_fail "The stay-probe could not step the clock."
 sleep 0.4
-clock_mid=$(realtime_ns)
-if [[ $(( clock_mid - clock_before )) -lt 60000000000 ]]; then
-  echo "The clock did not stay stepped. Something other than chronyd, ntpd, or systemd-timesyncd put it back within 1 s. This proof cannot run on this host."
-  exit 2
+clock_mid=$(realtime_ns) || setup_fail python3
+if [[ $(( clock_mid - probe_real )) -lt 60000000000 ]]; then
+  elapsed=$(( $(mono_ns) - probe_mono ))
+  set_clock_ns $(( probe_real + elapsed )) >/dev/null 2>&1 || true
+  clock_fail "The clock did not stay stepped. Something other than chronyd, ntpd, or systemd-timesyncd put it back within 1 s. This proof cannot run on this host."
 fi
-date -u -s "-2 min" >/dev/null || {
-  echo "The stay-probe could not restore the clock."
-  exit 2
-}
-clock_after=$(realtime_ns)
-clock_delta=$(( clock_after - clock_before ))
+elapsed=$(( $(mono_ns) - probe_mono ))
+set_clock_ns $(( probe_real + elapsed )) || clock_fail "The stay-probe could not restore the clock."
+clock_after=$(realtime_ns) || setup_fail python3
+clock_want=$(( probe_real + elapsed ))
+clock_delta=$(( clock_after - clock_want ))
 if [[ "$clock_delta" -lt 0 ]]; then
   clock_delta=$(( -clock_delta ))
 fi
 if [[ "$clock_delta" -gt 1000000000 ]]; then
-  date -u -s "@$(( clock_before / NS_PER_S ))" >/dev/null || true
-  echo "The restored clock is ${clock_delta} ns from the time before the stay-probe. This proof cannot run on this host."
-  exit 2
+  set_clock_ns "$clock_want" >/dev/null 2>&1 || true
+  clock_fail "The restored clock is ${clock_delta} ns from the monotonic elapsed time. This proof cannot run on this host."
 fi
 say "W25-47 stay_probe ok"
+mono_origin=$(mono_ns) || setup_fail python3
+real_origin=$(realtime_ns) || setup_fail python3
 
 if [[ -n "$(git -C "$root" status --porcelain)" ]]; then
   setup_fail dirty
 fi
-bin_mt=$(stat -c %Y "$bin")
-idp_mt=$(stat -c %Y "$idp")
+bin_mt=$(stat -c %Y "$bin") || setup_fail stat
+idp_mt=$(stat -c %Y "$idp") || setup_fail stat
 if [[ "$bin_mt" -lt "$head_ct" || "$idp_mt" -lt "$head_ct" ]]; then
   setup_fail mtime
 fi
@@ -216,11 +253,11 @@ if [[ "$lock_mode" == "outer" ]]; then
 fi
 proof_lock_take "w25-47-reauth"
 
-saved=$(date -u +%Y-%m-%dT%H:%M:%S)
 coord_pid=
 idp_pid=
 node_a_pid=
 node_b_pid=
+hello_pid=
 watchdog_pid=
 work=
 ns_a=w2547a
@@ -232,49 +269,61 @@ past_marker=0
 alarm_start_ns=0
 
 cleanup() {
+  local decided=$?
+  trap - EXIT INT TERM HUP
   if [[ "$cleaned" == 1 ]]; then
-    return
+    exit "$decided"
   fi
   cleaned=1
-  if [[ -n "$watchdog_pid" ]]; then
+  if [[ -n "${watchdog_pid:-}" ]]; then
     kill "$watchdog_pid" 2>/dev/null || true
     watchdog_pid=
   fi
-  # Put the clock back before any other wait.
-  if [[ -n "$saved" ]]; then
-    date -u -s "$saved" >/dev/null || true
-    saved=
+  if [[ -n "${hello_pid:-}" ]]; then
+    kill "$hello_pid" 2>/dev/null || true
+    hello_pid=
   fi
-  for pid in "$node_a_pid" "$node_b_pid" "$coord_pid" "$idp_pid"; do
+  restore_marked_clock
+  for pid in "${node_a_pid:-}" "${node_b_pid:-}" "${coord_pid:-}" "${idp_pid:-}"; do
     if [[ -n "$pid" ]]; then
       kill "$pid" 2>/dev/null || true
     fi
   done
   for ns in "$ns_a" "$ns_b"; do
     if ip netns list 2>/dev/null | awk '{print $1}' | read_all grep -qx "$ns"; then
-      ip netns pids "$ns" 2>/dev/null | while read -r pid; do
+      while read -r pid; do
+        [[ -n "$pid" ]] || continue
         kill "$pid" 2>/dev/null || true
-      done
+      done < <(ip netns pids "$ns" 2>/dev/null || true)
       ip netns del "$ns" 2>/dev/null || true
     fi
   done
   ip link del veth-a 2>/dev/null || true
   ip link del veth-b 2>/dev/null || true
-  if [[ -n "$forward_was" ]]; then
+  if [[ -n "${forward_was:-}" ]]; then
     printf '%s\n' "$forward_was" >/proc/sys/net/ipv4/ip_forward || true
   fi
-  if [[ -n "$rp_was" ]]; then
+  if [[ -n "${rp_was:-}" ]]; then
     printf '%s\n' "$rp_was" >/proc/sys/net/ipv4/conf/all/rp_filter || true
   fi
-  # After the marker, a lock status must not replace the decided exit.
-  if [[ "$past_marker" == 1 && "$lock_mode" != "outer" ]]; then
-    ( proof_lock_end ) || true
-  else
-    proof_lock_end
+  ( proof_lock_end ) || true
+  if [[ -n "${work:-}" ]]; then
+    rm -rf "$work"
   fi
   rm -f "$transcript"
+  exit "$decided"
 }
-trap cleanup EXIT INT TERM HUP
+trap cleanup EXIT
+
+on_signal() {
+  if [[ "$past_marker" == 1 ]]; then
+    say "W25-47 FAIL signal recovery_mono_s=0 run_id=${run_id}"
+    exit 1
+  fi
+  echo "The proof got a signal before the marker. run_id=${run_id}" >&2
+  exit 124
+}
+trap on_signal INT TERM HUP
 
 on_alarm() {
   if [[ "$past_marker" == 1 ]]; then
@@ -284,12 +333,12 @@ on_alarm() {
     say "W25-47 FAIL iteration recovery_mono_s=${elapsed} run_id=${run_id}"
     exit 1
   fi
-  echo "The iteration timed out after ${alarm_s} s." >&2
+  echo "The iteration timed out after ${alarm_s} s. run_id=${run_id}" >&2
   exit 124
 }
 trap on_alarm USR1
 
-alarm_start_ns=$(mono_ns)
+alarm_start_ns=$(mono_ns) || setup_fail python3
 (
   sleep "$alarm_s"
   kill -USR1 $$ 2>/dev/null || true
@@ -338,9 +387,8 @@ wait_file_prestep() {
   done
 }
 
-wait_dod() {
-  local dod="$1" file="$2" pattern="$3" start now
-  start=$(mono_ns)
+wait_from() {
+  local dod="$1" start="$2" file="$3" pattern="$4" now
   while true; do
     check_deadline
     now=$(mono_ns)
@@ -362,13 +410,23 @@ key_id() {
     | tr -d ' \n'
 }
 
+key_id_bounded() {
+  timeout 60 bash -c '
+    openssl x509 -in "$1" -pubkey -noout 2>/dev/null \
+      | openssl pkey -pubin -outform DER 2>/dev/null \
+      | tail -c 32 | od -An -tx1 | tr -d " \n"
+  ' bash "$1"
+}
+
 work=$(mktemp -d) || setup_fail work
 coord_dir="$work/coord"
 state_a="$work/node-a"
 state_b="$work/node-b"
+state_c="$work/node-c"
 idp_dir="$work/idp"
-mkdir -p "$coord_dir" "$idp_dir"
-chmod 700 "$coord_dir" "$idp_dir"
+mkdir -p "$coord_dir" "$idp_dir" || setup_fail work
+chmod 700 "$coord_dir" "$idp_dir" || setup_fail work
+: >"$work/orblx.err" || setup_fail work
 
 ip netns del "$ns_a" 2>/dev/null || true
 ip netns del "$ns_b" 2>/dev/null || true
@@ -392,10 +450,10 @@ ip netns exec "$ns_a" ip link set peer-a up || setup_fail netns
 ip netns exec "$ns_b" ip link set peer-b up || setup_fail netns
 ip netns exec "$ns_a" ip route add default via 10.200.0.1 || setup_fail netns
 ip netns exec "$ns_b" ip route add default via 10.200.1.1 || setup_fail netns
-forward_was=$(cat /proc/sys/net/ipv4/ip_forward)
-rp_was=$(cat /proc/sys/net/ipv4/conf/all/rp_filter)
-printf '1\n' >/proc/sys/net/ipv4/ip_forward
-printf '0\n' >/proc/sys/net/ipv4/conf/all/rp_filter
+forward_was=$(cat /proc/sys/net/ipv4/ip_forward) || setup_fail sysctl
+rp_was=$(cat /proc/sys/net/ipv4/conf/all/rp_filter) || setup_fail sysctl
+printf '1\n' >/proc/sys/net/ipv4/ip_forward || setup_fail sysctl
+printf '0\n' >/proc/sys/net/ipv4/conf/all/rp_filter || setup_fail sysctl
 ip netns exec "$ns_a" ping -c 1 -W 2 10.200.0.1 >/dev/null || setup_fail netns
 ip netns exec "$ns_b" ping -c 1 -W 2 10.200.0.1 >/dev/null || setup_fail netns
 
@@ -406,7 +464,7 @@ stdbuf -oL -eL "$idp" serve --dir "$idp_dir" --issuer "$issuer" --listen 127.0.0
 idp_pid=$!
 wait_prestep idp "$work/idp.log" "idp serve"
 
-cat >"$coord_dir/policy.hujson" <<'POLICY'
+cat >"$coord_dir/policy.hujson" <<'POLICY' || setup_fail policy
 {
   "owners": ["spiffe://orblx.local/node/a"],
   "userApproval": {
@@ -414,7 +472,7 @@ cat >"$coord_dir/policy.hujson" <<'POLICY'
   }
 }
 POLICY
-cat >"$work/coord.toml" <<CONF
+cat >"$work/coord.toml" <<CONF || setup_fail config
 [oidc]
 issuer = "${issuer}"
 client_id = "${client}"
@@ -433,7 +491,7 @@ wait_file_prestep coord "$coord_dir/trust-bundle.pem"
   --sub ada --ttl 3600 --out "$work/ada-1.token" >/dev/null || host_invalid token
 enroll_a=$("$bin" coord enroll --name a --coord 10.200.0.1:7443 \
   --bundle "$coord_dir/trust-bundle.pem" --id-token-file "$work/ada-1.token" \
-  --state "$state_a" --coord-name coord --endpoint 10.200.0.2:443) || host_invalid enroll
+  --state "$state_a" --coord-name coord --endpoint 10.200.0.2:443 2>>"$work/orblx.err") || host_invalid enroll
 overlay_a=$(printf '%s\n' "$enroll_a" | awk '/^overlay_ip /{print $2}')
 name_a=$(printf '%s\n' "$enroll_a" | awk '/^name /{print $2}')
 [[ "$name_a" == "a" && -n "$overlay_a" ]] || host_invalid enroll
@@ -450,45 +508,15 @@ kill "$node_a_pid" 2>/dev/null || true
 wait "$node_a_pid" 2>/dev/null || true
 node_a_pid=
 
-step_mono=$(mono_ns)
+step_mono=$(mono_ns) || dod_fail setup "$alarm_start_ns"
 say "W25-47 first_clock_step mono_ns=${step_mono} realtime_ns=$(realtime_ns)"
 past_marker=1
 
-say "DoD f: step the clock 11 min so the coordinator leaf is due."
-date -u -s "+11 min" >/dev/null || dod_fail f "$step_mono"
-wait_dod f "$work/coord.log" "coord svid renewed"
-say "DoD f passed."
-
-ip netns exec "$ns_a" stdbuf -oL -eL "$bin" up --state-dir "$state_a" --listen 10.200.0.2:443 \
-  --coord 10.200.0.1:7443 --coord-name coord --bundle "$coord_dir/trust-bundle.pem" \
-  --metrics off >"$work/node-a-again.log" 2>&1 &
-node_a_pid=$!
-wait_dod a "$work/node-a-again.log" "The TUN device is" || dod_fail a "$step_mono"
-
-say "DoD a: step the clock 17 min so the node leaf is past the grace."
-date -u -s "+17 min" >/dev/null || dod_fail a "$step_mono"
-a_start=$(mono_ns)
-status_a=
-while true; do
-  check_deadline
-  now=$(mono_ns)
-  if [[ $(( now - a_start )) -ge "$RECOVERY_NS" ]]; then
-    dod_fail a "$a_start"
-  fi
-  status_a=$("$bin" status --state-dir "$state_a" || true)
-  if printf '%s\n' "$status_a" | read_all grep -q "state needs-reauth" \
-    && printf '%s\n' "$status_a" | read_all grep -q "reauth orblx login --name a"; then
-    break
-  fi
-  status_a=
-  sleep 1
-done
-say "$status_a"
-say "DoD a passed."
-
-say "DoD b: owner re-auth for the same name."
-reauth_mono=$(mono_ns)
-old_nonces=$(python3 - "$coord_dir/nodes.json" <<'PY'
+say "DoD b live: re-auth while the old leaf is inside not_after."
+say "DoD b order: a_crash_after_deny_and_a_crash_after_nodes_match_the_audit_rule"
+live_mono=$(mono_ns)
+cp -a "$state_a" "$work/state-a-old" || dod_fail b "$live_mono"
+old_nonces=$(timeout 60 python3 - "$coord_dir/nodes.json" <<'PY'
 import json
 import sys
 file = json.load(open(sys.argv[1]))
@@ -502,25 +530,26 @@ if not nonces:
     raise SystemExit("no live nonce")
 print(",".join(nonces))
 PY
-) || dod_fail b "$reauth_mono"
+) || dod_fail b "$live_mono"
 
-"$idp" mint --dir "$idp_dir" --kid rs1 --issuer "$issuer" --aud "$client" \
-  --sub ada --ttl 3600 --nonce aabbccdd --out "$work/ada-2.token" >/dev/null || dod_fail b "$reauth_mono"
-enroll_again=$("$bin" coord enroll --name a --coord 10.200.0.1:7443 \
+timeout 60 "$idp" mint --dir "$idp_dir" --kid rs1 --issuer "$issuer" --aud "$client" \
+  --sub ada --ttl 3600 --nonce aabbccdd --out "$work/ada-2.token" >/dev/null || dod_fail b "$live_mono"
+enroll_again=$(timeout 60 "$bin" coord enroll --name a --coord 10.200.0.1:7443 \
   --bundle "$coord_dir/trust-bundle.pem" --id-token-file "$work/ada-2.token" \
-  --nonce aabbccdd --state "$state_a" --coord-name coord --endpoint 10.200.0.2:443) || dod_fail b "$reauth_mono"
+  --nonce aabbccdd --state "$state_a" --coord-name coord --endpoint 10.200.0.2:443 \
+  2>>"$work/orblx.err") || dod_fail b "$live_mono"
 name_again=$(printf '%s\n' "$enroll_again" | awk '/^name /{print $2}')
 overlay_again=$(printf '%s\n' "$enroll_again" | awk '/^overlay_ip /{print $2}')
-[[ "$name_again" == "a" ]] || dod_fail b "$reauth_mono"
-[[ "$overlay_again" == "$overlay_a" ]] || dod_fail b "$reauth_mono"
-new_key=$(key_id "$state_a/cert.pem") || dod_fail b "$reauth_mono"
-[[ "$new_key" != "$old_key" ]] || dod_fail b "$reauth_mono"
+[[ "$name_again" == "a" ]] || dod_fail b "$live_mono"
+[[ "$overlay_again" == "$overlay_a" ]] || dod_fail b "$live_mono"
+new_key=$(key_id_bounded "$state_a/cert.pem") || dod_fail b "$live_mono"
+[[ "$new_key" != "$old_key" ]] || dod_fail b "$live_mono"
 say "new_key_id=${new_key}"
-python3 - "$coord_dir/deny.json" "$coord_dir/config-audit.jsonl" "$old_key" "$new_key" "$old_nonces" <<'PY' || dod_fail b "$reauth_mono"
+timeout 60 python3 - "$coord_dir/deny.json" "$coord_dir/config-audit.jsonl" "$old_key" "$new_key" "$old_nonces" "$NODE_URI" <<'PY' || dod_fail b "$live_mono"
 import json
 import re
 import sys
-deny_path, audit_path, old_key, new_key, nonce_text = sys.argv[1:]
+deny_path, audit_path, old_key, new_key, nonce_text, node_uri = sys.argv[1:]
 deny = json.load(open(deny_path))
 ids = [item["key_id"] for item in deny.get("revoked_leaf_keys", [])]
 if old_key not in ids:
@@ -545,6 +574,8 @@ for line in open(audit_path):
 if len(records) != 1:
     raise SystemExit("reauth count %s" % len(records))
 detail = records[0].get("detail", "")
+if node_uri not in detail:
+    raise SystemExit("detail has no node uri")
 match = re.search(r"\bold ([0-9a-f]{64}(?:,[0-9a-f]{64})*) new ([0-9a-f]{64})\b", detail)
 if match is None:
     raise SystemExit("detail has no key fields")
@@ -553,36 +584,158 @@ if old_key not in old_field or match.group(2) != new_key:
     raise SystemExit("detail keys do not match")
 PY
 
-"$idp" mint --dir "$idp_dir" --kid rs1 --issuer "$issuer" --aud "$client" \
-  --sub ada --ttl 3600 --out "$work/ada-b.token" >/dev/null || dod_fail b "$reauth_mono"
-enroll_b=$("$bin" coord enroll --name b --coord 10.200.0.1:7443 \
+timeout 60 "$idp" mint --dir "$idp_dir" --kid rs1 --issuer "$issuer" --aud "$client" \
+  --sub ada --ttl 3600 --out "$work/ada-b.token" >/dev/null || dod_fail b "$live_mono"
+enroll_b=$(timeout 60 "$bin" coord enroll --name b --coord 10.200.0.1:7443 \
   --bundle "$coord_dir/trust-bundle.pem" --id-token-file "$work/ada-b.token" \
-  --state "$state_b" --coord-name coord --endpoint 10.200.1.2:443) || dod_fail b "$reauth_mono"
-overlay_b=$(printf '%s\n' "$enroll_b" | awk '/^overlay_ip /{print $2}')
-[[ -n "$overlay_b" ]] || dod_fail b "$reauth_mono"
+  --state "$state_b" --coord-name coord --endpoint 10.200.1.2:443 2>>"$work/orblx.err") || dod_fail b "$live_mono"
+[[ -n "$enroll_b" ]] || dod_fail b "$live_mono"
+cp "$coord_dir/deny.json" "$state_b/deny.json" || dod_fail b "$live_mono"
 ip netns exec "$ns_b" stdbuf -oL -eL "$bin" up --state-dir "$state_b" --listen 10.200.1.2:443 \
   --coord 10.200.0.1:7443 --coord-name coord --bundle "$coord_dir/trust-bundle.pem" \
   --metrics off >"$work/node-b.log" 2>&1 &
 node_b_pid=$!
+wait_from b "$live_mono" "$work/node-b.log" "The TUN device is"
 
-traffic=0
+present() {
+  local start="$1" log="$2" pattern="$3" cert="$4" key="$5" ticket="$6"
+  timeout 60 "$bin" hello-quic client \
+    --cert "$cert" --key "$key" --bundle "$coord_dir/trust-bundle.pem" \
+    --ticket "$ticket" --connect 10.200.1.2:443 \
+    >"$work/hello.out" 2>>"$work/orblx.err" &
+  hello_pid=$!
+  wait_from b "$start" "$log" "$pattern"
+  kill "$hello_pid" 2>/dev/null || true
+  wait "$hello_pid" 2>/dev/null || true
+  hello_pid=
+}
+
+present "$live_mono" "$work/node-b.log" "The leaf check failed. The deny list contains this identifier." \
+  "$work/state-a-old/cert.pem" "$work/state-a-old/key.pem" "$work/state-a-old/ticket.bin"
+rm -rf "$work/state-a-ticket"
+cp -a "$state_a" "$work/state-a-ticket" || dod_fail b "$live_mono"
+cp "$work/state-a-old/ticket.bin" "$work/state-a-ticket/ticket.bin" || dod_fail b "$live_mono"
+cp "$work/state-a-old/ticket.bin.mac" "$work/state-a-ticket/ticket.bin.mac" || dod_fail b "$live_mono"
+present "$live_mono" "$work/node-b.log" "The capability ticket check rejected the peer. The deny list contains this identifier." \
+  "$work/state-a-ticket/cert.pem" "$work/state-a-ticket/key.pem" "$work/state-a-ticket/ticket.bin"
+kill "$node_b_pid" 2>/dev/null || true
+wait "$node_b_pid" 2>/dev/null || true
+node_b_pid=
+say "DoD b live passed."
+
+say "DoD f: step the clock 11 min so the coordinator leaf is due."
+date -u -s "+11 min" >/dev/null || dod_fail f "$step_mono"
+wait_from f "$step_mono" "$work/coord.log" "coord svid renewed"
+say "DoD f passed."
+
+ip netns exec "$ns_a" stdbuf -oL -eL "$bin" up --state-dir "$state_a" --listen 10.200.0.2:443 \
+  --coord 10.200.0.1:7443 --coord-name coord --bundle "$coord_dir/trust-bundle.pem" \
+  --metrics off >"$work/node-a-again.log" 2>&1 &
+node_a_pid=$!
+wait_from a "$step_mono" "$work/node-a-again.log" "The TUN device is"
+
+say "DoD a: step the clock 17 min so the node leaf is past the grace."
+date -u -s "+17 min" >/dev/null || dod_fail a "$step_mono"
+a_start=$(mono_ns)
+status_a=
 while true; do
   check_deadline
   now=$(mono_ns)
-  if [[ $(( now - reauth_mono )) -ge "$RECOVERY_NS" ]]; then
-    dod_fail b "$reauth_mono"
+  if [[ $(( now - a_start )) -ge "$RECOVERY_NS" ]]; then
+    dod_fail a "$a_start"
   fi
-  status_b=$("$bin" status --state-dir "$state_a" || true)
-  if printf '%s\n' "$status_b" | read_all grep -q "peer b .* path direct " \
-    && ip netns exec "$ns_a" ping -c 1 -W 1 "$overlay_b" >/dev/null 2>&1; then
-    traffic=1
+  status_a=$(timeout 60 "$bin" status --state-dir "$state_a" 2>>"$work/orblx.err" || true)
+  if printf '%s\n' "$status_a" | read_all grep -q "state needs-reauth" \
+    && printf '%s\n' "$status_a" | read_all grep -q "reauth orblx login --name a"; then
     break
   fi
+  status_a=
   sleep 1
 done
-[[ "$traffic" == "1" ]] || dod_fail b "$reauth_mono"
+say "$status_a"
+say "DoD a passed."
+
+say "DoD b expired: re-auth after the leaf end."
+expired_mono=$(mono_ns)
+cp -a "$state_a" "$work/state-a-expired" || dod_fail b "$expired_mono"
+expired_key=$(key_id_bounded "$work/state-a-expired/cert.pem") || dod_fail b "$expired_mono"
+timeout 60 "$idp" mint --dir "$idp_dir" --kid rs1 --issuer "$issuer" --aud "$client" \
+  --sub ada --ttl 3600 --nonce bbeeff00 --out "$work/ada-3.token" >/dev/null || dod_fail b "$expired_mono"
+enroll_late=$(timeout 60 "$bin" coord enroll --name a --coord 10.200.0.1:7443 \
+  --bundle "$coord_dir/trust-bundle.pem" --id-token-file "$work/ada-3.token" \
+  --nonce bbeeff00 --state "$state_a" --coord-name coord --endpoint 10.200.0.2:443 \
+  2>>"$work/orblx.err") || dod_fail b "$expired_mono"
+name_late=$(printf '%s\n' "$enroll_late" | awk '/^name /{print $2}')
+overlay_late=$(printf '%s\n' "$enroll_late" | awk '/^overlay_ip /{print $2}')
+[[ "$name_late" == "a" ]] || dod_fail b "$expired_mono"
+[[ "$overlay_late" == "$overlay_a" ]] || dod_fail b "$expired_mono"
+late_key=$(key_id_bounded "$state_a/cert.pem") || dod_fail b "$expired_mono"
+[[ "$late_key" != "$expired_key" ]] || dod_fail b "$expired_mono"
+say "expired_new_key_id=${late_key}"
+timeout 60 python3 - "$coord_dir/deny.json" "$coord_dir/config-audit.jsonl" "$late_key" "$expired_key" "$NODE_URI" <<'PY' || dod_fail b "$expired_mono"
+import json
+import sys
+import time
+deny_path, audit_path, new_key, expired_key, node_uri = sys.argv[1:]
+deny = json.load(open(deny_path))
+now = int(time.time())
+for item in deny.get("revoked_leaf_keys", []):
+    if now > int(item["not_after"]) + 60:
+        raise SystemExit("stale leaf")
+    if item["key_id"] == expired_key:
+        raise SystemExit("expired key is still denied")
+records = []
+none_records = []
+for line in open(audit_path):
+    line = line.strip()
+    if not line:
+        continue
+    item = json.loads(line)
+    if item.get("action") != "reauth":
+        continue
+    records.append(item)
+    detail = item.get("detail", "")
+    if " old none " in " %s " % detail:
+        none_records.append(item)
+if len(records) != 2:
+    raise SystemExit("reauth count %s" % len(records))
+if len(none_records) != 1:
+    raise SystemExit("old none count %s" % len(none_records))
+detail = none_records[0].get("detail", "")
+if node_uri not in detail or "new %s" % new_key not in detail:
+    raise SystemExit("old none detail does not match")
+PY
+
+timeout 60 "$idp" mint --dir "$idp_dir" --kid rs1 --issuer "$issuer" --aud "$client" \
+  --sub ada --ttl 3600 --out "$work/ada-c.token" >/dev/null || dod_fail b "$expired_mono"
+enroll_c=$(timeout 60 "$bin" coord enroll --name c --coord 10.200.0.1:7443 \
+  --bundle "$coord_dir/trust-bundle.pem" --id-token-file "$work/ada-c.token" \
+  --state "$state_c" --coord-name coord --endpoint 10.200.1.2:443 2>>"$work/orblx.err") || dod_fail b "$expired_mono"
+[[ -n "$enroll_c" ]] || dod_fail b "$expired_mono"
+cp "$coord_dir/deny.json" "$state_c/deny.json" || dod_fail b "$expired_mono"
+ip netns exec "$ns_b" stdbuf -oL -eL "$bin" up --state-dir "$state_c" --listen 10.200.1.2:443 \
+  --coord 10.200.0.1:7443 --coord-name coord --bundle "$coord_dir/trust-bundle.pem" \
+  --metrics off >"$work/node-c.log" 2>&1 &
+node_b_pid=$!
+wait_from b "$expired_mono" "$work/node-c.log" "The TUN device is"
+present "$expired_mono" "$work/node-c.log" "The leaf check failed. The end time has passed." \
+  "$work/state-a-expired/cert.pem" "$work/state-a-expired/key.pem" "$work/state-a-expired/ticket.bin"
+rm -rf "$work/state-a-expired-ticket"
+cp -a "$state_a" "$work/state-a-expired-ticket" || dod_fail b "$expired_mono"
+cp "$work/state-a-expired/ticket.bin" "$work/state-a-expired-ticket/ticket.bin" || dod_fail b "$expired_mono"
+cp "$work/state-a-expired/ticket.bin.mac" "$work/state-a-expired-ticket/ticket.bin.mac" || dod_fail b "$expired_mono"
+present "$expired_mono" "$work/node-c.log" "The capability ticket check rejected the peer. The end time has passed." \
+  "$work/state-a-expired-ticket/cert.pem" "$work/state-a-expired-ticket/key.pem" "$work/state-a-expired-ticket/ticket.bin"
+
 say "DoD b passed."
 say "elapsed_s $(( ($(mono_ns) - alarm_start_ns) / NS_PER_S ))"
-secret_scan "$transcript" || dod_fail secret "$reauth_mono"
+secret_scan "$transcript" || dod_fail secret "$expired_mono"
+if [[ -s "$work/orblx.err" ]]; then
+  secret_scan "$work/orblx.err" || dod_fail secret "$expired_mono"
+fi
+for scan_file in "$work"/*.log; do
+  [[ -s "$scan_file" ]] || continue
+  secret_scan "$scan_file" || dod_fail secret "$expired_mono"
+done
 say "W25-47 PASS a b f run_id=${run_id}"
 exit 0
