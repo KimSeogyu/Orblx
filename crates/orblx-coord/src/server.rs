@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 
 use orblx_identity::{GoogleJwks, OidcJwks, TrustBundle, WorkloadKind};
@@ -29,6 +29,7 @@ pub fn serve_blocking(coord: &Coordinator, listen: SocketAddr) -> Result<(), Coo
 
 /// Accept QUIC connections on `listen`.
 pub async fn serve(coord: &Coordinator, listen: SocketAddr) -> Result<(), CoordError> {
+    coord.note_serving(SystemTime::now())?;
     warm_jwks(coord).await;
     let (addr, handle) = spawn(coord, listen).await?;
     println!("coord listen {addr}");
@@ -46,7 +47,8 @@ pub async fn spawn(
     coord.enable_config_audit()?;
     crate::webhook::start(coord);
     let material = coord.tls_material()?;
-    let (endpoint, live) = tlsutil::server_endpoint(&material, listen)?;
+    let deny = coord.deny_handle()?;
+    let (endpoint, live) = tlsutil::server_endpoint_with_deny(&material, listen, deny)?;
     let addr = endpoint.local_addr().map_err(CoordError::io)?;
     println!("coord svid expiry {}", live.not_after());
     let cert_coord = coord.clone();
@@ -147,10 +149,14 @@ async fn coord_cert_tick(coord: Coordinator, live: Arc<tlsutil::LiveCert>) {
 /// The time between two checks of the files that make the deny list (W25-2).
 const STAMP_TICK: Duration = Duration::from_millis(100);
 
+/// One file stamp: length and change time. A missing file is `None`.
+type FileStamp = Option<(u64, Option<SystemTime>)>;
+
 /// Wake the `deny-wait` requests when a file that makes the deny list changes.
 ///
 /// The files are the deny file, the config audit chain, the node store, and the policy file.
-/// The tick reads only the file size and change time.
+/// The tick reads only the file size and change time. The read runs on a blocking thread.
+/// A lost read does not change the stamp.
 async fn stamp_tick(coord: Coordinator, stamp: watch::Sender<u64>) {
     let mut last = None;
     loop {
@@ -158,26 +164,52 @@ async fn stamp_tick(coord: Coordinator, stamp: watch::Sender<u64>) {
         let (Ok(dir), Ok(policy)) = (coord.state_dir(), coord.policy_file()) else {
             continue;
         };
-        let now = [
+        let paths = vec![
             dir.join("deny.json"),
             dir.join(crate::state::CONFIG_AUDIT_FILE),
             dir.join("nodes.json"),
             dir.join(crate::sshca::SSH_CA_FILE),
             dir.join(crate::sshca::SSH_CERTS_FILE),
             policy,
-        ]
+        ];
+        let started = Instant::now();
+        let read = tokio::task::spawn_blocking(move || stamp_metadata(&paths)).await;
+        trace_slow_io("stamp_metadata", started.elapsed().as_millis());
+        let Ok(now) = read else {
+            continue;
+        };
+        if last.as_ref() != Some(&now) {
+            last = Some(now);
+            stamp.send_modify(|value| *value = value.wrapping_add(1));
+        }
+    }
+}
+
+/// Read the size and the change time of each path. A missing path stays `None`.
+fn stamp_metadata(paths: &[std::path::PathBuf]) -> Vec<FileStamp> {
+    paths
         .iter()
         .map(|path| {
             std::fs::metadata(path)
                 .ok()
                 .map(|meta| (meta.len(), meta.modified().ok()))
         })
-        .collect::<Vec<_>>();
-        if last.as_ref() != Some(&now) {
-            last = Some(now);
-            stamp.send_modify(|value| *value = value.wrapping_add(1));
-        }
+        .collect()
+}
+
+/// Trace one slow disk call. The line names the call and the elapsed time.
+///
+/// The line is printed when `ORBLX_TRACE_RENEW` is set and the call took at least 20 ms,
+/// the same gate as `write_atomic`.
+fn trace_slow_io(op: &str, ms: u128) {
+    if ms < 20 || std::env::var_os("ORBLX_TRACE_RENEW").is_none() {
+        return;
     }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    eprintln!("trace {stamp} slow_io op={op} ms={ms}");
 }
 
 /// Reply with the deny list of one node when its ETag is not `known` (W25-2).
@@ -556,6 +588,24 @@ async fn ssh_cert(
     }
 }
 
+pub(crate) fn enroll_token_dispatch(
+    coord: &Coordinator,
+    name: &str,
+    token: &str,
+    endpoints: &[String],
+    routes: &[String],
+    now: SystemTime,
+) -> Result<crate::state::EnrollResult, CoordError> {
+    match coord.enroll_token(name, token, endpoints, routes, now) {
+        Ok(result) => Ok(result),
+        Err(CoordError::Exists) => {
+            coord.reauth_deny_exists_token(name)?;
+            Err(CoordError::Exists)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 async fn dispatch(
     coord: &Coordinator,
     connection: &quinn::Connection,
@@ -586,7 +636,8 @@ async fn dispatch(
                     &request.routes,
                     now,
                 )?,
-                (Some(token), None, false) => coord.enroll_token(
+                (Some(token), None, false) => enroll_token_dispatch(
+                    coord,
                     &request.name,
                     token,
                     &request.endpoints,
@@ -601,14 +652,32 @@ async fn dispatch(
                     if let Some(plan) = coord.issuer_fetch_plan(kid.as_deref(), now)? {
                         refresh_issuer_jwks(coord, plan).await;
                     }
-                    coord.enroll_oidc(
-                        &request.name,
-                        id_token,
-                        request.nonce.as_deref(),
-                        &request.endpoints,
-                        &request.routes,
-                        now,
-                    )?
+                    // Re-auth writes the deny file under the coordinator lock.
+                    // The write runs on a blocking thread. The reply waits for it.
+                    let step = coord.clone();
+                    let name = request.name.clone();
+                    let token = id_token.clone();
+                    let nonce = request.nonce.clone();
+                    let endpoints = request.endpoints.clone();
+                    let routes = request.routes.clone();
+                    tokio::task::spawn_blocking(move || {
+                        match step.enroll_oidc(
+                            &name,
+                            &token,
+                            nonce.as_deref(),
+                            &endpoints,
+                            &routes,
+                            now,
+                        ) {
+                            Ok(result) => Ok(result),
+                            Err(CoordError::Exists) => {
+                                step.reauth_oidc(&name, &token, nonce.as_deref(), now)
+                            }
+                            Err(err) => Err(err),
+                        }
+                    })
+                    .await
+                    .map_err(|_| CoordError::State)??
                 }
                 _ => {
                     return Err(CoordError::Protocol(
@@ -625,7 +694,19 @@ async fn dispatch(
             if peer != request.name {
                 return Err(CoordError::Peer);
             }
-            let result = coord.renew_node(&request.name, now)?;
+            let der = peer_leaf_der(connection)?;
+            let key_id = orblx_identity::leaf_key_id(&der).map_err(|_| CoordError::Peer)?;
+            let not_after = orblx_identity::leaf_not_after(&der).map_err(|_| CoordError::Peer)?;
+            // Renew writes nodes.json under the coordinator lock. The write runs on a
+            // blocking thread so a stall in that fsync does not stop packet tasks.
+            // Deny writes stay in mutate_deny_locked. Renew does not write the deny file.
+            let step = coord.clone();
+            let name = request.name.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                step.renew_node(&name, &key_id, not_after, now)
+            })
+            .await
+            .map_err(|_| CoordError::State)??;
             println!("renewed {}", result.name);
             Ok(leaf_response(result))
         }
@@ -1075,6 +1156,19 @@ fn peer_node(coord: &Coordinator, connection: &quinn::Connection) -> Result<Stri
     Ok(name)
 }
 
+fn peer_leaf_der(connection: &quinn::Connection) -> Result<Vec<u8>, CoordError> {
+    let Some(identity) = connection.peer_identity() else {
+        return Err(CoordError::Peer);
+    };
+    let chain = identity
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .map_err(|_| CoordError::Peer)?;
+    let Some(leaf) = chain.first() else {
+        return Err(CoordError::Peer);
+    };
+    Ok(leaf.as_ref().to_vec())
+}
+
 fn peer_id(
     coord: &Coordinator,
     connection: &quinn::Connection,
@@ -1090,7 +1184,11 @@ fn peer_id(
     };
     let material = coord.tls_material()?;
     let trust = TrustBundle::from_pem(&material.trust_pem)?;
-    let deny = admin::deny_set(coord, SystemTime::now())?;
+    let handle = coord.deny_handle()?;
+    let deny = handle
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
     let id = trust.authenticate_leaf(leaf.as_ref(), SystemTime::now(), &deny)?;
     if id.kind() != WorkloadKind::Node && id.kind() != WorkloadKind::User {
         return Err(CoordError::Peer);

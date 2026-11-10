@@ -30,6 +30,20 @@ The client asks the coordinator for a short user certificate (`ssh-cert-request`
 - rc.1/rc.2: A node that sleeps or pauses longer than its SVID life plus 1 min (about 16 min by default) cannot reconnect, and a restart does not help. Enroll it again under a new node name with a new enroll token (orblx coord token create, then orblx coord enroll). The old node name cannot be enrolled again in this release. Policy rules and grants for the old name do not apply to the new name: update them, and revoke the old node (orblx admin revoke OLD_NAME --coord ADDR).
 - rc.1/rc.2 SSH login has no netmap age check and no cert serial; a node removed from the netmap but not on the deny list can still log in until its SVID expires. Upgrade to rc.3.
 
+## rc.3 long pause
+
+- Automatic recovery after a long sleep is not supported.
+- The owner runs `orblx login` for the same name, or `orblx coord enroll` with a pre-auth key whose `nodes` list contains that name.
+- The node keeps its name and its overlay address.
+- The coordinator issues a new leaf and a new ticket, and denies the previous leaf key id and ticket nonce.
+- An expired leaf is not accepted.
+- Upgrade all nodes before you use re-auth. An rc.2 node refuses a deny file that contains revoked_leaf_keys, so it refuses all peers.
+- If the old coordinator wall clock was ahead and was set back before rc.3 start, a legacy leaf can outlive the wait.
+
+## W25-47 DoD b
+
+b2 and b4 each have two branches. The live branch runs before any clock step. The deny set has every live leaf key id of the old node and every old ticket nonce, and the one `reauth` audit line has that old key id and the new key id. A handshake with the old leaf and a use of the old ticket are refused while both are still inside `not_after`. The expired branch runs after the clock step. The old leaf and the old ticket are refused because the end time has passed. The one `reauth` audit line for that re-auth says `old none` and the new key id. The deny set has no expired leaf key. The ordering proof is the unit test `a_crash_after_deny_and_a_crash_after_nodes_match_the_audit_rule`: crash point 1 writes the old key into `deny.json` and does not issue the new leaf.
+
 ## Known issues in v0.1.0-rc.2
 
 - With --coord, the coordinator cert is not renewed; nodes lose all peers about 26 min after coordinator start. (from code and a main run, not reproduced on the rc.2 tag)

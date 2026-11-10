@@ -95,6 +95,13 @@ impl MockOidc {
     }
 }
 
+/// The verified subject and issuer of one ID token.
+pub struct VerifiedLogin {
+    pub subject: String,
+    pub issuer: String,
+    pub expires_at: u64,
+}
+
 /// The gate that turns an ID token into a human SVID.
 ///
 /// [`IssueGate::new`] trusts the mock IdP.
@@ -252,6 +259,36 @@ impl IssueGate {
     /// A Google gate checks a Google ID token.
     /// `nonce` is required for a Google gate.
     /// The function does not issue an SVID.
+    /// Return the verified subject, issuer, and expiry.
+    ///
+    /// The issuer is the `iss` claim. A mock token has no nonce claim.
+    pub fn verified_login(
+        &self,
+        id_token: &str,
+        nonce: Option<&str>,
+        now: SystemTime,
+    ) -> Result<VerifiedLogin, IdentityError> {
+        match &self.idp {
+            IdpKey::Mock { .. } => {
+                let claims = self.verify_token(id_token, now)?;
+                Ok(VerifiedLogin {
+                    subject: claims.sub,
+                    issuer: claims.iss,
+                    expires_at: claims.exp,
+                })
+            }
+            IdpKey::Google { client_id, jwks } => {
+                let nonce = nonce.ok_or(IdentityError::Token)?;
+                let claims = jwks.verify(id_token, client_id, nonce, now)?;
+                Ok(VerifiedLogin {
+                    subject: claims.subject,
+                    issuer: claims.issuer,
+                    expires_at: claims.expires_at,
+                })
+            }
+        }
+    }
+
     pub fn owner_subject(
         &self,
         id_token: &str,

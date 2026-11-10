@@ -114,8 +114,20 @@ impl TrustBundle {
         let (not_before, not_after) = validity_unix(&cert)?;
         in_window(now_unix, not_before, not_after)?;
         deny.reject_uri(&spiffe_id)?;
+        let key = ed25519_public_key(&cert)?;
+        deny.reject_leaf_key(&key, now_unix)?;
         Ok(spiffe_id)
     }
+}
+
+/// Return the lowercase hex id of the 32-byte Ed25519 key in one leaf.
+///
+/// The function checks the algorithm OID first. It does not hash the key.
+pub fn leaf_key_id(der: &[u8]) -> Result<String, IdentityError> {
+    let cert = parse_cert(der)?;
+    check_common(&cert)?;
+    let key = ed25519_public_key(&cert)?;
+    Ok(crate::codec::encode_hex(&key))
 }
 
 fn load_root(der: &[u8]) -> Result<Root, IdentityError> {

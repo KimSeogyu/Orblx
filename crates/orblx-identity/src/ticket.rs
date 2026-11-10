@@ -297,6 +297,19 @@ pub fn sign_ticket(
 }
 
 /// Check the signature, the time window, and the deny list.
+/// Return the nonce and the `expires` unix second from one ticket body.
+///
+/// The function does not check the signature. The caller already checked it,
+/// or the caller only needs the id of a ticket it just signed.
+pub fn ticket_nonce_and_expiry(ticket_bytes: &[u8]) -> Result<([u8; 16], u64), IdentityError> {
+    if ticket_bytes.len() < SIGNATURE_LEN + 1 {
+        return Err(IdentityError::Ticket);
+    }
+    let body = &ticket_bytes[..ticket_bytes.len() - SIGNATURE_LEN];
+    let parsed = decode_body(body)?;
+    Ok((parsed.nonce, parsed.expires))
+}
+
 pub fn verify_ticket(
     verifier: &TicketVerifier,
     ticket_bytes: &[u8],

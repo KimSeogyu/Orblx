@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use orblx_audit::{verify_config_file, ConfigAction, EMPTY_DIGEST};
-use orblx_identity::{DenySet, IssueGate, MiniCa, MockOidc, SpiffeId, MOCK_OIDC_ISSUER};
+use orblx_identity::{DenyApply, DenySet, IssueGate, MiniCa, MockOidc, SpiffeId, MOCK_OIDC_ISSUER};
 
 use crate::state::{Coordinator, OidcConfig, CONFIG_AUDIT_FILE};
 
@@ -258,4 +258,316 @@ fn share_back_lets_one_owner_node_reach_one_guest_node() {
     // The acl a -> g:* does not cross the tenant. Only the share-back port is granted.
     assert_eq!(from_a, vec![(6, 22, 22)]);
     assert!(denied(&deny_for(&coord, "g2"), "a"));
+}
+
+/// A config record that does not change the revoked set must not publish a new deny document.
+///
+/// `revoke_all` writes `deny.json` and then the audit record. `stamp_tick` wakes on
+/// either file. The served version used to add the audit length, so the waiter saw
+/// version N and then N+1 with the same URIs, nonces, and `generated_at`.
+#[test]
+fn a_config_record_keeps_the_deny_document_when_the_set_is_the_same() {
+    let scratch = Scratch::new();
+    let now = SystemTime::now();
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+    coord
+        .enroll_token("a", &token.secret, &["a:443".to_string()], &[], now)
+        .unwrap();
+    let first = crate::admin::deny_json_for(&coord, "a", now).unwrap();
+    coord
+        .record_change(
+            "spiffe://orblx.local/node/owner",
+            ConfigAction::Revoke,
+            "spiffe://orblx.local/node/a",
+            EMPTY_DIGEST,
+            EMPTY_DIGEST,
+            "record only",
+        )
+        .unwrap();
+    let second = crate::admin::deny_json_for(&coord, "a", now).unwrap();
+    assert_eq!(first, second);
+}
+
+/// A restart serves a deny version that is at least as high as every version served before it.
+///
+/// Each served version is at most `deny.json` version plus the audit length. The audit
+/// length is `next_index`. The chain has no prune and no rotation, so the length does
+/// not fall. Both values are on disk. A new process has an empty cache and serves that
+/// sum, so the version is at least as high as every version served before the restart.
+#[test]
+fn a_restart_serves_a_deny_version_at_least_as_high() {
+    let scratch = Scratch::new();
+    let now = SystemTime::now();
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+    coord
+        .enroll_token("a", &token.secret, &["a:443".to_string()], &[], now)
+        .unwrap();
+    let first = deny_version(&crate::admin::deny_json_for(&coord, "a", now).unwrap());
+    coord
+        .record_change(
+            "spiffe://orblx.local/node/owner",
+            ConfigAction::Revoke,
+            "spiffe://orblx.local/node/a",
+            EMPTY_DIGEST,
+            EMPTY_DIGEST,
+            "record only",
+        )
+        .unwrap();
+    let second = deny_version(&crate::admin::deny_json_for(&coord, "a", now).unwrap());
+    drop(coord);
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    let restarted = deny_version(&crate::admin::deny_json_for(&coord, "a", now).unwrap());
+    assert!(restarted >= first);
+    assert!(restarted >= second);
+}
+
+fn deny_version(text: &str) -> u64 {
+    let mut deny = DenySet::empty();
+    deny.apply_json(text.as_bytes()).unwrap();
+    deny.version().unwrap()
+}
+
+fn enroll_named(coord: &Coordinator, name: &str, now: SystemTime) {
+    let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+    coord
+        .enroll_token(name, &token.secret, &[format!("{name}:443")], &[], now)
+        .unwrap();
+}
+
+fn audit_len(dir: &std::path::Path) -> u64 {
+    let text = fs::read_to_string(dir.join(CONFIG_AUDIT_FILE)).unwrap_or_default();
+    text.lines().filter(|line| !line.is_empty()).count() as u64
+}
+
+fn deny_document(version: u64, uris: &[&str]) -> String {
+    serde_json::json!({
+        "version": version,
+        "generated_at": 1,
+        "revoked_uris": uris,
+        "revoked_ticket_nonces": [],
+    })
+    .to_string()
+}
+
+/// Crypto scratch case. A fresh read serves 5. A later stale read serves 8 on
+/// the old rule. After a restart, revoke of c serves 7, and a node that kept 8
+/// does not install c.
+#[test]
+fn a_stale_read_cannot_hide_the_revoke_that_follows_a_restart() {
+    let scratch = Scratch::new();
+    let now = SystemTime::now();
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    for name in ["a", "b", "c"] {
+        enroll_named(&coord, name, now);
+    }
+    let v0 = crate::admin::deny_json_for(&coord, "a", now).unwrap();
+    assert_eq!(deny_version(&v0), 3);
+    crate::admin::revoke_all(&coord, "b", "spiffe://orblx.local/node/owner", now).unwrap();
+    let fresh = crate::admin::deny_json_for(&coord, "a", now).unwrap();
+    assert_eq!(deny_version(&fresh), 5);
+    let mut node = DenySet::empty();
+    node.apply_json(v0.as_bytes()).unwrap();
+    node.apply_json(fresh.as_bytes()).unwrap();
+    let stale_sets: [&[&str]; 3] = [
+        &[],
+        &["spiffe://orblx.local/node/stale-1"],
+        &["spiffe://orblx.local/node/stale-2"],
+    ];
+    for uris in stale_sets {
+        let version = coord
+            .served_deny_version(
+                "a",
+                0,
+                uris.iter().map(|uri| (*uri).to_string()).collect(),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        node.apply_json(deny_document(version, uris).as_bytes())
+            .unwrap();
+    }
+    let highest = node.version().unwrap();
+    drop(coord);
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    crate::admin::revoke_all(&coord, "c", "spiffe://orblx.local/node/owner", now).unwrap();
+    let revoked = crate::admin::deny_json_for(&coord, "a", now).unwrap();
+    let c_version = deny_version(&revoked);
+    assert!(
+        c_version > highest,
+        "revoke c served {c_version} but the node kept {highest}"
+    );
+    node.apply_json(revoked.as_bytes()).unwrap();
+    assert!(node.reject_uri(&SpiffeId::node("c").unwrap()).is_err());
+}
+
+/// A stale reply that follows a fresh reply has a lower version. A node that
+/// holds the fresh set ignores the stale reply.
+#[test]
+fn a_stale_reply_is_older_than_the_fresh_reply() {
+    let scratch = Scratch::new();
+    let now = SystemTime::now();
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    for name in ["a", "b"] {
+        enroll_named(&coord, name, now);
+    }
+    crate::admin::revoke_all(&coord, "b", "spiffe://orblx.local/node/owner", now).unwrap();
+    let fresh = crate::admin::deny_json_for(&coord, "a", now).unwrap();
+    let fresh_version = deny_version(&fresh);
+    let stale_version = coord
+        .served_deny_version("a", 0, Vec::new(), Vec::new(), Vec::new())
+        .unwrap();
+    assert!(
+        stale_version < fresh_version,
+        "stale {stale_version} fresh {fresh_version}"
+    );
+    let mut node = DenySet::empty();
+    node.apply_json(fresh.as_bytes()).unwrap();
+    let apply = node
+        .apply_json(deny_document(stale_version, &[]).as_bytes())
+        .unwrap();
+    assert_eq!(apply, orblx_identity::DenyApply::IgnoredOlder);
+    assert_eq!(node.version(), Some(fresh_version));
+}
+
+/// The served version is never above `deny.json` version plus the audit length.
+#[test]
+fn a_served_deny_version_never_exceeds_the_file_plus_the_audit() {
+    let scratch = Scratch::new();
+    let now = SystemTime::now();
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    enroll_named(&coord, "a", now);
+    let file_version = 4u64;
+    let uris = vec!["spiffe://orblx.local/node/b".to_string()];
+    let served = coord
+        .served_deny_version("a", file_version, uris.clone(), Vec::new(), Vec::new())
+        .unwrap();
+    let audit = audit_len(&scratch.0);
+    assert!(
+        served <= file_version + audit,
+        "served {served} file {file_version} audit {audit}"
+    );
+    let stale = coord
+        .served_deny_version(
+            "a",
+            0,
+            vec!["spiffe://orblx.local/node/z".to_string()],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+    let audit = audit_len(&scratch.0);
+    assert!(stale <= audit, "served {stale} file 0 audit {audit}");
+    let error = coord
+        .served_deny_version("a", 0, uris, Vec::new(), Vec::new())
+        .unwrap_err();
+    assert!(matches!(error, crate::error::CoordError::State));
+}
+
+fn record_only(coord: &Coordinator) {
+    coord
+        .record_change(
+            "spiffe://orblx.local/node/owner",
+            ConfigAction::Revoke,
+            "spiffe://orblx.local/node/a",
+            EMPTY_DIGEST,
+            EMPTY_DIGEST,
+            "record only",
+        )
+        .unwrap();
+}
+
+/// Two reads of one set. An audit-only record is between them. Read B takes
+/// the lock first. Read A still has the file version from before that record
+/// and the same set. A receives the cached version and not an error.
+#[test]
+fn a_same_set_serves_prev_when_the_other_read_locks_first() {
+    let scratch = Scratch::new();
+    let now = SystemTime::now();
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    enroll_named(&coord, "a", now);
+    enroll_named(&coord, "b", now);
+    crate::admin::revoke_all(&coord, "b", "spiffe://orblx.local/node/owner", now).unwrap();
+    let set = vec!["spiffe://orblx.local/node/b".to_string()];
+    record_only(&coord);
+    let prev = coord
+        .served_deny_version("a", 1, set.clone(), Vec::new(), Vec::new())
+        .unwrap();
+    let got = coord
+        .served_deny_version("a", 0, set, Vec::new(), Vec::new())
+        .unwrap();
+    assert_eq!(got, prev);
+}
+
+/// The cached version is above the deny file version plus the audit length
+/// held under the lock. That is a disk rollback. The call returns an error.
+#[test]
+fn a_cached_version_above_the_locked_bound_is_an_error() {
+    let scratch = Scratch::new();
+    let now = SystemTime::now();
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    enroll_named(&coord, "a", now);
+    let set = vec!["spiffe://orblx.local/node/b".to_string()];
+    let prev = coord
+        .served_deny_version("a", 4, set.clone(), Vec::new(), Vec::new())
+        .unwrap();
+    let audit = audit_len(&scratch.0);
+    assert!(prev > audit, "prev {prev} audit {audit}");
+    let error = coord
+        .served_deny_version("a", 4, set, Vec::new(), Vec::new())
+        .unwrap_err();
+    assert!(matches!(error, crate::error::CoordError::State));
+}
+
+/// Crypto order. The stale read loads `deny.json` before the deny write and
+/// calls the version function after two more audit records. Fresh is 4. The
+/// stale offer is 5. The stale input is not stored. A later fresh read is
+/// above that reply, so a node that took the stale reply accepts the fresh set.
+#[test]
+fn a_stale_file_read_is_not_stored_above_the_fresh_set() {
+    let scratch = Scratch::new();
+    let now = SystemTime::now();
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    enroll_named(&coord, "a", now);
+    enroll_named(&coord, "b", now);
+    let deny_path = scratch.0.join("deny.json");
+    assert!(!deny_path.exists());
+    let stale_file_version = 0u64;
+    let stale_uris: Vec<String> = Vec::new();
+    crate::admin::revoke_all(&coord, "b", "spiffe://orblx.local/node/owner", now).unwrap();
+    let fresh = crate::admin::deny_json_for(&coord, "a", now).unwrap();
+    let fresh_version = deny_version(&fresh);
+    assert_eq!(fresh_version, 4);
+    record_only(&coord);
+    record_only(&coord);
+    let stale = coord
+        .served_deny_version(
+            "a",
+            stale_file_version,
+            stale_uris.clone(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+    assert!(stale < fresh_version, "stale {stale} fresh {fresh_version}");
+    let later_text = crate::admin::deny_json_for(&coord, "a", now).unwrap();
+    let later = deny_version(&later_text);
+    assert!(later > stale, "fresh {later} stale {stale}");
+    let mut node = DenySet::empty();
+    node.apply_json(deny_document(stale, &[]).as_bytes())
+        .unwrap();
+    let apply = node.apply_json(later_text.as_bytes()).unwrap();
+    assert_eq!(apply, DenyApply::Applied);
+    assert!(node.reject_uri(&SpiffeId::node("b").unwrap()).is_err());
 }

@@ -129,6 +129,10 @@ pub enum ConfigAction {
     /// An owner set the stored netmap `seq` to the coordinator clock time after a
     /// clock-forward error (W25-34).
     NetmapSeqReset,
+    /// One same-name re-auth issued a new leaf (W25-47).
+    Reauth,
+    /// One same-name re-auth was refused (W25-47).
+    ReauthDeny,
 }
 
 impl ConfigAction {
@@ -137,7 +141,7 @@ impl ConfigAction {
     pub const RESERVED_CODES: [u8; 0] = [];
 
     /// Every action in code order.
-    pub const ALL: [Self; 46] = [
+    pub const ALL: [Self; 48] = [
         Self::PolicyLoad,
         Self::PolicyReplace,
         Self::PolicyReject,
@@ -184,6 +188,8 @@ impl ConfigAction {
         Self::PreauthRevoke,
         Self::SshCert,
         Self::NetmapSeqReset,
+        Self::Reauth,
+        Self::ReauthDeny,
     ];
 
     /// Return the stable action token.
@@ -236,6 +242,8 @@ impl ConfigAction {
             Self::PreauthRevoke => "preauth-revoke",
             Self::SshCert => "ssh-cert",
             Self::NetmapSeqReset => "netmap-seq-reset",
+            Self::Reauth => "reauth",
+            Self::ReauthDeny => "reauth-deny",
         }
     }
 
@@ -295,6 +303,8 @@ impl ConfigAction {
             Self::PreauthRevoke => 44,
             Self::SshCert => 45,
             Self::NetmapSeqReset => 46,
+            Self::Reauth => 47,
+            Self::ReauthDeny => 48,
         }
     }
 

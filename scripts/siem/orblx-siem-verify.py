@@ -41,7 +41,7 @@ ACTIONS = [
     "unshare", "packet-deny", "unrevoke", "sink-error", "user-approve",
     "user-reject", "node-remove", "route-failover", "role-set", "role-deny",
     "preauth-create", "preauth-use", "preauth-deny", "preauth-revoke",
-    "ssh-cert", "netmap-seq-reset",
+    "ssh-cert", "netmap-seq-reset", "reauth", "reauth-deny",
 ]
 
 SYSLOG_HEAD = re.compile(

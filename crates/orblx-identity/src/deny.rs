@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
@@ -29,6 +29,10 @@ pub struct DenySet {
     generated_at: Option<u64>,
     revoked_uris: BTreeSet<String>,
     revoked_nonces: BTreeSet<[u8; 16]>,
+    /// Leaf key id to the certificate `not_after` unix second.
+    ///
+    /// A reader ignores an entry when `now > not_after + MAX_SKEW`.
+    revoked_leaf_keys: BTreeMap<[u8; 32], u64>,
 }
 
 impl Default for DenySet {
@@ -45,6 +49,7 @@ impl DenySet {
             generated_at: None,
             revoked_uris: BTreeSet::new(),
             revoked_nonces: BTreeSet::new(),
+            revoked_leaf_keys: BTreeMap::new(),
         }
     }
 
@@ -105,13 +110,28 @@ impl DenySet {
             let bytes = decode_hex_array::<16>(&nonce).map_err(|_| IdentityError::DenyDocument)?;
             nonces.insert(bytes);
         }
+        let mut leaf_keys = BTreeMap::new();
+        for item in document.revoked_leaf_keys {
+            if !leaf_key_text_ok(&item.key_id) {
+                return Err(IdentityError::DenyDocument);
+            }
+            let key =
+                decode_hex_array::<32>(&item.key_id).map_err(|_| IdentityError::DenyDocument)?;
+            match leaf_keys.get(&key).copied() {
+                Some(end) if end >= item.not_after => {}
+                _ => {
+                    leaf_keys.insert(key, item.not_after);
+                }
+            }
+        }
         if let Some(current) = self.version {
             // W25-38: the same document again makes a stale set current.
             // The set never moves to a lower version.
             let same = document.version == current
                 && document.generated_at == self.generated_at.unwrap_or_default()
                 && uris == self.revoked_uris
-                && nonces == self.revoked_nonces;
+                && nonces == self.revoked_nonces
+                && leaf_keys == self.revoked_leaf_keys;
             if self.refuse_all && same {
                 self.refuse_all = false;
                 return Ok(DenyApply::Applied);
@@ -125,6 +145,7 @@ impl DenySet {
         self.generated_at = Some(document.generated_at);
         self.revoked_uris = uris;
         self.revoked_nonces = nonces;
+        self.revoked_leaf_keys = leaf_keys;
         Ok(DenyApply::Applied)
     }
 
@@ -147,6 +168,56 @@ impl DenySet {
         }
         Ok(())
     }
+
+    /// Refuse one lowercase hex ticket nonce.
+    ///
+    /// An empty string is not a nonce. `refuse_all` still fails closed.
+    pub fn reject_nonce_hex(&self, nonce: &str) -> Result<(), IdentityError> {
+        if self.refuse_all {
+            return Err(IdentityError::DenyDocument);
+        }
+        if nonce.is_empty() {
+            return Ok(());
+        }
+        let bytes = decode_hex_array::<16>(nonce).map_err(|_| IdentityError::DenyDocument)?;
+        self.reject_nonce(&bytes)
+    }
+
+    /// Refuse one leaf key while `now` is within `not_after + MAX_SKEW`.
+    ///
+    /// A later `now` ignores the entry. The entry needs no deny after that time.
+    pub fn reject_leaf_key(&self, key: &[u8; 32], now_unix: u64) -> Result<(), IdentityError> {
+        if self.refuse_all {
+            return Err(IdentityError::DenyDocument);
+        }
+        if let Some(not_after) = self.revoked_leaf_keys.get(key) {
+            if now_unix <= not_after.saturating_add(crate::clock::MAX_SKEW.as_secs()) {
+                return Err(IdentityError::Revoked);
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse one lowercase hex leaf key id. An empty string is not a key id.
+    pub fn reject_leaf_key_hex(&self, key_id: &str, now_unix: u64) -> Result<(), IdentityError> {
+        if self.refuse_all {
+            return Err(IdentityError::DenyDocument);
+        }
+        if key_id.is_empty() {
+            return Ok(());
+        }
+        if !leaf_key_text_ok(key_id) {
+            return Err(IdentityError::DenyDocument);
+        }
+        let key = decode_hex_array::<32>(key_id).map_err(|_| IdentityError::DenyDocument)?;
+        self.reject_leaf_key(&key, now_unix)
+    }
+}
+
+fn leaf_key_text_ok(key_id: &str) -> bool {
+    key_id.len() == 64
+        && key_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !key_id.bytes().any(|byte| byte.is_ascii_uppercase())
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,4 +227,12 @@ struct DenyDocument {
     generated_at: u64,
     revoked_uris: Vec<String>,
     revoked_ticket_nonces: Vec<String>,
+    #[serde(default)]
+    revoked_leaf_keys: Vec<RevokedLeafKeyDoc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RevokedLeafKeyDoc {
+    key_id: String,
+    not_after: u64,
 }

@@ -49,6 +49,7 @@ fn status_json(text: &str) -> Result<String, String> {
     let mut svid_expiry = Value::Null;
     let mut exit_node = Value::Null;
     let mut coord = Value::Null;
+    let mut reauth = Value::Null;
     let mut peers = Vec::new();
     for line in text.lines() {
         if line.is_empty() {
@@ -69,6 +70,7 @@ fn status_json(text: &str) -> Result<String, String> {
             }
             Some("exit_node") => exit_node = json!(rest(parts)),
             Some("coord") => coord = json!(rest(parts)),
+            Some("reauth") => reauth = json!(rest(parts)),
             Some("peer") => peers.push(parse_peer(line)?),
             Some(_) | None => {}
         }
@@ -84,6 +86,7 @@ fn status_json(text: &str) -> Result<String, String> {
         "svid_expiry": svid_expiry,
         "exit_node": exit_node,
         "coord": coord,
+        "reauth": reauth,
         "peers": peers,
     });
     serde_json::to_string(&value).map_err(|_| "The status text is not valid.".to_string())

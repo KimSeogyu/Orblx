@@ -136,6 +136,8 @@ mod tests {
             preauth_actor: String::new(),
             auth_expires_unix_ms: 0,
             grant_bound: None,
+            live_leaf_keys: None,
+            live_ticket_nonces: None,
         }
     }
 

@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orblx_crypto::TicketRing;
-use orblx_identity::{decode_certificate_pem, leaf_not_after, DenySet, SpiffeId, TrustBundle};
+use orblx_identity::{
+    decode_certificate_pem, leaf_key_id, leaf_not_after, ticket_nonce_and_expiry, DenySet,
+    SpiffeId, TrustBundle,
+};
 use rand::RngCore;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -507,6 +510,8 @@ pub struct HelloSession {
     peer_not_after: u64,
     /// Peer capability ticket `expires` (unix seconds). B2 with peer_not_after.
     ticket_expires: u64,
+    peer_key_id: String,
+    ticket_nonces: Vec<String>,
 }
 
 impl HelloSession {
@@ -532,6 +537,18 @@ impl HelloSession {
     #[must_use]
     pub fn session_id(&self) -> u32 {
         self.sender.session_id
+    }
+
+    /// The peer leaf key id. The node closes the session when this key is denied.
+    #[must_use]
+    pub fn peer_key_id(&self) -> &str {
+        &self.peer_key_id
+    }
+
+    /// Ticket nonces for this session. The node closes the session when one is denied.
+    #[must_use]
+    pub fn ticket_nonces(&self) -> &[String] {
+        &self.ticket_nonces
     }
 
     /// Send one IPv4 packet as a DATA frame.
@@ -814,6 +831,16 @@ async fn bind_session(
         return Err(HelloError::SessionDeadline);
     }
     let sender_gate = PeerGate::bound(peer.clone());
+    let peer_key_id = leaf_key_id(&leaf).map_err(HelloError::Identity)?;
+    let mut ticket_nonces = Vec::new();
+    if let Ok((nonce, _expires)) = ticket_nonce_and_expiry(&presented.bytes) {
+        ticket_nonces.push(hex_lower(&nonce));
+    }
+    if let Some(bytes) = gate.admitted_bytes() {
+        if let Ok((nonce, _expires)) = ticket_nonce_and_expiry(bytes) {
+            ticket_nonces.push(hex_lower(&nonce));
+        }
+    }
     Ok(HelloSession {
         connection,
         sender: HelloSender {
@@ -832,7 +859,19 @@ async fn bind_session(
         },
         peer_not_after,
         ticket_expires,
+        peer_key_id,
+        ticket_nonces,
     })
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push(HEX[usize::from(byte >> 4)] as char);
+        text.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    text
 }
 
 async fn exchange_ticket(

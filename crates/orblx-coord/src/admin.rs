@@ -17,17 +17,25 @@ use orblx_identity::{DenySet, SpiffeId, WorkloadKind};
 use serde_json::{json, Value};
 
 use crate::error::CoordError;
-use crate::files::{read_text, write_text};
+use crate::files::{read_text, write_durable, write_text};
 use crate::state::Coordinator;
 
 const DENY_FILE: &str = "deny.json";
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct DenyFile {
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub(crate) struct DenyFile {
     version: u64,
     generated_at: u64,
     revoked_uris: Vec<String>,
     revoked_ticket_nonces: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    revoked_leaf_keys: Vec<RevokedLeafKey>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub(crate) struct RevokedLeafKey {
+    pub key_id: String,
+    pub not_after: u64,
 }
 
 impl DenyFile {
@@ -37,7 +45,86 @@ impl DenyFile {
             generated_at: unix_now(now).unwrap_or(0),
             revoked_uris: Vec::new(),
             revoked_ticket_nonces: Vec::new(),
+            revoked_leaf_keys: Vec::new(),
         }
+    }
+
+    pub(crate) fn add_leaf(&mut self, key_id: &str, not_after: u64, now_unix: u64) {
+        if now_unix > not_after.saturating_add(60) {
+            return;
+        }
+        if self
+            .revoked_leaf_keys
+            .iter()
+            .any(|item| item.key_id == key_id)
+        {
+            return;
+        }
+        self.revoked_leaf_keys.push(RevokedLeafKey {
+            key_id: key_id.to_string(),
+            not_after,
+        });
+    }
+
+    pub(crate) fn add_nonce(&mut self, nonce: &str, expires: u64, now_unix: u64) {
+        if now_unix > expires {
+            return;
+        }
+        if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return;
+        }
+        if self.revoked_ticket_nonces.iter().any(|item| item == nonce) {
+            return;
+        }
+        self.revoked_ticket_nonces.push(nonce.to_string());
+    }
+
+    pub(crate) fn prune_leaves(&mut self, now_unix: u64) {
+        self.revoked_leaf_keys
+            .retain(|item| now_unix <= item.not_after.saturating_add(60));
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub(crate) fn contains_uri(&self, uri: &str) -> bool {
+        self.revoked_uris.iter().any(|item| item == uri)
+    }
+
+    pub(crate) fn add_uri(&mut self, uri: &str) -> Result<(), CoordError> {
+        let _ = SpiffeId::parse(uri)?;
+        if !self.contains_uri(uri) {
+            self.revoked_uris.push(uri.to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_uri(&mut self, uri: &str) {
+        self.revoked_uris.retain(|item| item != uri);
+    }
+
+    /// Add one ticket nonce. A bad nonce is an error. An expired nonce stays out.
+    pub(crate) fn add_nonce_exact(
+        &mut self,
+        nonce: &str,
+        expires: u64,
+        now_unix: u64,
+    ) -> Result<(), CoordError> {
+        if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(CoordError::State);
+        }
+        self.add_nonce(nonce, expires, now_unix);
+        Ok(())
+    }
+
+    pub(crate) fn bump(&mut self, now_unix: u64) {
+        self.version = self.version.saturating_add(1);
+        self.generated_at = now_unix;
+        self.revoked_uris.sort();
+        self.revoked_ticket_nonces.sort();
+        self.revoked_leaf_keys
+            .sort_by(|left, right| left.key_id.cmp(&right.key_id));
     }
 
     fn to_json(&self) -> Result<String, CoordError> {
@@ -54,21 +141,32 @@ pub fn deny_json(coord: &Coordinator, now: SystemTime) -> Result<String, CoordEr
 ///
 /// The list is the global deny list plus the nodes that this node does not see.
 /// A guest node does not see the other nodes of the owner, and the owner nodes do not see it.
-/// The version is the global version plus the config record count.
-/// Each change that can change the hidden nodes writes a config record, so the version grows.
+/// The version grows when the served set changes. A config record that leaves the
+/// revoked URIs, nonces, and leaf keys the same keeps the last version.
 pub fn deny_json_for(
     coord: &Coordinator,
     name: &str,
     now: SystemTime,
 ) -> Result<String, CoordError> {
     let mut file = read_deny(coord, now)?;
-    let (hidden, count) = coord.share_deny_for(name)?;
-    file.version = file.version.saturating_add(count);
+    let (hidden, _) = coord.share_deny_for(name)?;
     for uri in hidden {
         if !file.revoked_uris.contains(&uri) {
             file.revoked_uris.push(uri);
         }
     }
+    let keys = file
+        .revoked_leaf_keys
+        .iter()
+        .map(|item| (item.key_id.clone(), item.not_after))
+        .collect();
+    file.version = coord.served_deny_version(
+        name,
+        file.version,
+        file.revoked_uris.clone(),
+        file.revoked_ticket_nonces.clone(),
+        keys,
+    )?;
     file.to_json()
 }
 
@@ -214,29 +312,24 @@ pub fn revoke_undo(
 ) -> Result<Value, CoordError> {
     let id = principal_id(coord, principal)?;
     let uri = id.as_uri().to_string();
-    let mut file = read_deny(coord, now)?;
-    if !file.revoked_uris.contains(&uri) {
-        return Err(CoordError::Protocol(
-            "The principal is not in the deny list.".to_string(),
-        ));
-    }
     let before = deny_digest(coord)?;
-    file.revoked_uris.retain(|item| *item != uri);
-    file.version = file.version.saturating_add(1);
-    file.generated_at = unix_now(now)?;
-    let text = file.to_json()?;
-    write_text(&coord.state_dir()?.join(DENY_FILE), &text, 0o644)?;
+    let version = coord.mutate_deny(now, |file, _now_unix| {
+        if !file.contains_uri(&uri) {
+            return Err(CoordError::Protocol(
+                "The principal is not in the deny list.".to_string(),
+            ));
+        }
+        file.remove_uri(&uri);
+        Ok(())
+    })?;
     let after = deny_digest(coord)?;
-    let detail = format!(
-        "principal {uri} scope all svid restored deny_version {}",
-        file.version
-    );
+    let detail = format!("principal {uri} scope all svid restored deny_version {version}");
     coord.record_change(actor, ConfigAction::Unrevoke, &uri, before, after, &detail)?;
     Ok(json!({
         "op": "revoke-undo",
         "principal": uri,
         "svid_restored": true,
-        "deny_version": file.version
+        "deny_version": version
     }))
 }
 
@@ -586,28 +679,37 @@ pub(crate) fn push_deny(
     nonces: &[String],
     now: SystemTime,
 ) -> Result<u64, CoordError> {
-    let mut file = read_deny(coord, now)?;
-    for uri in uris {
-        let _ = SpiffeId::parse(uri)?;
-        if !file.revoked_uris.iter().any(|item| item == uri) {
-            file.revoked_uris.push(uri.clone());
+    coord.mutate_deny(now, |file, now_unix| {
+        for uri in uris {
+            file.add_uri(uri)?;
         }
+        for nonce in nonces {
+            file.add_nonce_exact(nonce, u64::MAX, now_unix)?;
+        }
+        Ok(())
+    })
+}
+
+/// Read `deny.json`. A missing file is an empty document.
+pub(crate) fn load_deny_file(
+    dir: &std::path::Path,
+    now: SystemTime,
+) -> Result<DenyFile, CoordError> {
+    let path = dir.join(DENY_FILE);
+    if !path.exists() {
+        return Ok(DenyFile::empty(now));
     }
-    for nonce in nonces {
-        if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(CoordError::State);
-        }
-        if !file.revoked_ticket_nonces.iter().any(|item| item == nonce) {
-            file.revoked_ticket_nonces.push(nonce.clone());
-        }
-    }
-    file.revoked_uris.sort();
-    file.revoked_ticket_nonces.sort();
-    file.version = file.version.saturating_add(1);
-    file.generated_at = unix_now(now)?;
+    serde_json::from_str(&read_text(&path)?).map_err(|_| CoordError::State)
+}
+
+/// Store `deny.json` with the atomic writer. The caller updates the deny cache.
+pub(crate) fn store_deny_file(
+    dir: &std::path::Path,
+    file: &DenyFile,
+) -> Result<String, CoordError> {
     let text = file.to_json()?;
-    write_text(&coord.state_dir()?.join(DENY_FILE), &text, 0o644)?;
-    Ok(file.version)
+    write_durable(&dir.join(DENY_FILE), text.as_bytes(), 0o644)?;
+    Ok(text)
 }
 
 /// Return the revoked SPIFFE URIs in the deny file of one state directory (W25-31).

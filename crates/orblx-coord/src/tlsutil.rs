@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orblx_identity::{
@@ -124,14 +124,23 @@ fn certified_key(
     Ok((not_after, Arc::new(certified)))
 }
 
+#[cfg(test)]
 pub(crate) fn server_config(
     material: &TlsMaterial,
+) -> Result<(rustls::ServerConfig, Arc<LiveCert>), CoordError> {
+    server_config_with_deny(material, Arc::new(RwLock::new(DenySet::empty())))
+}
+
+pub(crate) fn server_config_with_deny(
+    material: &TlsMaterial,
+    deny: Arc<RwLock<DenySet>>,
 ) -> Result<(rustls::ServerConfig, Arc<LiveCert>), CoordError> {
     let provider = crypto_provider();
     let trust = TrustBundle::from_pem(&material.trust_pem)?;
     let verifier = Arc::new(NodeClientVerifier {
         provider: Arc::clone(&provider),
         trust,
+        deny,
     });
     let live = Arc::new(LiveCert::new(Arc::clone(&provider), material)?);
     let mut server = rustls::ServerConfig::builder_with_provider(provider)
@@ -143,11 +152,20 @@ pub(crate) fn server_config(
     Ok((server, live))
 }
 
-pub fn server_endpoint(
+#[cfg(test)]
+pub(crate) fn server_endpoint(
     material: &TlsMaterial,
     listen: SocketAddr,
 ) -> Result<(quinn::Endpoint, Arc<LiveCert>), CoordError> {
-    let (server, live) = server_config(material)?;
+    server_endpoint_with_deny(material, listen, Arc::new(RwLock::new(DenySet::empty())))
+}
+
+pub fn server_endpoint_with_deny(
+    material: &TlsMaterial,
+    listen: SocketAddr,
+    deny: Arc<RwLock<DenySet>>,
+) -> Result<(quinn::Endpoint, Arc<LiveCert>), CoordError> {
+    let (server, live) = server_config_with_deny(material, deny)?;
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(server)
         .map_err(|err| CoordError::Tls(err.to_string()))?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic));
@@ -236,6 +254,7 @@ struct CoordServerVerifier {
 struct NodeClientVerifier {
     provider: Arc<CryptoProvider>,
     trust: TrustBundle,
+    deny: Arc<RwLock<DenySet>>,
 }
 
 impl std::fmt::Debug for CoordServerVerifier {
@@ -342,9 +361,14 @@ impl ClientCertVerifier for NodeClientVerifier {
         _intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
+        let deny = self
+            .deny
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
         let id = self
             .trust
-            .authenticate_leaf(end_entity.as_ref(), system_time(now), &DenySet::empty())
+            .authenticate_leaf(end_entity.as_ref(), system_time(now), &deny)
             .map_err(|err| rustls::Error::General(err.to_string()))?;
         if id.kind() != WorkloadKind::Node {
             return Err(rustls::Error::General(

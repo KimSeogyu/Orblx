@@ -81,6 +81,9 @@ struct KeyRecord {
     grant: Option<NodeGrantBound>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     revoked_unix_ms: Option<u64>,
+    /// Node names this key may re-auth. Empty means first enroll only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    nodes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -106,6 +109,9 @@ pub struct CreateAsk {
     pub tags: Vec<String>,
     #[serde(default)]
     pub grant: Option<GrantAsk>,
+    /// Node names this key may re-auth. Empty means first enroll only.
+    #[serde(default)]
+    pub nodes: Vec<String>,
 }
 
 fn one_use() -> u32 {
@@ -299,6 +305,9 @@ pub fn create(
     if file.keys.iter().any(|key| key.id == id) {
         return Err(CoordError::State);
     }
+    for node in &ask.nodes {
+        let _ = SpiffeId::node(node).map_err(|_| CoordError::Name)?;
+    }
     file.keys.push(KeyRecord {
         id: id.clone(),
         hash_hex,
@@ -311,6 +320,7 @@ pub fn create(
         tags: ask.tags.clone(),
         grant: grant.clone(),
         revoked_unix_ms: None,
+        nodes: ask.nodes.clone(),
     });
     write_file(&dir, &file)?;
     coord.record_change(
@@ -482,6 +492,9 @@ pub fn enroll(
             _ => "The pre-auth key is not valid.",
         };
         return Err(CoordError::Protocol(text.to_string()));
+    }
+    if coord.node_enrolled(name)? {
+        return reauth_existing(coord, name, &file.keys[index], now);
     }
     let stamp = PreauthStamp {
         tags: key.tags.clone(),
@@ -765,6 +778,37 @@ fn read_file(dir: &Path) -> Result<KeyFile, CoordError> {
     Ok(file)
 }
 
+/// Add one use. The caller already holds `FILE_LOCK`.
+pub(crate) fn add_use_held(dir: &Path, id: &str) -> Result<(), CoordError> {
+    let mut file = read_file(dir)?;
+    let key = file
+        .keys
+        .iter_mut()
+        .find(|key| key.id == id)
+        .ok_or(CoordError::State)?;
+    key.uses = key.uses.saturating_add(1);
+    write_file(dir, &file)
+}
+
+fn reauth_existing(
+    coord: &Coordinator,
+    name: &str,
+    key: &KeyRecord,
+    now: SystemTime,
+) -> Result<crate::state::EnrollResult, CoordError> {
+    coord.reauth_preauth(
+        name,
+        crate::reauth::PreauthFacts {
+            id: key.id.clone(),
+            created_by: key.created_by.clone(),
+            nodes: key.nodes.clone(),
+            tags: key.tags.clone(),
+            grant: key.grant.clone(),
+        },
+        now,
+    )
+}
+
 fn write_file(dir: &Path, file: &KeyFile) -> Result<(), CoordError> {
     let text = serde_json::to_string_pretty(file).map_err(|_| CoordError::State)?;
     if text.contains(PREAUTH_PREFIX) || text.contains("PRIVATE KEY") {
@@ -871,6 +915,7 @@ mod tests {
             ephemeral: false,
             tags: Vec::new(),
             grant: None,
+            nodes: Vec::new(),
         }
     }
 
