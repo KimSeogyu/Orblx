@@ -10,12 +10,14 @@ cd "$ROOT"
 LOG="${1:-$ROOT/target/sigterm-ready.log}"
 mkdir -p "$(dirname "$LOG")"
 
+# shellcheck source=scripts/proof/pipe-lib.sh
+. "$(cd "$(dirname "$0")" && pwd)/pipe-lib.sh"
+# shellcheck source=scripts/proof/proof-lock.sh
+. "$PROOF_LIB_DIR/proof-lock.sh"
+PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 GiB free before the lock).
+
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "not run: this proof needs root and a netns"
-  exit 2
-fi
-if ! command -v ip >/dev/null 2>&1; then
-  echo "not run: ip is missing"
   exit 2
 fi
 
@@ -24,8 +26,15 @@ WORK="$(mktemp -d /tmp/orblx-sigterm.XXXXXX)"
 cleanup() {
   ip netns delete "$NS" >/dev/null 2>&1 || true
   rm -rf "$WORK"
+  proof_lock_end
 }
 trap cleanup EXIT
+proof_lock_take "sigterm-ready" "orblx-sigterm"
+
+if ! command -v ip >/dev/null 2>&1; then
+  echo "not run: ip is missing"
+  exit 2
+fi
 
 echo "profile release" | tee "$LOG"
 rustc -V | tee -a "$LOG"

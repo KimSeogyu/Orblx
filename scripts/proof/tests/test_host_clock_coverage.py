@@ -199,7 +199,7 @@ class HostClockCoverageTest(unittest.TestCase):
         self.assertIn('"${name}-sched-${k}=${renew}:${expiry}"', src)
         self.assertIn('--bound "${bound_start}:${bound_end}"', src)
         self.assertNotIn("--unknown-samples", src)
-        self.assertIn("wait \"$SAMPLER_PID\"", src)
+        self.assertIn('reap_bound "$SAMPLER_PID" ticket_renewal_sampler', src)
         self.assertIn(
             "observation_note contention_unknown_samples_do_not_mean_a_renewal_interval_was_fully_observed",
             src,
