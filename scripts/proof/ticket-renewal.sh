@@ -100,10 +100,28 @@ dc() {
   docker compose --progress quiet --profile nodes -f "$FILE" "$@"
 }
 
+# Poll 20 s after kill. Then send SIGKILL and print the fail reason.
+reap_bound() {
+  local pid="$1"
+  local reason="$2"
+  local i
+  for ((i = 0; i < 200; i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "fail_reason ${reason}" >&2
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return 0
+}
+
 stop_sampler() {
   if [[ -n "${SAMPLER_PID:-}" ]]; then
     kill "$SAMPLER_PID" >/dev/null 2>&1 || true
-    wait "$SAMPLER_PID" 2>/dev/null || true
+    reap_bound "$SAMPLER_PID" ticket_renewal_sampler
     SAMPLER_PID=""
   fi
 }
@@ -622,7 +640,7 @@ cleanup() {
     kill "$pid" >/dev/null 2>&1 || true
   done
   for pid in "${DIAG_PIDS[@]}"; do
-    wait "$pid" 2>/dev/null || true
+    reap_bound "$pid" ticket_renewal_diag_pid
   done
   if [[ "$TR_DIAG" == "1" && -n "${OUTD:-}" ]]; then
     local n

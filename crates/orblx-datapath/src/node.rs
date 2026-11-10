@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orblx_identity::{decode_certificate_pem, extract_spiffe_id, leaf_validity, DenySet, SpiffeId};
 use serde::{Deserialize, Serialize};
+use tokio::signal::unix::Signal;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -564,8 +565,22 @@ pub fn running_pid(state_dir: &Path) -> Option<u32> {
 
 /// Run the node until the process receives SIGINT or SIGTERM.
 pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
+    crate::stop_signal::install_stop_flag();
     let entered_at = Instant::now();
     let mut prepared = prepare_node(request, entered_at)?;
+    if stop_during_start() {
+        return Ok(());
+    }
+    // The runtime and both signal streams exist before the TUN device opens.
+    // A SIGTERM during `open_tun` then stops the node in `wait_for_stop`.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| HelloError::Io(err.to_string()))?;
+    let _enter = runtime.enter();
+    let (terminate, interrupt) = crate::stop_signal::open_stop_streams();
+    drop(_enter);
+    println!("The node is ready. SIGTERM stops the node.");
     let install = prepared
         .router
         .install_cidrs(prepared.request.accept_routes);
@@ -587,7 +602,12 @@ pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
             .map_err(|err| HelloError::Node(err.to_string()))?,
         netmask: Ipv4Addr::new(255, 255, 255, 255),
     })?;
+    if stop_during_start() {
+        return Ok(());
+    }
     store_record_once(&mut prepared)?;
+    // `prepare_link`, kernel forward, and exit routes are local `ip` or ioctl calls.
+    // They do not poll the stop flag. A call that does not return can exceed 5 s.
     prepare_link(&bridge.name, &install)?;
     if !prepared.request.forward_routes.is_empty() {
         crate::subnet::enable_kernel_forward(&prepared.request.forward_routes)?;
@@ -616,16 +636,17 @@ pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
     if let Some(on_ready) = prepared.request.on_ready.take() {
         on_ready(overlay);
     }
+    if stop_during_start() {
+        return Ok(());
+    }
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| HelloError::Io(err.to_string()))?;
     let result = runtime.block_on(run_mesh(
         prepared,
         bridge.from_tun,
         bridge.to_tun,
         Some(bridge.name),
+        terminate,
+        interrupt,
     ));
     drop(exit_routes);
     result
@@ -636,8 +657,17 @@ pub fn run_node(request: NodeRequest) -> Result<(), HelloError> {
 /// Call this function inside a Tokio runtime.
 /// The function does not open a TUN device.
 pub async fn run_memory_node(request: NodeRequest, device: MemoryDevice) -> Result<(), HelloError> {
+    // This path does not build a runtime and does not call `open_tun`.
+    // It does call `run_mesh`, so it installs the same flag and streams.
+    // The caller is already inside a runtime.
+    crate::stop_signal::install_stop_flag();
+    let (terminate, interrupt) = crate::stop_signal::open_stop_streams();
+    println!("The node is ready. SIGTERM stops the node.");
     let entered_at = Instant::now();
     let mut prepared = prepare_node(request, entered_at)?;
+    if stop_during_start() {
+        return Ok(());
+    }
     store_record_once(&mut prepared)?;
     println!("The overlay IP is {}.", prepared.record.overlay_ip);
     println!(
@@ -651,7 +681,27 @@ pub async fn run_memory_node(request: NodeRequest, device: MemoryDevice) -> Resu
     if let Some(on_ready) = prepared.request.on_ready.take() {
         on_ready(overlay);
     }
-    run_mesh(prepared, device.from_tun, device.to_tun, None).await
+    if stop_during_start() {
+        return Ok(());
+    }
+    run_mesh(
+        prepared,
+        device.from_tun,
+        device.to_tun,
+        None,
+        terminate,
+        interrupt,
+    )
+    .await
+}
+
+fn stop_during_start() -> bool {
+    if crate::stop_signal::stop_requested() {
+        println!("The node is down.");
+        true
+    } else {
+        false
+    }
 }
 
 struct PreparedNode {
@@ -742,6 +792,8 @@ async fn run_mesh_inner(
     from_tun: mpsc::Receiver<Vec<u8>>,
     to_tun: mpsc::Sender<Vec<u8>>,
     interface: Option<String>,
+    terminate: Option<Signal>,
+    interrupt: Option<Signal>,
 ) -> Result<(), HelloError> {
     let PreparedNode {
         mut request,
@@ -1063,7 +1115,7 @@ async fn run_mesh_inner(
         None
     };
 
-    wait_for_stop(request.stop).await;
+    wait_for_stop(terminate, interrupt, request.stop).await;
     let _ = shutdown_tx.send(true);
     drop(resolver);
     endpoint.close();
@@ -1086,8 +1138,10 @@ async fn run_mesh(
     from_tun: mpsc::Receiver<Vec<u8>>,
     to_tun: mpsc::Sender<Vec<u8>>,
     interface: Option<String>,
+    terminate: Option<Signal>,
+    interrupt: Option<Signal>,
 ) -> Result<(), HelloError> {
-    run_mesh_inner(prepared, from_tun, to_tun, interface).await
+    run_mesh_inner(prepared, from_tun, to_tun, interface, terminate, interrupt).await
 }
 
 fn local_view(request: &NodeRequest) -> Result<NodeView, HelloError> {
@@ -1139,40 +1193,45 @@ fn we_dial(self_name: &str, peer_name: &str) -> bool {
     self_name < peer_name
 }
 
-async fn wait_for_stop(external: Option<watch::Receiver<bool>>) {
-    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
-    match terminate {
-        Ok(mut terminate) => {
-            tokio::select! {
-                result = tokio::signal::ctrl_c() => {
-                    if let Err(err) = result {
-                        eprintln!("The node did not wait for SIGINT. {err}");
-                    }
-                }
-                _ = terminate.recv() => {}
-                _ = external_stop(external) => {}
-            }
+pub(crate) async fn wait_for_stop(
+    mut terminate: Option<Signal>,
+    mut interrupt: Option<Signal>,
+    mut external: Option<watch::Receiver<bool>>,
+) {
+    if crate::stop_signal::stop_requested() {
+        return;
+    }
+    loop {
+        if crate::stop_signal::stop_requested() {
+            return;
         }
-        Err(err) => {
-            eprintln!("The node did not install the stop handler. {err}");
-            external_stop(external).await;
+        tokio::select! {
+            _ = recv_stop_signal(&mut terminate) => return,
+            _ = recv_stop_signal(&mut interrupt) => return,
+            _ = external_stop(&mut external) => return,
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
     }
 }
 
-async fn external_stop(external: Option<watch::Receiver<bool>>) {
-    let Some(mut external) = external else {
+async fn recv_stop_signal(stream: &mut Option<Signal>) {
+    match stream.as_mut() {
+        Some(stream) => {
+            stream.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn external_stop(external: &mut Option<watch::Receiver<bool>>) {
+    let Some(external) = external else {
         std::future::pending::<()>().await;
         return;
     };
-    loop {
-        if *external.borrow() {
-            return;
-        }
-        if external.changed().await.is_err() {
-            return;
-        }
+    if *external.borrow() {
+        return;
     }
+    let _ = external.changed().await;
 }
 
 /// Print each HA route (W25) and its routers.

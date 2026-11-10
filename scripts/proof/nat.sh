@@ -3,6 +3,24 @@
 # The host is REAL. Every extra host is a [C] container.
 # The script prints proof_ok and the path kind for each case.
 set -euo pipefail
+
+# Poll 20 s after kill. Then send SIGKILL and print the fail reason.
+reap_bound() {
+  local pid="$1"
+  local reason="$2"
+  local i
+  for ((i = 0; i < 200; i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "fail_reason ${reason}" >&2
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return 0
+}
 # shellcheck source=scripts/proof/pipe-lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
@@ -426,7 +444,7 @@ for _ in $(seq 1 100); do
 done
 sleep 3
 docker exec orblx-nat-x sh -c 'for p in /proc/[0-9]*; do if [ "$(cat "$p/comm" 2>/dev/null)" = ping ]; then kill -INT "${p#/proc/}"; fi; done' || true
-wait "$PING_PID" || true
+reap_bound "$PING_PID" nat_ping_pid
 echo "case3 path ${CASE3_PATH}"
 echo "case3 return ${CASE3_RETURN}"
 if [[ "$CASE3_PATH" != "relay" ]]; then

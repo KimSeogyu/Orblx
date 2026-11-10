@@ -392,6 +392,7 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
 }
 
 fn run_up(mut options: UpOptions) -> Result<(), String> {
+    orblx_datapath::install_stop_flag();
     // SAFETY: `geteuid` has no arguments and no failure case.
     let euid = unsafe { libc::geteuid() };
     check_private_paths(&options.state_dir, &options.netmap, euid)?;
@@ -414,6 +415,14 @@ fn run_up(mut options: UpOptions) -> Result<(), String> {
     spawn_deny_refresh(&options);
     let underlay = underlay_for(&netmap, options.coord, options.relay);
     let renew = load_renewer(&options.state_dir, options.coord, options.coord_name)?;
+    // `fetch_netmap_blocking`, `advertise_routes_blocking`, and `advertise_exit_blocking`
+    // can wait on the coordinator for longer than 5 s. This start path calls them only
+    // when `--coord` is set. A SIGTERM during that wait is stored in the stop flag and
+    // is seen here, after the call returns.
+    if orblx_datapath::stop_requested() {
+        println!("The node is down.");
+        return Ok(());
+    }
     run_node(NodeRequest {
         config,
         netmap,
