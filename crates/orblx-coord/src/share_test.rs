@@ -259,3 +259,33 @@ fn share_back_lets_one_owner_node_reach_one_guest_node() {
     assert_eq!(from_a, vec![(6, 22, 22)]);
     assert!(denied(&deny_for(&coord, "g2"), "a"));
 }
+
+/// A config record that does not change the revoked set must not publish a new deny document.
+///
+/// `revoke_all` writes `deny.json` and then the audit record. `stamp_tick` wakes on
+/// either file. The served version used to add the audit length, so the waiter saw
+/// version N and then N+1 with the same URIs, nonces, and `generated_at`.
+#[test]
+fn a_config_record_keeps_the_deny_document_when_the_set_is_the_same() {
+    let scratch = Scratch::new();
+    let now = SystemTime::now();
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+    coord
+        .enroll_token("a", &token.secret, &["a:443".to_string()], &[], now)
+        .unwrap();
+    let first = crate::admin::deny_json_for(&coord, "a", now).unwrap();
+    coord
+        .record_change(
+            "spiffe://orblx.local/node/owner",
+            ConfigAction::Revoke,
+            "spiffe://orblx.local/node/a",
+            EMPTY_DIGEST,
+            EMPTY_DIGEST,
+            "record only",
+        )
+        .unwrap();
+    let second = crate::admin::deny_json_for(&coord, "a", now).unwrap();
+    assert_eq!(first, second);
+}

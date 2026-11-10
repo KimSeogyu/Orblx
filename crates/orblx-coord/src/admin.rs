@@ -141,21 +141,32 @@ pub fn deny_json(coord: &Coordinator, now: SystemTime) -> Result<String, CoordEr
 ///
 /// The list is the global deny list plus the nodes that this node does not see.
 /// A guest node does not see the other nodes of the owner, and the owner nodes do not see it.
-/// The version is the global version plus the config record count.
-/// Each change that can change the hidden nodes writes a config record, so the version grows.
+/// The version grows when the served set changes. A config record that leaves the
+/// revoked URIs, nonces, and leaf keys the same keeps the last version.
 pub fn deny_json_for(
     coord: &Coordinator,
     name: &str,
     now: SystemTime,
 ) -> Result<String, CoordError> {
     let mut file = read_deny(coord, now)?;
-    let (hidden, count) = coord.share_deny_for(name)?;
-    file.version = file.version.saturating_add(count);
+    let (hidden, _) = coord.share_deny_for(name)?;
     for uri in hidden {
         if !file.revoked_uris.contains(&uri) {
             file.revoked_uris.push(uri);
         }
     }
+    let keys = file
+        .revoked_leaf_keys
+        .iter()
+        .map(|item| (item.key_id.clone(), item.not_after))
+        .collect();
+    file.version = coord.served_deny_version(
+        name,
+        file.version,
+        file.revoked_uris.clone(),
+        file.revoked_ticket_nonces.clone(),
+        keys,
+    )?;
     file.to_json()
 }
 

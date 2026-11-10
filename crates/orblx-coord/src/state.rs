@@ -188,6 +188,20 @@ struct Inner {
     endpoint_sigs: RefCell<HashMap<(String, String), SignedEndpoint>>,
     /// The in-memory deny set. Handshake and `peer_id` read this cache.
     deny: Arc<RwLock<DenySet>>,
+    /// The last deny document served to each node.
+    ///
+    /// A config record that does not change the revoked set must not publish a
+    /// new version. A new version wakes every waiter.
+    served_deny: HashMap<String, ServedDeny>,
+}
+
+/// The revoked set last served to one node, and the version that served it.
+#[derive(Clone, PartialEq, Eq)]
+struct ServedDeny {
+    version: u64,
+    uris: Vec<String>,
+    nonces: Vec<String>,
+    keys: Vec<(String, u64)>,
 }
 
 /// The time after which the coordinator reads a state file again, also when its metadata
@@ -491,6 +505,7 @@ impl Coordinator {
                 views: ViewCache::default(),
                 endpoint_sigs: RefCell::new(HashMap::new()),
                 deny: Arc::clone(&deny),
+                served_deny: HashMap::new(),
             })),
         };
         {
@@ -1002,6 +1017,60 @@ impl Coordinator {
         let hidden = crate::share::hidden_for(&inner.policy, viewer, &nodes);
         let count = inner.audit.as_ref().map_or(0, ConfigLog::len);
         Ok((hidden, count))
+    }
+
+    /// Return the version to serve for this revoked set.
+    ///
+    /// `file_version` is the version in `deny.json`. The config record count is
+    /// added so a share change that does not rewrite `deny.json` still grows
+    /// the version when the served set changes. When the served URIs, nonces,
+    /// and leaf keys are the same as the last reply for `name`, the last
+    /// version is reused. A record that does not change the set must not wake
+    /// the waiters.
+    pub(crate) fn served_deny_version(
+        &self,
+        name: &str,
+        file_version: u64,
+        mut uris: Vec<String>,
+        mut nonces: Vec<String>,
+        mut keys: Vec<(String, u64)>,
+    ) -> Result<u64, CoordError> {
+        let mut inner = self.lock()?;
+        reload_read(&mut inner)?;
+        let count = inner.audit.as_ref().map_or(0, ConfigLog::len);
+        uris.sort();
+        uris.dedup();
+        nonces.sort();
+        nonces.dedup();
+        keys.sort();
+        keys.dedup();
+        let offered = file_version.saturating_add(count);
+        if let Some(prev) = inner.served_deny.get(name) {
+            if prev.uris == uris && prev.nonces == nonces && prev.keys == keys {
+                return Ok(prev.version);
+            }
+            let version = offered.max(prev.version.saturating_add(1));
+            inner.served_deny.insert(
+                name.to_string(),
+                ServedDeny {
+                    version,
+                    uris,
+                    nonces,
+                    keys,
+                },
+            );
+            return Ok(version);
+        }
+        inner.served_deny.insert(
+            name.to_string(),
+            ServedDeny {
+                version: offered,
+                uris,
+                nonces,
+                keys,
+            },
+        );
+        Ok(offered)
     }
 
     pub fn netmap_for(&self, name: &str) -> Result<NetmapView, CoordError> {
