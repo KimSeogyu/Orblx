@@ -16,6 +16,24 @@
 # With --artifacts, DIR holds orblx-x86_64-unknown-linux-gnu.tar.gz.
 # With no --artifacts, the script builds that tarball on this host.
 set -euo pipefail
+
+# Poll 20 s after kill. Then send SIGKILL and print the fail reason.
+reap_bound() {
+  local pid="$1"
+  local reason="$2"
+  local i
+  for ((i = 0; i < 200; i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "fail_reason ${reason}" >&2
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return 0
+}
 # shellcheck source=scripts/proof/pipe-lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../proof/pipe-lib.sh"
 
@@ -59,7 +77,7 @@ WORK="$(mktemp -d)"
 cleanup() {
   if [[ -n "${http_pid}" ]]; then
     kill "$http_pid" >/dev/null 2>&1 || true
-    wait "$http_pid" 2>/dev/null || true
+    reap_bound "$http_pid" install_e2e_http_pid
   fi
   as_root docker network rm "$NET" >/dev/null 2>&1 || true
   as_root docker image rm "$IMAGE" >/dev/null 2>&1 || true

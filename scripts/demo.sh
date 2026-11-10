@@ -9,6 +9,24 @@
 
 set -euo pipefail
 
+# Poll 20 s after kill. Then send SIGKILL and print the fail reason.
+reap_bound() {
+  local pid="$1"
+  local reason="$2"
+  local i
+  for ((i = 0; i < 200; i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "fail_reason ${reason}" >&2
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return 0
+}
+
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 
@@ -26,7 +44,7 @@ cleanup() {
   fi
   if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
     kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    reap_bound "$pid" demo_cleanup_pid
   fi
   rm -rf "$work"
   rm -f "$log"

@@ -18,6 +18,7 @@ mod reserve;
 mod router;
 mod run;
 mod soak;
+mod stop_signal;
 mod subnet;
 mod tun_bench;
 mod tun_dev;
@@ -59,6 +60,7 @@ pub use quic::{
 pub use reserve::{reserve_tcp_listeners, reserve_udp_sockets};
 pub use router::{route_packet, RouteMatch, RouterError, RouterTable};
 pub use run::{run_hello, HelloRequest, HelloRole};
+pub use stop_signal::{install_stop_flag, stop_requested};
 pub use tun_bench::{run_local_tun_bench, TunBenchOutcome, TunBenchReport};
 pub use tun_dev::{
     open_tun, open_tun_port, tun_capability_note, TunBridge, TunConfig, TunPort, DEFAULT_UDP_PORT,

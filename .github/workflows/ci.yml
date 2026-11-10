@@ -41,6 +41,9 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Check that Cargo.lock has one signal-hook-registry version
+        run: bash scripts/check-signal-hook-registry.sh
+
       - name: Run the tests
         run: cargo test --workspace
 
@@ -125,6 +128,9 @@ jobs:
 
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Check that Cargo.lock has one signal-hook-registry version
+        run: bash scripts/check-signal-hook-registry.sh
 
       # W25-11: the renewal gap test is a gate on Linux only. On the macOS runner the OS
       # stops the test process for up to some hundred ms, so the test runs below as a report.

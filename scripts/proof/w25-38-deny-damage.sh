@@ -44,6 +44,24 @@
 # show unknown_samples 0.
 # The script does not print enroll tokens, private keys, or SVID material.
 set -euo pipefail
+
+# Poll 20 s after kill. Then send SIGKILL and print the fail reason.
+reap_bound() {
+  local pid="$1"
+  local reason="$2"
+  local i
+  for ((i = 0; i < 200; i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "fail_reason ${reason}" >&2
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return 0
+}
 # shellcheck source=scripts/proof/pipe-lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipe-lib.sh"
 
@@ -431,10 +449,10 @@ close_ssh_hold() {
     kill "$hold_writer" 2>/dev/null || true
   fi
   if [[ -n "${ssh_hold_pid:-}" ]]; then
-    wait "$ssh_hold_pid" 2>/dev/null || true
+    reap_bound "$ssh_hold_pid" w25_38_ssh_hold
   fi
   if [[ -n "${hold_writer:-}" ]]; then
-    wait "$hold_writer" 2>/dev/null || true
+    reap_bound "$hold_writer" w25_38_hold_writer
   fi
 }
 

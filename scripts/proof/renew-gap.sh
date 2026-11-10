@@ -18,6 +18,24 @@
 #      after the network starts. Run as root (docker).
 set -uo pipefail
 
+# Poll 20 s after kill. Then send SIGKILL and print the fail reason.
+reap_bound() {
+  local pid="$1"
+  local reason="$2"
+  local i
+  for ((i = 0; i < 200; i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "fail_reason ${reason}" >&2
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return 0
+}
+
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT" || exit 1
 RUNS="${ORBLX_RG_RUNS:-10}"
@@ -171,7 +189,7 @@ EOF
   dc exec -T node-a ping -n -D -O -i "$INTERVAL" -c "$((SECS * 20))" -W 1 100.64.0.2 \
     >"$OUT/run${i}.ping" 2>&1
   kill "$sampler" 2>/dev/null
-  wait "$sampler" 2>/dev/null
+  reap_bound "$sampler" renew_gap_sampler
   for name in node-a node-b; do
     dc logs --timestamps --no-log-prefix "$name" 2>/dev/null \
       | awk -v n="$name" '/The node renewed the SVID/ {print "svid_renewal " n " " $1}' >>"$OUT/run${i}.renewals"
