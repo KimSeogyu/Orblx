@@ -1564,7 +1564,15 @@ async fn deny_reload_loop(mesh: Mesh) {
                 }
                 // W25-31: a revoked SSH user certificate closes the mesh sessions of the
                 // node that asked for it. The node reads the netmap only when its text changes.
-                if let Ok(bytes) = fs::read(&mesh.netmap_path) {
+                // The read runs on a blocking thread. A lost read leaves the sessions as they are.
+                let netmap_path = mesh.netmap_path.clone();
+                let started = Instant::now();
+                let read = tokio::task::spawn_blocking(move || fs::read(netmap_path)).await;
+                let read_ms = started.elapsed().as_millis();
+                if read_ms >= 20 {
+                    tr!("slow_io op=netmap_read ms={read_ms}");
+                }
+                if let Ok(Ok(bytes)) = read {
                     if last_netmap.as_deref() != Some(bytes.as_slice()) {
                         if let Ok(netmap) = Netmap::from_slice(&bytes) {
                             close_ssh_revoked_links(&mesh, &netmap, &mut ssh_closed);

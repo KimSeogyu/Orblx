@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 
 use orblx_identity::{GoogleJwks, OidcJwks, TrustBundle, WorkloadKind};
@@ -149,10 +149,14 @@ async fn coord_cert_tick(coord: Coordinator, live: Arc<tlsutil::LiveCert>) {
 /// The time between two checks of the files that make the deny list (W25-2).
 const STAMP_TICK: Duration = Duration::from_millis(100);
 
+/// One file stamp: length and change time. A missing file is `None`.
+type FileStamp = Option<(u64, Option<SystemTime>)>;
+
 /// Wake the `deny-wait` requests when a file that makes the deny list changes.
 ///
 /// The files are the deny file, the config audit chain, the node store, and the policy file.
-/// The tick reads only the file size and change time.
+/// The tick reads only the file size and change time. The read runs on a blocking thread.
+/// A lost read does not change the stamp.
 async fn stamp_tick(coord: Coordinator, stamp: watch::Sender<u64>) {
     let mut last = None;
     loop {
@@ -160,26 +164,52 @@ async fn stamp_tick(coord: Coordinator, stamp: watch::Sender<u64>) {
         let (Ok(dir), Ok(policy)) = (coord.state_dir(), coord.policy_file()) else {
             continue;
         };
-        let now = [
+        let paths = vec![
             dir.join("deny.json"),
             dir.join(crate::state::CONFIG_AUDIT_FILE),
             dir.join("nodes.json"),
             dir.join(crate::sshca::SSH_CA_FILE),
             dir.join(crate::sshca::SSH_CERTS_FILE),
             policy,
-        ]
+        ];
+        let started = Instant::now();
+        let read = tokio::task::spawn_blocking(move || stamp_metadata(&paths)).await;
+        trace_slow_io("stamp_metadata", started.elapsed().as_millis());
+        let Ok(now) = read else {
+            continue;
+        };
+        if last.as_ref() != Some(&now) {
+            last = Some(now);
+            stamp.send_modify(|value| *value = value.wrapping_add(1));
+        }
+    }
+}
+
+/// Read the size and the change time of each path. A missing path stays `None`.
+fn stamp_metadata(paths: &[std::path::PathBuf]) -> Vec<FileStamp> {
+    paths
         .iter()
         .map(|path| {
             std::fs::metadata(path)
                 .ok()
                 .map(|meta| (meta.len(), meta.modified().ok()))
         })
-        .collect::<Vec<_>>();
-        if last.as_ref() != Some(&now) {
-            last = Some(now);
-            stamp.send_modify(|value| *value = value.wrapping_add(1));
-        }
+        .collect()
+}
+
+/// Trace one slow disk call. The line names the call and the elapsed time.
+///
+/// The line is printed when `ORBLX_TRACE_RENEW` is set and the call took at least 20 ms,
+/// the same gate as `write_atomic`.
+fn trace_slow_io(op: &str, ms: u128) {
+    if ms < 20 || std::env::var_os("ORBLX_TRACE_RENEW").is_none() {
+        return;
     }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    eprintln!("trace {stamp} slow_io op={op} ms={ms}");
 }
 
 /// Reply with the deny list of one node when its ETag is not `known` (W25-2).

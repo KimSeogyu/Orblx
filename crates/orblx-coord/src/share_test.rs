@@ -289,3 +289,43 @@ fn a_config_record_keeps_the_deny_document_when_the_set_is_the_same() {
     let second = crate::admin::deny_json_for(&coord, "a", now).unwrap();
     assert_eq!(first, second);
 }
+
+/// A restart serves a deny version that is at least as high as every version served before it.
+///
+/// The served version is at most `deny.json` version plus the audit length. Both of those
+/// are on disk. A new process has an empty memory cache, so its first serve uses that sum.
+#[test]
+fn a_restart_serves_a_deny_version_at_least_as_high() {
+    let scratch = Scratch::new();
+    let now = SystemTime::now();
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+    coord
+        .enroll_token("a", &token.secret, &["a:443".to_string()], &[], now)
+        .unwrap();
+    let first = deny_version(&crate::admin::deny_json_for(&coord, "a", now).unwrap());
+    coord
+        .record_change(
+            "spiffe://orblx.local/node/owner",
+            ConfigAction::Revoke,
+            "spiffe://orblx.local/node/a",
+            EMPTY_DIGEST,
+            EMPTY_DIGEST,
+            "record only",
+        )
+        .unwrap();
+    let second = deny_version(&crate::admin::deny_json_for(&coord, "a", now).unwrap());
+    drop(coord);
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    let restarted = deny_version(&crate::admin::deny_json_for(&coord, "a", now).unwrap());
+    assert!(restarted >= first);
+    assert!(restarted >= second);
+}
+
+fn deny_version(text: &str) -> u64 {
+    let mut deny = DenySet::empty();
+    deny.apply_json(text.as_bytes()).unwrap();
+    deny.version().unwrap()
+}
