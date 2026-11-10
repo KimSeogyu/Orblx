@@ -56,6 +56,7 @@ PROOF_MIN_FREE_GIB=15  # reason: the floor (PROOF_DISK_FLOOR_GIB, PO rule: 15 Gi
 RECOVERY_NS=60000000000
 NS_PER_S=1000000000
 NS_PER_MS=1000000
+STOP_WAIT_NS=20000000000
 NODE_URI="spiffe://orblx.local/node/a"
 SESSION_UP_LINE="The peer SPIFFE ID is "
 
@@ -163,7 +164,6 @@ case "$idp" in
 esac
 [[ -x "$bin" && -x "$idp" ]] || setup_fail binary
 head_sha=$(git -C "$root" rev-parse HEAD) || setup_fail git
-head_ct=$(git -C "$root" log -1 --format=%ct) || setup_fail git
 bin_sha=$(sha256sum "$bin" | awk '{print $1}') || setup_fail sha256sum
 idp_sha=$(sha256sum "$idp" | awk '{print $1}') || setup_fail sha256sum
 clocksource=$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource) || setup_fail clocksource
@@ -242,10 +242,18 @@ real_origin=$(realtime_ns) || setup_fail python3
 if [[ -n "$(git -C "$root" status --porcelain)" ]]; then
   setup_fail dirty
 fi
-bin_mt=$(stat -c %Y "$bin") || setup_fail stat
-idp_mt=$(stat -c %Y "$idp") || setup_fail stat
-if [[ "$bin_mt" -lt "$head_ct" || "$idp_mt" -lt "$head_ct" ]]; then
-  setup_fail mtime
+command -v cargo >/dev/null 2>&1 || setup_fail cargo
+cargo build --release --locked -p orblx-cli --bin orblx -p orblx-test-idp --bin orblx-test-idp \
+  || setup_fail cargo
+built_bin="$root/target/release/orblx"
+built_idp="$root/target/release/orblx-test-idp"
+[[ -x "$built_bin" && -x "$built_idp" ]] || setup_fail binary
+built_bin_sha=$(sha256sum "$built_bin" | awk '{print $1}') || setup_fail sha256sum
+built_idp_sha=$(sha256sum "$built_idp" | awk '{print $1}') || setup_fail sha256sum
+run_bin_sha=$(sha256sum "$bin" | awk '{print $1}') || setup_fail sha256sum
+run_idp_sha=$(sha256sum "$idp" | awk '{print $1}') || setup_fail sha256sum
+if [[ "$run_bin_sha" != "$built_bin_sha" || "$run_idp_sha" != "$built_idp_sha" ]]; then
+  setup_fail sha256
 fi
 
 # Outer mode has no in-script lock. The call below stays at the top level.
@@ -422,6 +430,52 @@ client_stopped() {
   [[ "$state" == "Z" ]]
 }
 
+child_alive() {
+  local pid="$1" state
+  [[ -n "$pid" ]] || return 1
+  if [[ ! -d "/proc/${pid}" ]]; then
+    return 1
+  fi
+  state=$(awk '/^State:/ { print $2 }' "/proc/${pid}/status" 2>/dev/null || true)
+  [[ -n "$state" && "$state" != "Z" ]]
+}
+
+stop_timeout() {
+  local step="$1"
+  if [[ "$past_marker" == 1 ]]; then
+    say "W25-47 FAIL stop-timeout step=${step} run_id=${run_id}"
+    exit 1
+  fi
+  say "W25-47 HOST_INVALID_PRESTEP step=${step} run_id=${run_id}"
+  exit 6
+}
+
+# Poll for 20 s on CLOCK_MONOTONIC, then SIGKILL. This clock decides.
+# The iteration alarm does not decide a stop.
+stop_child() {
+  local pid="$1" step="$2" start now
+  [[ -n "$pid" ]] || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  start=$(mono_ns) || stop_timeout "$step"
+  while child_alive "$pid"; do
+    now=$(mono_ns) || stop_timeout "$step"
+    if [[ $(( now - start )) -ge "$STOP_WAIT_NS" ]]; then
+      kill -KILL "$pid" 2>/dev/null || true
+      break
+    fi
+    sleep 0.2
+  done
+  start=$(mono_ns) || stop_timeout "$step"
+  while child_alive "$pid"; do
+    now=$(mono_ns) || stop_timeout "$step"
+    if [[ $(( now - start )) -ge "$STOP_WAIT_NS" ]]; then
+      stop_timeout "$step"
+    fi
+    sleep 0.2
+  done
+  wait "$pid" 2>/dev/null || true
+}
+
 key_id() {
   openssl x509 -in "$1" -pubkey -noout 2>/dev/null \
     | openssl pkey -pubin -outform DER 2>/dev/null \
@@ -524,8 +578,7 @@ ip netns exec "$ns_a" stdbuf -oL -eL "$bin" up --state-dir "$state_a" --listen 1
   --metrics off >"$work/node-a.log" 2>&1 &
 node_a_pid=$!
 wait_prestep tun "$work/node-a.log" "The TUN device is"
-kill "$node_a_pid" 2>/dev/null || true
-wait "$node_a_pid" 2>/dev/null || true
+stop_child "$node_a_pid" stop-node-a
 node_a_pid=
 
 step_mono=$(mono_ns) || dod_fail setup "$alarm_start_ns"
@@ -658,8 +711,7 @@ present() {
     check_deadline
     now=$(mono_ns)
     if [[ $(( now - start )) -ge "$RECOVERY_NS" ]]; then
-      kill "$hello_pid" 2>/dev/null || true
-      wait "$hello_pid" 2>/dev/null || true
+      stop_child "$hello_pid" stop-hello
       hello_pid=
       if [[ -s "$work/hello.err" ]]; then
         cat "$work/hello.err" >>"$work/orblx.err"
@@ -672,6 +724,16 @@ present() {
     sleep 1
   done
   hello_code=0
+  local reap_start
+  reap_start=$(mono_ns) || stop_timeout stop-hello
+  while child_alive "$hello_pid"; do
+    now=$(mono_ns) || stop_timeout stop-hello
+    if [[ $(( now - reap_start )) -ge "$STOP_WAIT_NS" ]]; then
+      kill -KILL "$hello_pid" 2>/dev/null || true
+      stop_timeout stop-hello
+    fi
+    sleep 0.2
+  done
   wait "$hello_pid" || hello_code=$?
   hello_pid=
   if [[ -s "$work/hello.err" ]]; then
@@ -695,8 +757,7 @@ cp "$work/state-a-old/ticket.bin" "$work/state-a-ticket/ticket.bin" || dod_fail 
 cp "$work/state-a-old/ticket.bin.mac" "$work/state-a-ticket/ticket.bin.mac" || dod_fail b "$live_mono"
 present "$live_mono" "$work/node-b.log" "The capability ticket check rejected the peer. The deny list contains this identifier." \
   "$work/state-a-ticket/cert.pem" "$work/state-a-ticket/key.pem" "$work/state-a-ticket/ticket.bin" "old-ticket"
-kill "$node_b_pid" 2>/dev/null || true
-wait "$node_b_pid" 2>/dev/null || true
+stop_child "$node_b_pid" stop-node-b
 node_b_pid=
 say "DoD b live passed."
 
