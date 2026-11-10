@@ -196,9 +196,12 @@ struct Inner {
 }
 
 /// The revoked set last served to one node, and the version that served it.
+///
+/// `file_version` is the `deny.json` version of the read that stored this set.
 #[derive(Clone, PartialEq, Eq)]
 struct ServedDeny {
     version: u64,
+    file_version: u64,
     uris: Vec<String>,
     nonces: Vec<String>,
     keys: Vec<(String, u64)>,
@@ -1022,18 +1025,20 @@ impl Coordinator {
     /// Return the version to serve for this revoked set.
     ///
     /// `file_version` is the version in the `deny.json` read that produced
-    /// `uris`, `nonces`, and `keys`. `offered` is that version plus the audit
-    /// length of this call (`ConfigLog::len`, which is `next_index`). The
-    /// served version is never above `offered`. This function is the only
-    /// path that chooses a served deny version.
+    /// `uris`, `nonces`, and `keys`. That read is outside the lock. `offered`
+    /// is that version plus the audit length of this call (`ConfigLog::len`,
+    /// which is `next_index`). The served version is never above `offered`.
+    /// This function is the only path that chooses a served deny version.
     ///
-    /// The same URIs, nonces, and leaf keys keep the last version when that
-    /// version is not above `offered`. A record that does not change the set
-    /// must not wake the waiters. A different set with a higher `offered`
-    /// stores that version. A different set with a lower or equal `offered`
-    /// is a stale read: the reply uses `offered` and the cache stays. A
-    /// cached version above `offered` is an error. The function does not
-    /// clamp it.
+    /// The same URIs, nonces, and leaf keys keep the last version. A record
+    /// that does not change the set must not wake the waiters. The function
+    /// returns an error only when that cached version is above the bound read
+    /// under this lock: the deny-set file version plus the audit length. A
+    /// lower `file_version` than the stored one is a stale read. The reply
+    /// uses a version below the cached fresh version, and the cache stays.
+    /// A different set with a higher `offered` and a file version at least the
+    /// stored one stores that version. A different set with a lower or equal
+    /// `offered` uses `offered` and the cache stays.
     pub(crate) fn served_deny_version(
         &self,
         name: &str,
@@ -1052,11 +1057,24 @@ impl Coordinator {
         keys.sort();
         keys.dedup();
         let offered = file_version.checked_add(count).ok_or(CoordError::State)?;
+        // Bound for a disk rollback. Both parts are already in memory: the
+        // deny set loaded or written under this lock, and the audit length.
+        // This is not `file_version`, which was read outside the lock.
+        let file_under_lock = inner
+            .deny
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .version()
+            .unwrap_or(0);
+        let bound = file_under_lock
+            .checked_add(count)
+            .ok_or(CoordError::State)?;
         let Some(prev) = inner.served_deny.get(name).cloned() else {
             inner.served_deny.insert(
                 name.to_string(),
                 ServedDeny {
                     version: offered,
+                    file_version,
                     uris,
                     nonces,
                     keys,
@@ -1066,16 +1084,21 @@ impl Coordinator {
         };
         let same = prev.uris == uris && prev.nonces == nonces && prev.keys == keys;
         if same {
-            if prev.version > offered {
+            if prev.version > bound {
                 return Err(CoordError::State);
             }
             return Ok(prev.version);
+        }
+        if file_version < prev.file_version {
+            let below = prev.version.saturating_sub(1);
+            return Ok(offered.min(below));
         }
         if offered > prev.version {
             inner.served_deny.insert(
                 name.to_string(),
                 ServedDeny {
                     version: offered,
+                    file_version,
                     uris,
                     nonces,
                     keys,
