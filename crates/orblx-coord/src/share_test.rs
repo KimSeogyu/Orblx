@@ -292,8 +292,10 @@ fn a_config_record_keeps_the_deny_document_when_the_set_is_the_same() {
 
 /// A restart serves a deny version that is at least as high as every version served before it.
 ///
-/// The served version is at most `deny.json` version plus the audit length. Both of those
-/// are on disk. A new process has an empty memory cache, so its first serve uses that sum.
+/// Each served version is at most `deny.json` version plus the audit length. The audit
+/// length is `next_index`. The chain has no prune and no rotation, so the length does
+/// not fall. Both values are on disk. A new process has an empty cache and serves that
+/// sum, so the version is at least as high as every version served before the restart.
 #[test]
 fn a_restart_serves_a_deny_version_at_least_as_high() {
     let scratch = Scratch::new();
@@ -328,4 +330,144 @@ fn deny_version(text: &str) -> u64 {
     let mut deny = DenySet::empty();
     deny.apply_json(text.as_bytes()).unwrap();
     deny.version().unwrap()
+}
+
+fn enroll_named(coord: &Coordinator, name: &str, now: SystemTime) {
+    let token = coord.create_token_at(Duration::from_secs(60), now).unwrap();
+    coord
+        .enroll_token(name, &token.secret, &[format!("{name}:443")], &[], now)
+        .unwrap();
+}
+
+fn audit_len(dir: &std::path::Path) -> u64 {
+    let text = fs::read_to_string(dir.join(CONFIG_AUDIT_FILE)).unwrap_or_default();
+    text.lines().filter(|line| !line.is_empty()).count() as u64
+}
+
+fn deny_document(version: u64, uris: &[&str]) -> String {
+    serde_json::json!({
+        "version": version,
+        "generated_at": 1,
+        "revoked_uris": uris,
+        "revoked_ticket_nonces": [],
+    })
+    .to_string()
+}
+
+/// Crypto scratch case. A fresh read serves 5. A later stale read serves 8 on
+/// the old rule. After a restart, revoke of c serves 7, and a node that kept 8
+/// does not install c.
+#[test]
+fn a_stale_read_cannot_hide_the_revoke_that_follows_a_restart() {
+    let scratch = Scratch::new();
+    let now = SystemTime::now();
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    for name in ["a", "b", "c"] {
+        enroll_named(&coord, name, now);
+    }
+    let v0 = crate::admin::deny_json_for(&coord, "a", now).unwrap();
+    assert_eq!(deny_version(&v0), 3);
+    crate::admin::revoke_all(&coord, "b", "spiffe://orblx.local/node/owner", now).unwrap();
+    let fresh = crate::admin::deny_json_for(&coord, "a", now).unwrap();
+    assert_eq!(deny_version(&fresh), 5);
+    let mut node = DenySet::empty();
+    node.apply_json(v0.as_bytes()).unwrap();
+    node.apply_json(fresh.as_bytes()).unwrap();
+    let stale_sets: [&[&str]; 3] = [
+        &[],
+        &["spiffe://orblx.local/node/stale-1"],
+        &["spiffe://orblx.local/node/stale-2"],
+    ];
+    for uris in stale_sets {
+        let version = coord
+            .served_deny_version(
+                "a",
+                0,
+                uris.iter().map(|uri| (*uri).to_string()).collect(),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        node.apply_json(deny_document(version, uris).as_bytes())
+            .unwrap();
+    }
+    let highest = node.version().unwrap();
+    drop(coord);
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    crate::admin::revoke_all(&coord, "c", "spiffe://orblx.local/node/owner", now).unwrap();
+    let revoked = crate::admin::deny_json_for(&coord, "a", now).unwrap();
+    let c_version = deny_version(&revoked);
+    assert!(
+        c_version > highest,
+        "revoke c served {c_version} but the node kept {highest}"
+    );
+    node.apply_json(revoked.as_bytes()).unwrap();
+    assert!(node.reject_uri(&SpiffeId::node("c").unwrap()).is_err());
+}
+
+/// A stale reply that follows a fresh reply has a lower version. A node that
+/// holds the fresh set ignores the stale reply.
+#[test]
+fn a_stale_reply_is_older_than_the_fresh_reply() {
+    let scratch = Scratch::new();
+    let now = SystemTime::now();
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    for name in ["a", "b"] {
+        enroll_named(&coord, name, now);
+    }
+    crate::admin::revoke_all(&coord, "b", "spiffe://orblx.local/node/owner", now).unwrap();
+    let fresh = crate::admin::deny_json_for(&coord, "a", now).unwrap();
+    let fresh_version = deny_version(&fresh);
+    let stale_version = coord
+        .served_deny_version("a", 0, Vec::new(), Vec::new(), Vec::new())
+        .unwrap();
+    assert!(
+        stale_version < fresh_version,
+        "stale {stale_version} fresh {fresh_version}"
+    );
+    let mut node = DenySet::empty();
+    node.apply_json(fresh.as_bytes()).unwrap();
+    let apply = node
+        .apply_json(deny_document(stale_version, &[]).as_bytes())
+        .unwrap();
+    assert_eq!(apply, orblx_identity::DenyApply::IgnoredOlder);
+    assert_eq!(node.version(), Some(fresh_version));
+}
+
+/// The served version is never above `deny.json` version plus the audit length.
+#[test]
+fn a_served_deny_version_never_exceeds_the_file_plus_the_audit() {
+    let scratch = Scratch::new();
+    let now = SystemTime::now();
+    let coord = Coordinator::open(&scratch.0, "coord", OidcConfig::TokenOnly).unwrap();
+    coord.enable_config_audit().unwrap();
+    enroll_named(&coord, "a", now);
+    let file_version = 4u64;
+    let uris = vec!["spiffe://orblx.local/node/b".to_string()];
+    let served = coord
+        .served_deny_version("a", file_version, uris.clone(), Vec::new(), Vec::new())
+        .unwrap();
+    let audit = audit_len(&scratch.0);
+    assert!(
+        served <= file_version + audit,
+        "served {served} file {file_version} audit {audit}"
+    );
+    let stale = coord
+        .served_deny_version(
+            "a",
+            0,
+            vec!["spiffe://orblx.local/node/z".to_string()],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+    let audit = audit_len(&scratch.0);
+    assert!(stale <= audit, "served {stale} file 0 audit {audit}");
+    let error = coord
+        .served_deny_version("a", 0, uris, Vec::new(), Vec::new())
+        .unwrap_err();
+    assert!(matches!(error, crate::error::CoordError::State));
 }

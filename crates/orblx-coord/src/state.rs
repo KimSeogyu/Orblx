@@ -1021,12 +1021,19 @@ impl Coordinator {
 
     /// Return the version to serve for this revoked set.
     ///
-    /// `file_version` is the version in `deny.json`. The config record count is
-    /// added so a share change that does not rewrite `deny.json` still grows
-    /// the version when the served set changes. When the served URIs, nonces,
-    /// and leaf keys are the same as the last reply for `name`, the last
-    /// version is reused. A record that does not change the set must not wake
-    /// the waiters.
+    /// `file_version` is the version in the `deny.json` read that produced
+    /// `uris`, `nonces`, and `keys`. `offered` is that version plus the audit
+    /// length of this call (`ConfigLog::len`, which is `next_index`). The
+    /// served version is never above `offered`. This function is the only
+    /// path that chooses a served deny version.
+    ///
+    /// The same URIs, nonces, and leaf keys keep the last version when that
+    /// version is not above `offered`. A record that does not change the set
+    /// must not wake the waiters. A different set with a higher `offered`
+    /// stores that version. A different set with a lower or equal `offered`
+    /// is a stale read: the reply uses `offered` and the cache stays. A
+    /// cached version above `offered` is an error. The function does not
+    /// clamp it.
     pub(crate) fn served_deny_version(
         &self,
         name: &str,
@@ -1044,32 +1051,37 @@ impl Coordinator {
         nonces.dedup();
         keys.sort();
         keys.dedup();
-        let offered = file_version.saturating_add(count);
-        if let Some(prev) = inner.served_deny.get(name) {
-            if prev.uris == uris && prev.nonces == nonces && prev.keys == keys {
-                return Ok(prev.version);
-            }
-            let version = offered.max(prev.version.saturating_add(1));
+        let offered = file_version.checked_add(count).ok_or(CoordError::State)?;
+        let Some(prev) = inner.served_deny.get(name).cloned() else {
             inner.served_deny.insert(
                 name.to_string(),
                 ServedDeny {
-                    version,
+                    version: offered,
                     uris,
                     nonces,
                     keys,
                 },
             );
-            return Ok(version);
+            return Ok(offered);
+        };
+        let same = prev.uris == uris && prev.nonces == nonces && prev.keys == keys;
+        if same {
+            if prev.version > offered {
+                return Err(CoordError::State);
+            }
+            return Ok(prev.version);
         }
-        inner.served_deny.insert(
-            name.to_string(),
-            ServedDeny {
-                version: offered,
-                uris,
-                nonces,
-                keys,
-            },
-        );
+        if offered > prev.version {
+            inner.served_deny.insert(
+                name.to_string(),
+                ServedDeny {
+                    version: offered,
+                    uris,
+                    nonces,
+                    keys,
+                },
+            );
+        }
         Ok(offered)
     }
 
